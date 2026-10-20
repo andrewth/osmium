@@ -241,7 +241,7 @@ user_hello:
     xor %edi, %edi
     syscall
     ud2
-3:  .ascii "hello from ring 3"
+3:  .ascii "hello from process ?"
 4:
 user_hello_end:
 
@@ -331,6 +331,12 @@ static CPU_TABLES: [core::sync::atomic::AtomicPtr<x86::CpuTables>; MAX_CPUS] =
 /// Points this CPU's TSS at the incoming task's kernel stack, where the CPU
 /// will put the trap frame when that task traps out of ring 3.
 fn on_switch(next: &osmium::sched::Task) {
+    // Each process runs on its own page table; kernel tasks on the kernel's.
+    let root = next.data::<Process>().map_or(CR3.load(Ordering::Relaxed), |p| p.root.0);
+    if x86::read_cr3() & !0xfff != root {
+        // SAFETY: both kinds of table map the kernel (shared root entry 0).
+        unsafe { x86::write_cr3(root) };
+    }
     let tables = CPU_TABLES[cpu::current_id()].load(Ordering::Relaxed);
     if let (Some(top), false) = (next.kernel_stack_top(), tables.is_null()) {
         // SAFETY: this CPU's own tables; interrupts are off during a switch.
@@ -700,8 +706,31 @@ fn serial_demo() {
     }
 }
 
-/// Where user programs are mapped; well above the identity-mapped RAM.
-const USER_BASE: u64 = 0x4000_0000;
+/// Where every user program is mapped, each in its own address space:
+/// root entry 1 (512 GiB), outside the kernel's root entry 0.
+const USER_BASE: u64 = 0x80_0000_0000;
+
+/// A user process: its own page table (sharing the kernel's root entry 0)
+/// and the frames it owns. Attached to its task; freed when the task is.
+struct Process {
+    root: PhysAddr,
+    pt: IrqSpinLock<PageTable<X86_64, &'static Frames>>,
+    frames: [PhysAddr; 2],
+}
+
+static PROCESSES_FREED: AtomicUsize = AtomicUsize::new(0);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        PROCESSES_FREED.fetch_add(1, Ordering::Relaxed);
+        let mut frames = FRAMES.lock();
+        for f in self.frames {
+            // SAFETY: the process's own frames; its page table, the only
+            // one mapping them, is dropped with it and no longer loaded.
+            unsafe { frames.dealloc(f, 0) };
+        }
+    }
+}
 
 /// Copies a user program into fresh pages, maps it user-accessible (code
 /// read/execute, stack read/write) at slot `n`, and spawns a task that drops
@@ -718,14 +747,20 @@ fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> alloc
         core::ptr::write_bytes(code_pa.0 as *mut u8, 0, PAGE_SIZE);
         core::ptr::copy_nonoverlapping(start, code_pa.0 as *mut u8, len);
     }
-    let (code_va, stack_va) = (USER_BASE + n * 0x10000, USER_BASE + n * 0x10000 + 0x8000);
-    {
-        let mut pt = PT.lock();
-        let pt = pt.as_mut().unwrap();
-        pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().flush();
-        pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().flush();
+    // Tell this copy which process it is (the '?' in its message).
+    // SAFETY: the frame holds the program just copied.
+    let code = unsafe { core::slice::from_raw_parts_mut(code_pa.0 as *mut u8, len) };
+    if let Some(q) = code.iter().position(|&b| b == b'?') {
+        code[q] = b'0' + n as u8;
     }
-    TaskBuilder::new(name).cpu(cpu).spawn(move || {
+    let (code_va, stack_va) = (USER_BASE, USER_BASE + 0x8000);
+    let mut pt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).unwrap();
+    // SAFETY: the kernel table lives for the whole run.
+    unsafe { pt.share_root_entries(PT.lock().as_ref().unwrap(), 0..1) };
+    pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().ignore();
+    pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
+    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames: [code_pa, stack_pa] };
+    TaskBuilder::new(name).cpu(cpu).data(process).spawn(move || {
         // SAFETY: CpuTables are loaded, the switch hook keeps rsp[0] on this
         // task's kernel stack, and both pages are mapped user-accessible.
         unsafe { x86::enter_user(code_va, stack_va + PAGE_SIZE as u64) }
@@ -739,10 +774,14 @@ fn user_demo() {
     // CPU's GS base, which CPU 0 alone would not test.
     let cpu = 1 % ONLINE.load(Ordering::Acquire);
     println!("[user]  running 3 ring-3 programs on CPU {cpu}");
-    let tasks = [spawn_user("user-1", 0, hello, cpu), spawn_user("user-2", 1, hello, cpu), spawn_user("user-bad", 2, bad, cpu)];
+    let tasks = [spawn_user("user-1", 1, hello, cpu), spawn_user("user-2", 2, hello, cpu), spawn_user("user-bad", 3, bad, cpu)];
+    println!("[user]  each program has its own page table; all run at {USER_BASE:#x}");
     for t in tasks {
         t.join();
     }
+    // Exited tasks (and their address spaces) are freed after the next switch.
+    osmium::sched::yield_now();
+    println!("[user]  {} of 3 address spaces torn down with their tasks", PROCESSES_FREED.load(Ordering::Relaxed));
 }
 
 /// Handles `int 0x80` from ring 3.
@@ -768,8 +807,9 @@ fn syscall(frame: &mut TrapFrame) {
 
 fn user_readable(addr: u64, len: u64) -> bool {
     let Some(end) = addr.checked_add(len) else { return false };
-    let pt = PT.lock();
-    let pt = pt.as_ref().unwrap();
+    let task = osmium::sched::current();
+    let Some(process) = task.data::<Process>() else { return false };
+    let pt = process.pt.lock();
     (addr & !(PAGE_SIZE as u64 - 1)..end)
         .step_by(PAGE_SIZE)
         .all(|p| pt.translate(VirtAddr::new(p)).is_some_and(|t| t.flags.contains(MapFlags::USER)))

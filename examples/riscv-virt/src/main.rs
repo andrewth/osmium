@@ -40,7 +40,7 @@ use core::ptr::NonNull;
 
 use osmium::arch::trap::TrapCpu;
 use osmium::sched::{FifoScheduler, StackAllocator, TaskBuilder};
-use osmium::sync::Once;
+use osmium::sync::{IrqSpinLock, Once};
 
 core::arch::global_asm!(
     r#"
@@ -86,10 +86,10 @@ core::arch::global_asm!(
     .globl user_hello, user_hello_end, user_bad, user_bad_end
 user_hello:
     li s0, 3
-1:  li a7, 64               // write(1, msg, 17)
+1:  li a7, 64               // write(1, msg, 20)
     li a0, 1
     lla a1, 3f
-    li a2, 17
+    li a2, 20
     ecall
     li t0, 20000000         // busy-wait: only the timer can switch us out
 2:  addi t0, t0, -1
@@ -100,7 +100,7 @@ user_hello:
     li a0, 0
     ecall
     unimp
-3:  .ascii "hello from U-mode"
+3:  .ascii "hello from process ?"
 user_hello_end:
 
 user_bad:
@@ -189,6 +189,12 @@ unsafe impl StackAllocator for GuardedStacks {
 /// Tells the trap entry where the incoming task's stack ends, so a trap
 /// taken below it moves to the exception stack.
 fn on_switch(next: &osmium::sched::Task) {
+    // Each process runs on its own page table; kernel tasks on the kernel's.
+    let root = next.data::<Process>().map_or(SATP_ROOT.load(Ordering::Relaxed), |p| p.root.0);
+    if riscv64::read_satp() & ((1 << 44) - 1) != (root >> 12) as usize {
+        // SAFETY: both kinds of table map the kernel (shared root entries).
+        unsafe { riscv64::write_satp(SatpMode::Sv39, 0, root) };
+    }
     let cpu = TrapCpu::current();
     cpu.set_stack_limit(next.kernel_stack_range().map_or(0, |r| r.start));
     // Where traps from U-mode land while `next` runs user code.
@@ -505,9 +511,32 @@ fn overflow_demo() {
     println!("[guard] the other tasks keep running: {} free frames", FRAMES.lock().free_frames());
 }
 
-/// Where user programs are mapped: 64 GiB, inside Sv39's lower half and
-/// clear of RAM (0x8000_0000) and the PCIe windows (0x3000_0000-0x7fff_ffff).
+/// Where every user program is mapped, each in its own address space: 64 GiB
+/// (root entry 64), clear of RAM and the PCIe windows, which the kernel
+/// shares from root entries 0..64.
 const USER_BASE: u64 = 0x10_0000_0000;
+
+/// A user process: its own page table (sharing the kernel's root entries
+/// 0..64) and the frames it owns. Attached to its task; freed with it.
+struct Process {
+    root: PhysAddr,
+    pt: IrqSpinLock<PageTable<Sv39, &'static Frames>>,
+    frames: [PhysAddr; 2],
+}
+
+static PROCESSES_FREED: AtomicUsize = AtomicUsize::new(0);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        PROCESSES_FREED.fetch_add(1, Ordering::Relaxed);
+        let mut frames = FRAMES.lock();
+        for f in self.frames {
+            // SAFETY: the process's own frames; its page table, the only one
+            // mapping them, is dropped with it and no longer active.
+            unsafe { frames.dealloc(f, 0) };
+        }
+    }
+}
 
 /// Copies a user program into fresh pages, maps it user-accessible (code
 /// read/execute, stack read/write) at slot `n`, and spawns a task that drops
@@ -524,14 +553,20 @@ fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> alloc
         core::ptr::write_bytes(code_pa.0 as *mut u8, 0, PAGE_SIZE);
         core::ptr::copy_nonoverlapping(start, code_pa.0 as *mut u8, len);
     }
-    let (code_va, stack_va) = (USER_BASE + n * 0x10000, USER_BASE + n * 0x10000 + 0x8000);
-    {
-        let mut pt = PT.lock();
-        let pt = pt.as_mut().unwrap();
-        pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().flush();
-        pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().flush();
+    // Tell this copy which process it is (the '?' in its message).
+    // SAFETY: the frame holds the program just copied.
+    let code = unsafe { core::slice::from_raw_parts_mut(code_pa.0 as *mut u8, len) };
+    if let Some(q) = code.iter().position(|&b| b == b'?') {
+        code[q] = b'0' + n as u8;
     }
-    TaskBuilder::new(name).cpu(cpu).spawn(move || {
+    let (code_va, stack_va) = (USER_BASE, USER_BASE + 0x8000);
+    let mut pt: PageTable<Sv39, &'static Frames> = PageTable::new(&FRAMES).unwrap();
+    // SAFETY: the kernel table lives for the whole run.
+    unsafe { pt.share_root_entries(PT.lock().as_ref().unwrap(), 0..64) };
+    pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().ignore();
+    pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
+    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames: [code_pa, stack_pa] };
+    TaskBuilder::new(name).cpu(cpu).data(process).spawn(move || {
         // The code was written through the identity map, possibly by another
         // hart: make it visible to this hart's instruction fetch.
         // SAFETY: fence.i only synchronizes this hart's instruction stream.
@@ -550,14 +585,18 @@ fn user_demo() {
     // would only go unnoticed on CPU 0.
     let cpu = 1 % ONLINE.load(Ordering::Acquire);
     let tasks = [
-        spawn_user("user-1", 0, hello, cpu),
-        spawn_user("user-2", 1, hello, cpu),
-        spawn_user("user-bad", 2, bad, cpu),
+        spawn_user("user-1", 1, hello, cpu),
+        spawn_user("user-2", 2, hello, cpu),
+        spawn_user("user-bad", 3, bad, cpu),
     ];
     println!("[user]  running 3 U-mode programs on CPU {cpu}");
+    println!("[user]  each program has its own page table; all run at {USER_BASE:#x}");
     for t in tasks {
         t.join();
     }
+    // Exited tasks (and their address spaces) are freed after the next switch.
+    osmium::sched::yield_now();
+    println!("[user]  {} of 3 address spaces torn down with their tasks", PROCESSES_FREED.load(Ordering::Relaxed));
 }
 
 /// Handles `ecall` from U-mode.
@@ -589,8 +628,9 @@ fn syscall(frame: &mut TrapFrame) {
 
 fn user_readable(addr: u64, len: u64) -> bool {
     let Some(end) = addr.checked_add(len) else { return false };
-    let pt = PT.lock();
-    let pt = pt.as_ref().unwrap();
+    let task = osmium::sched::current();
+    let Some(process) = task.data::<Process>() else { return false };
+    let pt = process.pt.lock();
     (addr & !(PAGE_SIZE as u64 - 1)..end)
         .step_by(PAGE_SIZE)
         .all(|p| pt.translate(VirtAddr::new(p)).is_some_and(|t| t.flags.contains(MapFlags::USER)))

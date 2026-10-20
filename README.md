@@ -94,9 +94,10 @@ features.
 
 ## Current limitations
 
-- User mode works on all three architectures (the examples run the same
-  user programs with system calls); there are no per-process address
-  spaces yet, so user programs share the kernel's page table. Kernel stack overflows are caught on all three
+- User mode works on all three architectures: the examples run the same
+  user programs, each in its own address space (sharing the kernel's root
+  page-table entries), with system calls. There is no ELF loader, file
+  system or process API yet; the examples hand-roll those parts. Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. The scheduler does no load balancing; tasks move only
