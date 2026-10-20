@@ -8,6 +8,7 @@ license = "GPL-2.0-only"
 
 [dependencies]
 osmium = { path = "../../crates/osmium", features = ["full"] }
+demos = { path = "../demos" }
 
 [profile.dev]
 panic = "abort"

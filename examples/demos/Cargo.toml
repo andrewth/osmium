@@ -1,0 +1,10 @@
+[package]
+name = "demos"
+description = "Architecture-independent scheduler demos shared by the example kernels"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-2.0-only"
+
+[dependencies]
+osmium = { path = "../../crates/osmium", features = ["full"] }

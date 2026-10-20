@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "demos"
+version = "0.1.0"
+dependencies = [
+ "osmium",
+]
+
+[[package]]
 name = "osmium"
 version = "0.1.0"
 dependencies = [
@@ -79,5 +86,6 @@ dependencies = [
 name = "riscv-virt"
 version = "0.1.0"
 dependencies = [
+ "demos",
  "osmium",
 ]

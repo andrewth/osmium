@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["examples/riscv-virt"]
+exclude = ["examples/riscv-virt", "examples/aarch64-virt", "examples/demos"]
 
 [workspace.package]
 version = "0.1.0"

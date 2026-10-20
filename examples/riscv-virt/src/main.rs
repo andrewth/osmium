@@ -28,7 +28,7 @@ use osmium::mm::paging::formats::Sv39;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sched::timer::TimerQueue;
-use osmium::sched::{FifoScheduler, Mutex, TaskBuilder};
+use osmium::sched::FifoScheduler;
 use osmium::sync::Once;
 
 core::arch::global_asm!(
@@ -196,76 +196,11 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     irq::enable();
     println!("[sched] FIFO scheduler, {} ms tick", TICK_NS / 1_000_000);
 
-    cooperative_demo();
-    mutex_demo();
-    preemption_demo();
-    sleep_demo();
+    demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });
     fault_demo();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     sbi::shutdown()
-}
-
-fn cooperative_demo() {
-    let tasks: Vec<_> = ["A", "B", "C"]
-        .into_iter()
-        .map(|name| {
-            TaskBuilder::new(name).spawn(move || {
-                for i in 0..2 {
-                    println!("[task]  {name}{i}");
-                    osmium::sched::yield_now();
-                }
-            })
-        })
-        .collect();
-    for t in tasks {
-        t.join();
-    }
-}
-
-fn mutex_demo() {
-    static COUNTER: Mutex<u64> = Mutex::new(0);
-    let tasks: Vec<_> = (0..4)
-        .map(|_| {
-            TaskBuilder::new("adder").spawn(|| {
-                for _ in 0..1000 {
-                    let mut g = COUNTER.lock();
-                    let v = *g;
-                    osmium::sched::yield_now();
-                    *g = v + 1;
-                }
-            })
-        })
-        .collect();
-    for t in tasks {
-        t.join();
-    }
-    println!("[mutex] 4 tasks x 1000 increments across yields = {}", *COUNTER.lock());
-}
-
-fn preemption_demo() {
-    static FLAG: AtomicBool = AtomicBool::new(false);
-    let start = TICKS.load(Ordering::Relaxed);
-    // `spinner` never yields. On one CPU, `setter` can only run if the timer
-    // interrupt preempts it.
-    let spinner = TaskBuilder::new("spinner").spawn(|| {
-        while !FLAG.load(Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
-    });
-    let setter = TaskBuilder::new("setter").spawn(|| FLAG.store(true, Ordering::Release));
-    spinner.join();
-    setter.join();
-    println!("[preempt] busy-looping task was preempted after {} ticks", TICKS.load(Ordering::Relaxed) - start);
-}
-
-fn sleep_demo() {
-    let t = TaskBuilder::new("sleeper").spawn(|| {
-        let t0 = now_ns();
-        TIMERS.sleep_until(t0 + 50_000_000);
-        println!("[timer] slept {} ms (asked for 50)", (now_ns() - t0) / 1_000_000);
-    });
-    t.join();
 }
 
 /// The last synchronous trap that `on_trap` recovered from.
