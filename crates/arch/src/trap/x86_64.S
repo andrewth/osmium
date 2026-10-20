@@ -1013,6 +1013,7 @@ osmium_trap_stub_255:
     push 0
     push 255
     jmp osmium_trap_common
+.globl osmium_trap_common
 osmium_trap_common:
     // Slots for cr2 (filled in Rust) and padding keep the frame 16-byte aligned.
     sub rsp, 16
