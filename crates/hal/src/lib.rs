@@ -8,8 +8,13 @@
 //! - [`mmio`]: register cells for `#[repr(C)]` register blocks, and the
 //!   bounds-checked [`mmio::IoMem`] window.
 //! - [`port`]: typed x86 I/O ports.
-//! - [`serial`], [`irq`], [`timer`], [`block`]: device-class traits that
-//!   drivers implement and kernels consume.
+//! - [`serial`], [`irq`], [`timer`], [`block`], [`net`]: device-class traits
+//!   that drivers implement and kernels consume.
+//! - [`usb`]: USB descriptors and requests, the [`usb::UsbHost`]
+//!   host-controller trait and device enumeration.
+//! - [`pci`]: configuration space (ECAM), enumeration, BARs, capabilities.
+//! - [`virtio`]: virtio register, feature and ring-layout definitions shared
+//!   by drivers and device models.
 //! - [`irq::IrqTable`]: maps interrupt numbers to handlers.
 //! - [`console`]: a swappable global console behind `print!`/`println!`.
 //! - [`dma`]: DMA buffer descriptors.
@@ -23,7 +28,11 @@ pub mod console;
 pub mod dma;
 pub mod irq;
 pub mod mmio;
+pub mod net;
+pub mod pci;
 #[cfg(target_arch = "x86_64")]
 pub mod port;
 pub mod serial;
 pub mod timer;
+pub mod usb;
+pub mod virtio;

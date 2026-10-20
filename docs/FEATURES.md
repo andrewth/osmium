@@ -98,6 +98,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ MMU control: activate a root table, flush one page, flush all
 - ✅ x86_64: port I/O, MSRs, CR3, CPUID; AArch64: system registers, `MAIR` constant; RISC-V: `satp`, CSRs
 - ✅ Host simulation backend
+- ✅ DMA memory barriers (`dma_wmb`, `dma_rmb`, `mb`)
 - ✅ Trap entry (RISC-V S/M-mode, AArch64 EL1/EL2): full `TrapFrame`, registered handler, portable `Trap` cause decoding
 - ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
 - ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction), per-CPU GDT/TSS (`CpuTables`) with IST stacks (`trap::set_ist`)
@@ -129,8 +130,12 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Device-class traits: `SerialPort`, `InterruptController`, `Clock`/`OneShotTimer`, `BlockDevice`
 - ✅ IRQ dispatch table: register handlers by number, dispatch from the trap path
 - ✅ Global console with `print!`/`println!` that can be swapped at runtime
-- ✅ DMA buffer descriptor (`DmaBuffer` with CPU and device addresses)
-- 🗺 Async variants of device traits, PCI(e) enumeration, ACPI tables
+- ✅ DMA buffer descriptor (`DmaBuffer` with CPU and device addresses), self-freeing `OwnedDma`, and a `DmaAllocator` over any `LockedFrames`
+- ✅ `NetDevice` trait and `MacAddress`
+- ✅ PCI: `ConfigAccess` over ECAM or x86 port I/O, brute-force enumeration, BAR probing and assignment (`BarAllocator`), capability lists
+- ✅ USB: setup packets, standard descriptor parsing, the `UsbHost` host-controller trait, and generic device enumeration
+- ✅ virtio constants and split-ring layout shared by drivers and device models
+- 🗺 Async variants of device traits, PCI bridge walking, MSI/MSI-X
 
 ### `osmium-drivers`: reference drivers
 - ✅ NS16550A UART (port I/O and MMIO backends)
@@ -141,7 +146,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Intel 8254 PIT (calibration delays)
 - ✅ x86 I/O APIC (GSI routing, polarity/trigger, masking); the x86_64 example routes COM1's receive interrupt through it into an `SpscRing`
 - ✅ RAM disk `BlockDevice`
-- 🗺 virtio (MMIO/PCI): blk, net, console; GICv3; IO-APIC; HPET; NVMe
+- ✅ virtio-mmio transport (legacy and 1.x), split virtqueue, virtio-net `NetDevice`
+- 🗺 virtio-pci transport; virtio blk, console; xHCI USB host controller and class drivers (HID, mass storage, CDC-ECM); GICv3; IO-APIC; HPET; NVMe
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)

@@ -12,4 +12,5 @@ workspace = true
 [dependencies]
 osmium-arch.workspace = true
 osmium-hal.workspace = true
+osmium-mm.workspace = true
 osmium-sync.workspace = true

@@ -19,6 +19,9 @@ use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::Fdt;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
+use osmium::drivers::virtio::mmio::MmioTransport;
+use osmium::drivers::virtio::net::VirtioNet;
+use osmium::drivers::virtio::{DeviceType, Transport};
 use osmium::hal::console::{Console, SerialConsole, set_console};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
@@ -171,6 +174,13 @@ struct SecondaryBoot {
 /// Timer interrupt period.
 const TICK_NS: u64 = 10_000_000;
 
+/// Base and size of every virtio-mmio slot in the device tree.
+fn virtio_slots<'a>(fdt: &Fdt<'a>) -> impl Iterator<Item = (u64, u64)> + 'a {
+    fdt.all_nodes()
+        .filter(|n| n.compatible().any(|c| c == "virtio,mmio"))
+        .filter_map(|n| n.reg().next().map(|(a, s)| (a, s.unwrap_or(0x200))))
+}
+
 fn now_ns() -> u64 {
     RATE.get().unwrap().ticks_to_ns(cpu::ticks())
 }
@@ -251,6 +261,10 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).unwrap();
     let uart_page = uart_base & !(PAGE_SIZE as u64 - 1);
     pt.map_range(va(uart_page), pa(uart_page), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
+    for (base, _) in virtio_slots(&fdt) {
+        let page = base & !(PAGE_SIZE as u64 - 1);
+        pt.map_range(va(page), pa(page), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
+    }
     // SAFETY: the table identity-maps the running code, its stack, the heap and the UART.
     unsafe { riscv64::write_satp(SatpMode::Sv39, 0, pt.root().0) };
     SATP_ROOT.store(pt.root().0, Ordering::Release);
@@ -300,6 +314,23 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         core::hint::spin_loop();
     }
     println!("[smp]   {ncpus} CPUs online");
+
+    // --- virtio-net ----------------------------------------------------------
+    let net = virtio_slots(&fdt).find_map(|(base, len)| {
+        // SAFETY: the device tree puts a virtio-mmio slot here, mapped above;
+        // nothing else uses it.
+        let t = MmioTransport::new(unsafe { IoMem::new(base as *mut u8, len as usize) }).ok()?;
+        (t.device_type() == DeviceType::Net).then_some((base, t))
+    });
+    match net {
+        Some((base, t)) => {
+            let legacy = if t.is_legacy() { "legacy" } else { "1.x" };
+            let mut net = VirtioNet::new(t, &FRAMES).expect("virtio-net init failed");
+            println!("[net]   virtio-net ({legacy}) at {base:#x}");
+            demos::arp(&mut net, now_ns);
+        }
+        None => println!("[net]   no virtio-net device"),
+    }
 
     demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });
     if ncpus > 1 {
