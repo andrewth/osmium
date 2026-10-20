@@ -256,9 +256,10 @@ extern "C" fn kmain(start_info: usize) -> ! {
     );
 
     // --- CPUs from the ACPI MADT (read while the boot tables map it) ---------
-    let my_apic = x86::cpuid(1, 0).ebx >> 24;
-    APIC_IDS[0].store(my_apic, Ordering::Relaxed);
-    let mut ncpus = 1;
+    // Every enabled CPU's APIC id; the boot CPU's own id comes later from
+    // its local APIC's ID register (not CPUID, which a hypervisor may not
+    // virtualize).
+    let mut madt_ids = [None; MAX_CPUS];
     if let Some(rsdp) = info.rsdp() {
         // SAFETY: the boot tables identity-map the first 4 GiB, where QEMU's
         // ACPI tables live; they are only read here.
@@ -270,12 +271,12 @@ extern "C" fn kmain(start_info: usize) -> ! {
             let (gsi, active_low, level) = m.isa_irq(COM1_IRQ);
             IOAPIC_INFO.call_once(|| (io.addr, io.gsi_base, gsi, osmium::drivers::ioapic::LineMode { active_low, level }));
         }
-        for c in madt.iter().flat_map(|m| m.local_apics()).filter(|c| c.enabled && c.apic_id != my_apic) {
-            APIC_IDS[ncpus].store(c.apic_id, Ordering::Relaxed);
-            ncpus += 1;
+        let enabled = madt.iter().flat_map(|m| m.local_apics()).filter(|c| c.enabled);
+        for (slot, c) in madt_ids.iter_mut().zip(enabled) {
+            *slot = Some(c.apic_id);
         }
     }
-    println!("[acpi]  MADT lists {ncpus} enabled CPUs; this one is APIC id {my_apic}");
+    println!("[acpi]  MADT lists {} enabled CPUs", madt_ids.iter().flatten().count());
 
     // --- Physical memory ---------------------------------------------------
     // SAFETY: linker-provided symbols.
@@ -349,6 +350,14 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: the local APIC's default address, mapped uncached above.
     let apic = LAPIC.call_once(|| LocalApic::new(unsafe { IoMem::new(lapic::DEFAULT_BASE as *mut u8, PAGE_SIZE) }));
     apic.enable(SPURIOUS_VECTOR);
+    // CPU 0 is this one; the others are started below in MADT order.
+    let my_apic = apic.id();
+    APIC_IDS[0].store(my_apic, Ordering::Relaxed);
+    let mut ncpus = 1;
+    for id in madt_ids.into_iter().flatten().filter(|&id| id != my_apic) {
+        APIC_IDS[ncpus].store(id, Ordering::Relaxed);
+        ncpus += 1;
+    }
     apic.start_timer(TIMER_VECTOR, u32::MAX, false);
     let apic_hz = pit.calibrate(10_000_000, || u32::MAX as u64 - apic.timer_remaining() as u64);
     apic.stop_timer();
