@@ -65,12 +65,14 @@ vmx_guest:
     jz 5f
     mov %al, (%ebx)                 // EPT violation -> MMIO write
     jmp 4b
-5:  movzbl 5(%ebx), %ecx            // EPT violation -> MMIO read: LSR
+5:  movzbl 5(%ebx), %ebx            // EPT violation -> MMIO read: LSR
+    push %ebx                       // cpuid clobbers ebx
     xor %eax, %eax
     cpuid                           // CPUID exit; VMX must be hidden
     mov $1, %eax
     cpuid
     mov %ecx, %ebp
+    pop %ebx
     mov $0xc0000102, %ecx           // IA32_KERNEL_GS_BASE round trip
     mov $0x12345678, %eax
     xor %edx, %edx
