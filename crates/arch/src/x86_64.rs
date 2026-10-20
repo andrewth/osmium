@@ -394,3 +394,34 @@ pub unsafe fn enter_user(entry: u64, stack_top: u64) -> ! {
         )
     }
 }
+
+/// Returns to ring 3 with every register taken from `frame`, as if
+/// returning from the trap that saved it: how a forked child resumes where
+/// its parent made the system call. `frame.cs` and `frame.ss` must be ring-3
+/// selectors, as in any frame saved on a trap from ring 3 (the `syscall`
+/// stub builds the same frame). Does not return.
+///
+/// # Safety
+/// As for [`enter_user`]; `frame.rip` and `frame.rsp` must be valid user
+/// addresses in the active address space.
+#[cfg(bare)]
+pub unsafe fn resume_user(frame: &crate::trap::TrapFrame) -> ! {
+    debug_assert!(frame.cs & 3 == 3 && frame.ss & 3 == 3, "resume_user needs a ring-3 frame");
+    // SAFETY: the caller upholds the contract. With interrupts disabled, the
+    // return path pops the frame and iretq leaves on the user stack, so the
+    // frame may sit on this stack, which nothing uses again: the next trap
+    // from ring 3 starts at the TSS's `rsp[0]`. The kernel never runs on the
+    // user GS base (only the syscall stub swaps it, briefly), so no swapgs.
+    unsafe {
+        asm!(
+            "cli",
+            "mov ds, {ds:x}",
+            "mov es, {ds:x}",
+            "mov rsp, {frame}",
+            "jmp osmium_trap_return",
+            ds = in(reg) selectors::USER_DATA as u64,
+            frame = in(reg) frame,
+            options(noreturn),
+        )
+    }
+}

@@ -663,7 +663,52 @@ fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> (Arc<Task>, Weak<P
     (task, Arc::downgrade(&process))
 }
 
+/// The Rust program that forks and execs, from `examples/user/init.rs`.
+static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
+
+/// What `fork` and `execve` need: spaces like `new_space`'s, and a stack
+/// and `mmap` area where `spawn_elf` puts them.
+fn platform() -> osmium::proc::Platform {
+    osmium::proc::Platform {
+        new_memory: || {
+            // SAFETY: the kernel table lives for the whole run.
+            let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().unwrap(), 0..1) };
+            Ok(alloc::boxed::Box::new(space.map_err(|_| osmium::fs::Errno::ENOMEM)?))
+        },
+        // SAFETY: the table shares the kernel's root entry 0. Instruction
+        // fetch is coherent with stores on x86, so nothing else is needed.
+        activate: |root| unsafe { x86::write_cr3(root.0) },
+        // SAFETY: the child's task is running with its table active (the
+        // switch hook), and the frame is its parent's from a system call.
+        resume: |frame| unsafe { x86::resume_user(&frame) },
+        stack_top: 0xff_0000_0000,
+        stack_size: 64 * 1024,
+        mmap_area: 0xa0_0000_0000..0xa1_0000_0000,
+    }
+}
+
+/// Runs `/bin/init`, which forks, execs and waits, on `cpu`; its children
+/// go wherever the scheduler puts them.
+fn fork_exec_demo(cpu: usize) {
+    demos::user::install("init", INIT_ELF);
+    let process = Process::new_boxed("init", (platform().new_memory)().unwrap(), 0);
+    let init = Arc::downgrade(&process);
+    let task = process.spawn(TaskBuilder::new("init").cpu(cpu), || {
+        let entry = osmium::proc::current().unwrap().exec("/bin/init", &[b"init"], &[]).expect("exec /bin/init");
+        // SAFETY: exec activated the new table; CpuTables are loaded and the
+        // switch hook keeps rsp[0] on this task's kernel stack.
+        unsafe { x86::enter_user(entry.pc, entry.sp) }
+    });
+    drop(process);
+    task.join();
+    // The task holds the process: let it go too.
+    drop(task);
+    let freed = demos::user::freed(&[init]);
+    println!("[user]  init and its children reaped; {freed} of 1 init address space torn down");
+}
+
 fn user_demo() {
+    osmium::proc::set_platform(platform());
     // SAFETY: linker symbols delimiting the user programs.
     let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
     // On another CPU: the syscall stub finds its kernel stack through that
@@ -686,6 +731,7 @@ fn user_demo() {
     // switched away from them.
     let freed = demos::user::freed(&processes);
     println!("[user]  {freed} of 4 address spaces torn down with their tasks");
+    fork_exec_demo(cpu);
 }
 
 /// Handles `syscall` and `int 0x80` from ring 3.

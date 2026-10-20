@@ -120,7 +120,7 @@ pub unsafe fn enter_user(entry: u64, user_sp: u64, kernel_sp: u64) -> ! {
 #[cfg(all(bare, not(feature = "aarch64-el2")))]
 pub unsafe fn resume_user(frame: &crate::trap::TrapFrame, kernel_sp: u64) -> ! {
     const SIZE: usize = core::mem::size_of::<crate::trap::TrapFrame>();
-    debug_assert!(frame.spsr & 0xf == 0, "resume_user needs an EL0t frame");
+    debug_assert!(frame.spsr & 0x1f == 0, "resume_user needs an AArch64 EL0t frame");
     debug_assert!(kernel_sp.is_multiple_of(16));
     // SAFETY: the caller upholds the contract. With IRQs masked, the frame
     // is copied to the top of the kernel stack highest pair first: a source

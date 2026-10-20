@@ -1034,6 +1034,10 @@ osmium_trap_common:
     mov rdi, rsp
     cld
     call osmium_trap_dispatch
+    // The return path, also entered by `x86_64::resume_user` with rsp at a
+    // frame and interrupts disabled.
+.globl osmium_trap_return
+osmium_trap_return:
     pop r15
     pop r14
     pop r13
