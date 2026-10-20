@@ -14,6 +14,7 @@
 //! | [`virtio::net::VirtioNet`] | virtio network card (MMIO, legacy and 1.x) | `NetDevice` |
 //! | [`xhci::Xhci`] | xHCI USB host controller | `UsbHost` |
 //! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet (PCI, polled) | `NetDevice` per port |
+//! | [`nvme::Nvme`] | NVM Express SSD (PCI, polled) | `BlockDevice` |
 //! | [`usb::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
 //! | [`usb::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
 //! | [`usb::ecm::UsbEthernet`] | USB Ethernet (CDC-ECM) on any `UsbHost` | `NetDevice` |
@@ -31,6 +32,7 @@ pub mod gicv2;
 pub mod ioapic;
 pub mod lapic;
 pub mod mlx4;
+pub mod nvme;
 pub mod pit;
 pub mod pl011;
 pub mod plic;
