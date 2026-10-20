@@ -203,7 +203,7 @@ fn set_exception_stack() {
 static UART: Once<SerialConsole<Pl011>> = Once::new();
 static GIC: Once<GicV2> = Once::new();
 static IRQS: IrqTable<256> = IrqTable::new();
-static SCHED: FifoScheduler = FifoScheduler::new(2);
+static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
 static TIMERS: TimerQueue = TimerQueue::new();
 static RATE: Once<TickRate> = Once::new();
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -371,6 +371,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });
     if ncpus > 1 {
         demos::smp(ncpus);
+        demos::balance(ncpus, &|| SCHED.steals());
     }
     fault_demo();
     overflow_demo();
