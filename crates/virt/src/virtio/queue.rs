@@ -5,10 +5,7 @@ use core::sync::atomic::{Ordering, fence};
 
 use crate::memory::{GuestMemory, GuestPhysAddr, OutOfBounds};
 
-const DESC_F_NEXT: u16 = 1;
-const DESC_F_WRITE: u16 = 2;
-const DESC_F_INDIRECT: u16 = 4;
-const AVAIL_F_NO_INTERRUPT: u16 = 1;
+use osmium_hal::virtio::queue::{AVAIL_F_NO_INTERRUPT, DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, DESC_SIZE, avail_entry, used_entry};
 
 /// Why a descriptor chain could not be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,7 +157,7 @@ impl SplitQueue {
         let slot = self.last_avail % self.size;
         self.last_avail = self.last_avail.wrapping_add(1);
         Some(
-            mem.read_obj::<u16>(GuestPhysAddr(self.avail.0 + 4 + 2 * slot as u64))
+            mem.read_obj::<u16>(GuestPhysAddr(self.avail.0 + avail_entry(slot) as u64))
                 .map_err(QueueError::from)
                 .and_then(|head| self.chain(mem, head)),
         )
@@ -176,7 +173,7 @@ impl SplitQueue {
             if descs.len() == self.size as usize {
                 return Err(QueueError::Loop);
             }
-            let raw = mem.read_obj::<[u8; 16]>(GuestPhysAddr(self.desc.0 + 16 * i as u64))?;
+            let raw = mem.read_obj::<[u8; DESC_SIZE]>(GuestPhysAddr(self.desc.0 + (DESC_SIZE * i as usize) as u64))?;
             let addr = u64::from_le_bytes(raw[0..8].try_into().unwrap());
             let len = u32::from_le_bytes(raw[8..12].try_into().unwrap());
             let flags = u16::from_le_bytes([raw[12], raw[13]]);
@@ -195,9 +192,9 @@ impl SplitQueue {
     /// Returns chain `head` to the driver, recording that the device wrote
     /// `len` bytes into it. Returns true if the driver wants an interrupt.
     pub fn add_used(&mut self, mem: &GuestMemory, head: u16, len: u32) -> Result<bool, QueueError> {
-        let slot = (self.next_used % self.size) as u64;
+        let slot = self.next_used % self.size;
         let elem = (head as u64) | (len as u64) << 32;
-        mem.write_obj(GuestPhysAddr(self.used.0 + 4 + 8 * slot), elem.to_le())?;
+        mem.write_obj(GuestPhysAddr(self.used.0 + used_entry(slot) as u64), elem.to_le())?;
         self.next_used = self.next_used.wrapping_add(1);
         // Publish the element before the index that exposes it.
         fence(Ordering::Release);

@@ -15,25 +15,7 @@ pub use console::VirtioConsole;
 pub use mmio::{DeviceCtx, MMIO_SIZE, VirtioMmio};
 pub use queue::{Desc, DescChain, QueueError, SplitQueue};
 
-/// The device conforms to virtio 1.x (always offered by the transport).
-pub const F_VERSION_1: u64 = 1 << 32;
-
-const INT_USED_BUFFER: u32 = 1;
-const INT_CONFIG: u32 = 2;
-
-/// Device status bits (virtio 1.x §2.1).
-pub mod status {
-    /// The guest noticed the device.
-    pub const ACKNOWLEDGE: u32 = 1;
-    /// The guest has a driver for it.
-    pub const DRIVER: u32 = 2;
-    /// The driver is ready.
-    pub const DRIVER_OK: u32 = 4;
-    /// Feature negotiation is complete.
-    pub const FEATURES_OK: u32 = 8;
-    /// The driver gave up on the device.
-    pub const FAILED: u32 = 128;
-}
+pub use osmium_hal::virtio::{device_id, feature, status};
 
 /// A virtio device model, independent of the transport.
 pub trait VirtioDevice: Send {
@@ -41,7 +23,7 @@ pub trait VirtioDevice: Send {
     fn device_id(&self) -> u32;
 
     /// Device-specific feature bits offered to the driver. The transport
-    /// adds [`F_VERSION_1`].
+    /// adds [`feature::VERSION_1`].
     fn features(&self) -> u64 {
         0
     }

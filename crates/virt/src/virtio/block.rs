@@ -110,7 +110,7 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
 
 impl<B: BlockDevice + Send> VirtioDevice for VirtioBlock<B> {
     fn device_id(&self) -> u32 {
-        2
+        super::device_id::BLOCK
     }
 
     fn features(&self) -> u64 {

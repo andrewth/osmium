@@ -7,37 +7,14 @@ use alloc::vec::Vec;
 use osmium_sync::IrqSpinLock;
 
 use super::queue::{DescChain, QueueError, SplitQueue};
-use super::{F_VERSION_1, INT_CONFIG, INT_USED_BUFFER, VirtioDevice, status};
+use osmium_hal::virtio::feature::VERSION_1;
+use osmium_hal::virtio::mmio::*;
+use osmium_hal::virtio::status;
+
+use super::VirtioDevice;
 use crate::bus::BusDevice;
 use crate::memory::{GuestMemory, GuestPhysAddr};
 
-// TODO: switch to the shared constants in osmium_hal::virtio once they land.
-const MAGIC_VALUE: u64 = 0x000;
-const VERSION: u64 = 0x004;
-const DEVICE_ID: u64 = 0x008;
-const VENDOR_ID: u64 = 0x00c;
-const DEVICE_FEATURES: u64 = 0x010;
-const DEVICE_FEATURES_SEL: u64 = 0x014;
-const DRIVER_FEATURES: u64 = 0x020;
-const DRIVER_FEATURES_SEL: u64 = 0x024;
-const QUEUE_SEL: u64 = 0x030;
-const QUEUE_NUM_MAX: u64 = 0x034;
-const QUEUE_NUM: u64 = 0x038;
-const QUEUE_READY: u64 = 0x044;
-const QUEUE_NOTIFY: u64 = 0x050;
-const INTERRUPT_STATUS: u64 = 0x060;
-const INTERRUPT_ACK: u64 = 0x064;
-const STATUS: u64 = 0x070;
-const QUEUE_DESC_LOW: u64 = 0x080;
-const QUEUE_DESC_HIGH: u64 = 0x084;
-const QUEUE_DRIVER_LOW: u64 = 0x090;
-const QUEUE_DRIVER_HIGH: u64 = 0x094;
-const QUEUE_DEVICE_LOW: u64 = 0x0a0;
-const QUEUE_DEVICE_HIGH: u64 = 0x0a4;
-const CONFIG_GENERATION: u64 = 0x0fc;
-const CONFIG: u64 = 0x100;
-
-const MAGIC: u32 = 0x7472_6976;
 /// Vendor ID reported to the guest ("OSMI").
 const VENDOR: u32 = 0x494d_534f;
 
@@ -128,7 +105,7 @@ impl<D: VirtioDevice> VirtioMmio<D> {
         let mut ctx = DeviceCtx { queues: &mut s.queues, mem: &self.mem, interrupt: false };
         let r = f(&mut s.device, &mut ctx);
         if ctx.interrupt {
-            self.raise(s, INT_USED_BUFFER);
+            self.raise(s, USED_BUFFER);
         }
         r
     }
@@ -137,7 +114,7 @@ impl<D: VirtioDevice> VirtioMmio<D> {
     pub fn config_changed(&self) {
         let mut s = self.inner.lock();
         s.config_generation = s.config_generation.wrapping_add(1);
-        self.raise(&mut s, INT_CONFIG);
+        self.raise(&mut s, CONFIG_CHANGE);
     }
 
     /// Whether the interrupt line is asserted.
@@ -170,13 +147,13 @@ impl<D: VirtioDevice> VirtioMmio<D> {
 
     fn read_reg(&self, s: &mut Inner<D>, offset: u64) -> u32 {
         let q = s.queues.get(s.queue_sel as usize);
-        match offset {
+        match offset as usize {
             MAGIC_VALUE => MAGIC,
-            VERSION => 2,
+            VERSION => VERSION_MODERN,
             DEVICE_ID => s.device.device_id(),
             VENDOR_ID => VENDOR,
             DEVICE_FEATURES => {
-                let f = s.device.features() | F_VERSION_1;
+                let f = s.device.features() | VERSION_1;
                 match s.device_features_sel {
                     0 => f as u32,
                     1 => (f >> 32) as u32,
@@ -198,10 +175,10 @@ impl<D: VirtioDevice> VirtioMmio<D> {
         let q = s.queues.get_mut(sel);
         let set_lo = |a: &mut GuestPhysAddr| a.0 = a.0 & !0xffff_ffff | v as u64;
         let set_hi = |a: &mut GuestPhysAddr| a.0 = a.0 & 0xffff_ffff | (v as u64) << 32;
-        match (offset, q) {
+        match (offset as usize, q) {
             (DEVICE_FEATURES_SEL, _) => s.device_features_sel = v,
             (DRIVER_FEATURES_SEL, _) => s.driver_features_sel = v,
-            (DRIVER_FEATURES, _) if s.status & status::FEATURES_OK == 0 => {
+            (DRIVER_FEATURES, _) if s.status & u32::from(status::FEATURES_OK) == 0 => {
                 let shift = match s.driver_features_sel {
                     0 => 0,
                     1 => 32,
@@ -218,11 +195,11 @@ impl<D: VirtioDevice> VirtioMmio<D> {
             (QUEUE_DRIVER_HIGH, Some(q)) if !q.ready => set_hi(&mut q.avail),
             (QUEUE_DEVICE_LOW, Some(q)) if !q.ready => set_lo(&mut q.used),
             (QUEUE_DEVICE_HIGH, Some(q)) if !q.ready => set_hi(&mut q.used),
-            (QUEUE_NOTIFY, _) if s.status & status::DRIVER_OK != 0 => {
+            (QUEUE_NOTIFY, _) if s.status & u32::from(status::DRIVER_OK) != 0 => {
                 let mut ctx = DeviceCtx { queues: &mut s.queues, mem: &self.mem, interrupt: false };
                 s.device.notify(v as usize, &mut ctx);
                 if ctx.interrupt {
-                    self.raise(s, INT_USED_BUFFER);
+                    self.raise(s, USED_BUFFER);
                 }
             }
             (INTERRUPT_ACK, _) => {
@@ -235,13 +212,13 @@ impl<D: VirtioDevice> VirtioMmio<D> {
             (STATUS, _) if v == 0 => self.reset(s),
             (STATUS, _) => {
                 let mut v = v;
-                if v & status::FEATURES_OK != 0 && s.status & status::FEATURES_OK == 0 {
-                    let offered = s.device.features() | F_VERSION_1;
-                    let ok = s.driver_features & !offered == 0 && s.driver_features & F_VERSION_1 != 0;
+                if v & u32::from(status::FEATURES_OK) != 0 && s.status & u32::from(status::FEATURES_OK) == 0 {
+                    let offered = s.device.features() | VERSION_1;
+                    let ok = s.driver_features & !offered == 0 && s.driver_features & VERSION_1 != 0;
                     if ok {
                         s.device.ack_features(s.driver_features);
                     } else {
-                        v &= !status::FEATURES_OK;
+                        v &= !u32::from(status::FEATURES_OK);
                     }
                 }
                 s.status = v;
@@ -254,8 +231,8 @@ impl<D: VirtioDevice> VirtioMmio<D> {
 impl<D: VirtioDevice> BusDevice for VirtioMmio<D> {
     fn read(&self, offset: u64, data: &mut [u8]) {
         let mut s = self.inner.lock();
-        if offset >= CONFIG {
-            s.device.read_config(offset - CONFIG, data);
+        if offset >= CONFIG as u64 {
+            s.device.read_config(offset - CONFIG as u64, data);
             return;
         }
         let v = self.read_reg(&mut s, offset & !3);
@@ -268,8 +245,8 @@ impl<D: VirtioDevice> BusDevice for VirtioMmio<D> {
 
     fn write(&self, offset: u64, data: &[u8]) {
         let mut s = self.inner.lock();
-        if offset >= CONFIG {
-            s.device.write_config(offset - CONFIG, data);
+        if offset >= CONFIG as u64 {
+            s.device.write_config(offset - CONFIG as u64, data);
             return;
         }
         // Registers take aligned 32-bit writes only.
@@ -288,13 +265,13 @@ pub(crate) mod tests {
 
     /// Drives the transport like a guest driver would, up to DRIVER_OK.
     pub(crate) fn bring_up<D: VirtioDevice>(dev: &VirtioMmio<D>, queues: &[(u32, u64)]) {
-        let w = |off, v: u32| dev.write(off, &v.to_le_bytes());
+        let w = |off: usize, v: u32| dev.write(off as u64, &v.to_le_bytes());
         w(STATUS, 0);
-        w(STATUS, status::ACKNOWLEDGE | status::DRIVER);
+        w(STATUS, u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER));
         w(DRIVER_FEATURES_SEL, 1);
         w(DRIVER_FEATURES, 1);
-        w(STATUS, status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK);
-        assert_ne!(rd(dev, STATUS) & status::FEATURES_OK, 0);
+        w(STATUS, u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER) | u32::from(status::FEATURES_OK));
+        assert_ne!(rd(dev, STATUS) & u32::from(status::FEATURES_OK), 0);
         for &(q, base) in queues {
             w(QUEUE_SEL, q);
             w(QUEUE_NUM, 8);
@@ -303,22 +280,22 @@ pub(crate) mod tests {
             w(QUEUE_DEVICE_LOW, (base + USED) as u32);
             w(QUEUE_READY, 1);
         }
-        w(STATUS, status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK);
+        w(STATUS, u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER) | u32::from(status::FEATURES_OK) | u32::from(status::DRIVER_OK));
     }
 
-    pub(crate) fn rd<D: VirtioDevice>(dev: &VirtioMmio<D>, off: u64) -> u32 {
+    pub(crate) fn rd<D: VirtioDevice>(dev: &VirtioMmio<D>, off: usize) -> u32 {
         let mut b = [0u8; 4];
-        dev.read(off, &mut b);
+        dev.read(off as u64, &mut b);
         u32::from_le_bytes(b)
     }
 
     pub(crate) fn notify<D: VirtioDevice>(dev: &VirtioMmio<D>, q: u32) {
-        dev.write(QUEUE_NOTIFY, &q.to_le_bytes());
+        dev.write(QUEUE_NOTIFY as u64, &q.to_le_bytes());
     }
 
     pub(crate) fn ack<D: VirtioDevice>(dev: &VirtioMmio<D>) {
         let st = rd(dev, INTERRUPT_STATUS);
-        dev.write(INTERRUPT_ACK, &st.to_le_bytes());
+        dev.write(INTERRUPT_ACK as u64, &st.to_le_bytes());
     }
 
     struct Dummy;
@@ -345,25 +322,25 @@ pub(crate) mod tests {
         assert_eq!(rd(&dev, VERSION), 2);
         assert_eq!(rd(&dev, DEVICE_ID), 42);
         assert_eq!(rd(&dev, DEVICE_FEATURES), 1 << 5);
-        dev.write(DEVICE_FEATURES_SEL, &1u32.to_le_bytes());
+        dev.write(DEVICE_FEATURES_SEL as u64, &1u32.to_le_bytes());
         assert_eq!(rd(&dev, DEVICE_FEATURES), 1, "VERSION_1");
         assert_eq!(rd(&dev, QUEUE_NUM_MAX), 256);
-        dev.write(QUEUE_SEL, &1u32.to_le_bytes());
+        dev.write(QUEUE_SEL as u64, &1u32.to_le_bytes());
         assert_eq!(rd(&dev, QUEUE_NUM_MAX), 0, "no queue 1");
 
         // A driver that does not accept VERSION_1 fails negotiation.
-        dev.write(STATUS, &(status::ACKNOWLEDGE | status::DRIVER).to_le_bytes());
-        dev.write(STATUS, &(status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK).to_le_bytes());
-        assert_eq!(rd(&dev, STATUS) & status::FEATURES_OK, 0);
+        dev.write(STATUS as u64, &(u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER)).to_le_bytes());
+        dev.write(STATUS as u64, &(u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER) | u32::from(status::FEATURES_OK)).to_le_bytes());
+        assert_eq!(rd(&dev, STATUS) & u32::from(status::FEATURES_OK), 0);
 
         bring_up(&dev, &[(0, 0)]);
         assert_eq!(rd(&dev, QUEUE_READY), 1);
 
         let mut b = [0u8; 2];
-        dev.read(CONFIG + 3, &mut b);
+        dev.read(CONFIG as u64 + 3, &mut b);
         assert_eq!(b, [3, 3]);
 
-        dev.write(STATUS, &0u32.to_le_bytes());
+        dev.write(STATUS as u64, &0u32.to_le_bytes());
         assert_eq!(rd(&dev, STATUS), 0);
         assert_eq!(rd(&dev, QUEUE_READY), 0, "reset disables queues");
     }

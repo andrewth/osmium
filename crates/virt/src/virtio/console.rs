@@ -62,7 +62,7 @@ impl VirtioConsole {
 
 impl VirtioDevice for VirtioConsole {
     fn device_id(&self) -> u32 {
-        3
+        super::device_id::CONSOLE
     }
 
     fn num_queues(&self) -> usize {
