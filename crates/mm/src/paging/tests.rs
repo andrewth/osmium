@@ -131,3 +131,42 @@ fn encodings() {
     assert!(Ept::flags(Ept::leaf(pa(0), MapFlags::READ | MapFlags::DEVICE, 0), 0).contains(MapFlags::DEVICE));
     assert!(Aarch64::flags(Aarch64::leaf(pa(0), MapFlags::RW | MapFlags::DEVICE, 0), 0).contains(MapFlags::DEVICE));
 }
+
+#[test]
+fn shared_kernel_entries() {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let before = frames.lock().free_frames();
+    let mut kernel: PageTable<X86_64, _> = PageTable::new(&frames).unwrap();
+    // Kernel lives under root entry 0 (the first 512 GiB).
+    kernel.map(va(0x20_0000), pa(0x20_0000), PageSize::Size4K, MapFlags::RW).unwrap().ignore();
+    let kernel_tables = before - frames.lock().free_frames();
+    {
+        let mut proc_a: PageTable<X86_64, _> = PageTable::new(&frames).unwrap();
+        let mut proc_b: PageTable<X86_64, _> = PageTable::new(&frames).unwrap();
+        // SAFETY: `kernel` outlives both process tables.
+        unsafe {
+            proc_a.share_root_entries(&kernel, 0..1);
+            proc_b.share_root_entries(&kernel, 0..1);
+        }
+        // The same user address maps to different frames per process.
+        let user = va(0x80_0000_0000);
+        proc_a.map(user, pa(0x1000), PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
+        proc_b.map(user, pa(0x2000), PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
+        assert_eq!(proc_a.translate(user).unwrap().pa, pa(0x1000));
+        assert_eq!(proc_b.translate(user).unwrap().pa, pa(0x2000));
+        assert!(kernel.translate(user).is_none());
+        // Both see the kernel, including later changes made through it.
+        assert_eq!(proc_a.translate(va(0x20_0000)).unwrap().pa, pa(0x20_0000));
+        kernel.map(va(0x30_0000), pa(0x30_0000), PageSize::Size4K, MapFlags::RW).unwrap().ignore();
+        assert_eq!(proc_b.translate(va(0x30_0000)).unwrap().pa, pa(0x30_0000));
+        // Kernel mappings cannot be changed through a process table.
+        assert_eq!(proc_a.map(va(0x40_0000), pa(0), PageSize::Size4K, MapFlags::RW).err(), Some(MapError::InvalidAddress));
+        assert_eq!(proc_a.unmap(va(0x20_0000)).err(), Some(UnmapError::InvalidAddress));
+    }
+    // Dropping the processes freed only their own tables.
+    assert!(kernel.translate(va(0x30_0000)).is_some());
+    drop(kernel);
+    assert_eq!(frames.lock().free_frames(), before, "everything freed exactly once");
+    assert!(kernel_tables > 0);
+}

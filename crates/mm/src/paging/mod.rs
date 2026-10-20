@@ -244,6 +244,9 @@ pub struct Translation {
 pub struct PageTable<F: PageTableFormat, A: TableAlloc> {
     root: PhysAddr,
     alloc: A,
+    /// Root entries borrowed from another table (bit `i` = root index `i`):
+    /// never freed or modified through this table.
+    shared: [u64; ENTRIES / 64],
     _format: PhantomData<F>,
 }
 
@@ -251,7 +254,7 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     /// Allocates an empty root table.
     pub fn new(alloc: A) -> Result<Self, MapError> {
         let root = Self::new_table(&alloc)?;
-        Ok(Self { root, alloc, _format: PhantomData })
+        Ok(Self { root, alloc, shared: [0; ENTRIES / 64], _format: PhantomData })
     }
 
     /// Physical address of the root table, for CR3, TTBR, satp, EPTP or VTTBR.
@@ -264,8 +267,39 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         &self.alloc
     }
 
+    /// Makes this table use `kernel`'s root entries `indices` (and so all
+    /// the subtables below them): the usual way to give each process its own
+    /// table with the kernel mapped in every one. Later changes inside those
+    /// subtables, made through `kernel`, are seen here too; root entries the
+    /// kernel creates afterwards are not, so populate them first.
+    ///
+    /// Shared entries are never freed by this table, and `map`, `unmap`,
+    /// `protect` and `split` refuse addresses under them
+    /// ([`MapError::InvalidAddress`] / [`UnmapError::InvalidAddress`]).
+    ///
+    /// # Safety
+    /// `kernel` (its subtables, at least) must outlive this table.
+    pub unsafe fn share_root_entries<B: TableAlloc>(&mut self, kernel: &PageTable<F, B>, indices: core::ops::Range<usize>) {
+        assert!(indices.end <= ENTRIES, "root index out of range");
+        let top = F::LEVELS - 1;
+        for i in indices {
+            let va = VirtAddr::new((i as u64) << (12 + 9 * top));
+            let pte = kernel.entry(kernel.root, va, top).load(Ordering::Acquire);
+            self.entry(self.root, va, top).store(pte, Ordering::Release);
+            self.shared[i / 64] |= 1 << (i % 64);
+        }
+    }
+
+    fn is_shared(&self, va: VirtAddr) -> bool {
+        let i = (va.0 >> (12 + 9 * (F::LEVELS - 1))) as usize % ENTRIES;
+        self.shared[i / 64] & (1 << (i % 64)) != 0
+    }
+
     /// Maps the page at `va` to `pa`.
     pub fn map(&mut self, va: VirtAddr, pa: PhysAddr, size: PageSize, flags: MapFlags) -> Result<Flush, MapError> {
+        if self.is_shared(va) {
+            return Err(MapError::InvalidAddress);
+        }
         if size.level() > F::MAX_LEAF_LEVEL || size.level() >= F::LEVELS {
             return Err(MapError::UnsupportedSize);
         }
@@ -324,6 +358,9 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
 
     /// Removes the leaf that maps `va` and returns what it mapped.
     pub fn unmap(&mut self, va: VirtAddr) -> Result<(Translation, Flush), UnmapError> {
+        if self.is_shared(va) {
+            return Err(UnmapError::InvalidAddress);
+        }
         let (e, level) = self.find_leaf(va)?;
         let pte = e.swap(0, Ordering::AcqRel);
         let size = PageSize::from_level(level);
@@ -339,6 +376,9 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     /// The translation does not change, so no TLB flush is required, but
     /// the caller should flush before relying on the finer granularity.
     pub fn split(&mut self, va: VirtAddr) -> Result<PageSize, MapError> {
+        if self.is_shared(va) {
+            return Err(MapError::InvalidAddress);
+        }
         let (e, level) = self.find_leaf(va).map_err(|_| MapError::InvalidAddress)?;
         if level == 0 {
             return Ok(PageSize::Size4K);
@@ -371,6 +411,9 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
 
     /// Changes the flags of the leaf that maps `va`.
     pub fn protect(&mut self, va: VirtAddr, flags: MapFlags) -> Result<Flush, UnmapError> {
+        if self.is_shared(va) {
+            return Err(UnmapError::InvalidAddress);
+        }
         let (e, level) = self.find_leaf(va)?;
         let pte = e.load(Ordering::Acquire);
         e.store(F::leaf(F::addr(pte, level), flags, level), Ordering::Release);
@@ -428,6 +471,9 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         if level > 0 {
             for i in 0..ENTRIES {
                 let va = VirtAddr::new((i as u64) << (12 + 9 * level));
+                if level == F::LEVELS - 1 && self.is_shared(va) {
+                    continue;
+                }
                 let pte = self.entry(table, va, level).load(Ordering::Relaxed);
                 if F::is_valid(pte) && !F::is_leaf(pte, level) {
                     self.free_subtree(F::addr(pte, level), level - 1);
