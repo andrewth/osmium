@@ -8,6 +8,7 @@
 //! | [`gicv2::GicV2`] | Arm Generic Interrupt Controller v2 | `InterruptController` |
 //! | [`lapic::LocalApic`] | x86 local APIC (xAPIC MMIO) | EOI, IPIs, timer |
 //! | [`pit::Pit`] | Intel 8254 PIT | calibration delays |
+//! | [`ioapic::IoApic`] | x86 I/O APIC | GSI routing |
 //! | [`ramdisk::RamDisk`] | Memory-backed disk | `BlockDevice` |
 //!
 //! Every driver is constructed from an [`osmium_hal::mmio::IoMem`] (or a
@@ -19,6 +20,7 @@
 extern crate std;
 
 pub mod gicv2;
+pub mod ioapic;
 pub mod lapic;
 pub mod pit;
 pub mod pl011;

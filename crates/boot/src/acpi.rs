@@ -120,6 +120,20 @@ pub struct IoApic {
     pub gsi_base: u32,
 }
 
+/// An ISA interrupt that the platform wires to a different GSI or with
+/// non-ISA polarity/trigger, from the MADT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptOverride {
+    /// ISA IRQ number.
+    pub source: u8,
+    /// Global system interrupt it arrives on.
+    pub gsi: u32,
+    /// Active low (otherwise active high, the ISA default).
+    pub active_low: bool,
+    /// Level-triggered (otherwise edge, the ISA default).
+    pub level: bool,
+}
+
 /// The Multiple APIC Description Table (`APIC`).
 #[derive(Clone, Copy, Debug)]
 pub struct Madt<'a> {
@@ -170,6 +184,27 @@ impl<'a> Madt<'a> {
             9 => Some(LocalApic { processor_uid: le32(e, 12)?, apic_id: le32(e, 4)?, enabled: le32(e, 8)? & 1 != 0 }),
             _ => None,
         })
+    }
+
+    /// Interrupt source overrides.
+    pub fn overrides(&self) -> impl Iterator<Item = InterruptOverride> + 'a {
+        Self::walk(self.entries).filter_map(|(typ, e)| {
+            let flags = u16::from_le_bytes([*e.get(8)?, *e.get(9)?]);
+            (typ == 2).then_some(InterruptOverride {
+                source: *e.get(3)?,
+                gsi: le32(e, 4)?,
+                active_low: flags & 0b11 == 0b11,
+                level: flags >> 2 & 0b11 == 0b11,
+            })
+        })
+    }
+
+    /// The GSI and line mode `(gsi, active_low, level)` of ISA IRQ `irq`,
+    /// applying any override (identity, active high and edge otherwise).
+    pub fn isa_irq(&self, irq: u8) -> (u32, bool, bool) {
+        self.overrides()
+            .find(|o| o.source == irq)
+            .map_or((irq as u32, false, false), |o| (o.gsi, o.active_low, o.level))
     }
 
     /// I/O APICs.
@@ -240,6 +275,12 @@ mod tests {
             madt_body.extend_from_slice(&[0, 8, uid, id]);
             madt_body.extend_from_slice(&flags.to_le_bytes());
         }
+        madt_body.extend_from_slice(&[2, 10, 0, 0]); // IRQ0 -> GSI2, defaults
+        madt_body.extend_from_slice(&2u32.to_le_bytes());
+        madt_body.extend_from_slice(&0u16.to_le_bytes());
+        madt_body.extend_from_slice(&[2, 10, 0, 9]); // IRQ9 -> GSI9, level, active low
+        madt_body.extend_from_slice(&9u32.to_le_bytes());
+        madt_body.extend_from_slice(&0b1111u16.to_le_bytes());
         madt_body.extend_from_slice(&[1, 12, 7, 0]);
         madt_body.extend_from_slice(&0xfec0_0000u32.to_le_bytes());
         madt_body.extend_from_slice(&0u32.to_le_bytes());
@@ -283,6 +324,9 @@ mod tests {
         assert_eq!(cpus.len(), 3);
         assert_eq!(cpus.iter().filter(|c| c.enabled).count(), 2);
         assert_eq!(m.io_apics().next(), Some(IoApic { id: 7, addr: 0xfec0_0000, gsi_base: 0 }));
+        assert_eq!(m.isa_irq(0), (2, false, false));
+        assert_eq!(m.isa_irq(9), (9, true, true));
+        assert_eq!(m.isa_irq(4), (4, false, false), "no override: identity");
         let ecam = Mcfg::parse(acpi.find(b"MCFG").unwrap()).unwrap().entries().next().unwrap();
         assert_eq!((ecam.base, ecam.end_bus), (0xb000_0000, 0xff));
 
