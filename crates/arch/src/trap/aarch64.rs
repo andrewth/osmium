@@ -1,4 +1,6 @@
-use super::{Access, Interrupt, Trap};
+use core::sync::atomic::Ordering;
+
+use super::{Access, Interrupt, Trap, TrapCpu};
 
 #[cfg(all(bare, not(feature = "aarch64-el2")))]
 core::arch::global_asm!(include_str!("aarch64_el1.S"));
@@ -99,7 +101,7 @@ impl TrapFrame {
         let addr = self.far as usize;
         match ec {
             0x00 => Trap::IllegalInstruction,
-            0x15 | 0x16 | 0x17 => Trap::Syscall,
+            0x15..=0x17 => Trap::Syscall,
             0x3c => Trap::Breakpoint,
             0x20 | 0x21 => Trap::PageFault { addr, access: Access::Execute },
             0x24 | 0x25 => {
@@ -128,12 +130,30 @@ impl TrapFrame {
     }
 }
 
+impl TrapCpu {
+    /// Returns true if `frame` was taken because the kernel stack overflowed,
+    /// i.e. it was saved on the exception stack. A handler for such a frame
+    /// must not return to it: switch away (for example by ending the task).
+    pub fn overflowed(&self, frame: &TrapFrame) -> bool {
+        let lo = self.stack_lo.load(Ordering::Relaxed);
+        let sp = frame.sp;
+        let on_exception_stack =
+            (self.exception_lo.load(Ordering::Relaxed)..=self.exception_sp.load(Ordering::Relaxed)).contains(&sp);
+        (4..8).contains(&frame.kind) && !on_exception_stack && sp.wrapping_sub(size_of::<TrapFrame>() as u64) < lo
+    }
+}
+
 /// Points this CPU's vector base (`VBAR_EL1`, or `VBAR_EL2` with
 /// `aarch64-el2`) at the Osmium vector table. Call on every CPU.
 ///
+/// Call after `osmium_arch::cpu::set_current_id`: current-EL vectors find
+/// this CPU's [`TrapCpu`] through it, and use `TPIDRRO_EL0` and `SP_EL0` as
+/// scratch registers (the kernel must not rely on them).
+///
 /// # Safety
 /// Replaces the current vectors. Exceptions are handled on the current stack
-/// (`SP_ELx`), which must be valid whenever one can occur.
+/// (`SP_ELx`), unless the [`TrapCpu`] overflow check moves them to the
+/// exception stack.
 pub unsafe fn install() {
     #[cfg(bare)]
     {

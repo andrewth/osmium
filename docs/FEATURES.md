@@ -103,7 +103,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction), per-CPU GDT/TSS (`CpuTables`) with IST stacks (`trap::set_ist`)
 - ✅ x86_64 user mode: `enter_user` (ring 3 via `iretq`), `trap::allow_from_user` for `int 0x80` system calls, `TrapFrame::from_user`
 - ✅ RISC-V trap entry swaps through `sscratch` to a per-CPU `TrapCpu`: an exception stack when the interrupted kernel stack overflowed, a kernel stack for traps from U-mode, and a hook point for hypervisor guest exits
-- 🗺 Exception-stack switching on AArch64
+- ✅ AArch64 current-EL vectors check `sp` against the same per-CPU `TrapCpu` before the first store and move to an exception stack on overflow (vector sizes enforced at assembly time)
 - 🗺 FPU/SIMD state save and restore; user-mode entry/return
 
 ### `osmium-sync`: synchronization

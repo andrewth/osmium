@@ -27,9 +27,14 @@ use osmium::hal::println;
 use osmium::hal::timer::TickRate;
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::formats::Aarch64;
+use osmium::mm::frame::order_for;
+use osmium::mm::paging::PageSize;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
-use osmium::sched::FifoScheduler;
+use core::ptr::NonNull;
+
+use osmium::arch::trap::TrapCpu;
+use osmium::sched::{FifoScheduler, StackAllocator, TaskBuilder};
 use osmium::sched::timer::TimerQueue;
 use osmium::sync::{IrqSpinLock, Once};
 
@@ -97,6 +102,48 @@ static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMap
 
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
+
+/// The kernel page table, shared by all CPUs.
+static PT: IrqSpinLock<Option<PageTable<Aarch64, &'static Frames>>> = IrqSpinLock::new(None);
+
+/// Task stacks with an unmapped guard page below them.
+struct GuardedStacks;
+
+// SAFETY: blocks come from the frame allocator (exclusive, page aligned) and
+// the usable part stays mapped read/write.
+unsafe impl StackAllocator for GuardedStacks {
+    fn alloc(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
+        let order = order_for(size + PAGE_SIZE);
+        let guard = FRAMES.lock().alloc(order)?;
+        let (_, flush) = PT.lock().as_mut()?.unmap_4k(VirtAddr::new(guard.0)).ok()?;
+        flush.flush();
+        Some((NonNull::new((guard.0 + PAGE_SIZE as u64) as *mut u8)?, (PAGE_SIZE << order) - PAGE_SIZE))
+    }
+
+    unsafe fn free(&self, base: NonNull<u8>, len: usize) {
+        let guard = base.as_ptr() as u64 - PAGE_SIZE as u64;
+        {
+            let mut pt = PT.lock();
+            let flags = MapFlags::RW | MapFlags::GLOBAL;
+            let pt = pt.as_mut().unwrap();
+            pt.map(VirtAddr::new(guard), PhysAddr::new(guard), PageSize::Size4K, flags).unwrap().flush();
+        }
+        // SAFETY: the block came from `alloc` with the same order.
+        unsafe { FRAMES.lock().dealloc(PhysAddr::new(guard), order_for(len + PAGE_SIZE)) };
+    }
+}
+
+/// Tells the exception vectors where the incoming task's stack ends.
+fn on_switch(next: &osmium::sched::Task) {
+    TrapCpu::current().set_stack_limit(next.kernel_stack_range().map_or(0, |r| r.start));
+}
+
+/// Gives this CPU an emergency stack for exceptions from an overflowed stack.
+fn set_exception_stack() {
+    let stack = alloc::vec![0u8; 16 * 1024].leak();
+    let lo = stack.as_ptr() as usize;
+    TrapCpu::current().set_exception_stack(lo..lo + stack.len());
+}
 
 static UART: Once<SerialConsole<Pl011>> = Once::new();
 static GIC: Once<GicV2> = Once::new();
@@ -217,8 +264,11 @@ extern "C" fn kmain(x0: usize) -> ! {
     TTBR0.store(pt.root().0, Ordering::Release);
     let t = pt.translate(va(kmain as *const () as u64)).unwrap();
     println!("[mmu]   MMU on, TTBR0 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
-    // The table must outlive the kernel.
-    alloc::boxed::Box::leak(alloc::boxed::Box::new(pt));
+    *PT.lock() = Some(pt);
+    set_exception_stack();
+    osmium::sched::set_stack_allocator(&GuardedStacks);
+    osmium::sched::set_switch_hook(on_switch);
+    println!("[guard] task stacks get unmapped guard pages; overflowing exceptions move to a per-CPU exception stack");
 
     // --- Interrupts, scheduler ---------------------------------------------
     // SAFETY: the device tree says the GIC lives here, mapped as device memory above.
@@ -268,6 +318,7 @@ extern "C" fn kmain(x0: usize) -> ! {
         demos::smp(ncpus);
     }
     fault_demo();
+    overflow_demo();
 
     println!(
         "[done]  {} timer ticks, {} IPIs, {} free frames; shutting down",
@@ -301,6 +352,7 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     // SAFETY: we are on the stack the boot CPU allocated for us.
     unsafe { trap::install() };
     enable_mmu(PhysAddr::new(TTBR0.load(Ordering::Acquire)));
+    set_exception_stack();
     osmium::sched::init_cpu();
     start_local_interrupts();
     println!("[smp]   MPIDR {:#x} online as CPU {}", aarch64::read_mpidr_el1() & 0xff_ffff, boot.cpu);
@@ -362,7 +414,35 @@ fn fault_demo() {
     RECOVER.store(false, Ordering::SeqCst);
 }
 
+/// A task that recurses until it runs off the bottom of its stack.
+fn overflow_demo() {
+    #[inline(never)]
+    fn recurse(depth: u64) -> u64 {
+        let frame = core::hint::black_box([depth; 32]);
+        if core::hint::black_box(true) { recurse(depth + 1) + frame[7] } else { 0 }
+    }
+    let t = TaskBuilder::new("deep").stack_size(16 * 1024).spawn(|| {
+        recurse(0);
+    });
+    t.join();
+    println!("[guard] the other tasks keep running: {} free frames", FRAMES.lock().free_frames());
+}
+
 fn on_trap(frame: &mut TrapFrame) {
+    if TrapCpu::current().overflowed(frame) {
+        // This frame lives on the exception stack; the task's own stack is
+        // exhausted, so it cannot continue. End only that task.
+        let task = osmium::sched::current();
+        println!("[guard] task {:?} overflowed its stack ({:?} at sp {:#x}); killed", task.name(), frame.cause(), frame.sp());
+        // A nested exception must stay on the exception stack.
+        RECOVER.store(true, Ordering::SeqCst);
+        // SAFETY: the breakpoint arm below steps over it.
+        unsafe { core::arch::asm!("brk #0") };
+        RECOVER.store(false, Ordering::SeqCst);
+        println!("[guard] nested {:?} on the exception stack handled", RECOVERED.lock().take().unwrap());
+        drop(task);
+        osmium::sched::exit();
+    }
     match frame.cause() {
         Trap::Interrupt(Interrupt::External) => {
             IRQS.handle_pending(GIC.get().unwrap());

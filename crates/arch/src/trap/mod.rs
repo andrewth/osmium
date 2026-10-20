@@ -129,10 +129,15 @@ impl OnceFlag {
     }
 }
 
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+mod cpu;
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+pub use cpu::{TrapCpu, offsets};
+
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
 #[cfg(target_arch = "riscv64")]
-pub use riscv64::{TrapCpu, TrapFrame, install, offsets};
+pub use riscv64::{TrapFrame, install};
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
