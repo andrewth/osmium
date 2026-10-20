@@ -2,7 +2,8 @@
 //! and Cloud Hypervisor to start x86 kernels directly in 32-bit protected
 //! mode.
 //!
-//! A kernel advertises its 32-bit entry point with [`pvh_entry_note!`](crate::pvh_entry_note).
+//! A kernel advertises its 32-bit entry point with [`pvh_entry_note!`](crate::pvh_entry_note),
+//! or uses the ready-made x86-64 entry from [`pvh_start!`](crate::pvh_start).
 //! The loader enters it with paging off and `ebx` holding the physical
 //! address of the start-info structure.
 
@@ -34,6 +35,155 @@ macro_rules! pvh_entry_note {
             ".balign 4\n",
             ".popsection\n",
         ));
+    };
+}
+
+/// Emits a complete x86-64 PVH entry point, `pvh_start`, plus its ELF note.
+///
+/// The 32-bit entry zeroes `_bss_start.._bss_end` (from the linker script),
+/// identity-maps the first 4 GiB with 2 MiB pages, enables long mode with NX
+/// and write protection, loads a flat GDT (code `0x08`, data `0x10`), and
+/// calls `main(start_info_phys)` on a 64 KiB boot stack. If `main` returns, the
+/// CPU halts. The boot page-table root is exported as `boot_pml4`.
+///
+/// With `ap: ap_main`, it also emits `ap_start64`: 64-bit code for
+/// application processors that reach long mode on the boot page tables (with
+/// `rdi` = CPU index and `rsp` = their stack). It reloads the GDT and segments
+/// and calls `ap_main`.
+///
+/// The linker script must place `.text.entry` and `.bss.boot` and keep
+/// `.note.Xen`, all below 4 GiB.
+///
+/// ```ignore
+/// osmium_boot::pvh_start!(kmain);
+/// osmium_boot::pvh_start!(kmain, ap: ap_main);
+/// ```
+#[macro_export]
+macro_rules! pvh_start {
+    ($main:path) => {
+        $crate::pvh_entry_note!("pvh_start");
+        core::arch::global_asm!($crate::__pvh_start_asm!(), main = sym $main, options(att_syntax));
+    };
+    ($main:path, ap: $ap_main:path) => {
+        $crate::pvh_start!($main);
+        core::arch::global_asm!(
+            r#"
+    .section .text.entry, "ax"
+    .code64
+    .globl ap_start64
+ap_start64:
+    lgdt osmium_boot_gdtr
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    xor %ax, %ax
+    mov %ax, %fs
+    mov %ax, %gs
+    pushq $0x08
+    lea 1f(%rip), %rax
+    push %rax
+    lretq
+1:  call {ap_main}
+2:  hlt
+    jmp 2b
+"#,
+            ap_main = sym $ap_main,
+            options(att_syntax)
+        );
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __pvh_start_asm {
+    () => {
+        r#"
+    .section .text.entry, "ax"
+    .code32
+    .globl pvh_start
+pvh_start:
+    cli
+    cld
+    mov %ebx, %esi
+
+    mov $_bss_start, %edi
+    mov $_bss_end, %ecx
+    sub %edi, %ecx
+    shr $2, %ecx
+    xor %eax, %eax
+    rep stosl
+
+    // PML4[0] -> PDPT; PDPT[0..4] -> PD[0..4]; PD entries map 2 MiB each.
+    mov $osmium_boot_pdpt, %eax
+    or $0x3, %eax
+    mov %eax, boot_pml4
+    mov $osmium_boot_pd, %eax
+    or $0x3, %eax
+    mov $osmium_boot_pdpt, %edi
+    mov $4, %ecx
+1:  mov %eax, (%edi)
+    add $0x1000, %eax
+    add $8, %edi
+    loop 1b
+    mov $osmium_boot_pd, %edi
+    mov $0x83, %eax
+    mov $2048, %ecx
+2:  mov %eax, (%edi)
+    add $0x200000, %eax
+    add $8, %edi
+    loop 2b
+
+    mov $boot_pml4, %eax
+    mov %eax, %cr3
+    mov %cr4, %eax
+    or $(1 << 5), %eax
+    mov %eax, %cr4
+    mov $0xc0000080, %ecx
+    rdmsr
+    or $((1 << 8) | (1 << 11)), %eax
+    wrmsr
+    mov %cr0, %eax
+    or $((1 << 31) | (1 << 16) | 1), %eax
+    mov %eax, %cr0
+
+    lgdt osmium_boot_gdtr
+    ljmp $0x08, $3f
+
+    .code64
+3:  mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    xor %ax, %ax
+    mov %ax, %fs
+    mov %ax, %gs
+    mov $osmium_boot_stack_top, %rsp
+    mov %esi, %edi
+    call {main}
+4:  hlt
+    jmp 4b
+
+    .section .rodata
+    .balign 8
+osmium_boot_gdt:
+    .quad 0
+    .quad 0x00af9a000000ffff
+    .quad 0x00cf92000000ffff
+    .globl osmium_boot_gdtr
+osmium_boot_gdtr:
+    .word osmium_boot_gdtr - osmium_boot_gdt - 1
+    .quad osmium_boot_gdt
+
+    .section .bss.boot, "aw", @nobits
+    .balign 4096
+    .globl boot_pml4
+boot_pml4:        .space 4096
+osmium_boot_pdpt: .space 4096
+osmium_boot_pd:   .space 4096 * 4
+    .space 65536
+osmium_boot_stack_top:
+"#
     };
 }
 
