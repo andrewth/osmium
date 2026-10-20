@@ -103,7 +103,13 @@ pub trait DmaAllocator {
     fn alloc_coherent(&self, len: usize) -> Option<DmaBuffer>;
 
     /// Frees a buffer from `alloc_coherent`.
-    fn free_coherent(&self, buf: DmaBuffer);
+    ///
+    /// # Safety
+    /// `buf` must have been returned by `alloc_coherent` on this same
+    /// allocator, and no device may access the memory any more (the device
+    /// has been stopped or told to forget the address). Otherwise the memory
+    /// is reused while something else still writes to it.
+    unsafe fn free_coherent(&self, buf: DmaBuffer);
 }
 
 /// A [`DmaBuffer`] that returns itself to its allocator when dropped.
@@ -111,6 +117,12 @@ pub trait DmaAllocator {
 /// Drivers hold their rings and buffers this way so that every exit path,
 /// including a failed initialization, frees them. A driver must stop the
 /// device (reset it) before its `OwnedDma` fields drop.
+///
+/// That obligation is not checked here: a device only learns a buffer's
+/// address through its registers, and whoever created the device's register
+/// window ([`IoMem::new`](crate::mmio::IoMem::new), which is `unsafe`)
+/// vouched that accesses through it do not violate memory safety. Leaving a
+/// device pointed at a dropped buffer breaks that promise.
 pub struct OwnedDma<'a, A: DmaAllocator + ?Sized> {
     buf: ManuallyDrop<DmaBuffer>,
     alloc: &'a A,
@@ -134,7 +146,10 @@ impl<A: DmaAllocator + ?Sized> Deref for OwnedDma<'_, A> {
 impl<A: DmaAllocator + ?Sized> Drop for OwnedDma<'_, A> {
     fn drop(&mut self) {
         // SAFETY: `buf` is not used again.
-        self.alloc.free_coherent(unsafe { ManuallyDrop::take(&mut self.buf) });
+        let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
+        // SAFETY: `buf` came from `self.alloc` in `new`, and the device is
+        // stopped before an `OwnedDma` drops (see the type's documentation).
+        unsafe { self.alloc.free_coherent(buf) };
     }
 }
 
@@ -164,9 +179,10 @@ impl<A: FrameAllocator, M: PhysMapper> DmaAllocator for LockedFrames<A, M> {
         Some(buf)
     }
 
-    fn free_coherent(&self, buf: DmaBuffer) {
+    unsafe fn free_coherent(&self, buf: DmaBuffer) {
         let order = order_for(buf.len().max(1));
-        // SAFETY: allocated by `alloc_coherent` with the same order.
+        // SAFETY: allocated by this allocator's `alloc_coherent` with the
+        // same order, and no longer used by a device (caller's contract).
         unsafe { self.lock().dealloc(buf.device_addr(), order) };
     }
 }

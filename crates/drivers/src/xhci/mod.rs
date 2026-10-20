@@ -1226,8 +1226,9 @@ mod tests {
             Some(unsafe { DmaBuffer::new(b.cpu_ptr(), high, len) })
         }
 
-        fn free_coherent(&self, buf: DmaBuffer) {
-            self.0.free_coherent(buf)
+        unsafe fn free_coherent(&self, buf: DmaBuffer) {
+            // SAFETY: forwarded contract; the buffer came from `self.0`.
+            unsafe { self.0.free_coherent(buf) }
         }
     }
 

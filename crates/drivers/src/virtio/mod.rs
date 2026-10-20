@@ -214,7 +214,7 @@ pub(crate) mod testing {
             Some(unsafe { DmaBuffer::new(p, PhysAddr::new(p.as_ptr() as u64), len) })
         }
 
-        fn free_coherent(&self, buf: DmaBuffer) {
+        unsafe fn free_coherent(&self, buf: DmaBuffer) {
             self.live.set(self.live.get() - 1);
             let layout = Layout::from_size_align(buf.len().max(1), 4096).unwrap();
             // SAFETY: allocated above with this layout.

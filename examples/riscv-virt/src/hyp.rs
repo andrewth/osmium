@@ -487,7 +487,7 @@ impl DmaAllocator for BumpDma {
         }
     }
 
-    fn free_coherent(&self, _buf: DmaBuffer) {}
+    unsafe fn free_coherent(&self, _buf: DmaBuffer) {}
 }
 
 /// The hypervisor's side of the guest's link: answers ARP requests for the
