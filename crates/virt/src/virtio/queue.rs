@@ -234,15 +234,16 @@ pub(crate) mod tests {
         pub fn post(&mut self, mem: &GuestMemory, bufs: &[(u64, u32, bool)]) -> u16 {
             let head = self.next_desc;
             for (n, &(addr, len, write)) in bufs.iter().enumerate() {
+                // Requests complete before the next is posted, so slots can be reused.
                 let i = self.next_desc;
-                self.next_desc += 1;
+                self.next_desc = (i + 1) % self.size;
                 let last = n + 1 == bufs.len();
                 let flags = if write { DESC_F_WRITE } else { 0 } | if last { 0 } else { DESC_F_NEXT };
                 let mut raw = [0u8; 16];
                 raw[0..8].copy_from_slice(&addr.to_le_bytes());
                 raw[8..12].copy_from_slice(&len.to_le_bytes());
                 raw[12..14].copy_from_slice(&flags.to_le_bytes());
-                raw[14..16].copy_from_slice(&(i + 1).to_le_bytes());
+                raw[14..16].copy_from_slice(&self.next_desc.to_le_bytes());
                 mem.write_obj(GuestPhysAddr(DESC + 16 * i as u64), raw).unwrap();
             }
             let slot = self.avail_idx % self.size;

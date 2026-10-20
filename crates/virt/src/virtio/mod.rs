@@ -5,10 +5,12 @@
 //! [`BusDevice`](crate::BusDevice) that handles feature negotiation, queue
 //! setup, notifications and interrupts.
 
+mod block;
 mod console;
 mod mmio;
 pub mod queue;
 
+pub use block::VirtioBlock;
 pub use console::VirtioConsole;
 pub use mmio::{DeviceCtx, MMIO_SIZE, VirtioMmio};
 pub use queue::{Desc, DescChain, QueueError, SplitQueue};

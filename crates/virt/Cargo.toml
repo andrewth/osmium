@@ -10,5 +10,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+osmium-hal.workspace = true
 osmium-mm.workspace = true
 osmium-sync.workspace = true
