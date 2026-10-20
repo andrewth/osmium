@@ -180,6 +180,16 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ ACPI: RSDP/RSDT/XSDT with checksums, MADT (local APICs, x2APICs, I/O APICs), MCFG (PCI ECAM windows)
 - 🗺 UEFI boot services wrapper, Limine protocol, AML
 
+### `osmium-fs`: file systems
+- ✅ `File` trait: one node (file, directory, device, symlink), stateless and offset-based like `pread`/`pwrite`, with defaults so a device implements only what it supports; `Stat`, `DirEntry`, `FileKind`
+- ✅ `Errno` with Linux numbers, and osmium's own `OpenFlags` for system call layers to translate into
+- ✅ `Vfs`: absolute-path lookup across mounts (`..` leaves a mount at its root), symbolic links (40 deep), trailing-`/` rules, `open` with create/exclusive/truncate, `mkdir`, `mknod`, `unlink`, `rmdir`, `symlink`, `readlink`, `stat`/`lstat`, `canonicalize`, copy-on-write mount table
+- ✅ `RamFs` (tmpfs), with unlinked-but-open files kept alive
+- ✅ `DevDir` for a kernel-populated `/dev`, plus null and zero devices
+- ✅ cpio `newc` archives: zero-copy iteration and initramfs unpacking (concatenated archives, `..` refused), tested against GNU cpio
+- ✅ ext2, read and write, over any `BlockDevice`: indirect block maps, sparse files, fast and slow symlinks, allocation, truncation, orphaned open files; tested with `mkfs.ext2 -d`, `e2fsck` and `debugfs`
+- 🗺 FAT32, a block cache, rename and hard links, timestamps from a clock in the VFS
+
 ### `osmium-virt`: hypervisor building blocks
 - ✅ `GuestPhysAddr`, and `GuestMemory`: a GPA-to-host region map with bounds-checked `read`/`write`/`read_obj`/`write_obj` and a `Pod` marker
 - ✅ Stage-2 page tables: `osmium_mm` `PageTable` with the `Ept`, `Aarch64Stage2` and `Sv39x4`/`Sv48x4` formats; EPTP, VTTBR and hgatp encoders
