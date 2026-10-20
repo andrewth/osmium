@@ -15,6 +15,10 @@
 
 pub mod psci;
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 #[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
 mod hw;
 #[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
@@ -145,9 +149,8 @@ pub struct Aarch64Vcpu {
     pub el1: El1Regs,
     /// `VTTBR_EL2` (stage-2 root and VMID).
     pub vttbr: u64,
-    /// A virtual IRQ is pending (`HCR_EL2.VI`), e.g. from an emulated
-    /// interrupt controller.
-    pub virq: bool,
+    irq: Arc<AtomicBool>,
+    timer: Option<Box<dyn Fn(bool) + Send + Sync>>,
     pending: Option<Load>,
 }
 
@@ -160,7 +163,47 @@ impl Aarch64Vcpu {
         x[0] = arg;
         let state =
             GuestState { x, pc: entry.0, pstate: PSTATE_EL1H, esr: 0, far: 0, hpfar: 0, vector: 0, host: [0; 13] };
-        Self { state, el1: El1Regs::default(), vttbr, virq: false, pending: None }
+        Self { state, el1: El1Regs::default(), vttbr, irq: Arc::new(AtomicBool::new(false)), timer: None, pending: None }
+    }
+
+    /// The vCPU's IRQ line, for an interrupt controller (a
+    /// [`VirtualGicV2`](crate::devices::VirtualGicV2) output) to drive. Its
+    /// level becomes `HCR_EL2.VI` at the next entry.
+    pub fn irq_line(&self) -> Arc<AtomicBool> {
+        self.irq.clone()
+    }
+
+    /// Connects the guest's virtual timer to an interrupt line (usually the
+    /// GIC's PPI 27): before every entry, `line` receives the timer's
+    /// level. The hardware timer is disabled while the host runs, and its
+    /// expiry during a guest run forces an exit (`HCR_EL2.IMO`), provided
+    /// the host's GIC has the PPI enabled. While the level is high the host
+    /// should disable that PPI in its own GIC (and re-enable it when the
+    /// level drops), or the still-firing timer exits the guest again before
+    /// it can handle the virtual interrupt.
+    pub fn connect_timer(&mut self, line: impl Fn(bool) + Send + Sync + 'static) {
+        self.timer = Some(Box::new(line));
+    }
+
+    /// Whether the guest's virtual timer condition is met at counter `now`
+    /// (enabled, not masked, compare value reached).
+    pub fn timer_level(&self, now: u64) -> bool {
+        let ctl = self.el1.cntv_ctl;
+        ctl & 1 != 0 && ctl & 2 == 0 && now >= self.el1.cntv_cval
+    }
+
+    /// Whether a vCPU halted in `wfi` has a reason to run again at counter
+    /// `now`: its IRQ line is up or its timer is due.
+    pub fn interrupt_pending(&self, now: u64) -> bool {
+        self.irq.load(Ordering::Acquire) || self.timer_level(now)
+    }
+
+    /// Feeds the timer line before an entry.
+    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    fn sync_timer(&self, now: u64) {
+        if let Some(line) = &self.timer {
+            line(self.timer_level(now));
+        }
     }
 
     /// Turns the exception recorded in `state` into an exit.
@@ -208,6 +251,7 @@ impl Aarch64Vcpu {
 impl Vcpu for Aarch64Vcpu {
     #[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
     fn run(&mut self) -> VmExit {
+        self.sync_timer(hw::counter());
         hw::run(self);
         self.classify()
     }
@@ -296,5 +340,23 @@ mod tests {
         assert_eq!(v.state.pc, 0x4000_0108);
         assert_eq!(exit(&mut v, vector::IRQ, 0, 0, 0), VmExit::ExternalInterrupt);
         assert_eq!(exit(&mut v, vector::SERROR, 0xbf00_0000, 0, 0), VmExit::Unhandled { reason: 0xbf00_0000 });
+    }
+
+    #[test]
+    fn timer_and_irq_line() {
+        let mut v = Aarch64Vcpu::new(GuestPhysAddr(0), 0, 0);
+        let seen = Arc::new(AtomicBool::new(false));
+        let s = seen.clone();
+        v.connect_timer(move |l| s.store(l, Ordering::SeqCst));
+        v.el1.cntv_cval = 1000;
+        v.el1.cntv_ctl = 1;
+        v.sync_timer(999);
+        assert!(!seen.load(Ordering::SeqCst) && !v.interrupt_pending(999));
+        v.sync_timer(1000);
+        assert!(seen.load(Ordering::SeqCst) && v.interrupt_pending(1000));
+        v.el1.cntv_ctl = 3; // masked
+        assert!(!v.timer_level(2000));
+        v.irq_line().store(true, Ordering::SeqCst);
+        assert!(v.interrupt_pending(0));
     }
 }

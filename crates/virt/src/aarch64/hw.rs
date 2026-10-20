@@ -215,7 +215,7 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     let daif = mrs!("daif");
     // SAFETY: masks interrupts for the switch; restored below.
     unsafe { asm!("msr daifset, #0xf", options(nomem, nostack, preserves_flags)) };
-    let hcr = HCR_GUEST | if v.virq { HCR_VI } else { 0 };
+    let hcr = HCR_GUEST | if v.irq.load(core::sync::atomic::Ordering::Acquire) { HCR_VI } else { 0 };
     msr!("hcr_el2", hcr);
     if mrs!("vttbr_el2") != v.vttbr {
         msr!("vttbr_el2", v.vttbr);
@@ -230,6 +230,9 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     // the assembly saves and restores every callee-saved host register.
     unsafe { osmium_el2_run(&mut v.state) };
     save_el1(&mut v.el1);
+    // The guest's timer must not fire while the host runs; its level is
+    // recomputed in software before the next entry.
+    msr!("cntv_ctl_el0", 0u64);
     // Back to the host's stage-1 only: no stage 2, nothing routed.
     msr!("hcr_el2", 1u64 << 31);
     // SAFETY: restores the caller's interrupt mask.
