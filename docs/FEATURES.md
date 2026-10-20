@@ -157,7 +157,9 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ USB class drivers on any `UsbHost`: mass storage (SCSI over Bulk-Only) as a `BlockDevice`, and HID boot keyboards with US-layout key translation
 - ✅ USB Ethernet (CDC-ECM) as a `NetDevice` on any `UsbHost`: functional-descriptor probing, MAC from the string descriptor, alternate-setting selection, notification-driven link state; boots under QEMU `usb-net` (its second configuration) and resolves ARP
 - ✅ Mellanox ConnectX-2/-3 (mlx4) Ethernet: reset, firmware start, ICM, polled raw Ethernet queue pair per port as a `NetDevice`; tested against a simulated HCA
-- 🗺 virtio-pci transport; virtio console; xHCI hubs and isochronous transfers; HID report descriptors; GICv3; HPET; NVMe
+- ✅ AHCI (SATA): HBA handoff and port bring-up, IDENTIFY, READ/WRITE DMA EXT and FLUSH CACHE EXT; each disk is its own `BlockDevice` that outlives the HBA; error recovery with CLO or COMRESET; boots against QEMU `ich9-ahci` + `ide-hd`
+- ✅ NVMe: admin and one I/O queue pair (phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting, normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
+- 🗺 virtio-pci transport; virtio console; xHCI hubs and isochronous transfers; HID report descriptors; GICv3; HPET; AHCI/NVMe interrupts, NCQ and multiple queues; ATAPI
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)
@@ -230,6 +232,11 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `wire`: Ethernet, ARP, IPv4, ICMP, UDP and TCP headers and the Internet checksum, usable on their own
 - ✅ Tested on the host over a simulated lossy link, and under QEMU against the user-mode network (DHCP lease, ping, TCP echo)
 - 🗺 IP fragmentation, TCP window scaling, SACK, out-of-order reassembly and congestion control, a DNS resolver, IPv6, socket system calls in `osmium-proc`
+
+### `osmium-iscsi`: iSCSI initiator
+- ✅ RFC 7143 login (AuthMethod None, operational negotiation honouring the target's answers), SendTargets discovery, full-feature phase with immediate data, unsolicited Data-Out and R2T-driven writes, multi-PDU Data-In, NOP-In replies and logout; SCSI INQUIRY, TEST UNIT READY, READ CAPACITY(10/16), READ/WRITE(10/16) and SYNCHRONIZE CACHE as a `BlockDevice` over an `osmium-net` TCP socket
+- ✅ Tested on the host against an in-process target and `scripts/iscsi-target.py` (a stdlib-only target), and under QEMU through a user-network `guestfwd` to that script
+- 🗺 CHAP, header and data digests, login redirection, error recovery levels above 0, multiple connections and LUNs per session
 
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name

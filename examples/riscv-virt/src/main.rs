@@ -539,6 +539,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             println!("[net]   virtio-net ({legacy}) at {base:#x}");
             demos::arp(&mut net, now_ns);
             demos::net(&mut net, now_ns);
+            demos::iscsi(&mut net, now_ns);
         }
         None => println!("[net]   no virtio-net device"),
     }

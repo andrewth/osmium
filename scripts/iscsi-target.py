@@ -10,8 +10,9 @@ network forwarding, launched once per connection:
 
     -netdev user,id=n0,guestfwd=tcp:10.0.2.100:3260-cmd:python3 scripts/iscsi-target.py disk.img
 
-Logs go to stderr only, since stdout is the TCP stream. For manual testing
-it can listen on a port instead (and serves connections one after another):
+Logs go to stderr (or --log FILE), and nowhere when stderr is the TCP stream
+as well, which is how QEMU's guestfwd launches commands. For manual
+testing it can listen on a port instead (and serves connections one after another):
 
     python3 scripts/iscsi-target.py --listen 3260 disk.img
     qemu-img info iscsi://127.0.0.1:3260/iqn.2026-10.org.osmium:disk0/0
@@ -71,8 +72,11 @@ OR_KEYS = {"InitialR2T", "DataPDUInOrder", "DataSequenceInOrder"}
 AND_KEYS = {"ImmediateData"}
 
 
+LOG = sys.stderr
+
+
 def log(*args):
-    print("[iscsi-target]", *args, file=sys.stderr, flush=True)
+    print("[iscsi-target]", *args, file=LOG, flush=True)
 
 
 def parse_text(data):
@@ -841,7 +845,15 @@ def main():
     ap.add_argument("--address", help="TargetAddress for SendTargets (default: the connection's own)")
     ap.add_argument("--read-only", action="store_true", help="refuse writes")
     ap.add_argument("--self-test", action="store_true", help="test against a built-in initiator and exit")
+    ap.add_argument("--log", metavar="FILE", help="append logs to FILE instead of stderr")
     args = ap.parse_args()
+    global LOG
+    if args.log:
+        LOG = open(args.log, "a")
+    elif args.listen is None and not args.self_test and os.path.sameopenfile(1, 2):
+        # QEMU's guestfwd hands the connection over as stderr too, where a
+        # log line would corrupt the stream.
+        LOG = open(os.devnull, "w")
     if args.self_test:
         self_test()
         return

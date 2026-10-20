@@ -239,6 +239,47 @@ pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     }
 }
 
+/// Logs in to the iSCSI target QEMU's user network forwards to
+/// `10.0.2.100:3260` (`scripts/iscsi-target.py`), after a DHCP lease on
+/// `dev`, and round-trips a block on its LUN 0.
+pub fn iscsi(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
+    use osmium::hal::block::BlockDevice;
+    use osmium::iscsi::{IscsiDisk, Options, Stack};
+    use osmium::net::{DhcpClient, Instant, Interface, Ipv4Addr, SocketAddrV4, SocketSet};
+
+    const PORTAL: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 100), 3260);
+    let now = || Instant::from_nanos(now_ns());
+    let mut iface = Interface::new(dev, now_ns());
+    let mut sockets = SocketSet::new();
+    sockets.add(DhcpClient::new());
+    let start = now();
+    while iface.config().is_none() && now() - start < core::time::Duration::from_secs(5) {
+        iface.poll(now(), dev, &mut sockets);
+    }
+    if iface.config().is_none() {
+        println!("[iscsi] no DHCP lease");
+        return;
+    }
+    let net = Stack { iface: &mut iface, dev, sockets: &mut sockets, now_ns };
+    let opts = Options::new("iqn.2026-10.org.osmium:riscv-virt", "iqn.2026-10.org.osmium:disk0");
+    let mut disk = match IscsiDisk::connect(net, PORTAL, &opts) {
+        Ok(disk) => disk,
+        Err(e) => {
+            println!("[iscsi] login to {PORTAL} failed: {e:?}");
+            return;
+        }
+    };
+    let q = disk.inquiry();
+    println!("[iscsi] {PORTAL}: \"{}\" \"{}\", {} blocks of {}", q.vendor(), q.product(), disk.num_blocks(), disk.block_size());
+    match block_roundtrip(&mut disk) {
+        Ok(lba) => println!("[iscsi] wrote and read back block {lba}"),
+        Err(e) => println!("[iscsi] round trip failed: {e:?}"),
+    }
+    if let Err(e) = disk.logout() {
+        println!("[iscsi] logout: {e:?}");
+    }
+}
+
 /// Enumerates every device on `shared`'s root ports, then drives what it
 /// recognises: a mass-storage device gets a block written and read back
 /// while a keyboard's interrupt transfer is outstanding, which checks that
