@@ -82,6 +82,14 @@ impl Stack {
         }
     }
 
+    /// Lowest usable byte.
+    fn bottom(&self) -> usize {
+        match self {
+            Stack::Heap(s) => s.as_ptr() as usize,
+            Stack::Custom { base, .. } => base.as_ptr() as usize,
+        }
+    }
+
     /// One past the highest usable byte, 16-byte aligned.
     fn top(&self) -> usize {
         match self {
@@ -170,6 +178,12 @@ impl Task {
     /// per-CPU boot tasks run on stacks the kernel set up itself).
     pub fn kernel_stack_top(&self) -> Option<usize> {
         self._stack.as_ref().map(Stack::top)
+    }
+
+    /// The task's kernel stack, lowest to one past the highest usable
+    /// address, if it owns one. Trap paths use the bottom to detect overflow.
+    pub fn kernel_stack_range(&self) -> Option<core::ops::Range<usize>> {
+        self._stack.as_ref().map(|s| s.bottom()..s.top())
     }
 
     /// Returns true if this is a CPU's idle task.

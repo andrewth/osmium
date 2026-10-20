@@ -102,7 +102,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
 - ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction), per-CPU GDT/TSS (`CpuTables`) with IST stacks (`trap::set_ist`)
 - ✅ x86_64 user mode: `enter_user` (ring 3 via `iretq`), `trap::allow_from_user` for `int 0x80` system calls, `TrapFrame::from_user`
-- 🗺 Separate exception stacks on RISC-V and AArch64 (needed to survive a kernel stack overflow there)
+- ✅ RISC-V trap entry swaps through `sscratch` to a per-CPU `TrapCpu`: an exception stack when the interrupted kernel stack overflowed, a kernel stack for traps from U-mode, and a hook point for hypervisor guest exits
+- 🗺 Exception-stack switching on AArch64
 - 🗺 FPU/SIMD state save and restore; user-mode entry/return
 
 ### `osmium-sync`: synchronization

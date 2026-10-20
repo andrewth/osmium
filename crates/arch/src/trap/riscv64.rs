@@ -1,4 +1,7 @@
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use super::{Access, Interrupt, Trap};
+use crate::MAX_CPUS;
 
 #[cfg(all(bare, not(feature = "riscv-m-mode")))]
 core::arch::global_asm!(include_str!("riscv64_s.S"));
@@ -94,11 +97,116 @@ impl TrapFrame {
     }
 }
 
-/// Points this CPU's trap vector at the Osmium entry stub. Call on every CPU.
+/// Offsets into [`TrapCpu`], shared with the entry stub (and with
+/// hypervisor entry paths built on it).
+pub mod offsets {
+    /// One GPR save slot for the stub (`t0`).
+    pub const SCRATCH: usize = 0x00;
+    /// Top of the stack for traps from U-mode (or a guest).
+    pub const KERNEL_SP: usize = 0x08;
+    /// Top of the emergency stack used when the interrupted stack overflowed.
+    pub const EXCEPTION_SP: usize = 0x10;
+    /// Lowest valid address of the current kernel stack (0 = no check).
+    pub const STACK_LO: usize = 0x18;
+    /// Reserved for the hypervisor: `*mut` guest GPRs, null when no vCPU runs.
+    pub const GUEST: usize = 0x20;
+    /// Reserved for the hypervisor.
+    pub const RESERVED: usize = 0x28;
+    /// A second GPR save slot for the stub (`t1`).
+    pub const SCRATCH2: usize = 0x30;
+}
+
+/// Per-CPU state the trap entry finds through `sscratch` (`mscratch`), which
+/// always points here once [`install`] has run.
+///
+/// On entry the stub swaps `sp` with `sscratch` and picks the stack for the
+/// frame: [`TrapCpu::set_kernel_stack`]'s stack for traps from U-mode, the
+/// [`TrapCpu::set_exception_stack`] stack if the interrupted kernel stack
+/// would go below [`TrapCpu::set_stack_limit`], and otherwise the interrupted
+/// stack itself.
+#[repr(C, align(64))]
+pub struct TrapCpu {
+    scratch: AtomicU64,
+    kernel_sp: AtomicU64,
+    exception_sp: AtomicU64,
+    stack_lo: AtomicU64,
+    guest: AtomicU64,
+    reserved: AtomicU64,
+    scratch2: AtomicU64,
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(TrapCpu, kernel_sp) == offsets::KERNEL_SP);
+    assert!(core::mem::offset_of!(TrapCpu, exception_sp) == offsets::EXCEPTION_SP);
+    assert!(core::mem::offset_of!(TrapCpu, stack_lo) == offsets::STACK_LO);
+    assert!(core::mem::offset_of!(TrapCpu, guest) == offsets::GUEST);
+    assert!(core::mem::offset_of!(TrapCpu, reserved) == offsets::RESERVED);
+    assert!(core::mem::offset_of!(TrapCpu, scratch2) == offsets::SCRATCH2);
+};
+
+static TRAP_CPUS: [TrapCpu; MAX_CPUS] = [const {
+    TrapCpu {
+        scratch: AtomicU64::new(0),
+        kernel_sp: AtomicU64::new(0),
+        exception_sp: AtomicU64::new(0),
+        stack_lo: AtomicU64::new(0),
+        guest: AtomicU64::new(0),
+        reserved: AtomicU64::new(0),
+        scratch2: AtomicU64::new(0),
+    }
+}; MAX_CPUS];
+
+impl TrapCpu {
+    /// The calling CPU's state (by `osmium_arch::cpu::current_id`).
+    pub fn current() -> &'static TrapCpu {
+        &TRAP_CPUS[crate::cpu::current_id()]
+    }
+
+    /// Sets the stack (top address) used for traps from U-mode. Update it
+    /// on every switch to a task that runs user code.
+    pub fn set_kernel_stack(&self, top: usize) {
+        self.kernel_sp.store(top as u64, Ordering::Relaxed);
+    }
+
+    /// Sets the emergency stack (top address) used when the interrupted
+    /// kernel stack has overflowed.
+    pub fn set_exception_stack(&self, top: usize) {
+        self.exception_sp.store(top as u64, Ordering::Relaxed);
+    }
+
+    /// Sets the lowest valid address of the kernel stack about to run
+    /// (0 disables the check). Update it on every context switch.
+    pub fn set_stack_limit(&self, lo: usize) {
+        self.stack_lo.store(lo as u64, Ordering::Relaxed);
+    }
+
+    /// Returns true if `frame` was taken because its stack overflowed, i.e.
+    /// it was saved on the exception stack.
+    pub fn overflowed(&self, frame: &TrapFrame) -> bool {
+        let lo = self.stack_lo.load(Ordering::Relaxed);
+        frame.status & SPP_OR_MPP != 0 && lo != 0 && (frame.x[2].wrapping_sub(size_of::<TrapFrame>() as u64)) < lo
+    }
+
+    /// Address of this structure, as kept in `sscratch`.
+    pub fn as_ptr(&self) -> *const TrapCpu {
+        self
+    }
+}
+
+#[cfg(not(feature = "riscv-m-mode"))]
+const SPP_OR_MPP: u64 = 1 << 8;
+#[cfg(feature = "riscv-m-mode")]
+const SPP_OR_MPP: u64 = 0b11 << 11;
+
+/// Points this CPU's trap vector at the Osmium entry stub and `sscratch`
+/// (`mscratch`) at its [`TrapCpu`]. Call on every CPU, after
+/// `osmium_arch::cpu::set_current_id`.
 ///
 /// # Safety
-/// Replaces the current trap vector. Traps are handled on the current stack,
-/// which must be a valid kernel stack whenever a trap can occur.
+/// Replaces the current trap vector and scratch register, which must not be
+/// used for anything else from now on. Kernel-mode traps are handled on the
+/// interrupted stack, which must be valid unless the overflow check (see
+/// [`TrapCpu`]) catches it.
 pub unsafe fn install() {
     #[cfg(bare)]
     {
@@ -106,15 +214,17 @@ pub unsafe fn install() {
             fn osmium_trap_entry();
         }
         let entry = osmium_trap_entry as *const () as usize;
-        // SAFETY: the entry stub is 4-byte aligned; direct mode.
+        let cpu = TrapCpu::current().as_ptr() as usize;
+        // SAFETY: the entry stub is 4-byte aligned (direct mode), and the
+        // scratch register must point at TrapCpu before the first trap.
         #[cfg(not(feature = "riscv-m-mode"))]
         unsafe {
-            core::arch::asm!("csrw stvec, {}", in(reg) entry)
+            core::arch::asm!("csrw sscratch, {}", "csrw stvec, {}", in(reg) cpu, in(reg) entry)
         };
         // SAFETY: as above.
         #[cfg(feature = "riscv-m-mode")]
         unsafe {
-            core::arch::asm!("csrw mtvec, {}", in(reg) entry)
+            core::arch::asm!("csrw mscratch, {}", "csrw mtvec, {}", in(reg) cpu, in(reg) entry)
         };
     }
 }

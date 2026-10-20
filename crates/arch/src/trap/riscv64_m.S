@@ -2,39 +2,65 @@
 .balign 4
 .globl osmium_trap_entry
 osmium_trap_entry:
-    addi sp, sp, -288
-    sd x1, 8(sp)
-    sd x3, 24(sp)
-    sd x4, 32(sp)
-    sd x5, 40(sp)
-    sd x6, 48(sp)
-    sd x7, 56(sp)
-    sd x8, 64(sp)
-    sd x9, 72(sp)
-    sd x10, 80(sp)
-    sd x11, 88(sp)
-    sd x12, 96(sp)
-    sd x13, 104(sp)
-    sd x14, 112(sp)
-    sd x15, 120(sp)
-    sd x16, 128(sp)
-    sd x17, 136(sp)
-    sd x18, 144(sp)
-    sd x19, 152(sp)
-    sd x20, 160(sp)
-    sd x21, 168(sp)
-    sd x22, 176(sp)
-    sd x23, 184(sp)
-    sd x24, 192(sp)
-    sd x25, 200(sp)
-    sd x26, 208(sp)
-    sd x27, 216(sp)
-    sd x28, 224(sp)
-    sd x29, 232(sp)
-    sd x30, 240(sp)
-    sd x31, 248(sp)
-    addi t0, sp, 288
-    sd t0, 16(sp)
+    // sp <-> mscratch: sp = this CPU's TrapCpu, mscratch = interrupted sp.
+    csrrw sp, mscratch, sp
+    sd t0, 0x00(sp)
+    sd t1, 0x30(sp)
+    // HOOK: guest exits (riscv64-hs) branch away here, before the
+    // stack decision; t0/t1 are saved in TrapCpu.
+    // Pick the stack for the frame; t0 = frame base.
+    csrr t1, mstatus
+    li t0, 0x1800
+    and t1, t1, t0        // MPP: 0 = from U-mode
+    beqz t1, 2f
+    csrr t0, mscratch
+    addi t0, t0, -288
+    ld t1, 0x18(sp)
+    bgeu t0, t1, 3f
+    // Interrupted sp is below the current stack's limit: overflow.
+    ld t0, 0x10(sp)
+    addi t0, t0, -288
+    j 3f
+2:  // From user mode: the kernel stack for this CPU's running task.
+    ld t0, 0x08(sp)
+    addi t0, t0, -288
+3:
+    sd x1, 8(t0)
+    sd x3, 24(t0)
+    sd x4, 32(t0)
+    sd x7, 56(t0)
+    sd x8, 64(t0)
+    sd x9, 72(t0)
+    sd x10, 80(t0)
+    sd x11, 88(t0)
+    sd x12, 96(t0)
+    sd x13, 104(t0)
+    sd x14, 112(t0)
+    sd x15, 120(t0)
+    sd x16, 128(t0)
+    sd x17, 136(t0)
+    sd x18, 144(t0)
+    sd x19, 152(t0)
+    sd x20, 160(t0)
+    sd x21, 168(t0)
+    sd x22, 176(t0)
+    sd x23, 184(t0)
+    sd x24, 192(t0)
+    sd x25, 200(t0)
+    sd x26, 208(t0)
+    sd x27, 216(t0)
+    sd x28, 224(t0)
+    sd x29, 232(t0)
+    sd x30, 240(t0)
+    sd x31, 248(t0)
+    ld t1, 0x00(sp)
+    sd t1, 40(t0)
+    ld t1, 0x30(sp)
+    sd t1, 48(t0)
+    csrr t1, mscratch
+    sd t1, 16(t0)
+    csrw mscratch, sp
+    mv sp, t0
     csrr t0, mepc
     sd t0, 256(sp)
     csrr t0, mstatus
@@ -79,5 +105,5 @@ osmium_trap_entry:
     ld x29, 232(sp)
     ld x30, 240(sp)
     ld x31, 248(sp)
-    addi sp, sp, 288
+    ld sp, 16(sp)
     mret
