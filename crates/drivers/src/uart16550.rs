@@ -1,6 +1,6 @@
 //! NS16550A-compatible UART.
 
-use osmium_hal::mmio::IoMem;
+use osmium_hal::mmio::{IoMem, IoMemError};
 use osmium_hal::serial::SerialPort;
 
 const RBR_THR: u8 = 0;
@@ -23,8 +23,13 @@ pub trait UartIo {
     fn write(&self, reg: u8, value: u8);
 }
 
+/// Highest register number.
+const LAST_REG: u8 = 7;
+
 /// Registers in memory, `1 << shift` bytes apart (the device tree's
 /// `reg-shift`), accessed as bytes.
+///
+/// Only the low three bits of a register number are used.
 pub struct Mmio {
     io: IoMem,
     shift: u8,
@@ -32,17 +37,36 @@ pub struct Mmio {
 
 impl Mmio {
     /// Uses the registers in `io` with the given register spacing.
+    ///
+    /// # Panics
+    /// If `io` does not hold all eight registers at that spacing; see
+    /// [`Mmio::try_new`].
     pub fn new(io: IoMem, shift: u8) -> Self {
-        Self { io, shift }
+        Self::try_new(io, shift).expect("UART registers outside window")
+    }
+
+    /// Uses the registers in `io` with the given register spacing, or fails
+    /// if `io` does not hold all eight registers at that spacing.
+    pub fn try_new(io: IoMem, shift: u8) -> Result<Self, IoMemError> {
+        let last = (LAST_REG as usize).checked_shl(shift as u32).filter(|&o| o >> shift == LAST_REG as usize);
+        match last {
+            Some(o) if o < io.len() => Ok(Self { io, shift }),
+            _ => Err(IoMemError),
+        }
+    }
+
+    fn offset(&self, reg: u8) -> usize {
+        // Cannot overflow or leave the window: checked in `try_new`.
+        ((reg & LAST_REG) as usize) << self.shift
     }
 }
 
 impl UartIo for Mmio {
     fn read(&self, reg: u8) -> u8 {
-        self.io.read((reg as usize) << self.shift).expect("UART register outside window")
+        self.io.read(self.offset(reg)).expect("checked in try_new")
     }
     fn write(&self, reg: u8, value: u8) {
-        self.io.write((reg as usize) << self.shift, value).expect("UART register outside window");
+        self.io.write(self.offset(reg), value).expect("checked in try_new");
     }
 }
 
@@ -54,12 +78,22 @@ pub struct Pio {
 
 #[cfg(target_arch = "x86_64")]
 impl Pio {
-    /// Uses ports `base..base + 8`.
+    /// Uses ports `base..base + 8`. Only the low three bits of a register
+    /// number are used.
     ///
     /// # Safety
     /// The caller must own those ports.
+    ///
+    /// # Panics
+    /// If the range runs past port 0xffff.
     pub const unsafe fn new(base: u16) -> Self {
+        assert!(base.checked_add(LAST_REG as u16).is_some(), "UART ports past 0xffff");
         Self { base }
+    }
+
+    fn port(&self, reg: u8) -> u16 {
+        // Cannot overflow: checked in `new`.
+        self.base + (reg & LAST_REG) as u16
     }
 }
 
@@ -67,11 +101,11 @@ impl Pio {
 impl UartIo for Pio {
     fn read(&self, reg: u8) -> u8 {
         // SAFETY: ownership of the ports was asserted in `new`.
-        unsafe { osmium_arch::x86_64::inb(self.base + reg as u16) }
+        unsafe { osmium_arch::x86_64::inb(self.port(reg)) }
     }
     fn write(&self, reg: u8, value: u8) {
         // SAFETY: ownership of the ports was asserted in `new`.
-        unsafe { osmium_arch::x86_64::outb(self.base + reg as u16, value) }
+        unsafe { osmium_arch::x86_64::outb(self.port(reg), value) }
     }
 }
 
@@ -177,5 +211,21 @@ mod tests {
         assert_eq!(uart.read_byte(), None);
         drop(uart);
         assert_eq!(regs[0], b'A');
+    }
+
+    #[test]
+    fn mmio_rejects_unreachable_registers() {
+        let mut regs = [0u8; 32];
+        let base = regs.as_mut_ptr();
+        let io = |len| {
+            // SAFETY: the window lies within a local array.
+            unsafe { IoMem::new(base, len) }
+        };
+        assert!(Mmio::try_new(io(29), 2).is_ok(), "register 7 at offset 28");
+        assert!(Mmio::try_new(io(28), 2).is_err());
+        assert!(Mmio::try_new(io(32), 3).is_err());
+        assert!(Mmio::try_new(io(32), 62).is_err(), "7 << 62 overflows");
+        assert!(Mmio::try_new(io(32), 64).is_err());
+        assert!(Mmio::try_new(io(32), 255).is_err());
     }
 }

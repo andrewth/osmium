@@ -2,12 +2,18 @@
 //! to local-APIC vectors.
 
 use osmium_hal::mmio::IoMem;
-use osmium_sync::IrqSpinLock;
+use osmium_sync::{IrqDisabled, IrqSpinLock, SpinLockGuard};
+
+// A held `IoApic::lock`, which owns the select/window pair.
+type Selected<'a> = SpinLockGuard<'a, (), IrqDisabled>;
 
 const IOREGSEL: usize = 0x00;
 const IOWIN: usize = 0x10;
 const REG_VERSION: u32 = 0x01;
 const REG_REDIRECTION: u32 = 0x10;
+/// IOREGSEL is 8 bits wide and the redirection table starts at 0x10 with
+/// two registers per entry, so at most 120 entries are addressable.
+const MAX_LINES: u32 = 120;
 
 const MASKED: u32 = 1 << 16;
 const LEVEL: u32 = 1 << 15;
@@ -40,21 +46,26 @@ impl IoApic {
         Self { io, gsi_base, lock: IrqSpinLock::new(()) }
     }
 
-    fn read(&self, reg: u32) -> u32 {
-        let _g = self.lock.lock();
+    // The `_locked` accessors require `self.lock` to be held; taking its
+    // guard as an argument makes that hard to forget.
+    fn read_locked(&self, _: &Selected<'_>, reg: u32) -> u32 {
         let _ = self.io.write(IOREGSEL, reg);
         self.io.read(IOWIN).expect("I/O APIC window too small")
     }
 
-    fn write(&self, reg: u32, v: u32) {
-        let _g = self.lock.lock();
+    fn write_locked(&self, _: &Selected<'_>, reg: u32, v: u32) {
         let _ = self.io.write(IOREGSEL, reg);
         let _ = self.io.write(IOWIN, v);
     }
 
-    /// Number of redirection entries (lines).
+    fn read(&self, reg: u32) -> u32 {
+        self.read_locked(&self.lock.lock(), reg)
+    }
+
+    /// Number of redirection entries (lines), at most 120 however many the
+    /// version register claims.
     pub fn lines(&self) -> u32 {
-        (self.read(REG_VERSION) >> 16 & 0xff) + 1
+        ((self.read(REG_VERSION) >> 16 & 0xff) + 1).min(MAX_LINES)
     }
 
     /// Returns true if this I/O APIC handles `gsi`.
@@ -78,22 +89,32 @@ impl IoApic {
         if mode.level {
             low |= LEVEL;
         }
-        // Mask while changing, then write the destination, then unmask.
-        self.write(reg, MASKED);
-        self.write(reg + 1, (dest as u32) << 24);
-        self.write(reg, low);
+        // Mask while changing, then write the destination, then unmask, all
+        // under one lock hold.
+        let g = self.lock.lock();
+        self.write_locked(&g, reg, MASKED);
+        self.write_locked(&g, reg + 1, (dest as u32) << 24);
+        self.write_locked(&g, reg, low);
+    }
+
+    /// Updates the low half of `gsi`'s entry with one lock hold, so a
+    /// concurrent update is not lost.
+    fn modify(&self, gsi: u32, f: impl FnOnce(u32) -> u32) {
+        // `entry` reads the version register, so call it before locking.
+        let reg = self.entry(gsi);
+        let g = self.lock.lock();
+        let v = self.read_locked(&g, reg);
+        self.write_locked(&g, reg, f(v));
     }
 
     /// Masks `gsi`.
     pub fn mask(&self, gsi: u32) {
-        let reg = self.entry(gsi);
-        self.write(reg, self.read(reg) | MASKED);
+        self.modify(gsi, |v| v | MASKED);
     }
 
     /// Unmasks `gsi`.
     pub fn unmask(&self, gsi: u32) {
-        let reg = self.entry(gsi);
-        self.write(reg, self.read(reg) & !MASKED);
+        self.modify(gsi, |v| v & !MASKED);
     }
 }
 
@@ -116,5 +137,15 @@ mod tests {
         drop(apic);
         assert_eq!(regs[IOREGSEL / 4], REG_REDIRECTION + 8, "entry 4, low half written last");
         assert_eq!(regs[IOWIN / 4], 40, "vector 40, edge, active high, unmasked");
+    }
+
+    #[test]
+    fn lines_capped_by_register_select_width() {
+        let mut regs = [0u32; 8];
+        regs[IOWIN / 4] = 0xff << 16; // claims 256 lines
+        // SAFETY: the window covers a local array.
+        let apic = IoApic::new(unsafe { IoMem::new(regs.as_mut_ptr().cast(), 32) }, 0);
+        assert_eq!(apic.lines(), 120);
+        assert!(apic.handles(119) && !apic.handles(120));
     }
 }

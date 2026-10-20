@@ -45,6 +45,13 @@ pub enum RegisterError {
     Busy,
 }
 
+/// Most interrupts [`IrqTable::handle_pending`] handles in one call.
+///
+/// Large enough that ordinary bursts (every line of a controller firing at
+/// once) drain in one trap, small enough that a storm returns to the
+/// interrupted code within a bounded time.
+pub const MAX_CLAIMS_PER_CALL: usize = 64;
+
 /// Maps interrupt numbers below `N` to handlers.
 ///
 /// Registration takes a write lock; dispatch takes a read lock, so CPUs
@@ -88,11 +95,18 @@ impl<const N: usize> IrqTable<N> {
     }
 
     /// Claims, dispatches and completes interrupts from `ctrl` until none
-    /// are pending. Returns how many were handled. Call this from the
-    /// external-interrupt trap path.
+    /// are pending, or until [`MAX_CLAIMS_PER_CALL`] have been handled.
+    /// Returns how many were handled. Call this from the external-interrupt
+    /// trap path.
+    ///
+    /// The bound keeps an interrupt storm (a line that re-asserts as fast as
+    /// it is completed) from livelocking the caller: interrupts still pending
+    /// stay asserted at the controller, so the trap is taken again once the
+    /// caller has returned and made progress.
     pub fn handle_pending(&self, ctrl: &dyn InterruptController) -> usize {
         let mut n = 0;
-        while let Some(irq) = ctrl.claim() {
+        while n < MAX_CLAIMS_PER_CALL {
+            let Some(irq) = ctrl.claim() else { break };
             self.dispatch(irq);
             ctrl.complete(irq);
             n += 1;
@@ -150,5 +164,24 @@ mod tests {
         assert_eq!(*ctrl.completed.lock(), [9, 5, 3], "spurious IRQs are completed too");
         assert!(TABLE.unregister(3).is_some());
         assert!(!TABLE.dispatch(3));
+    }
+
+    /// A controller with one line that is pending again as soon as it is
+    /// completed.
+    struct Storm;
+
+    impl InterruptController for Storm {
+        fn enable(&self, _: u32) {}
+        fn disable(&self, _: u32) {}
+        fn claim(&self) -> Option<u32> {
+            Some(1)
+        }
+        fn complete(&self, _: u32) {}
+    }
+
+    #[test]
+    fn storm_is_bounded() {
+        static TABLE: IrqTable<4> = IrqTable::new();
+        assert_eq!(TABLE.handle_pending(&Storm), MAX_CLAIMS_PER_CALL);
     }
 }

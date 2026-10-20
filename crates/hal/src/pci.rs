@@ -349,17 +349,15 @@ impl<'a, C: ConfigAccess + ?Sized> Function<'a, C> {
             ((hi as u64) << 32 | (lo & !0xf) as u64, (mask_hi as u64) << 32 | (mask_lo & !0xf) as u64)
         } else {
             let flags = if kind == BarKind::Io { 3 } else { 0xf };
-            // An unimplemented BAR reads back zero; only then extend the
-            // mask to 64 bits.
-            let mask = match mask_lo & !flags {
-                0 => 0,
-                m => m as u64 | 0xffff_ffff_0000_0000,
-            };
-            ((lo & !flags) as u64, mask)
+            ((lo & !flags) as u64, (mask_lo & !flags) as u64)
         };
         self.set_command(cmd);
 
-        (mask != 0).then(|| Bar { index, kind, address, size: (!mask).wrapping_add(1) })
+        // The size is the lowest writable address bit. The bits above it
+        // need not all read back as ones: an I/O BAR may decode only 16
+        // bits, and a 64-bit BAR below 4 GiB may hardwire its upper half to
+        // zero. An unimplemented BAR reads back zero.
+        (mask != 0).then(|| Bar { index, kind, address, size: 1 << mask.trailing_zeros() })
     }
 
     /// Programs `bar` to decode at `address`, which must be aligned to its
@@ -495,11 +493,13 @@ mod tests {
     use std::vec::Vec;
 
     /// Configuration space with BARs that decode like hardware: writes keep
-    /// only the address bits above the BAR's size.
+    /// only the address bits above the BAR's size, and bits in `hardwired`
+    /// read back as zero.
     #[derive(Default)]
     struct FakeConfig {
         space: RefCell<BTreeMap<(Address, u16), u32>>,
         bar_sizes: BTreeMap<(Address, u16), u64>,
+        hardwired: BTreeMap<(Address, u16), u32>,
     }
 
     impl FakeConfig {
@@ -521,6 +521,7 @@ mod tests {
                 None if is_bar && !upper_half => 0,
                 None => v,
             };
+            let v = v & !self.hardwired.get(&(a, off)).copied().unwrap_or(0);
             self.set(a, off, v);
         }
         fn max_bus(&self) -> u8 {
@@ -571,6 +572,38 @@ mod tests {
 
         f.enable_memory_and_dma();
         assert_eq!(f.command() & 6, 6);
+    }
+
+    #[test]
+    fn bar_sizes_with_zero_upper_bits() {
+        let mut cfg = FakeConfig::default();
+        let a = Address::new(0, 3, 0);
+        cfg.set(a, reg::VENDOR_DEVICE, 0x1000_1af4);
+        cfg.set(a, reg::HEADER_TYPE, 0);
+        // BAR0: 32-byte I/O BAR at 0xc040 decoding only 16 address bits.
+        cfg.set(a, reg::BAR0, 0xc041);
+        cfg.bar_sizes.insert((a, reg::BAR0), 0x20);
+        cfg.hardwired.insert((a, reg::BAR0), 0xffff_0000);
+        // BAR1: 1 MiB 64-bit prefetchable BAR whose upper half is hardwired
+        // to zero (it can only decode below 4 GiB).
+        cfg.set(a, reg::BAR0 + 4, 0b1100);
+        cfg.set(a, reg::BAR0 + 8, 0);
+        cfg.bar_sizes.insert((a, reg::BAR0 + 4), 0x10_0000);
+        cfg.hardwired.insert((a, reg::BAR0 + 8), !0);
+        // BAR3: 8 GiB 64-bit BAR: the low dword has no writable address bits.
+        cfg.set(a, reg::BAR0 + 12, 0b0100);
+        cfg.set(a, reg::BAR0 + 16, 0);
+        cfg.bar_sizes.insert((a, reg::BAR0 + 12), 1 << 33);
+        cfg.hardwired.insert((a, reg::BAR0 + 16), 1);
+
+        let f = Function::new(&cfg, a).unwrap();
+        let io = f.bar(0).unwrap();
+        assert_eq!((io.kind, io.address, io.size), (BarKind::Io, 0xc040, 0x20));
+        let mem = f.bar(1).unwrap();
+        assert_eq!((mem.kind, mem.size), (BarKind::Memory64 { prefetchable: true }, 0x10_0000));
+        let big = f.bar(3).unwrap();
+        assert_eq!((big.kind, big.size), (BarKind::Memory64 { prefetchable: false }, 1 << 33));
+        assert_eq!(cfg.read32(a, reg::BAR0), 0xc041, "restored after probing");
     }
 
     #[test]

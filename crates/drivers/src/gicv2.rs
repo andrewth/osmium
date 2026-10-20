@@ -20,8 +20,10 @@ const GICC_PMR: usize = 0x04;
 const GICC_IAR: usize = 0x0c;
 const GICC_EOIR: usize = 0x10;
 
-const SPURIOUS: u32 = 1023;
 const FIRST_SPI: u32 = 32;
+/// Interrupt ids 1020–1023 are special (spurious and reserved), so no
+/// distributor implements more than 1020 lines.
+const MAX_IRQS: u32 = 1020;
 
 /// A GICv2: one distributor shared by all CPUs plus a banked CPU interface.
 ///
@@ -60,10 +62,17 @@ impl GicV2 {
         let _ = self.gicc.write(GICC_CTLR, 1u32);
     }
 
-    /// Number of interrupt lines the distributor implements.
+    /// Number of interrupt lines the distributor implements (at most 1020).
     pub fn num_irqs(&self) -> u32 {
         let typer: u32 = self.gicd.read(GICD_TYPER).unwrap_or(0);
-        ((typer & 0x1f) + 1) * 32
+        (((typer & 0x1f) + 1) * 32).min(MAX_IRQS)
+    }
+
+    /// Returns true if `irq` names a line the distributor implements. The
+    /// per-interrupt operations ignore any other number, which would
+    /// otherwise land in a neighbouring register bank.
+    fn valid(&self, irq: u32) -> bool {
+        irq < self.num_irqs()
     }
 
     fn set_byte(&self, base: usize, irq: u32, value: u8) {
@@ -73,8 +82,11 @@ impl GicV2 {
 
 impl InterruptController for GicV2 {
     /// Enables `irq`; shared peripheral interrupts are also routed to the
-    /// current CPU.
+    /// current CPU. Does nothing if the distributor lacks `irq`.
     fn enable(&self, irq: u32) {
+        if !self.valid(irq) {
+            return;
+        }
         if irq >= FIRST_SPI {
             let cpu = osmium_arch::cpu::current_id() % 8;
             self.set_byte(GICD_ITARGETSR, irq, 1 << cpu);
@@ -82,7 +94,11 @@ impl InterruptController for GicV2 {
         let _ = self.gicd.write(GICD_ISENABLER + (irq as usize / 32) * 4, 1u32 << (irq % 32));
     }
 
+    /// Does nothing if the distributor lacks `irq`.
     fn disable(&self, irq: u32) {
+        if !self.valid(irq) {
+            return;
+        }
         let _ = self.gicd.write(GICD_ICENABLER + (irq as usize / 32) * 4, 1u32 << (irq % 32));
     }
 
@@ -94,16 +110,26 @@ impl InterruptController for GicV2 {
         if id < 16 {
             self.sgi_source.get().store(iar & 0x1c00, Ordering::Relaxed);
         }
-        (id != SPURIOUS).then_some(id)
+        // 1020–1023 are not interrupts: 1023 is spurious, and the others
+        // are only returned to secure software or reserved.
+        (id < MAX_IRQS).then_some(id)
     }
 
+    /// Ignores ids [`InterruptController::claim`] never returns.
     fn complete(&self, irq: u32) {
+        if irq >= MAX_IRQS {
+            return;
+        }
         let source = if irq < 16 { self.sgi_source.get().load(Ordering::Relaxed) } else { 0 };
         let _ = self.gicc.write(GICC_EOIR, irq | source);
     }
 
-    /// Higher `priority` is more urgent (the GIC encodes the inverse).
+    /// Higher `priority` is more urgent (the GIC encodes the inverse). Does
+    /// nothing if the distributor lacks `irq`.
     fn set_priority(&self, irq: u32, priority: u8) {
+        if !self.valid(irq) {
+            return;
+        }
         self.set_byte(GICD_IPRIORITYR, irq, 0xff - priority);
     }
 }
@@ -152,5 +178,25 @@ mod tests {
         drop(gic);
         assert_eq!(d[GICD_SGIR / 4], 0b1010 << 16 | 1);
         assert_eq!(c[GICC_EOIR / 4], 2 << 10 | 1, "EOI carries the source CPU");
+    }
+
+    #[test]
+    fn out_of_range_irqs_are_ignored() {
+        let mut d = [0u32; 0x1000 / 4];
+        let mut c = [0u32; 0x100 / 4];
+        d[GICD_TYPER / 4] = 2; // 96 lines
+        c[GICC_IAR / 4] = 1022;
+        // SAFETY: the windows cover local arrays.
+        let gic = unsafe { GicV2::new(IoMem::new(d.as_mut_ptr().cast(), 0x1000), IoMem::new(c.as_mut_ptr().cast(), 0x100)) };
+        // Line 1024 + 32 would be an ICENABLER write; 96 is past the end.
+        gic.enable(1024 + 32);
+        gic.enable(96);
+        gic.disable(u32::MAX);
+        gic.set_priority(96, 1);
+        assert_eq!(gic.claim(), None, "1022 is not an interrupt");
+        gic.complete(1023);
+        drop(gic);
+        assert!(d.iter().enumerate().all(|(i, &v)| i == GICD_TYPER / 4 || v == 0));
+        assert_eq!(c[GICC_EOIR / 4], 0);
     }
 }

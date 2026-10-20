@@ -52,16 +52,16 @@ impl Pl011 {
     }
 
     /// Programs 8N1 with FIFOs. With `Some((clock_hz, baud))` it also sets
-    /// the divisor; with `None` the firmware's baud rate is kept.
+    /// the divisor; with `None` the firmware's baud rate is kept. It is also
+    /// kept if `clock / (16 * baud)` does not fit the divisor registers: a
+    /// `baud` of 0, or one too high or too low for the clock.
     pub fn init(&mut self, clock_and_baud: Option<(u32, u32)>) {
         let r = self.regs();
         r.cr.write(0);
         while r.fr.read() & FR_BUSY != 0 {
             core::hint::spin_loop();
         }
-        if let Some((clock, baud)) = clock_and_baud {
-            // Divisor in 1/64ths: clock / (16 * baud) * 64, rounded.
-            let div64 = (clock as u64 * 4 + baud as u64 / 2) / baud as u64;
+        if let Some(div64) = clock_and_baud.and_then(|(clock, baud)| divisor64(clock, baud)) {
             r.ibrd.write((div64 >> 6) as u32);
             r.fbrd.write((div64 & 0x3f) as u32);
         }
@@ -74,6 +74,15 @@ impl Pl011 {
     pub fn enable_rx_interrupt(&mut self) {
         self.regs().imsc.set_bits(IMSC_RXIM);
     }
+}
+
+/// The baud divisor in 1/64ths, `clock / (16 * baud) * 64` rounded, or
+/// `None` if `baud` is 0 or the divisor is outside the hardware's range
+/// (integer part 1 to 65535, with no fraction at 65535).
+fn divisor64(clock: u32, baud: u32) -> Option<u64> {
+    let baud = baud as u64;
+    let div64 = (clock as u64 * 4 + baud / 2).checked_div(baud)?;
+    (64..=0xffff << 6).contains(&div64).then_some(div64)
 }
 
 impl SerialPort for Pl011 {
@@ -117,6 +126,23 @@ mod tests {
         assert_eq!(regs[0], b'z' as u32);
         // 24 MHz / (16 * 115200) = 13.02 -> IBRD 13, FBRD 1.
         assert_eq!((regs[0x24 / 4], regs[0x28 / 4]), (13, 1));
+        assert_eq!(regs[0x30 / 4], CR_UARTEN | CR_TXE | CR_RXE);
+    }
+
+    #[test]
+    fn unrepresentable_baud_keeps_the_divisor() {
+        assert_eq!(divisor64(24_000_000, 0), None);
+        assert_eq!(divisor64(24_000_000, 3_000_000), None, "divisor 0.5");
+        assert_eq!(divisor64(24_000_000, 1_500_000), Some(64), "divisor 1");
+        assert_eq!(divisor64(u32::MAX, 1), None, "divisor above 65535");
+
+        let mut regs = [0u32; 0x1000 / 4];
+        regs[0x24 / 4] = 26;
+        // SAFETY: the window covers a local array.
+        let mut uart = Pl011::new(unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) }).unwrap();
+        uart.init(Some((24_000_000, 0)));
+        drop(uart);
+        assert_eq!(regs[0x24 / 4], 26, "firmware divisor kept");
         assert_eq!(regs[0x30 / 4], CR_UARTEN | CR_TXE | CR_RXE);
     }
 }

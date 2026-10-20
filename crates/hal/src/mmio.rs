@@ -179,11 +179,17 @@ impl IoMem {
 
     fn ptr<T>(&self, offset: usize) -> Result<*mut T, IoMemError> {
         let size = core::mem::size_of::<T>();
-        if offset.checked_add(size).is_none_or(|end| end > self.len) || !offset.is_multiple_of(size) {
+        if offset.checked_add(size).is_none_or(|end| end > self.len) {
             return Err(IoMemError);
         }
         // SAFETY: bounds checked above.
-        Ok(unsafe { self.base.add(offset) }.cast())
+        let p = unsafe { self.base.add(offset) };
+        // The address itself must be aligned, not just the offset: the base
+        // of a sub-window from `slice` need not be.
+        if !(p as usize).is_multiple_of(size) {
+            return Err(IoMemError);
+        }
+        Ok(p.cast())
     }
 
     /// Reads the register at `offset`.
@@ -235,7 +241,8 @@ mod tests {
 
     #[test]
     fn iomem_bounds_and_alignment() {
-        let mut backing = [0u32; 4];
+        // u64 elements, so the window's base is 8-byte aligned.
+        let mut backing = [0u64; 2];
         // SAFETY: the window covers a local array.
         let io = unsafe { IoMem::new(backing.as_mut_ptr().cast(), 16) };
         io.write::<u32>(4, 0xdead_beef).unwrap();
@@ -246,7 +253,20 @@ mod tests {
         assert_eq!(io.slice(8, 8).unwrap().read::<u64>(0), Ok(0));
         assert!(io.slice(12, 8).is_err());
         drop(io);
-        assert_eq!(backing[1], 0xdead_beef);
+        assert_eq!(backing[0] >> 32, 0xdead_beef);
+    }
+
+    #[test]
+    fn alignment_is_of_the_address_not_the_offset() {
+        let mut backing = [0u64; 2];
+        // SAFETY: the window covers a local array.
+        let io = unsafe { IoMem::new(backing.as_mut_ptr().cast(), 16) };
+        let odd = io.slice(1, 12).unwrap();
+        assert_eq!(odd.read::<u32>(0), Err(IoMemError), "base + 1 is misaligned");
+        assert_eq!(odd.write::<u16>(4, 1), Err(IoMemError));
+        assert_eq!(odd.read::<u32>(3), Ok(0), "base + 4 is aligned");
+        assert_eq!(odd.read::<u8>(0), Ok(0));
+        assert_eq!(io.slice(4, 12).unwrap().read::<u64>(0), Err(IoMemError));
     }
 
     #[test]
