@@ -27,6 +27,8 @@ use osmium::drivers::virtio::blk::VirtioBlk;
 use osmium::drivers::virtio::net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
 use osmium::drivers::plic::Plic;
+use osmium::drivers::ahci::{self, Ahci};
+use osmium::drivers::nvme::{self, Nvme};
 use osmium::drivers::xhci::Xhci;
 use osmium::hal::block::BlockDevice;
 use osmium::hal::irq::{InterruptController, IrqTable};
@@ -284,22 +286,27 @@ fn pcie_host(fdt: &Fdt<'_>) -> Option<PcieHost> {
     Some(PcieHost { ecam: (base, len?), mem })
 }
 
-/// Finds the first xHCI controller, assigns its BARs and enables it; returns
-/// its address and BAR 0.
-fn find_xhci(host: &PcieHost) -> Option<(pci::Address, u64, u64, u8)> {
+/// Finds the first function of class `class`, assigns its BARs from `bars`
+/// and enables it; returns its address, BAR `bar` and interrupt pin.
+fn find_pci(host: &PcieHost, bars: &mut pci::BarAllocator, class: pci::Class, bar: u8) -> Option<(pci::Address, u64, u64, u8)> {
     // SAFETY: the device tree puts the ECAM window here, mapped as device
     // memory; only this function uses it.
     let ecam = pci::Ecam::new(unsafe { IoMem::new(host.ecam.0 as *mut u8, host.ecam.1 as usize) }, 0);
     let mut found = None;
     pci::for_each_function(&ecam, 0, |f| {
-        if found.is_none() && f.class() == pci::Class::XHCI {
+        if found.is_none() && f.class() == class {
             found = Some(f.address());
         }
     });
     let f = pci::Function::new(&ecam, found?)?;
-    // Firmware (OpenSBI) leaves BARs unassigned on this machine.
-    pci::BarAllocator::new(host.mem.0, host.mem.1).assign(&f).ok()?;
-    let bar = f.bar(0)?;
+    // Firmware (OpenSBI) leaves BARs unassigned on this machine. One
+    // allocator serves every device, so their BARs don't overlap.
+    bars.assign(&f).ok()?;
+    // Bus addresses double as CPU addresses because QEMU's `ranges` maps the
+    // 32-bit window 1:1; another board would translate here.
+    let bar = f.bar(bar)?;
+    // Memory space and bus master only: unassigned I/O BARs (ich9-ahci has
+    // legacy ones) stay at 0 and must not decode.
     f.enable_memory_and_dma();
     Some((f.address(), bar.address, bar.size, f.interrupt_pin()))
 }
@@ -462,6 +469,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         pt.map_range(va(base), pa(base), len, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
     }
     let pcie = pcie_host(&fdt);
+    let mut bars = pcie.as_ref().map(|h| pci::BarAllocator::new(h.mem.0, h.mem.1));
     if let Some(h) = &pcie {
         for (base, len) in [h.ecam, h.mem] {
             pt.map_range(va(base), pa(base), len, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
@@ -555,8 +563,59 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         None => println!("[blk]   no virtio-blk device"),
     }
 
+    // --- AHCI behind PCIe -------------------------------------------------------
+    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, ahci::CLASS, ahci::ABAR)) {
+        Some((addr, base, len, _)) => {
+            // SAFETY: BAR 5 was just assigned this range inside the mapped
+            // window; nothing else uses it.
+            let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
+            let (b, d, f) = (addr.bus, addr.device, addr.function);
+            match Ahci::new(io, &FRAMES) {
+                Ok(mut hba) => {
+                    let ports: Vec<u8> = hba.disks().collect();
+                    println!("[ahci]  {b:02x}:{d:02x}.{f} AHCI {:#x}, SATA disks on ports {ports:?}", hba.version());
+                    for port in ports {
+                        match hba.take_disk(port) {
+                            Ok(mut disk) => {
+                                let (n, bs) = (disk.num_blocks(), disk.block_size());
+                                let r = demos::block_roundtrip(&mut disk);
+                                println!("[ahci]  port {port} \"{}\": {n} sectors of {bs}; round trip {r:?}", disk.model());
+                            }
+                            Err(e) => println!("[ahci]  port {port}: {e:?}"),
+                        }
+                    }
+                }
+                Err(e) => println!("[ahci]  {b:02x}:{d:02x}.{f}: init failed: {e:?}"),
+            }
+        }
+        None => println!("[ahci]  no AHCI controller"),
+    }
+
+    // --- NVMe behind PCIe -------------------------------------------------------
+    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, pci::Class::NVME, nvme::BAR)) {
+        Some((addr, base, len, _)) => {
+            // SAFETY: BAR 0 was just assigned this range inside the mapped
+            // window; nothing else uses it.
+            let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
+            let (b, d, f) = (addr.bus, addr.device, addr.function);
+            match Nvme::new(io, &FRAMES) {
+                Ok(mut disk) => {
+                    let (n, bs) = (disk.num_blocks(), disk.block_size());
+                    let r = demos::block_roundtrip(&mut disk);
+                    println!(
+                        "[nvme]  {b:02x}:{d:02x}.{f} \"{}\" namespace {}: {n} blocks of {bs}; round trip {r:?}",
+                        disk.model(),
+                        disk.namespace()
+                    );
+                }
+                Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: init failed: {e:?}"),
+            }
+        }
+        None => println!("[nvme]  no NVMe controller"),
+    }
+
     // --- xHCI behind PCIe ------------------------------------------------------
-    match pcie.as_ref().and_then(find_xhci) {
+    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, pci::Class::XHCI, 0)) {
         Some((addr, base, len, pin)) => {
             // SAFETY: BAR 0 was just assigned this range inside the mapped
             // window; nothing else uses it.
