@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use osmium::arch::aarch64::{self, psci};
-use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
+use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
 use osmium::drivers::gicv2::GicV2;
@@ -699,6 +699,8 @@ fn on_trap(frame: &mut TrapFrame) {
         match frame.cause() {
             Trap::Syscall => return syscall(frame),
             Trap::Interrupt(_) => {}
+            // A write to a page `fork` shares gets its own copy; retry.
+            Trap::PageFault { addr, access: Access::Write } if osmium::proc::handle_page_fault(addr as u64, true) => return,
             cause => {
                 // A fault in user mode ends that task, not the kernel.
                 let task = osmium::sched::current();

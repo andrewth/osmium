@@ -244,6 +244,14 @@ impl Process {
         self.memory.lock().clone()
     }
 
+    /// Handles a user page fault at `addr`. A write to a copy-on-write page
+    /// (shared by `fork`) gets its own copy and returns true: return to user
+    /// mode and the instruction runs again. Any other fault returns false,
+    /// and ends the process (see [`handle_page_fault`]).
+    pub fn handle_page_fault(&self, addr: u64, write: bool) -> bool {
+        write && self.memory().cow_fault(addr)
+    }
+
     /// The root page table to activate when switching to this process.
     pub fn root(&self) -> PhysAddr {
         self.memory.lock().root()
@@ -370,6 +378,14 @@ fn intern(name: &str) -> &'static str {
 /// The process the running task belongs to, if it is a user task.
 pub fn current() -> Option<Arc<Process>> {
     osmium_sched::current().data::<Arc<Process>>().cloned()
+}
+
+/// [`Process::handle_page_fault`] for the calling task's process. A trap
+/// handler calls it for a page fault taken in user mode, before killing the
+/// process; false if the task is not a user task or the fault is not one to
+/// resolve.
+pub fn handle_page_fault(addr: u64, write: bool) -> bool {
+    current().is_some_and(|p| p.handle_page_fault(addr, write))
 }
 
 /// The root table to activate for `next`, for the scheduler's switch hook

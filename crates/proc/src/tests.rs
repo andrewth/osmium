@@ -417,7 +417,7 @@ fn fork_copies_memory_and_shares_open_files() {
     let live = frames.live();
     let Outcome::Fork { child, stack: 0 } = dispatch(&p, Sys::Fork.number(), [0; 6]) else { panic!("no fork") };
     let c = Process::find(child).unwrap();
-    assert_eq!(frames.live(), live + 4 + 2 + 4, "4 data and 2 heap pages; a root, an L1 and two L0 tables");
+    assert_eq!(frames.live(), live + 4, "pages are shared: only a root, an L1 and two L0 tables are new");
     assert_eq!((c.parent(), p.children()), (Some(p.pid()), alloc::vec![child]));
     assert_eq!(call(&c, Sys::Getppid, &[]), p.pid().0 as i64);
     assert_eq!(c.name(), "parent");
@@ -426,6 +426,7 @@ fn fork_copies_memory_and_shares_open_files() {
     assert_eq!(get(&c, DATA, 6), b"before");
     assert_eq!(get(&c, 0x40_1000, 4), b"heap");
     put(&c, DATA, b"child!");
+    assert_eq!(frames.live(), live + 4 + 1, "the write copied one page");
     assert_eq!(get(&p, DATA, 6), b"before");
     assert_eq!(call(&c, Sys::Brk, &[0]) as u64, brk);
 
@@ -448,7 +449,7 @@ fn fork_copies_memory_and_shares_open_files() {
     assert_eq!(call(&p, Sys::Wait4, &[-1i64 as u64, DATA + 0x300, 0, DATA + 0x400]), child.0 as i64);
     assert_eq!(get(&p, DATA + 0x300, 4), 0x700i32.to_ne_bytes());
     assert!(Process::find(child).is_none(), "reaped and freed");
-    assert_eq!(frames.live(), live + 6 + 4, "only the vfork child's copy is left");
+    assert_eq!(frames.live(), live + 4 + 1, "the vfork child's tables, and the page the parent copied from it");
     assert_eq!(call(&p, Sys::Wait4, &[child.0 as u64, 0, 1, 0]), -(Errno::ECHILD.0 as i64), "already reaped");
     Process::find(v).unwrap().set_exited(ExitStatus::Signal(11));
     assert_eq!(call(&p, Sys::Wait4, &[v.0 as u64, DATA + 0x300, 0, 0]), v.0 as i64);
@@ -553,4 +554,103 @@ fn dup_and_fcntl() {
     assert_eq!(call(&p, Sys::Fcntl, &[1, 3, 0]), 2, "O_RDWR");
     assert_eq!(call(&p, Sys::Dup, &[42]), -(Errno::EBADF.0 as i64));
     assert_eq!(p.files().lock().len(), 3 + 5);
+}
+
+fn fork_child(p: &Arc<Process>) -> Arc<Process> {
+    platform();
+    let Outcome::Fork { child, .. } = dispatch(p, Sys::Fork.number(), [0; 6]) else { panic!("no fork") };
+    Process::find(child).unwrap()
+}
+
+#[test]
+fn write_faults_copy_shared_pages_and_reclaim_unshared_ones() {
+    let (p, frames) = process("cow");
+    p.memory().map_anon(0x20_0000, 0x1000, MapFlags::READ).unwrap();
+    put(&p, DATA, b"parent");
+    let live = frames.live();
+    let c = fork_child(&p);
+    let forked = frames.live();
+    assert_eq!(forked, live + 4, "no page was copied");
+
+    // Only a write to a copy-on-write page is resolved.
+    assert!(!p.handle_page_fault(DATA, false), "reads do not fault");
+    assert!(!p.handle_page_fault(0x20_0000, true), "read-only pages stay so");
+    assert!(!p.handle_page_fault(0x30_0000, true), "unmapped");
+    assert!(p.handle_page_fault(DATA + 0x10, true));
+    assert_eq!(frames.live(), forked + 1, "the parent got a copy");
+    assert!(!p.handle_page_fault(DATA, true), "and now it is writable");
+    assert!(c.handle_page_fault(DATA, true));
+    assert_eq!(frames.live(), forked + 1, "the child was the last sharer: it reclaims the page");
+    assert!(!c.handle_page_fault(DATA, true));
+
+    // Each side has its own page now.
+    put(&c, DATA, b"child ");
+    assert_eq!(get(&p, DATA, 6), b"parent");
+    assert_eq!(get(&c, DATA, 6), b"child ");
+    // Untouched pages are still shared.
+    assert_eq!(get(&c, DATA + 0x1000, 4), [0; 4]);
+    assert_eq!(frames.live(), forked + 1);
+}
+
+#[test]
+fn kernel_copies_to_shared_pages_copy_them_first() {
+    let (p, frames) = process("cow-sys");
+    put(&p, DATA, b"/hello.txt\0");
+    let fd = call(&p, Sys::Openat, &[-100i64 as u64, DATA, 0, 0]) as u64;
+    let live = frames.live();
+    let c = fork_child(&p);
+    // read(2) into a shared page, in the child, then in the parent.
+    assert_eq!(call(&c, Sys::Read, &[fd, DATA + 0x800, 4]), 4);
+    assert_eq!(frames.live(), live + 3 + 1, "the child copied the page");
+    assert_eq!(get(&p, DATA + 0x800, 4), [0; 4], "the parent's page is untouched");
+    assert_eq!(call(&p, Sys::Read, &[fd, DATA + 0x800, 4]), 4);
+    assert_eq!(frames.live(), live + 3 + 1, "the parent reclaimed its page");
+    assert_eq!(get(&c, DATA + 0x800, 4), b"hell");
+    // A write that spans two shared pages copies both.
+    let g = fork_child(&c);
+    let before = frames.live();
+    put(&g, DATA + 0xffe, b"abcd");
+    assert_eq!(frames.live(), before + 2);
+    assert_eq!(get(&c, DATA + 0xffe, 4), [0; 4]);
+    assert_eq!(get(&g, DATA + 0xffe, 4), b"abcd");
+}
+
+#[test]
+fn shared_pages_are_freed_with_the_last_owner_in_any_order() {
+    for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2], [1, 2, 0]] {
+        let (p, frames) = process("cow-exit");
+        put(&p, DATA, b"x");
+        put(&p, DATA + 0x2000, b"y");
+        let c = fork_child(&p);
+        let g = fork_child(&c);
+        put(&g, DATA, b"g");
+        assert!(c.handle_page_fault(DATA + 0x2000, true));
+        let mut procs = [Some(p), Some(c), Some(g)];
+        for i in order {
+            drop(procs[i].take());
+            // The survivors still read and write all their pages.
+            for q in procs.iter().flatten() {
+                put(q, DATA + 0x2000, b"z");
+                put(q, DATA + 0x3000, b"w");
+                assert_eq!(get(q, DATA + 0x2000, 1), b"z");
+            }
+        }
+        assert_eq!(frames.live(), 1, "only the kernel table is left: {order:?}");
+    }
+}
+
+#[test]
+fn unmapping_and_remapping_forgets_copy_on_write() {
+    let (p, frames) = process("cow-unmap");
+    let c = fork_child(&p);
+    let live = frames.live();
+    p.memory().unmap(DATA, 0x1000);
+    assert_eq!(frames.live(), live, "the child still holds the page");
+    p.memory().map_anon(DATA, 0x1000, MapFlags::RW).unwrap();
+    assert_eq!(frames.live(), live + 1);
+    assert!(!p.handle_page_fault(DATA, true), "a fresh page is not copy-on-write");
+    put(&p, DATA, b"new");
+    assert_eq!(get(&c, DATA, 3), [0; 3]);
+    drop((p, c));
+    assert_eq!(frames.live(), 1);
 }

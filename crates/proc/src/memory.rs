@@ -2,6 +2,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use core::ops::Range;
 
 use osmium_boot::elf::Elf;
@@ -43,10 +44,23 @@ pub trait UserMemory: Send + Sync {
     /// allows that from here (AArch64); RISC-V still needs a `fence.i` on
     /// the hart that runs it.
     fn load_elf(&self, elf: &Elf<'_>) -> Result<u64, Errno>;
-    /// A copy of this space for `fork`: the same kernel mappings, and a
-    /// fresh copy of every page this space owns, with the same permissions.
+    /// A copy of this space for `fork`: the same kernel mappings, and every
+    /// page this space owns shared copy-on-write: writable pages become
+    /// read-only in both spaces until one of them writes (see
+    /// [`UserMemory::cow_fault`]), and kernel copies to them (`write`) break
+    /// the sharing the same way.
     fn fork(&self) -> Result<Box<dyn UserMemory>, Errno>;
+    /// Handles a user write fault at `va`: if the page is a copy-on-write
+    /// page, gives this space its own writable copy (or the original, if no
+    /// other space still shares it) and returns true, so the faulting
+    /// instruction can be retried. Returns false for any other fault.
+    fn cow_fault(&self, va: u64) -> bool;
 }
+
+/// Reference counts of the frames that forked spaces share. A frame that is
+/// absent has one owner. Spaces only ever share frames with their forks, so
+/// each family of spaces has its own table.
+type Shares = Arc<IrqSpinLock<BTreeMap<PhysAddr, u32>>>;
 
 /// A user address space in page-table format `F`, with table pages and user
 /// pages both drawn from `A`.
@@ -61,6 +75,8 @@ pub struct AddressSpace<F: PageTableFormat, A: TableAlloc + Clone> {
     alloc: A,
     /// The root entries shared with the kernel.
     shared: Range<usize>,
+    /// The frames shared with forked relatives.
+    shares: Shares,
     inner: IrqSpinLock<Inner<F, A>>,
 }
 
@@ -68,6 +84,81 @@ struct Inner<F: PageTableFormat, A: TableAlloc> {
     pt: PageTable<F, A>,
     /// The pages this space allocated, by user address, freed with it.
     frames: BTreeMap<u64, PhysAddr>,
+    /// Pages that were writable when a fork made them read-only: a write
+    /// fault copies them, or makes them writable again if no one shares them.
+    cow: BTreeSet<u64>,
+}
+
+impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
+    /// Drops this space's reference to `pa`, freeing it if it was the last.
+    fn release(&self, pa: PhysAddr) {
+        let mut shares = self.shares.lock();
+        match shares.get_mut(&pa) {
+            Some(n) => {
+                *n -= 1;
+                if *n <= 1 {
+                    shares.remove(&pa);
+                }
+            }
+            // SAFETY: the last owner's frame, no longer mapped by anyone.
+            None => unsafe { self.alloc.free_table(pa) },
+        }
+    }
+
+    /// Gives the copy-on-write page at `page` (page-aligned) its own writable
+    /// frame. Returns false if it is not one, or memory ran out.
+    fn break_cow(&self, inner: &mut Inner<F, A>, page: u64) -> bool {
+        if !inner.cow.contains(&page) {
+            return false;
+        }
+        let va = VirtAddr::new(page);
+        let Some(t) = inner.pt.translate(va) else { return false };
+        let flags = t.flags | MapFlags::WRITE;
+        let mut shares = self.shares.lock();
+        if shares.get(&t.pa).is_some_and(|&n| n > 1) {
+            let Some(new) = self.alloc.alloc_table() else { return false };
+            // SAFETY: both are whole frames reached through the allocator's
+            // mapping; `new` is fresh and exclusively ours.
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.alloc.phys_to_virt(t.pa), self.alloc.phys_to_virt(new), PAGE_SIZE)
+            };
+            let Ok((_, flush)) = inner.pt.unmap(va) else {
+                // SAFETY: never mapped.
+                unsafe { self.alloc.free_table(new) };
+                return false;
+            };
+            flush.flush();
+            match inner.pt.map(va, new, PageSize::Size4K, flags) {
+                Ok(flush) => flush.flush(),
+                Err(_) => {
+                    // SAFETY: never mapped.
+                    unsafe { self.alloc.free_table(new) };
+                    if let Ok(flush) = inner.pt.map(va, t.pa, PageSize::Size4K, t.flags) {
+                        flush.flush();
+                    }
+                    return false;
+                }
+            }
+            if let Some(n) = shares.get_mut(&t.pa) {
+                *n -= 1;
+                if *n <= 1 {
+                    shares.remove(&t.pa);
+                }
+            }
+            inner.frames.insert(page, new);
+            if flags.contains(MapFlags::EXEC) {
+                sync_icache(self.alloc.phys_to_virt(new));
+            }
+        } else {
+            shares.remove(&t.pa);
+            match inner.pt.protect(va, flags) {
+                Ok(flush) => flush.flush(),
+                Err(_) => return false,
+            }
+        }
+        inner.cow.remove(&page);
+        true
+    }
 }
 
 impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + Sync + 'static> AddressSpace<F, A> {
@@ -84,7 +175,13 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         let mut pt = PageTable::new(alloc.clone())?;
         // SAFETY: forwarded contract.
         unsafe { pt.share_root_entries(kernel, shared.clone()) };
-        Ok(Self { root: pt.root(), alloc, shared, inner: IrqSpinLock::new(Inner { pt, frames: BTreeMap::new() }) })
+        Ok(Self {
+            root: pt.root(),
+            alloc,
+            shared,
+            shares: Arc::default(),
+            inner: IrqSpinLock::new(Inner { pt, frames: BTreeMap::new(), cow: BTreeSet::new() }),
+        })
     }
 
     /// Whether `va..end` is non-empty, in the lower (user) half, and clear of
@@ -130,7 +227,17 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Errno> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        let end = va.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
+        let mut from = va & !(PAGE - 1);
+        while from < end
+            && let Some(&page) = inner.cow.range(from..end).next()
+        {
+            from = page + PAGE;
+            if !self.break_cow(&mut inner, page) {
+                return Err(Errno::EFAULT);
+            }
+        }
         walk(&inner.pt, va, data.len(), MapFlags::WRITE, |dst, off, n| {
             // SAFETY: `dst` points at `n` bytes of a user-writable frame.
             unsafe { core::ptr::copy_nonoverlapping(data[off..].as_ptr(), dst, n) }
@@ -174,10 +281,11 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             from = page + PAGE;
             let Ok((t, flush)) = inner.pt.unmap(VirtAddr::new(page)) else { continue };
             flush.flush();
+            inner.cow.remove(&page);
             if inner.frames.remove(&page) == Some(t.pa) {
-                // SAFETY: our own frame, no longer mapped. A process is
-                // single-threaded, so no other CPU holds a stale TLB entry.
-                unsafe { self.alloc.free_table(t.pa) };
+                // A process is single-threaded, so no other CPU holds a stale
+                // TLB entry for the page.
+                self.release(t.pa);
             }
         }
     }
@@ -198,7 +306,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             return Err(Errno::ENOMEM);
         }
         let mut inner = self.inner.lock();
-        let Inner { pt, frames } = &mut *inner;
+        let Inner { pt, frames, .. } = &mut *inner;
         let mut fresh = BTreeSet::new();
         let loaded = elf.load_into(pt, MapFlags::USER, || {
             let pa = self.alloc.alloc_table()?;
@@ -229,7 +337,8 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn fork(&self) -> Result<Box<dyn UserMemory>, Errno> {
-        let inner = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
         let mut pt = PageTable::new(self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
         // SAFETY: our shared root entries are the kernel's, which outlive
         // this space (see `new`) and so the copy, made under the same terms.
@@ -238,43 +347,54 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             root: pt.root(),
             alloc: self.alloc.clone(),
             shared: self.shared.clone(),
-            inner: IrqSpinLock::new(Inner { pt, frames: BTreeMap::new() }),
+            shares: self.shares.clone(),
+            inner: IrqSpinLock::new(Inner { pt, frames: BTreeMap::new(), cow: BTreeSet::new() }),
         };
         {
             let mut copy = child.inner.lock();
             for (&va, &pa) in &inner.frames {
-                let t = inner.pt.translate(VirtAddr::new(va)).expect("owned pages stay mapped");
-                // On failure, dropping `child` frees the pages copied so far.
-                let new = self.alloc.alloc_table().ok_or(Errno::ENOMEM)?;
-                let dst = self.alloc.phys_to_virt(new);
-                // SAFETY: both are whole frames reached through the
-                // allocator's mapping; `new` is fresh and exclusively ours.
-                unsafe { core::ptr::copy_nonoverlapping(self.alloc.phys_to_virt(pa), dst, PAGE_SIZE) };
-                match copy.pt.map(VirtAddr::new(va), new, PageSize::Size4K, t.flags) {
+                let v = VirtAddr::new(va);
+                let t = inner.pt.translate(v).expect("owned pages stay mapped");
+                let mut flags = t.flags;
+                let mut cow = inner.cow.contains(&va);
+                if flags.contains(MapFlags::WRITE) {
+                    flags = flags.difference(MapFlags::WRITE);
+                    if !flags.contains(MapFlags::READ) && !flags.contains(MapFlags::EXEC) {
+                        flags = flags | MapFlags::READ;
+                    }
+                    // The parent may be running on this table.
+                    inner.pt.protect(v, flags).map_err(|_| Errno::EINVAL)?.flush();
+                    cow = true;
+                }
+                // On failure, dropping `child` releases the pages shared so far.
+                match copy.pt.map(v, pa, PageSize::Size4K, flags) {
                     // The copy is not active anywhere yet.
                     Ok(flush) => flush.ignore(),
-                    Err(e) => {
-                        // SAFETY: the frame was never mapped.
-                        unsafe { self.alloc.free_table(new) };
-                        return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL });
-                    }
+                    Err(e) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
                 }
-                copy.frames.insert(va, new);
-                if t.flags.contains(MapFlags::EXEC) {
-                    sync_icache(dst);
+                *self.shares.lock().entry(pa).or_insert(1) += 1;
+                copy.frames.insert(va, pa);
+                if cow {
+                    inner.cow.insert(va);
+                    copy.cow.insert(va);
                 }
             }
         }
         Ok(Box::new(child))
     }
+
+    fn cow_fault(&self, va: u64) -> bool {
+        let mut inner = self.inner.lock();
+        self.break_cow(&mut inner, va & !(PAGE - 1))
+    }
 }
 
 impl<F: PageTableFormat, A: TableAlloc + Clone> Drop for AddressSpace<F, A> {
     fn drop(&mut self) {
-        for &pa in self.inner.get_mut().frames.values() {
-            // SAFETY: our own frames; the table mapping them is inactive (see
-            // the type's documentation) and dropped with us.
-            unsafe { self.alloc.free_table(pa) };
+        // The table mapping the frames is inactive (see the type's
+        // documentation) and dropped with us.
+        for pa in core::mem::take(&mut self.inner.get_mut().frames).into_values() {
+            self.release(pa);
         }
     }
 }
