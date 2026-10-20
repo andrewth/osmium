@@ -41,6 +41,9 @@ pub enum IscsiError {
         /// The sense data that came with a CHECK CONDITION.
         sense: Option<Sense>,
     },
+    /// A PDU from the target failed its CRC32C header or data digest. The
+    /// session is dropped.
+    Digest,
     /// The session has logged out or failed.
     NoSession,
 }
@@ -70,6 +73,7 @@ impl fmt::Display for IscsiError {
                 write!(f, "SCSI status {status:#04x}, sense key {:#x} ASC {:#04x} ASCQ {:#04x}", s.key, s.asc, s.ascq)
             }
             IscsiError::Scsi { status, sense: None } => write!(f, "SCSI status {status:#04x}"),
+            IscsiError::Digest => f.write_str("iSCSI digest mismatch"),
             IscsiError::NoSession => f.write_str("no iSCSI session"),
         }
     }

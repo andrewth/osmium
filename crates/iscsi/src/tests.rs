@@ -7,9 +7,11 @@ use std::vec::Vec;
 use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_net::{Ipv4Addr, SocketAddrV4};
 
+use crate::chap::Chap;
+use crate::params::DigestPolicy;
 use crate::pdu::RESERVED_TAG;
 use crate::scsi::{self, Sense, op, sense_key};
-use crate::testing::{Fault, INITIATOR_NAME, PORTAL, TARGET_NAME, TargetConfig, TestNet};
+use crate::testing::{Corrupt, Fault, INITIATOR_NAME, PORTAL, TARGET_NAME, TargetChap, TargetConfig, TestNet};
 use crate::{Data, IscsiDisk, IscsiError, Options, discover};
 
 const BLOCKS: usize = 2048;
@@ -449,5 +451,203 @@ fn against_the_python_target() {
         assert!(on_disk[1000 * 512..1300 * 512] == data[..]);
     }
     drop(net);
+    let _ = std::fs::remove_file(&image);
+}
+
+const SECRET: &[u8] = b"0123456789abcdef";
+const TARGET_SECRET: &[u8] = b"fedcba9876543210";
+
+fn chap_target(mutual: bool) -> TargetConfig {
+    let mut chap = TargetChap::new("alice", SECRET);
+    if mutual {
+        chap.mutual = Some(("tgt".into(), TARGET_SECRET.to_vec()));
+    }
+    TargetConfig { chap: Some(chap), ..TargetConfig::default() }
+}
+
+fn chap_options(chap: Chap) -> Options {
+    Options { chap: Some(chap), ..options() }
+}
+
+/// A read and a write that cross the wire intact.
+fn round_trip(disk: &mut IscsiDisk<&mut TestNet>) {
+    let data = pattern(64 * 512, 5);
+    disk.write_blocks(40, &data).unwrap();
+    let mut back = vec![0u8; data.len()];
+    disk.read_blocks(40, &mut back).unwrap();
+    assert!(back == data);
+}
+
+#[test]
+fn one_way_chap_login() {
+    let mut net = TestNet::new(chap_target(false), BLOCKS);
+    let mut disk = IscsiDisk::connect(&mut net, PORTAL, &chap_options(Chap::new("alice", SECRET))).unwrap();
+    round_trip(&mut disk);
+    drop(disk);
+    assert_eq!(net.target.stats.logins, 1);
+    // Discovery authenticates too.
+    let targets = discover(&mut net, PORTAL, &chap_options(Chap::new("alice", SECRET))).unwrap();
+    assert_eq!(targets[0].name, TARGET_NAME);
+}
+
+#[test]
+fn mutual_chap_login() {
+    let mut net = TestNet::new(chap_target(true), BLOCKS);
+    let chap = Chap::new("alice", SECRET).mutual("tgt", TARGET_SECRET, *b"my-own-challenge");
+    let mut disk = IscsiDisk::connect(&mut net, PORTAL, &chap_options(chap)).unwrap();
+    round_trip(&mut disk);
+}
+
+#[test]
+fn chap_failures() {
+    let neg = |e: IscsiError| matches!(e, IscsiError::Negotiation(_));
+    // A wrong secret or name: the target refuses with authentication failure.
+    for chap in [Chap::new("alice", b"wrong secret....."), Chap::new("mallory", SECRET)] {
+        let mut net = TestNet::new(chap_target(false), BLOCKS);
+        let e = IscsiDisk::connect(&mut net, PORTAL, &chap_options(chap)).err().unwrap();
+        assert_eq!(e, IscsiError::Login { class: 2, detail: 1 });
+        assert_eq!(sockets(&net), 0);
+    }
+    // We want mutual CHAP and the target does not answer our challenge.
+    let mut net = TestNet::new(chap_target(false), BLOCKS);
+    let chap = Chap::new("alice", SECRET).mutual("tgt", TARGET_SECRET, [7; 16]);
+    assert!(neg(IscsiDisk::connect(&mut net, PORTAL, &chap_options(chap)).err().unwrap()));
+    // The target answers with the wrong secret, or under the wrong name.
+    let mut cfg = chap_target(true);
+    cfg.chap.as_mut().unwrap().bad_mutual = true;
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let chap = Chap::new("alice", SECRET).mutual("tgt", TARGET_SECRET, [7; 16]);
+    assert!(neg(IscsiDisk::connect(&mut net, PORTAL, &chap_options(chap)).err().unwrap()));
+    let mut net = TestNet::new(chap_target(true), BLOCKS);
+    let chap = Chap::new("alice", SECRET).mutual("someone else", TARGET_SECRET, [7; 16]);
+    assert!(neg(IscsiDisk::connect(&mut net, PORTAL, &chap_options(chap)).err().unwrap()));
+    let mut net = TestNet::new(chap_target(true), BLOCKS);
+    let chap = Chap::new("alice", SECRET).mutual("tgt", b"not the target's secret", [7; 16]);
+    assert!(neg(IscsiDisk::connect(&mut net, PORTAL, &chap_options(chap)).err().unwrap()));
+    assert_eq!(sockets(&net), 0);
+    // We have credentials but the target offers no CHAP: refuse to go on
+    // unauthenticated.
+    let mut net = TestNet::new(TargetConfig::default(), BLOCKS);
+    let e = IscsiDisk::connect(&mut net, PORTAL, &chap_options(Chap::new("alice", SECRET))).err().unwrap();
+    assert!(neg(e) || matches!(e, IscsiError::Protocol(_)), "{e:?}");
+    // The target requires CHAP and we have none.
+    let mut net = TestNet::new(chap_target(false), BLOCKS);
+    assert!(IscsiDisk::connect(&mut net, PORTAL, &options()).is_err());
+}
+
+fn digests(header: DigestPolicy, data: DigestPolicy) -> Options {
+    Options { offer: crate::Offer { header_digest: header, data_digest: data, ..crate::Offer::default() }, ..options() }
+}
+
+#[test]
+fn digests_are_negotiated_and_checked() {
+    use DigestPolicy::*;
+    let crc = TargetConfig { header_digest: "CRC32C", data_digest: "CRC32C", ..TargetConfig::default() };
+    for (h, d, want) in
+        [(Require, Require, (true, true)), (Prefer, Prefer, (true, true)), (Require, Off, (true, false))]
+    {
+        // A target that answers CRC32C to whatever was offered, unless it was None.
+        let cfg = TargetConfig { data_digest: if d == Off { "None" } else { "CRC32C" }, ..crc.clone() };
+        let mut net = TestNet::new(cfg, BLOCKS);
+        let mut disk = IscsiDisk::connect(&mut net, PORTAL, &digests(h, d)).unwrap();
+        assert_eq!((disk.params().header_digest, disk.params().data_digest), want, "{h:?} {d:?}");
+        round_trip(&mut disk);
+        // Big transfers go through R2T and many Data-In PDUs.
+        let big = pattern(256 * 512, 8);
+        disk.write_blocks(200, &big).unwrap();
+        let mut back = vec![0u8; big.len()];
+        disk.read_blocks(200, &mut back).unwrap();
+        assert!(back == big);
+    }
+    // Offering digests to a target that declines: fine for Prefer, not Require.
+    let mut net = TestNet::new(TargetConfig::default(), BLOCKS);
+    let disk = IscsiDisk::connect(&mut net, PORTAL, &digests(Prefer, Prefer)).unwrap();
+    assert_eq!((disk.params().header_digest, disk.params().data_digest), (false, false));
+    drop(disk);
+    let e = IscsiDisk::connect(&mut net, PORTAL, &digests(Require, Off)).err().unwrap();
+    assert!(matches!(e, IscsiError::Negotiation(_)));
+    // A target that insists on a digest we do not want.
+    let mut net = TestNet::new(crc.clone(), BLOCKS);
+    let e = IscsiDisk::connect(&mut net, PORTAL, &digests(Off, Off)).err().unwrap();
+    assert!(matches!(e, IscsiError::Negotiation(_)));
+    assert_eq!(sockets(&net), 0);
+    // Discovery sessions use them too.
+    let mut net = TestNet::new(crc, BLOCKS);
+    assert_eq!(discover(&mut net, PORTAL, &digests(Require, Require)).unwrap().len(), 2);
+}
+
+#[test]
+fn a_corrupt_digest_fails_the_session() {
+    let crc = TargetConfig { header_digest: "CRC32C", data_digest: "CRC32C", ..TargetConfig::default() };
+    for corrupt in [Corrupt::Header, Corrupt::Data] {
+        let mut net = TestNet::new(crc.clone(), BLOCKS);
+        let mut disk =
+            IscsiDisk::connect(&mut net, PORTAL, &digests(DigestPolicy::Require, DigestPolicy::Require)).unwrap();
+        disk.net_mut().target.corrupt = Some(corrupt);
+        let mut buf = vec![0u8; 4 * 512];
+        let e = disk.execute(&scsi::read(8, 4), Data::In(&mut buf)).unwrap_err();
+        assert_eq!(e, IscsiError::Digest, "{corrupt:?}");
+        assert!(!disk.is_logged_in());
+    }
+    // Without a data digest a flipped data bit goes unnoticed; the header
+    // digest alone still covers the header.
+    let hdr = TargetConfig { header_digest: "CRC32C", ..TargetConfig::default() };
+    let mut net = TestNet::new(hdr, BLOCKS);
+    let mut disk = IscsiDisk::connect(&mut net, PORTAL, &digests(DigestPolicy::Require, DigestPolicy::Off)).unwrap();
+    disk.net_mut().target.corrupt = Some(Corrupt::Data);
+    let mut buf = vec![0u8; 512];
+    disk.execute(&scsi::read(8, 1), Data::In(&mut buf)).unwrap();
+    assert!(buf != disk.net_mut().target.disk[8 * 512..9 * 512]);
+}
+
+#[test]
+fn chap_and_digests_together() {
+    let mut cfg = chap_target(true);
+    cfg.header_digest = "CRC32C";
+    cfg.data_digest = "CRC32C";
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let opts = Options {
+        chap: Some(Chap::new("alice", SECRET).mutual("tgt", TARGET_SECRET, [3; 16])),
+        ..digests(DigestPolicy::Prefer, DigestPolicy::Prefer)
+    };
+    let mut disk = IscsiDisk::connect(&mut net, PORTAL, &opts).unwrap();
+    assert!(disk.params().header_digest && disk.params().data_digest);
+    round_trip(&mut disk);
+}
+
+/// CHAP (one-way and mutual) and CRC32C digests against scripts/iscsi-target.py.
+#[test]
+fn chap_and_digests_against_the_python_target() {
+    let image = std::env::temp_dir().join(std::format!("osmium-iscsi-chap-{}.img", std::process::id()));
+    std::fs::write(&image, pattern(BLOCKS * 512, 3)).unwrap();
+    let args = ["--chap", "alice:0123456789abcdef", "--mutual-chap", "tgt:fedcba9876543210", "--digests"];
+    let Some(mut net) = TestNet::python_with(&image, &args) else {
+        std::eprintln!("python3 not found; skipping");
+        return;
+    };
+    let mutual = Chap::new("alice", SECRET).mutual("tgt", TARGET_SECRET, *b"a random 16 byte");
+    let both = Options { chap: Some(mutual), ..digests(DigestPolicy::Require, DigestPolicy::Require) };
+    let mut disk = IscsiDisk::connect(&mut net, PORTAL, &both).unwrap();
+    assert!(disk.params().header_digest && disk.params().data_digest);
+    let data = pattern(300 * 512, 6);
+    disk.write_blocks(500, &data).unwrap();
+    let mut back = vec![0u8; data.len()];
+    disk.read_blocks(500, &mut back).unwrap();
+    assert!(back == data);
+    drop(disk);
+    // Discovery with CHAP only.
+    let chap = Options { chap: Some(Chap::new("alice", SECRET)), ..options() };
+    // One-way CHAP is refused when the target is configured for mutual.
+    assert!(discover(&mut net, PORTAL, &chap).is_err());
+    // Wrong secrets, from either side.
+    for wrong in [Chap::new("alice", b"wrong secret....."), Chap::new("alice", SECRET).mutual("tgt", b"nope", [5; 16])]
+    {
+        assert!(IscsiDisk::connect(&mut net, PORTAL, &chap_options(wrong)).is_err());
+    }
+    // No credentials at all.
+    assert!(IscsiDisk::connect(&mut net, PORTAL, &options()).is_err());
+    drop(net);
+    let on_disk = std::fs::read(&image).unwrap();
+    assert!(on_disk[500 * 512..800 * 512] == data[..]);
     let _ = std::fs::remove_file(&image);
 }

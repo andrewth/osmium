@@ -24,8 +24,9 @@ A connection that misbehaves is logged and dropped; the next one is served.
 
 runs a small Python initiator against it.
 
-Supported: login (SecurityNegotiation with AuthMethod=None, operational
-negotiation, either stage skipped), NOP-Out, Text (SendTargets), Logout,
+Supported: login (SecurityNegotiation with AuthMethod=None or, with --chap,
+CHAP-MD5 one-way or mutual; operational negotiation, either stage skipped;
+CRC32C header and data digests with --digests), NOP-Out, Text (SendTargets), Logout,
 Task Management (answered as complete), and the SCSI commands INQUIRY
 (standard and VPD pages 0x00, 0x80, 0x83), TEST UNIT READY, REQUEST SENSE,
 READ CAPACITY(10)/(16), READ(6/10/16), WRITE(6/10/16), SYNCHRONIZE CACHE
@@ -34,6 +35,7 @@ unsolicited Data-Out as negotiated and ask for the rest with R2Ts.
 """
 
 import argparse
+import hashlib
 import os
 import socket
 import struct
@@ -105,6 +107,19 @@ def parse_text(data):
     return pairs
 
 
+def parse_binary(value):
+    """A binary key value: 0x hex or 0b base64; None if malformed."""
+    import base64
+    try:
+        if value[:2].lower() == "0x":
+            return bytes.fromhex(value[2:])
+        if value[:2].lower() == "0b":
+            return base64.b64decode(value[2:], validate=True)
+    except ValueError:
+        pass
+    return None
+
+
 def make_text(pairs):
     return b"".join(f"{k}={v}".encode() + b"\0" for k, v in pairs)
 
@@ -125,6 +140,33 @@ def admissible(key, value):
     if key in OR_KEYS or key in AND_KEYS:
         return value if value in ("Yes", "No") else None
     return value
+
+
+def _crc32c_table():
+    table = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+        table.append(c)
+    return table
+
+
+CRC32C_TABLE = _crc32c_table()
+
+
+def crc32c(data):
+    c = 0xFFFFFFFF
+    for b in data:
+        c = CRC32C_TABLE[(c ^ b) & 0xFF] ^ (c >> 8)
+    return (c ^ 0xFFFFFFFF).to_bytes(4, "little")
+
+
+# Options from the command line: CHAP credentials as (name, secret) pairs
+# (`mutual` is how the target proves itself), and whether to accept digests.
+CHAP = None
+CHAP_MUTUAL = None
+DIGESTS = False
 
 
 def u32(b, off):
@@ -156,25 +198,42 @@ class Pdu:
     def set(self, off, v):
         struct.pack_into(">I", self.bhs, off, v & 0xFFFFFFFF)
 
-    def encode(self):
+    def encode(self, header_digest=False, data_digest=False):
         bhs = bytearray(self.bhs)
         bhs[4] = 0
         bhs[5:8] = len(self.data).to_bytes(3, "big")
         pad = -len(self.data) % 4
-        return bytes(bhs) + self.data + b"\0" * pad
+        out = bytes(bhs) + (crc32c(bhs) if header_digest else b"")
+        padded = self.data + b"\0" * pad
+        return out + padded + (crc32c(padded) if data_digest and self.data else b"")
 
 
-def read_pdu(read_exact):
+def read_pdu(read_exact, header_digest=False, data_digest=False):
     """The next PDU from the stream, or None at end of stream."""
     bhs = read_exact(48)
     if bhs is None:
         return None
     ahs = bhs[4] * 4
     dlen = int.from_bytes(bhs[5:8], "big")
-    rest = read_exact(ahs + dlen + (-dlen % 4))
+    rest = read_exact(ahs)
     if rest is None:
         return None
-    return Pdu(bhs, rest[ahs:ahs + dlen])
+    if header_digest:
+        digest = read_exact(4)
+        if digest is None:
+            return None
+        if digest != crc32c(bhs + rest):
+            raise ProtocolError("header digest mismatch")
+    data = read_exact(dlen + (-dlen % 4))
+    if data is None:
+        return None
+    if data_digest and dlen:
+        digest = read_exact(4)
+        if digest is None:
+            return None
+        if digest != crc32c(data):
+            raise ProtocolError("data digest mismatch")
+    return Pdu(bhs, data[:dlen])
 
 
 class Stream:
@@ -182,6 +241,7 @@ class Stream:
 
     def __init__(self, rfile, wfile):
         self.rfile, self.wfile = rfile, wfile
+        self.header_digest = self.data_digest = False
 
     def read_exact(self, n):
         buf = bytearray()
@@ -193,10 +253,10 @@ class Stream:
         return bytes(buf)
 
     def recv(self):
-        return read_pdu(self.read_exact)
+        return read_pdu(self.read_exact, self.header_digest, self.data_digest)
 
     def send(self, pdu):
-        self.wfile.write(pdu.encode())
+        self.wfile.write(pdu.encode(self.header_digest, self.data_digest))
         self.wfile.flush()
 
 
@@ -249,6 +309,12 @@ class Session:
         self.unit_attention = True
         self.ttt = 0x10
         self.declared = False
+        # CHAP: whether the initiator has authenticated, and the challenge
+        # we issued (identifier, bytes).
+        self.authed = CHAP is None
+        self.chap_challenge = None
+        self.digests = [False, False]
+        self.entering_full_feature = False
 
     # Sequence numbers.
 
@@ -271,11 +337,22 @@ class Session:
         if key in ("InitiatorName", "InitiatorAlias", "TargetName", "SessionType"):
             return True
         if key == "AuthMethod":
-            if "None" not in value.split(","):
+            want = "None" if CHAP is None else "CHAP"
+            if want not in value.split(","):
                 return False
-            out.append((key, "None"))
+            out.append((key, want))
+        elif key == "CHAP_A":
+            if CHAP is None or "5" not in value.split(","):
+                return False
+            self.chap_challenge = (os.urandom(1)[0], os.urandom(16))
+            out += [(key, "5"), ("CHAP_I", self.chap_challenge[0]), ("CHAP_C", "0x" + self.chap_challenge[1].hex())]
+        elif key in ("CHAP_N", "CHAP_R", "CHAP_I", "CHAP_C"):
+            pass  # checked together, once the whole request is read
         elif key in ("HeaderDigest", "DataDigest"):
-            out.append((key, "None" if "None" in value.split(",") else "Reject"))
+            values = value.split(",")
+            use = DIGESTS and "CRC32C" in values
+            self.digests[key == "DataDigest"] = use
+            out.append((key, "CRC32C" if use else "None" if "None" in values else "Reject"))
         elif admissible(key, value) is None:
             # The key keeps its current value (RFC 7143 §6.2). A declaration
             # is not answered, so a bad one is only ignored.
@@ -302,6 +379,30 @@ class Session:
             out.append((key, "NotUnderstood"))
         return True
 
+    def chap_check(self, names, out):
+        """Verifies the initiator's CHAP answer; answers its challenge, if any."""
+        if self.chap_challenge is None:
+            return False
+        ident, challenge = self.chap_challenge
+        name, secret = CHAP
+        want = hashlib.md5(bytes([ident]) + secret + challenge).digest()
+        if names.get("CHAP_N") != name or parse_binary(names["CHAP_R"]) != want:
+            log("CHAP authentication failed")
+            return False
+        if "CHAP_I" in names or "CHAP_C" in names:
+            if CHAP_MUTUAL is None:
+                return False
+            their_challenge = parse_binary(names.get("CHAP_C", ""))
+            if their_challenge is None or their_challenge == challenge:
+                return False
+            mname, msecret = CHAP_MUTUAL
+            answer = hashlib.md5(bytes([int(names["CHAP_I"]) & 0xFF]) + msecret + their_challenge).digest()
+            out += [("CHAP_N", mname), ("CHAP_R", "0x" + answer.hex())]
+        elif CHAP_MUTUAL is not None:
+            return False
+        self.authed = True
+        return True
+
     def login(self, req):
         flags = req.flags
         transit, csg, nsg = bool(flags & 0x80), (flags >> 2) & 3, flags & 3
@@ -325,6 +426,11 @@ class Session:
         out = []
         if status == (0, 0) and not all(self.negotiate(k, v, out) for k, v in keys):
             status = (2, 1)  # authentication failure
+        if status == (0, 0) and "CHAP_R" in names and not self.chap_check(names, out):
+            status = (2, 1)
+        if status == (0, 0) and not self.authed and (csg == 1 or transit):
+            log("login without authentication")
+            status = (2, 1)
         self.params["FirstBurstLength"] = min(self.params["FirstBurstLength"], self.params["MaxBurstLength"])
         if "InitiatorName" in names:
             out.append(("TargetPortalGroupTag", 1))
@@ -338,12 +444,16 @@ class Session:
             if transit and nsg == 3:
                 resp.bhs[14:16] = (1).to_bytes(2, "big")
                 self.full_feature = True
+                self.entering_full_feature = True
                 log(f"full feature phase: {self.params}, initiator MRDSL {self.initiator_mrdsl}")
             resp.data = make_text(out)
         else:
             resp.bhs[1] = csg << 2
         self.status_sn(resp)
         self.s.send(resp)
+        if self.entering_full_feature:
+            # Digests start with the full feature phase.
+            self.s.header_digest, self.s.data_digest = self.digests
         return status == (0, 0)
 
     # Full feature phase.
@@ -935,6 +1045,8 @@ def self_test():
         with open(path, "rb") as f:
             f.seek(10 * BLOCK)
             assert f.read(BLOCK)[:4] == bytes([3, 10, 17, 24])
+    assert crc32c(b"123456789") == (0xE3069283).to_bytes(4, "little")
+    assert crc32c(bytes(32)) == bytes([0xAA, 0x36, 0x91, 0x8A])
     print("iscsi-target self-test passed", file=sys.stderr)
 
 
@@ -945,11 +1057,24 @@ def main():
     ap.add_argument("--bind", default="127.0.0.1", metavar="ADDR",
                     help="address to listen on with --listen (default: 127.0.0.1)")
     ap.add_argument("--address", help="TargetAddress for SendTargets (default: the connection's own)")
+    ap.add_argument("--chap", metavar="USER:SECRET", help="require CHAP (MD5) from the initiator")
+    ap.add_argument("--mutual-chap", metavar="NAME:SECRET",
+                    help="with --chap, also authenticate to the initiator as NAME (and require it to ask)")
+    ap.add_argument("--digests", action="store_true", help="accept CRC32C header and data digests when offered")
     ap.add_argument("--read-only", action="store_true", help="refuse writes")
     ap.add_argument("--self-test", action="store_true", help="test against a built-in initiator and exit")
     ap.add_argument("--log", metavar="FILE", help="append logs to FILE instead of stderr")
     args = ap.parse_args()
-    global LOG
+    global LOG, CHAP, CHAP_MUTUAL, DIGESTS
+    if args.chap:
+        user, _, secret = args.chap.partition(":")
+        CHAP = (user, secret.encode())
+    if args.mutual_chap:
+        if CHAP is None:
+            ap.error("--mutual-chap needs --chap")
+        name, _, secret = args.mutual_chap.partition(":")
+        CHAP_MUTUAL = (name, secret.encode())
+    DIGESTS = args.digests
     if args.log:
         LOG = open(args.log, "a")
     elif args.listen is None and not args.self_test and os.path.sameopenfile(1, 2):

@@ -12,10 +12,10 @@ use std::vec::Vec;
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
 use osmium_net::{Config, Instant, Interface, Ipv4Addr, SocketAddrV4, SocketHandle, SocketSet, TcpSocket, TcpState};
 
-use crate::Net;
 use crate::pdu::*;
 use crate::scsi::{self, Sense, op, sense_key};
 use crate::text;
+use crate::{Net, chap};
 
 type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
 
@@ -103,13 +103,24 @@ impl TestNet {
     /// `image`, one process per connection as QEMU's guestfwd runs it.
     /// Time is real, since the target is. `None` without python3.
     pub(crate) fn python(image: &std::path::Path) -> Option<Self> {
+        Self::python_with(image, &[])
+    }
+
+    /// As [`python`](Self::python), with extra command-line arguments for
+    /// the script (`--chap`, `--digests`, ...).
+    pub(crate) fn python_with(image: &std::path::Path, args: &[&str]) -> Option<Self> {
         let ok = std::process::Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success());
         if !ok {
             return None;
         }
         let mut net = Self::new(TargetConfig::default(), 0);
-        net.relay =
-            Some(Relay { image: image.into(), start: std::time::Instant::now(), listener: None, conns: Vec::new() });
+        net.relay = Some(Relay {
+            image: image.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            start: std::time::Instant::now(),
+            listener: None,
+            conns: Vec::new(),
+        });
         Some(net)
     }
 }
@@ -172,6 +183,39 @@ pub(crate) struct TargetConfig {
     pub(crate) ignore_mrdsl: bool,
     /// Go from SecurityNegotiation straight to the full feature phase.
     pub(crate) skip_operational: bool,
+    /// Require CHAP, with these credentials.
+    pub(crate) chap: Option<TargetChap>,
+    /// The HeaderDigest and DataDigest value the target answers with.
+    pub(crate) header_digest: &'static str,
+    pub(crate) data_digest: &'static str,
+}
+
+/// The target's side of CHAP.
+#[derive(Clone)]
+pub(crate) struct TargetChap {
+    /// The initiator's name and secret.
+    pub(crate) user: String,
+    pub(crate) secret: Vec<u8>,
+    /// The target's own name and secret, answered to a challenge from the
+    /// initiator.
+    pub(crate) mutual: Option<(String, Vec<u8>)>,
+    /// Answer an initiator's challenge wrongly.
+    pub(crate) bad_mutual: bool,
+}
+
+impl TargetChap {
+    pub(crate) fn new(user: &str, secret: &[u8]) -> Self {
+        Self { user: user.into(), secret: secret.into(), mutual: None, bad_mutual: false }
+    }
+}
+
+/// A one-off corruption of the next PDU the target sends with a payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Corrupt {
+    /// A bit in the header.
+    Header,
+    /// A bit in the data segment.
+    Data,
 }
 
 impl Default for TargetConfig {
@@ -194,6 +238,9 @@ impl Default for TargetConfig {
             trickle: 0,
             ignore_mrdsl: false,
             skip_operational: false,
+            chap: None,
+            header_digest: "None",
+            data_digest: "None",
         }
     }
 }
@@ -268,6 +315,12 @@ struct Conn {
     /// until the next goes out.
     paced: VecDeque<Vec<u8>>,
     pace_wait: usize,
+    /// The digests in force, from the end of login.
+    header_digest: bool,
+    data_digest: bool,
+    /// Digests agreed in login, switched on after its last response.
+    agreed: (bool, bool),
+    corrupt: Option<Corrupt>,
 }
 
 /// Counts of what the target saw.
@@ -303,6 +356,9 @@ pub(crate) struct Target {
     pub(crate) fault: Option<Fault>,
     /// The next SCSI Response skips a StatSN.
     pub(crate) skip_stat_sn: bool,
+    /// Corrupt the next PDU with data (or any, for a header) once digests
+    /// are on.
+    pub(crate) corrupt: Option<Corrupt>,
     attention_sent: bool,
     listener: Option<SocketHandle>,
     conns: Vec<Conn>,
@@ -321,6 +377,7 @@ impl Target {
             ignore_next: false,
             fault: None,
             skip_stat_sn: false,
+            corrupt: None,
             attention_sent: false,
             listener: None,
             conns: Vec::new(),
@@ -348,6 +405,10 @@ impl Target {
                     closing: false,
                     paced: VecDeque::new(),
                     pace_wait: 0,
+                    header_digest: false,
+                    data_digest: false,
+                    agreed: (false, false),
+                    corrupt: None,
                 });
                 self.listener = None;
             }
@@ -366,7 +427,10 @@ impl Target {
             while let Ok(n @ 1..) = s.recv(&mut buf) {
                 c.reader.push(&buf[..n]);
             }
-            while let Some(pdu) = c.reader.next_pdu().unwrap() {
+            while let Some(pdu) = c.reader.next_pdu().expect("initiator digests are valid") {
+                if (c.header_digest || c.data_digest) && self.corrupt.is_some() {
+                    c.corrupt = self.corrupt.take();
+                }
                 let m = Message::decode(pdu).expect("initiator sent an unknown PDU");
                 self.handle(c, m);
             }
@@ -392,7 +456,24 @@ impl Target {
     }
 
     fn send(c: &mut Conn, m: Message) {
-        c.out.extend_from_slice(&m.encode().to_bytes());
+        let pdu = m.encode();
+        let mut bytes = pdu.to_bytes_with(c.header_digest, c.data_digest);
+        let hit = match c.corrupt {
+            Some(Corrupt::Header) => {
+                bytes[20] ^= 1;
+                true
+            }
+            Some(Corrupt::Data) if !pdu.data.is_empty() => {
+                // The last byte of the padded data: inside the digest's range.
+                bytes[BHS_LEN + 4 * c.header_digest as usize + pdu.data.len().next_multiple_of(4) - 1] ^= 1;
+                true
+            }
+            _ => false,
+        };
+        if hit {
+            c.corrupt = None;
+        }
+        c.out.extend_from_slice(&bytes);
     }
 
     /// The next StatSN for a status-bearing PDU.
@@ -515,6 +596,7 @@ impl Target {
         let get = |k: &str| keys.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
         let mut out = Vec::new();
         let mut class = 0;
+        let mut detail = 3;
         let mut transit = r.transit;
         let mut nsg = r.nsg;
         if r.csg == stage::SECURITY && c.security_rounds == 0 {
@@ -529,9 +611,49 @@ impl Target {
         match r.csg {
             stage::SECURITY => {
                 c.security_rounds += 1;
-                if c.security_rounds == 1 {
-                    assert_eq!(get("AuthMethod"), Some("None"));
-                    text::push(&mut out, "AuthMethod", "None");
+                if let Some(chap) = self.cfg.chap.clone() {
+                    (transit, nsg) = (r.transit, r.nsg);
+                    match c.security_rounds {
+                        1 => {
+                            if get("AuthMethod").is_some_and(|m| m.split(',').any(|v| v == "CHAP")) {
+                                text::push(&mut out, "AuthMethod", "CHAP");
+                                text::push(&mut out, "TargetPortalGroupTag", "1");
+                            } else {
+                                (class, detail) = (2, 1);
+                            }
+                            (transit, nsg) = (false, 0);
+                        }
+                        2 => {
+                            assert_eq!(get("CHAP_A"), Some("5"));
+                            text::push(&mut out, "CHAP_A", "5");
+                            text::push(&mut out, "CHAP_I", &CHAP_ID.to_string());
+                            text::push(&mut out, "CHAP_C", &chap::hex(&CHAP_CHALLENGE));
+                            (transit, nsg) = (false, 0);
+                        }
+                        _ => {
+                            let want = chap::response(CHAP_ID, &chap.secret, &CHAP_CHALLENGE);
+                            let got = get("CHAP_R").and_then(chap::decode_binary);
+                            if get("CHAP_N") != Some(chap.user.as_str()) || got.as_deref() != Some(&want[..]) {
+                                (class, detail) = (2, 1);
+                            } else if let (Some((name, secret)), Some(id), Some(c)) =
+                                (&chap.mutual, get("CHAP_I"), get("CHAP_C").and_then(chap::decode_binary))
+                            {
+                                let mut answer = chap::response(id.parse().unwrap(), secret, &c);
+                                if chap.bad_mutual {
+                                    answer[0] ^= 1;
+                                }
+                                text::push(&mut out, "CHAP_N", name);
+                                text::push(&mut out, "CHAP_R", &chap::hex(&answer));
+                            } else if chap.mutual.is_some() {
+                                (class, detail) = (2, 1);
+                            }
+                        }
+                    }
+                } else if c.security_rounds == 1 {
+                    let method = get("AuthMethod");
+                    assert!(matches!(method, Some("None" | "CHAP")));
+                    // Credentials we do not ask for are not accepted.
+                    text::push(&mut out, "AuthMethod", if method == Some("None") { "None" } else { "Reject" });
                     text::push(&mut out, "TargetPortalGroupTag", "1");
                 }
                 if self.cfg.extra_security_round && c.security_rounds == 1 {
@@ -547,7 +669,14 @@ impl Target {
                     let num = || text::number(v).unwrap() as usize;
                     let yes = || text::boolean(v).unwrap();
                     let reply: String = match k.as_str() {
-                        "HeaderDigest" | "DataDigest" => "None".into(),
+                        "HeaderDigest" => {
+                            c.agreed.0 = cfg.header_digest == "CRC32C";
+                            cfg.header_digest.into()
+                        }
+                        "DataDigest" => {
+                            c.agreed.1 = cfg.data_digest == "CRC32C";
+                            cfg.data_digest.into()
+                        }
                         "MaxRecvDataSegmentLength" => {
                             c.initiator_mrdsl = num();
                             continue;
@@ -611,12 +740,15 @@ impl Target {
                 exp_cmd_sn: exp,
                 max_cmd_sn: max,
                 status_class: class,
-                status_detail: if class == 0 { 0 } else { 3 },
+                status_detail: if class == 0 { 0 } else { detail },
                 data: if class == 0 { out } else { vec![] },
             }),
         );
         if class != 0 {
             c.closing = true;
+        } else if transit && nsg == stage::FULL_FEATURE {
+            (c.header_digest, c.data_digest) = c.agreed;
+            c.reader.set_digests(c.header_digest, c.data_digest);
         }
     }
 
@@ -903,6 +1035,10 @@ impl Target {
     }
 }
 
+/// The target's CHAP identifier and challenge.
+const CHAP_ID: u8 = 0x2a;
+const CHAP_CHALLENGE: [u8; 16] = *b"0123456789abcdef";
+
 /// `len` bytes of text: one private key with a long value.
 fn filler(len: usize) -> Vec<u8> {
     let mut v = b"X-org.osmium.Pad=".to_vec();
@@ -914,6 +1050,7 @@ fn filler(len: usize) -> Vec<u8> {
 /// Pipes TCP connections on port 3260 to and from a target process.
 struct Relay {
     image: std::path::PathBuf,
+    args: Vec<String>,
     start: std::time::Instant,
     listener: Option<SocketHandle>,
     conns: Vec<Piped>,
@@ -940,6 +1077,7 @@ impl Relay {
             let mut child = Command::new("python3")
                 .arg(script)
                 .arg(&self.image)
+                .args(&self.args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())

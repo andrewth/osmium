@@ -245,7 +245,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 ### `osmium-iscsi`: iSCSI initiator
 - ✅ RFC 7143 login (AuthMethod None, operational negotiation honouring the target's answers), SendTargets discovery, full-feature phase with immediate data, unsolicited Data-Out and R2T-driven writes, multi-PDU Data-In, NOP-In replies and logout; SCSI INQUIRY, TEST UNIT READY, READ CAPACITY(10/16), READ/WRITE(10/16) and SYNCHRONIZE CACHE as a `BlockDevice` over an `osmium-net` TCP socket
 - ✅ Tested on the host against an in-process target and `scripts/iscsi-target.py` (a stdlib-only target), and under QEMU through a user-network `guestfwd` to that script
-- 🗺 CHAP, header and data digests, login redirection, error recovery levels above 0, multiple connections and LUNs per session
+- ✅ CHAP-MD5 authentication (one-way and mutual, credentials in `Options::chap`; local no_std MD5) and CRC32C header/data digests (`Offer::header_digest`/`data_digest`: off, prefer or require), tested against the in-process target and `scripts/iscsi-target.py` (`--chap`, `--mutual-chap`, `--digests`)
+- 🗺 Login redirection, error recovery levels above 0, multiple connections and LUNs per session
 
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name

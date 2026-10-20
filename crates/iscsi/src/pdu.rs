@@ -13,6 +13,8 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::crc32c::crc32c;
+
 /// Bytes in a Basic Header Segment.
 pub const BHS_LEN: usize = 48;
 
@@ -65,6 +67,8 @@ pub enum PduError {
     UnknownOpcode(u8),
     /// The data segment is longer than allowed.
     TooLong(usize),
+    /// A header or data digest does not match its contents.
+    Digest,
 }
 
 impl fmt::Display for PduError {
@@ -72,6 +76,7 @@ impl fmt::Display for PduError {
         match self {
             PduError::UnknownOpcode(op) => write!(f, "unknown iSCSI opcode {op:#04x}"),
             PduError::TooLong(n) => write!(f, "iSCSI data segment of {n} bytes is too long"),
+            PduError::Digest => write!(f, "iSCSI digest mismatch"),
         }
     }
 }
@@ -128,13 +133,27 @@ impl Pdu {
     /// The PDU as it goes on the wire, data segment length set and the data
     /// padded to four bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(BHS_LEN + self.data.len().next_multiple_of(4));
+        self.to_bytes_with(false, false)
+    }
+
+    /// Like [`to_bytes`](Self::to_bytes), with a CRC32C header digest after
+    /// the BHS and a data digest after the padded data segment (none if
+    /// there is no data), as negotiated for the connection.
+    pub fn to_bytes_with(&self, header_digest: bool, data_digest: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(BHS_LEN + self.data.len().next_multiple_of(4) + 8);
         out.extend_from_slice(&self.bhs);
         out[4] = 0; // no AHS
         let len = (self.data.len() as u32).to_be_bytes();
         out[5..8].copy_from_slice(&len[1..]);
+        if header_digest {
+            out.extend_from_slice(&crc32c(&out).to_le_bytes());
+        }
+        let data_at = out.len();
         out.extend_from_slice(&self.data);
-        out.resize(out.len().next_multiple_of(4), 0);
+        out.resize(data_at + self.data.len().next_multiple_of(4), 0);
+        if data_digest && !self.data.is_empty() {
+            out.extend_from_slice(&crc32c(&out[data_at..]).to_le_bytes());
+        }
         out
     }
 }
@@ -144,17 +163,26 @@ impl Pdu {
 pub struct PduReader {
     buf: Vec<u8>,
     max_data: usize,
+    header_digest: bool,
+    data_digest: bool,
 }
 
 impl PduReader {
     /// A reader that rejects data segments longer than `max_data` bytes.
     pub fn new(max_data: usize) -> Self {
-        Self { buf: Vec::new(), max_data }
+        Self { buf: Vec::new(), max_data, header_digest: false, data_digest: false }
     }
 
     /// Changes the longest data segment accepted.
     pub fn set_max_data(&mut self, max_data: usize) {
         self.max_data = max_data;
+    }
+
+    /// Expects (and checks) a CRC32C header and/or data digest on every PDU
+    /// from now on, as negotiated for the connection.
+    pub fn set_digests(&mut self, header: bool, data: bool) {
+        self.header_digest = header;
+        self.data_digest = data;
     }
 
     /// Appends bytes received from the stream.
@@ -175,17 +203,34 @@ impl PduReader {
             return Ok(None);
         }
         let ahs = self.buf[4] as usize * 4;
+        let header_end = BHS_LEN + ahs;
+        let data_at = header_end + if self.header_digest { 4 } else { 0 };
+        if self.header_digest {
+            // Check the header before trusting the lengths in it.
+            let Some(digest) = self.buf.get(header_end..data_at) else {
+                return Ok(None);
+            };
+            if crc32c(&self.buf[..header_end]).to_le_bytes() != digest {
+                return Err(PduError::Digest);
+            }
+        }
         let len = u32::from_be_bytes([0, self.buf[5], self.buf[6], self.buf[7]]) as usize;
         if len > self.max_data {
             return Err(PduError::TooLong(len));
         }
-        let total = BHS_LEN + ahs + len.next_multiple_of(4);
+        let padded = len.next_multiple_of(4);
+        let total = data_at + padded + if self.data_digest && len > 0 { 4 } else { 0 };
         if self.buf.len() < total {
             return Ok(None);
         }
+        if self.data_digest && len > 0 {
+            let end = data_at + padded;
+            if crc32c(&self.buf[data_at..end]).to_le_bytes() != self.buf[end..total] {
+                return Err(PduError::Digest);
+            }
+        }
         let mut pdu = Pdu { bhs: self.buf[..BHS_LEN].try_into().unwrap(), data: Vec::new() };
-        let data = BHS_LEN + ahs;
-        pdu.data.extend_from_slice(&self.buf[data..data + len]);
+        pdu.data.extend_from_slice(&self.buf[data_at..data_at + len]);
         self.buf.drain(..total);
         Ok(Some(pdu))
     }

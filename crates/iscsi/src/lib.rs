@@ -24,7 +24,10 @@
 //! } // dropping the disk logs out
 //! ```
 //!
-//! The session negotiates no authentication (AuthMethod=None), no digests,
+//! By default the session negotiates no authentication (AuthMethod=None)
+//! and no digests. [`Options::chap`] ([`Chap`]) logs in with CHAP-MD5,
+//! one-way or mutual, and [`Offer::header_digest`] / [`Offer::data_digest`]
+//! ([`DigestPolicy`]) ask for CRC32C digests. It uses
 //! error recovery level 0, one connection and one outstanding R2T, and
 //! runs one command at a time. Writes send immediate and unsolicited data
 //! as `ImmediateData`, `InitialR2T` and `FirstBurstLength` allow, and the
@@ -38,9 +41,12 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod chap;
 mod disk;
 mod error;
 mod net;
+pub mod crc32c;
+pub mod md5;
 pub mod params;
 pub mod pdu;
 pub mod scsi;
@@ -55,5 +61,6 @@ mod tests;
 pub use disk::IscsiDisk;
 pub use error::IscsiError;
 pub use net::{Net, Stack};
-pub use params::{Offer, Params};
+pub use chap::{Chap, Mutual};
+pub use params::{DigestPolicy, Offer, Params};
 pub use session::{Data, DiscoveredTarget, Options, discover};

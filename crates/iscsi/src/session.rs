@@ -15,10 +15,11 @@ use core::time::Duration;
 
 use osmium_net::{Instant, SocketHandle, TcpSocket, TcpState};
 
+use crate::chap::{self, Chap};
 use crate::net::Net;
 use crate::params::{Negotiator, Offer, Params};
 use crate::pdu::{
-    DataOut, LoginRequest, LogoutRequest, Message, NopOut, PduReader, RESERVED_TAG, ScsiCommand, TextRequest,
+    DataOut, LoginRequest, LogoutRequest, Message, NopOut, PduError, PduReader, RESERVED_TAG, ScsiCommand, TextRequest,
     lun_field, sn_lt, stage,
 };
 use crate::scsi::{Cdb, Sense, status};
@@ -61,6 +62,9 @@ pub struct Options {
     pub timeout: Duration,
     /// The operational parameters to ask for.
     pub offer: Offer,
+    /// CHAP credentials. With them, the login must authenticate (the target
+    /// that offers no CHAP is refused); without, AuthMethod=None.
+    pub chap: Option<Chap>,
     /// TCP receive buffer, in bytes (at most 65535 is used).
     pub rx_buffer: usize,
     /// TCP send buffer, in bytes.
@@ -79,6 +83,7 @@ impl Options {
             isid: [0x80, 0x6f, 0x73, 0x6d, 0x00, 0x01],
             timeout: Duration::from_secs(10),
             offer: Offer::default(),
+            chap: None,
             rx_buffer: 65535,
             tx_buffer: 65536,
         }
@@ -103,6 +108,20 @@ struct Residual {
     count: u32,
 }
 
+/// Where a CHAP login stands.
+#[derive(Clone, Copy)]
+enum Auth {
+    /// Waiting for the target to agree to CHAP.
+    Method,
+    /// Waiting for its challenge.
+    Algorithm,
+    /// Our answer is out; waiting for the target to accept it. Mutual CHAP
+    /// holds the response we expect from the target.
+    Response(Option<[u8; 16]>),
+    /// Authenticated, or no authentication wanted.
+    Done,
+}
+
 /// A TCP connection carrying PDUs. Dropping it closes the connection and
 /// removes its socket.
 struct Conn<N: Net> {
@@ -110,13 +129,23 @@ struct Conn<N: Net> {
     socket: SocketHandle,
     reader: PduReader,
     timeout: Duration,
+    /// CRC32C digests on the PDUs we send, once negotiated.
+    header_digest: bool,
+    data_digest: bool,
 }
 
 impl<N: Net> Conn<N> {
     /// Connects to `target` and waits until the connection is established.
     fn open(mut net: N, target: SocketAddrV4, opts: &Options) -> Result<Self, IscsiError> {
         let socket = net.with_sockets(|s| s.add(TcpSocket::new(opts.rx_buffer, opts.tx_buffer)));
-        let mut c = Self { net, socket, reader: PduReader::new(LOGIN_DSL), timeout: opts.timeout };
+        let mut c = Self {
+            net,
+            socket,
+            reader: PduReader::new(LOGIN_DSL),
+            timeout: opts.timeout,
+            header_digest: false,
+            data_digest: false,
+        };
         c.tcp(|t| t.connect(target, 0))?;
         let deadline = c.deadline();
         loop {
@@ -148,7 +177,7 @@ impl<N: Net> Conn<N> {
     /// Queues `m` on the connection, waiting until `deadline` for room in
     /// the send buffer.
     fn send(&mut self, m: Message, deadline: Instant) -> Result<(), IscsiError> {
-        let bytes = m.encode().to_bytes();
+        let bytes = m.encode().to_bytes_with(self.header_digest, self.data_digest);
         let mut sent = 0;
         while sent < bytes.len() {
             match self.tcp(|t| t.send(&bytes[sent..])) {
@@ -163,7 +192,11 @@ impl<N: Net> Conn<N> {
     /// The next PDU from the target.
     fn recv(&mut self, deadline: Instant) -> Result<Message, IscsiError> {
         loop {
-            if let Some(pdu) = self.reader.next_pdu().map_err(|_| IscsiError::Protocol("data segment too long"))? {
+            let next = self.reader.next_pdu().map_err(|e| match e {
+                PduError::Digest => IscsiError::Digest,
+                _ => IscsiError::Protocol("data segment too long"),
+            })?;
+            if let Some(pdu) = next {
                 return Message::decode(pdu).map_err(|_| IscsiError::Protocol("unexpected opcode"));
             }
             let mut buf = [0u8; 2048];
@@ -232,6 +265,11 @@ impl<N: Net> Session<N> {
         s.negotiate(opts, discovery)?;
         // From now on the target's segments are bounded by what we declared.
         s.conn.reader.set_max_data(s.params.max_recv_data_segment_length as usize);
+        // Digests start with the full feature phase.
+        let p = &s.params;
+        s.conn.header_digest = p.header_digest;
+        s.conn.data_digest = p.data_digest;
+        s.conn.reader.set_digests(p.header_digest, p.data_digest);
         s.open = true;
         Ok(s)
     }
@@ -257,7 +295,7 @@ impl<N: Net> Session<N> {
     }
 
     /// The login exchange (RFC 7143 §6.3): SecurityNegotiation with
-    /// AuthMethod=None, then LoginOperationalNegotiation, then the full
+    /// AuthMethod=None (or CHAP, in three rounds, RFC 7143 §12.1), then LoginOperationalNegotiation, then the full
     /// feature phase. The target may hold us in a stage for more rounds,
     /// split its text across responses, or offer keys of its own.
     fn negotiate(&mut self, opts: &Options, discovery: bool) -> Result<(), IscsiError> {
@@ -265,14 +303,18 @@ impl<N: Net> Session<N> {
         let mut neg = Negotiator::new(opts.offer.clone());
         let itt = self.next_itt();
         let target_name = (!discovery).then_some(opts.target_name.as_str());
-        let mut keys = neg.security_keys(&opts.initiator_name, target_name);
+        let mut keys = neg.security_keys(&opts.initiator_name, target_name, opts.chap.is_some());
+        let mut auth = if opts.chap.is_some() { Auth::Method } else { Auth::Done };
         let mut current = stage::SECURITY;
         let mut operational_sent = false;
         let mut exchanges = 0;
         loop {
             let next = if current == stage::SECURITY { stage::OPERATIONAL } else { stage::FULL_FEATURE };
+            // CHAP takes several rounds in SecurityNegotiation before we may
+            // move on.
+            let transit = current != stage::SECURITY || matches!(auth, Auth::Response(_) | Auth::Done);
             let mut req = LoginRequest {
-                transit: true,
+                transit,
                 cont: false,
                 csg: current,
                 nsg: next,
@@ -321,6 +363,28 @@ impl<N: Net> Session<N> {
                 };
             };
             keys = neg.respond(&text)?;
+            if current == stage::SECURITY
+                && let Some(chap) = &opts.chap
+            {
+                let pairs = text::parse(&text).ok_or(IscsiError::Protocol("malformed login text"))?;
+                match auth {
+                    Auth::Method if !resp.transit => {
+                        keys.extend_from_slice(&chap::start());
+                        auth = Auth::Algorithm;
+                    }
+                    Auth::Algorithm if !resp.transit => {
+                        let (answer, expected) = chap::answer(chap, &pairs)?;
+                        keys.extend_from_slice(&answer);
+                        auth = Auth::Response(expected);
+                    }
+                    Auth::Response(expected) if resp.transit => {
+                        chap::verify(chap, expected, &pairs)?;
+                        auth = Auth::Done;
+                    }
+                    Auth::Done => {}
+                    _ => return Err(IscsiError::Protocol("CHAP exchange out of step")),
+                }
+            }
             if resp.transit {
                 // The target moves on only when we asked to, and to no
                 // later stage than we asked for (RFC 7143 §6.3): never

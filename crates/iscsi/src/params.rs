@@ -13,6 +13,41 @@ use alloc::vec::Vec;
 use crate::IscsiError;
 use crate::text::{self, boolean, number, yes_no};
 
+/// Whether to use a CRC32C digest (`HeaderDigest` or `DataDigest`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DigestPolicy {
+    /// No digest; fail if the target insists on one.
+    #[default]
+    Off,
+    /// Use one if the target supports it (`CRC32C,None`).
+    Prefer,
+    /// Use one or fail the login (`CRC32C`).
+    Require,
+}
+
+impl DigestPolicy {
+    fn offer(self) -> &'static str {
+        match self {
+            Self::Off => "None",
+            Self::Prefer => "CRC32C,None",
+            Self::Require => "CRC32C",
+        }
+    }
+
+    /// Picks from a list of values the target allows.
+    fn choose(self, value: &str) -> Result<bool, IscsiError> {
+        let has = |v| value.split(',').any(|x| x == v);
+        match self {
+            Self::Off if has("None") => Ok(false),
+            Self::Off => Err(IscsiError::Negotiation("target requires digests")),
+            Self::Prefer if has("CRC32C") => Ok(true),
+            Self::Prefer if has("None") => Ok(false),
+            Self::Require if has("CRC32C") => Ok(true),
+            _ => Err(IscsiError::Negotiation("target does not agree on a digest")),
+        }
+    }
+}
+
 /// What the initiator asks for in operational negotiation. The values in
 /// effect are the [`Params`] the target agreed to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +65,10 @@ pub struct Offer {
     pub initial_r2t: bool,
     /// Allow data in the SCSI Command PDU itself.
     pub immediate_data: bool,
+    /// CRC32C over each PDU header.
+    pub header_digest: DigestPolicy,
+    /// CRC32C over each data segment.
+    pub data_digest: DigestPolicy,
 }
 
 impl Default for Offer {
@@ -40,6 +79,8 @@ impl Default for Offer {
             first_burst_length: 65536,
             initial_r2t: false,
             immediate_data: true,
+            header_digest: DigestPolicy::Off,
+            data_digest: DigestPolicy::Off,
         }
     }
 }
@@ -60,6 +101,10 @@ pub struct Params {
     pub initial_r2t: bool,
     /// The SCSI Command PDU may carry data.
     pub immediate_data: bool,
+    /// PDU headers carry a CRC32C digest.
+    pub header_digest: bool,
+    /// Data segments carry a CRC32C digest.
+    pub data_digest: bool,
     /// R2Ts outstanding per command; always 1 here.
     pub max_outstanding_r2t: u32,
     /// Always 0: a failure ends the session.
@@ -90,6 +135,8 @@ impl Default for Params {
             first_burst_length: 65536,
             initial_r2t: true,
             immediate_data: true,
+            header_digest: false,
+            data_digest: false,
             max_outstanding_r2t: 1,
             error_recovery_level: 0,
             default_time2wait: 2,
@@ -118,11 +165,13 @@ pub(crate) struct Negotiator {
     pub(crate) params: Params,
     /// Keys we offered and the target has not answered yet.
     offered: Vec<&'static str>,
+    /// CHAP is the only authentication we accept.
+    chap: bool,
 }
 
 impl Negotiator {
     pub(crate) fn new(offer: Offer) -> Self {
-        Self { offer, params: Params::default(), offered: Vec::new() }
+        Self { offer, params: Params::default(), offered: Vec::new(), chap: false }
     }
 
     fn offer(&mut self, out: &mut Vec<u8>, key: &'static str, value: &str) {
@@ -131,8 +180,10 @@ impl Negotiator {
     }
 
     /// The SecurityNegotiation keys of the first Login Request. A discovery
-    /// session names no target.
-    pub(crate) fn security_keys(&mut self, initiator_name: &str, target_name: Option<&str>) -> Vec<u8> {
+    /// session names no target. With `chap`, authentication is required and
+    /// CHAP is the method offered.
+    pub(crate) fn security_keys(&mut self, initiator_name: &str, target_name: Option<&str>, chap: bool) -> Vec<u8> {
+        self.chap = chap;
         let mut out = Vec::new();
         text::push(&mut out, "InitiatorName", initiator_name);
         match target_name {
@@ -142,7 +193,7 @@ impl Negotiator {
             }
             None => text::push(&mut out, "SessionType", "Discovery"),
         }
-        self.offer(&mut out, "AuthMethod", "None");
+        self.offer(&mut out, "AuthMethod", if chap { "CHAP" } else { "None" });
         out
     }
 
@@ -151,8 +202,8 @@ impl Negotiator {
     pub(crate) fn operational_keys(&mut self, discovery: bool) -> Vec<u8> {
         let o = self.offer.clone();
         let mut out = Vec::new();
-        self.offer(&mut out, "HeaderDigest", "None");
-        self.offer(&mut out, "DataDigest", "None");
+        self.offer(&mut out, "HeaderDigest", o.header_digest.offer());
+        self.offer(&mut out, "DataDigest", o.data_digest.offer());
         let mrdsl = (o.max_recv_data_segment_length as u64).clamp(MIN_DSL, MAX_DSL) as u32;
         text::push(&mut out, "MaxRecvDataSegmentLength", &mrdsl.to_string());
         self.params.max_recv_data_segment_length = mrdsl;
@@ -195,8 +246,8 @@ impl Negotiator {
                 // the default is more than we offered, we keep to our offer:
                 // a smaller burst, or no immediate data, is always allowed.
                 match key {
-                    "AuthMethod" => return Err(bad("target rejected AuthMethod=None")),
-                    "HeaderDigest" | "DataDigest" => return Err(bad("target rejected digest None")),
+                    "AuthMethod" => return Err(bad("target rejected our AuthMethod")),
+                    "HeaderDigest" | "DataDigest" => return Err(bad("target rejected our digest offer")),
                     "MaxBurstLength" => p.max_burst_length = p.max_burst_length.min(o.max_burst_length),
                     "FirstBurstLength" => p.first_burst_length = p.first_burst_length.min(o.first_burst_length),
                     "ImmediateData" => p.immediate_data &= o.immediate_data,
@@ -216,17 +267,38 @@ impl Negotiator {
             // The result, to send back if the target offered the key.
             let result: Option<String> = match key {
                 "AuthMethod" => {
-                    if !value.split(',').any(|v| v == "None") {
-                        return Err(bad("target requires authentication"));
+                    let want = if self.chap { "CHAP" } else { "None" };
+                    if !value.split(',').any(|v| v == want) {
+                        return Err(bad(if self.chap {
+                            "target does not offer CHAP"
+                        } else {
+                            "target requires authentication"
+                        }));
                     }
-                    Some("None".into())
+                    Some(want.into())
                 }
                 "HeaderDigest" | "DataDigest" => {
-                    if !value.split(',').any(|v| v == "None") {
-                        return Err(bad("target requires digests"));
+                    let policy = if key == "HeaderDigest" { o.header_digest } else { o.data_digest };
+                    // Our offer's answer is one value from it; a digest the
+                    // target itself offers is chosen from its list.
+                    let on = if ours {
+                        match (value, policy) {
+                            ("None", DigestPolicy::Off | DigestPolicy::Prefer) => false,
+                            ("CRC32C", DigestPolicy::Prefer | DigestPolicy::Require) => true,
+                            _ => return Err(bad("target chose a digest we did not offer")),
+                        }
+                    } else {
+                        policy.choose(value)?
+                    };
+                    if key == "HeaderDigest" {
+                        p.header_digest = on;
+                    } else {
+                        p.data_digest = on;
                     }
-                    Some("None".into())
+                    Some(if on { "CRC32C" } else { "None" }.into())
                 }
+                // CHAP is handled by the session, which sees the same text.
+                k if k.starts_with("CHAP_") => None,
                 "MaxRecvDataSegmentLength" => {
                     p.max_xmit_data_segment_length = num(MIN_DSL, MAX_DSL)? as u32;
                     None
@@ -315,7 +387,7 @@ mod tests {
     #[test]
     fn offers_and_results() {
         let mut n = Negotiator::new(Offer::default());
-        let sec = n.security_keys("iqn.init", Some("iqn.target"));
+        let sec = n.security_keys("iqn.init", Some("iqn.target"), false);
         assert_eq!(
             keys(&sec),
             [
@@ -357,7 +429,7 @@ mod tests {
     #[test]
     fn target_offers_are_answered() {
         let mut n = Negotiator::new(Offer { max_burst_length: 65536, ..Offer::default() });
-        n.security_keys("i", Some("t"));
+        n.security_keys("i", Some("t"), false);
         let replies = n
             .respond(
                 b"AuthMethod=None\0MaxBurstLength=1048576\0X-com.example.Foo=1\0OFMarker=Yes\0DataDigest=CRC32C,None\0",
@@ -378,7 +450,7 @@ mod tests {
     #[test]
     fn failures() {
         let mut n = Negotiator::new(Offer::default());
-        n.security_keys("i", None);
+        n.security_keys("i", None, false);
         assert!(matches!(n.respond(b"AuthMethod=CHAP\0"), Err(IscsiError::Negotiation(_))));
         assert!(matches!(n.respond(b"AuthMethod=Reject\0"), Err(IscsiError::Negotiation(_))));
         let mut n = Negotiator::new(Offer::default());
@@ -423,7 +495,7 @@ mod tests {
         }
         // The same values offered by the target are cut to ours.
         let mut n = Negotiator::new(Offer::default());
-        n.security_keys("i", Some("t"));
+        n.security_keys("i", Some("t"), false);
         let replies = n.respond(b"ErrorRecoveryLevel=2\0DefaultTime2Retain=20\0MaxOutstandingR2T=2\0").unwrap();
         assert_eq!(
             keys(&replies),
