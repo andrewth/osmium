@@ -21,7 +21,9 @@ use osmium::virt::riscv::harts::GuestHarts;
 use osmium::virt::riscv::{self, RiscvVcpu, sbi};
 use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
 use osmium::hal::dma::{DmaAllocator, DmaBuffer};
-use osmium::virt::virtio::{MMIO_SIZE, VirtioMmio, VirtioNetDevice};
+use osmium::drivers::ramdisk::RamDisk;
+use osmium::hal::block::BlockDevice as _;
+use osmium::virt::virtio::{MMIO_SIZE, VirtioBlock, VirtioMmio, VirtioNetDevice};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, Vcpu, VmExit, run_vcpu};
 
 use crate::FRAMES;
@@ -154,6 +156,11 @@ const PLIC_BASE: u64 = 0x0c00_0000;
 const UART_IRQ: u32 = 10;
 const NET_BASE: u64 = 0x1000_1000;
 const NET_IRQ: u32 = 1;
+const BLK_BASE: u64 = 0x1000_2000;
+const BLK_IRQ: u32 = 2;
+/// The sector the driver guest writes and the host checks.
+const BLK_SECTOR: u64 = 3;
+const BLK_TEXT: &[u8] = b"written by osmium's virtio-blk driver in a guest";
 const GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 /// Guest RAM for the driver demo, clear of the host image the guest also sees.
@@ -184,7 +191,7 @@ pub fn demo_irq() {
         memory: &[(GUEST2_RAM.0, len)],
         plic: Some((PLIC_BASE, 32)),
         uarts: &[(GUEST_UART, UART_IRQ)],
-        virtio: &[(NET_BASE, NET_IRQ)],
+        virtio: &[(NET_BASE, NET_IRQ), (BLK_BASE, BLK_IRQ)],
         bootargs: "",
     }
     .to_dtb();
@@ -237,6 +244,14 @@ pub fn demo_irq() {
         p.set_level(NET_IRQ, level)
     });
     mmio.insert(NET_BASE, MMIO_SIZE, Arc::new(net)).unwrap();
+    // A 32 KiB RAM disk behind virtio-blk. The device needs 'static data;
+    // the buffer is reclaimed once the device is gone.
+    let disk_buf: &'static mut [u8] = alloc::vec![0u8; 64 * 512].leak();
+    let disk_raw = disk_buf as *mut [u8];
+    let disk = RamDisk::new(disk_buf, 512);
+    let p = plic.clone();
+    let blk = Arc::new(VirtioMmio::new(VirtioBlock::new(disk), mem.clone(), move |level| p.set_level(BLK_IRQ, level)));
+    mmio.insert(BLK_BASE, MMIO_SIZE, blk.clone()).unwrap();
     let pio = Bus::new();
 
     let mut halts = 0;
@@ -267,7 +282,19 @@ pub fn demo_irq() {
         VmExit::ExternalInterrupt => ControlFlow::Continue(()),
         other => ControlFlow::Break(other),
     });
+    // The guest's block write must be on the host's RAM disk.
+    let mut sector = [0u8; 512];
+    blk.with_device(|b, _| b.disk().read_blocks(BLK_SECTOR, &mut sector)).unwrap();
+    if sector.starts_with(BLK_TEXT) {
+        println!("[hyp]   the host RAM disk holds the sector the guest wrote ({BLK_SECTOR})");
+    } else {
+        println!("[hyp]   sector {BLK_SECTOR} on the host's RAM disk is not what the guest wrote");
+    }
+
+    drop(blk);
     drop(mmio);
+    // SAFETY: the device that borrowed the buffer has just been dropped.
+    drop(unsafe { alloc::boxed::Box::from_raw(disk_raw) });
     drop(gstage);
     drop(mem);
     // SAFETY: the guest has stopped, and the devices that could reach its
@@ -289,7 +316,10 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     use osmium::hal::serial::{SerialPort, SerialWriter};
     use osmium::drivers::virtio::Transport;
     use osmium::drivers::virtio::mmio::MmioTransport;
+    use osmium::drivers::virtio::DeviceType;
+    use osmium::drivers::virtio::blk::VirtioBlk;
     use osmium::drivers::virtio::net::VirtioNet;
+    use osmium::hal::block::BlockDevice;
     use osmium::hal::net::{MacAddress, NetDevice};
 
     // SAFETY: the hypervisor put a device tree at `dtb`.
@@ -387,6 +417,26 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
             break;
         }
     }
+
+    // virtio-blk with osmium's driver (polled): write a sector, read it back.
+    let blk = fdt.all_nodes().filter(|n| n.is_compatible("virtio,mmio")).find_map(|n| {
+        let (b, s) = n.reg().next()?;
+        // SAFETY: a virtio-mmio window from the device tree.
+        let t = MmioTransport::new(unsafe { IoMem::new(b as *mut u8, s? as usize) }).ok()?;
+        (t.device_type() == DeviceType::Block).then_some(t)
+    });
+    let Some(Ok(mut disk)) = blk.map(|t| VirtioBlk::new(t, &dma)) else { sbi_shutdown() };
+    let mut sector = [0u8; 512];
+    sector[..BLK_TEXT.len()].copy_from_slice(BLK_TEXT);
+    let mut back = [0u8; 512];
+    let ok = disk.write_blocks(BLK_SECTOR, &sector).is_ok() && disk.read_blocks(BLK_SECTOR, &mut back).is_ok() && back == sector;
+    let _ = writeln!(
+        SerialWriter(&mut uart),
+        "[vguest] virtio-blk: {} sectors; sector {BLK_SECTOR} {}",
+        disk.num_blocks(),
+        if ok { "written and read back" } else { "FAILED" }
+    );
+    drop(disk);
     sbi_shutdown()
 }
 
