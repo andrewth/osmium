@@ -714,3 +714,20 @@ fn wait4_sees_a_process_only_when_its_last_thread_is_gone() {
     assert_eq!(callt(&parent, &pmain, Sys::Wait4, &[child.0 as u64, DATA + 0x700, 1, 0]), child.0 as i64);
     assert_eq!(get(&parent, DATA + 0x700, 4), (2i32 << 8).to_ne_bytes(), "the last thread's status");
 }
+
+#[test]
+fn clone_during_an_exec_is_refused_instead_of_escaping_the_doom() {
+    platform();
+    let (p, _) = process("exec-clone");
+    let main = p.leader();
+    let flags = clone_flags();
+    let Outcome::Thread { tid: t1, .. } = clone_thread(&p, &main, flags, STACK, DATA + 0x10, DATA + 0x20, 0) else {
+        panic!()
+    };
+    let th1 = p.group.find(t1).unwrap();
+    assert!(thread::doom_others(&p, &th1));
+    // The exec'ing thread cannot be joined by a straggler.
+    let out = clone_thread(&p, &th1, flags, STACK - 0x400, DATA + 0x10, DATA + 0x24, 0);
+    assert!(matches!(out, Outcome::Return(v) if v == -(Errno::EINTR.0 as i64)), "{out:?}");
+    assert_eq!(p.group.live(), 2, "no thread was added");
+}

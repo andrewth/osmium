@@ -276,6 +276,14 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
     }
     {
         let mut threads = p.group.threads.lock();
+        // `doom_others` snapshots the list under this lock, so a thread added
+        // after it would never be doomed and `execve` would wait for it forever.
+        if caller.doomed.load(Ordering::SeqCst)
+            || p.group.exiting.get().is_some()
+            || threads.iter().any(|t| t.doomed.load(Ordering::SeqCst))
+        {
+            return Err(Errno::EINTR);
+        }
         if threads.len() >= THREADS_MAX {
             return Err(Errno::EAGAIN);
         }

@@ -370,6 +370,9 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                     // The parent may be running on this table.
                     inner.pt.protect(v, flags).map_err(|_| Errno::EINVAL)?.flush();
                     cow = true;
+                    // Record it now, so if the child's map below fails the parent
+                    // can still write the page (a lone share breaks COW in place).
+                    inner.cow.insert(va);
                 }
                 // On failure, dropping `child` releases the pages shared so far.
                 match copy.pt.map(v, pa, PageSize::Size4K, flags) {

@@ -349,12 +349,10 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Openat => openat(p, fd, a[1], a[2], a[3] as u32),
         Sys::Close => p.files().lock().close(fd).map(|()| 0),
         Sys::Lseek => lseek(p, fd, a[1] as i64, a[2]),
-        Sys::Fstat => p.files().lock().get(fd).and_then(|f| put_stat(p, a[1], &f.file().stat())),
+        Sys::Fstat => open_file(p, fd).and_then(|f| put_stat(p, a[1], &f.file().stat())),
         Sys::Newfstatat => newfstatat(p, fd, a[1], a[2], a[3]),
         Sys::Getdents64 => getdents64(p, fd, a[1], a[2]),
-        Sys::Ioctl => {
-            p.files().lock().get(fd).and_then(|f| f.file().ioctl(a[1] as u32, a[2] as usize).map(|v| v as u64))
-        }
+        Sys::Ioctl => open_file(p, fd).and_then(|f| f.file().ioctl(a[1] as u32, a[2] as usize).map(|v| v as u64)),
         Sys::Getcwd => getcwd(p, a[0], a[1]),
         Sys::Chdir => chdir(p, a[0]),
         Sys::Mkdirat => {
@@ -444,14 +442,35 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
 /// Bytes moved per copy between user memory and a file.
 const CHUNK: usize = 4096;
 
+/// The open file behind `fd`, cloned out so the table lock is not held
+/// across file operations (see [`crate::fd`]).
+fn open_file(p: &Process, fd: i32) -> Result<alloc::sync::Arc<OpenFile>, Errno> {
+    p.files().lock().get(fd)
+}
+
+/// Reads up to `len` bytes. Once some bytes have been delivered, a later
+/// chunk's error, or a file with no more data ready (per `poll`), ends the
+/// call with the partial count instead of failing or blocking.
 fn read(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
-    let f = p.files().lock().get(fd)?;
+    let f = open_file(p, fd)?;
     let mut kbuf = vec![0u8; (len as usize).min(CHUNK)];
     let mut done = 0;
     while done < len {
+        if done > 0 && f.file().poll() & osmium_fs::POLLIN == 0 {
+            break;
+        }
         let want = ((len - done) as usize).min(CHUNK);
-        let n = f.read(&mut kbuf[..want])?;
-        p.memory().write(buf + done, &kbuf[..n])?;
+        let n = match f.read(&mut kbuf[..want]) {
+            Ok(n) => n,
+            Err(_) if done > 0 => break,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = p.memory().write(buf + done, &kbuf[..n]) {
+            if done > 0 {
+                break;
+            }
+            return Err(e);
+        }
         done += n as u64;
         // A short read (a console line, the end of a file) ends the call.
         if n < want {
@@ -461,14 +480,32 @@ fn read(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
     Ok(done)
 }
 
+/// Writes `len` bytes. Once some bytes are written, a later chunk's error,
+/// or a file that is no longer writable (per `poll`), ends the call with the
+/// partial count.
 fn write(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
-    let f = p.files().lock().get(fd)?;
+    let f = open_file(p, fd)?;
     let mut kbuf = vec![0u8; (len as usize).min(CHUNK)];
     let mut done = 0;
     while done < len {
+        if done > 0 && f.file().poll() & osmium_fs::POLLOUT == 0 {
+            break;
+        }
         let want = ((len - done) as usize).min(CHUNK);
-        p.memory().read(buf + done, &mut kbuf[..want])?;
-        let n = f.write(&kbuf[..want]).inspect_err(|&e| sigpipe(p, &f, e))?;
+        if let Err(e) = p.memory().read(buf + done, &mut kbuf[..want]) {
+            if done > 0 {
+                break;
+            }
+            return Err(e);
+        }
+        let n = match f.write(&kbuf[..want]) {
+            Ok(n) => n,
+            Err(_) if done > 0 => break,
+            Err(e) => {
+                sigpipe(p, &f, e);
+                return Err(e);
+            }
+        };
         done += n as u64;
         if n < want {
             break;

@@ -345,3 +345,58 @@ fn epoll_levels_edges_and_one_shots() {
     assert_eq!(call(&p, Sys::Sendto, &[c, B1, 1, 0, 0, 0]), 1);
     assert_eq!(drain(&p, outer), [(IN, 2)]);
 }
+
+/// A file whose first read or write moves a full chunk and whose later ones
+/// fail with `EAGAIN`, like a pipe that fills or drains mid-call.
+struct Flaky(core::sync::atomic::AtomicUsize);
+
+impl osmium_fs::File for Flaky {
+    fn stat(&self) -> osmium_fs::Stat {
+        osmium_fs::Stat::default()
+    }
+    fn read(&self, _off: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst) == 0 { Ok(buf.len()) } else { Err(Errno::EAGAIN) }
+    }
+    fn write(&self, _off: u64, buf: &[u8]) -> Result<usize, Errno> {
+        if self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst) == 0 { Ok(buf.len()) } else { Err(Errno::EAGAIN) }
+    }
+}
+
+#[test]
+fn a_later_chunk_error_returns_the_partial_count() {
+    use crate::fd::{Access, OpenFile};
+    let p = process();
+    let open = |p: &Process| {
+        let f = OpenFile::new(alloc::sync::Arc::new(Flaky(Default::default())), Access::RW);
+        p.files().lock().insert(f).unwrap() as u64
+    };
+    let (buf, len) = (BASE + 0x1000, 8192);
+    let fd = open(&p);
+    assert_eq!(call(&p, Sys::Write, &[fd, buf, len]), 4096);
+    let fd = open(&p);
+    assert_eq!(call(&p, Sys::Read, &[fd, buf, len]), 4096);
+    // With nothing delivered yet, the error is reported.
+    assert_eq!(call(&p, Sys::Read, &[fd, buf, len]), err(Errno::EAGAIN));
+    assert_eq!(call(&p, Sys::Write, &[fd, buf, len]), err(Errno::EAGAIN));
+}
+
+#[test]
+fn epoll_rejects_loops_and_keeps_events_when_the_buffer_is_bad() {
+    let p = process();
+    let (a, b) = pair(&p, STREAM);
+    let e1 = call(&p, Sys::EpollCreate1, &[0]) as u64;
+    let e2 = call(&p, Sys::EpollCreate1, &[0]) as u64;
+    let e3 = call(&p, Sys::EpollCreate1, &[0]) as u64;
+    assert_eq!(ctl(&p, e1, 1, e2, IN, 0), 0);
+    assert_eq!(ctl(&p, e2, 1, e3, IN, 0), 0);
+    assert_eq!(ctl(&p, e2, 1, e1, IN, 0), err(Errno::ELOOP));
+    assert_eq!(ctl(&p, e3, 1, e1, IN, 0), err(Errno::ELOOP), "through a chain");
+
+    // A one-shot event survives a failed copy-out.
+    assert_eq!(ctl(&p, e1, 1, b, IN | ONESHOT, 4), 0);
+    put(&p, B1, b"x");
+    assert_eq!(call(&p, Sys::Write, &[a, B1, 1]), 1);
+    assert_eq!(call(&p, Sys::EpollPwait, &[e1, 0x100000, 4, 0, 0, 0]), err(Errno::EFAULT));
+    assert_eq!(drain(&p, e1), [(IN, 4)]);
+    assert!(drain(&p, e1).is_empty());
+}

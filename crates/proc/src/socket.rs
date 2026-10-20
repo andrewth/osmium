@@ -245,37 +245,38 @@ impl SocketFile {
     /// `accept`: waits for a connection and returns it with the peer's
     /// address.
     pub fn accept(&self, nonblock: bool, wait: bool) -> Result<(SocketFile, SocketAddrV4), Errno> {
-        let (port, backlog) = match &*self.kind.lock() {
-            Kind::Tcp(Tcp::Listening { port, backlog }) => (*port, backlog.clone()),
-            _ => return Err(Errno::EINVAL),
-        };
-        let ready = |s: &SocketSet| {
-            backlog
-                .iter()
-                .position(|&h| !matches!(s.get::<TcpSocket>(h).state(), TcpState::Listen | TcpState::SynReceived))
+        let ready = |s: &SocketSet, h: SocketHandle| {
+            !matches!(s.get::<TcpSocket>(h).state(), TcpState::Listen | TcpState::SynReceived)
         };
         let deadline = self.net.deadline(self.rcv_timeout.load(Ordering::Relaxed));
         loop {
-            let taken = self.net.op(|_, s| {
-                let i = ready(s)?;
-                let h = backlog[i];
-                let peer = v4(s.get::<TcpSocket>(h).remote_endpoint());
-                let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
-                t.listen(port).expect("a fresh socket can listen");
-                Some((i, h, peer, s.add(t)))
-            });
-            if let Some((i, h, peer, fresh)) = taken {
-                // The slot is the same listener, or a clone's, so look it up
-                // again rather than assume.
-                if let Kind::Tcp(Tcp::Listening { backlog, .. }) = &mut *self.kind.lock() {
+            // Claim a connection under the socket's lock, against the live
+            // backlog, so two concurrent accepts never take the same slot.
+            // (The order is kind, then net, as in `connect`.)
+            let (taken, snapshot) = {
+                let mut kind = self.kind.lock();
+                let Kind::Tcp(Tcp::Listening { port, backlog }) = &mut *kind else { return Err(Errno::EINVAL) };
+                let port = *port;
+                let taken = self.net.op(|_, s| {
+                    let i = backlog.iter().position(|&h| ready(s, h))?;
+                    let h = backlog[i];
+                    let peer = v4(s.get::<TcpSocket>(h).remote_endpoint());
+                    let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
+                    t.listen(port).expect("a fresh socket can listen");
+                    let fresh = s.add(t);
                     backlog[i] = fresh;
-                }
+                    Some((h, peer))
+                });
+                (taken, backlog.clone())
+            };
+            if let Some((h, peer)) = taken {
                 return Ok((Self::new(self.net.clone(), Kind::Tcp(Tcp::Connected(h)), nonblock), peer));
             }
             if !wait {
                 return Err(Errno::EAGAIN);
             }
-            if !self.net.wait(deadline, |s| ready(s).is_some()) {
+            // The snapshot only decides when to wake; the claim above rechecks.
+            if !self.net.wait(deadline, |s| snapshot.iter().any(|&h| ready(s, h))) {
                 return Err(Errno::EAGAIN);
             }
         }

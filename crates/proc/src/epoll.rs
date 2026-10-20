@@ -40,6 +40,20 @@ const DATA_OFF: usize = 4;
 #[cfg(not(target_arch = "x86_64"))]
 const DATA_OFF: usize = 8;
 
+/// Most levels of epoll instances watching epoll instances.
+const MAX_NEST: usize = 5;
+
+/// Serialises the loop check and insert of an epoll instance into another.
+static NEST: IrqSpinLock<()> = IrqSpinLock::new(());
+
+/// One reported event, with the state it consumed.
+struct Ready {
+    fd: i32,
+    mask: u32,
+    data: u64,
+    prev_last: u32,
+}
+
 struct Watch {
     file: Weak<OpenFile>,
     events: u32,
@@ -57,12 +71,13 @@ pub struct EpollFile {
 }
 
 impl EpollFile {
-    /// The ready events, at most `max`: each is the mask and the user data.
-    fn collect(&self, max: usize) -> Vec<(u32, u64)> {
+    /// The ready events, at most `max`. Each carries what it changed, so
+    /// [`Self::restore`] can undo it if the events cannot be delivered.
+    fn collect(&self, max: usize) -> Vec<Ready> {
         let mut out = Vec::new();
         let mut watches = self.watches.lock();
         watches.retain(|_, w| w.file.strong_count() > 0);
-        for w in watches.values_mut() {
+        for (&fd, w) in watches.iter_mut() {
             if out.len() == max {
                 break;
             }
@@ -72,15 +87,42 @@ impl EpollFile {
             }
             let ready = Self::bits(&f, false) & (w.events | POLLERR | POLLHUP);
             let fire = if w.events & EPOLLET != 0 { ready & !w.last } else { ready };
+            let prev_last = w.last;
             w.last = ready;
             if fire != 0 {
                 if w.events & EPOLLONESHOT != 0 {
                     w.disarmed = true;
                 }
-                out.push((fire, w.data));
+                out.push(Ready { fd, mask: fire, data: w.data, prev_last });
             }
         }
         out
+    }
+
+    /// Undoes the edge and one-shot state that `collect` consumed for `ready`.
+    fn restore(&self, ready: &[Ready]) {
+        let mut watches = self.watches.lock();
+        for r in ready {
+            if let Some(w) = watches.get_mut(&r.fd).filter(|w| w.data == r.data) {
+                w.last = r.prev_last;
+                w.disarmed = false;
+            }
+        }
+    }
+
+    /// Whether `goal` is this instance or is watched, directly or through
+    /// other instances, by it. Too deep a nesting counts as reachable.
+    fn reaches(&self, goal: &EpollFile, depth: usize) -> bool {
+        if core::ptr::eq(self, goal) {
+            return true;
+        }
+        if depth >= MAX_NEST {
+            return true;
+        }
+        let files: Vec<Arc<OpenFile>> = self.watches.lock().values().filter_map(|w| w.file.upgrade()).collect();
+        files.iter().any(|f| {
+            f.file().as_any().and_then(|a| a.downcast_ref::<EpollFile>()).is_some_and(|e| e.reaches(goal, depth + 1))
+        })
     }
 
     /// `f`'s readiness; a nested epoll is looked into only when `shallow`
@@ -151,6 +193,16 @@ pub(crate) fn ctl(p: &Process, epfd: i32, op: u64, fd: i32, event: u64) -> SysRe
         let data = u64::from_ne_bytes(b[DATA_OFF..DATA_OFF + 8].try_into().expect("8 bytes"));
         (events, data)
     };
+    // Adding an instance to another must not close a loop (collecting would
+    // lock instances in a cycle); `NEST` makes the check and insert one step.
+    let nest_guard =
+        (op == EPOLL_CTL_ADD && target.file().as_any().is_some_and(|a| a.is::<EpollFile>())).then(|| NEST.lock());
+    if nest_guard.is_some() {
+        let inner = target.file().as_any().and_then(|a| a.downcast_ref::<EpollFile>()).expect("checked above");
+        if inner.reaches(ep, 0) {
+            return Err(Errno::ELOOP);
+        }
+    }
     let mut watches = ep.watches.lock();
     match op {
         EPOLL_CTL_ADD => {
@@ -176,6 +228,7 @@ pub(crate) fn ctl(p: &Process, epfd: i32, op: u64, fd: i32, event: u64) -> SysRe
         _ => return Err(Errno::EINVAL),
     }
     drop(watches);
+    drop(nest_guard);
     notify();
     Ok(0)
 }
@@ -198,11 +251,15 @@ pub(crate) fn wait_events(p: &Process, epfd: i32, events: u64, max: u64, timeout
     })
     .unwrap_or_default();
     let mut out = alloc::vec![0u8; ready.len() * EVENT_LEN];
-    for (c, (mask, data)) in out.as_chunks_mut::<EVENT_LEN>().0.iter_mut().zip(&ready) {
-        c[..4].copy_from_slice(&mask.to_ne_bytes());
-        c[DATA_OFF..DATA_OFF + 8].copy_from_slice(&data.to_ne_bytes());
+    for (c, r) in out.as_chunks_mut::<EVENT_LEN>().0.iter_mut().zip(&ready) {
+        c[..4].copy_from_slice(&r.mask.to_ne_bytes());
+        c[DATA_OFF..DATA_OFF + 8].copy_from_slice(&r.data.to_ne_bytes());
     }
-    p.memory().write(events, &out)?;
+    if let Err(e) = p.memory().write(events, &out) {
+        // Nothing was delivered, so the events must stay pending.
+        ep.restore(&ready);
+        return Err(e);
+    }
     Ok(ready.len() as u64)
 }
 
