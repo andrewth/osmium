@@ -70,6 +70,12 @@ osmium riscv-virt example (hart 0)
 
 (Press `Ctrl-A X` to leave QEMU if it does not exit on its own.)
 
+[`examples/riscv-firmware`](examples/riscv-firmware) shows the other end of
+the range: machine-mode firmware started with `-bios none`, with no heap and
+no scheduler. Two async tasks on the heap-free `osmium-exec` executor await
+CLINT timer interrupts and UART input routed through the PLIC, then the
+firmware powers off. The binary links no allocator.
+
 ## Testing
 
 Every crate builds and runs its tests on the host. `osmium-arch` replaces
