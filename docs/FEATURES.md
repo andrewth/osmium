@@ -188,7 +188,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `DevDir` for a kernel-populated `/dev`, plus null and zero devices
 - ✅ cpio `newc` archives: zero-copy iteration and initramfs unpacking (concatenated archives, `..` refused), tested against GNU cpio
 - ✅ ext2, read and write, over any `BlockDevice`: indirect block maps, sparse files, fast and slow symlinks, allocation, truncation, orphaned open files; tested with `mkfs.ext2 -d`, `e2fsck` and `debugfs`
-- 🗺 FAT32, a block cache, rename and hard links, timestamps from a clock in the VFS
+- ✅ FAT32 (`osmium-fs-fat`), read and write, over any `BlockDevice`: VFAT long names with generated `~N` short names, case-insensitive lookup, every FAT copy and the FSInfo free count kept current, orphaned open files; tested with `mkfs.fat` and `fsck.fat`
+- 🗺 A block cache, rename and hard links, timestamps from a clock in the VFS
 
 ### `osmium-virt`: hypervisor building blocks
 - ✅ `GuestPhysAddr`, and `GuestMemory`: a GPA-to-host region map with bounds-checked `read`/`write`/`read_obj`/`write_obj` and a `Pod` marker

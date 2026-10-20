@@ -36,6 +36,7 @@ colors and type.
 | `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
 | `osmium-fs` | `File` trait and `Vfs` namespace (mounts, `..` across mounts, symlinks), Linux `Errno`, RAM file system, `/dev` nodes, cpio initramfs unpacking, ext2 (read and write) over any `BlockDevice` | yes |
 | `osmium-proc` | `Process` (address space, fd table, cwd, exit status, `wait`), `AddressSpace` with page-table-checked user copies, and one portable system-call dispatcher using each architecture's Linux numbers and structure layouts | yes |
+| `osmium-fs-fat` | FAT32 for the `osmium-fs` VFS over any `BlockDevice`: long (VFAT) names, create, write, truncate, remove | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
 
 The library never defines an entry point, panic handler or global allocator;

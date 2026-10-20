@@ -15,6 +15,8 @@
 //! | `sched` | `osmium-sched` | tasks, context switch, schedulers, wait queues, timers |
 //! | `virt` | `osmium-virt` | guest memory, stage-2 tables, device buses, VM exits |
 //! | `exec` | `osmium-exec` | heap-free async executor for firmware |
+//! | `fs` | `osmium-fs` | virtual file system, mounts, RAM file system, initramfs |
+//! | `fs_fat` | `osmium-fs-fat` | FAT32 with long names on any block device |
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
 //!
 //! The library never defines an entry point, panic handler or global
@@ -32,6 +34,8 @@ pub use osmium_exec as exec;
 pub use osmium_fs as fs;
 #[cfg(feature = "proc")]
 pub use osmium_proc as proc;
+#[cfg(feature = "fs-fat")]
+pub use osmium_fs_fat as fs_fat;
 #[cfg(feature = "hal")]
 pub use osmium_hal as hal;
 #[cfg(feature = "mm")]
