@@ -90,9 +90,9 @@ loads a kernel image.
 
 ## Current limits
 
-- AArch64 and x86 guests are single-vCPU; x86 guests must run with paging
-  off for MMIO emulation without decode assists, and FS, GS, TR and the
-  syscall MSRs are not switched (no VMLOAD/VMSAVE).
+- AArch64 and x86 guests are single-vCPU. x86 MMIO emulation without
+  decode assists walks 4-level (long-mode) guest page tables, or none; 32-bit
+  paging is not walked.
 - No VMX backend (QEMU's TCG does not emulate VMX).
 - AArch64 FP/SIMD registers are not switched; leave the guest's `CPACR_EL1`
   FP access off, or run one guest per CPU.

@@ -152,11 +152,40 @@ x86_guest_end:
     options(att_syntax)
 );
 
+// A 64-bit guest, entered directly in long mode on page tables the host
+// built in its RAM. It prints through the MMIO 16550 (mapped in its own
+// tables, unmapped in the nested ones), so every access is a nested page
+// fault whose instruction is fetched through the guest's tables.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .globl lm_guest, lm_guest_end
+    .code64
+lm_guest:
+    lea 3f(%rip), %rsi
+    mov $0xfed00000, %rbx
+1:  lodsb
+    test %al, %al
+    jz 2f
+    mov %al, (%rbx)                 // nested page fault -> MMIO write
+    jmp 1b
+2:  movzbq 5(%rbx), %r12            // MMIO read into a REX register
+    mov $1, %eax
+    vmmcall
+4:  jmp 4b
+3:  .asciz "[guest] 64-bit, paging on, MMIO through the guest's page tables\n"
+lm_guest_end:
+"#,
+    options(att_syntax)
+);
+
 unsafe extern "C" {
     static _kernel_start: u8;
     static _kernel_end: u8;
     static x86_guest: u8;
     static x86_guest_end: u8;
+    static lm_guest: u8;
+    static lm_guest_end: u8;
 }
 
 fn sym(s: &u8) -> u64 {
@@ -224,6 +253,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
         }
     }
     guest_demo();
+    long_mode_demo();
 
     println!("[done]  {} free frames; shutting down", FRAMES.lock().free_frames());
     shutdown()
@@ -282,9 +312,9 @@ fn guest_demo() {
     let mmio = Bus::new();
     mmio.insert(GUEST_MMIO_UART, 8, Arc::new(Uart16550Model::new(console))).unwrap();
 
-    let (vmcb, iopm, msrpm) = (block(0), block(2), block(1));
+    let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-    let mut vcpu = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
+    let mut vcpu = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
         .with_memory(mem.clone())
         .with_irq_line(intr);
     // The PIC's output is the vCPU's INTR line; delivery acknowledges it.
@@ -320,6 +350,77 @@ fn guest_demo() {
         f.dealloc(PhysAddr::new(vmcb.1), 0);
         f.dealloc(PhysAddr::new(iopm.1), 2);
         f.dealloc(PhysAddr::new(msrpm.1), 1);
+        f.dealloc(PhysAddr::new(host.1), 0);
+        f.dealloc(ram, GUEST_RAM_ORDER);
+    }
+}
+
+/// Runs a 64-bit guest with paging on: long mode set up in the VMCB, page
+/// tables built by the host in guest RAM.
+fn long_mode_demo() {
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guest until it is freed below.
+    unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image in .rodata.
+    let image = unsafe {
+        let start = &raw const lm_guest;
+        core::slice::from_raw_parts(start, (&raw const lm_guest_end).offset_from(start) as usize)
+    };
+    mem.write(GuestPhysAddr(GUEST_ENTRY), image).unwrap();
+    // Guest page tables: PML4 0x1000 -> PDPT 0x2000. PDPT[0] -> PD 0x3000
+    // mapping 0..2 MiB (RAM); PDPT[3] -> PD 0x4000 mapping the 2 MiB page
+    // holding the MMIO UART, uncached.
+    let pte = |gpa: u64, v: u64| mem.write_obj(GuestPhysAddr(gpa), v).unwrap();
+    pte(0x1000, 0x2003);
+    pte(0x2000, 0x3003);
+    pte(0x2000 + 3 * 8, 0x4003);
+    pte(0x3000, 0x83);
+    let uart_page = GUEST_MMIO_UART & !0x1f_ffff;
+    pte(0x4000 + ((GUEST_MMIO_UART >> 21) & 0x1ff) * 8, uart_page | 0x9b); // P, RW, PWT, PCD, PS
+    let mem = Arc::new(mem);
+
+    let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
+    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER).unwrap();
+
+    let line = Arc::new(IrqSpinLock::new(Vec::new()));
+    let out = line.clone();
+    let mmio = Bus::new();
+    let uart = Uart16550Model::new(move |b| {
+        let mut l = out.lock();
+        l.push(b);
+        if b == b'\n' {
+            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
+            l.clear();
+        }
+    });
+    mmio.insert(GUEST_MMIO_UART, 8, Arc::new(uart)).unwrap();
+    let pio = Bus::new();
+
+    let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
+    // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
+    let mut vcpu = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
+        .with_memory(mem.clone());
+    vcpu.set_long_mode(0x1000);
+    let exit = run_vcpu(&mut vcpu, &mmio, &pio, |_, exit| match exit {
+        VmExit::Hypercall { nr: 1, .. } => ControlFlow::Break(VmExit::Shutdown),
+        VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+        other => ControlFlow::Break(other),
+    });
+    println!("[hyp]   64-bit guest exit {exit:?}, LSR {:#x} in r12", vcpu.regs.r12);
+
+    drop(vcpu);
+    drop(npt);
+    drop(mem);
+    // SAFETY: the guest has stopped; nothing references these blocks.
+    unsafe {
+        let mut f = FRAMES.lock();
+        f.dealloc(PhysAddr::new(vmcb.1), 0);
+        f.dealloc(PhysAddr::new(iopm.1), 2);
+        f.dealloc(PhysAddr::new(msrpm.1), 1);
+        f.dealloc(PhysAddr::new(host.1), 0);
         f.dealloc(ram, GUEST_RAM_ORDER);
     }
 }
