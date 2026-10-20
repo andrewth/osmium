@@ -4,7 +4,7 @@ use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
 
 use super::AhciError;
-use super::port::{Command, Port};
+use super::port::{Command, MAX_SLOTS, Port};
 
 /// Bytes of DMA bounce buffer per disk, and so the most one command
 /// transfers.
@@ -15,16 +15,29 @@ pub(super) const IDENTIFY_DEVICE: u8 = 0xec;
 pub(super) const READ_DMA_EXT: u8 = 0x25;
 pub(super) const WRITE_DMA_EXT: u8 = 0x35;
 pub(super) const FLUSH_CACHE_EXT: u8 = 0xea;
+pub(super) const READ_FPDMA_QUEUED: u8 = 0x60;
+pub(super) const WRITE_FPDMA_QUEUED: u8 = 0x61;
+pub(super) const READ_LOG_EXT: u8 = 0x2f;
+/// The log page (in the LBA) holding the details of an NCQ error.
+pub(super) const NCQ_ERROR_LOG: u64 = 0x10;
+pub(super) const IDENTIFY_PACKET_DEVICE: u8 = 0xa1;
 
 /// The device register for commands that take an LBA.
 pub(super) const DEVICE_LBA: u8 = 0x40;
 
 const IDENTIFY_LEN: usize = 512;
 const SECTOR_SIZE: usize = 512;
+/// Bytes one queued command moves, at least (a sector may be larger).
+const NCQ_CHUNK: usize = 16 * 1024;
 
 // IDENTIFY DEVICE words.
 const ID_SERIAL: usize = 10;
 const ID_MODEL: usize = 27;
+/// Word 75 bits 4:0 are the queue depth less one; word 76 bit 8 says the
+/// device does native command queuing.
+const ID_QUEUE_DEPTH: usize = 75;
+const ID_SATA_CAPS: usize = 76;
+const ID_NCQ: u16 = 1 << 8;
 const ID_COMMAND_SETS: usize = 83;
 const ID_LBA48: u16 = 1 << 10;
 /// Words 83 and 106 are valid when their bits 15:14 are 01.
@@ -38,10 +51,19 @@ const ID_LOGICAL_SECTOR: usize = 117;
 
 /// A SATA disk, addressed in logical sectors with 48-bit LBAs. It owns its
 /// port; dropping it stops the port and frees its memory.
+///
+/// If the HBA and the disk both do native command queuing, a read or write
+/// of more than one chunk (16 KiB, or a sector if that is larger) keeps up
+/// to eight chunks in flight at once, each in its own command slot with its
+/// own part of the bounce buffer ([`AhciDisk::queue_depth`]).
 pub struct AhciDisk<'d, D: DmaAllocator + ?Sized> {
     port: Port<'d, D>,
     sectors: u64,
     sector_size: usize,
+    /// Commands in flight at once: 1 unless the disk does NCQ.
+    slots: usize,
+    /// Bytes of bounce buffer per slot.
+    chunk: usize,
     model: [u8; 40],
     serial: [u8; 20],
 }
@@ -50,7 +72,7 @@ impl<'d, D: DmaAllocator + ?Sized> AhciDisk<'d, D> {
     /// Gives `port` a bounce buffer from `dma` and identifies its disk.
     pub(super) fn new(mut port: Port<'d, D>, dma: &'d D) -> Result<Self, AhciError> {
         port.set_data(OwnedDma::new(dma, DATA_LEN).ok_or(AhciError::NoMemory)?)?;
-        let cmd = Command { command: IDENTIFY_DEVICE, lba: 0, count: 0, device: 0, len: IDENTIFY_LEN, write: false };
+        let cmd = Command { command: IDENTIFY_DEVICE, len: IDENTIFY_LEN, ..Command::default() };
         port.exec(cmd)?;
         let mut id = [0u8; IDENTIFY_LEN];
         port.data()?.read(0, &mut id);
@@ -84,7 +106,40 @@ impl<'d, D: DmaAllocator + ?Sized> AhciDisk<'d, D> {
         let mut serial = [0u8; 20];
         string(ID_MODEL, &mut model);
         string(ID_SERIAL, &mut serial);
-        Ok(Self { port, sectors, sector_size, model, serial })
+
+        // Native command queuing needs both ends, and a queue worth having.
+        let depth = (word(ID_QUEUE_DEPTH) & 0x1f) as usize + 1;
+        let slots = if port.hba_ncq() && word(ID_SATA_CAPS) & ID_NCQ != 0 { depth.min(port.max_slots()) } else { 1 };
+        let chunk = if slots > 1 { NCQ_CHUNK.max(sector_size) } else { DATA_LEN };
+        if slots > 1 {
+            port.set_data(OwnedDma::new(dma, slots * chunk).ok_or(AhciError::NoMemory)?)?;
+            port.set_slots(slots);
+        }
+        Ok(Self { port, sectors, sector_size, slots, chunk, model, serial })
+    }
+
+    /// Commands the disk keeps in flight at once: more than 1 means native
+    /// command queuing is in use.
+    pub fn queue_depth(&self) -> usize {
+        self.slots
+    }
+
+    /// Waits for completions by calling `idle` between looks at the port
+    /// (typically a function that sleeps until the next interrupt), with
+    /// the port's interrupts armed, instead of spinning. The HBA's interrupts must be on
+    /// ([`Ahci::enable_interrupts`](super::Ahci::enable_interrupts)), and
+    /// the kernel's handler must call [`AhciIrq::handle`](super::AhciIrq::handle).
+    ///
+    /// `idle` must return when a timer interrupt arrives even if the disk
+    /// stays silent, or a dead disk would hang the caller: waits are only
+    /// bounded by a count of `idle` calls. A spurious return is harmless.
+    pub fn enable_interrupts(&mut self, idle: fn()) {
+        self.port.set_idle(Some(idle));
+    }
+
+    /// Goes back to polling.
+    pub fn disable_interrupts(&mut self) {
+        self.port.set_idle(None);
     }
 
     /// The port the disk is on.
@@ -105,14 +160,39 @@ impl<'d, D: DmaAllocator + ?Sized> AhciDisk<'d, D> {
     /// Moves `len` bytes of the bounce buffer to or from the disk at `lba`.
     fn transfer(&mut self, command: u8, lba: u64, len: usize, write: bool) -> Result<(), BlockError> {
         let count = (len / self.sector_size) as u16;
-        let cmd = Command { command, lba, count, device: DEVICE_LBA, len, write };
+        let cmd = Command { command, lba, count, device: DEVICE_LBA, len, write, ..Command::default() };
         self.port.exec(cmd).map_err(|_| BlockError::Io)
+    }
+
+    /// One round of queued commands over `len` bytes of the bounce buffer
+    /// (at most `slots * chunk`), starting at `lba`.
+    fn transfer_queued(&mut self, command: u8, lba: u64, len: usize, write: bool) -> Result<(), BlockError> {
+        let mut cmds = [Command::default(); MAX_SLOTS];
+        let n = len.div_ceil(self.chunk);
+        for (i, cmd) in cmds[..n].iter_mut().enumerate() {
+            let off = i * self.chunk;
+            let bytes = self.chunk.min(len - off);
+            let sectors = (bytes / self.sector_size) as u16;
+            *cmd = Command {
+                command,
+                features: sectors,
+                lba: lba + (off / self.sector_size) as u64,
+                // The tag is the slot, in bits 7:3.
+                count: (i as u16) << 3,
+                device: DEVICE_LBA,
+                len: bytes,
+                write,
+                data_off: off,
+                packet: None,
+            };
+        }
+        self.port.exec_queued(&cmds[..n]).map_err(|_| BlockError::Io)
     }
 }
 
 /// `s` without leading and trailing spaces and NULs, or `""` if it is
 /// not text.
-fn trim(s: &[u8]) -> &str {
+pub(super) fn trim(s: &[u8]) -> &str {
     core::str::from_utf8(s).unwrap_or("").trim_matches([' ', '\0'])
 }
 
@@ -127,20 +207,30 @@ impl<D: DmaAllocator + ?Sized> BlockDevice for AhciDisk<'_, D> {
 
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         self.check_range(lba, buf.len())?;
-        for (i, chunk) in buf.chunks_mut(DATA_LEN).enumerate() {
-            let sector = lba + (i * DATA_LEN / self.sector_size) as u64;
-            self.transfer(READ_DMA_EXT, sector, chunk.len(), false)?;
-            self.port.data().map_err(|_| BlockError::Io)?.read(0, chunk);
+        let round = self.slots * self.chunk;
+        for (i, part) in buf.chunks_mut(round).enumerate() {
+            let sector = lba + (i * round / self.sector_size) as u64;
+            if self.slots > 1 {
+                self.transfer_queued(READ_FPDMA_QUEUED, sector, part.len(), false)?;
+            } else {
+                self.transfer(READ_DMA_EXT, sector, part.len(), false)?;
+            }
+            self.port.data().map_err(|_| BlockError::Io)?.read(0, part);
         }
         Ok(())
     }
 
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         self.check_range(lba, buf.len())?;
-        for (i, chunk) in buf.chunks(DATA_LEN).enumerate() {
-            let sector = lba + (i * DATA_LEN / self.sector_size) as u64;
-            self.port.data().map_err(|_| BlockError::Io)?.write(0, chunk);
-            self.transfer(WRITE_DMA_EXT, sector, chunk.len(), true)?;
+        let round = self.slots * self.chunk;
+        for (i, part) in buf.chunks(round).enumerate() {
+            let sector = lba + (i * round / self.sector_size) as u64;
+            self.port.data().map_err(|_| BlockError::Io)?.write(0, part);
+            if self.slots > 1 {
+                self.transfer_queued(WRITE_FPDMA_QUEUED, sector, part.len(), true)?;
+            } else {
+                self.transfer(WRITE_DMA_EXT, sector, part.len(), true)?;
+            }
         }
         Ok(())
     }

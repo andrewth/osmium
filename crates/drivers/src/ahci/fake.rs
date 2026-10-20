@@ -13,6 +13,14 @@
 //! ST while the device is busy, issuing a command on a stopped port)
 //! panic the test.
 //!
+//! It also models what the driver's newer features need: several command
+//! slots (a queued command per slot, completed one slot per few reads,
+//! highest tag first, with the device refusing everything but the NCQ error
+//! log after a queued failure), PxIE and the HBA's IS and GHC.IE, so tests
+//! can see the interrupt line and run the driver's handler from the idle
+//! hook, and an ATAPI drive that answers PACKET commands with a handful of
+//! SCSI commands over an optional disc.
+//!
 //! [`FakeClock`] keeps the fake's time, which moves only when the driver
 //! reads the clock.
 
@@ -25,9 +33,13 @@ use std::vec::Vec;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::timer::Clock;
 
-use super::disk::{DEVICE_LBA, FLUSH_CACHE_EXT, IDENTIFY_DEVICE, READ_DMA_EXT, WRITE_DMA_EXT};
+use super::atapi::{PACKET, READ_10, READ_CAPACITY_10, REQUEST_SENSE, TEST_UNIT_READY};
+use super::disk::{
+    DEVICE_LBA, FLUSH_CACHE_EXT, IDENTIFY_DEVICE, IDENTIFY_PACKET_DEVICE, NCQ_ERROR_LOG, READ_DMA_EXT,
+    READ_FPDMA_QUEUED, READ_LOG_EXT, WRITE_DMA_EXT, WRITE_FPDMA_QUEUED,
+};
 use super::port::*;
-use super::{BOHC, BOHC_BOS, BOHC_OOS, CAP, CAP2, CAP2_BOH, GHC, HBA_IS, MAX_PORTS, PI, VS, cap};
+use super::{BOHC, BOHC_BOS, BOHC_OOS, CAP, CAP2, CAP2_BOH, GHC, GHC_IE, HBA_IS, MAX_PORTS, PI, VS, cap};
 
 /// Register reads it takes CR/FR, BSY and command completion to catch up.
 const LAG: u32 = 2;
@@ -54,8 +66,25 @@ pub struct Cmd {
 }
 
 pub enum FakeDev {
-    Disk { data: Vec<u8>, sectors: u64, sector_size: usize, model: String, serial: String, lba48: bool },
-    Atapi,
+    Disk { data: Vec<u8>, sectors: u64, sector_size: usize, model: String, serial: String, lba48: bool, ncq: u8 },
+    Atapi(Cd),
+}
+
+/// An optical drive.
+pub struct Cd {
+    /// The disc in the tray, as blocks of `block_size`.
+    pub disc: Option<Vec<u8>>,
+    pub block_size: usize,
+    pub dma: bool,
+    /// The next command fails with a unit attention, which REQUEST SENSE
+    /// clears.
+    pub attention: bool,
+    /// Commands left to fail with "not ready" first.
+    pub not_ready: u32,
+    /// Reads at or past this block fail.
+    pub fail_from: u64,
+    /// The SCSI commands run, first byte each.
+    pub scsi: Vec<u8>,
 }
 
 impl FakeDev {
@@ -69,7 +98,29 @@ impl FakeDev {
             model: "Fake Disk".into(),
             serial: "0001".into(),
             lba48: true,
+            ncq: 0,
         }
+    }
+
+    /// An optical drive with `disc` in it.
+    pub fn atapi(disc: Option<Vec<u8>>) -> Self {
+        FakeDev::Atapi(Cd {
+            disc,
+            block_size: 2048,
+            dma: true,
+            attention: false,
+            not_ready: 0,
+            fail_from: u64::MAX,
+            scsi: Vec::new(),
+        })
+    }
+
+    /// Makes a disk do NCQ with a queue of `depth`.
+    pub fn with_ncq(mut self, depth: u8) -> Self {
+        if let FakeDev::Disk { ncq, .. } = &mut self {
+            *ncq = depth;
+        }
+        self
     }
 
     pub fn with_data(mut self, contents: Vec<u8>) -> Self {
@@ -95,7 +146,7 @@ impl FakeDev {
     fn signature(&self) -> u32 {
         match self {
             FakeDev::Disk { .. } => 0x0000_0101,
-            FakeDev::Atapi => 0xeb14_0101,
+            FakeDev::Atapi(_) => 0xeb14_0101,
         }
     }
 }
@@ -123,6 +174,17 @@ pub struct FakePort {
     /// IDENTIFY DEVICE words to replace: (index, value).
     pub identify_words: Vec<(usize, u16)>,
 
+    /// The most commands that were outstanding together.
+    pub max_inflight: u32,
+    /// The slots commands ran in, in order.
+    pub slots_run: Vec<usize>,
+    /// PxSACT, and the device refusing all but READ LOG EXT after a queued
+    /// command failed.
+    sact: u32,
+    ncq_error: bool,
+    /// Packet commands received: the 12 bytes of each.
+    pub packets: Vec<[u8; 12]>,
+
     pub starts: u32,
     pub clos: u32,
     pub comresets: u32,
@@ -145,6 +207,14 @@ pub struct FakePort {
     comreset_at: u64,
     /// SSTS reads left before the link comes up.
     link_in: Option<u32>,
+}
+
+impl FakePort {
+    /// True if the device still refuses commands until its NCQ error log
+    /// is read.
+    pub fn ncq_error_pending(&self) -> bool {
+        self.ncq_error
+    }
 }
 
 /// The register file.
@@ -178,6 +248,8 @@ pub struct FakeHba {
     pub log: Vec<Cmd>,
     /// Nanoseconds on [`FakeClock`].
     pub now: u64,
+    /// The HBA's IS register.
+    hba_is: u32,
 }
 
 /// A clock on the fake HBA's time, which each reading moves on by 1 µs.
@@ -248,13 +320,14 @@ impl FakeHba {
     pub fn new(ports: usize) -> Self {
         Self {
             regs: Regs((0..REGS_LEN / 4).map(|_| Cell::new(0)).collect()),
-            cap: cap::S64A | cap::SCLO | 31 << 8 | (ports as u32 - 1),
+            cap: cap::S64A | cap::SNCQ | cap::SCLO | 31 << 8 | (ports as u32 - 1),
             pi: ((1u64 << ports) - 1) as u32,
             bios_owned: false,
             handed_off: false,
             ports: (0..ports).map(|_| FakePort { fail_from: u64::MAX, ..FakePort::default() }).collect(),
             log: Vec::new(),
             now: 0,
+            hba_is: 0,
         }
     }
 
@@ -269,6 +342,29 @@ impl FakeHba {
 
     pub fn ghc(&self) -> u32 {
         self.regs.get(GHC)
+    }
+
+    /// Lets the hardware get on with it while the CPU sleeps: runs the
+    /// commands that were waiting for the driver to look again.
+    pub fn sleep(&mut self) {
+        for p in 0..self.ports.len() {
+            if self.ports[p].pending.take().is_some() {
+                self.execute(p);
+            }
+        }
+    }
+
+    /// True if the HBA's interrupt line is asserted.
+    pub fn irq_asserted(&self) -> bool {
+        self.ghc() & GHC_IE != 0 && self.hba_is != 0
+    }
+
+    /// Raises the HBA's IS bit for `p` if the port has an enabled status.
+    fn sync_irq(&mut self, p: usize) {
+        if self.ports[p].is & self.regs.port_reg(p, IE) != 0 {
+            self.hba_is |= 1 << p;
+            self.regs.set(HBA_IS, self.hba_is);
+        }
     }
 
     pub fn port_reg(&self, port: usize, reg: usize) -> u32 {
@@ -342,7 +438,7 @@ impl FakeHba {
                 Some(n) => port.busy_reads = Some(n - 1),
                 None => {}
             },
-            CI => match port.pending {
+            CI | SACT => match port.pending {
                 Some(0) => {
                     port.pending = None;
                     self.execute(p);
@@ -368,7 +464,10 @@ impl FakeHba {
                     self.handed_off = true;
                     regs.set(BOHC, BOHC_OOS);
                 }
-                HBA_IS => regs.set(HBA_IS, 0),
+                HBA_IS => {
+                    self.hba_is &= !v;
+                    regs.set(HBA_IS, self.hba_is);
+                }
                 CAP | PI | VS | CAP2 => panic!("write to read-only register {off:#x}"),
                 _ => {}
             }
@@ -376,6 +475,11 @@ impl FakeHba {
         };
         let port = &mut self.ports[p];
         match reg {
+            IE => self.sync_irq(p),
+            SACT => {
+                port.sact |= v;
+                regs.pset(p, SACT, port.sact);
+            }
             CLB | CLBU => assert_eq!(port.cmd & (CMD_ST | CMD_CR), 0, "command list moved under a running port"),
             FB | FBU => assert_eq!(port.cmd & (CMD_FRE | CMD_FR), 0, "FIS area moved while receiving"),
             IS => {
@@ -392,6 +496,7 @@ impl FakeHba {
                 assert_ne!(port.cmd & CMD_ST, 0, "command issued on a stopped port");
                 assert!(!port.latched, "command issued before error recovery");
                 port.ci |= v;
+                port.max_inflight = port.max_inflight.max(port.ci.count_ones());
                 regs.pset(p, CI, port.ci);
                 regs.pset(p, TFD, regs.port_reg(p, TFD) | STS_BSY);
                 port.pending = if port.hang { None } else { Some(LAG) };
@@ -422,8 +527,10 @@ impl FakeHba {
         }
         if new & CMD_ST == 0 && prev & CMD_ST != 0 {
             port.ci = 0;
+            port.sact = 0;
             port.pending = None;
             regs.pset(p, CI, 0);
+            regs.pset(p, SACT, 0);
         }
         if new & CMD_SUD != 0 && prev & CMD_SUD == 0 {
             link_start(regs, p, port);
@@ -476,21 +583,24 @@ impl FakeHba {
         }
     }
 
-    /// Runs the command in slot 0.
+    /// Runs the highest-numbered outstanding command.
     fn execute(&mut self, p: usize) {
         let regs = &self.regs;
         let base = PORT_BASE + PORT_STRIDE * p;
+        let slot = 31 - self.ports[p].ci.leading_zeros() as usize;
         let clb = regs.get(base + CLB) as u64 | (regs.get(base + CLBU) as u64) << 32;
-        let hdr = mem(clb, 32);
+        let hdr = mem(clb + 32 * slot as u64, 32);
         let dw0 = dword(hdr, 0);
         assert_eq!(dw0 & HDR_CFL_MASK, 5, "a register FIS is five dwords");
         let write = dw0 & HDR_WRITE != 0;
+        let atapi = dw0 & HDR_ATAPI != 0;
         let prdtl = (dw0 >> 16) as usize;
         let ctba = dword(hdr, 8) as u64 | (dword(hdr, 12) as u64) << 32;
         assert_eq!(ctba % 128, 0, "command table alignment");
         let fis = mem(ctba, 20);
         assert_eq!((fis[0], fis[1] & FIS_COMMAND), (FIS_REG_H2D, FIS_COMMAND));
         let command = fis[2];
+        let features = fis[3] as u16 | (fis[11] as u16) << 8;
         let lba = u64::from_le_bytes([fis[4], fis[5], fis[6], fis[8], fis[9], fis[10], 0, 0]);
         let count = u16::from_le_bytes([fis[12], fis[13]]);
         let prds: Vec<(u64, usize)> = (0..prdtl)
@@ -502,64 +612,101 @@ impl FakeHba {
             })
             .collect();
         let total: usize = prds.iter().map(|d| d.1).sum();
-        self.log.push(Cmd { command, lba, count, bytes: total as u32 });
+        let queued = matches!(command, READ_FPDMA_QUEUED | WRITE_FPDMA_QUEUED);
+        self.log.push(Cmd { command, lba, count: if queued { features } else { count }, bytes: total as u32 });
 
         let port = &mut self.ports[p];
-        let result = match (port.dev.as_mut(), command) {
-            (Some(FakeDev::Disk { .. }), IDENTIFY_DEVICE) => {
-                assert!(!write);
-                let mut id = identify(port.dev.as_ref().unwrap());
-                for &(i, w) in &port.identify_words {
-                    id[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
-                }
-                let n = id.len() - port.short_by as usize;
-                scatter(&prds, &id[..n]);
-                Ok(n)
-            }
-            (Some(FakeDev::Disk { data, sectors, sector_size, .. }), READ_DMA_EXT | WRITE_DMA_EXT) => {
-                assert_ne!(fis[7] & DEVICE_LBA, 0, "LBA mode");
-                assert_eq!(write, command == WRITE_DMA_EXT, "header W bit");
-                let n = if count == 0 { 65536 } else { count as u64 };
-                let bytes = n as usize * *sector_size;
-                assert_eq!(total, bytes, "PRDT covers the transfer");
-                let start = lba as usize * *sector_size;
-                if lba + n > port.fail_from {
-                    Err(UNC)
-                } else if lba + n > *sectors || start + bytes > data.len() {
-                    Err(IDNF)
-                } else if write {
-                    gather(&prds, &mut data[start..start + bytes]);
-                    Ok(bytes)
-                } else {
-                    let n = bytes - port.short_by as usize;
-                    scatter(&prds, &data[start..start + n]);
+        port.slots_run.push(slot);
+        let result = if port.ncq_error && command != READ_LOG_EXT {
+            // The device waits for its NCQ error log to be read.
+            Err(ABRT)
+        } else {
+            match (port.dev.as_mut(), command) {
+                (Some(FakeDev::Disk { .. }), IDENTIFY_DEVICE) => {
+                    assert!(!write);
+                    let mut id = identify(port.dev.as_ref().unwrap());
+                    for &(i, w) in &port.identify_words {
+                        id[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+                    }
+                    let n = id.len() - port.short_by as usize;
+                    scatter(&prds, &id[..n]);
                     Ok(n)
                 }
+                (Some(FakeDev::Disk { data, sectors, sector_size, .. }), READ_DMA_EXT | WRITE_DMA_EXT) => {
+                    assert_ne!(fis[7] & DEVICE_LBA, 0, "LBA mode");
+                    assert_eq!(write, command == WRITE_DMA_EXT, "header W bit");
+                    let n = if count == 0 { 65536 } else { count as u64 };
+                    let rw = Rw { fail_from: port.fail_from, short_by: port.short_by, lba, n, write };
+                    disk_rw(data, *sectors, *sector_size, rw, &prds, total)
+                }
+                (
+                    Some(FakeDev::Disk { data, sectors, sector_size, ncq, .. }),
+                    READ_FPDMA_QUEUED | WRITE_FPDMA_QUEUED,
+                ) => {
+                    assert!(*ncq > 0, "the device does not do NCQ");
+                    assert_eq!(fis[7], DEVICE_LBA, "bit 6 of the device register, nothing else");
+                    assert_eq!(count, (slot as u16) << 3, "the tag is the slot, in bits 7:3");
+                    assert_ne!(port.sact & 1 << slot, 0, "PxSACT is set before PxCI");
+                    assert!(port.sact.count_ones() <= *ncq as u32, "more commands than the device's queue");
+                    assert_eq!(write, command == WRITE_FPDMA_QUEUED, "header W bit");
+                    let n = if features == 0 { 65536 } else { features as u64 };
+                    let rw = Rw { fail_from: port.fail_from, short_by: port.short_by, lba, n, write };
+                    disk_rw(data, *sectors, *sector_size, rw, &prds, total)
+                }
+                (Some(FakeDev::Disk { .. }), READ_LOG_EXT) => {
+                    assert_eq!((lba, count, total), (NCQ_ERROR_LOG, 1, 512));
+                    port.ncq_error = false;
+                    scatter(&prds, &[0u8; 512]);
+                    Ok(512)
+                }
+                (Some(FakeDev::Disk { .. }), FLUSH_CACHE_EXT) => {
+                    assert_eq!(prdtl, 0);
+                    if port.fail_flush { Err(ABRT) } else { Ok(0) }
+                }
+                (Some(FakeDev::Atapi(cd)), IDENTIFY_PACKET_DEVICE) => {
+                    let id = identify_packet(cd);
+                    scatter(&prds, &id);
+                    Ok(id.len())
+                }
+                (Some(FakeDev::Atapi(cd)), PACKET) => {
+                    assert!(atapi, "the header's A bit");
+                    assert_eq!(features & 1 != 0, cd.dma, "DMA only if the drive has it");
+                    let cdb: [u8; 12] = mem(ctba + 0x40, 12).try_into().expect("12 bytes");
+                    port.packets.push(cdb);
+                    scsi(cd, &cdb, &prds, total, write)
+                }
+                _ => Err(ABRT),
             }
-            (Some(FakeDev::Disk { .. }), FLUSH_CACHE_EXT) => {
-                assert_eq!(prdtl, 0);
-                if port.fail_flush { Err(ABRT) } else { Ok(0) }
-            }
-            _ => Err(ABRT),
         };
         match result {
             Ok(bytes) => {
                 hdr[4..8].copy_from_slice(&(bytes as u32).to_le_bytes());
-                port.ci &= !1;
-                port.is |= 1; // D2H register FIS received
+                port.ci &= !(1 << slot);
+                if queued {
+                    port.sact &= !(1 << slot);
+                    regs.pset(p, SACT, port.sact);
+                    port.is |= IS_SDBS;
+                } else {
+                    port.is |= IS_DHRS;
+                    let fb = regs.get(base + FB) as u64 | (regs.get(base + FBU) as u64) << 32;
+                    mem(fb + 0x40, 4).copy_from_slice(&[0x34, 0x40, STS_READY as u8, 0]);
+                }
                 regs.pset(p, TFD, STS_READY);
-                let fb = regs.get(base + FB) as u64 | (regs.get(base + FBU) as u64) << 32;
-                mem(fb + 0x40, 4).copy_from_slice(&[0x34, 0x40, STS_READY as u8, 0]);
             }
             Err(error) => {
                 port.is |= IS_TFES;
                 port.latched = true;
+                port.ncq_error |= queued;
                 let busy = if port.busy_after_error { STS_BSY } else { 0 };
                 regs.pset(p, TFD, (error as u32) << 8 | busy | STS_READY | STS_ERR);
             }
         }
         regs.pset(p, CI, port.ci);
         regs.pset(p, IS, port.is);
+        if port.ci != 0 && !port.latched {
+            port.pending = Some(LAG);
+        }
+        self.sync_irq(p);
     }
 }
 
@@ -597,9 +744,134 @@ fn gather(prds: &[(u64, usize)], mut dst: &mut [u8]) {
     }
 }
 
+/// What a disk read or write needs to know.
+struct Rw {
+    fail_from: u64,
+    short_by: u32,
+    lba: u64,
+    /// Sectors.
+    n: u64,
+    write: bool,
+}
+
+/// Runs a read or write against a disk's contents; returns the bytes moved
+/// or the ATA error.
+fn disk_rw(
+    data: &mut [u8],
+    sectors: u64,
+    sector_size: usize,
+    rw: Rw,
+    prds: &[(u64, usize)],
+    total: usize,
+) -> Result<usize, u8> {
+    let bytes = rw.n as usize * sector_size;
+    assert_eq!(total, bytes, "PRDT covers the transfer");
+    let start = rw.lba as usize * sector_size;
+    if rw.lba + rw.n > rw.fail_from {
+        Err(UNC)
+    } else if rw.lba + rw.n > sectors || start + bytes > data.len() {
+        Err(IDNF)
+    } else if rw.write {
+        gather(prds, &mut data[start..start + bytes]);
+        Ok(bytes)
+    } else {
+        let n = bytes - rw.short_by as usize;
+        scatter(prds, &data[start..start + n]);
+        Ok(n)
+    }
+}
+
+/// Runs one SCSI command on an optical drive; the error is the ATA error
+/// register (the sense key in its top four bits).
+fn scsi(cd: &mut Cd, cdb: &[u8; 12], prds: &[(u64, usize)], total: usize, write: bool) -> Result<usize, u8> {
+    const NOT_READY: u8 = 0x20;
+    const MEDIUM_ERROR: u8 = 0x30;
+    const ILLEGAL_REQUEST: u8 = 0x50;
+    const UNIT_ATTENTION: u8 = 0x60;
+    assert!(!write, "nothing writes to a CD");
+    cd.scsi.push(cdb[0]);
+    if cdb[0] != REQUEST_SENSE {
+        if cd.attention {
+            return Err(UNIT_ATTENTION);
+        }
+        if cd.not_ready > 0 {
+            cd.not_ready -= 1;
+            return Err(NOT_READY);
+        }
+    }
+    let size = cd.block_size;
+    match (cdb[0], &cd.disc) {
+        (TEST_UNIT_READY, Some(_)) => {
+            assert_eq!(total, 0);
+            Ok(0)
+        }
+        (REQUEST_SENSE, _) => {
+            let mut sense = [0u8; 18];
+            sense[0] = 0x70;
+            sense[2] = if cd.attention { 6 } else { 2 };
+            sense[12] = if cd.attention {
+                0x28
+            } else if cd.disc.is_none() {
+                0x3a
+            } else {
+                0x04
+            };
+            sense[7] = 10;
+            cd.attention = false;
+            assert_eq!(total, 18);
+            scatter(prds, &sense);
+            Ok(18)
+        }
+        (READ_CAPACITY_10, Some(disc)) => {
+            assert_eq!(total, 8);
+            let mut out = [0u8; 8];
+            out[..4].copy_from_slice(&((disc.len() / size - 1) as u32).to_be_bytes());
+            out[4..].copy_from_slice(&(size as u32).to_be_bytes());
+            scatter(prds, &out);
+            Ok(8)
+        }
+        (READ_10, Some(disc)) => {
+            let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]) as usize;
+            let n = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+            assert_eq!(total, n * size, "the PRDT covers the transfer");
+            if (lba + n) as u64 > cd.fail_from {
+                Err(MEDIUM_ERROR)
+            } else if (lba + n) * size > disc.len() {
+                Err(ILLEGAL_REQUEST)
+            } else {
+                scatter(prds, &disc[lba * size..(lba + n) * size]);
+                Ok(total)
+            }
+        }
+        (_, None) => Err(NOT_READY),
+        _ => Err(ILLEGAL_REQUEST),
+    }
+}
+
+/// IDENTIFY PACKET DEVICE data for an optical drive.
+fn identify_packet(cd: &Cd) -> [u8; 512] {
+    let mut w = [0u16; 256];
+    let string = |w: &mut [u16], s: &str| {
+        let mut bytes = s.bytes().chain(core::iter::repeat(b' '));
+        for word in w {
+            *word = u16::from_be_bytes([bytes.next().unwrap(), bytes.next().unwrap()]);
+        }
+    };
+    // ATAPI, CD/DVD, removable, 12-byte packets.
+    w[0] = 0x8000 | 5 << 8 | 1 << 7;
+    string(&mut w[10..20], "CD0001");
+    string(&mut w[27..47], "Fake DVD-ROM");
+    w[49] = if cd.dma { 1 << 8 } else { 0 };
+    let mut out = [0u8; 512];
+    for (i, word) in w.iter().enumerate() {
+        out[2 * i..2 * i + 2].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
 /// IDENTIFY DEVICE data for a disk.
 fn identify(dev: &FakeDev) -> [u8; 512] {
-    let FakeDev::Disk { sectors, sector_size, model, serial, lba48, .. } = dev else { unreachable!() };
+    let FakeDev::Disk { sectors, sector_size, model, serial, lba48, ncq, .. } = dev else { unreachable!() };
     let mut w = [0u16; 256];
     let string = |w: &mut [u16], s: &str| {
         let mut bytes = s.bytes().chain(core::iter::repeat(b' '));
@@ -615,6 +887,8 @@ fn identify(dev: &FakeDev) -> [u8; 512] {
     w[60] = lba28 as u16;
     w[61] = (lba28 >> 16) as u16;
     let lba48_bit = if *lba48 { 1 << 10 } else { 0 };
+    w[75] = (*ncq).saturating_sub(1) as u16;
+    w[76] = if *ncq > 0 { 1 << 8 } else { 0 };
     w[83] = 0x4000 | lba48_bit;
     w[86] = lba48_bit;
     if *lba48 {

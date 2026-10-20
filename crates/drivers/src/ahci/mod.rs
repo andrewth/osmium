@@ -10,12 +10,38 @@
 //! its port outright, so each disk can live on its own (in a static, say)
 //! after the [`Ahci`] is gone.
 //!
-//! As with virtio-blk, everything is polled and synchronous: each port runs
-//! one command at a time, in command slot 0, with data bounced through a
-//! DMA buffer of [`DATA_LEN`] bytes (larger transfers are split). Reads and
-//! writes use the 48-bit DMA commands. A command that fails, or does not
-//! finish, is reported as an I/O error after the port is recovered, so
-//! later commands still work.
+//! As with virtio-blk, calls are synchronous: they return when the
+//! command has finished. By default each port runs one command at a time,
+//! in command slot 0, with data bounced through a DMA buffer of
+//! [`DATA_LEN`] bytes (larger transfers are split), and completions are
+//! polled. Reads and writes use the 48-bit DMA commands. A command that
+//! fails, or does not finish, is reported as an I/O error after the port is
+//! recovered, so later commands still work.
+//!
+//! **Interrupts.** [`Ahci::enable_interrupts`] turns on the HBA's interrupt
+//! line, [`AhciDisk::enable_interrupts`] makes one disk wait for a command
+//! by sleeping (in a function the caller supplies, typically a `wfi`/`hlt`)
+//! with that port's interrupts armed rather than spinning, and the kernel's
+//! interrupt handler calls [`AhciIrq::handle`]. The handler only masks the
+//! interrupting ports; the waiter reads the completion from the port's
+//! registers, so no state is shared and no completion is lost. It works the
+//! same from INTx or a message-signalled interrupt: for MSI, enable it on
+//! the PCI function with [`osmium_hal::pci::Function::msi`] (one vector is
+//! enough: the HBA then sends it for every port) and route that vector to
+//! the handler. Without `enable_interrupts` nothing changes: completions
+//! are polled.
+//!
+//! **NCQ.** When both the HBA (CAP.SNCQ) and the disk support it, a disk
+//! uses the FPDMA QUEUED commands, and a transfer of more than one chunk
+//! keeps up to [`MAX_QUEUE`] chunks in flight, each in its own slot with its
+//! own part of the bounce buffer ([`AhciDisk::queue_depth`]). A failure
+//! anywhere in a queued round fails the whole call, after the port is
+//! recovered and the device's NCQ error log read.
+//!
+//! **ATAPI.** [`Ahci::take_atapi`] turns a packet device (an optical drive)
+//! into an [`AhciAtapi`], a read-only [`BlockDevice`](osmium_hal::block::BlockDevice) over the disc's
+//! 2048-byte blocks, using IDENTIFY PACKET DEVICE and the PACKET command
+//! with READ(10) and READ CAPACITY(10), so `osmium_fs_iso9660` can mount it.
 //!
 //! The caller enables memory decoding and bus mastering on the PCI
 //! function. The [`DmaAllocator`] must hand out 1 KiB-aligned memory (any
@@ -25,23 +51,33 @@
 //! the [`Clock`] given to [`Ahci::new`] or, without one, a generous poll
 //! count.
 //!
-//! Not yet supported: interrupts, native command queuing, port
-//! multipliers, ATAPI devices, hot plug, and disks without 48-bit LBA.
+//! Not yet supported: port multipliers, hot plug, disks without 48-bit LBA,
+//! writing or ejecting optical media, and queued or interrupt-driven ATAPI
+//! commands (an [`AhciAtapi`] polls, one command at a time). Queued
+//! commands are in flight within one call only: a call does not return
+//! before they have all finished.
 
+mod atapi;
 mod disk;
 mod port;
 
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod feature_tests;
 
 use osmium_hal::dma::DmaAllocator;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::Class;
 use osmium_hal::timer::Clock;
 
+pub use atapi::AhciAtapi;
 pub use disk::{AhciDisk, DATA_LEN};
 pub use port::DeviceKind;
-use port::{PORT_BASE, PORT_STRIDE, Port};
+use port::{IE, PORT_BASE, PORT_STRIDE, Port};
+
+/// Most commands a disk keeps in flight with NCQ.
+pub const MAX_QUEUE: usize = port::MAX_SLOTS;
 
 /// The PCI class of an AHCI HBA (01/06/01).
 pub const CLASS: Class = Class { class: 0x01, subclass: 0x06, prog_if: 0x01 };
@@ -69,6 +105,8 @@ mod cap {
     pub const SSS: u32 = 1 << 27;
     /// Command list override, to free a stuck task file.
     pub const SCLO: u32 = 1 << 24;
+    /// Native command queuing.
+    pub const SNCQ: u32 = 1 << 30;
 }
 
 const GHC_IE: u32 = 1 << 1;
@@ -95,8 +133,9 @@ pub enum AhciError {
     Timeout,
     /// No device on that port, no such port, or its disk is already taken.
     NoDevice,
-    /// The device is not a disk this driver handles: not ATA (an ATAPI
-    /// drive, say), no 48-bit LBA, or an odd sector size.
+    /// The device is not one this driver handles: not ATA (for
+    /// [`Ahci::take_disk`]) or not an optical ATAPI drive (for
+    /// [`Ahci::take_atapi`]), no 48-bit LBA, or an odd sector size.
     Unsupported,
     /// The device moved fewer bytes than the command asked for.
     ShortTransfer,
@@ -204,9 +243,47 @@ impl<'d, D: DmaAllocator + ?Sized> Ahci<'d, D> {
         self.ports.get(port as usize)?.as_ref().map(|p| p.kind)
     }
 
+    /// Lets the HBA raise its interrupt line (INTx or MSI, whichever the
+    /// bus function routes). Only ports whose disk called
+    /// [`AhciDisk::enable_interrupts`] and are waiting on a command
+    /// interrupt. Stays on after this [`Ahci`] is dropped.
+    pub fn enable_interrupts(&mut self) {
+        w32(&self.io, HBA_IS, r32(&self.io, HBA_IS));
+        w32(&self.io, GHC, r32(&self.io, GHC) | GHC_IE);
+    }
+
+    /// Stops the HBA from raising its interrupt line.
+    pub fn disable_interrupts(&mut self) {
+        w32(&self.io, GHC, r32(&self.io, GHC) & !GHC_IE);
+    }
+
+    /// The handle for the kernel's interrupt handler.
+    pub fn irq(&self) -> AhciIrq {
+        AhciIrq { io: self.io.clone(), pi: self.pi }
+    }
+
     /// Ports with a SATA disk not yet taken, lowest first.
     pub fn disks(&self) -> impl Iterator<Item = u8> + '_ {
         (0..MAX_PORTS as u8).filter(|&p| self.device(p) == Some(DeviceKind::Ata))
+    }
+
+    /// Ports with an ATAPI drive not yet taken, lowest first.
+    pub fn atapi_drives(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..MAX_PORTS as u8).filter(|&p| self.device(p) == Some(DeviceKind::Atapi))
+    }
+
+    /// Takes the optical drive on `port`: identifies it, reads the size of
+    /// the disc in it (none is fine: 0 blocks) and returns a read-only block
+    /// device that owns the port from now on. If identification fails, the
+    /// port is stopped and stays unavailable.
+    pub fn take_atapi(&mut self, port: u8) -> Result<AhciAtapi<'d, D>, AhciError> {
+        let slot = self.ports.get_mut(port as usize).ok_or(AhciError::NoDevice)?;
+        match slot.as_ref().map(|p| p.kind) {
+            None => return Err(AhciError::NoDevice),
+            Some(DeviceKind::Atapi) => {}
+            Some(_) => return Err(AhciError::Unsupported),
+        }
+        AhciAtapi::new(slot.take().expect("checked above"), self.dma)
     }
 
     /// Takes the disk on `port`: identifies it and returns a block device
@@ -220,6 +297,36 @@ impl<'d, D: DmaAllocator + ?Sized> Ahci<'d, D> {
             Some(_) => return Err(AhciError::Unsupported),
         }
         AhciDisk::new(slot.take().expect("checked above"), self.dma)
+    }
+}
+
+/// The interrupt handler's view of an HBA: [`Ahci::irq`] hands it out, and
+/// it keeps working (and can be copied to the kernel's handler) while the
+/// [`Ahci`] and its disks come and go. It holds no state besides the
+/// registers.
+#[derive(Clone)]
+pub struct AhciIrq {
+    io: IoMem,
+    pi: u32,
+}
+
+impl AhciIrq {
+    /// Services the HBA's interrupt: for every port that raised one, masks
+    /// the port's interrupts (PxIE) and acknowledges the HBA's status
+    /// (IS). The port's own status (PxIS) is left alone, for whoever is
+    /// waiting on the port to find; the waiter re-arms the port. Returns
+    /// false, touching nothing, if no port had an interrupt pending (a
+    /// shared line).
+    pub fn handle(&self) -> bool {
+        let pending = r32(&self.io, HBA_IS) & self.pi;
+        if pending == 0 {
+            return false;
+        }
+        for port in (0..MAX_PORTS).filter(|p| pending & 1 << p != 0) {
+            w32(&self.io, PORT_BASE + PORT_STRIDE * port + IE, 0);
+        }
+        w32(&self.io, HBA_IS, pending);
+        true
     }
 }
 
@@ -251,7 +358,7 @@ mod tests {
         hba.pi = 0b0111; // port 3 is not implemented
         hba.bios_owned = true;
         hba.attach(0, FakeDev::disk(100, 512));
-        hba.attach(2, FakeDev::Atapi);
+        hba.attach(2, FakeDev::atapi(None));
         hba.attach(3, FakeDev::disk(100, 512));
         // Firmware left port 0 running.
         hba.running(0);
@@ -304,7 +411,7 @@ mod tests {
             hba.ports[0].link_reads = 50;
             hba.ports[1].stuck_det = Some(port::DET_PRESENT);
             hba.ports[2].stuck_det = Some(port::DET_OFFLINE);
-            hba.attach(4, FakeDev::Atapi);
+            hba.attach(4, FakeDev::atapi(None));
             hba.ports[4].stuck_det = Some(7); // not a state a COMRESET fixes
             let ahci = Ahci::new(fake::install(hba), &dma, clock).unwrap();
             assert!(ahci.disks().eq([0, 1, 2]));
