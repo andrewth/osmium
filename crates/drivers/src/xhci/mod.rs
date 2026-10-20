@@ -8,7 +8,7 @@
 //! interrupt line. Transfers go through one bounce buffer of
 //! [`BOUNCE_LEN`] bytes; longer bulk and interrupt transfers are split.
 //!
-//! Not yet supported: interrupts, isochronous endpoints, hubs (route
+//! Not yet supported: MSI/MSI-X, isochronous endpoints, hubs (route
 //! strings), streams, and SuperSpeed burst sizes from companion descriptors.
 
 pub mod ring;
@@ -43,7 +43,9 @@ const PORT_STRIDE: usize = 0x10;
 
 const CMD_RUN: u32 = 1 << 0;
 const CMD_RESET: u32 = 1 << 1;
+const CMD_INTE: u32 = 1 << 2;
 const STS_HALTED: u32 = 1 << 0;
+const STS_EINT: u32 = 1 << 3;
 const STS_NOT_READY: u32 = 1 << 11;
 
 const PORT_CONNECTED: u32 = 1 << 0;
@@ -58,6 +60,11 @@ const PORT_CHANGES: u32 = 0x00fe_0000;
 
 // Interrupter 0, in the runtime registers.
 const IMAN: usize = 0x20;
+const IMAN_IP: u32 = 1 << 0;
+const IMAN_IE: u32 = 1 << 1;
+const IMOD: usize = 0x24;
+/// Interrupt moderation: 400 x 250 ns = 100 us between interrupts.
+const IMOD_INTERVAL: u32 = 400;
 const ERSTSZ: usize = 0x28;
 const ERSTBA: usize = 0x30;
 const ERDP: usize = 0x38;
@@ -148,6 +155,7 @@ pub struct Xhci<'d, D: DmaAllocator + ?Sized> {
     events: EventRing<'d, D>,
     bounce: OwnedDma<'d, D>,
     slots: [Option<Slot<'d, D>>; MAX_SLOTS as usize],
+    interrupts: u64,
 }
 
 fn speed_from_id(id: u32) -> Option<Speed> {
@@ -260,6 +268,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
             events: EventRing::new(dma).ok_or(no_mem)?,
             bounce: OwnedDma::new(dma, BOUNCE_LEN).ok_or(no_mem)?,
             slots: [const { None }; MAX_SLOTS as usize],
+            interrupts: 0,
             io,
         };
         if scratchpads > 0 && hc.op_read(PAGESIZE) & 1 == 0 {
@@ -287,6 +296,56 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         Ok(hc)
     }
 
+    /// Lets interrupter 0 raise the controller's interrupt line (INTx or
+    /// MSI, whichever the bus function routes). From now on the kernel's
+    /// handler must call [`handle_interrupt`](Self::handle_interrupt).
+    ///
+    /// Polled operations keep working: they pop events themselves, so the
+    /// interrupt that follows an event they consumed finds an empty ring.
+    /// The caller serializes both with one lock (the driver is `&mut self`
+    /// throughout), so exactly one context drains the ring at a time, and
+    /// an interrupt can only be handled between operations, never inside
+    /// one: no waiter's completion is ever stolen by the handler. The
+    /// handler must therefore not run on a CPU that holds that lock.
+    pub fn enable_interrupts(&mut self) {
+        self.rt_write(IMOD, IMOD_INTERVAL);
+        self.rt_write(IMAN, IMAN_IP | IMAN_IE);
+        self.op_write(USBSTS, STS_EINT);
+        self.op_write(USBCMD, self.op_read(USBCMD) | CMD_INTE);
+    }
+
+    /// Stops the controller from raising interrupts (polling still works).
+    pub fn disable_interrupts(&mut self) {
+        self.op_write(USBCMD, self.op_read(USBCMD) & !CMD_INTE);
+        self.rt_write(IMAN, IMAN_IP);
+    }
+
+    /// Services the controller's interrupt: acknowledges it, then files
+    /// every event on the ring (so `submit_in` completions are ready for
+    /// `poll_in`) and advances `ERDP`. Returns false, doing nothing, if the
+    /// controller was not asserting an interrupt (a shared line).
+    ///
+    /// The acknowledgement comes before draining: an event written after
+    /// the drain raises a new interrupt instead of being missed.
+    pub fn handle_interrupt(&mut self) -> bool {
+        if self.op_read(USBSTS) & STS_EINT == 0 && self.rt_read(IMAN) & IMAN_IP == 0 {
+            return false;
+        }
+        // Both are write-1-to-clear; the other USBSTS bits are left alone
+        // (writing 0) and IE stays set.
+        self.op_write(USBSTS, STS_EINT);
+        self.rt_write(IMAN, IMAN_IP | IMAN_IE);
+        self.interrupts += 1;
+        self.drain_events();
+        true
+    }
+
+    /// How many interrupts [`handle_interrupt`](Self::handle_interrupt)
+    /// has serviced.
+    pub fn interrupts_handled(&self) -> u64 {
+        self.interrupts
+    }
+
     fn r32(&self, off: usize) -> u32 {
         self.io.read(off).expect("xHCI register outside window")
     }
@@ -308,6 +367,10 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     fn op_write64(&self, reg: usize, v: u64) {
         self.op_write(reg, v as u32);
         self.op_write(reg + 4, (v >> 32) as u32);
+    }
+
+    fn rt_read(&self, reg: usize) -> u32 {
+        self.r32(self.rt + reg)
     }
 
     fn rt_write(&self, reg: usize, v: u32) {
@@ -799,6 +862,7 @@ impl<D: DmaAllocator + ?Sized> Drop for Xhci<'_, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::vec;
 
     #[test]
     fn device_context_indices() {
@@ -828,6 +892,98 @@ mod tests {
         // riscv-virt example when built and returned by value.
         let size = size_of::<Xhci<'_, crate::virtio::testing::HostDma>>();
         assert!(size < 16 * 1024, "Xhci is {size} bytes");
+    }
+
+    /// A controller over fake registers (op at 0x20, runtime at 0x200, no
+    /// reset sequence) with one slot whose endpoint 3 has a `submit_in`
+    /// transfer outstanding at TRB address 0x1000.
+    fn fake<'a>(
+        dma: &'a crate::virtio::testing::HostDma,
+        regs: &mut [u32],
+    ) -> Xhci<'a, crate::virtio::testing::HostDma> {
+        // SAFETY: the window covers the caller's array, which outlives the controller.
+        let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), regs.len() * 4) };
+        let mut endpoints = [const { None }; MAX_ENDPOINTS];
+        let pending = Pending { buf: OwnedDma::new(dma, 8).unwrap(), trb: 0x1000, len: 8, done: None };
+        endpoints[1] = Some(Endpoint { dci: 3, ring: ProducerRing::new(dma).unwrap(), pending: Some(pending) });
+        let slot = Slot {
+            output: OwnedDma::new(dma, 1024).unwrap(),
+            input: OwnedDma::new(dma, 1056).unwrap(),
+            endpoints,
+            speed: Speed::Full,
+        };
+        let mut slots = [const { None }; MAX_SLOTS as usize];
+        slots[0] = Some(slot);
+        Xhci {
+            io,
+            op: 0x20,
+            rt: 0x200,
+            db: 0x100,
+            ctx_size: 32,
+            max_ports: 1,
+            dma,
+            dcbaa: OwnedDma::new(dma, 2048).unwrap(),
+            _scratchpad: None,
+            commands: ProducerRing::new(dma).unwrap(),
+            events: EventRing::new(dma).unwrap(),
+            bounce: OwnedDma::new(dma, BOUNCE_LEN).unwrap(),
+            slots,
+            interrupts: 0,
+        }
+    }
+
+    fn transfer_event(slot: u8, dci: u8, trb: u64) -> Trb {
+        Trb {
+            param: trb,
+            status: (completion::SUCCESS as u32) << 24,
+            control: kind::TRANSFER_EVENT << 10 | (dci as u32) << 16 | (slot as u32) << 24,
+        }
+    }
+
+    #[test]
+    fn interrupt_enable_sets_ie_and_inte() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = vec![0u32; 0x400];
+        let mut hc = fake(&dma, &mut regs);
+        hc.enable_interrupts();
+        drop(hc);
+        assert_eq!(regs[(0x200 + IMAN) / 4], IMAN_IP | IMAN_IE);
+        assert_eq!(regs[(0x200 + IMOD) / 4], IMOD_INTERVAL);
+        assert_eq!(regs[(0x20 + USBCMD) / 4] & CMD_INTE, CMD_INTE);
+    }
+
+    #[test]
+    fn interrupt_not_ours_is_ignored() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = vec![0u32; 0x400];
+        let mut hc = fake(&dma, &mut regs);
+        hc.events.controller_write(0, transfer_event(1, 3, 0x1000));
+        assert!(!hc.handle_interrupt());
+        assert_eq!(hc.interrupts_handled(), 0);
+        assert!(hc.slot(DeviceId(1)).unwrap().endpoint(3).unwrap().pending.as_ref().unwrap().done.is_none());
+    }
+
+    #[test]
+    fn interrupt_files_events_and_acks() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = vec![0u32; 0x400];
+        regs[(0x20 + USBSTS) / 4] = STS_EINT;
+        let mut hc = fake(&dma, &mut regs);
+        // A stray event for another transfer, then the keyboard's.
+        hc.events.controller_write(0, transfer_event(1, 3, 0x2000));
+        hc.events.controller_write(1, transfer_event(1, 3, 0x1000));
+        hc.events.controller_write(2, Trb { param: 0, status: 0, control: kind::PORT_STATUS_CHANGE << 10 });
+        assert!(hc.handle_interrupt());
+        assert_eq!(hc.interrupts_handled(), 1);
+        let done = hc.slot(DeviceId(1)).unwrap().endpoint(3).unwrap().pending.as_ref().unwrap().done;
+        assert_eq!(done.map(|e| e.param), Some(0x1000));
+        let erdp = hc.events.dequeue_addr().as_u64() | ERDP_BUSY as u64;
+        drop(hc);
+        // EINT and IP were written back (write-1-to-clear); ERDP moved past 3 events with EHB.
+        assert_eq!(regs[(0x20 + USBSTS) / 4], STS_EINT);
+        assert_eq!(regs[(0x200 + IMAN) / 4], IMAN_IP | IMAN_IE);
+        let lo = regs[(0x200 + ERDP) / 4] as u64 | (regs[(0x200 + ERDP) / 4 + 1] as u64) << 32;
+        assert_eq!(lo, erdp);
     }
 
     #[test]

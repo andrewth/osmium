@@ -180,7 +180,11 @@ pub fn arp(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
 /// while a keyboard's interrupt transfer is outstanding, which checks that
 /// the two drivers can share the controller, and is then mounted as FAT32
 /// (see [`fat`]).
-pub fn usb<H: osmium::hal::usb::UsbHost + Send + 'static>(shared: &'static osmium::sync::SpinLock<H>) {
+pub fn usb<H, G>(shared: &'static osmium::sync::SpinLock<H, G>)
+where
+    H: osmium::hal::usb::UsbHost + Send + 'static,
+    G: osmium::sync::Guardian + 'static,
+{
     use osmium::drivers::usb::hid::BootKeyboard;
     use osmium::drivers::usb::storage::UsbStorage;
     use osmium::hal::block::BlockDevice;

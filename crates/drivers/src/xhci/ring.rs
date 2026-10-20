@@ -115,6 +115,14 @@ impl<'d, D: DmaAllocator + ?Sized> EventRing<'d, D> {
         self.mem.device_addr() + (self.dequeue * TRB_SIZE) as u64
     }
 
+    /// Writes `trb` at index `i` with the producer's current cycle bit,
+    /// as the controller would, for tests.
+    #[cfg(test)]
+    pub(crate) fn controller_write(&mut self, i: usize, mut trb: Trb) {
+        trb.control = trb.control & !flag::CYCLE | self.cycle as u32;
+        store(&self.mem, i, trb);
+    }
+
     /// Takes the next event, if the controller has written one. Tell the
     /// controller how far the ring was consumed by writing
     /// [`dequeue_addr`](Self::dequeue_addr) to `ERDP` afterwards.

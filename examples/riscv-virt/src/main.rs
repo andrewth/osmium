@@ -20,14 +20,16 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use osmium::arch::riscv64::{self, SatpMode, sbi};
 use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq};
-use osmium::boot::fdt::Fdt;
+use osmium::boot::fdt::{Fdt, Node};
 use osmium::drivers::uart16550::{Mmio, Uart16550};
 use osmium::drivers::virtio::mmio::MmioTransport;
 use osmium::drivers::virtio::blk::VirtioBlk;
 use osmium::drivers::virtio::net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
+use osmium::drivers::plic::Plic;
 use osmium::drivers::xhci::Xhci;
 use osmium::hal::block::BlockDevice;
+use osmium::hal::irq::{InterruptController, IrqTable};
 use osmium::hal::pci;
 use osmium::hal::usb::UsbHost;
 use osmium::hal::console::{Console, SerialConsole, set_console};
@@ -155,7 +157,26 @@ impl Console for SbiConsole {
 
 type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
 
-static XHCI: Once<osmium::sync::SpinLock<Xhci<'static, Frames>>> = Once::new();
+/// The xHCI controller. Its lock masks interrupts on the locking CPU: the
+/// controller's interrupt handler takes the same lock, so on one CPU the
+/// handler must never run while the lock is held (it would spin forever on
+/// a lock its own CPU owns). Masking costs timer-tick latency only for the
+/// length of one polled operation, and unlike `try_lock`-and-defer it needs
+/// no way to quiet a level-triggered line the handler could not service.
+/// Another CPU holding the lock only delays the handler until it releases.
+static XHCI: Once<osmium::sync::IrqSpinLock<Xhci<'static, Frames>>> = Once::new();
+
+/// The platform interrupt controller, once the device tree has been read.
+static PLIC: Once<Plic> = Once::new();
+/// External interrupt handlers by PLIC source number.
+static IRQS: IrqTable<64> = IrqTable::new();
+
+/// PLIC handler for the xHCI function's INTx line.
+fn xhci_irq(_irq: u32) {
+    if let Some(xhci) = XHCI.get() {
+        xhci.lock().handle_interrupt();
+    }
+}
 
 // SAFETY: the kernel runs identity-mapped (before and after enabling
 // paging), so physical address = virtual address for all RAM.
@@ -259,7 +280,7 @@ fn pcie_host(fdt: &Fdt<'_>) -> Option<PcieHost> {
 
 /// Finds the first xHCI controller, assigns its BARs and enables it; returns
 /// its address and BAR 0.
-fn find_xhci(host: &PcieHost) -> Option<(pci::Address, u64, u64)> {
+fn find_xhci(host: &PcieHost) -> Option<(pci::Address, u64, u64, u8)> {
     // SAFETY: the device tree puts the ECAM window here, mapped as device
     // memory; only this function uses it.
     let ecam = pci::Ecam::new(unsafe { IoMem::new(host.ecam.0 as *mut u8, host.ecam.1 as usize) }, 0);
@@ -274,7 +295,69 @@ fn find_xhci(host: &PcieHost) -> Option<(pci::Address, u64, u64)> {
     pci::BarAllocator::new(host.mem.0, host.mem.1).assign(&f).ok()?;
     let bar = f.bar(0)?;
     f.enable_memory_and_dma();
-    Some((f.address(), bar.address, bar.size))
+    Some((f.address(), bar.address, bar.size, f.interrupt_pin()))
+}
+
+/// The PLIC source a PCI function's INTx `pin` (1 = INTA) is wired to, read
+/// from the host bridge's `interrupt-map`: entries of child unit address
+/// (3 cells), pin (1), interrupt parent phandle, parent unit address (the
+/// parent's `#address-cells`) and parent specifier (`#interrupt-cells`).
+fn pci_intx_irq(fdt: &Fdt<'_>, addr: pci::Address, pin: u8) -> Option<u32> {
+    let node = fdt.find_compatible(&["pci-host-ecam-generic"])?;
+    let map: Vec<u32> = node.property("interrupt-map")?.as_u32_cells().collect();
+    let mask: Vec<u32> = node.property("interrupt-map-mask")?.as_u32_cells().collect();
+    let unit = [(addr.bus as u32) << 16 | (addr.device as u32) << 11 | (addr.function as u32) << 8, 0, 0, pin as u32];
+    let cell = |n: &Node<'_>, name, default| n.property(name).and_then(|p| p.as_u32()).unwrap_or(default) as usize;
+    let mut i = 0;
+    while i + 5 <= map.len() {
+        let phandle = map[i + 4];
+        let parent = fdt.all_nodes().find(|n| n.property("phandle").and_then(|p| p.as_u32()) == Some(phandle))?;
+        let (acells, icells) = (cell(&parent, "#address-cells", 0), cell(&parent, "#interrupt-cells", 1));
+        if i + 5 + acells + icells > map.len() {
+            return None;
+        }
+        if (0..4).all(|k| map[i + k] & mask.get(k).copied().unwrap_or(!0) == unit[k] & mask.get(k).copied().unwrap_or(!0)) {
+            return map.get(i + 5 + acells).copied();
+        }
+        i += 5 + acells + icells;
+    }
+    None
+}
+
+/// Routes the xHCI function's INTx line to a PLIC source on this hart,
+/// registers the handler and turns the controller's interrupter on.
+/// Returns the PLIC source number.
+fn xhci_interrupts(
+    fdt: &Fdt<'_>,
+    xhci: &'static osmium::sync::IrqSpinLock<Xhci<'static, Frames>>,
+    addr: pci::Address,
+    pin: u8,
+    plic_base: u64,
+    plic_len: u64,
+) -> Option<u32> {
+    if pin == 0 {
+        return None;
+    }
+    // QEMU virt swizzles INTx over four PLIC sources starting at 32.
+    let swizzle = 32 + (addr.device as u32 + pin as u32 - 1) % 4;
+    let irq = match pci_intx_irq(fdt, addr, pin) {
+        Some(irq) if irq == swizzle => irq,
+        Some(irq) => {
+            println!("[usb]   interrupt-map says source {irq}, the virt swizzle {swizzle}; using the map");
+            irq
+        }
+        None => swizzle,
+    };
+    // SAFETY: the device tree puts the PLIC here; it was mapped as device memory.
+    let io = unsafe { IoMem::new(plic_base as *mut u8, plic_len as usize) };
+    let plic = PLIC.call_once(|| Plic::new(io, |cpu| Plic::supervisor_context(HARTS[cpu].load(Ordering::Relaxed))));
+    IRQS.register(irq, &xhci_irq).ok()?;
+    plic.set_threshold(0);
+    plic.enable(irq);
+    xhci.lock().enable_interrupts();
+    // SAFETY: only adds supervisor external interrupts; the handler is registered.
+    unsafe { riscv64::write_sie(riscv64::read_sie() | riscv64::SIE_SEIE) };
+    Some(irq)
 }
 
 /// Base and size of every virtio-mmio slot in the device tree.
@@ -367,6 +450,10 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     for (base, _) in virtio_slots(&fdt) {
         let page = base & !(PAGE_SIZE as u64 - 1);
         pt.map_range(va(page), pa(page), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
+    }
+    let plic_reg = fdt.find_compatible(&["riscv,plic0", "sifive,plic-1.0.0"]).and_then(|n| n.reg().next());
+    if let Some((base, Some(len))) = plic_reg {
+        pt.map_range(va(base), pa(base), len, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
     }
     let pcie = pcie_host(&fdt);
     if let Some(h) = &pcie {
@@ -463,7 +550,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     // --- xHCI behind PCIe ------------------------------------------------------
     match pcie.as_ref().and_then(find_xhci) {
-        Some((addr, base, len)) => {
+        Some((addr, base, len, pin)) => {
             // SAFETY: BAR 0 was just assigned this range inside the mapped
             // window; nothing else uses it.
             let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
@@ -471,8 +558,14 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             hc.no_op().expect("xHCI command ring");
             println!("[usb]   xHCI at {:02x}:{:02x}.{} BAR0 {base:#x}, {} ports", addr.bus, addr.device, addr.function, hc.num_ports());
             // In a static, so drivers built on it (and a file system on the
-            // USB stick) can live as long as the kernel.
-            demos::usb(XHCI.call_once(|| osmium::sync::SpinLock::new(hc)));
+            // USB stick) and the interrupt handler can live as long as the kernel.
+            let xhci = XHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc));
+            match plic_reg.and_then(|(base, len)| xhci_interrupts(&fdt, xhci, addr, pin, base, len?)) {
+                Some(irq) => println!("[usb]   xHCI interrupts on PLIC source {irq}"),
+                None => println!("[usb]   xHCI interrupts unavailable; polling"),
+            }
+            demos::usb(xhci);
+            println!("[usb]   xHCI interrupts: {}", xhci.lock().interrupts_handled());
         }
         None => println!("[usb]   no xHCI controller"),
     }
@@ -695,6 +788,11 @@ fn on_trap(frame: &mut TrapFrame) {
             // SAFETY: the faulting instruction is mapped executable code.
             let insn = unsafe { (frame.pc() as *const u16).read() };
             frame.set_pc(frame.pc() + if insn & 3 == 3 { 4 } else { 2 });
+        }
+        Trap::Interrupt(Interrupt::External) => {
+            if let Some(plic) = PLIC.get() {
+                IRQS.handle_pending(plic);
+            }
         }
         Trap::Interrupt(Interrupt::Timer) => {
             on_timer();
