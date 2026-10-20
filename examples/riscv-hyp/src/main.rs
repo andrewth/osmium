@@ -19,10 +19,10 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use osmium::arch::cpu;
-use osmium::arch::riscv64::sbi as host_sbi;
+use osmium::arch::riscv64::{self as rv, sbi as host_sbi};
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::boot::elf::Elf;
 use osmium::boot::fdt::Fdt;
@@ -59,6 +59,17 @@ _start:
     j 1b
 2:  call kmain
 
+    # Secondary harts start here (SBI HSM) with a0 = hart id and
+    # a1 = &SecondaryBoot.
+    .globl secondary_start
+secondary_start:
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+    ld sp, 0(a1)
+    call secondary_main
+
     .section .bss.stack
     .align 12
     .space 65536
@@ -69,7 +80,21 @@ boot_stack_top:
 unsafe extern "C" {
     static _kernel_start: u8;
     static _kernel_end: u8;
+    fn secondary_start();
 }
+
+/// Handed to a secondary hart through `a1`.
+#[repr(C)]
+struct SecondaryBoot {
+    stack_top: u64,
+    cpu: usize,
+}
+
+/// Most harts the guest gets: one vCPU per host hart.
+const MAX_HARTS: usize = 4;
+/// Host hart ID of each logical CPU.
+static HARTS: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
+static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
 /// Where QEMU's loader puts the guest kernel, and the window kept free for it.
 const IMAGE_BASE: u64 = 0x9800_0000;
@@ -99,8 +124,9 @@ fn sym(s: &u8) -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
-    // SAFETY: this kernel runs on one hart, logical CPU 0.
+    // SAFETY: the boot hart is logical CPU 0; secondaries get 1, 2, ...
     unsafe { cpu::set_current_id(0) };
+    HARTS[0].store(hartid, Ordering::Relaxed);
     trap::set_handler(on_trap);
     // SAFETY: we run on the boot stack from here on.
     unsafe { trap::install() };
@@ -133,11 +159,39 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
     HEAP.init(&FRAMES);
     riscv::init_cpu();
+    // Kicks arrive as supervisor software interrupts. With SSIE on they
+    // exit a running guest; the host itself keeps sstatus.SIE off.
+    // SAFETY: only enables a source the host never takes in HS-mode.
+    unsafe { rv::write_sie(rv::read_sie() | 1 << 1) };
+
+    // One vCPU per host hart: start the others.
+    let cpus = fdt.find_node("/cpus").expect("no /cpus");
+    let mut ncpus = 1;
+    for c in cpus.children().filter(|c| c.name().starts_with("cpu@")) {
+        let Some(h) = c.reg().next().map(|(a, _)| a as usize) else { continue };
+        if h == hartid || ncpus == MAX_HARTS {
+            continue;
+        }
+        let stack = alloc::vec![0u8; 64 * 1024].leak();
+        let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
+            stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
+            cpu: ncpus,
+        }));
+        HARTS[ncpus].store(h, Ordering::Relaxed);
+        // SAFETY: secondary_start sets up gp and the stack from `boot`.
+        unsafe { host_sbi::hart_start(h, secondary_start as *const () as usize, boot as *const _ as usize) }
+            .expect("hart_start failed");
+        ncpus += 1;
+        while ONLINE.load(Ordering::Acquire) < ncpus {
+            core::hint::spin_loop();
+        }
+    }
+    println!("[smp]   {ncpus} host harts online, one per guest vCPU");
 
     // SAFETY: the window is reserved RAM that QEMU's loader filled (or left zero).
     let window = unsafe { core::slice::from_raw_parts(IMAGE_BASE as *const u8, IMAGE_WINDOW as usize) };
     match Elf::new(window) {
-        Ok(elf) => boot_guest(&elf),
+        Ok(elf) => boot_guest(&elf, ncpus),
         Err(e) => println!(
             "[hyp]   no guest kernel at {IMAGE_BASE:#x} ({e:?}): pass one with -device loader,file=...,addr={IMAGE_BASE:#x},force-raw=on"
         ),
@@ -161,9 +215,123 @@ fn guest_console() -> impl Fn(u8) + Send + Sync + Clone + 'static {
     }
 }
 
-/// Loads `elf` into fresh guest RAM and runs it on one vCPU until it shuts
-/// down.
-fn boot_guest(elf: &Elf<'_>) {
+/// A guest shared by every host hart, each running one of its vCPUs.
+struct Vm {
+    cpus: Arc<GuestCpus>,
+    mem: Arc<GuestMemory>,
+    hgatp: u64,
+    mmio: Bus,
+    /// Per vCPU: its external-interrupt line (PLIC context 2n + 1).
+    lines: Vec<Arc<AtomicBool>>,
+    done: AtomicBool,
+    /// vCPUs not yet back in their host loop for good.
+    running: AtomicUsize,
+}
+
+static VM: AtomicPtr<Vm> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Rust entry of a secondary host hart: ready it for guests, then run the
+/// vCPU with its index whenever the guest starts it.
+#[unsafe(no_mangle)]
+extern "C" fn secondary_main(_hartid: usize, boot: &SecondaryBoot) -> ! {
+    // SAFETY: the boot hart hands out distinct logical ids.
+    unsafe { cpu::set_current_id(boot.cpu) };
+    // SAFETY: we are on the stack the boot hart allocated for us.
+    unsafe { trap::install() };
+    riscv::init_cpu();
+    // SAFETY: as on the boot hart: kicks exit the guest; the host never takes them.
+    unsafe { rv::write_sie(rv::read_sie() | 1 << 1) };
+    ONLINE.fetch_add(1, Ordering::Release);
+    loop {
+        // SAFETY: boot_guest publishes the VM only while it lives, and waits
+        // for every vCPU loop to finish before freeing it.
+        if let Some(vm) = unsafe { VM.load(Ordering::Acquire).as_ref() } {
+            vcpu_loop(vm, boot.cpu);
+            while !VM.load(Ordering::Acquire).is_null() {
+                core::hint::spin_loop();
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Runs vCPU `me` on this host hart each time the guest starts it, until
+/// the guest is done. Returns the exit that ended the guest, if it was this
+/// vCPU's.
+fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
+    let sbi_out = guest_console();
+    let mut last = None;
+    while !vm.done.load(Ordering::Acquire) {
+        let Some((entry, opaque)) = vm.cpus.take_start(me) else {
+            core::hint::spin_loop();
+            continue;
+        };
+        let mut vcpu =
+            RiscvVcpu::new(GuestPhysAddr(entry), me as u64, opaque, vm.hgatp).with_external_irq(vm.lines[me].clone());
+        vm.cpus.attach(me, &mut vcpu);
+        let mut stopped = false;
+        let exit = run_vcpu(&mut vcpu, &vm.mmio, &Bus::new(), |v, exit| match exit {
+            VmExit::Hypercall { .. } => {
+                match sbi::handle_smp(
+                    v,
+                    &vm.mem,
+                    exit,
+                    &mut |b| b.iter().for_each(|&c| sbi_out(c)),
+                    Some((&vm.cpus, me)),
+                ) {
+                    Some(sbi::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
+                    Some(sbi::Outcome::Stop) => {
+                        stopped = true;
+                        ControlFlow::Break(VmExit::Halt)
+                    }
+                    _ => ControlFlow::Continue(()),
+                }
+            }
+            VmExit::Halt => {
+                // The guest idles in wfi: run it again once it has an
+                // interrupt (its timer, an IPI or a device), or stop when
+                // another vCPU has shut the guest down.
+                while !v.interrupt_pending(riscv::time()) {
+                    if vm.done.load(Ordering::Acquire) {
+                        return ControlFlow::Break(VmExit::Halt);
+                    }
+                    core::hint::spin_loop();
+                }
+                ControlFlow::Continue(())
+            }
+            VmExit::ExternalInterrupt => {
+                // A kick from another hart: clear it; the next entry delivers
+                // whatever the guest now has pending.
+                // SAFETY: clears only this hart's software-interrupt bit.
+                unsafe { rv::write_sip(rv::read_sip() & !(1 << 1)) };
+                if vm.done.load(Ordering::Acquire) {
+                    return ControlFlow::Break(VmExit::Halt);
+                }
+                ControlFlow::Continue(())
+            }
+            other => ControlFlow::Break(other),
+        });
+        if stopped {
+            continue; // hart_stop: wait for the guest to start it again
+        }
+        if !vm.done.swap(true, Ordering::AcqRel) {
+            // This vCPU ended the guest: get the others out of guest code.
+            for i in 0..vm.lines.len() {
+                vm.cpus.kick(i);
+            }
+            last = Some(exit);
+            if exit != VmExit::Shutdown {
+                println!("[hyp]   vCPU {me} stopped the guest: {exit:?} at pc {:#x}", vcpu.state.pc);
+            }
+        }
+    }
+    vm.running.fetch_sub(1, Ordering::AcqRel);
+    last
+}
+
+/// Loads `elf` into fresh guest RAM and runs it with one vCPU per host
+/// hart until it shuts down.
+fn boot_guest(elf: &Elf<'_>, harts: usize) {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
     let mut mem = GuestMemory::new();
@@ -177,11 +345,11 @@ fn boot_guest(elf: &Elf<'_>) {
         mem.write(GuestPhysAddr(s.vaddr + s.data.len() as u64), &zeros).expect("guest segment outside its RAM");
         loaded += s.mem_size;
     }
-    println!("[hyp]   guest kernel: {} KiB loaded, entry {:#x}", loaded >> 10, elf.entry());
+    println!("[hyp]   guest kernel: {} KiB loaded, entry {:#x}, {harts} vCPUs", loaded >> 10, elf.entry());
 
     let dtb_at = GUEST_RAM + len - GUEST_DTB_SIZE;
     let dtb = GuestMachine {
-        harts: 1,
+        harts: harts as u32,
         isa: "rv64imac",
         timebase: 10_000_000,
         memory: &[(GUEST_RAM, len)],
@@ -197,57 +365,46 @@ fn boot_guest(elf: &Elf<'_>) {
 
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
     map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
-    let hgatp = hgatp_sv39x4(gstage.root(), 1);
 
-    let mut vcpu = RiscvVcpu::new(GuestPhysAddr(elf.entry()), 0, dtb_at, hgatp);
-    let eip = vcpu.external_irq();
-    // Context 1 is hart 0's S-mode context (0 is its unconnected M context).
-    let plic = Arc::new(VirtualPlic::new(32, 2, move |ctx, level| {
-        if ctx == 1 {
-            eip.store(level, Ordering::Release)
+    // Hart n's S-mode context is 2n + 1 (2n is its unconnected M context).
+    let lines: Vec<Arc<AtomicBool>> = (0..harts).map(|_| Arc::new(AtomicBool::new(false))).collect();
+    let l = lines.clone();
+    let plic = Arc::new(VirtualPlic::new(32, 2 * harts, move |ctx, level| {
+        if ctx % 2 == 1 {
+            l[ctx / 2].store(level, Ordering::Release)
         }
     }));
     let p = plic.clone();
     let uart = Arc::new(Uart16550Model::new(guest_console()).with_irq(move |level| p.set_level(UART_IRQ, level)));
     let mmio = Bus::new();
-    mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2), plic).unwrap();
+    mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2 * harts), plic).unwrap();
     mmio.insert(GUEST_UART, 8, uart).unwrap();
-    let pio = Bus::new();
-    let cpus = GuestCpus::new(1);
-    cpus.request_start(0, elf.entry(), dtb_at).unwrap();
-    let _ = cpus.take_start(0);
-    cpus.attach(0, &mut vcpu);
-
-    let sbi_out = guest_console();
-    let (mut exits, mut halts) = (0u64, 0u64);
-    let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| {
-        exits += 1;
-        match exit {
-            VmExit::Hypercall { .. } => {
-                match sbi::handle_smp(v, &mem, exit, &mut |b| b.iter().for_each(|&c| sbi_out(c)), Some((&cpus, 0))) {
-                    Some(sbi::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
-                    Some(sbi::Outcome::Stop) => ControlFlow::Break(VmExit::Halt),
-                    _ => ControlFlow::Continue(()),
-                }
-            }
-            VmExit::Halt => {
-                // The guest idles in wfi: run it again once it has an
-                // interrupt (its timer, or a device).
-                halts += 1;
-                let deadline = riscv::time() + 50_000_000; // 5 s
-                while !v.interrupt_pending(riscv::time()) {
-                    if riscv::time() > deadline {
-                        return ControlFlow::Break(VmExit::Halt);
-                    }
-                    core::hint::spin_loop();
-                }
-                ControlFlow::Continue(())
-            }
-            VmExit::ExternalInterrupt => ControlFlow::Continue(()),
-            other => ControlFlow::Break(other),
-        }
+    // An IPI or fence for a vCPU running guest code on another hart kicks
+    // that hart with a host IPI.
+    let cpus = GuestCpus::with_kick(harts, |cpu| {
+        let _ = host_sbi::send_ipi(1, HARTS[cpu].load(Ordering::Relaxed));
     });
-    println!("[hyp]   guest exit {exit:?} after {exits} exits ({halts} in wfi), pc {:#x}", vcpu.state.pc);
+    cpus.request_start(0, elf.entry(), dtb_at).unwrap();
+
+    let vm = Vm {
+        cpus,
+        mem,
+        hgatp: hgatp_sv39x4(gstage.root(), 1),
+        mmio,
+        lines,
+        done: AtomicBool::new(false),
+        running: AtomicUsize::new(harts),
+    };
+    VM.store(&raw const vm as *mut Vm, Ordering::Release);
+    let exit = vcpu_loop(&vm, 0);
+    while vm.running.load(Ordering::Acquire) > 0 {
+        core::hint::spin_loop();
+    }
+    VM.store(core::ptr::null_mut(), Ordering::Release);
+    match exit {
+        Some(e) => println!("[hyp]   guest exit {e:?} from vCPU 0"),
+        None => println!("[hyp]   guest ended by another vCPU"),
+    }
 }
 
 fn on_trap(frame: &mut TrapFrame) {

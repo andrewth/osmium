@@ -184,6 +184,13 @@ impl RiscvVcpu {
         self.external.clone()
     }
 
+    /// Uses `line` as the external-interrupt line instead, for an
+    /// interrupt controller built before the vCPU.
+    pub fn with_external_irq(mut self, line: Arc<AtomicBool>) -> Self {
+        self.external = line;
+        self
+    }
+
     /// Connects the vCPU's software-interrupt line (from
     /// [`GuestHarts::ipi_line`](harts::GuestHarts::ipi_line)): a raised
     /// line becomes `hvip.VSSIP` at the next entry, and the guest clears it
