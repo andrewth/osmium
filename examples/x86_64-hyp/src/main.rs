@@ -6,8 +6,9 @@
 //! intercepted, so this is not the host's COM1), reads the UART's status
 //! register, does the same with a second 16550 at a guest-physical address
 //! the nested page table leaves unmapped (each access a nested page fault,
-//! decoded and emulated), executes `hlt` and asks to be shut down with
-//! `vmmcall`.
+//! decoded and emulated), then programs an emulated 8259 PIC pair and an
+//! IDT and takes COM1's receive interrupt (injected through `EVENTINJ`),
+//! and asks to be shut down with `vmmcall`.
 #![no_std]
 #![no_main]
 
@@ -16,6 +17,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::ptr::NonNull;
 
 use osmium::arch::trap::{self, TrapFrame};
@@ -30,7 +32,7 @@ use osmium::mm::paging::formats::X86_64;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
-use osmium::virt::devices::Uart16550 as Uart16550Model;
+use osmium::virt::devices::{Uart16550 as Uart16550Model, VirtualPic};
 use osmium::virt::x86::{self as svm, SvmPages, SvmVcpu};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
@@ -134,6 +136,7 @@ core::arch::global_asm!(
     .section .rodata.guest, "a"
     .globl x86_guest, x86_guest_end
     .code32
+    .set GBASE, 0x100000            // where the host copies this code
 x86_guest:
     call 1f
 1:  pop %esi
@@ -154,12 +157,86 @@ x86_guest:
     mov %al, (%ebx)                 // nested page fault -> MMIO write
     jmp 6b
 7:  movzbl 5(%ebx), %ecx            // nested page fault -> MMIO read: LSR
-    hlt                             // halt exit
+    // 8259 PICs: master at vector 0x20, slave at 0x28; only IRQ 4 (COM1).
+    mov $0x11, %al
+    out %al, $0x20
+    out %al, $0xa0
+    mov $0x20, %al
+    out %al, $0x21
+    mov $0x28, %al
+    out %al, $0xa1
+    mov $4, %al
+    out %al, $0x21
+    mov $2, %al
+    out %al, $0xa1
+    mov $1, %al
+    out %al, $0x21
+    out %al, $0xa1
+    mov $0xef, %al
+    out %al, $0x21
+    mov $0xff, %al
+    out %al, $0xa1
+    lgdt GBASE + gdtr - x86_guest   // interrupt delivery reloads CS from it
+    lidt GBASE + idtr - x86_guest
+    mov $0x3f9, %dx                 // 16550 IER: receive interrupt
+    mov $1, %al
+    out %al, %dx
+8:  sti
+    hlt                             // halt exit; the interrupt arrives here
+    cli
+    cmpb $0, GBASE + received - x86_guest
+    je 8b
+    mov $0x3f8, %dx                 // report it over port I/O
+    mov $GBASE + 9f - x86_guest, %esi
+10: lodsb
+    test %al, %al
+    jz 11f
+    out %al, %dx
+    jmp 10b
+11: movb GBASE + received - x86_guest, %al
+    out %al, %dx
+    mov $0x0a, %al
+    out %al, %dx
     mov $1, %eax                    // hypercall 1: power off
     vmmcall
 5:  jmp 5b
+
+irq4:                               // COM1: read the byte, EOI, return
+    push %eax
+    push %edx
+    mov $0x3f8, %dx
+    in %dx, %al
+    movb %al, GBASE + received - x86_guest
+    mov $0x20, %al
+    out %al, $0x20
+    pop %edx
+    pop %eax
+    iret
+
 4:  .asciz "[guest] hello from SVM over port I/O\n"
     .asciz "[guest] and over MMIO (nested page faults)\n"
+9:  .asciz "[guest] IRQ 4 through the 8259 PIC, received: "
+received:
+    .byte 0
+    .balign 8
+idt:
+    .space 0x24 * 8
+    .word (GBASE + irq4 - x86_guest) & 0xffff
+    .word 0x08                      // the guest's flat code segment
+    .word 0x8e00                    // present, 32-bit interrupt gate
+    .word (GBASE + irq4 - x86_guest) >> 16
+idt_end:
+idtr:
+    .word idt_end - idt - 1
+    .long GBASE + idt - x86_guest
+    .balign 8
+gdt:
+    .quad 0
+    .quad 0x00cf9a000000ffff         // 0x08: flat 32-bit code
+    .quad 0x00cf92000000ffff         // 0x10: flat data
+gdtr:
+    .word gdtr - gdt - 1
+    .long GBASE + gdt - x86_guest
 x86_guest_end:
     .code64
 "#,
@@ -285,23 +362,37 @@ fn guest_demo() {
             l.clear();
         }
     };
-    pio.insert(0x3f8, 8, Arc::new(Uart16550Model::new(console.clone()))).unwrap();
+    let intr = Arc::new(AtomicBool::new(false));
+    let i = intr.clone();
+    let pic = Arc::new(VirtualPic::new(move |level| i.store(level, Ordering::Release)));
+    let p = pic.clone();
+    let com1 = Arc::new(Uart16550Model::new(console.clone()).with_irq(move |level| p.set_level(4, level)));
+    pio.insert(0x3f8, 8, com1.clone()).unwrap();
+    pio.insert(0x20, 2, pic.master()).unwrap();
+    pio.insert(0xa0, 2, pic.slave()).unwrap();
     let mmio = Bus::new();
     mmio.insert(GUEST_MMIO_UART, 8, Arc::new(Uart16550Model::new(console))).unwrap();
 
     let (vmcb, iopm, msrpm) = (block(0), block(2), block(1));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
     let mut vcpu = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
-        .with_memory(mem.clone());
+        .with_memory(mem.clone())
+        .with_irq_line(intr);
+    // The PIC's output is the vCPU's INTR line; delivery acknowledges it.
+    let p = pic.clone();
+    vcpu.connect_intr(move || p.acknowledge());
     let (mut hypercalls, mut halts) = (0, 0);
-    let exit = run_vcpu(&mut vcpu, &mmio, &pio, |_, exit| match exit {
+    let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { nr: 1, .. } => {
             hypercalls += 1;
             ControlFlow::Break(VmExit::Shutdown)
         }
         VmExit::Halt => {
             halts += 1;
-            ControlFlow::Continue(())
+            // The guest waits with interrupts on: "type" a key, which raises
+            // COM1's IRQ 4 at the PIC.
+            com1.push_input(b'k');
+            if v.interrupt_pending() { ControlFlow::Continue(()) } else { ControlFlow::Break(VmExit::Halt) }
         }
         VmExit::ExternalInterrupt => ControlFlow::Continue(()),
         other => ControlFlow::Break(other),
