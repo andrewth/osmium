@@ -124,7 +124,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `MemoryMap`: a fixed-capacity, heap-free region list that merges, carves and reserves (OSKit's LMM/AMM role, used at boot)
 - ✅ Frame allocators: a bitmap allocator, and a buddy allocator (orders 0–N, intrusive free lists, coalescing)
 - ✅ Generic multi-level page table `PageTable<F, A>` with map, unmap, translate, protect, huge-page `split` and `unmap_4k`, huge pages (2 MiB / 1 GiB), and freeing of intermediate tables
-- ✅ PTE formats: x86_64 4-level, AArch64 stage 1 (4 KiB granule), RISC-V Sv39/Sv48, Intel EPT, AArch64 stage 2
+- ✅ PTE formats: x86_64 4-level, AArch64 stage 1 (4 KiB granule), RISC-V Sv39/Sv48, Intel EPT, AArch64 stage 2, RISC-V G-stage Sv39x4/Sv48x4 (multi-page roots via `PageTableFormat::ROOT_PAGES` and `TableAlloc::alloc_root`)
 - ✅ Heap: a size-class slab front-end plus a large-allocation path over any `PageSource`; `LockedHeap` implements `GlobalAlloc`; works from a static arena (firmware) or the frame allocator (kernels)
 - 🗺 Virtual memory areas (VMA tree), demand paging, copy-on-write, typed frame metadata (as in OSTD's `Frame<M>`), 5-level paging, IOMMU tables
 
@@ -181,11 +181,13 @@ Status: ✅ implemented in this release · 🗺 roadmap
 
 ### `osmium-virt`: hypervisor building blocks
 - ✅ `GuestPhysAddr`, and `GuestMemory`: a GPA-to-host region map with bounds-checked `read`/`write`/`read_obj`/`write_obj` and a `Pod` marker
-- ✅ Stage-2 page tables: `osmium_mm` `PageTable` with the `Ept` and `Aarch64Stage2` formats
+- ✅ Stage-2 page tables: `osmium_mm` `PageTable` with the `Ept`, `Aarch64Stage2` and `Sv39x4`/`Sv48x4` formats; EPTP, VTTBR and hgatp encoders
 - ✅ `MmioBus` / `PioBus` device dispatch (as in rust-vmm `vm-device`)
 - ✅ Normalized `VmExit` enum, `Vcpu` trait, and a generic `run_vcpu` loop that services MMIO and PIO exits
 - ✅ An emulated 16550 UART device
-- 🗺 VMX/SVM, Arm EL2 and RISC-V H-extension `Vcpu` backends, virtual interrupt controllers, virtio device models
+- ✅ virtio device models: split virtqueue over `GuestMemory`, the virtio-mmio (v2) transport as a bus device, virtio-console and virtio-blk (over any `BlockDevice`), sharing `osmium_hal::virtio` definitions with the drivers
+- ✅ RISC-V H-extension `Vcpu` (`riscv64-hs`): world switch through the trap entry's guest-exit hook, VS CSR switching, MMIO emulation from guest-page faults (`htinst` or `hlvx`-fetched instruction, compressed forms included), `wfi` halts, host-interrupt exits, and a minimal SBI (BASE, TIME, SRST, DBCN, legacy)
+- 🗺 VMX/SVM and Arm EL2 `Vcpu` backends, virtual interrupt controllers (APLIC/IMSIC, vGIC), virtio-net device, guest FP state, multi-vCPU guests
 
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name
@@ -193,7 +195,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 ### Tooling and examples
 - ✅ Host unit and integration tests for every crate
 - ✅ Builds for `x86_64-unknown-none`, `aarch64-unknown-none-softfloat` and `riscv64imac-unknown-none-elf`
-- ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps
+- ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps; it also runs a small guest in VS-mode under the H extension
 - ✅ `examples/aarch64-virt`: the same on QEMU AArch64 `virt` (GICv2, PL011, generic timer, stage-1 paging, PSCI)
 - ✅ `examples/x86_64-pc`: the same on QEMU q35 (PVH boot, COM1, local APIC timer, 4-level paging, ACPI MADT, INIT/SIPI trampoline)
 - ✅ `examples/riscv-firmware`: M-mode firmware with `-bios none`, no heap and no scheduler: async tasks on `osmium-exec` await CLINT timer and PLIC/UART interrupts, then power off
