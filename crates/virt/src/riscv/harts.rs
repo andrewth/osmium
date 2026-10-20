@@ -21,6 +21,8 @@ struct Slot {
     state: AtomicU64,
     start: IrqSpinLock<Option<(u64, u64)>>,
     ipi: Arc<AtomicBool>,
+    /// A remote fence (SBI RFENCE) is due before the hart runs again.
+    fence: Arc<AtomicBool>,
     /// Host CPU the hart's vCPU is running guest code on, or `usize::MAX`.
     running: Arc<AtomicUsize>,
 }
@@ -60,6 +62,7 @@ impl GuestHarts {
                 state: AtomicU64::new(status::STOPPED),
                 start: IrqSpinLock::new(None),
                 ipi: Arc::new(AtomicBool::new(false)),
+                fence: Arc::new(AtomicBool::new(false)),
                 running: Arc::new(AtomicUsize::new(NOT_RUNNING)),
             })
             .collect();
@@ -71,6 +74,7 @@ impl GuestHarts {
     pub fn attach(&self, hart: usize, vcpu: &mut super::RiscvVcpu) {
         vcpu.connect_ipi(self.slots[hart].ipi.clone());
         vcpu.running = Some(self.slots[hart].running.clone());
+        vcpu.fence = Some(self.slots[hart].fence.clone());
     }
 
     /// Number of harts.
@@ -124,6 +128,22 @@ impl GuestHarts {
     /// Raises the software interrupt of every hart in `mask` (bit `i` =
     /// hart `base + i`; `base` = `u64::MAX` means all harts).
     pub fn send_ipi(&self, mask: u64, base: u64) -> Result<(), i64> {
+        self.each(mask, base, |s| s.ipi.store(true, Ordering::Release));
+        Ok(())
+    }
+
+    /// Makes every hart in `mask` execute `fence.i` and flush its guest
+    /// TLB (`hfence.vvma` for the VM) before it next runs guest code: SBI
+    /// RFENCE `remote_fence_i` and `remote_sfence_vma[_asid]`, done
+    /// conservatively for the whole address space.
+    pub fn remote_fence(&self, mask: u64, base: u64) -> Result<(), i64> {
+        self.each(mask, base, |s| s.fence.store(true, Ordering::Release));
+        Ok(())
+    }
+
+    /// Applies `f` to the harts selected by `mask`/`base`, kicking those
+    /// running on another host CPU so they notice now.
+    fn each(&self, mask: u64, base: u64, f: impl Fn(&Slot)) {
         for (i, s) in self.slots.iter().enumerate() {
             let hit = if base == u64::MAX {
                 true
@@ -131,7 +151,7 @@ impl GuestHarts {
                 (i as u64).checked_sub(base).is_some_and(|b| b < 64 && mask & (1 << b) != 0)
             };
             if hit {
-                s.ipi.store(true, Ordering::Release);
+                f(s);
                 let cpu = s.running.load(Ordering::Acquire);
                 if let Some(kick) = &self.kick
                     && cpu != NOT_RUNNING
@@ -141,7 +161,6 @@ impl GuestHarts {
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -181,5 +200,10 @@ mod tests {
         h.slots[1].running.store(3, Ordering::SeqCst);
         h.send_ipi(0b10, 0).unwrap();
         assert_eq!(kicked.load(Ordering::SeqCst), 3);
+        kicked.store(NOT_RUNNING, Ordering::SeqCst);
+        h.remote_fence(0b10, 0).unwrap();
+        assert_eq!(kicked.load(Ordering::SeqCst), 3, "fences kick too");
+        assert!(h.slots[1].fence.load(Ordering::SeqCst));
+        assert!(!h.slots[0].fence.load(Ordering::SeqCst));
     }
 }

@@ -128,6 +128,7 @@ pub struct RiscvVcpu {
     external: Arc<AtomicBool>,
     ipi: Option<Arc<AtomicBool>>,
     running: Option<Arc<core::sync::atomic::AtomicUsize>>,
+    fence: Option<Arc<AtomicBool>>,
 }
 
 /// SBI virtual-interrupt bits in `hvip`.
@@ -160,7 +161,7 @@ impl RiscvVcpu {
             htinst: 0,
             host: [0; 17],
         };
-        Self { state, csrs: VsCsrs::default(), hgatp, pending: None, external: Arc::new(AtomicBool::new(false)), ipi: None, running: None }
+        Self { state, csrs: VsCsrs::default(), hgatp, pending: None, external: Arc::new(AtomicBool::new(false)), ipi: None, running: None, fence: None }
     }
 
     /// The vCPU's supervisor external-interrupt line, for an interrupt
@@ -271,6 +272,9 @@ impl Vcpu for RiscvVcpu {
             r.store(osmium_arch::cpu::current_id(), Ordering::Release);
         }
         self.sync_lines();
+        if self.fence.as_ref().is_some_and(|f| f.swap(false, Ordering::AcqRel)) {
+            hw::fence_guest(self.hgatp);
+        }
         hw::run(self);
         if let Some(r) = &self.running {
             r.store(harts::NOT_RUNNING, Ordering::Release);

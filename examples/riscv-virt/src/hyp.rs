@@ -446,8 +446,8 @@ fn sbi_shutdown() -> ! {
     osmium::arch::riscv64::sbi::shutdown()
 }
 
-// A two-hart guest: hart 0 starts hart 1 through SBI HSM, hart 1 sends hart
-// 0 an IPI and stops itself, hart 0 spins on sip.SSIP until the IPI arrives
+// A two-hart guest: hart 0 starts hart 1 through SBI HSM, hart 1 asks for a
+// remote sfence.vma on hart 0, sends it an IPI and stops itself, hart 0 spins on sip.SSIP until the IPI arrives
 // (the hypervisor kicks its host CPU to make it exit) and waits for hart 1
 // to report STOPPED, then powers off. Position independent.
 core::arch::global_asm!(
@@ -495,6 +495,13 @@ smp_guest:
     li a0, 12f - 11f
     la a1, 11f
     jal ra, 20f
+    li a7, 0x52464E43               // RFENCE remote_sfence_vma(hart 0, all)
+    li a6, 1
+    li a0, 1
+    li a1, 0
+    li a2, 0
+    li a3, -1
+    ecall
     li a7, 0x735049                 // IPI send_ipi(mask 1, base 0)
     li a6, 0
     li a0, 1

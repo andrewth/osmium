@@ -30,6 +30,8 @@ pub mod eid {
     pub const HSM: u64 = 0x48_534d;
     /// Inter-processor interrupts ("sPI").
     pub const IPI: u64 = 0x73_5049;
+    /// Remote fences ("RFNC").
+    pub const RFENCE: u64 = 0x5246_4e43;
 }
 
 /// SBI error: the call is not supported.
@@ -96,6 +98,7 @@ pub fn handle_smp(
                 eid::BASE
                     | eid::HSM
                     | eid::IPI
+                    | eid::RFENCE
                     | eid::TIME
                     | eid::SRST
                     | eid::DBCN
@@ -132,6 +135,11 @@ pub fn handle_smp(
             None => (ERR_INVALID_PARAM, 0),
         },
         (eid::IPI, 0) if let Some((h, _)) = harts => match h.send_ipi(args[0], args[1]) {
+            Ok(()) => (0, 0),
+            Err(e) => (e, 0),
+        },
+        // remote_fence_i, remote_sfence_vma, remote_sfence_vma_asid.
+        (eid::RFENCE, 0..=2) if let Some((h, _)) = harts => match h.remote_fence(args[0], args[1]) {
             Ok(()) => (0, 0),
             Err(e) => (e, 0),
         },
@@ -177,8 +185,8 @@ mod tests {
 
         call(&mut v, &mem, eid::BASE, 3, [eid::DBCN, 0, 0, 0, 0, 0], &mut out);
         assert_eq!(v.state.x[11], 1);
-        call(&mut v, &mem, 0x5246_4e43, 0, [0; 6], &mut out);
-        assert_eq!(v.state.x[10] as i64, ERR_NOT_SUPPORTED, "RFENCE is not offered");
+        call(&mut v, &mem, eid::RFENCE, 0, [0; 6], &mut out);
+        assert_eq!(v.state.x[10] as i64, ERR_NOT_SUPPORTED, "RFENCE needs GuestHarts");
         call(&mut v, &mem, eid::HSM, 0, [1, 0, 0, 0, 0, 0], &mut out);
         assert_eq!(v.state.x[10] as i64, ERR_NOT_SUPPORTED, "HSM needs GuestHarts");
 
@@ -194,6 +202,8 @@ mod tests {
         smp(&mut v, eid::HSM, 2, [1, 0, 0, 0, 0, 0]);
         assert_eq!(v.state.x[11], super::super::harts::status::START_PENDING);
         assert_eq!(harts.take_start(1), Some((0x8000_1000, 42)));
+        smp(&mut v, eid::RFENCE, 1, [0b10, 0, 0x8000_0000, 0x1000, 0, 0]);
+        assert_eq!(v.state.x[10], 0);
         smp(&mut v, eid::IPI, 0, [0b10, 0, 0, 0, 0, 0]);
         assert!(harts.ipi_line(1).load(core::sync::atomic::Ordering::SeqCst));
         assert_eq!(smp(&mut v, eid::HSM, 1, [0; 6]), Some(Outcome::Stop));

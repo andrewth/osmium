@@ -252,6 +252,15 @@ fn save_vs(c: &mut VsCsrs) {
     c.vstimecmp = csr_read!("0x24d");
 }
 
+/// Executes a remote fence requested of this hart: `fence.i`, then
+/// `hfence.vvma` for all guest addresses of the VM whose `hgatp` is given
+/// (it applies to the VMID currently in `hgatp`, so install it first).
+pub(super) fn fence_guest(hgatp: u64) {
+    csr_write!("0x680", hgatp);
+    // SAFETY: instruction-cache and guest-TLB maintenance only.
+    unsafe { asm!("fence.i", ".insn r 0x73, 0, 0x11, x0, x0, x0", options(nostack)) };
+}
+
 /// Enters the guest and returns at its next exit.
 pub(super) fn run(v: &mut RiscvVcpu) {
     // The vCPU's task may have moved to a hart that never ran a guest.
