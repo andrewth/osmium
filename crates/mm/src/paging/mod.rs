@@ -224,6 +224,10 @@ pub enum MapError {
     HugePageConflict,
     /// No frame for an intermediate table.
     OutOfMemory,
+    /// The flags grant no access (none of `READ`, `WRITE`, `EXEC`). Not every
+    /// format can express such a leaf (on RISC-V it would read as a table
+    /// pointer), so leave the page unmapped instead.
+    NoAccess,
 }
 
 /// Why an existing mapping could not be changed.
@@ -233,6 +237,13 @@ pub enum UnmapError {
     NotMapped,
     /// The virtual address is outside the format's range.
     InvalidAddress,
+    /// The new flags grant no access; see [`MapError::NoAccess`].
+    NoAccess,
+}
+
+/// Whether a leaf with `flags` permits any access.
+fn grants_access(flags: MapFlags) -> bool {
+    flags.contains(MapFlags::READ) || flags.contains(MapFlags::WRITE) || flags.contains(MapFlags::EXEC)
 }
 
 /// A TLB invalidation that the caller must perform or explicitly skip.
@@ -331,6 +342,9 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     pub fn map(&mut self, va: VirtAddr, pa: PhysAddr, size: PageSize, flags: MapFlags) -> Result<Flush, MapError> {
         if self.is_shared(va) {
             return Err(MapError::InvalidAddress);
+        }
+        if !grants_access(flags) {
+            return Err(MapError::NoAccess);
         }
         if size.level() > F::MAX_LEAF_LEVEL || size.level() >= F::LEVELS {
             return Err(MapError::UnsupportedSize);
@@ -446,6 +460,9 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         if self.is_shared(va) {
             return Err(UnmapError::InvalidAddress);
         }
+        if !grants_access(flags) {
+            return Err(UnmapError::NoAccess);
+        }
         let (e, level) = self.find_leaf(va)?;
         let pte = e.load(Ordering::Acquire);
         e.store(F::leaf(F::addr(pte, level), flags, level), Ordering::Release);
@@ -480,7 +497,10 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
             }
             table = F::addr(pte, level);
         }
-        unreachable!("level 0 entries are always leaves")
+        // Only a malformed level-0 entry gets here (every format treats
+        // valid level-0 entries as leaves, and `map` never writes one that
+        // is not): report it as unmapped rather than trusting it.
+        Err(UnmapError::NotMapped)
     }
 
     fn entry(&self, table: PhysAddr, va: VirtAddr, level: usize) -> &AtomicU64 {

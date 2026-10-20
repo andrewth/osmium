@@ -153,6 +153,12 @@ impl<'a> Elf<'a> {
     ///
     /// Only absolute (non-PIE) images are supported; relocations are not
     /// applied. On error, pages mapped so far stay mapped; drop the table.
+    ///
+    /// Every page the image touches is mapped by this call: a page that is
+    /// already mapped (other than by an earlier segment of this image) is
+    /// [`MapError::AlreadyMapped`], and [`PageTable::map`] refuses the root
+    /// entries a table shares with the kernel, so an image never writes
+    /// memory it does not own.
     pub fn load_into<F: PageTableFormat, A: TableAlloc>(
         &self,
         pt: &mut PageTable<F, A>,
@@ -160,7 +166,12 @@ impl<'a> Elf<'a> {
         mut alloc_frame: impl FnMut() -> Option<PhysAddr>,
     ) -> Result<(), MapError> {
         let page = PAGE_SIZE as u64;
-        for seg in self.segments() {
+        // The pages a segment covers; None if its end overflows.
+        let pages = |s: &Segment<'_>| {
+            let end = s.vaddr.checked_add(s.mem_size)?.checked_next_multiple_of(page)?;
+            Some(s.vaddr & !(page - 1)..end)
+        };
+        for (i, seg) in self.segments().enumerate() {
             let mut flags = extra | MapFlags::READ;
             if seg.flags.write {
                 flags = flags | MapFlags::WRITE;
@@ -168,14 +179,18 @@ impl<'a> Elf<'a> {
             if seg.flags.execute {
                 flags = flags | MapFlags::EXEC;
             }
-            let end = seg.vaddr.checked_add(seg.mem_size).ok_or(MapError::InvalidAddress)?;
-            let mut va = seg.vaddr & !(page - 1);
-            while va < end {
+            let span = pages(&seg).ok_or(MapError::InvalidAddress)?;
+            // `new` checked filesz <= memsz, and `span` fits in a u64.
+            let file_end = seg.vaddr + seg.data.len() as u64;
+            for va in span.step_by(PAGE_SIZE) {
                 let pa = match pt.translate(VirtAddr::new(va)) {
-                    Some(t) => {
-                        let _ = pt.protect(VirtAddr::new(va), t.flags | flags);
+                    // A page this segment shares with an earlier one of this
+                    // image, which this call mapped: add our permissions.
+                    Some(t) if self.segments().take(i).any(|s| pages(&s).is_some_and(|r| r.contains(&va))) => {
+                        pt.protect(VirtAddr::new(va), t.flags | flags).map_err(|_| MapError::InvalidAddress)?.ignore();
                         t.pa
                     }
+                    Some(_) => return Err(MapError::AlreadyMapped),
                     None => {
                         let pa = alloc_frame().ok_or(MapError::OutOfMemory)?;
                         // SAFETY: a fresh frame from the caller, reachable
@@ -185,16 +200,18 @@ impl<'a> Elf<'a> {
                         pa
                     }
                 };
-                let (lo, hi) = (va.max(seg.vaddr), (va + page).min(seg.vaddr + seg.data.len() as u64));
+                // `va` is below the page-aligned end of `span`, so this
+                // cannot overflow.
+                let (lo, hi) = (va.max(seg.vaddr), (va + page).min(file_end));
                 if lo < hi {
                     let src = &seg.data[(lo - seg.vaddr) as usize..(hi - seg.vaddr) as usize];
-                    // SAFETY: the destination lies within the page's frame.
+                    // SAFETY: the destination lies within the page's frame,
+                    // which this call mapped.
                     unsafe {
                         let dst = pt.allocator().phys_to_virt(pa + (lo - va));
                         core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
                     }
                 }
-                va += page;
             }
         }
         Ok(())
@@ -301,6 +318,34 @@ mod tests {
         assert!(data.flags.contains(MapFlags::WRITE) && !data.flags.contains(MapFlags::EXEC));
         // SAFETY: as above; bytes past the file data are zero (.bss).
         assert_eq!(unsafe { *(data.pa.0 as *const [u8; 4]) }, [0xaa, 0xbb, 0, 0]);
+
+        // A page that is already mapped (here standing in for kernel memory
+        // in a shared root entry) is refused, not written through.
+        let victim = page();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&host).unwrap();
+        pt.map(VirtAddr::new(0x40_2000), victim, PageSize::Size4K, MapFlags::READ | MapFlags::WRITE).unwrap().ignore();
+        assert_eq!(elf.load_into(&mut pt, MapFlags::USER, || Some(page())), Err(MapError::AlreadyMapped));
+        // SAFETY: the host page mapped above.
+        assert_eq!(unsafe { *(victim.0 as *const [u8; 2]) }, [0, 0], "nothing copied into it");
+
+        // Two segments sharing a page: both permissions, both contents.
+        let mut g = sample();
+        g[120 + 16..120 + 24].copy_from_slice(&0x40_1800u64.to_le_bytes());
+        let elf = Elf::new(&g).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&host).unwrap();
+        elf.load_into(&mut pt, MapFlags::USER, || Some(page())).unwrap();
+        let t = pt.translate(VirtAddr::new(0x40_1000)).unwrap();
+        assert!(t.flags.contains(MapFlags::WRITE | MapFlags::EXEC));
+        // SAFETY: the translated host page.
+        let bytes = unsafe { &*(t.pa.0 as *const [u8; 0x802]) };
+        assert_eq!((&bytes[..4], &bytes[0x800..]), (&[0x90, 0x90, 0x0f, 0x05][..], &[0xaa, 0xbb][..]));
+
+        // A segment whose end overflows the address space.
+        let mut g = sample();
+        g[120 + 16..120 + 24].copy_from_slice(&0xffff_ffff_ffff_f000u64.to_le_bytes());
+        let elf = Elf::new(&g).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&host).unwrap();
+        assert_eq!(elf.load_into(&mut pt, MapFlags::USER, || Some(page())), Err(MapError::InvalidAddress));
     }
 
     #[test]

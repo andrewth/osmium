@@ -104,6 +104,8 @@ fn sym(s: &u8) -> u64 {
 }
 
 const COM1: u16 = 0x3f8;
+/// RAM the PVH boot tables identity-map (`pvh_start!`): the first 4 GiB.
+const BOOT_MAPPED: u64 = 1 << 32;
 /// Physical address the AP trampoline is copied to (STARTUP vector 0x08).
 const TRAMPOLINE: u64 = x86::smp::TRAMPOLINE;
 const IPI_VECTOR: u8 = 33;
@@ -143,6 +145,13 @@ fn load_cpu_tables() {
     // installed; the kernel does not use the GS base.
     unsafe { (&*ptr).enable_syscall() };
 }
+
+/// Application processors' first stacks (`AP_STACKS[cpu]`), where each
+/// stays as its CPU's bootstrap task.
+#[repr(align(16))]
+#[allow(dead_code)] // only its address is used
+struct ApStack([u8; 64 * 1024]);
+static mut AP_STACKS: [ApStack; MAX_CPUS] = [const { ApStack([0; 64 * 1024]) }; MAX_CPUS];
 
 /// Each CPU's GDT and TSS, so the switch hook can update `rsp[0]`.
 static CPU_TABLES: [core::sync::atomic::AtomicPtr<x86::CpuTables>; MAX_CPUS] =
@@ -296,12 +305,14 @@ extern "C" fn kmain(start_info: usize) -> ! {
     for r in map.regions() {
         println!("[mem]   {:#011x}..{:#011x} {:?}", r.start.0, r.end.0, r.kind);
     }
-    let ram_end = map.usable().map(|r| r.end.0).max().unwrap();
     {
         let mut buddy = FRAMES.lock();
-        for r in map.usable() {
+        // Only RAM below 4 GiB for now: the allocator writes into free
+        // frames, and the boot tables map just the first 4 GiB. The rest is
+        // added once the kernel's own table maps it.
+        for r in map.usable().filter(|r| r.start.0 < BOOT_MAPPED) {
             // SAFETY: the memory map says the range is free RAM, identity-mapped.
-            unsafe { buddy.add_region(r.start, r.end) };
+            unsafe { buddy.add_region(r.start, r.end.min(PhysAddr::new(BOOT_MAPPED))) };
         }
         println!("[frame] buddy allocator: {} free frames ({} MiB)", buddy.free_frames(), (buddy.free_frames() * PAGE_SIZE) >> 20);
     }
@@ -321,7 +332,14 @@ extern "C" fn kmain(start_info: usize) -> ! {
     pt.map_range(va(0x10_0000), pa(0x10_0000), kstart - 0x10_0000, k(MapFlags::RW)).unwrap();
     pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).unwrap();
     pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).unwrap();
-    pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).unwrap();
+    pt.map_range(va(erodata), pa(erodata), kend.next_multiple_of(PAGE_SIZE as u64) - erodata, k(MapFlags::RW)).unwrap();
+    // RAM above the kernel, one region at a time: a single span to the end
+    // of RAM would cover the PCI hole below 4 GiB (and the local APIC) as
+    // cacheable memory once there is RAM above it.
+    for r in map.usable().filter(|r| r.end.0 > kend) {
+        let start = r.start.0.max(kend.next_multiple_of(PAGE_SIZE as u64));
+        pt.map_range(va(start), pa(start), r.end.0 - start, k(MapFlags::RW)).unwrap();
+    }
     pt.map_range(va(lapic::DEFAULT_BASE), pa(lapic::DEFAULT_BASE), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE))
         .unwrap();
     if let Some(&(io, ..)) = IOAPIC_INFO.get() {
@@ -332,6 +350,13 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: the new table maps the running code, its stack, the heap and the APIC.
     unsafe { x86::write_cr3(pt.root().0) };
     CR3.store(pt.root().0, Ordering::Release);
+    {
+        let mut buddy = FRAMES.lock();
+        for r in map.usable().filter(|r| r.end.0 > BOOT_MAPPED) {
+            // SAFETY: free RAM, identity-mapped by the table just loaded.
+            unsafe { buddy.add_region(r.start.max(PhysAddr::new(BOOT_MAPPED)), r.end) };
+        }
+    }
     let t = pt.translate(va(kmain as *const () as u64)).unwrap();
     println!("[mmu]   CR3 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
     *PT.lock() = Some(pt);
@@ -391,10 +416,13 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // allocator), mapped writable above; no AP is starting yet.
     unsafe { x86::smp::install() };
     for (cpu, apic_id) in APIC_IDS.iter().enumerate().take(ncpus).skip(1) {
-        let stack = alloc::vec![0u8; 64 * 1024].leak();
+        // In the kernel image, not the heap: the AP first runs on the boot
+        // tables, which map only the first 4 GiB.
+        // SAFETY: only the address is taken; this AP is its sole user.
+        let stack = unsafe { &raw mut AP_STACKS[cpu] };
         let boot = x86::smp::ApBoot {
             cr3: &raw const boot_pml4 as u64,
-            stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
+            stack_top: (stack as u64 + size_of::<ApStack>() as u64) & !15,
             entry: ap_start64 as *const () as u64,
             cpu,
         };

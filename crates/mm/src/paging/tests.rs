@@ -35,6 +35,15 @@ fn exercise<F: PageTableFormat>(high_va: u64) {
         assert_eq!(t.size, PageSize::Size4K);
         assert!(t.flags.contains(MapFlags::RW));
         assert!(!t.flags.contains(MapFlags::EXEC));
+        // A leaf must grant some access: RISC-V would read V-only as a
+        // table pointer. protect() can't drop to no access either.
+        for size in [PageSize::Size4K, PageSize::Size2M] {
+            let f = MapFlags::USER | MapFlags::GLOBAL;
+            assert_eq!(pt.map(va(0x60_0000), pa(0x20_0000), size, f).err(), Some(MapError::NoAccess));
+        }
+        assert!(pt.translate(va(0x60_0000)).is_none());
+        assert_eq!(pt.protect(va(0x40_0000), MapFlags::USER).err(), Some(UnmapError::NoAccess));
+        assert_eq!(pt.unmap(va(0x60_0000)).err(), Some(UnmapError::NotMapped));
         assert_eq!(
             pt.map(va(0x40_0000), pa(0x1000), PageSize::Size4K, MapFlags::READ).err(),
             Some(MapError::AlreadyMapped)

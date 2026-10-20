@@ -318,8 +318,10 @@ impl<const LEVELS: usize, const VA_BITS: u32> PageTableFormat for Riscv<LEVELS, 
         pte & rv::V != 0
     }
 
-    fn is_leaf(pte: u64, _level: usize) -> bool {
-        pte & (rv::R | rv::W | rv::X) != 0
+    fn is_leaf(pte: u64, level: usize) -> bool {
+        // Hardware treats a valid level-0 entry without R/W/X as a fault, not
+        // a pointer; `map` never writes one.
+        level == 0 || pte & (rv::R | rv::W | rv::X) != 0
     }
 
     fn addr(pte: u64, _level: usize) -> PhysAddr {
