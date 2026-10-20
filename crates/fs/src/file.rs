@@ -197,6 +197,11 @@ impl OpenFlags {
         self.0
     }
 
+    /// The flags in either (`|` in a `const`).
+    pub const fn union(self, other: OpenFlags) -> OpenFlags {
+        OpenFlags(self.0 | other.0)
+    }
+
     /// Whether every flag in `other` is set.
     pub const fn contains(self, other: OpenFlags) -> bool {
         self.0 & other.0 == other.0

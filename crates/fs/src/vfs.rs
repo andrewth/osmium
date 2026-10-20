@@ -151,10 +151,20 @@ impl Vfs {
 
     /// Creates the directory `path` with permission bits `mode`.
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        self.mknod(path, FileKind::Directory, mode).map(drop)
+    }
+
+    /// Creates a node of `kind` at `path` with permission bits `mode`, such
+    /// as a FIFO or device node (`mknod`), or a regular file or directory.
+    /// Symbolic links need a target: use [`symlink`](Vfs::symlink).
+    pub fn mknod(&self, path: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
+        if kind == FileKind::Symlink {
+            return Err(Errno::EINVAL);
+        }
         let parent = self.parent(path)?;
         match parent.name {
-            Some(name) if name != "." && name != ".." => {
-                parent.dir.create(name, FileKind::Directory, mode & 0o7777).map(drop)
+            Some(name) if name != "." && name != ".." && (!parent.trailing_slash || kind == FileKind::Directory) => {
+                parent.dir.create(name, kind, mode & 0o7777)
             }
             _ => Err(Errno::EEXIST),
         }
