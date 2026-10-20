@@ -39,7 +39,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-fs` | `File` trait and `Vfs` namespace (mounts, `..` across mounts, symlinks), Linux `Errno`, RAM file system, `/dev` nodes, cpio initramfs unpacking | yes |
 | `osmium-proc` | `Process` (address space, fd table, cwd, exit status, `wait`), `AddressSpace` with page-table-checked user copies, and one portable system-call dispatcher using each architecture's Linux numbers and structure layouts | yes |
 | `osmium-fs-fat` | FAT12, FAT16 and FAT32 for the `osmium-fs` VFS over any `BlockDevice`: long (VFAT) names, create, write, truncate, remove | yes |
-| `osmium-net` | Polled IPv4 stack over any `NetDevice`: ARP, ICMP echo, UDP, TCP, DHCP client | yes |
+| `osmium-net` | Polled IPv4 stack over any `NetDevice`: ARP, ICMP echo, UDP, TCP (SACK, timestamps), DHCP client, DNS (UDP and TCP), IP fragmentation, IGMPv2 multicast | yes |
 | `osmium-iscsi` | iSCSI initiator over `osmium-net` TCP as a `BlockDevice`: login and negotiation, R2T and immediate-data writes, SendTargets discovery | yes |
 | `osmium-fs-ext4` | ext2/ext3/ext4 (read and write) for the `osmium-fs` VFS over any `BlockDevice` | yes |
 | `osmium-fs-iso9660` | read-only ISO 9660 for the `osmium-fs` VFS over any `BlockDevice`: Rock Ridge, Joliet, deep-directory relocation, multi-extent and interleaved files | yes |

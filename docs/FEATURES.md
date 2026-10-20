@@ -251,10 +251,13 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `DnsClient`: a pollable stub resolver for A records over a `UdpSocket`, using the DHCP-reported server or explicit ones, with random ids, question/source validation, CNAME chains, retries with backoff across servers, a TTL cache and short negative caching
 - ✅ IPv4 fragment reassembly (timeouts, bounded buffers, overlaps condemn the datagram) and send-side fragmentation of UDP and ICMP datagrams larger than the MTU
 - ✅ TCP initial sequence numbers follow RFC 6528 (a keyed SipHash of the four-tuple plus a clock); the generator is keyed from the seed and any entropy the caller supplies (`Interface::new_with_entropy`, `add_entropy`)
-- ✅ `wire`: Ethernet, ARP, IPv4 (with fragment fields), ICMP, UDP and TCP headers (MSS, window scale and SACK options) and the Internet checksum, usable on their own
+- ✅ `wire`: Ethernet, ARP, IPv4 (with fragment fields), ICMP, UDP and TCP headers (MSS, window scale, SACK and timestamp options), IPv4 options and IGMP and the Internet checksum, usable on their own
 - ✅ Tested on the host over a simulated link that drops, duplicates and reorders frames (TCP bulk transfers, fragments, DNS), and under QEMU against the user-mode network (DHCP lease, ping, DNS lookup, TCP echo)
-- 🗺 IPv6, TCP timestamps and DNS over TCP
-
+- ✅ IPv4 header options are validated on receive (lengths walked, unknown options skipped, source-routed packets dropped, no panics on malformed headers); fragments are bounded in count as well as in datagrams, so a stream of tiny fragments cannot grow the bookkeeping
+- ✅ IPv4 multicast: `join_multicast_group` / `leave_multicast_group`, IGMPv2 (unsolicited reports, randomly delayed answers to queries, report suppression, leave messages, IGMPv1 router compatibility, router alert option), the RFC 1112 multicast MAC mapping, multicast UDP send (TTL 1 by default) and receive on joined groups
+- ✅ TCP timestamps (RFC 7323): negotiated in the handshake, a round-trip sample from every ACK of new data (also for retransmissions), PAWS against old duplicates, and the MSS reduced by the option
+- ✅ DNS over TCP (RFC 7766): a truncated UDP response is retried over a TCP connection to the same server with length-prefixed framing, falling back to the partial answer if the connection fails
+- 🗺 IPv6
 ### `osmium-iscsi`: iSCSI initiator
 - ✅ RFC 7143 login (AuthMethod None, operational negotiation honouring the target's answers), SendTargets discovery, full-feature phase with immediate data, unsolicited Data-Out and R2T-driven writes, multi-PDU Data-In, NOP-In replies and logout; SCSI INQUIRY, TEST UNIT READY, READ CAPACITY(10/16), READ/WRITE(10/16) and SYNCHRONIZE CACHE as a `BlockDevice` over an `osmium-net` TCP socket
 - ✅ Tested on the host against an in-process target and `scripts/iscsi-target.py` (a stdlib-only target), and under QEMU through a user-network `guestfwd` to that script

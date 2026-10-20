@@ -615,7 +615,7 @@ impl TcpSocket {
         // is a wrapped-around duplicate, and one without a timestamp on a
         // connection that agreed on them is not from the peer.
         if self.ts_ok && !seg.has(TCP_RST) {
-            let Some((val, _)) = seg.timestamps else { return None };
+            let (val, _) = seg.timestamps?;
             if before(val, self.ts_recent) && now - self.ts_recent_at < TS_RECENT_LIFE {
                 self.ack_pending = true;
                 return None;

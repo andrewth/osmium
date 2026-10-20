@@ -17,11 +17,15 @@
 //! typically wraps the interface, the device and the socket set in one lock.
 //!
 //! TCP reassembles out-of-order data, is congestion controlled (NewReno, or
-//! RFC 6675 recovery with SACK) and negotiates window scaling. Fragmented
-//! IPv4 datagrams are reassembled, and UDP and ICMP datagrams larger than the
-//! MTU are fragmented when sent.
+//! RFC 6675 recovery with SACK), negotiates window scaling, and uses
+//! timestamps (RFC 7323) for round-trip samples and protection against
+//! wrapped sequence numbers. Fragmented IPv4 datagrams are reassembled, and
+//! UDP and ICMP datagrams larger than the MTU are fragmented when sent. IP
+//! options are checked and skipped ([`ipopt`]). An interface can join
+//! multicast groups ([`Interface::join_multicast_group`]), reported with
+//! IGMPv2 ([`igmp`]). The DNS client retries truncated answers over TCP.
 //!
-//! Not supported: IP options, IPv6, multicast, TCP timestamps, DNS over TCP.
+//! Not supported: IPv6, IP forwarding, IGMPv3 reports.
 //!
 //! [`NetDevice`]: osmium_hal::net::NetDevice
 #![no_std]

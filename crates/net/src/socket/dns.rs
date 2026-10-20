@@ -10,8 +10,15 @@
 //! Only `A` records are asked for. A response is believed only if it comes
 //! from a configured server, echoes the query's random id and question, and
 //! its records belong to the name asked for (directly or through the
-//! `CNAME`s that lead from it). A truncated response (TC) is an error: there
-//! is no TCP fallback.
+//! `CNAME`s that lead from it).
+//!
+//! A response that does not fit a datagram (TC set) is asked for again over
+//! TCP (RFC 7766): the client opens a connection to the server that sent it,
+//! sends the query with its two-byte length prefix, and reads the
+//! length-prefixed answer, which may be larger than 512 bytes. The
+//! connection lives in the same [`SocketSet`] and is closed afterwards. If it
+//! cannot be had in time, the addresses the truncated response did carry are
+//! used, or else the lookup fails with [`DnsError::Truncated`].
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -20,7 +27,7 @@ use core::time::Duration;
 
 use super::SocketHandle;
 use crate::rng::Rng;
-use crate::{Error, Instant, Interface, SocketSet, UdpSocket};
+use crate::{Error, Instant, Interface, SocketSet, TcpSocket, TcpState, UdpSocket};
 
 const SERVER_PORT: u16 = 53;
 const TYPE_A: u16 = 1;
@@ -48,6 +55,16 @@ const RESULT_KEEP: Duration = Duration::from_secs(60);
 /// 512 bytes; a little more is tolerated).
 const MAX_RESPONSE: usize = 1232;
 
+/// How long a TCP lookup may take, handshake included.
+const TCP_TIMEOUT: Duration = Duration::from_secs(10);
+/// The largest TCP response accepted; a longer one fails the lookup.
+const MAX_TCP_RESPONSE: usize = 16 * 1024;
+/// Buffers of the TCP socket: the response, and the one query.
+const TCP_RX: usize = MAX_TCP_RESPONSE + 2;
+const TCP_TX: usize = 512;
+/// How long a finished TCP socket is given to close before it is removed.
+const TCP_CLOSE_GRACE: Duration = Duration::from_secs(5);
+
 /// Why a lookup failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DnsError {
@@ -64,7 +81,7 @@ pub enum DnsError {
     NoAddress,
     /// The server failed or refused.
     ServerFailure,
-    /// The response did not fit a datagram (and TCP is not used).
+    /// The response did not fit a datagram, and the TCP retry failed.
     Truncated,
     /// No server answered.
     Timeout,
@@ -96,8 +113,31 @@ pub struct DnsQuery(u32);
 
 type Outcome = Result<Vec<Ipv4Addr>, DnsError>;
 
+/// Where a lookup stands on the TCP retry.
+enum Tcp {
+    /// Not needed (yet).
+    No,
+    /// A server sent a truncated response: connect to it and ask again. The
+    /// addresses it did give, and their TTL, are the fallback.
+    Wanted { server: Ipv4Addr, partial: Vec<Ipv4Addr>, ttl: u32 },
+    /// A [`TcpJob`] is working on it; UDP retries are off.
+    Active,
+}
+
+/// A query in flight over TCP.
+struct TcpJob {
+    query: DnsQuery,
+    socket: SocketHandle,
+    started: Instant,
+    /// Bytes received: a two-byte length and the message.
+    buf: Vec<u8>,
+    partial: Vec<Ipv4Addr>,
+    ttl: u32,
+}
+
 struct Query {
     handle: DnsQuery,
+    tcp: Tcp,
     /// Lower case, without a trailing dot.
     name: String,
     id: u16,
@@ -119,6 +159,9 @@ pub struct DnsClient {
     servers: Vec<Ipv4Addr>,
     queries: Vec<Query>,
     cache: Vec<CacheEntry>,
+    jobs: Vec<TcpJob>,
+    /// TCP sockets that are done, closing, and when to give up on that.
+    closing: Vec<(SocketHandle, Instant)>,
     rng: Rng,
     next_handle: u32,
 }
@@ -274,6 +317,8 @@ impl DnsClient {
             servers: Vec::new(),
             queries: Vec::new(),
             cache: Vec::new(),
+            jobs: Vec::new(),
+            closing: Vec::new(),
             rng: Rng::new(iface.random_u64()),
             next_handle: 0,
         }
@@ -297,8 +342,16 @@ impl DnsClient {
         let literal = name.parse::<Ipv4Addr>().ok();
         let name = normalize(name).ok_or(DnsError::InvalidName)?;
         let handle = DnsQuery(self.next_handle);
-        let mut query =
-            Query { handle, id: 0, started: now, attempts: 0, next_try: now, result: None, name: name.clone() };
+        let mut query = Query {
+            handle,
+            tcp: Tcp::No,
+            id: 0,
+            started: now,
+            attempts: 0,
+            next_try: now,
+            result: None,
+            name: name.clone(),
+        };
         if let Some(ip) = literal {
             query.result = Some((Ok(alloc::vec![ip]), now));
         } else if let Some(c) = self.cache.iter().find(|c| c.name == name && c.expires > now) {
@@ -366,22 +419,158 @@ impl DnsClient {
         self.cache.push(entry);
     }
 
-    fn handle_response(&mut self, msg: &[u8], now: Instant) {
+    fn handle_response(&mut self, msg: &[u8], from: Ipv4Addr, now: Instant) {
         let Some(r) = parse_response(msg) else { return };
         let Some(i) = self.queries.iter().position(|q| q.result.is_none() && q.id == r.id && q.name == r.name) else {
             return;
         };
+        if r.truncated && r.rcode == 0 {
+            // The answer is partial: get all of it over TCP. One attempt
+            // only; a second truncated datagram changes nothing.
+            if matches!(self.queries[i].tcp, Tcp::No) {
+                self.queries[i].tcp = Tcp::Wanted { server: from, partial: r.addresses, ttl: r.ttl };
+            }
+            return;
+        }
+        self.apply(i, r, now);
+    }
+
+    /// Acts on a response that answers query `i`.
+    fn apply(&mut self, i: usize, r: Response, now: Instant) {
         match r.rcode {
             0 if !r.addresses.is_empty() => {
                 let ttl = (r.ttl > 0).then(|| Duration::from_secs(u64::from(r.ttl.min(MAX_TTL))));
                 self.finish(i, Ok(r.addresses), ttl, now);
             }
-            0 if r.truncated => self.finish(i, Err(DnsError::Truncated), None, now),
             0 => self.finish(i, Err(DnsError::NoAddress), Some(NEGATIVE_TTL), now),
             3 => self.finish(i, Err(DnsError::NameNotFound), Some(NEGATIVE_TTL), now),
             // Another server may do better.
             _ if self.queries[i].attempts < ATTEMPTS => self.queries[i].next_try = now,
             _ => self.finish(i, Err(DnsError::ServerFailure), None, now),
+        }
+    }
+
+    /// Starts the TCP retries that are wanted, moves their data, and tidies
+    /// the sockets of those that are done.
+    fn poll_tcp(&mut self, now: Instant, sockets: &mut SocketSet) {
+        // Close the sockets of the jobs whose lookup ended, and reap.
+        let mut j = 0;
+        while j < self.jobs.len() {
+            let ended = self.queries.iter().find(|q| q.handle == self.jobs[j].query).is_none_or(|q| q.result.is_some());
+            if ended {
+                let job = self.jobs.swap_remove(j);
+                self.retire(job.socket, now, sockets);
+            } else {
+                j += 1;
+            }
+        }
+        let mut c = 0;
+        while c < self.closing.len() {
+            let (handle, deadline) = self.closing[c];
+            let done = matches!(sockets.get::<TcpSocket>(handle).state(), TcpState::Closed | TcpState::TimeWait);
+            if done || now >= deadline {
+                sockets.remove(handle);
+                self.closing.swap_remove(c);
+            } else {
+                c += 1;
+            }
+        }
+
+        // Start the wanted connections.
+        for i in 0..self.queries.len() {
+            if self.queries[i].result.is_some() || !matches!(self.queries[i].tcp, Tcp::Wanted { .. }) {
+                continue;
+            }
+            let Tcp::Wanted { server, partial, ttl } = core::mem::replace(&mut self.queries[i].tcp, Tcp::Active) else {
+                continue;
+            };
+            let q = &self.queries[i];
+            let mut message = encode_query(q.id, &q.name);
+            message.splice(0..0, (message.len() as u16).to_be_bytes());
+            let mut socket = TcpSocket::new(TCP_RX, TCP_TX);
+            // The query waits in the send buffer until the handshake is done.
+            let started = socket.connect(SocketAddrV4::new(server, SERVER_PORT), 0).is_ok()
+                && socket.send(&message) == Ok(message.len());
+            if !started {
+                self.tcp_failed(i, partial, ttl, now);
+                continue;
+            }
+            self.jobs.push(TcpJob {
+                query: q.handle,
+                socket: sockets.add(socket),
+                started: now,
+                buf: Vec::new(),
+                partial,
+                ttl,
+            });
+            self.queries[i].next_try = now + TCP_TIMEOUT;
+        }
+
+        // Move data.
+        let mut j = 0;
+        while j < self.jobs.len() {
+            let Some(i) = self.queries.iter().position(|q| q.handle == self.jobs[j].query) else {
+                j += 1;
+                continue;
+            };
+            let job = &mut self.jobs[j];
+            let socket = sockets.get_mut::<TcpSocket>(job.socket);
+            let mut chunk = [0u8; 512];
+            let mut failed = socket.error().is_some() || now - job.started >= TCP_TIMEOUT;
+            while !failed {
+                match socket.recv(&mut chunk) {
+                    Ok(0) => {
+                        // The server closed before it finished answering.
+                        failed = true;
+                    }
+                    Ok(n) if job.buf.len() + n <= TCP_RX => job.buf.extend_from_slice(&chunk[..n]),
+                    Ok(_) => failed = true,
+                    Err(_) => break,
+                }
+            }
+            if !failed && socket.state() == TcpState::Closed {
+                failed = true;
+            }
+            let reply = match job.buf.as_slice() {
+                [hi, lo, rest @ ..] if rest.len() >= usize::from(u16::from_be_bytes([*hi, *lo])) => {
+                    Some(&rest[..usize::from(u16::from_be_bytes([*hi, *lo]))])
+                }
+                _ => None,
+            };
+            if let Some(msg) = reply {
+                // The connection is the server's: its answer need not be
+                // checked against a source address, only against the query.
+                let response =
+                    parse_response(msg).filter(|r| r.id == self.queries[i].id && r.name == self.queries[i].name);
+                let (partial, ttl) = (core::mem::take(&mut job.partial), job.ttl);
+                match response {
+                    // Truncation over TCP is no matter: take what there is.
+                    Some(r) => self.apply(i, r, now),
+                    None => self.tcp_failed(i, partial, ttl, now),
+                }
+            } else if failed {
+                let (partial, ttl) = (core::mem::take(&mut job.partial), job.ttl);
+                self.tcp_failed(i, partial, ttl, now);
+            }
+            // A finished query makes the next call retire the job.
+            j += 1;
+        }
+    }
+
+    /// Closes a job's socket and leaves it to be removed.
+    fn retire(&mut self, socket: SocketHandle, now: Instant, sockets: &mut SocketSet) {
+        sockets.get_mut::<TcpSocket>(socket).close();
+        self.closing.push((socket, now + TCP_CLOSE_GRACE));
+    }
+
+    /// The TCP retry of query `i` did not work out: the addresses the
+    /// truncated response carried will do, if it carried any.
+    fn tcp_failed(&mut self, i: usize, partial: Vec<Ipv4Addr>, ttl: u32, now: Instant) {
+        if partial.is_empty() {
+            self.finish(i, Err(DnsError::Truncated), None, now);
+        } else {
+            let ttl = (ttl > 0).then(|| Duration::from_secs(u64::from(ttl.min(MAX_TTL))));
+            self.finish(i, Ok(partial), ttl, now);
         }
     }
 
@@ -392,13 +581,14 @@ impl DnsClient {
         let mut buf = [0u8; MAX_RESPONSE];
         while let Ok((n, from)) = sockets.get_mut::<UdpSocket>(self.socket).recv_from(&mut buf) {
             if n <= buf.len() && from.port() == SERVER_PORT && servers.contains(from.ip()) {
-                self.handle_response(&buf[..n], now);
+                self.handle_response(&buf[..n], *from.ip(), now);
             }
         }
+        self.poll_tcp(now, sockets);
 
         for i in 0..self.queries.len() {
             let q = &self.queries[i];
-            if q.result.is_none() && q.next_try <= now {
+            if q.result.is_none() && q.next_try <= now && matches!(q.tcp, Tcp::No) {
                 if servers.is_empty() {
                     if now - q.started >= NO_SERVER_WAIT {
                         self.finish(i, Err(DnsError::NoServer), None, now);
@@ -521,13 +711,79 @@ mod tests {
         ignore: usize,
         ttl: u32,
         rcode: u8,
+        /// Answer over UDP with TC set (and one address).
+        truncate: bool,
+        /// The TCP listener, if the server has one.
+        tcp: Option<crate::SocketHandle>,
+        tcp_queries: usize,
+        tcp_rx: Vec<u8>,
+        tcp_tx: Vec<u8>,
+    }
+
+    /// The addresses the TCP server gives.
+    fn big_answer() -> Vec<Ipv4Addr> {
+        (1..=8).map(|n| Ipv4Addr::new(10, 0, 0, n)).collect()
     }
 
     impl Server {
         fn new(b: &mut Host) -> Self {
             let socket = b.sockets.add(UdpSocket::new(16, 16));
             b.sockets.get_mut::<UdpSocket>(socket).bind(53).unwrap();
-            Self { socket, queries: 0, ignore: 0, ttl: 60, rcode: 0 }
+            Self {
+                socket,
+                queries: 0,
+                ignore: 0,
+                ttl: 60,
+                rcode: 0,
+                truncate: false,
+                tcp: None,
+                tcp_queries: 0,
+                tcp_rx: Vec::new(),
+                tcp_tx: Vec::new(),
+            }
+        }
+
+        fn listen(&mut self, b: &mut Host) {
+            let mut socket = TcpSocket::new(4096, 4096);
+            socket.listen(53).unwrap();
+            self.tcp = Some(b.sockets.add(socket));
+        }
+
+        /// Serves one TCP connection, answering with more than 512 bytes and
+        /// dribbling the reply out in pieces.
+        fn serve_tcp(&mut self, b: &mut Host) {
+            let Some(handle) = self.tcp else { return };
+            let socket = b.sockets.get_mut::<TcpSocket>(handle);
+            if !self.tcp_tx.is_empty() {
+                let n = socket.send(&self.tcp_tx[..self.tcp_tx.len().min(100)]).unwrap_or(0);
+                self.tcp_tx.drain(..n);
+                if self.tcp_tx.is_empty() {
+                    socket.close();
+                }
+                return;
+            }
+            let mut buf = [0u8; 600];
+            if let Ok(n @ 1..) = socket.recv(&mut buf) {
+                self.tcp_rx.extend_from_slice(&buf[..n]);
+            }
+            let [hi, lo, query @ ..] = self.tcp_rx.as_slice() else { return };
+            if query.len() < usize::from(u16::from_be_bytes([*hi, *lo])) {
+                return;
+            }
+            self.tcp_queries += 1;
+            let query = query.to_vec();
+            self.tcp_rx.clear();
+            let noise = [7u8; 30];
+            let addrs: Vec<[u8; 4]> = big_answer().iter().map(|a| a.octets()).collect();
+            let mut answers: Vec<(&[u8], u16, u32, &[u8])> = (0..30).map(|_| (Q, 16, 60, &noise[..])).collect();
+            answers.extend(addrs.iter().map(|a| (Q, TYPE_A, 60, &a[..])));
+            let r = response(&query, 0, &answers);
+            assert!(r.len() > 512, "the point is a response too big for UDP");
+            self.tcp_tx = (r.len() as u16).to_be_bytes().to_vec();
+            self.tcp_tx.extend_from_slice(&r);
+            // The first byte alone, then the rest.
+            let first: Vec<u8> = self.tcp_tx.drain(..1).collect();
+            socket.send(&first).unwrap();
         }
 
         fn serve(&mut self, b: &mut Host) {
@@ -540,9 +796,13 @@ mod tests {
                 }
                 let answers: &[(&[u8], u16, u32, &[u8])] = &[(Q, TYPE_A, self.ttl, &IP1)];
                 let none: &[(&[u8], u16, u32, &[u8])] = &[];
-                let r = response(&buf[..n], self.rcode, if self.rcode == 0 { answers } else { none });
+                let mut r = response(&buf[..n], self.rcode, if self.rcode == 0 { answers } else { none });
+                if self.truncate {
+                    r[2] |= 0x02;
+                }
                 b.sockets.get_mut::<UdpSocket>(self.socket).send_to(&r, from).unwrap();
             }
+            self.serve_tcp(b);
         }
     }
 
@@ -598,6 +858,65 @@ mod tests {
         assert!(t.wait(q, 1000).unwrap().is_ok());
         assert_eq!(t.server.queries, 2);
         assert_eq!(t.dns.result(q), Some(Err(DnsError::Cancelled)), "taken once");
+    }
+
+    #[test]
+    fn truncated_responses_are_retried_over_tcp() {
+        let mut t = Setup::new();
+        t.server.truncate = true;
+        t.server.listen(&mut t.b);
+        let q = t.dns.resolve("big.example", t.now).unwrap();
+        assert_eq!(t.wait(q, 5000), Some(Ok(big_answer())));
+        assert_eq!((t.server.queries, t.server.tcp_queries), (1, 1));
+        // The answer is cached, and the connection's socket is gone.
+        let q = t.dns.resolve("big.example", t.now).unwrap();
+        assert_eq!(t.dns.result(q), Some(Ok(big_answer())));
+        for _ in 0..200 {
+            t.a.poll(t.now);
+            t.b.poll(t.now);
+            t.dns.poll(t.now, &t.a.iface, &mut t.a.sockets);
+            t.now = Instant::from_millis(t.now.as_millis() + 1);
+        }
+        assert_eq!(t.a.sockets.iter().count(), 1, "only the UDP socket is left");
+        assert!(t.dns.jobs.is_empty() && t.dns.closing.is_empty());
+    }
+
+    #[test]
+    fn a_failed_tcp_retry_falls_back_to_the_partial_answer() {
+        // Nobody listens on TCP port 53: the connection is refused, and the
+        // address the truncated response carried is used.
+        let mut t = Setup::new();
+        t.server.truncate = true;
+        let q = t.dns.resolve("part.example", t.now).unwrap();
+        assert_eq!(t.wait(q, 5000), Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
+        assert_eq!(t.server.queries, 1, "no UDP retry while TCP was tried");
+
+        // A truncated response with no address at all.
+        let mut t = Setup::new();
+        t.server.truncate = true;
+        t.server.rcode = 0;
+        let q = t.dns.resolve("none.example", t.now).unwrap();
+        // Make the UDP answer carry none by dropping its records: rcode 0
+        // with TC and no answers.
+        let mut query = encode_query(t.dns.queries[0].id, "none.example");
+        query[2] = 0x83;
+        query[3] = 0x80;
+        t.dns.handle_response(&query, B_IP, t.now);
+        assert_eq!(t.wait(q, 5000), Some(Err(DnsError::Truncated)));
+    }
+
+    #[test]
+    fn a_silent_tcp_server_times_out() {
+        let mut t = Setup::new();
+        t.server.truncate = true;
+        t.server.listen(&mut t.b);
+        // The server accepts but never answers: B's TCP replies are dropped
+        // after the handshake.
+        t.b.set_shaper(|n, _| if n > 4 { Fate::Drop } else { Fate::Deliver });
+        let q = t.dns.resolve("slow.example", t.now).unwrap();
+        let start = t.now;
+        assert_eq!(t.wait(q, 20_000), Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
+        assert!((TCP_TIMEOUT..TCP_TIMEOUT + Duration::from_secs(1)).contains(&(t.now - start)));
     }
 
     #[test]

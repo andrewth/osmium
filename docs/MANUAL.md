@@ -818,8 +818,15 @@ loop {
 - TCP: `listen(port)` or `connect(remote, 0)`, then `send`, `recv`, `close`
   and `state()`. Errors are `Error::WouldBlock`, `ConnectionRefused`, and so
   on.
-- Not supported: IP fragmentation, window scaling, SACK, out-of-order
-  reassembly, IPv6, DNS. Socket system calls are not wired into
+- Multicast: `iface.join_multicast_group(now, group)` makes the interface
+  accept the group and report it with IGMPv2; a `UdpSocket` bound to the port
+  then receives it, and `send_to` a group address sends to the group's MAC
+  with TTL 1 (`set_multicast_ttl` changes that). `leave_multicast_group`
+  undoes a join.
+- A truncated DNS answer is retried over TCP by `DnsClient` itself; TCP
+  connections negotiate timestamps (RFC 7323) when the peer offers them.
+- Not supported: IPv6, forwarding, IGMPv3 membership reports (IGMPv3 queries
+  are answered with v2 reports). Socket system calls are not wired into
   `osmium-proc` yet.
 
 ### iSCSI
