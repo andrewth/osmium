@@ -25,6 +25,7 @@ pub mod decode;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod hw;
 pub mod pc;
+pub mod vmx;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub use hw::{SvmError, enable};
 

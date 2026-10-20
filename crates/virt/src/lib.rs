@@ -14,12 +14,12 @@
 //! - [`riscv`]: a RISC-V H-extension vCPU and a minimal SBI for guests.
 //! - [`smp`]: start/stop state, IPIs and kicks for multi-vCPU guests.
 //! - [`aarch64`]: an AArch64 EL2 (non-VHE) vCPU and PSCI for guests.
-//! - [`x86`]: an AMD SVM vCPU with nested paging.
+//! - [`x86`]: AMD SVM and Intel VMX vCPUs with nested paging.
 //! - [`virtio`]: virtio device models behind the virtio-mmio transport.
 //!
 //! Hardware backends implement [`Vcpu`]: RISC-V H ([`riscv::RiscvVcpu`]),
-//! AArch64 EL2 ([`aarch64::Aarch64Vcpu`]) and AMD SVM ([`x86::SvmVcpu`]).
-//! Intel VMX is not implemented. `docs/HYPERVISOR.md` shows how the pieces
+//! AArch64 EL2 ([`aarch64::Aarch64Vcpu`]) and AMD SVM ([`x86::SvmVcpu`])
+//! and Intel VMX ([`x86::vmx::VmxVcpu`]). `docs/HYPERVISOR.md` shows how the pieces
 //! fit together.
 #![no_std]
 

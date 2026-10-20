@@ -959,7 +959,7 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
   that uses FP/SIMD faults instead of seeing another process's registers.
 - The heap can return large blocks to the frame allocator only if the
   mapper implements `virt_to_phys` (`OffsetMapper` does).
-- The hypervisor has no Intel VMX backend, and x86 MMIO emulation does not
+- The Intel VMX backend has only run under nested KVM, and x86 MMIO emulation does not
   walk 32-bit guest page tables. Guest FP/SIMD state is switched only on the
   assumption that the host kernel is soft-float. On x86 that switching is
   opt-in (`with_fp_switching`: x87 and SSE, not AVX), and SVE is not

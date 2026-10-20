@@ -142,7 +142,14 @@ recipe is the same on each:
   assists it walks 4-level (long-mode) guest page tables, or none; 32-bit
   paging is not walked. MSRs other than the syscall ones, EFER, PAT,
   `TSC_AUX` and `APIC_BASE` read as zero.
-- No VMX backend (QEMU's TCG does not emulate VMX).
+- `x86::vmx::VmxVcpu` is the Intel backend: EPT (`stage2::eptp`), VPID and
+  unrestricted guest mode, so guests start as under SVM (protected mode, real
+  mode or long mode). It differs from SVM in four ways: no decode assists (MMIO
+  instructions are always fetched from guest memory), `vmcall` for hypercalls,
+  EPT violations for MMIO, and the host's task register (`CpuTables::load`) must
+  be loaded before `vmx::enable`. The VMCS stays bound to the host CPU that
+  first runs the vCPU. QEMU's TCG does not emulate VMX, so it has only run
+  under nested KVM (`examples/x86_64-vmx`).
 - FP/SIMD state is switched per vCPU on the assumption that the host
   kernel itself never uses those registers (soft-float targets): always on
   RISC-V and AArch64 (where SVE is not switched and traps), and on x86 for

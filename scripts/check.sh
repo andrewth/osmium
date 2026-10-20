@@ -283,6 +283,26 @@ if command -v qemu-system-x86_64 >/dev/null; then
     rm -f "$nestlog"
 fi
 
+# Intel VMX hypervisor: needs KVM with nested virtualization (TCG has no VMX).
+if command -v qemu-system-x86_64 >/dev/null && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
+    && grep -qx '[Y1]' /sys/module/kvm_intel/parameters/nested 2>/dev/null; then
+    echo "== boot examples/x86_64-vmx under QEMU/KVM"
+    vmxlog=$(mktemp)
+    (cd examples/x86_64-vmx && cargo build -q --release)
+    timeout 60 qemu-system-x86_64 -machine q35 -accel kvm -cpu host -m 128M -nographic -no-reboot -display none \
+        -kernel examples/x86_64-vmx/target/x86_64-unknown-none/release/x86_64-vmx \
+        -serial "file:$vmxlog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$vmxlog"
+    for line in 'VMX on: EPT, VPID and unrestricted guest' '\[guest\] hello from VMX over port I/O' \
+        '\[guest\] and over MMIO (EPT violations)' 'guest exit Shutdown: 1 hypercall, LSR 0x60 (port) 0x60 (MMIO)' \
+        'KERNEL_GS_BASE 0x12345678' 'VMX hidden' '\[done\]'; do
+        grep -q "$line" "$vmxlog" || { echo "x86_64-vmx: missing '$line'"; exit 1; }
+    done
+    rm -f "$vmxlog"
+else
+    echo "== skipping examples/x86_64-vmx: needs /dev/kvm and nested VMX"
+fi
+
 # UEFI application on OVMF (x86_64) and AAVMF (AArch64): GOP sets a mode and
 # the app draws on its framebuffer, or with Blt where virtio-gpu's GOP has
 # none; the screens are checked.
