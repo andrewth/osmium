@@ -151,6 +151,12 @@ pub trait PageTableFormat {
 
     /// Encodes an entry pointing at the next-level table at `pa`.
     fn table(pa: PhysAddr) -> u64;
+    /// Encodes an entry at `level` pointing at the table at `pa`, one level
+    /// down. Formats whose table entries record the child's level (AMD-Vi's
+    /// `NextLevel`) override this; the default ignores `level`.
+    fn table_at(pa: PhysAddr, _level: usize) -> u64 {
+        Self::table(pa)
+    }
     /// Encodes a leaf mapping `pa` at `level`.
     fn leaf(pa: PhysAddr, flags: MapFlags, level: usize) -> u64;
     /// Returns true if the entry is valid (present).
@@ -373,7 +379,7 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
             let pte = e.load(Ordering::Acquire);
             table = if !F::is_valid(pte) {
                 let next = Self::new_table(&self.alloc)?;
-                e.store(F::table(next), Ordering::Release);
+                e.store(F::table_at(next, level), Ordering::Release);
                 next
             } else if F::is_leaf(pte, level) {
                 return Err(MapError::HugePageConflict);
@@ -487,9 +493,9 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         if F::BREAK_BEFORE_MAKE {
             e.store(0, Ordering::Release);
             invalidate(huge);
-            e.store(F::table(table), Ordering::Release);
+            e.store(F::table_at(table, level), Ordering::Release);
         } else {
-            e.store(F::table(table), Ordering::Release);
+            e.store(F::table_at(table, level), Ordering::Release);
             invalidate(huge);
         }
         Ok(child)

@@ -18,6 +18,8 @@
 //! - [`irq::IrqTable`]: maps interrupt numbers to handlers.
 //! - [`console`]: a swappable global console behind `print!`/`println!`.
 //! - [`dma`]: DMA buffer descriptors.
+//! - [`iommu`]: the IOMMU model: domains, IOVA allocation and DMA through
+//!   an IOMMU.
 //! - [`display`]: linear framebuffers, pixel formats and the
 //!   [`display::Display`] trait.
 #![no_std]
@@ -29,6 +31,7 @@ pub mod block;
 pub mod console;
 pub mod display;
 pub mod dma;
+pub mod iommu;
 pub mod irq;
 pub mod mmio;
 pub mod net;

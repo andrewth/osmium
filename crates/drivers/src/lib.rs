@@ -22,6 +22,10 @@
 //! | [`usb::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
 //! | [`usb::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
 //! | [`usb::ecm::UsbEthernet`] | USB Ethernet (CDC-ECM) on any `UsbHost` | `NetDevice` |
+//! | [`iommu::vtd::Vtd`] | Intel VT-d DMA remapping unit | `Iommu` |
+//! | [`iommu::amdvi::AmdVi`] | AMD-Vi (AMD IOMMU) unit | `Iommu` |
+//! | [`iommu::smmuv3::Smmuv3`] | Arm SMMUv3 | `Iommu` |
+//! | [`iommu::riscv::RiscvIommu`] | RISC-V IOMMU | `Iommu` |
 //!
 //! Every driver is constructed from an [`osmium_hal::mmio::IoMem`] (or a
 //! port base), so it works the same under any memory map and can be tested
@@ -36,6 +40,7 @@ pub mod clint;
 pub mod display;
 pub mod gicv2;
 pub mod ioapic;
+pub mod iommu;
 pub mod lapic;
 pub mod mlx4;
 pub mod nvme;

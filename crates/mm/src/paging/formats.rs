@@ -9,6 +9,12 @@
 //! | [`Sv39x4`] / [`Sv48x4`] | RISC-V G-stage (guest physical), 16 KiB root | 3 / 4 | 41 / 50 |
 //! | [`Ept`] | Intel extended page tables (guest physical) | 4 | 48 |
 //! | [`Aarch64Stage2`] | AArch64 stage 2 (guest IPA), starting level 0 | 4 | 48 |
+//! | [`VtdSecondLevel`] | Intel VT-d second-level (IOVA), 4-level | 4 | 48 |
+//! | [`AmdVi`] | AMD-Vi I/O page tables (IOVA), 4 KiB pages only | 4 | 48 |
+//!
+//! IOMMUs reuse the CPU formats where the hardware does: an Arm SMMUv3
+//! stage-2 context uses [`Aarch64Stage2`] and a RISC-V IOMMU G-stage context
+//! uses [`Sv39x4`] / [`Sv48x4`].
 
 use super::{MapFlags, PageTableFormat};
 use crate::addr::PhysAddr;
@@ -538,6 +544,139 @@ impl PageTableFormat for Aarch64Stage2 {
         }
         if pte & s2::MEMATTR_MASK == s2::MEMATTR_DEVICE {
             f = f | MapFlags::DEVICE;
+        }
+        f
+    }
+}
+
+/// Intel VT-d second-level translation (scalable-mode second-stage or
+/// legacy-mode context entry with `AW` = 2, 48-bit, 4 levels), for IOVAs.
+///
+/// Only read and write permissions exist; `EXEC` is treated as `READ` and
+/// `USER`, `GLOBAL` and `DEVICE` are dropped. Leaves above 4 KiB need the
+/// matching `SLLPS` capability bit, which this format does not check.
+pub struct VtdSecondLevel;
+
+mod vtd {
+    pub const R: u64 = 1 << 0;
+    pub const W: u64 = 1 << 1;
+    pub const SP: u64 = 1 << 7;
+}
+
+impl PageTableFormat for VtdSecondLevel {
+    const LEVELS: usize = 4;
+    const VA_BITS: u32 = 48;
+    const SIGN_EXTEND: bool = false;
+    const MAX_LEAF_LEVEL: usize = 2;
+
+    fn table(pa: PhysAddr) -> u64 {
+        pa.0 | vtd::R | vtd::W
+    }
+
+    fn leaf(pa: PhysAddr, f: MapFlags, level: usize) -> u64 {
+        let mut e = pa.0;
+        if f.contains(MapFlags::READ) || f.contains(MapFlags::EXEC) {
+            e |= vtd::R;
+        }
+        if f.contains(MapFlags::WRITE) {
+            e |= vtd::W;
+        }
+        if level > 0 {
+            e |= vtd::SP;
+        }
+        e
+    }
+
+    fn is_valid(pte: u64) -> bool {
+        pte & (vtd::R | vtd::W) != 0
+    }
+
+    fn is_leaf(pte: u64, level: usize) -> bool {
+        level == 0 || pte & vtd::SP != 0
+    }
+
+    fn addr(pte: u64, level: usize) -> PhysAddr {
+        let level = if Self::is_leaf(pte, level) { level } else { 0 };
+        PhysAddr::new(pte & addr_mask(level))
+    }
+
+    fn flags(pte: u64, _level: usize) -> MapFlags {
+        let mut f = MapFlags::NONE;
+        if pte & vtd::R != 0 {
+            f = f | MapFlags::READ;
+        }
+        if pte & vtd::W != 0 {
+            f = f | MapFlags::WRITE;
+        }
+        f
+    }
+}
+
+/// AMD-Vi I/O page tables (`Mode` = 4 in the device table entry), 4 KiB
+/// pages only.
+///
+/// Each table entry records the level of the table below it in `NextLevel`,
+/// which is why this format overrides `table_at`. Leaves above 4 KiB (the
+/// `NextLevel` = 7 encoding) are not supported. `USER`, `GLOBAL`, `DEVICE`
+/// are dropped and `EXEC` is treated as `READ`.
+pub struct AmdVi;
+
+mod amdvi {
+    pub const PR: u64 = 1 << 0;
+    pub const NEXT_LEVEL_SHIFT: u32 = 9;
+    pub const NEXT_LEVEL_MASK: u64 = 7 << NEXT_LEVEL_SHIFT;
+    pub const IR: u64 = 1 << 61;
+    pub const IW: u64 = 1 << 62;
+}
+
+impl PageTableFormat for AmdVi {
+    const LEVELS: usize = 4;
+    const VA_BITS: u32 = 48;
+    const SIGN_EXTEND: bool = false;
+    const MAX_LEAF_LEVEL: usize = 0;
+
+    fn table(pa: PhysAddr) -> u64 {
+        // Callers go through `table_at`; assume the lowest-level pointer.
+        Self::table_at(pa, 1)
+    }
+
+    fn table_at(pa: PhysAddr, level: usize) -> u64 {
+        // The entry at our level `level` points at the table of our level
+        // `level - 1`, which AMD numbers from 1.
+        assert!((1..Self::LEVELS).contains(&level));
+        pa.0 | amdvi::PR | amdvi::IR | amdvi::IW | (level as u64) << amdvi::NEXT_LEVEL_SHIFT
+    }
+
+    fn leaf(pa: PhysAddr, f: MapFlags, _level: usize) -> u64 {
+        let mut e = pa.0 | amdvi::PR;
+        if f.contains(MapFlags::READ) || f.contains(MapFlags::EXEC) {
+            e |= amdvi::IR;
+        }
+        if f.contains(MapFlags::WRITE) {
+            e |= amdvi::IW;
+        }
+        e
+    }
+
+    fn is_valid(pte: u64) -> bool {
+        pte & amdvi::PR != 0
+    }
+
+    fn is_leaf(pte: u64, level: usize) -> bool {
+        level == 0 || pte & amdvi::NEXT_LEVEL_MASK == 0
+    }
+
+    fn addr(pte: u64, _level: usize) -> PhysAddr {
+        PhysAddr::new(pte & addr_mask(0))
+    }
+
+    fn flags(pte: u64, _level: usize) -> MapFlags {
+        let mut f = MapFlags::NONE;
+        if pte & amdvi::IR != 0 {
+            f = f | MapFlags::READ;
+        }
+        if pte & amdvi::IW != 0 {
+            f = f | MapFlags::WRITE;
         }
         f
     }
