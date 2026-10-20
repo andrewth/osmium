@@ -152,6 +152,7 @@ pub struct Aarch64Vcpu {
     irq: Arc<AtomicBool>,
     timer: Option<Box<dyn Fn(bool) + Send + Sync>>,
     pending: Option<Load>,
+    pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
 }
 
 impl Aarch64Vcpu {
@@ -163,7 +164,7 @@ impl Aarch64Vcpu {
         x[0] = arg;
         let state =
             GuestState { x, pc: entry.0, pstate: PSTATE_EL1H, esr: 0, far: 0, hpfar: 0, vector: 0, host: [0; 13] };
-        Self { state, el1: El1Regs::default(), vttbr, irq: Arc::new(AtomicBool::new(false)), timer: None, pending: None }
+        Self { state, el1: El1Regs::default(), vttbr, irq: Arc::new(AtomicBool::new(false)), timer: None, pending: None, running: None }
     }
 
     /// The vCPU's IRQ line, for an interrupt controller (a
@@ -171,6 +172,12 @@ impl Aarch64Vcpu {
     /// level becomes `HCR_EL2.VI` at the next entry.
     pub fn irq_line(&self) -> Arc<AtomicBool> {
         self.irq.clone()
+    }
+
+    /// Uses `line` as the IRQ line, for a controller created before the vCPU.
+    pub fn with_irq_line(mut self, line: Arc<AtomicBool>) -> Self {
+        self.irq = line;
+        self
     }
 
     /// Connects the guest's virtual timer to an interrupt line (usually the
@@ -251,8 +258,14 @@ impl Aarch64Vcpu {
 impl Vcpu for Aarch64Vcpu {
     #[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
     fn run(&mut self) -> VmExit {
+        if let Some(r) = &self.running {
+            r.store(osmium_arch::cpu::current_id(), Ordering::Release);
+        }
         self.sync_timer(hw::counter());
         hw::run(self);
+        if let Some(r) = &self.running {
+            r.store(crate::smp::NOT_RUNNING, Ordering::Release);
+        }
         self.classify()
     }
 

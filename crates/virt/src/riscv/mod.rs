@@ -140,8 +140,8 @@ pub struct RiscvVcpu {
     pending: Option<MemOp>,
     external: Arc<AtomicBool>,
     ipi: Option<Arc<AtomicBool>>,
-    running: Option<Arc<core::sync::atomic::AtomicUsize>>,
-    fence: Option<Arc<AtomicBool>>,
+    pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
+    pub(crate) fence: Option<Arc<AtomicBool>>,
 }
 
 /// SBI virtual-interrupt bits in `hvip`.
@@ -290,7 +290,7 @@ impl Vcpu for RiscvVcpu {
         }
         hw::run(self);
         if let Some(r) = &self.running {
-            r.store(harts::NOT_RUNNING, Ordering::Release);
+            r.store(crate::smp::NOT_RUNNING, Ordering::Release);
         }
         self.classify(|pc| hw::fetch(pc))
     }

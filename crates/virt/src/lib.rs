@@ -12,6 +12,7 @@
 //!   backends implement, and [`run_vcpu`], a loop that services device exits.
 //! - [`devices`]: emulated devices.
 //! - [`riscv`]: a RISC-V H-extension vCPU and a minimal SBI for guests.
+//! - [`smp`]: start/stop state, IPIs and kicks for multi-vCPU guests.
 //! - [`aarch64`]: AArch64 EL2 exit decoding and PSCI for guests.
 //! - [`x86`]: an AMD SVM vCPU with nested paging.
 //! - [`virtio`]: virtio device models behind the virtio-mmio transport.
@@ -28,6 +29,7 @@ pub mod aarch64;
 pub mod bus;
 pub mod devices;
 pub mod memory;
+pub mod smp;
 pub mod riscv;
 pub mod stage2;
 pub mod vcpu;
