@@ -7,22 +7,13 @@ use osmium_hal::block::{BlockDevice, BlockError};
 use super::{DescChain, DeviceCtx, VirtioDevice};
 use crate::memory::GuestMemory;
 
-const F_RO: u64 = 1 << 5;
-const F_BLK_SIZE: u64 = 1 << 6;
-const F_FLUSH: u64 = 1 << 9;
-
-const T_IN: u32 = 0;
-const T_OUT: u32 = 1;
-const T_FLUSH: u32 = 4;
-const T_GET_ID: u32 = 8;
-
-const S_OK: u8 = 0;
-const S_IOERR: u8 = 1;
-const S_UNSUPP: u8 = 2;
+use osmium_hal::virtio::blk::{
+    CONFIG_BLK_SIZE, CONFIG_CAPACITY, F_BLK_SIZE, F_FLUSH, F_RO, HEADER_LEN as HEADER, S_IOERR, S_OK, S_UNSUPP,
+    SECTOR_SIZE, T_FLUSH, T_GET_ID, T_IN, T_OUT,
+};
 
 /// virtio-blk addresses the disk in 512-byte sectors whatever the block size.
-const SECTOR: u64 = 512;
-const HEADER: usize = 16;
+const SECTOR: u64 = SECTOR_SIZE as u64;
 const ID: &[u8; 20] = b"osmium-virtio-blk\0\0\0";
 
 /// A virtio block device that serves guest requests from a host
@@ -126,11 +117,11 @@ impl<B: BlockDevice + Send> VirtioDevice for VirtioBlock<B> {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        // capacity (u64, sectors) at 0; blk_size (u32) at 20.
+        // capacity (u64, sectors) and blk_size (u32).
         let bs = self.disk.block_size() as u64;
         let mut cfg = [0u8; 24];
-        cfg[0..8].copy_from_slice(&(self.disk.num_blocks() * bs / SECTOR).to_le_bytes());
-        cfg[20..24].copy_from_slice(&(bs as u32).to_le_bytes());
+        cfg[CONFIG_CAPACITY..CONFIG_CAPACITY + 8].copy_from_slice(&(self.disk.num_blocks() * bs / SECTOR).to_le_bytes());
+        cfg[CONFIG_BLK_SIZE..CONFIG_BLK_SIZE + 4].copy_from_slice(&(bs as u32).to_le_bytes());
         for (i, d) in data.iter_mut().enumerate() {
             *d = cfg.get(offset as usize + i).copied().unwrap_or(0);
         }
