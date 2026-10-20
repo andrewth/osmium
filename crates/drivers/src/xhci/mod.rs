@@ -843,6 +843,10 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
     }
 
     fn transfer_out(&mut self, dev: DeviceId, endpoint: u8, data: &[u8]) -> Result<(), UsbError> {
+        if data.is_empty() {
+            // A zero-length packet, which ends a transfer that filled its last packet.
+            return self.transfer_chunk(dev, endpoint & 0x7f, 0).map(drop);
+        }
         for chunk in data.chunks(BOUNCE_LEN) {
             self.bounce.write(0, chunk);
             self.transfer_chunk(dev, endpoint & 0x7f, chunk.len())?;

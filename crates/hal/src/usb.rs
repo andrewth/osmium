@@ -547,7 +547,9 @@ pub trait UsbHost {
     /// the bytes received, which may be fewer than `buf.len()`.
     fn transfer_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbError>;
 
-    /// Bulk or interrupt OUT transfer on endpoint address `endpoint`.
+    /// Bulk or interrupt OUT transfer on endpoint address `endpoint`. Empty
+    /// `data` sends one zero-length packet, which ends a transfer whose last
+    /// packet was full (CDC-ECM frames, for one).
     fn transfer_out(&mut self, dev: DeviceId, endpoint: u8, data: &[u8]) -> Result<(), UsbError>;
 
     /// Starts a bulk or interrupt IN transfer of up to `len` bytes on
@@ -712,29 +714,45 @@ pub fn enumerate<H: UsbHost + ?Sized>(host: &mut H, port: u8, config_buf: &mut [
     result
 }
 
-fn configure<H: UsbHost + ?Sized>(host: &mut H, id: DeviceId, config_buf: &mut [u8]) -> Result<Enumerated, UsbError> {
-    let mut buf = [0u8; DeviceDescriptor::LEN];
-    let setup = SetupPacket::get_descriptor(descriptor_type::DEVICE, 0, buf.len() as u16);
-    let n = host.control_in(id, setup, &mut buf)?;
-    let device = DeviceDescriptor::parse(&buf[..n])?;
-
+/// Reads the configuration descriptor set at `index` (0 to
+/// `bNumConfigurations` - 1) into `config_buf` and returns its length, which
+/// is `wTotalLength` or `config_buf.len()` if that is shorter. Does not
+/// select it: for a device with several configurations, pass the set you
+/// want to [`set_configuration`].
+pub fn read_configuration<H: UsbHost + ?Sized>(
+    host: &mut H,
+    dev: DeviceId,
+    index: u8,
+    config_buf: &mut [u8],
+) -> Result<usize, UsbError> {
     let mut header = [0u8; ConfigurationDescriptor::LEN];
-    let setup = SetupPacket::get_descriptor(descriptor_type::CONFIGURATION, 0, header.len() as u16);
-    let n = host.control_in(id, setup, &mut header)?;
+    let setup = SetupPacket::get_descriptor(descriptor_type::CONFIGURATION, index, header.len() as u16);
+    let n = host.control_in(dev, setup, &mut header)?;
     let config = ConfigurationDescriptor::parse(&header[..n])?;
-
     let want = (config.total_length as usize).min(config_buf.len());
-    let setup = SetupPacket::get_descriptor(descriptor_type::CONFIGURATION, 0, want as u16);
-    let config_len = host.control_in(id, setup, &mut config_buf[..want])?;
+    let setup = SetupPacket::get_descriptor(descriptor_type::CONFIGURATION, index, want as u16);
+    host.control_in(dev, setup, &mut config_buf[..want])
+}
 
-    host.control_out(id, SetupPacket::set_configuration(config.value), &[])?;
+/// Selects the configuration whose descriptor set is `config` (as returned
+/// by [`read_configuration`]) and enables the endpoints of every interface's
+/// alternate setting 0. [`enumerate`] does this for configuration 0; call it
+/// again to switch to another. Endpoints the previous configuration enabled
+/// are not disabled.
+pub fn set_configuration<H: UsbHost + ?Sized>(
+    host: &mut H,
+    dev: DeviceId,
+    config: &[u8],
+) -> Result<ConfigurationDescriptor, UsbError> {
+    let header = ConfigurationDescriptor::parse(config)?;
+    host.control_out(dev, SetupPacket::set_configuration(header.value), &[])?;
 
     const MAX_ENDPOINTS: usize = 30;
     let mut endpoints =
         [EndpointDescriptor { address: 0, attributes: 0, max_packet_size_raw: 0, interval: 0 }; MAX_ENDPOINTS];
     let mut count = 0;
     let mut in_default = false;
-    for d in Descriptors::new(&config_buf[..config_len]) {
+    for d in Descriptors::new(config) {
         match d? {
             Descriptor::Interface(i) => in_default = i.alternate == 0,
             Descriptor::Endpoint(e) if in_default && count < MAX_ENDPOINTS => {
@@ -745,8 +763,19 @@ fn configure<H: UsbHost + ?Sized>(host: &mut H, id: DeviceId, config_buf: &mut [
         }
     }
     if count > 0 {
-        host.configure_endpoints(id, &endpoints[..count])?;
+        host.configure_endpoints(dev, &endpoints[..count])?;
     }
+    Ok(header)
+}
+
+fn configure<H: UsbHost + ?Sized>(host: &mut H, id: DeviceId, config_buf: &mut [u8]) -> Result<Enumerated, UsbError> {
+    let mut buf = [0u8; DeviceDescriptor::LEN];
+    let setup = SetupPacket::get_descriptor(descriptor_type::DEVICE, 0, buf.len() as u16);
+    let n = host.control_in(id, setup, &mut buf)?;
+    let device = DeviceDescriptor::parse(&buf[..n])?;
+
+    let config_len = read_configuration(host, id, 0, config_buf)?;
+    let config = set_configuration(host, id, &config_buf[..config_len])?;
     Ok(Enumerated { id, device, config, config_len })
 }
 

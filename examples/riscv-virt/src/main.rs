@@ -564,7 +564,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
                 Some(irq) => println!("[usb]   xHCI interrupts on PLIC source {irq}"),
                 None => println!("[usb]   xHCI interrupts unavailable; polling"),
             }
-            demos::usb(xhci);
+            demos::usb(xhci, now_ns);
             println!("[usb]   xHCI interrupts: {}", xhci.lock().interrupts_handled());
         }
         None => println!("[usb]   no xHCI controller"),

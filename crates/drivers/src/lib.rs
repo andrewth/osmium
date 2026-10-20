@@ -16,6 +16,7 @@
 //! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet (PCI, polled) | `NetDevice` per port |
 //! | [`usb::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
 //! | [`usb::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
+//! | [`usb::ecm::UsbEthernet`] | USB Ethernet (CDC-ECM) on any `UsbHost` | `NetDevice` |
 //!
 //! Every driver is constructed from an [`osmium_hal::mmio::IoMem`] (or a
 //! port base), so it works the same under any memory map and can be tested

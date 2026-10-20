@@ -152,10 +152,12 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ x86 I/O APIC (GSI routing, polarity/trigger, masking); the x86_64 example routes COM1's receive interrupt through it into an `SpscRing`
 - ✅ RAM disk `BlockDevice`
 - ✅ virtio-mmio transport (legacy and 1.x), split virtqueue, virtio-net `NetDevice`
+- ✅ virtio-blk `BlockDevice` (read-only and flush features, requests split at 64 KiB)
 - ✅ xHCI USB host controller (`UsbHost`): polled command and event rings, root-port reset, control, bulk and interrupt transfers, interrupt endpoints that stay armed (`submit_in`/`poll_in`); interrupter 0 interrupts (`enable_interrupts`, `handle_interrupt`) file events with no one polling
 - ✅ USB class drivers on any `UsbHost`: mass storage (SCSI over Bulk-Only) as a `BlockDevice`, and HID boot keyboards with US-layout key translation
+- ✅ USB Ethernet (CDC-ECM) as a `NetDevice` on any `UsbHost`: functional-descriptor probing, MAC from the string descriptor, alternate-setting selection, notification-driven link state; boots under QEMU `usb-net` (its second configuration) and resolves ARP
 - ✅ Mellanox ConnectX-2/-3 (mlx4) Ethernet: reset, firmware start, ICM, polled raw Ethernet queue pair per port as a `NetDevice`; tested against a simulated HCA
-- 🗺 virtio-pci transport; virtio blk, console; xHCI hubs and isochronous transfers; USB CDC-ECM networking and HID report descriptors; GICv3; HPET; NVMe
+- 🗺 virtio-pci transport; virtio console; xHCI hubs and isochronous transfers; HID report descriptors; GICv3; HPET; NVMe
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)

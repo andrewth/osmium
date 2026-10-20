@@ -147,6 +147,11 @@ pub fn smp(ncpus: usize) {
 /// Resolves the QEMU user-mode network's gateway (10.0.2.2) with ARP,
 /// proving that `dev` can both transmit and receive. Gives up after a second.
 pub fn arp(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
+    arp_tagged(dev, now_ns, "[net]   ");
+}
+
+/// [`arp`] with `tag` starting each line it prints, to tell devices apart.
+pub fn arp_tagged(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64, tag: &str) {
     const ME: [u8; 4] = [10, 0, 2, 15];
     const GATEWAY: [u8; 4] = [10, 0, 2, 2];
     let mac = dev.mac_address();
@@ -158,7 +163,7 @@ pub fn arp(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     req[22..28].copy_from_slice(&mac.0);
     req[28..32].copy_from_slice(&ME);
     req[38..42].copy_from_slice(&GATEWAY);
-    println!("[net]   {mac}, link {}", if dev.link_up() { "up" } else { "down" });
+    println!("{tag}{mac}, link {}", if dev.link_up() { "up" } else { "down" });
     dev.transmit(&req).expect("transmit failed");
 
     let deadline = now_ns() + 1_000_000_000;
@@ -168,30 +173,34 @@ pub fn arp(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
         let f = &frame[..n];
         if n >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 2] && f[28..32] == GATEWAY {
             let gw = osmium::hal::net::MacAddress(f[22..28].try_into().unwrap());
-            println!("[net]   ARP: {}.{}.{}.{} is at {gw}", GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3]);
+            println!("{tag}ARP: {}.{}.{}.{} is at {gw}", GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3]);
             return;
         }
     }
-    println!("[net]   no ARP reply");
+    println!("{tag}no ARP reply");
 }
 
 /// Enumerates every device on `shared`'s root ports, then drives what it
 /// recognises: a mass-storage device gets a block written and read back
 /// while a keyboard's interrupt transfer is outstanding, which checks that
 /// the two drivers can share the controller, and is then mounted as FAT32
-/// (see [`fat`]).
-pub fn usb<H, G>(shared: &'static osmium::sync::SpinLock<H, G>)
+/// (see [`fat`]). A CDC-ECM network adapter, in whichever of the device's
+/// configurations offers it, is switched to that configuration and resolves
+/// the gateway with [`arp_tagged`] (`now_ns` times its wait).
+pub fn usb<H, G>(shared: &'static osmium::sync::SpinLock<H, G>, now_ns: fn() -> u64)
 where
     H: osmium::hal::usb::UsbHost + Send + 'static,
     G: osmium::sync::Guardian + 'static,
 {
+    use osmium::drivers::usb::ecm::{EcmFunction, UsbEthernet};
     use osmium::drivers::usb::hid::BootKeyboard;
     use osmium::drivers::usb::storage::UsbStorage;
     use osmium::hal::block::BlockDevice;
-    use osmium::hal::usb::{Descriptor, Descriptors, UsbHost, enumerate};
+    use osmium::hal::usb::{Descriptor, Descriptors, UsbHost, enumerate, read_configuration, set_configuration};
 
     let mut host = shared;
     let mut found = Vec::new();
+    let mut nics = Vec::new();
     for port in 1..=host.num_ports() {
         let status = host.port_status(port);
         if !status.connected {
@@ -221,7 +230,45 @@ where
             }
         }
         config.truncate(dev.config_len);
+        // A network adapter may offer CDC-ECM only in a later configuration.
+        if EcmFunction::parse(&config).is_some() {
+            nics.push((dev.id, config.clone()));
+        } else {
+            for index in 1..d.num_configurations {
+                let mut other = alloc::vec![0u8; 512];
+                let Ok(n) = read_configuration(&mut host, dev.id, index, &mut other) else { continue };
+                other.truncate(n);
+                for desc in Descriptors::new(&other).flatten() {
+                    if let Descriptor::Interface(i) = desc
+                        && i.alternate == 0
+                    {
+                        println!(
+                            "[usb]     configuration {}: interface {} class {:02x}/{:02x}/{:02x}",
+                            index + 1,
+                            i.number,
+                            i.class,
+                            i.subclass,
+                            i.protocol
+                        );
+                    }
+                }
+                if EcmFunction::parse(&other).is_some() {
+                    match set_configuration(&mut host, dev.id, &other) {
+                        Ok(c) => println!("[usb]     switched to configuration {} (CDC-ECM)", c.value),
+                        Err(e) => println!("[usb]     switching configuration failed: {e}"),
+                    }
+                    nics.push((dev.id, other));
+                    break;
+                }
+            }
+        }
         found.push((dev.id, config));
+    }
+    for (id, config) in &nics {
+        match UsbEthernet::new(shared, *id, config) {
+            Ok(mut eth) => arp_tagged(&mut eth, now_ns, "[usb]     ecm: "),
+            Err(e) => println!("[usb]     ecm: init failed: {e}"),
+        }
     }
 
     // Both drivers hold the controller through its lock.
