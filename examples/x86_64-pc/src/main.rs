@@ -219,7 +219,8 @@ tramp_end:
 );
 
 // User programs: position-independent ring-3 code, copied into user pages.
-// System calls go through `int 0x80`: rax = number, rdi/rsi/rdx = arguments.
+// System calls: rax = number, rdi/rsi/rdx = arguments. `user_hello` enters
+// with `syscall`, `user_bad` with `int 0x80`; the kernel sees the same frame.
 core::arch::global_asm!(
     r#"
     .section .rodata.user, "a"
@@ -229,8 +230,8 @@ user_hello:
 1:  lea 3f(%rip), %rsi
     mov $(4f - 3f), %edx
     mov $1, %edi
-    mov $1, %eax              // write(1, msg, len)
-    int $0x80
+    mov $1, %eax              // write(1, msg, len), via the syscall instruction
+    syscall
     mov $20000000, %ecx       // busy-wait without yielding: only the timer
 2:  dec %ecx                  // can switch us out
     jnz 2b
@@ -238,7 +239,7 @@ user_hello:
     jnz 1b
     mov $60, %eax             // exit(0)
     xor %edi, %edi
-    int $0x80
+    syscall
     ud2
 3:  .ascii "hello from ring 3"
 4:
@@ -314,9 +315,13 @@ fn load_cpu_tables() {
     let tables = alloc::boxed::Box::leak(alloc::boxed::Box::new(x86::CpuTables::new()));
     let stack = alloc::vec![0u8; 16 * 1024].leak();
     tables.tss.ist[DOUBLE_FAULT_IST as usize - 1] = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
-    CPU_TABLES[cpu::current_id()].store(&raw mut *tables, Ordering::Relaxed);
+    let ptr = &raw mut *tables;
+    CPU_TABLES[cpu::current_id()].store(ptr, Ordering::Relaxed);
     // SAFETY: called once per CPU, with interrupts disabled.
     irq::without(|| unsafe { tables.load() });
+    // SAFETY: the tables are loaded on this CPU and live forever; traps are
+    // installed; the kernel does not use the GS base.
+    unsafe { (&*ptr).enable_syscall() };
 }
 
 /// Each CPU's GDT and TSS, so the switch hook can update `rsp[0]`.
@@ -701,7 +706,7 @@ const USER_BASE: u64 = 0x4000_0000;
 /// Copies a user program into fresh pages, maps it user-accessible (code
 /// read/execute, stack read/write) at slot `n`, and spawns a task that drops
 /// to ring 3 there.
-fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8)) -> alloc::sync::Arc<osmium::sched::Task> {
+fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> alloc::sync::Arc<osmium::sched::Task> {
     let (start, end) = (code.0 as *const u8, code.1 as *const u8);
     let len = end as usize - start as usize;
     assert!(len <= PAGE_SIZE);
@@ -720,7 +725,7 @@ fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8)) -> alloc::sync::Arc<
         pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().flush();
         pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().flush();
     }
-    TaskBuilder::new(name).spawn(move || {
+    TaskBuilder::new(name).cpu(cpu).spawn(move || {
         // SAFETY: CpuTables are loaded, the switch hook keeps rsp[0] on this
         // task's kernel stack, and both pages are mapped user-accessible.
         unsafe { x86::enter_user(code_va, stack_va + PAGE_SIZE as u64) }
@@ -730,7 +735,11 @@ fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8)) -> alloc::sync::Arc<
 fn user_demo() {
     // SAFETY: linker symbols delimiting the user programs.
     let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
-    let tasks = [spawn_user("user-1", 0, hello), spawn_user("user-2", 1, hello), spawn_user("user-bad", 2, bad)];
+    // On another CPU: the syscall stub finds its kernel stack through that
+    // CPU's GS base, which CPU 0 alone would not test.
+    let cpu = 1 % ONLINE.load(Ordering::Acquire);
+    println!("[user]  running 3 ring-3 programs on CPU {cpu}");
+    let tasks = [spawn_user("user-1", 0, hello, cpu), spawn_user("user-2", 1, hello, cpu), spawn_user("user-bad", 2, bad, cpu)];
     for t in tasks {
         t.join();
     }
@@ -749,7 +758,7 @@ fn syscall(frame: &mut TrapFrame) {
             frame.set_return(a2);
         }
         60 => {
-            println!("[user]  {} exited with status {a0}", task.name());
+            println!("[user]  {} exited with status {a0} (kernel sees CPU {})", task.name(), cpu::current_id());
             drop(task);
             osmium::sched::exit();
         }

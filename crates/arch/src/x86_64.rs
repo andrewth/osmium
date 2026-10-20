@@ -19,6 +19,12 @@ pub mod msr {
     pub const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
     /// Value returned in ECX by `rdtscp`; Osmium stores the CPU id here.
     pub const IA32_TSC_AUX: u32 = 0xc000_0103;
+    /// `syscall` segment selectors.
+    pub const IA32_STAR: u32 = 0xc000_0081;
+    /// `syscall` entry point.
+    pub const IA32_LSTAR: u32 = 0xc000_0082;
+    /// RFLAGS bits cleared on `syscall`.
+    pub const IA32_FMASK: u32 = 0xc000_0084;
     /// VMX capability reporting base.
     pub const IA32_VMX_BASIC: u32 = 0x480;
     /// Feature control (VMX enable lock).
@@ -208,8 +214,14 @@ const _: () = assert!(size_of::<Tss>() == 104);
 
 /// One CPU's GDT and TSS. Each CPU needs its own, because the TSS holds
 /// per-CPU stacks and `ltr` marks its descriptor busy.
+///
+/// After `CpuTables::enable_syscall` (bare-metal builds), `IA32_KERNEL_GS_BASE` points here:
+/// the `syscall` entry stub uses `scratch` and reads the kernel stack from
+/// `tss.rsp[0]`.
 #[repr(C, align(16))]
 pub struct CpuTables {
+    /// Scratch slot for the `syscall` entry stub (the user's `rsp`).
+    scratch: u64,
     gdt: [u64; 7],
     /// This CPU's task-state segment.
     pub tss: Tss,
@@ -219,6 +231,7 @@ impl CpuTables {
     /// Flat kernel and user segments, and an empty TSS.
     pub const fn new() -> Self {
         Self {
+            scratch: 0,
             gdt: [
                 0,
                 0x00af_9a00_0000_ffff, // kernel code: present, DPL 0, 64-bit
@@ -280,6 +293,67 @@ impl CpuTables {
         }
     }
 }
+
+impl CpuTables {
+    /// Enables the `syscall` instruction on this CPU. Its entry stub
+    /// switches to `tss.rsp[0]` (keep it on the running task's kernel stack,
+    /// as for interrupts from ring 3), builds the same frame as `int 0x80`
+    /// (vector `trap::SYSCALL_VECTOR`), and goes through the normal trap
+    /// handler, so handlers treat both entry paths alike. The return is via
+    /// `iretq`.
+    ///
+    /// # Safety
+    /// [`CpuTables::load`] must have run on this CPU for these tables, and
+    /// `trap::install` must have run. GS is reserved for the stub's `swapgs`
+    /// (the kernel must not use the GS base itself).
+    #[cfg(bare)]
+    pub unsafe fn enable_syscall(&'static self) {
+        unsafe extern "C" {
+            fn osmium_syscall_entry();
+        }
+        const EFER_SCE: u64 = 1 << 0;
+        // SAFETY: standard syscall MSR setup for the segments CpuTables defines.
+        unsafe {
+            wrmsr(msr::IA32_EFER, rdmsr(msr::IA32_EFER) | EFER_SCE);
+            // sysret would load CS = STAR[63:48] + 16 and SS = + 8 (user
+            // code/data); syscall loads CS = STAR[47:32], SS = + 8.
+            wrmsr(msr::IA32_STAR, (selectors::KERNEL_DATA as u64) << 48 | (selectors::KERNEL_CODE as u64) << 32);
+            wrmsr(msr::IA32_LSTAR, osmium_syscall_entry as *const () as u64);
+            // Clear IF, TF, DF and AC on entry.
+            wrmsr(msr::IA32_FMASK, 0x4_0700);
+            wrmsr(msr::IA32_KERNEL_GS_BASE, self as *const Self as u64);
+        }
+    }
+}
+
+/// Offset of `tss.rsp[0]` within [`CpuTables`], used by the syscall stub.
+#[doc(hidden)]
+pub const SYSCALL_KERNEL_RSP: usize = core::mem::offset_of!(CpuTables, tss) + 4;
+
+// Bare-metal only: it jumps into the trap entry path of `trap::x86_64`.
+#[cfg(bare)]
+core::arch::global_asm!(
+    ".section .text.osmium_trap, \"ax\", @progbits",
+    ".globl osmium_syscall_entry",
+    "osmium_syscall_entry:",
+    // Interrupts are masked (FMASK). rcx = user rip, r11 = user rflags.
+    "    swapgs",
+    "    mov gs:[0], rsp",
+    "    mov rsp, gs:[{krsp}]",
+    "    push {uds}",                 // ss
+    "    push qword ptr gs:[0]",      // rsp
+    "    swapgs",
+    "    push r11",                   // rflags
+    "    push {ucs}",                 // cs
+    "    push rcx",                   // rip
+    "    push 0",                     // error code
+    "    push {vector}",              // vector: same as int 0x80
+    "    jmp osmium_trap_common",
+    krsp = const SYSCALL_KERNEL_RSP,
+    uds = const selectors::USER_DATA as u64,
+    ucs = const selectors::USER_CODE as u64,
+    vector = const 0x80u64,
+);
 
 impl Default for CpuTables {
     fn default() -> Self {
