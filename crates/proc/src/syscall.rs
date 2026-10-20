@@ -577,10 +577,11 @@ fn mmap(p: &Process, len: u64, prot: u64, flags: u64, fd: i32) -> SysResult {
 }
 
 fn munmap(p: &Process, addr: u64, len: u64) -> SysResult {
+    let len = len.checked_next_multiple_of(4096).ok_or(Errno::EINVAL)?;
     if !addr.is_multiple_of(4096) || len == 0 {
         return Err(Errno::EINVAL);
     }
-    p.memory().unmap(addr, len.next_multiple_of(4096));
+    p.memory().unmap(addr, len);
     Ok(0)
 }
 
@@ -613,6 +614,17 @@ fn fork(p: &Process, flags: u64, [stack, ptid, ctid, _tls]: [u64; 4]) -> Result<
     let vfork = flags & (VM | VFORK) == VM | VFORK;
     if flags & !(VM | VFORK | PARENT_SETTID | CHILD_CLEARTID | CHILD_SETTID) != 0 || (flags & VM != 0 && !vfork) {
         return Err(Errno::EINVAL);
+    }
+    // Fail before the child exists: once registered, it would linger as a
+    // child that never runs, so `wait4` could block on it for ever. Writing
+    // the bytes back unchanged checks the parent's page, and the child's is
+    // a copy of it.
+    for (flag, va) in [(PARENT_SETTID, ptid), (CHILD_SETTID, ctid)] {
+        if flags & flag != 0 {
+            let mut old = [0; 4];
+            p.memory().read(va, &mut old)?;
+            p.memory().write(va, &old)?;
+        }
     }
     let child = p.fork()?;
     let tid = child.pid().0.to_ne_bytes();

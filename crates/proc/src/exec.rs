@@ -154,7 +154,10 @@ fn read_executable(path: &str) -> Result<Vec<u8>, Errno> {
     if st.size > IMAGE_MAX {
         return Err(Errno::ENOMEM);
     }
-    let mut image = alloc::vec![0; st.size as usize];
+    // Fallibly: a large executable must fail `execve`, not the kernel.
+    let mut image = Vec::new();
+    image.try_reserve_exact(st.size as usize).map_err(|_| Errno::ENOMEM)?;
+    image.resize(st.size as usize, 0);
     let mut done = 0;
     while done < image.len() {
         match file.read(done as u64, &mut image[done..])? {

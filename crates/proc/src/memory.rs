@@ -13,6 +13,9 @@ use osmium_fs::Errno;
 
 const PAGE: u64 = PAGE_SIZE as u64;
 
+/// The most memory an executable's segments may span together.
+const MAX_IMAGE_MEMORY: u64 = 1 << 30;
+
 /// A process's view of memory, with the page-table format erased so that
 /// [`crate::Process`] and the system-call layer are not generic.
 ///
@@ -84,6 +87,18 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         Ok(Self { root: pt.root(), alloc, shared, inner: IrqSpinLock::new(Inner { pt, frames: BTreeMap::new() }) })
     }
 
+    /// Whether `va..end` is non-empty, in the lower (user) half, and clear of
+    /// the root entries shared with the kernel.
+    fn is_user_range(&self, va: u64, end: u64) -> bool {
+        let top = 1u64 << (F::VA_BITS - u32::from(F::SIGN_EXTEND));
+        if va >= end || end > top {
+            return false;
+        }
+        let shift = 12 + 9 * (F::LEVELS as u32 - 1);
+        let (first, last) = ((va >> shift) as usize, ((end - 1) >> shift) as usize);
+        last < self.shared.start || first >= self.shared.end
+    }
+
     /// Copies `code` into fresh pages mapped at `va` (page-aligned) with
     /// `flags` plus `USER`, for programs that are flat binaries.
     pub fn load_flat(&self, va: u64, code: &[u8], flags: MapFlags) -> Result<(), MapError> {
@@ -152,7 +167,11 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     fn unmap(&self, va: u64, len: u64) {
         let end = va.saturating_add(len);
         let mut inner = self.inner.lock();
-        for page in (va & !(PAGE - 1)..end).step_by(PAGE_SIZE) {
+        // Every user page is one of ours, so visit those rather than each
+        // page of a range that may span most of the address space.
+        let mut from = va & !(PAGE - 1);
+        while let Some((&page, _)) = inner.frames.range(from..end).next() {
+            from = page + PAGE;
             let Ok((t, flush)) = inner.pt.unmap(VirtAddr::new(page)) else { continue };
             flush.flush();
             if inner.frames.remove(&page) == Some(t.pa) {
@@ -164,6 +183,20 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn load_elf(&self, elf: &Elf<'_>) -> Result<u64, Errno> {
+        // The loader writes into any page already mapped, and the kernel's
+        // are, through the shared root entries: keep every segment out of
+        // them, and bound the total so loading cannot exhaust memory.
+        let mut total = 0u64;
+        for seg in elf.segments().filter(|s| s.mem_size != 0) {
+            let end = seg.vaddr.checked_add(seg.mem_size).ok_or(Errno::ENOEXEC)?;
+            if !self.is_user_range(seg.vaddr, end) {
+                return Err(Errno::ENOEXEC);
+            }
+            total = total.saturating_add(seg.mem_size);
+        }
+        if total > MAX_IMAGE_MEMORY {
+            return Err(Errno::ENOMEM);
+        }
         let mut inner = self.inner.lock();
         let Inner { pt, frames } = &mut *inner;
         let mut fresh = BTreeSet::new();

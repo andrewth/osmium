@@ -237,6 +237,37 @@ fn brk_and_mmap_map_memory() {
     assert_eq!(call(&p, Sys::Mmap, &[0, 0x1000, 3, 0x02, 3, 0]), -(Errno::ENODEV.0 as i64), "file mappings");
     assert_eq!(call(&p, Sys::Munmap, &[a as u64, 0x3000]), 0);
     assert!(p.memory().read(a as u64, &mut [0]).is_err());
+
+    // PROT_NONE reserves without mapping, so access faults rather than
+    // leaving an entry with no permissions that the table walk misreads.
+    let live = frames.live();
+    let none = call(&p, Sys::Mmap, &[0, 0x2000, 0, 0x22, u64::MAX, 0]);
+    assert_eq!(none, 0x100_4000);
+    assert_eq!(frames.live(), live);
+    assert!(p.memory().read(none as u64, &mut [0]).is_err());
+    assert_eq!(call(&p, Sys::Munmap, &[none as u64, 0x2000]), 0);
+    // A length spanning the address space visits only mapped pages.
+    assert_eq!(call(&p, Sys::Munmap, &[0, u64::MAX - 0xfff]), 0);
+    assert_eq!(call(&p, Sys::Munmap, &[0, u64::MAX]), -(Errno::EINVAL.0 as i64), "rounds past 2^64");
+}
+
+#[test]
+fn programs_cannot_load_into_kernel_mappings() {
+    let frames = leaked_frames();
+    let kernel: &'static mut PageTable<Sv39, &'static HeapFrames> =
+        Box::leak(Box::new(PageTable::new(frames).unwrap()));
+    let page = frames.alloc_table().unwrap();
+    // SAFETY: a fresh host page.
+    unsafe { frames.phys_to_virt(page).write_bytes(0x5a, 4096) };
+    let va = osmium_mm::addr::VirtAddr::new(0x40_0000);
+    kernel.map(va, page, osmium_mm::paging::PageSize::Size4K, MapFlags::RW).unwrap().ignore();
+    // SAFETY: the kernel table is leaked. Root entry 0 (the first GiB) is
+    // the kernel's, as the program's segments are.
+    let s = unsafe { AddressSpace::new(frames, kernel, 0..1) }.unwrap();
+    let elf = osmium_boot::elf::Elf::new(program()).unwrap();
+    assert_eq!(s.load_elf(&elf), Err(Errno::ENOEXEC));
+    // SAFETY: the page is still mapped, and only read here.
+    assert!(unsafe { core::slice::from_raw_parts(frames.phys_to_virt(page), 4096) }.iter().all(|&b| b == 0x5a));
 }
 
 #[test]

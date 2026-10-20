@@ -317,7 +317,8 @@ impl Process {
     }
 
     /// `mmap` for private anonymous memory: maps `len` bytes of zeroed
-    /// pages and returns their address.
+    /// pages and returns their address. With no access at all (`PROT_NONE`)
+    /// the range is only reserved: left unmapped, any access faults.
     pub fn mmap_anon(&self, len: u64, flags: MapFlags) -> Result<u64, Errno> {
         let len = len.checked_next_multiple_of(PAGE).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         let mut area = self.mmap.lock();
@@ -325,7 +326,9 @@ impl Process {
         if va.checked_add(len).is_none_or(|end| end > area.1) {
             return Err(Errno::ENOMEM);
         }
-        self.memory().map_anon(va, len, flags)?;
+        if flags != MapFlags::NONE {
+            self.memory().map_anon(va, len, flags)?;
+        }
         area.0 += len;
         Ok(va)
     }
