@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::arch::x86_64 as x86;
@@ -34,7 +34,7 @@ use osmium::mm::paging::formats::X86_64;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
-use osmium::virt::devices::{Uart16550 as Uart16550Model, VirtualPic, VirtualPit};
+use osmium::virt::devices::{LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualLapic, VirtualPic, VirtualPit};
 use osmium::virt::x86::{self as svm, SvmPages, SvmVcpu};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
@@ -196,12 +196,15 @@ x86_guest_end:
 // A 64-bit guest, entered directly in long mode on page tables the host
 // built in its RAM. It prints through the MMIO 16550 (mapped in its own
 // tables, unmapped in the nested ones), so every access is a nested page
-// fault whose instruction is fetched through the guest's tables.
+// fault whose instruction is fetched through the guest's tables. Then it
+// programs its emulated local APIC's timer (periodic, vector 0x40) and
+// takes three interrupts through a 64-bit IDT.
 core::arch::global_asm!(
     r#"
     .section .rodata.guest, "a"
     .globl lm_guest, lm_guest_end
     .code64
+    .set GBASE, 0x100000
 lm_guest:
     lea 3f(%rip), %rsi
     mov $0xfed00000, %rbx
@@ -211,10 +214,62 @@ lm_guest:
     mov %al, (%rbx)                 // nested page fault -> MMIO write
     jmp 1b
 2:  movzbq 5(%rbx), %r12            // MMIO read into a REX register
-    mov $1, %eax
+    lgdt lm_gdtr(%rip)
+    mov $0x10, %ax
+    mov %ax, %ss                    // iretq reloads SS from the GDT
+    lidt lm_idtr(%rip)
+    mov $0xfee00000, %rdi           // local APIC
+    movl $0x1ff, 0xf0(%rdi)         // SVR: enabled, spurious vector 0xff
+    movl $0xb, 0x3e0(%rdi)          // timer divide by 1
+    movl $0x20040, 0x320(%rdi)      // LVT timer: periodic, vector 0x40
+    movl $100000, 0x380(%rdi)       // initial count: 1 ms at 100 MHz
+5:  sti
+    hlt
+    cli
+    cmpl $3, lm_ticks(%rip)
+    jb 5b
+    movl $0, 0x380(%rdi)            // stop the timer
+    lea 6f(%rip), %rsi
+7:  lodsb
+    test %al, %al
+    jz 8f
+    mov %al, (%rbx)
+    jmp 7b
+8:  mov $1, %eax
     vmmcall
 4:  jmp 4b
+
+lm_timer:                           // APIC timer: count, EOI, return
+    incl lm_ticks(%rip)
+    movl $0, 0xb0(%rdi)             // EOI
+    iretq
+
 3:  .asciz "[guest] 64-bit, paging on, MMIO through the guest's page tables\n"
+6:  .asciz "[guest] 3 local APIC timer interrupts through a 64-bit IDT\n"
+    .balign 4
+lm_ticks:
+    .long 0
+    .balign 8
+lm_gdt:
+    .quad 0
+    .quad 0x00af9a000000ffff         // 0x08: 64-bit code
+    .quad 0x00cf92000000ffff         // 0x10: data
+lm_gdtr:
+    .word lm_gdtr - lm_gdt - 1
+    .quad GBASE + lm_gdt - lm_guest
+    .balign 16
+lm_idt:
+    .space 0x40 * 16
+    .word (GBASE + lm_timer - lm_guest) & 0xffff
+    .word 0x08
+    .word 0x8e00                    // present, 64-bit interrupt gate
+    .word (GBASE + lm_timer - lm_guest) >> 16
+    .long 0
+    .long 0
+lm_idt_end:
+lm_idtr:
+    .word lm_idt_end - lm_idt - 1
+    .quad GBASE + lm_idt - lm_guest
 lm_guest_end:
 "#,
     options(att_syntax)
@@ -302,6 +357,22 @@ extern "C" fn kmain(start_info: usize) -> ! {
 
 const GUEST_ENTRY: u64 = 0x10_0000;
 const GUEST_MMIO_UART: u64 = 0xfed0_0000;
+const GUEST_LAPIC: u64 = 0xfee0_0000;
+/// The emulated local APIC timer's input clock.
+const LAPIC_TIMER_HZ: u64 = 100_000_000;
+
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Host time in nanoseconds for the emulated timers: the TSC, calibrated
+/// once against the real PIT.
+fn clock() -> impl Fn() -> u64 + Copy + Send + Sync + 'static {
+    if TSC_HZ.load(Ordering::Relaxed) == 0 {
+        // SAFETY: nothing else uses the host's PIT.
+        TSC_HZ.store(unsafe { Pit::new(PitPio::new()) }.calibrate(10_000_000, cpu::ticks), Ordering::Relaxed);
+    }
+    let hz = TSC_HZ.load(Ordering::Relaxed) as u128;
+    move || (cpu::ticks() as u128 * 1_000_000_000 / hz) as u64
+}
 const GUEST_RAM_ORDER: u32 = 9; // 2 MiB at guest-physical 0
 
 /// One block of `order` frames as (host pointer, physical address).
@@ -350,10 +421,7 @@ fn guest_demo() {
     pio.insert(0x3f8, 8, com1.clone()).unwrap();
     pio.insert(0x20, 2, pic.master()).unwrap();
     pio.insert(0xa0, 2, pic.slave()).unwrap();
-    // The PIT counts in host time: the TSC, calibrated against the real PIT.
-    // SAFETY: nothing else uses the host's PIT now.
-    let tsc_hz = unsafe { Pit::new(PitPio::new()) }.calibrate(10_000_000, cpu::ticks);
-    let clock = move || (cpu::ticks() as u128 * 1_000_000_000 / tsc_hz as u128) as u64;
+    let clock = clock();
     let p = pic.clone();
     let pit = Arc::new(VirtualPit::new(clock, move |level| p.set_level(0, level)));
     pio.insert(0x40, 4, pit.clone()).unwrap();
@@ -403,7 +471,7 @@ fn guest_demo() {
         "[hyp]   guest exit {exit:?}: {hypercalls} hypercall, LSR {:#x} (port) {:#x} (MMIO); {halts} halts, TSC {} MHz",
         vcpu.regs.rdi,
         vcpu.regs.rcx,
-        tsc_hz / 1_000_000
+        TSC_HZ.load(Ordering::Relaxed) / 1_000_000
     );
 
     drop(vcpu);
@@ -445,6 +513,7 @@ fn long_mode_demo() {
     pte(0x3000, 0x83);
     let uart_page = GUEST_MMIO_UART & !0x1f_ffff;
     pte(0x4000 + ((GUEST_MMIO_UART >> 21) & 0x1ff) * 8, uart_page | 0x9b); // P, RW, PWT, PCD, PS
+    pte(0x4000 + ((GUEST_LAPIC >> 21) & 0x1ff) * 8, (GUEST_LAPIC & !0x1f_ffff) | 0x9b);
     let mem = Arc::new(mem);
 
     let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
@@ -462,16 +531,34 @@ fn long_mode_demo() {
         }
     });
     mmio.insert(GUEST_MMIO_UART, 8, Arc::new(uart)).unwrap();
+    let intr = Arc::new(AtomicBool::new(false));
+    let i = intr.clone();
+    let apic = Arc::new(VirtualLapic::new(0, LAPIC_TIMER_HZ, clock(), move |level| i.store(level, Ordering::Release)));
+    mmio.insert(GUEST_LAPIC, LAPIC_WINDOW, apic.clone()).unwrap();
     let pio = Bus::new();
 
     let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
     let mut vcpu =
         unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
-            .with_memory(mem.clone());
+            .with_memory(mem.clone())
+            .with_irq_line(intr);
     vcpu.set_long_mode(0x1000);
-    let exit = run_vcpu(&mut vcpu, &mmio, &pio, |_, exit| match exit {
+    let a = apic.clone();
+    vcpu.connect_intr(move || a.acknowledge());
+    let now = clock();
+    let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { nr: 1, .. } => ControlFlow::Break(VmExit::Shutdown),
+        VmExit::Halt => loop {
+            apic.poll();
+            if v.interrupt_pending() {
+                break ControlFlow::Continue(());
+            }
+            let Some(deadline) = apic.next_deadline() else { break ControlFlow::Break(VmExit::Halt) };
+            while now() < deadline {
+                core::hint::spin_loop();
+            }
+        },
         VmExit::ExternalInterrupt => ControlFlow::Continue(()),
         other => ControlFlow::Break(other),
     });

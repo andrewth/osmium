@@ -145,6 +145,7 @@ if command -v qemu-system-x86_64 >/dev/null; then
         '\[guest\] 5 ticks from the 8254 PIT on IRQ 0' \
         'guest exit Shutdown: 1 hypercall, LSR 0x60 (port) 0x60 (MMIO)' \
         "\\[guest\\] 64-bit, paging on, MMIO through the guest's page tables" \
+        '\[guest\] 3 local APIC timer interrupts through a 64-bit IDT' \
         '64-bit guest exit Shutdown, LSR 0x60 in r12' '\[done\]'; do
         grep -q "$line" "$svmlog" || { echo "x86_64-hyp: missing '$line'"; exit 1; }
     done
