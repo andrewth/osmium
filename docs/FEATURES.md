@@ -98,7 +98,9 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ MMU control: activate a root table, flush one page, flush all
 - ✅ x86_64: port I/O, MSRs, CR3, CPUID; AArch64: system registers, `MAIR` constant; RISC-V: `satp`, CSRs
 - ✅ Host simulation backend
-- 🗺 Trap/exception entry stubs and trap-frame layout per arch
+- ✅ Trap entry (RISC-V S/M-mode, AArch64 EL1/EL2): full `TrapFrame`, registered handler, portable `Trap` cause decoding
+- ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
+- 🗺 x86_64 IDT/trap entry
 - 🗺 FPU/SIMD state save and restore; user-mode entry/return
 
 ### `osmium-sync`: synchronization
@@ -131,7 +133,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ NS16550A UART (port I/O and MMIO backends)
 - ✅ Arm PL011 UART
 - ✅ RISC-V PLIC
-- ✅ Arm GICv2 (distributor + CPU interface)
+- ✅ Arm GICv2 (distributor + CPU interface, SGIs with correct source-CPU EOI)
 - ✅ x86 local APIC (xAPIC MMIO)
 - ✅ RAM disk `BlockDevice`
 - 🗺 virtio (MMIO/PCI): blk, net, console; GICv3; IO-APIC; HPET; NVMe
@@ -140,6 +142,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)
 - ✅ `Task`, built with `TaskBuilder` (name, priority, stack size, home CPU)
 - ✅ Injectable `Scheduler` trait (as in OSTD) and the core operations: `yield_now`, `block`/`wake`, `exit`, tick-driven preemption, and `on_cpu` hand-off so global run queues are safe on SMP
+- ✅ Remote-wake hook so kernels can IPI a CPU when work is queued there; task migration with `Task::set_cpu`
 - ✅ Ready-made policies: `FifoScheduler` (round-robin with a time slice) and `PriorityScheduler` (O(1) bitmap, 64 levels)
 - ✅ `WaitQueue` (no lost wake-ups), sleeping `Mutex`, `Semaphore`
 - ✅ `TimerQueue`: deadline-ordered callbacks driven by the timer IRQ
@@ -167,4 +170,6 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Host unit and integration tests for every crate
 - ✅ Builds for `x86_64-unknown-none`, `aarch64-unknown-none-softfloat` and `riscv64imac-unknown-none-elf`
 - ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps
+- ✅ `examples/aarch64-virt`: the same on QEMU AArch64 `virt` (GICv2, PL011, generic timer, stage-1 paging, PSCI)
+- ✅ Both examples bring up 4 CPUs and run shared SMP demos (cross-CPU mutex wake-ups by IPI, task migration)
 - ✅ `scripts/check.sh`: tests, clippy, rustdoc, all targets, and the QEMU boot test

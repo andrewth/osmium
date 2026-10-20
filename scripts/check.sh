@@ -40,13 +40,17 @@ boot() {
         -kernel "examples/$name/target/$target/release/$name" \
         -serial "file:$log" -monitor none </dev/null >/dev/null
     sed -n '/^osmium/,$p' "$log"
-    for line in '\[mutex\] .* = 4000' '\[preempt\]' '\[timer\]' 'PageFault' '\[done\]'; do
+    for line in '\[mutex\] .* = 4000' '\[preempt\]' '\[timer\]' '4 CPUs online' \
+        'mask 0b1111), mutex total 2000' 'visited CPUs \[0, 1, 2, 3, 0\]' 'PageFault' '\[done\]'; do
         grep -q "$line" "$log" || { echo "$name: missing '$line'"; exit 1; }
     done
     rm -f "$log"
 }
 
-boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf -machine virt -bios default -smp 1
-boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat -machine virt,gic-version=2 -cpu cortex-a72 -smp 1
+# Multi-threaded TCG runs the four CPUs in parallel on host threads.
+boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
+    -machine virt -bios default -smp 4 -accel tcg,thread=multi
+boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
+    -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
 
 echo "all checks passed"

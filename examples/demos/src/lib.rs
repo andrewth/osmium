@@ -95,3 +95,49 @@ pub fn sleep(env: &Env) {
     });
     t.join();
 }
+
+/// Work spread over `ncpus` CPUs: tasks pinned to every CPU contend for one
+/// sleeping mutex (so wake-ups cross CPUs), and one task migrates through
+/// all of them.
+pub fn smp(ncpus: usize) {
+    use core::sync::atomic::AtomicUsize;
+    use osmium::arch::cpu;
+
+    static TOTAL: Mutex<u64> = Mutex::new(0);
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    let workers: Vec<_> = (0..ncpus * 2)
+        .map(|i| {
+            TaskBuilder::new("worker").cpu(i % ncpus).spawn(|| {
+                for _ in 0..250 {
+                    let mut g = TOTAL.lock();
+                    SEEN.fetch_or(1 << cpu::current_id(), Ordering::Relaxed);
+                    let v = *g;
+                    osmium::sched::yield_now();
+                    *g = v + 1;
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join();
+    }
+    println!(
+        "[smp]   {} tasks on {ncpus} CPUs (ran on mask {:#b}), mutex total {}",
+        ncpus * 2,
+        SEEN.load(Ordering::Relaxed),
+        *TOTAL.lock()
+    );
+
+    let path = alloc::sync::Arc::new(osmium::sync::IrqSpinLock::new(Vec::new()));
+    let p = path.clone();
+    let hopper = TaskBuilder::new("hopper").spawn(move || {
+        for _ in 0..=ncpus {
+            let here = cpu::current_id();
+            p.lock().push(here);
+            osmium::sched::current().set_cpu((here + 1) % ncpus);
+            osmium::sched::yield_now();
+        }
+    });
+    hopper.join();
+    println!("[smp]   migrating task visited CPUs {:?}", *path.lock());
+}

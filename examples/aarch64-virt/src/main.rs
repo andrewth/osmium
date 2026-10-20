@@ -12,7 +12,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use osmium::arch::aarch64::{self, psci};
 use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
@@ -55,6 +55,15 @@ _start:
 3:  wfe
     b 3b
 
+    // Secondary CPUs start here (via PSCI CPU_ON) at EL1 with the MMU off
+    // and x0 = &SecondaryBoot.
+    .globl secondary_start
+secondary_start:
+    ldr x1, [x0]
+    mov sp, x1
+    bl secondary_main
+    b 3b
+
     .section .bss.stack, "aw", @nobits
     .balign 4096
     .space 65536
@@ -63,6 +72,7 @@ boot_stack_top:
 );
 
 unsafe extern "C" {
+    fn secondary_start();
     static _kernel_start: u8;
     static _etext: u8;
     static _erodata: u8;
@@ -96,6 +106,19 @@ static TIMERS: TimerQueue = TimerQueue::new();
 static RATE: Once<TickRate> = Once::new();
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static PSCI: Once<psci::Conduit> = Once::new();
+static TTBR0: AtomicU64 = AtomicU64::new(0);
+static VTIMER_IRQ: AtomicU32 = AtomicU32::new(0);
+static ONLINE: AtomicUsize = AtomicUsize::new(1);
+static IPIS: AtomicU64 = AtomicU64::new(0);
+/// SGI used to wake other CPUs.
+const IPI_SGI: u32 = 1;
+
+/// Handed to a secondary CPU through `x0`.
+#[repr(C)]
+struct SecondaryBoot {
+    stack_top: u64,
+    cpu: usize,
+}
 
 fn now_ns() -> u64 {
     RATE.get().unwrap().ticks_to_ns(cpu::ticks())
@@ -191,6 +214,7 @@ extern "C" fn kmain(x0: usize) -> ! {
         pt.map_range(va(base), pa(base), len.next_multiple_of(PAGE_SIZE as u64), k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
     }
     enable_mmu(pt.root());
+    TTBR0.store(pt.root().0, Ordering::Release);
     let t = pt.translate(va(kmain as *const () as u64)).unwrap();
     println!("[mmu]   MMU on, TTBR0 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
     // The table must outlive the kernel.
@@ -202,24 +226,87 @@ extern "C" fn kmain(x0: usize) -> ! {
         GicV2::new(IoMem::new(gicd as *mut u8, gicd_len as usize), IoMem::new(gicc as *mut u8, gicc_len as usize))
     });
     gic.init_distributor();
-    gic.init_cpu();
+    VTIMER_IRQ.store(vtimer_irq, Ordering::Relaxed);
     IRQS.register(vtimer_irq, &on_timer).unwrap();
-    gic.set_priority(vtimer_irq, 0x80);
-    gic.enable(vtimer_irq);
+    IRQS.register(IPI_SGI, &|_| {
+        IPIS.fetch_add(1, Ordering::Relaxed);
+    })
+    .unwrap();
 
     osmium::sched::inject_scheduler(&SCHED);
     osmium::sched::init_cpu();
-    arm_timer();
-    // SAFETY: enables the virtual timer; the GIC routes it to us.
-    unsafe { aarch64::write_cntv_ctl_el0(1) };
-    irq::enable();
+    start_local_interrupts();
     println!("[sched] FIFO scheduler, {} ms tick, {} lines on the GIC", TICK_NS / 1_000_000, gic.num_irqs());
 
+    // --- Secondary CPUs -----------------------------------------------------
+    osmium::sched::set_remote_wake_hook(|cpu| GIC.get().unwrap().send_sgi(1 << cpu, IPI_SGI));
+    let boot_mpidr = aarch64::read_mpidr_el1() & 0xff_00ff_ffff;
+    let cpus = fdt.find_node("/cpus").expect("no /cpus");
+    let mpidrs = cpus
+        .children()
+        .filter(|c| c.property("device_type").and_then(|p| p.as_str()) == Some("cpu"))
+        .filter_map(|c| c.reg().next().map(|(m, _)| m));
+    let mut ncpus = 1;
+    for mpidr in mpidrs.filter(|&m| m != boot_mpidr) {
+        let stack = alloc::vec![0u8; 64 * 1024].leak();
+        let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
+            stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
+            cpu: ncpus,
+        }));
+        // SAFETY: `secondary_start` sets up its stack from `boot`.
+        let rc = unsafe { psci::cpu_on(conduit, mpidr, secondary_start as *const () as u64, boot as *const _ as u64) };
+        assert_eq!(rc, 0, "PSCI CPU_ON {mpidr:#x} failed");
+        ncpus += 1;
+    }
+    while ONLINE.load(Ordering::Acquire) < ncpus {
+        core::hint::spin_loop();
+    }
+    println!("[smp]   {ncpus} CPUs online");
+
     demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });
+    if ncpus > 1 {
+        demos::smp(ncpus);
+    }
     fault_demo();
 
-    println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
+    println!(
+        "[done]  {} timer ticks, {} IPIs, {} free frames; shutting down",
+        TICKS.load(Ordering::Relaxed),
+        IPIS.load(Ordering::Relaxed),
+        FRAMES.lock().free_frames()
+    );
     shutdown()
+}
+
+/// Per-CPU interrupt setup: GIC CPU interface, banked timer and IPI lines,
+/// the generic timer, and the CPU's interrupt mask.
+fn start_local_interrupts() {
+    let gic = GIC.get().unwrap();
+    let vtimer = VTIMER_IRQ.load(Ordering::Relaxed);
+    gic.init_cpu();
+    gic.set_priority(vtimer, 0x80);
+    gic.enable(vtimer);
+    gic.enable(IPI_SGI);
+    arm_timer();
+    // SAFETY: enables the virtual timer; the GIC routes it to this CPU.
+    unsafe { aarch64::write_cntv_ctl_el0(1) };
+    irq::enable();
+}
+
+/// Entry point of secondary CPUs, on their own stack with the MMU off.
+#[unsafe(no_mangle)]
+extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
+    // SAFETY: each secondary gets a distinct logical id from the boot CPU.
+    unsafe { cpu::set_current_id(boot.cpu) };
+    // SAFETY: we are on the stack the boot CPU allocated for us.
+    unsafe { trap::install() };
+    enable_mmu(PhysAddr::new(TTBR0.load(Ordering::Acquire)));
+    osmium::sched::init_cpu();
+    start_local_interrupts();
+    println!("[smp]   MPIDR {:#x} online as CPU {}", aarch64::read_mpidr_el1() & 0xff_ffff, boot.cpu);
+    ONLINE.fetch_add(1, Ordering::Release);
+    // Hand the CPU to the scheduler for good.
+    osmium::sched::exit()
 }
 
 /// Programs MAIR, TCR and TTBR0 and turns on the MMU and caches.
@@ -251,7 +338,9 @@ fn arm_timer() {
 }
 
 fn on_timer(_irq: u32) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    if cpu::current_id() == 0 {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
     arm_timer();
     TIMERS.process(now_ns());
     osmium::sched::tick();

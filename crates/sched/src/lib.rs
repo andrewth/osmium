@@ -28,8 +28,9 @@
 //!   runnable.
 //!
 //! The scheduler keeps tasks on their CPU; wake-ups go to the task's last
-//! CPU. Cross-CPU wake-ups are picked up when that CPU next schedules, so
-//! kernels that need prompt remote wake-ups should send an IPI.
+//! CPU, and [`Task::set_cpu`] migrates a task the next time it is queued.
+//! Register [`set_remote_wake_hook`] to send an IPI when work is queued on
+//! another CPU; without it, that CPU notices at its next timer tick.
 #![no_std]
 
 extern crate alloc;
@@ -44,7 +45,8 @@ mod task;
 pub mod timer;
 
 pub use core_sched::{
-    EnqueueReason, Scheduler, current, exit, init_cpu, inject_scheduler, preempt_if_needed, spawn, tick, yield_now,
+    EnqueueReason, Scheduler, current, exit, init_cpu, inject_scheduler, preempt_if_needed, set_remote_wake_hook, spawn, tick,
+    yield_now,
 };
 pub use policy::{FifoScheduler, PriorityScheduler};
 pub use sync::{Mutex, MutexGuard, Semaphore, WaitQueue};

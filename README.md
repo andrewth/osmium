@@ -16,7 +16,7 @@ principles and the full feature list with status.
 
 | Crate | What it provides | Needs `alloc` |
 |---|---|---|
-| `osmium-arch` | IRQ flag control, CPU id, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs, RISC-V CSRs and SBI | no |
+| `osmium-arch` | IRQ flag control, CPU id, trap entry with a portable `Trap` cause, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
 | `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA), `IrqTable`, global console with `println!` | no |
@@ -29,13 +29,17 @@ principles and the full feature list with status.
 The library never defines an entry point, panic handler or global allocator;
 your OS assembles those from the parts it uses.
 
-## Example: a kernel in ~300 lines
+## Examples: the same kernel on two architectures
 
-[`examples/riscv-virt`](examples/riscv-virt) boots on QEMU's RISC-V `virt`
-machine. It discovers hardware from the device tree, builds a memory map,
-feeds the buddy allocator, turns on the heap, enables W^X Sv39 paging, moves
-the console to the UART driver, and runs tasks with timer-interrupt
-preemption:
+[`examples/riscv-virt`](examples/riscv-virt) and
+[`examples/aarch64-virt`](examples/aarch64-virt) boot on QEMU's `virt`
+machines with four CPUs. Each discovers hardware from the device tree, builds
+a memory map, feeds the buddy allocator, turns on the heap, enables W^X
+paging (Sv39 or AArch64 stage 1), moves the console to the UART driver
+(16550 or PL011), brings up the other CPUs (SBI HSM or PSCI), and runs the
+shared demos in [`examples/demos`](examples/demos): tasks with timer
+preemption, a sleeping mutex, timer sleeps, cross-CPU wake-ups by IPI, task
+migration, and recovery from a breakpoint and a page fault:
 
 ```console
 $ cd examples/riscv-virt && cargo run --release
@@ -45,13 +49,20 @@ osmium riscv-virt example (hart 0)
 [frame] buddy allocator: 32625 free frames (127 MiB)
 [mmu]   Sv39 on, root 0x80062000; kmain mapped R|X|G via Size4K page
 [sched] FIFO scheduler, 10 ms tick
+[smp]   hart 0 online as CPU 1
+[smp]   hart 2 online as CPU 2
+[smp]   hart 3 online as CPU 3
+[smp]   4 CPUs online
 [task]  A0
-[task]  B0
 ...
 [mutex] 4 tasks x 1000 increments across yields = 4000
 [preempt] busy-looping task was preempted after 2 ticks
-[timer] slept 50 ms (asked for 50)
-[done]  9 timer ticks, 32610 free frames; shutting down
+[timer] slept 51 ms (asked for 50)
+[smp]   8 tasks on 4 CPUs (ran on mask 0b1111), mutex total 2000
+[smp]   migrating task visited CPUs [0, 1, 2, 3, 0]
+[trap]  recovered from Breakpoint
+[trap]  recovered from PageFault { addr: 4096, access: Read }
+[done]  10 timer ticks, 32545 free frames; shutting down
 ```
 
 (Press `Ctrl-A X` to leave QEMU if it does not exit on its own.)
@@ -74,12 +85,12 @@ features.
 
 ## Current limitations
 
-- There is no trap or exception framework yet. The example writes its own
-  trap entry, and user mode is not supported.
-- SMP is designed in (per-CPU state, `on_cpu` hand-off, IRQ-safe locks), but
-  secondary-CPU bring-up has not been exercised on hardware. The scheduler
-  does no load balancing, and a cross-CPU wake-up waits until the target CPU
-  next schedules unless the kernel sends an IPI.
+- Traps are supported on RISC-V and AArch64 only; x86_64 has no IDT setup
+  yet and no bootable example. User mode is not supported on any
+  architecture.
+- SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
+  physical hardware. The scheduler does no load balancing; tasks move only
+  when `Task::set_cpu` asks.
 - The context switch saves FP registers only on targets that have them
   enabled (`neon`, `d`). Soft-float kernels are unaffected.
 - The hypervisor crate supplies the plumbing (memory, buses, exits, stage-2

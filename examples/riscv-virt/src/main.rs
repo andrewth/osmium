@@ -12,11 +12,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use osmium::arch::riscv64::{self, SatpMode, sbi};
 use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
-use osmium::arch::{cpu, irq};
+use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::Fdt;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
 use osmium::hal::console::{Console, SerialConsole, set_console};
@@ -49,6 +49,17 @@ _start:
     j 1b
 2:  call kmain
 
+    # Secondary harts start here (via SBI HSM) with a0 = hart id and
+    # a1 = &SecondaryBoot, MMU off.
+    .globl secondary_start
+secondary_start:
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+    ld sp, 0(a1)
+    call secondary_main
+
     .section .bss.stack
     .align 12
     .space 65536
@@ -57,6 +68,7 @@ boot_stack_top:
 );
 
 unsafe extern "C" {
+    fn secondary_start();
     static _kernel_start: u8;
     static _etext: u8;
     static _erodata: u8;
@@ -96,6 +108,18 @@ static TIMERS: TimerQueue = TimerQueue::new();
 static RATE: Once<TickRate> = Once::new();
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Hart id of each logical CPU.
+static HARTS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static ONLINE: AtomicUsize = AtomicUsize::new(1);
+static SATP_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Handed to a secondary hart through `a1`.
+#[repr(C)]
+struct SecondaryBoot {
+    stack_top: u64,
+    cpu: usize,
+}
+
 /// Timer interrupt period.
 const TICK_NS: u64 = 10_000_000;
 
@@ -105,8 +129,9 @@ fn now_ns() -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
-    // SAFETY: a single hart runs this kernel; id 0 is unique.
+    // SAFETY: the boot hart is logical CPU 0; secondaries get 1, 2, ...
     unsafe { cpu::set_current_id(0) };
+    HARTS[0].store(hartid, Ordering::Relaxed);
     // Before anything can fault: OpenSBI leaves stvec pointing at `_start`.
     trap::set_handler(on_trap);
     // SAFETY: we run on a valid kernel stack from here on.
@@ -180,6 +205,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     pt.map_range(va(uart_page), pa(uart_page), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
     // SAFETY: the table identity-maps the running code, its stack, the heap and the UART.
     unsafe { riscv64::write_satp(SatpMode::Sv39, 0, pt.root().0) };
+    SATP_ROOT.store(pt.root().0, Ordering::Release);
     let t = pt.translate(va(kmain as *const () as u64)).unwrap();
     println!("[mmu]   Sv39 on, root {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
     let t = pt.translate(va(ram_end - 1)).unwrap();
@@ -191,12 +217,43 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     osmium::sched::inject_scheduler(&SCHED);
     osmium::sched::init_cpu();
     sbi::set_timer(cpu::ticks() + RATE.get().unwrap().ns_to_ticks(TICK_NS));
-    // SAFETY: enabling the supervisor timer interrupt; the trap vector is installed.
-    unsafe { riscv64::write_sie(riscv64::SIE_STIE) };
+    // SAFETY: enabling timer and software interrupts; the trap vector is installed.
+    unsafe { riscv64::write_sie(riscv64::SIE_STIE | riscv64::SIE_SSIE) };
     irq::enable();
     println!("[sched] FIFO scheduler, {} ms tick", TICK_NS / 1_000_000);
 
+    // --- Secondary harts ----------------------------------------------------
+    osmium::sched::set_remote_wake_hook(|cpu| {
+        let _ = sbi::send_ipi(1, HARTS[cpu].load(Ordering::Relaxed));
+    });
+    let cpus = fdt.find_node("/cpus").expect("no /cpus");
+    let harts = cpus
+        .children()
+        .filter(|c| c.property("device_type").and_then(|p| p.as_str()) == Some("cpu"))
+        .filter(|c| c.property("status").and_then(|p| p.as_str()).is_none_or(|s| s == "okay"))
+        .filter_map(|c| c.reg().next().map(|(h, _)| h as usize));
+    let mut ncpus = 1;
+    for h in harts.filter(|&h| h != hartid) {
+        let stack = alloc::vec![0u8; 64 * 1024].leak();
+        let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
+            stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
+            cpu: ncpus,
+        }));
+        HARTS[ncpus].store(h, Ordering::Relaxed);
+        // SAFETY: `secondary_start` sets up gp and the stack from `boot`.
+        unsafe { sbi::hart_start(h, secondary_start as *const () as usize, boot as *const _ as usize) }
+            .expect("hart_start failed");
+        ncpus += 1;
+    }
+    while ONLINE.load(Ordering::Acquire) < ncpus {
+        core::hint::spin_loop();
+    }
+    println!("[smp]   {ncpus} CPUs online");
+
     demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });
+    if ncpus > 1 {
+        demos::smp(ncpus);
+    }
     fault_demo();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
@@ -219,8 +276,36 @@ fn fault_demo() {
     RECOVER.store(false, Ordering::SeqCst);
 }
 
+/// Entry point of secondary harts, on their own stack with the MMU off.
+#[unsafe(no_mangle)]
+extern "C" fn secondary_main(hartid: usize, boot: &SecondaryBoot) -> ! {
+    // SAFETY: each secondary gets a distinct logical id from the boot hart.
+    unsafe { cpu::set_current_id(boot.cpu) };
+    // SAFETY: we are on the stack the boot hart allocated for us.
+    unsafe { trap::install() };
+    // SAFETY: the boot hart's table identity-maps everything we touch.
+    unsafe { riscv64::write_satp(SatpMode::Sv39, 0, SATP_ROOT.load(Ordering::Acquire)) };
+    osmium::sched::init_cpu();
+    sbi::set_timer(cpu::ticks() + RATE.get().unwrap().ns_to_ticks(TICK_NS));
+    // SAFETY: as on the boot hart.
+    unsafe { riscv64::write_sie(riscv64::SIE_STIE | riscv64::SIE_SSIE) };
+    irq::enable();
+    println!("[smp]   hart {hartid} online as CPU {}", boot.cpu);
+    ONLINE.fetch_add(1, Ordering::Release);
+    // This flow of execution has nothing more to do: hand the CPU to the
+    // scheduler for good.
+    osmium::sched::exit()
+}
+
 fn on_trap(frame: &mut TrapFrame) {
     match frame.cause() {
+        Trap::Interrupt(Interrupt::Software) => {
+            // An IPI: new work was queued here. Clear it; the idle loop or
+            // the next preemption point picks the work up.
+            // SAFETY: clears only SSIP.
+            unsafe { riscv64::write_sip(riscv64::read_sip() & !riscv64::SIE_SSIE) };
+            osmium::sched::preempt_if_needed();
+        }
         cause @ (Trap::Breakpoint | Trap::PageFault { .. }) if RECOVER.load(Ordering::SeqCst) => {
             *RECOVERED.lock() = Some(cause);
             // Step over the instruction: 2 bytes if compressed, else 4.
@@ -239,7 +324,9 @@ fn on_trap(frame: &mut TrapFrame) {
 
 /// Called on every supervisor timer interrupt.
 fn on_timer() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    if cpu::current_id() == 0 {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
     let rate = RATE.get().unwrap();
     sbi::set_timer(cpu::ticks() + rate.ns_to_ticks(TICK_NS));
     TIMERS.process(now_ns());

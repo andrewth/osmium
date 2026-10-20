@@ -39,6 +39,7 @@ pub trait Scheduler: Sync {
 }
 
 static SCHEDULER: Once<&'static dyn Scheduler> = Once::new();
+static REMOTE_WAKE: Once<fn(usize)> = Once::new();
 
 /// Installs the scheduling policy. Panics if called twice.
 pub fn inject_scheduler(scheduler: &'static dyn Scheduler) {
@@ -47,6 +48,25 @@ pub fn inject_scheduler(scheduler: &'static dyn Scheduler) {
 
 fn scheduler() -> &'static dyn Scheduler {
     *SCHEDULER.get().expect("no scheduler injected")
+}
+
+/// Registers `hook`, called with a CPU id whenever a task is queued on a CPU
+/// other than the calling one. Kernels use it to send an inter-processor
+/// interrupt so an idle CPU notices new work at once instead of at its next
+/// timer tick. The hook runs with interrupts disabled. Panics if called twice.
+pub fn set_remote_wake_hook(hook: fn(usize)) {
+    assert!(REMOTE_WAKE.set(hook).is_ok(), "remote wake hook already set");
+}
+
+/// Queues `task` and notifies its CPU if that is not this one. IRQs must be off.
+fn enqueue(task: Arc<Task>, reason: EnqueueReason) {
+    let target = task.cpu();
+    scheduler().enqueue(task, reason);
+    if target != cpu::current_id()
+        && let Some(hook) = REMOTE_WAKE.get()
+    {
+        hook(target);
+    }
 }
 
 struct CpuState {
@@ -85,7 +105,7 @@ pub fn current() -> Arc<Task> {
 /// Makes a task built with [`crate::TaskBuilder::build`] runnable.
 pub fn spawn(task: Arc<Task>) {
     task.state.store(TaskState::Ready as u8, Ordering::Release);
-    irq::without(|| scheduler().enqueue(task, EnqueueReason::Spawned));
+    irq::without(|| enqueue(task, EnqueueReason::Spawned));
 }
 
 /// Gives up the CPU to another runnable task, if there is one.
@@ -136,7 +156,7 @@ pub(crate) fn wake(task: Arc<Task>) -> bool {
     {
         return false;
     }
-    irq::without(|| scheduler().enqueue(task, EnqueueReason::Woken));
+    irq::without(|| enqueue(task, EnqueueReason::Woken));
     true
 }
 
@@ -176,7 +196,7 @@ fn schedule(requeue: Option<EnqueueReason>) {
             {
                 // SAFETY: as above.
                 let me = unsafe { (*st).current.clone() }.unwrap();
-                sched.enqueue(me, reason);
+                enqueue(me, reason);
             }
         }
         None if !cur.is_idle && cur.state() == TaskState::Running => {

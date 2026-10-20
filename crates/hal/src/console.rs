@@ -15,6 +15,21 @@ use crate::serial::{SerialPort, SerialWriter};
 pub trait Console: Sync {
     /// Writes `s`. Implementations serialize concurrent writers.
     fn write_str(&self, s: &str);
+
+    /// Writes a formatted message. The default calls `write_str` once per
+    /// fragment; implementations with a lock should override it to hold the
+    /// lock for the whole message, so lines from different CPUs do not
+    /// interleave.
+    fn write_fmt(&self, args: fmt::Arguments<'_>) {
+        struct Adapter<'a, C: Console + ?Sized>(&'a C);
+        impl<C: Console + ?Sized> Write for Adapter<'_, C> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                self.0.write_str(s);
+                Ok(())
+            }
+        }
+        let _ = Adapter(self).write_fmt(args);
+    }
 }
 
 static CONSOLE: RwSpinLock<Option<&'static dyn Console>, IrqDisabled> = RwSpinLock::new(None);
@@ -27,16 +42,9 @@ pub fn set_console(console: &'static dyn Console) -> Option<&'static dyn Console
 /// Writes formatted text to the console.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
-    struct Adapter(&'static dyn Console);
-    impl Write for Adapter {
-        fn write_str(&mut self, s: &str) -> fmt::Result {
-            self.0.write_str(s);
-            Ok(())
-        }
-    }
     let console = *CONSOLE.read();
     if let Some(c) = console {
-        let _ = Adapter(c).write_fmt(args);
+        c.write_fmt(args);
     }
 }
 
@@ -74,6 +82,11 @@ impl<S: SerialPort + Send> Console for SerialConsole<S> {
     fn write_str(&self, s: &str) {
         let mut port = self.port.lock();
         let _ = SerialWriter(&mut *port).write_str(s);
+    }
+
+    fn write_fmt(&self, args: fmt::Arguments<'_>) {
+        let mut port = self.port.lock();
+        let _ = SerialWriter(&mut *port).write_fmt(args);
     }
 }
 

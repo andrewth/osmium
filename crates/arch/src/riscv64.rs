@@ -97,6 +97,7 @@ pub mod sbi {
     const EID_TIME: usize = 0x5449_4d45;
     const EID_HSM: usize = 0x0048_534d;
     const EID_SRST: usize = 0x5352_5354;
+    const EID_IPI: usize = 0x0073_5049;
     const EID_LEGACY_PUTCHAR: usize = 0x01;
 
     /// Programs the next timer interrupt for absolute `time` value `deadline`.
@@ -118,6 +119,13 @@ pub mod sbi {
     pub unsafe fn hart_start(hartid: usize, start: usize, opaque: usize) -> Result<(), SbiError> {
         // SAFETY: the caller upholds the contract.
         unsafe { call(EID_HSM, 0, [hartid, start, opaque]) }.map(|_| ())
+    }
+
+    /// Raises a supervisor software interrupt on each hart whose bit is set
+    /// in `hart_mask` (bit 0 = hart `hart_mask_base`).
+    pub fn send_ipi(hart_mask: usize, hart_mask_base: usize) -> Result<(), SbiError> {
+        // SAFETY: only raises software interrupts.
+        unsafe { call(EID_IPI, 0, [hart_mask, hart_mask_base, 0]) }.map(|_| ())
     }
 
     /// Shuts the system down.

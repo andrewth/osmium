@@ -161,3 +161,48 @@ fn timer_sleep() {
     sleeper.join();
     assert_eq!(woke.load(Ordering::Acquire), 1);
 }
+
+#[test]
+fn migration_between_cpus() {
+    static HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn hook(_cpu: usize) {
+        HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    become_cpu();
+    osmium_sched::set_remote_wake_hook(hook);
+    let home = osmium_arch::cpu::current_id();
+
+    // A second host thread acts as another CPU that just keeps scheduling.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let other = std::thread::spawn(move || {
+        become_cpu();
+        tx.send(osmium_arch::cpu::current_id()).unwrap();
+        while !DONE.load(Ordering::Acquire) {
+            osmium_sched::yield_now();
+            std::thread::yield_now();
+        }
+    });
+    let away = rx.recv().unwrap();
+
+    let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let v = visited.clone();
+    let hopper = builder("hopper").spawn(move || {
+        for _ in 0..50 {
+            let here = osmium_arch::cpu::current_id();
+            v.lock().unwrap().push(here);
+            // Requeue on the other CPU; it may pick us up while this CPU is
+            // still saving our registers, which `on_cpu` must handle.
+            osmium_sched::current().set_cpu(if here == home { away } else { home });
+            osmium_sched::yield_now();
+        }
+    });
+    hopper.join();
+    DONE.store(true, Ordering::Release);
+    other.join().unwrap();
+
+    let visited = visited.lock().unwrap();
+    let expected: Vec<usize> = (0..50).map(|i| if i % 2 == 0 { home } else { away }).collect();
+    assert_eq!(*visited, expected, "alternated between the two CPUs");
+    assert!(HOOK_CALLS.load(Ordering::Relaxed) >= 50, "every hop notified the target CPU");
+}
