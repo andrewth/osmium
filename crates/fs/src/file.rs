@@ -84,6 +84,17 @@ pub struct DirEntry {
     pub name: String,
 }
 
+/// Data can be read (a [`File::poll`] bit, with Linux's value).
+pub const POLLIN: u32 = 0x1;
+/// A write would not block.
+pub const POLLOUT: u32 = 0x4;
+/// An error is pending.
+pub const POLLERR: u32 = 0x8;
+/// The peer hung up; reads return end of file.
+pub const POLLHUP: u32 = 0x10;
+/// The peer closed or shut down its writing side.
+pub const POLLRDHUP: u32 = 0x2000;
+
 /// A node of a file system: a file, directory, device or anything else
 /// reachable through a file descriptor.
 ///
@@ -126,6 +137,14 @@ pub trait File: Send + Sync {
     /// specific to its type (the socket calls); `None` by default.
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         None
+    }
+
+    /// Which of the [`POLLIN`], [`POLLOUT`], [`POLLERR`], [`POLLHUP`] and
+    /// [`POLLRDHUP`] conditions hold now, without blocking (`poll`, `select`
+    /// and `epoll` build on it). Files that never block are always ready to
+    /// read and write, which is the default.
+    fn poll(&self) -> u32 {
+        POLLIN | POLLOUT
     }
 
     /// Device-specific control (`ioctl`); returns the call's result.

@@ -7,16 +7,18 @@ use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use osmium_fs::{Errno, File, FileKind, Stat};
+use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, Stat};
 use osmium_net::{Error, Socket, SocketAddr, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket};
 use osmium_sync::IrqSpinLock;
 
 use crate::fd::{Access, OpenFile};
 use crate::net::{NetStack, stack};
 use crate::process::Process;
+use crate::unix::{self, UnixSocket};
 
 type SysResult = Result<u64, Errno>;
 
+const AF_UNIX: u64 = 1;
 /// The IPv4 address of `a`. The socket layer is `AF_INET` only, so an IPv6
 /// address (which it never creates) reads as unspecified.
 fn v4(a: SocketAddr) -> SocketAddrV4 {
@@ -32,6 +34,8 @@ const SOCK_DGRAM: u64 = 2;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 const SOCKADDR_LEN: usize = 16;
+const MSG_PEEK: u64 = 0x2;
+const MSG_TRUNC: u64 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_NOSIGNAL: u64 = 0x4000;
 const SOL_SOCKET: u64 = 1;
@@ -58,6 +62,10 @@ const UDP_QUEUE: usize = 16;
 const MAX_BACKLOG: usize = 16;
 /// Bytes moved per send or receive call at most.
 const IO_MAX: usize = 64 * 1024;
+/// `struct msghdr` on 64-bit Linux.
+const MSGHDR_LEN: usize = 56;
+/// Most `iovec`s of one `sendmsg` or `recvmsg` (`UIO_MAXIOV`).
+const IOV_MAX: u64 = 1024;
 
 enum Tcp {
     /// Not connected or listening, possibly bound to an address.
@@ -83,6 +91,13 @@ pub struct SocketFile {
     /// `SO_RCVTIMEO` and `SO_SNDTIMEO` in nanoseconds; 0 waits for ever.
     rcv_timeout: AtomicU64,
     snd_timeout: AtomicU64,
+}
+
+/// What a receive took.
+struct Received {
+    copied: usize,
+    truncated: bool,
+    from: Option<SocketAddrV4>,
 }
 
 fn net_errno(e: Error) -> Errno {
@@ -165,7 +180,7 @@ impl SocketFile {
     /// Checks that `a` can be bound here and picks a port if it has none.
     fn bind_addr(&self, a: SocketAddrV4, udp: bool) -> Result<SocketAddrV4, Errno> {
         self.net.op(|iface, s| {
-            if !a.ip().is_unspecified() && iface.config().map(|c| c.address) != Some(*a.ip()) {
+            if !a.ip().is_unspecified() && !a.ip().is_loopback() && iface.config().map(|c| c.address) != Some(*a.ip()) {
                 return Err(Errno::EADDRNOTAVAIL);
             }
             let mut port = a.port();
@@ -281,7 +296,7 @@ impl SocketFile {
             }
             Kind::Tcp(Tcp::Listening { .. }) => Err(Errno::EISCONN),
             Kind::Tcp(Tcp::Unconnected(bound)) => {
-                if self.net.peek(|i, _| i.config()).is_none() {
+                if !to.ip().is_loopback() && self.net.peek(|i, _| i.config()).is_none() {
                     return Err(Errno::ENETUNREACH);
                 }
                 let port = bound.map_or(0, |a| a.port());
@@ -403,7 +418,14 @@ impl SocketFile {
     /// `recv`/`recvfrom`: returns the bytes copied and the sender (for
     /// datagrams).
     pub fn recv(&self, buf: &mut [u8], flags: u64) -> Result<(usize, Option<SocketAddrV4>), Errno> {
+        self.recv_full(buf, flags).map(|r| (r.copied, r.from))
+    }
+
+    /// [`recv`](Self::recv) that also reports truncation. `MSG_PEEK` leaves
+    /// the data queued.
+    fn recv_full(&self, buf: &mut [u8], flags: u64) -> Result<Received, Errno> {
         let wait = self.wait_mode(flags);
+        let peek = flags & MSG_PEEK != 0;
         let udp = match &*self.kind.lock() {
             Kind::Udp { handle, peer } => Some((*handle, *peer)),
             _ => None,
@@ -411,9 +433,22 @@ impl SocketFile {
         let deadline = self.net.deadline(self.rcv_timeout.load(Ordering::Relaxed));
         if let Some((h, peer)) = udp {
             loop {
-                match self.net.op(|_, s| s.get_mut::<UdpSocket>(h).recv_from(buf)) {
-                    Ok((_, from)) if peer.is_some_and(|p| SocketAddr::V4(p) != from) => continue,
-                    Ok((n, from)) => return Ok((n.min(buf.len()), Some(v4(from)))),
+                let got = if peek {
+                    self.net.peek(|_, s| s.get::<UdpSocket>(h).peek_from(buf))
+                } else {
+                    self.net.op(|_, s| s.get_mut::<UdpSocket>(h).recv_from(buf))
+                };
+                match got {
+                    Ok((_, from)) if peer.is_some_and(|p| SocketAddr::V4(p) != from) => {
+                        // Not from our peer: dropped, even when only peeking.
+                        if peek {
+                            let _ = self.net.op(|_, s| s.get_mut::<UdpSocket>(h).recv_from(&mut []));
+                        }
+                    }
+                    Ok((full, from)) => {
+                        let copied = full.min(buf.len());
+                        return Ok(Received { copied, truncated: full > copied, from: Some(v4(from)) });
+                    }
                     Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_recv()) => {
                     }
                     Err(e) => return Err(net_errno(e)),
@@ -422,13 +457,57 @@ impl SocketFile {
         }
         let h = self.tcp_handle()?;
         loop {
-            match self.net.op(|_, s| s.get_mut::<TcpSocket>(h).recv(buf)) {
-                Ok(n) => return Ok((n, None)),
+            let got = if peek {
+                self.net.peek(|_, s| s.get::<TcpSocket>(h).peek(buf))
+            } else {
+                self.net.op(|_, s| s.get_mut::<TcpSocket>(h).recv(buf))
+            };
+            match got {
+                Ok(n) => return Ok(Received { copied: n, truncated: false, from: None }),
                 Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| readable(s.get::<TcpSocket>(h))) => {}
                 Err(Error::InvalidState) => return Err(Errno::ENOTCONN),
                 Err(e) => return Err(net_errno(e)),
             }
         }
+    }
+
+    /// Which `poll` conditions hold.
+    fn readiness(&self) -> u32 {
+        let kind = self.kind.lock();
+        self.net.peek(|_, s| match &*kind {
+            Kind::Tcp(Tcp::Unconnected(_)) => POLLOUT | POLLHUP,
+            Kind::Tcp(Tcp::Listening { backlog, .. }) => {
+                let up = backlog
+                    .iter()
+                    .any(|&h| !matches!(s.get::<TcpSocket>(h).state(), TcpState::Listen | TcpState::SynReceived));
+                if up { POLLIN } else { 0 }
+            }
+            Kind::Tcp(Tcp::Connected(h)) => {
+                let t = s.get::<TcpSocket>(*h);
+                let state = t.state();
+                let mut m = 0;
+                if readable(t) {
+                    m |= POLLIN;
+                }
+                if state != TcpState::SynSent && (t.can_send() || !t.may_send()) {
+                    m |= POLLOUT;
+                }
+                if t.error().is_some() {
+                    m |= POLLERR;
+                }
+                if matches!(state, TcpState::CloseWait | TcpState::Closing | TcpState::LastAck | TcpState::TimeWait) {
+                    m |= POLLRDHUP;
+                }
+                if state == TcpState::Closed {
+                    m |= POLLRDHUP | POLLHUP;
+                }
+                m
+            }
+            Kind::Udp { handle, .. } => {
+                let u = s.get::<UdpSocket>(*handle);
+                (if u.can_recv() { POLLIN } else { 0 }) | (if u.can_send() { POLLOUT } else { 0 })
+            }
+        })
     }
 
     /// `shutdown`: `how` is 0 (read), 1 (write) or 2 (both). Reads cannot be
@@ -523,6 +602,10 @@ impl File for SocketFile {
         Stat { kind: FileKind::Socket, mode: 0o777, nlink: 1, ..Stat::default() }
     }
 
+    fn poll(&self) -> u32 {
+        self.readiness()
+    }
+
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
@@ -530,10 +613,10 @@ impl File for SocketFile {
 
 /// Whether `file` is a socket in non-blocking mode (for `F_GETFL`).
 pub(crate) fn status_flags(file: &Arc<dyn File>) -> u64 {
-    match file.as_any().and_then(|a| a.downcast_ref::<SocketFile>()) {
-        Some(s) if s.is_nonblocking() => O_NONBLOCK,
-        _ => 0,
-    }
+    let any = file.as_any();
+    let inet = any.and_then(|a| a.downcast_ref::<SocketFile>()).is_some_and(SocketFile::is_nonblocking);
+    let unix = any.and_then(|a| a.downcast_ref::<UnixSocket>()).is_some_and(UnixSocket::is_nonblocking);
+    if inet || unix { O_NONBLOCK } else { 0 }
 }
 
 /// Applies `F_SETFL` to a socket; other files have no flags to change.
@@ -541,10 +624,64 @@ pub(crate) fn set_status_flags(file: &Arc<dyn File>, flags: u64) {
     if let Some(s) = file.as_any().and_then(|a| a.downcast_ref::<SocketFile>()) {
         s.set_nonblocking(flags & O_NONBLOCK != 0);
     }
+    if let Some(s) = file.as_any().and_then(|a| a.downcast_ref::<UnixSocket>()) {
+        s.set_nonblocking(flags & O_NONBLOCK != 0);
+    }
 }
 
+/// An `AF_INET` socket, for the calls only those have (`bind`, `connect`...).
 fn sock(of: &Arc<OpenFile>) -> Result<&SocketFile, Errno> {
-    of.file().as_any().and_then(|a| a.downcast_ref::<SocketFile>()).ok_or(Errno::ENOTSOCK)
+    let any = of.file().as_any();
+    match any.and_then(|a| a.downcast_ref::<SocketFile>()) {
+        Some(s) => Ok(s),
+        None if any.is_some_and(|a| a.is::<UnixSocket>()) => Err(Errno::EOPNOTSUPP),
+        None => Err(Errno::ENOTSOCK),
+    }
+}
+
+/// Either kind of socket, for the calls both have.
+enum Any<'sock> {
+    Inet(&'sock SocketFile),
+    Unix(&'sock UnixSocket),
+}
+
+fn any(of: &Arc<OpenFile>) -> Result<Any<'_>, Errno> {
+    if let Some(u) = of.file().as_any().and_then(|a| a.downcast_ref::<UnixSocket>()) {
+        return Ok(Any::Unix(u));
+    }
+    sock(of).map(Any::Inet)
+}
+
+impl Any<'_> {
+    fn is_dgram(&self) -> bool {
+        match self {
+            Any::Inet(s) => s.type_code() == SOCK_DGRAM,
+            Any::Unix(u) => u.is_dgram(),
+        }
+    }
+
+    fn type_code(&self) -> u64 {
+        if self.is_dgram() { SOCK_DGRAM } else { SOCK_STREAM }
+    }
+
+    fn send(&self, data: &[u8], to: Option<SocketAddrV4>, flags: u64) -> Result<usize, Errno> {
+        match self {
+            Any::Inet(s) => s.send(data, to, flags),
+            Any::Unix(_) if to.is_some() => Err(Errno::EISCONN),
+            Any::Unix(u) => u.send(data, !u.is_nonblocking() && flags & MSG_DONTWAIT == 0),
+        }
+    }
+
+    fn recv(&self, buf: &mut [u8], flags: u64) -> Result<Received, Errno> {
+        match self {
+            Any::Inet(s) => s.recv_full(buf, flags),
+            Any::Unix(u) => {
+                let wait = !u.is_nonblocking() && flags & MSG_DONTWAIT == 0;
+                let r = u.recv(buf, flags & MSG_PEEK != 0, wait)?;
+                Ok(Received { copied: r.copied, truncated: r.truncated, from: None })
+            }
+        }
+    }
 }
 
 fn open(p: &Process, fd: i32) -> Result<Arc<OpenFile>, Errno> {
@@ -628,13 +765,16 @@ pub(crate) fn connect(p: &Process, fd: i32, addr: u64, len: u64) -> SysResult {
 
 pub(crate) fn sendto(p: &Process, fd: i32, buf: u64, len: u64, flags: u64, addr: u64, alen: u64) -> SysResult {
     let of = open(p, fd)?;
-    let s = sock(&of)?;
+    let s = any(&of)?;
+    if addr != 0 && matches!(s, Any::Unix(_)) {
+        return Err(Errno::EISCONN);
+    }
     let to = if addr != 0 { Some(get_addr(p, addr, alen)?) } else { None };
     let n = len as usize;
     if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    if n > IO_MAX && s.type_code() == SOCK_DGRAM {
+    if n > IO_MAX && s.is_dgram() {
         return Err(Errno::EMSGSIZE);
     }
     let mut data = vec![0u8; n.min(IO_MAX)];
@@ -642,34 +782,205 @@ pub(crate) fn sendto(p: &Process, fd: i32, buf: u64, len: u64, flags: u64, addr:
     s.send(&data, to, flags).map(|n| n as u64)
 }
 
+/// Writes the address `recvfrom` and `recvmsg` report: the sender, or a zero
+/// length for a socket with no addresses.
+fn put_from(p: &Process, addr: u64, lenp: u64, from: Option<SocketAddrV4>) -> Result<(), Errno> {
+    match from {
+        Some(from) => put_addr(p, addr, lenp, from),
+        None if addr != 0 && lenp != 0 => p.memory().write(lenp, &0u32.to_ne_bytes()),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn recvfrom(p: &Process, fd: i32, buf: u64, len: u64, flags: u64, addr: u64, lenp: u64) -> SysResult {
     let of = open(p, fd)?;
-    let s = sock(&of)?;
-    if flags & !MSG_DONTWAIT != 0 {
+    let s = any(&of)?;
+    if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
     let mut data = vec![0u8; (len as usize).min(IO_MAX)];
-    let (n, from) = s.recv(&mut data, flags)?;
-    p.memory().write(buf, &data[..n])?;
-    if let Some(from) = from {
-        put_addr(p, addr, lenp, from)?;
+    let r = s.recv(&mut data, flags)?;
+    p.memory().write(buf, &data[..r.copied])?;
+    put_from(p, addr, lenp, r.from)?;
+    Ok(r.copied as u64)
+}
+
+/// The `struct iovec` array of `count` entries at `iov`, and the sum of their
+/// lengths.
+fn read_iov(p: &Process, iov: u64, count: u64) -> Result<(Vec<(u64, usize)>, usize), Errno> {
+    if count > IOV_MAX {
+        return Err(Errno::EMSGSIZE);
     }
-    Ok(n as u64)
+    let mut v = Vec::with_capacity(count as usize);
+    let mut total = 0usize;
+    for i in 0..count {
+        let at = i.checked_mul(16).and_then(|o| iov.checked_add(o)).ok_or(Errno::EFAULT)?;
+        let mut b = [0u8; 16];
+        p.memory().read(at, &mut b)?;
+        let base = u64::from_ne_bytes(b[..8].try_into().expect("8 bytes"));
+        let len = u64::from_ne_bytes(b[8..].try_into().expect("8 bytes"));
+        let len = usize::try_from(len).map_err(|_| Errno::EINVAL)?;
+        total = total.checked_add(len).filter(|&t| t <= isize::MAX as usize).ok_or(Errno::EINVAL)?;
+        v.push((base, len));
+    }
+    Ok((v, total))
+}
+
+/// The fields of a `struct msghdr` that are used.
+struct MsgHdr {
+    name: u64,
+    iov: u64,
+    iovlen: u64,
+    controllen: u64,
+}
+
+fn read_msghdr(p: &Process, msg: u64) -> Result<MsgHdr, Errno> {
+    let mut b = [0u8; MSGHDR_LEN];
+    p.memory().read(msg, &mut b)?;
+    let word = |at: usize| u64::from_ne_bytes(b[at..at + 8].try_into().expect("8 bytes"));
+    Ok(MsgHdr { name: word(0), iov: word(16), iovlen: word(24), controllen: word(40) })
+}
+
+pub(crate) fn sendmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
+    let of = open(p, fd)?;
+    let s = any(&of)?;
+    let h = read_msghdr(p, msg)?;
+    if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 || h.controllen != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let mut namelen = [0u8; 4];
+    p.memory().read(msg.checked_add(8).ok_or(Errno::EFAULT)?, &mut namelen)?;
+    let to = if h.name != 0 {
+        if matches!(s, Any::Unix(_)) {
+            return Err(Errno::EISCONN);
+        }
+        Some(get_addr(p, h.name, u64::from(u32::from_ne_bytes(namelen)))?)
+    } else {
+        None
+    };
+    let (iov, total) = read_iov(p, h.iov, h.iovlen)?;
+    if total > IO_MAX && s.is_dgram() {
+        return Err(Errno::EMSGSIZE);
+    }
+    // Gather the pieces into one buffer, so a datagram goes out whole.
+    let mut data = vec![0u8; total.min(IO_MAX)];
+    let mut at = 0;
+    for (base, len) in iov {
+        let take = len.min(data.len() - at);
+        if take > 0 {
+            p.memory().read(base, &mut data[at..at + take])?;
+            at += take;
+        }
+    }
+    s.send(&data, to, flags).map(|n| n as u64)
+}
+
+pub(crate) fn recvmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
+    let of = open(p, fd)?;
+    let s = any(&of)?;
+    let h = read_msghdr(p, msg)?;
+    if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let (iov, total) = read_iov(p, h.iov, h.iovlen)?;
+    let mut data = vec![0u8; total.min(IO_MAX)];
+    let r = s.recv(&mut data, flags)?;
+    // Scatter what arrived over the buffers, in order.
+    let mut at = 0;
+    for (base, len) in iov {
+        let take = len.min(r.copied - at);
+        if take > 0 {
+            p.memory().write(base, &data[at..at + take])?;
+            at += take;
+        }
+    }
+    let namelen_at = msg.checked_add(8).ok_or(Errno::EFAULT)?;
+    put_from(p, h.name, namelen_at, r.from)?;
+    // No ancillary data is ever returned.
+    p.memory().write(msg.checked_add(40).ok_or(Errno::EFAULT)?, &0u64.to_ne_bytes())?;
+    let flags_out = if r.truncated { MSG_TRUNC as u32 } else { 0 };
+    p.memory().write(msg.checked_add(48).ok_or(Errno::EFAULT)?, &flags_out.to_ne_bytes())?;
+    Ok(r.copied as u64)
+}
+
+pub(crate) fn socketpair(p: &Process, domain: u64, ty: u64, protocol: u64, sv: u64) -> SysResult {
+    if domain != AF_UNIX {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if ty & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let dgram = match ty & 0xf {
+        SOCK_STREAM => false,
+        SOCK_DGRAM => true,
+        _ => return Err(Errno::EPROTOTYPE),
+    };
+    if protocol != 0 {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    let (a, b) = unix::socketpair(dgram, ty & SOCK_NONBLOCK != 0);
+    let cloexec = ty & SOCK_CLOEXEC != 0;
+    let (fa, fb) = {
+        let mut files = p.files().lock();
+        let fa = files.insert_from(0, OpenFile::new(Arc::new(a), Access::RW), cloexec)?;
+        match files.insert_from(0, OpenFile::new(Arc::new(b), Access::RW), cloexec) {
+            Ok(fb) => (fa, fb),
+            Err(e) => {
+                let _ = files.close(fa);
+                return Err(e);
+            }
+        }
+    };
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&fa.to_ne_bytes());
+    out[4..].copy_from_slice(&fb.to_ne_bytes());
+    if let Err(e) = p.memory().write(sv, &out) {
+        let mut files = p.files().lock();
+        let _ = files.close(fa);
+        let _ = files.close(fb);
+        return Err(e);
+    }
+    Ok(0)
 }
 
 pub(crate) fn shutdown(p: &Process, fd: i32, how: u64) -> SysResult {
     let of = open(p, fd)?;
-    sock(&of)?.shutdown(how).map(|()| 0)
+    match any(&of)? {
+        Any::Inet(s) => s.shutdown(how),
+        Any::Unix(u) => u.shutdown(how),
+    }
+    .map(|()| 0)
+}
+
+/// Writes an unnamed `AF_UNIX` address (just the family), as `socketpair`
+/// ends have.
+fn put_unix_addr(p: &Process, va: u64, lenp: u64) -> Result<(), Errno> {
+    if va == 0 {
+        return Ok(());
+    }
+    let mut cap = [0u8; 4];
+    p.memory().read(lenp, &mut cap)?;
+    let n = (u32::from_ne_bytes(cap) as usize).min(2);
+    p.memory().write(va, &(AF_UNIX as u16).to_ne_bytes()[..n])?;
+    p.memory().write(lenp, &2u32.to_ne_bytes())
 }
 
 pub(crate) fn getsockname(p: &Process, fd: i32, addr: u64, lenp: u64) -> SysResult {
     let of = open(p, fd)?;
-    put_addr(p, addr, lenp, sock(&of)?.local_addr()).map(|()| 0)
+    match any(&of)? {
+        Any::Inet(s) => put_addr(p, addr, lenp, s.local_addr()),
+        Any::Unix(_) => put_unix_addr(p, addr, lenp),
+    }
+    .map(|()| 0)
 }
 
 pub(crate) fn getpeername(p: &Process, fd: i32, addr: u64, lenp: u64) -> SysResult {
     let of = open(p, fd)?;
-    put_addr(p, addr, lenp, sock(&of)?.peer_addr()?).map(|()| 0)
+    match any(&of)? {
+        Any::Inet(s) => put_addr(p, addr, lenp, s.peer_addr()?),
+        Any::Unix(_) => put_unix_addr(p, addr, lenp),
+    }
+    .map(|()| 0)
 }
 
 /// Whether option `name` at `level` is one this layer accepts and ignores.
@@ -683,7 +994,7 @@ fn known_option(level: u64, name: u64) -> bool {
 
 pub(crate) fn setsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, len: u64) -> SysResult {
     let of = open(p, fd)?;
-    let s = sock(&of)?;
+    let s = any(&of)?;
     if level == SOL_SOCKET && matches!(name, SO_RCVTIMEO | SO_SNDTIMEO) {
         // struct timeval { time_t sec; suseconds_t usec; }
         if len < 16 {
@@ -697,8 +1008,11 @@ pub(crate) fn setsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, 
             return Err(Errno::EINVAL);
         }
         let ns = sec * 1_000_000_000 + usec * 1000;
-        let timeout = if name == SO_RCVTIMEO { &s.rcv_timeout } else { &s.snd_timeout };
-        timeout.store(ns, Ordering::Relaxed);
+        // Socket pairs accept timeouts and ignore them.
+        if let Any::Inet(s) = s {
+            let timeout = if name == SO_RCVTIMEO { &s.rcv_timeout } else { &s.snd_timeout };
+            timeout.store(ns, Ordering::Relaxed);
+        }
         return Ok(0);
     }
     if !known_option(level, name) {
@@ -713,10 +1027,13 @@ pub(crate) fn setsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, 
 
 pub(crate) fn getsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, lenp: u64) -> SysResult {
     let of = open(p, fd)?;
-    let s = sock(&of)?;
+    let s = any(&of)?;
     let v: i32 = match (level, name) {
         (SOL_SOCKET, SO_TYPE) => s.type_code() as i32,
-        (SOL_SOCKET, SO_ERROR) => s.pending_error(),
+        (SOL_SOCKET, SO_ERROR) => match &s {
+            Any::Inet(s) => s.pending_error(),
+            Any::Unix(_) => 0,
+        },
         (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => TCP_BUFFER as i32,
         _ if known_option(level, name) => 0,
         _ => return Err(Errno::ENOPROTOOPT),

@@ -66,7 +66,15 @@ impl NetStack {
             let mut g = self.inner.lock();
             let inner = &mut *g;
             let r = f(&mut inner.iface, &mut inner.sockets);
-            let active = inner.iface.poll(now, &mut *inner.dev, &mut inner.sockets);
+            let mut active = inner.iface.poll(now, &mut *inner.dev, &mut inner.sockets);
+            // Traffic to this host itself takes several rounds (a handshake
+            // is three packets); finish them here, within reason.
+            for _ in 0..32 {
+                if !inner.iface.loopback_pending() {
+                    break;
+                }
+                active |= inner.iface.poll(now, &mut *inner.dev, &mut inner.sockets);
+            }
             inner.reap.retain(|&h| {
                 let done = !inner.sockets.get::<TcpSocket>(h).is_open();
                 if done {
@@ -77,6 +85,7 @@ impl NetStack {
             (r, active)
         };
         self.events.wake_all();
+        crate::poll::notify();
         (r, active)
     }
 
@@ -118,6 +127,11 @@ impl NetStack {
                 None
             }
         })
+    }
+
+    /// The stack's clock, in nanoseconds.
+    pub(crate) fn clock_ns(&self) -> u64 {
+        (self.now_ns)()
     }
 
     /// The time `timeout_ns` from now, or `None` for no timeout (0).

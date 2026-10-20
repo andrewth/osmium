@@ -97,6 +97,15 @@ impl UdpSocket {
         Ok((data.len(), from))
     }
 
+    /// Like [`recv_from`](Self::recv_from), but leaves the datagram queued
+    /// (`MSG_PEEK`).
+    pub fn peek_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
+        let (from, data) = self.rx.front().ok_or(Error::WouldBlock)?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok((data.len(), *from))
+    }
+
     /// Returns true if a datagram is waiting.
     pub fn can_recv(&self) -> bool {
         !self.rx.is_empty()
@@ -124,14 +133,17 @@ impl UdpSocket {
     pub(crate) fn dispatch(&mut self, cx: &mut Cx, out: &mut Vec<Packet>) {
         let Some(local) = self.local else { return };
         while let Some((remote, data)) = self.tx.front() {
-            let src = if local.ip().is_unspecified() {
+            // Datagrams to this host itself come from the loopback address.
+            let src = if !local.ip().is_unspecified() {
+                local.ip()
+            } else if remote.ip().is_loopback() {
+                remote.ip()
+            } else {
                 // Without an address of the interface's, hold the datagram.
                 match cx.source_for(remote.ip()) {
                     Some(a) => a,
                     None => return,
                 }
-            } else {
-                local.ip()
             };
             let header = UdpHeader { src_port: local.port(), dst_port: remote.port() };
             let payload = header.emit(src, remote.ip(), data);

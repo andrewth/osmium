@@ -72,6 +72,9 @@ pub mod signal;
 pub mod syscall;
 pub mod net;
 pub mod socket;
+mod epoll;
+pub mod poll;
+mod unix;
 pub mod thread;
 mod uregs;
 
@@ -102,3 +105,5 @@ mod tests;
 
 #[cfg(test)]
 mod net_tests;
+#[cfg(test)]
+mod poll_tests;

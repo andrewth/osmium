@@ -172,6 +172,12 @@ pub struct Interface {
     igmp: Igmp,
     multicast_ttl: u8,
     v6: v6::State,
+    /// IPv4 packets addressed to 127.0.0.0/8, delivered by the next poll.
+    loopback: VecDeque<Vec<u8>>,
+    /// Set while a looped-back packet is being processed.
+    looping: bool,
+    /// A packet was looped back since [`loopback_pending`](Self::loopback_pending) last said so.
+    looped: bool,
 }
 
 impl Interface {
@@ -197,6 +203,9 @@ impl Interface {
             igmp: Igmp::new(),
             multicast_ttl: 1,
             v6: v6::State::new(dev.mac_address()),
+            loopback: VecDeque::new(),
+            looping: false,
+            looped: false,
         }
     }
 
@@ -365,6 +374,15 @@ impl Interface {
             }
         }
 
+        let looped = self.loopback.len();
+        for _ in 0..looped {
+            let Some(bytes) = self.loopback.pop_front() else { break };
+            self.looping = true;
+            self.looped = true;
+            self.process_ipv4(now, &bytes, false, sockets);
+            self.looping = false;
+        }
+
         if let Some(c) = self.config {
             for Outgoing { dst, message } in self.igmp.poll(now) {
                 self.send_igmp(now, c.address, dst, message);
@@ -373,6 +391,13 @@ impl Interface {
         self.retry_arp(now);
         self.reassembling.retain(|r| now - r.first < REASSEMBLY_TIMEOUT);
         active | self.flush(dev)
+    }
+
+    /// Whether packets to 127.0.0.0/8 were sent or delivered since this was
+    /// last asked. If so, poll again: the sockets that received them have
+    /// replies to send, and those arrive in the same way, without a device.
+    pub fn loopback_pending(&mut self) -> bool {
+        core::mem::take(&mut self.looped)
     }
 
     /// When the interface next needs polling if nothing arrives: a time at
@@ -414,6 +439,27 @@ impl Interface {
             self.tx.pop_front();
         }
         sent
+    }
+
+    /// Queues `p` for delivery to this host's own sockets, no device involved.
+    fn queue_loopback(&mut self, p: &Packet) {
+        if self.loopback.len() >= TX_QUEUE {
+            return;
+        }
+        let (IpAddr::V4(src), IpAddr::V4(dst)) = (p.src, p.dst) else { return };
+        let header = Ipv4Header {
+            src,
+            dst,
+            protocol: p.protocol,
+            ttl: TTL,
+            ident: 0,
+            payload_len: p.payload.len(),
+        };
+        let mut bytes = vec![0; IPV4_HEADER_LEN + p.payload.len()];
+        header.emit(&mut bytes);
+        bytes[IPV4_HEADER_LEN..].copy_from_slice(&p.payload);
+        self.loopback.push_back(bytes);
+        self.looped = true;
     }
 
     fn queue_frame(&mut self, frame: Vec<u8>) {
@@ -483,6 +529,9 @@ impl Interface {
         let too_big = IPV4_HEADER_LEN + p.payload.len() > self.mtu;
         if (too_big && p.protocol == PROTO_TCP) || p.payload.len() > MAX_DATAGRAM || self.mtu < IPV4_HEADER_LEN + 8 {
             return;
+        }
+        if p.dst.is_loopback() {
+            return self.queue_loopback(&p);
         }
         if p.dst.is_multicast() {
             // Multicast has no next hop to resolve: the group names the MAC.
@@ -657,14 +706,14 @@ impl Interface {
         let Some((ip, fragment, payload)) = Ipv4Header::parse_fragment(bytes) else { return };
         // A source that is no one host's, or is ours, is forged.
         let src = ip.src;
-        if src.is_unspecified() || src.is_broadcast() || src.is_multicast() || src.is_loopback() {
+        if src.is_unspecified() || src.is_broadcast() || src.is_multicast() || (src.is_loopback() && !self.looping) {
             return;
         }
         if self.config.is_some_and(|c| src == c.address || src == c.broadcast()) {
             return;
         }
         let ours = self.config.map(|c| c.address);
-        let to_us = Some(ip.dst) == ours;
+        let to_us = Some(ip.dst) == ours || (self.looping && ip.dst.is_loopback());
         // Multicast is taken for the groups joined, and only once configured.
         let to_group = ours.is_some() && ip.dst.is_multicast() && self.igmp.is_member(ip.dst);
         let broadcast = ip.dst.is_broadcast() || self.config.is_some_and(|c| ip.dst == c.broadcast());
@@ -726,7 +775,7 @@ impl Interface {
             }
             PROTO_UDP => {
                 let Some((udp, data)) = UdpHeader::parse(payload, ip.src, ip.dst) else { return };
-                if ours.is_none() && udp.dst_port != dhcp::CLIENT_PORT {
+                if ours.is_none() && !self.looping && udp.dst_port != dhcp::CLIENT_PORT {
                     return;
                 }
                 let dst = SocketAddr::new(ip.dst.into(), udp.dst_port);

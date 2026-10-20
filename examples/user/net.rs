@@ -20,6 +20,13 @@ mod sys {
     pub const SETSOCKOPT: u64 = 208;
     pub const SHUTDOWN: u64 = 210;
     pub const READ: u64 = 63;
+    pub const BIND: u64 = 200;
+    pub const SOCKETPAIR: u64 = 199;
+    pub const SENDMSG: u64 = 211;
+    pub const RECVMSG: u64 = 212;
+    pub const EPOLL_CREATE1: u64 = 20;
+    pub const EPOLL_CTL: u64 = 21;
+    pub const EPOLL_PWAIT: u64 = 22;
 
     pub fn call(nr: u64, a: [u64; 6]) -> i64 {
         let ret: u64;
@@ -51,6 +58,13 @@ mod sys {
     pub const SETSOCKOPT: u64 = 208;
     pub const SHUTDOWN: u64 = 210;
     pub const READ: u64 = 63;
+    pub const BIND: u64 = 200;
+    pub const SOCKETPAIR: u64 = 199;
+    pub const SENDMSG: u64 = 211;
+    pub const RECVMSG: u64 = 212;
+    pub const EPOLL_CREATE1: u64 = 20;
+    pub const EPOLL_CTL: u64 = 21;
+    pub const EPOLL_PWAIT: u64 = 22;
 
     pub fn call(nr: u64, a: [u64; 6]) -> i64 {
         let ret: u64;
@@ -82,6 +96,13 @@ mod sys {
     pub const SETSOCKOPT: u64 = 54;
     pub const SHUTDOWN: u64 = 48;
     pub const READ: u64 = 0;
+    pub const BIND: u64 = 49;
+    pub const SOCKETPAIR: u64 = 53;
+    pub const SENDMSG: u64 = 46;
+    pub const RECVMSG: u64 = 47;
+    pub const EPOLL_CREATE1: u64 = 291;
+    pub const EPOLL_CTL: u64 = 233;
+    pub const EPOLL_PWAIT: u64 = 281;
 
     pub fn call(nr: u64, a: [u64; 6]) -> i64 {
         let ret: u64;
@@ -135,6 +156,15 @@ const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOL_SOCKET: u64 = 1;
 const SO_RCVTIMEO: u64 = 20;
+const AF_UNIX: u64 = 1;
+const MSG_PEEK: u64 = 2;
+const EPOLLIN: u32 = 1;
+const EPOLL_CTL_ADD: u64 = 1;
+/// `struct epoll_event` is packed on x86_64 only.
+#[cfg(target_arch = "x86_64")]
+const EPOLL_DATA: usize = 4;
+#[cfg(not(target_arch = "x86_64"))]
+const EPOLL_DATA: usize = 8;
 
 /// A `struct sockaddr_in`.
 fn sockaddr(ip: [u8; 4], port: u16) -> [u8; 16] {
@@ -245,9 +275,83 @@ fn udp_tftp() {
     sys::call(sys::CLOSE, [fd, 0, 0, 0, 0, 0]);
 }
 
+/// A `struct msghdr` over `iov` (an array of `(base, len)` pairs).
+fn msghdr(iov: &[[u64; 2]]) -> [u64; 7] {
+    [0, 0, iov.as_ptr() as u64, iov.len() as u64, 0, 0, 0]
+}
+
+/// A socket pair used with `sendmsg`, `recvmsg` and `epoll`.
+fn pair_epoll() {
+    let mut sv = [0i32; 2];
+    let r = sys::call(sys::SOCKETPAIR, [AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64, 0, 0]);
+    if r < 0 {
+        say!("net: socketpair failed: {r}");
+        return;
+    }
+    let (a, b) = (sv[0] as u64, sv[1] as u64);
+    let ep = sys::call(sys::EPOLL_CREATE1, [0; 6]) as u64;
+    let mut ev = [0u8; 16];
+    ev[..4].copy_from_slice(&EPOLLIN.to_ne_bytes());
+    ev[EPOLL_DATA..EPOLL_DATA + 8].copy_from_slice(&42u64.to_ne_bytes());
+    sys::call(sys::EPOLL_CTL, [ep, EPOLL_CTL_ADD, b, ev.as_ptr() as u64, 0, 0]);
+    let mut out = [0u8; 16];
+    let idle = sys::call(sys::EPOLL_PWAIT, [ep, out.as_mut_ptr() as u64, 1, 0, 0, 0]);
+    let out_iov = [[b"ping".as_ptr() as u64, 4], [b"-pong".as_ptr() as u64, 5]];
+    let out_msg = msghdr(&out_iov);
+    let sent = sys::call(sys::SENDMSG, [a, out_msg.as_ptr() as u64, 0, 0, 0, 0]);
+    // Waits up to a second; the data is already there.
+    let ready = sys::call(sys::EPOLL_PWAIT, [ep, out.as_mut_ptr() as u64, 1, 1000, 0, 0]);
+    let data = u64::from_ne_bytes(out[EPOLL_DATA..EPOLL_DATA + 8].try_into().unwrap_or([0; 8]));
+    let (mut first, mut rest) = ([0u8; 3], [0u8; 16]);
+    let in_iov = [[first.as_mut_ptr() as u64, 3], [rest.as_mut_ptr() as u64, 16]];
+    let in_msg = msghdr(&in_iov);
+    let got = sys::call(sys::RECVMSG, [b, in_msg.as_ptr() as u64, 0, 0, 0, 0]);
+    let text = core::str::from_utf8(&rest[..(got.max(3) - 3) as usize]).unwrap_or("?");
+    say!(
+        "net: socketpair: epoll idle {idle}, ready {ready} with data {data}; sendmsg {sent}, recvmsg {got}: \"{}{text}\"",
+        core::str::from_utf8(&first).unwrap_or("?")
+    );
+    for fd in [a, b, ep] {
+        sys::call(sys::CLOSE, [fd, 0, 0, 0, 0, 0]);
+    }
+}
+
+/// UDP to the loopback address stays inside the kernel's stack; `MSG_PEEK`
+/// leaves the datagram to be read again.
+fn udp_loopback() {
+    let (rx, tx) = (socket(SOCK_DGRAM), socket(SOCK_DGRAM));
+    if rx < 0 || tx < 0 {
+        say!("net: loopback sockets failed: {rx} {tx}");
+        return;
+    }
+    let (rx, tx) = (rx as u64, tx as u64);
+    let to = sockaddr([127, 0, 0, 1], 5000);
+    let r = sys::call(sys::BIND, [rx, to.as_ptr() as u64, 16, 0, 0, 0]);
+    let sent = sys::call(sys::SENDTO, [tx, b"local".as_ptr() as u64, 5, 0, to.as_ptr() as u64, 16]);
+    let mut buf = [0u8; 16];
+    let mut from = [0u8; 16];
+    let mut len = 16u32;
+    let name = [from.as_mut_ptr() as u64, &mut len as *mut u32 as u64];
+    let peeked = sys::call(sys::RECVFROM, [rx, buf.as_mut_ptr() as u64, 16, MSG_PEEK, name[0], name[1]]);
+    let got = sys::call(sys::RECVFROM, [rx, buf.as_mut_ptr() as u64, 16, 0, 0, 0]);
+    let text = core::str::from_utf8(&buf[..got.max(0) as usize]).unwrap_or("?");
+    say!(
+        "net: UDP loopback: bind {r}, sent {sent}, peeked {peeked} then read {got} from {}.{}.{}.{}:{}: \"{text}\"",
+        from[4],
+        from[5],
+        from[6],
+        from[7],
+        u16::from_be_bytes([from[2], from[3]])
+    );
+    sys::call(sys::CLOSE, [rx, 0, 0, 0, 0, 0]);
+    sys::call(sys::CLOSE, [tx, 0, 0, 0, 0, 0]);
+}
+
 extern "C" fn main() -> ! {
     tcp_echo();
     udp_tftp();
+    pair_epoll();
+    udp_loopback();
     exit(0)
 }
 

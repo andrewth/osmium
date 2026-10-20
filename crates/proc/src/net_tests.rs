@@ -52,9 +52,9 @@ impl NetDevice for Port {
 }
 
 /// Plain bytes at `BASE`.
-struct Flat(Mutex<Vec<u8>>);
+pub(crate) struct Flat(pub(crate) Mutex<Vec<u8>>);
 
-const BASE: u64 = 0x1000;
+pub(crate) const BASE: u64 = 0x1000;
 
 impl UserMemory for Flat {
     fn root(&self) -> PhysAddr {
@@ -135,7 +135,7 @@ fn pump(net: &NetStack, peer: &mut Peer) {
     }
 }
 
-fn call(p: &Process, sys: Sys, args: &[u64]) -> i64 {
+pub(crate) fn call(p: &Process, sys: Sys, args: &[u64]) -> i64 {
     let mut a = [0; 6];
     a[..args.len()].copy_from_slice(args);
     match dispatch(p, sys.number(), a) {
@@ -144,7 +144,7 @@ fn call(p: &Process, sys: Sys, args: &[u64]) -> i64 {
     }
 }
 
-fn err(e: Errno) -> i64 {
+pub(crate) fn err(e: Errno) -> i64 {
     -(e.0 as i64)
 }
 
@@ -160,17 +160,17 @@ fn parse(b: &[u8]) -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::new(b[4], b[5], b[6], b[7]), u16::from_be_bytes([b[2], b[3]]))
 }
 
-const ADDR: u64 = BASE;
-const LEN: u64 = BASE + 0x20;
-const BUF: u64 = BASE + 0x100;
+pub(crate) const ADDR: u64 = BASE;
+pub(crate) const LEN: u64 = BASE + 0x20;
+pub(crate) const BUF: u64 = BASE + 0x100;
 const STREAM_NB: u64 = 1 | 0o4000;
 const DGRAM: u64 = 2;
 
-fn put(p: &Process, va: u64, b: &[u8]) {
+pub(crate) fn put(p: &Process, va: u64, b: &[u8]) {
     p.memory().write(va, b).unwrap();
 }
 
-fn get(p: &Process, va: u64, n: usize) -> Vec<u8> {
+pub(crate) fn get(p: &Process, va: u64, n: usize) -> Vec<u8> {
     let mut v = alloc::vec![0; n];
     p.memory().read(va, &mut v).unwrap();
     v
@@ -322,4 +322,86 @@ fn sockets_over_a_simulated_link() {
     assert_eq!(call(&p, Sys::Close, &[dup]), 0);
     pump(&net, &mut peer);
     assert_eq!(call(&p, Sys::Bind, &[u, ADDR, 16]), err(Errno::EBADF));
+
+    loopback(&p);
+}
+
+/// Traffic to 127.0.0.0/8 stays inside the stack, and sockets poll, peek and
+/// use `sendmsg`/`recvmsg` like any other.
+fn loopback(p: &Process) {
+    use crate::poll_tests::{B1, B2, HUP, IN, MSG, MSG_PEEK, NAMELEN, OUT, ctl, drain, msghdr, revents};
+    let lo = Ipv4Addr::new(127, 0, 0, 1);
+
+    // A listener on the loopback address is not readable until a client comes.
+    let srv = call(p, Sys::Socket, &[2, STREAM_NB, 0]) as u64;
+    put(p, ADDR, &sockaddr(lo, 9090));
+    assert_eq!(call(p, Sys::Bind, &[srv, ADDR, 16]), 0, "binding 127.0.0.1 needs no match with the interface");
+    assert_eq!(call(p, Sys::Listen, &[srv, 2]), 0);
+    assert_eq!(revents(p, srv, IN), 0);
+    let ep = call(p, Sys::EpollCreate1, &[0]) as u64;
+    assert_eq!(ctl(p, ep, 1, srv, IN, 1), 0);
+    assert!(drain(p, ep).is_empty());
+
+    let cl = call(p, Sys::Socket, &[2, STREAM_NB, 0]) as u64;
+    let r = connect_to(p, cl, Ipv4Addr::new(127, 0, 0, 1), 9090);
+    assert!(r == 0 || r == err(Errno::EINPROGRESS), "connect: {r}");
+    assert_eq!(drain(p, ep), [(IN, 1)], "the listener has a connection");
+    assert_eq!(revents(p, srv, IN), IN);
+    put(p, LEN, &16u32.to_ne_bytes());
+    let conn = call(p, Sys::Accept4, &[srv, ADDR, LEN, 0o4000]) as u64;
+    assert_eq!(parse(&get(p, ADDR, 16)).ip(), &lo);
+    assert_eq!(revents(p, srv, IN), 0);
+    assert_eq!(revents(p, cl, IN | OUT), OUT);
+
+    // Data in both directions, peeked before it is read.
+    put(p, B1, b"ping");
+    assert_eq!(call(p, Sys::Write, &[cl, B1, 4]), 4);
+    assert_eq!(revents(p, conn, IN), IN);
+    assert_eq!(call(p, Sys::Recvfrom, &[conn, B2, 2, MSG_PEEK, 0, 0]), 2);
+    assert_eq!(get(p, B2, 2), b"pi");
+    assert_eq!(call(p, Sys::Recvfrom, &[conn, B2, 16, 0, 0, 0]), 4);
+    assert_eq!(get(p, B2, 4), b"ping");
+    put(p, B1, b"po");
+    put(p, B1 + 0x10, b"ng");
+    msghdr(p, 0, 0, &[(B1, 2), (B1 + 0x10, 2)], 0);
+    assert_eq!(call(p, Sys::Sendmsg, &[conn, MSG, 0]), 4);
+    msghdr(p, 0, 0, &[(B2, 1), (B2 + 0x10, 8)], 0);
+    assert_eq!(call(p, Sys::Recvmsg, &[cl, MSG, 0]), 4);
+    assert_eq!(get(p, B2, 1), b"p");
+    assert_eq!(get(p, B2 + 0x10, 3), b"ong");
+
+    // The peer closing is a hang-up and an end of file.
+    assert_eq!(call(p, Sys::Close, &[conn]), 0);
+    assert_ne!(revents(p, cl, 0) & HUP | revents(p, cl, IN) & IN, 0);
+    assert_eq!(call(p, Sys::Read, &[cl, B2, 4]), 0);
+    assert_eq!(call(p, Sys::Close, &[cl]), 0);
+    assert_eq!(call(p, Sys::Close, &[srv]), 0);
+
+    // Datagrams to another 127/8 address; the sender is reported as loopback.
+    let rx = call(p, Sys::Socket, &[2, DGRAM | 0o4000, 0]) as u64;
+    put(p, ADDR, &sockaddr(Ipv4Addr::UNSPECIFIED, 5353));
+    assert_eq!(call(p, Sys::Bind, &[rx, ADDR, 16]), 0);
+    let tx = call(p, Sys::Socket, &[2, DGRAM | 0o4000, 0]) as u64;
+    assert_eq!(revents(p, rx, IN), 0);
+    put(p, ADDR, &sockaddr(Ipv4Addr::new(127, 9, 8, 7), 5353));
+    put(p, B1, b"hello, ");
+    put(p, B1 + 0x10, b"loopback");
+    msghdr(p, ADDR, 16, &[(B1, 7), (B1 + 0x10, 8)], 0);
+    assert_eq!(call(p, Sys::Sendmsg, &[tx, MSG, 0]), 15);
+    assert_eq!(revents(p, rx, IN), IN);
+    // Peek with a short buffer: truncated, still queued, and named.
+    let name = BASE + 0x700;
+    msghdr(p, name, 16, &[(B2, 5)], 0);
+    assert_eq!(call(p, Sys::Recvmsg, &[rx, MSG, MSG_PEEK]), 5);
+    assert_eq!(get(p, B2, 5), b"hello");
+    assert_eq!(u32::from_ne_bytes(get(p, MSG + 48, 4).try_into().unwrap()), 0x20, "MSG_TRUNC");
+    assert_eq!(get(p, NAMELEN, 4), 16u32.to_ne_bytes());
+    let from = parse(&get(p, name, 16));
+    assert!(from.ip().is_loopback() && from.port() != 0, "{from}");
+    msghdr(p, name, 16, &[(B2, 64)], 0);
+    assert_eq!(call(p, Sys::Recvmsg, &[rx, MSG, 0]), 15);
+    assert_eq!(get(p, B2, 15), b"hello, loopback");
+    assert_eq!(revents(p, rx, IN), 0);
+    assert_eq!(call(p, Sys::Close, &[rx]), 0);
+    assert_eq!(call(p, Sys::Close, &[tx]), 0);
 }

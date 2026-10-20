@@ -496,6 +496,23 @@ impl TcpSocket {
         Ok(n)
     }
 
+    /// Like [`recv`](Self::recv), but leaves the data queued (`MSG_PEEK`).
+    pub fn peek(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        if self.rx.is_empty() {
+            return match (self.error, self.rx_fin) {
+                (Some(e), _) => Err(e),
+                (None, true) => Ok(0),
+                (None, false) if self.state == State::Closed || self.state == State::Listen => Err(Error::InvalidState),
+                (None, false) => Err(Error::WouldBlock),
+            };
+        }
+        let n = buf.len().min(self.rx.len());
+        for (b, byte) in buf.iter_mut().zip(self.rx.iter()) {
+            *b = *byte;
+        }
+        Ok(n)
+    }
+
     /// The largest window the peer can be told.
     fn max_window(&self) -> u32 {
         65535 << self.rcv_shift
@@ -1217,7 +1234,13 @@ impl TcpSocket {
         }
 
         if self.fresh {
-            let Some(addr) = cx.source_for(self.remote.ip()) else { return };
+            // A connection to this host itself is from the loopback address.
+            let addr = if self.remote.ip().is_loopback() {
+                self.remote.ip()
+            } else {
+                let Some(addr) = cx.source_for(self.remote.ip()) else { return };
+                addr
+            };
             self.local.set_ip(addr);
             if self.local.port() == 0 {
                 self.local.set_port(cx.rng.ephemeral_port());

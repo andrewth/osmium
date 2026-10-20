@@ -836,8 +836,12 @@ loop {
   the MTU are not fragmented on send.
 - Not supported: IPv6 fragmentation, privacy addresses, DHCPv6, forwarding,
   IGMPv3 membership reports (IGMPv3 queries are answered with v2 reports).
-  Socket system calls are not wired into
-  `osmium-proc` yet.
+- `osmium-proc` exposes this stack as sockets: `net::set_stack` takes a
+  `NetStack`, and `socket`, `sendmsg`/`recvmsg`, `socketpair`, `poll`,
+  `select` and `epoll` work on descriptors. 127.0.0.0/8 is delivered inside
+  the stack without a device. A file reports readiness through
+  `osmium_fs::File::poll` (default: always ready); call `poll::tick()` from a
+  timer, and `poll::set_clock` if there is no stack, so timeouts are noticed.
 
 ### iSCSI
 

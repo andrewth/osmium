@@ -57,6 +57,8 @@ pub mod wire;
 
 #[cfg(test)]
 mod testing;
+#[cfg(test)]
+mod loopback_tests;
 
 pub use error::Error;
 pub use iface::{Config, Interface, Ipv6Address};

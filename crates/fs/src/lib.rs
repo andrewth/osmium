@@ -26,6 +26,6 @@ mod ramfs;
 mod vfs;
 
 pub use errno::Errno;
-pub use file::{DirEntry, File, FileKind, OpenFlags, Stat};
+pub use file::{DirEntry, File, FileKind, OpenFlags, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, Stat};
 pub use ramfs::RamFs;
 pub use vfs::{NAME_MAX, PATH_MAX, Vfs};
