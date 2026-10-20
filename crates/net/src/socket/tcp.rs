@@ -43,6 +43,14 @@ const MIN_MSS: usize = 64;
 const MAX_BURST: usize = 16;
 /// Out-of-order ranges held, and SACK ranges remembered; more are dropped.
 const MAX_RANGES: usize = 64;
+/// Bytes the timestamps option takes from each segment, with its padding.
+const TS_OPTION_LEN: usize = 12;
+/// How long `TS.Recent` is trusted without an update (RFC 7323 5.5: the
+/// clock may have wrapped; 24 days is the RFC's figure).
+const TS_RECENT_LIFE: Duration = Duration::from_secs(24 * 24 * 3600);
+/// The largest round trip taken from a timestamp echo; more is a bogus
+/// echo.
+const MAX_TS_RTT: u32 = 60_000;
 /// The largest window scale shift (RFC 7323).
 const MAX_SHIFT: u8 = 14;
 /// The largest receive buffer: what the largest shift can advertise.
@@ -183,6 +191,21 @@ pub struct TcpSocket {
     error: Option<Error>,
     /// Offer SACK in the handshake; off only in tests.
     sack_enabled: bool,
+    /// Offer timestamps in the handshake; off only in tests.
+    ts_enabled: bool,
+    /// Timestamps (RFC 7323) were agreed.
+    ts_ok: bool,
+    /// Added to the clock to make the TSval we send, so that it does not
+    /// reveal our uptime.
+    ts_offset: u32,
+    /// The latest in-order TSval from the peer, which we echo (`TS.Recent`).
+    ts_recent: u32,
+    /// When `ts_recent` was last updated, to retire it after 24 days.
+    ts_recent_at: Instant,
+    /// The acknowledgment number of the last segment sent (`Last.ACK.sent`).
+    last_ack_sent: u32,
+    /// The time of the segment being processed or built.
+    clock: Instant,
 }
 
 impl TcpSocket {
@@ -241,13 +264,21 @@ impl TcpSocket {
             probe: false,
             error: None,
             sack_enabled: true,
+            ts_enabled: true,
+            ts_ok: false,
+            ts_offset: 0,
+            ts_recent: 0,
+            ts_recent_at: Instant::ZERO,
+            last_ack_sent: 0,
+            clock: Instant::ZERO,
         }
     }
 
     fn reset(&mut self) {
-        let sack_enabled = self.sack_enabled;
+        let (sack_enabled, ts_enabled) = (self.sack_enabled, self.ts_enabled);
         *self = Self::new(self.rx_cap, self.tx_cap);
         self.sack_enabled = sack_enabled;
+        self.ts_enabled = ts_enabled;
     }
 
     /// Returns a connection that came from [`listen`](Self::listen) to
@@ -358,6 +389,14 @@ impl TcpSocket {
     /// Returns true unless the socket is closed (TIME-WAIT counts as open).
     pub fn is_open(&self) -> bool {
         self.state != State::Closed
+    }
+
+    /// Returns true if the connection uses the timestamps option (RFC 7323):
+    /// both ends offered it in the handshake. Timestamps give a round-trip
+    /// sample from every ACK and protect against old duplicate segments
+    /// after the sequence numbers wrap.
+    pub fn has_timestamps(&self) -> bool {
+        self.ts_ok
     }
 
     /// Returns true while the connection is established in both directions
@@ -471,6 +510,22 @@ impl TcpSocket {
         self.state == State::Listen && binds(self.local, dst)
     }
 
+    /// The TSval we send now.
+    fn tsval(&self) -> u32 {
+        (self.clock.as_millis() as u32).wrapping_add(self.ts_offset)
+    }
+
+    /// Takes a round-trip sample from the echo of one of our timestamps in
+    /// an ACK of new data (RFC 7323 4.1). Unlike the timed segment this is
+    /// valid for retransmissions too, so it replaces that sample.
+    fn sample_echo(&mut self, echo: u32) {
+        let ms = self.tsval().wrapping_sub(echo);
+        if ms <= MAX_TS_RTT {
+            self.update_rtt(Duration::from_millis(u64::from(ms)));
+            self.rtt_sample = None;
+        }
+    }
+
     fn update_rtt(&mut self, rtt: Duration) {
         // RFC 6298 2.2 and 2.3, with alpha = 1/8 and beta = 1/4.
         let (srtt, rttvar) = match self.srtt {
@@ -496,6 +551,7 @@ impl TcpSocket {
         payload: &[u8],
     ) -> Option<TcpHeader> {
         let now = cx.now;
+        self.clock = now;
         match self.state {
             State::Closed => return None,
             State::Listen => {
@@ -514,6 +570,7 @@ impl TcpSocket {
                 self.remote = src;
                 self.rcv_nxt = seg.seq.wrapping_add(1);
                 self.set_iss(cx.rng.isn(dst, src, now));
+                self.ts_offset = cx.rng.next_u32();
                 self.snd_wnd = u32::from(seg.window);
                 self.snd_wl1 = seg.seq;
                 self.snd_mss = Self::peer_mss(seg, cx.mss);
@@ -554,6 +611,16 @@ impl TcpSocket {
         // the receive window (RFC 9293 3.10.7.4)?
         let seg_len = payload.len() as u32 + u32::from(seg.has(TCP_SYN)) + u32::from(seg.has(TCP_FIN));
         let wnd = self.rx_window();
+        // PAWS (RFC 7323 5): a segment older than the newest timestamp seen
+        // is a wrapped-around duplicate, and one without a timestamp on a
+        // connection that agreed on them is not from the peer.
+        if self.ts_ok && !seg.has(TCP_RST) {
+            let Some((val, _)) = seg.timestamps else { return None };
+            if before(val, self.ts_recent) && now - self.ts_recent_at < TS_RECENT_LIFE {
+                self.ack_pending = true;
+                return None;
+            }
+        }
         let in_window = |s: u32| s.wrapping_sub(self.rcv_nxt) < wnd;
         let acceptable = seg.seq == self.rcv_nxt
             || (wnd > 0 && (in_window(seg.seq) || (seg_len > 0 && in_window(seg.seq.wrapping_add(seg_len - 1)))));
@@ -589,6 +656,15 @@ impl TcpSocket {
             return None;
         }
 
+        if let Some((val, _)) = seg.timestamps.filter(|_| self.ts_ok) {
+            // RFC 7323 4.3: only a segment that starts at or before what we
+            // last acknowledged moves `TS.Recent`.
+            let stale = now - self.ts_recent_at >= TS_RECENT_LIFE;
+            if (!before(val, self.ts_recent) || stale) && before_eq(seg.seq, self.last_ack_sent) {
+                self.ts_recent = val;
+                self.ts_recent_at = now;
+            }
+        }
         if !seg.has(TCP_ACK) {
             return None;
         }
@@ -611,6 +687,9 @@ impl TcpSocket {
             self.process_sack(seg);
         }
         if before(self.snd_una, seg.ack) {
+            if let Some((_, echo)) = seg.timestamps.filter(|_| self.ts_ok) {
+                self.sample_echo(echo);
+            }
             self.on_new_ack(seg.ack);
             self.ack_received(seg.ack, now);
         } else if seg.ack == self.snd_una
@@ -674,6 +753,7 @@ impl TcpSocket {
                     }
                     let ack = self.segment(TCP_ACK);
                     self.adv_wnd = u32::from(ack.window) << self.rcv_shift;
+                    self.last_ack_sent = ack.ack;
                     return Some(ack);
                 }
             }
@@ -725,6 +805,12 @@ impl TcpSocket {
         self.snd_shift = syn.wscale.map_or(0, |s| s.min(MAX_SHIFT));
         self.rcv_shift = if self.ws_active { self.ws_offer } else { 0 };
         self.sack_ok = syn.sack_permitted && self.sack_enabled;
+        self.ts_ok = syn.timestamps.is_some() && self.ts_enabled;
+        if let Some((val, _)) = syn.timestamps.filter(|_| self.ts_ok) {
+            self.ts_recent = val;
+            self.ts_recent_at = self.clock;
+            self.snd_mss = self.snd_mss.saturating_sub(TS_OPTION_LEN).max(MIN_MSS);
+        }
         let mss = self.snd_mss as u32;
         // RFC 6928.
         self.cwnd = (10 * mss).min((2 * mss).max(14600));
@@ -795,7 +881,9 @@ impl TcpSocket {
         let block = |(s, d): &(u32, Vec<u8>)| (*s, s.wrapping_add(d.len() as u32));
         let recent = self.ooo.iter().filter(|(s, _)| Some(*s) == self.ooo_recent).map(block);
         let others = self.ooo.iter().filter(|(s, _)| Some(*s) != self.ooo_recent).map(block);
-        for b in recent.chain(others).take(MAX_SACK_BLOCKS) {
+        // Timestamps leave room for three blocks.
+        let room = if self.ts_ok { MAX_SACK_BLOCKS - 1 } else { MAX_SACK_BLOCKS };
+        for b in recent.chain(others).take(room) {
             h.sack[usize::from(h.sack_len)] = b;
             h.sack_len += 1;
         }
@@ -1024,6 +1112,9 @@ impl TcpSocket {
         if flags & (TCP_ACK | TCP_SYN) == TCP_ACK {
             self.fill_sack(&mut h);
         }
+        if self.ts_ok && flags & TCP_RST == 0 {
+            h.timestamps = Some((self.tsval(), self.ts_recent));
+        }
         h
     }
 
@@ -1071,12 +1162,16 @@ impl TcpSocket {
     fn emit(&mut self, header: TcpHeader, payload: &[u8], out: &mut Vec<Packet>) {
         let shift = if header.has(TCP_SYN) { 0 } else { self.rcv_shift };
         self.adv_wnd = u32::from(header.window) << shift;
+        if header.has(TCP_ACK) {
+            self.last_ack_sent = header.ack;
+        }
         let segment = header.emit(*self.local.ip(), *self.remote.ip(), payload);
         out.push(Packet { src: *self.local.ip(), dst: *self.remote.ip(), protocol: PROTO_TCP, payload: segment });
     }
 
     pub(crate) fn dispatch(&mut self, cx: &mut Cx, out: &mut Vec<Packet>) {
         let now = cx.now;
+        self.clock = now;
         match self.state {
             State::Closed => {
                 if let Some(rst) = self.rst_pending.take() {
@@ -1111,6 +1206,7 @@ impl TcpSocket {
                 self.local.set_port(cx.rng.ephemeral_port());
             }
             self.set_iss(cx.rng.isn(self.local, self.remote, now));
+            self.ts_offset = cx.rng.next_u32();
             let mss = cx.mss as u32;
             self.cwnd = (10 * mss).min((2 * mss).max(14600));
             self.fresh = false;
@@ -1152,6 +1248,7 @@ impl TcpSocket {
                 if self.state == State::SynSent {
                     syn.wscale = Some(self.ws_offer);
                     syn.sack_permitted = self.sack_enabled;
+                    syn.timestamps = self.ts_enabled.then(|| (self.tsval(), 0));
                 } else {
                     syn.wscale = self.ws_active.then_some(self.ws_offer);
                     syn.sack_permitted = self.sack_ok;
@@ -1890,4 +1987,96 @@ mod tests {
         assert!(rcv_nxt_gap <= 2);
         assert!(run(&mut a, &mut b, &mut now, 3000, |_, b| tcp(b, cb).recv_queue() == 5 * 1460));
     }
+
+    #[test]
+    fn timestamps_are_negotiated() {
+        let (mut a, mut b, ca, cb, _) = connected(1024, 1024);
+        assert!(tcp(&mut a, ca).has_timestamps() && tcp(&mut b, cb).has_timestamps());
+        // 1500 less IP, TCP and the 12 bytes of option.
+        assert_eq!(tcp(&mut a, ca).snd_mss, 1500 - 40 - 12);
+        assert_eq!(tcp(&mut b, cb).snd_mss, 1500 - 40 - 12);
+
+        // One side without them: neither uses them.
+        let (mut a, mut b) = pair();
+        let ca = a.sockets.add(TcpSocket::new(1024, 1024));
+        let cb = b.sockets.add(TcpSocket::new(1024, 1024));
+        tcp(&mut a, ca).ts_enabled = false;
+        tcp(&mut b, cb).listen(80).unwrap();
+        tcp(&mut a, ca).connect(SocketAddrV4::new(B_IP, 80), 0).unwrap();
+        let mut now = Instant::ZERO;
+        assert!(run(&mut a, &mut b, &mut now, 1000, |a, b| {
+            tcp(a, ca).state() == State::Established && tcp(b, cb).state() == State::Established
+        }));
+        assert!(!tcp(&mut a, ca).has_timestamps() && !tcp(&mut b, cb).has_timestamps());
+        assert_eq!(tcp(&mut b, cb).snd_mss, 1500 - 40);
+        tcp(&mut a, ca).send(b"plain").unwrap();
+        assert!(run(&mut a, &mut b, &mut now, 100, |_, b| tcp(b, cb).can_recv()));
+    }
+
+    #[test]
+    fn paws_drops_old_segments() {
+        let (mut a, mut b, ca, cb, mut now) = connected(1024, 1024);
+        tcp(&mut a, ca).send(b"one").unwrap();
+        assert!(run(&mut a, &mut b, &mut now, 100, |_, b| tcp(b, cb).can_recv()));
+        let mut buf = [0u8; 16];
+        assert_eq!(tcp(&mut b, cb).recv(&mut buf), Ok(3));
+
+        let sock = tcp(&mut b, cb);
+        let (local, remote) = (sock.local, sock.remote);
+        let recent = sock.ts_recent;
+        let mut rng = crate::rng::Rng::new(1);
+        let mut segment = |sock: &mut TcpSocket, now: Instant, ts: Option<(u32, u32)>, data: &[u8]| {
+            let seg = TcpHeader {
+                src_port: remote.port(),
+                dst_port: local.port(),
+                seq: sock.rcv_nxt,
+                ack: sock.snd_nxt,
+                flags: TCP_ACK,
+                window: 1000,
+                timestamps: ts,
+                ..TcpHeader::default()
+            };
+            let mut cx = Cx { now, addr: Some(*local.ip()), mac: Default::default(), mss: 1460, rng: &mut rng };
+            sock.process(&mut cx, local, remote, &seg, data);
+            sock.recv_queue()
+        };
+        assert_eq!(segment(sock, now, Some((recent.wrapping_sub(1), 0)), b"old"), 0, "older than TS.Recent");
+        assert_eq!(segment(sock, now, None, b"bare"), 0, "no timestamp on a timestamped connection");
+        assert_eq!(segment(sock, now, Some((recent.wrapping_add(1), 0)), b"new"), 3);
+        assert_eq!(sock.ts_recent, recent.wrapping_add(1));
+        // After 24 days of silence TS.Recent is not trusted.
+        let later = now + TS_RECENT_LIFE;
+        assert_eq!(segment(sock, later, Some((recent.wrapping_sub(5), 0)), b"!"), 4);
+    }
+
+    #[test]
+    fn timestamp_echo_samples_the_round_trip() {
+        let mut s = TcpSocket::new(1024, 1024);
+        s.clock = Instant::from_millis(1000);
+        s.sample_echo(s.tsval().wrapping_sub(50));
+        assert_eq!(s.srtt, Some((Duration::from_millis(50), Duration::from_millis(25))));
+        // An echo from the future or from long ago is not a round trip.
+        s.sample_echo(s.tsval().wrapping_add(5));
+        s.sample_echo(s.tsval().wrapping_sub(MAX_TS_RTT + 1));
+        assert_eq!(s.srtt, Some((Duration::from_millis(50), Duration::from_millis(25))));
+    }
+
+    #[test]
+    fn timestamped_transfer_survives_loss() {
+        let (mut a, mut b, ca, cb, mut now) = connected(8192, 8192);
+        a.set_filter(|n, _| n % 7 != 3);
+        let data: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
+        let (mut sent, mut got) = (0, Vec::new());
+        assert!(run(&mut a, &mut b, &mut now, 60_000, |a, b| {
+            sent += tcp(a, ca).send(&data[sent..]).unwrap_or(0);
+            let mut buf = [0u8; 2048];
+            while let Ok(n @ 1..) = tcp(b, cb).recv(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+            got.len() == data.len()
+        }));
+        assert_eq!(got, data);
+        assert!(tcp(&mut a, ca).srtt.is_some());
+    }
+
 }

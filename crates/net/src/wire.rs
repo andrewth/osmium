@@ -370,8 +370,8 @@ pub const TCP_PSH: u8 = 0x08;
 /// TCP flag: ACK.
 pub const TCP_ACK: u8 = 0x10;
 
-/// A TCP header. Of the options, the maximum segment size, window scale and
-/// SACK are kept.
+/// A TCP header. Of the options, the maximum segment size, window scale,
+/// SACK and timestamps are kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TcpHeader {
     /// Source port.
@@ -397,6 +397,8 @@ pub struct TcpHeader {
     pub sack: [(u32, u32); MAX_SACK_BLOCKS],
     /// Number of blocks in `sack`.
     pub sack_len: u8,
+    /// The timestamps option (RFC 7323) as `(TSval, TSecr)`.
+    pub timestamps: Option<(u32, u32)>,
 }
 
 /// The most SACK blocks a segment carries: a TCP header has room for four.
@@ -440,6 +442,7 @@ impl TcpHeader {
                         (2, 4) => header.mss = Some(be16(opts, 2)),
                         (3, 3) => header.wscale = Some(opts[2]),
                         (4, 2) => header.sack_permitted = true,
+                        (8, 10) => header.timestamps = Some((be32(opts, 2), be32(opts, 6))),
                         (5, _) if len >= 10 && (len - 2) % 8 == 0 => {
                             for block in opts[2..len].as_chunks::<8>().0 {
                                 if usize::from(header.sack_len) == MAX_SACK_BLOCKS {
@@ -467,13 +470,21 @@ impl TcpHeader {
             opts.extend_from_slice(&[2, 4]);
             opts.extend_from_slice(&mss.to_be_bytes());
         }
+        if let Some((val, echo)) = self.timestamps {
+            opts.extend_from_slice(&[1, 1, 8, 10]);
+            opts.extend_from_slice(&val.to_be_bytes());
+            opts.extend_from_slice(&echo.to_be_bytes());
+        }
         if self.sack_permitted {
             opts.extend_from_slice(&[4, 2]);
         }
         if let Some(shift) = self.wscale {
             opts.extend_from_slice(&[1, 3, 3, shift]);
         }
-        let blocks = &self.sack[..usize::from(self.sack_len).min(MAX_SACK_BLOCKS)];
+        // The 40 bytes of options hold four SACK blocks, or three beside
+        // timestamps.
+        let room = if self.timestamps.is_some() { MAX_SACK_BLOCKS - 1 } else { MAX_SACK_BLOCKS };
+        let blocks = &self.sack[..usize::from(self.sack_len).min(room)];
         if !blocks.is_empty() {
             opts.extend_from_slice(&[1, 1, 5, 2 + 8 * blocks.len() as u8]);
             for (left, right) in blocks {
@@ -577,10 +588,23 @@ mod tests {
     #[test]
     fn tcp_options_round_trip() {
         let (src, dst) = (Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8));
-        let syn =
-            TcpHeader { flags: TCP_SYN, mss: Some(1460), wscale: Some(7), sack_permitted: true, ..Default::default() };
+        let syn = TcpHeader {
+            flags: TCP_SYN,
+            mss: Some(1460),
+            wscale: Some(7),
+            sack_permitted: true,
+            timestamps: Some((0xdead_beef, 0)),
+            ..Default::default()
+        };
         let b = syn.emit(src, dst, &[]);
         assert_eq!(TcpHeader::parse(&b, src, dst), Some((syn, &[][..])));
+        // Beside timestamps a segment carries three SACK blocks, not four.
+        let mut ack = TcpHeader { flags: TCP_ACK, sack_len: 4, timestamps: Some((1, 2)), ..Default::default() };
+        ack.sack = [(10, 20), (30, 40), (50, 60), (70, 80)];
+        let b = ack.emit(src, dst, &[]);
+        let (parsed, _) = TcpHeader::parse(&b, src, dst).unwrap();
+        assert_eq!((parsed.sack_len, parsed.timestamps), (3, Some((1, 2))));
+        assert_eq!(b.len(), 60, "12 timestamp bytes and 3 blocks fill the 40 option bytes");
         let mut ack = TcpHeader { flags: TCP_ACK, sack_len: 3, ..Default::default() };
         ack.sack[..3].copy_from_slice(&[(10, 20), (30, 40), (50, 60)]);
         let b = ack.emit(src, dst, b"x");
