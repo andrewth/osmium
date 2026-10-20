@@ -37,7 +37,7 @@ use osmium::hal::usb::UsbHost;
 use osmium::hal::console::{Console, SerialConsole, set_console};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
-use osmium::hal::timer::TickRate;
+use osmium::hal::timer::{Clock, TickRate};
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::formats::Sv39;
 use osmium::mm::frame::order_for;
@@ -384,6 +384,15 @@ fn now_ns() -> u64 {
     RATE.get().unwrap().ticks_to_ns(cpu::ticks())
 }
 
+/// [`now_ns`] for drivers that take a [`Clock`].
+struct Uptime;
+
+impl Clock for Uptime {
+    fn now_ns(&self) -> u64 {
+        now_ns()
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: the boot hart is logical CPU 0; secondaries get 1, 2, ...
@@ -571,7 +580,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             // window; nothing else uses it.
             let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
             let (b, d, f) = (addr.bus, addr.device, addr.function);
-            match Ahci::new(io, &FRAMES) {
+            match Ahci::new(io, &FRAMES, Some(&Uptime)) {
                 Ok(mut hba) => {
                     let ports: Vec<u8> = hba.disks().collect();
                     println!("[ahci]  {b:02x}:{d:02x}.{f} AHCI {:#x}, SATA disks on ports {ports:?}", hba.version());

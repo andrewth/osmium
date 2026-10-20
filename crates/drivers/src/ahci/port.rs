@@ -6,6 +6,7 @@ use core::mem::ManuallyDrop;
 use osmium_arch::barrier;
 use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
 use osmium_hal::mmio::IoMem;
+use osmium_hal::timer::Clock;
 
 use super::{AhciError, POLL_LIMIT, cap, r32, w32};
 
@@ -51,10 +52,19 @@ pub(super) const DET_MASK: u32 = 0xf;
 pub(super) const DET_PRESENT: u32 = 1;
 /// PxSSTS.DET: a device is present and the link is up.
 pub(super) const DET_ESTABLISHED: u32 = 3;
+/// PxSSTS.DET: the PHY is offline (disabled, or in a loopback mode).
+pub(super) const DET_OFFLINE: u32 = 4;
 /// PxSCTL.DET: hold COMRESET on the link.
 const DET_COMRESET: u32 = 1;
-/// Reads of PxSSTS that COMRESET is held for (at least 1 ms of bus time).
-const COMRESET_READS: u32 = 2000;
+
+/// How long COMRESET is held: at least 1 ms (AHCI 1.3.1 §10.4.2).
+const COMRESET_NS: u64 = 1_000_000;
+/// How long the PHY gets to bring the link up after spin-up or COMRESET.
+const PHY_NS: u64 = 10_000_000;
+/// Without a clock, those waits are counted in register reads instead,
+/// assuming no uncached MMIO read takes less than 10 ns.
+const COMRESET_POLLS: u32 = if cfg!(test) { 100 } else { 100_000 };
+const PHY_POLLS: u32 = if cfg!(test) { 1000 } else { 1_000_000 };
 
 // Port memory: the command list (32 headers of 32 bytes, 1 KiB aligned),
 // the received-FIS area (256 bytes, 256 aligned) and the command table
@@ -125,7 +135,13 @@ pub(super) struct Port<'d, D: DmaAllocator + ?Sized> {
     index: u8,
     /// The HBA's CAP register.
     cap: u32,
+    clock: Option<&'d dyn Clock>,
     pub kind: DeviceKind,
+    /// Error recovery failed. If the command engine would not stop, the
+    /// HBA may still be running the abandoned command, so the command
+    /// table and data buffer are left alone for good: every later command
+    /// fails without touching them.
+    broken: bool,
     mem: ManuallyDrop<OwnedDma<'d, D>>,
     /// The data buffer, once a disk driver has given it one.
     data: ManuallyDrop<Option<OwnedDma<'d, D>>>,
@@ -135,22 +151,37 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
     /// Brings up port `index` (AHCI 1.3.1 §10.1.2): stops it, gives it a
     /// command list and received-FIS area, and starts it once the device is
     /// ready. Returns `Ok(None)` if no device is on the link.
-    pub fn probe(io: &IoMem, index: u8, cap: u32, dma: &'d D) -> Result<Option<Self>, AhciError> {
+    pub fn probe(
+        io: &IoMem,
+        index: u8,
+        cap: u32,
+        dma: &'d D,
+        clock: Option<&'d dyn Clock>,
+    ) -> Result<Option<Self>, AhciError> {
         let base = PORT_BASE + PORT_STRIDE * index as usize;
         let r = |reg| r32(io, base + reg);
         stop(io, base)?;
-        if cap & cap::SSS != 0 {
+        let spin_up = cap & cap::SSS != 0;
+        if spin_up {
             w32(io, base + CMD, r(CMD) | CMD_SUD);
         }
-        // A device that is present but still negotiating gets a moment to
-        // bring the link up; an empty port is skipped at once.
-        let mut det = r(SSTS) & DET_MASK;
-        for _ in 0..POLL_LIMIT {
-            if det != DET_PRESENT {
-                break;
-            }
-            osmium_arch::cpu::spin_hint();
-            det = r(SSTS) & DET_MASK;
+        // The PHY gets a while to bring the link up. Without staggered
+        // spin-up an empty port is skipped at once; with it, the device
+        // was only just told to spin up, so DET 0 does not mean empty yet.
+        let link = || {
+            let mut det = 0;
+            wait(clock, PHY_NS, PHY_POLLS, || {
+                det = r(SSTS) & DET_MASK;
+                det == DET_ESTABLISHED || (det == 0 && !spin_up)
+            });
+            det
+        };
+        let mut det = link();
+        // A device that never finishes negotiating, or a PHY left offline,
+        // gets one COMRESET.
+        if det == DET_PRESENT || det == DET_OFFLINE {
+            comreset(io, base, clock);
+            det = link();
         }
         if det != DET_ESTABLISHED {
             return Ok(None);
@@ -174,7 +205,9 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
             base,
             index,
             cap,
+            clock,
             kind: DeviceKind::Other(0),
+            broken: false,
             mem: ManuallyDrop::new(mem),
             data: ManuallyDrop::new(None),
         };
@@ -203,9 +236,13 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
         Ok(())
     }
 
-    /// The data buffer. Panics if there is none.
-    pub fn data(&self) -> &DmaBuffer {
-        self.data.as_ref().expect("port has no data buffer")
+    /// The data buffer, unless the port is broken (and the HBA may still
+    /// be using it). Panics if there is none.
+    pub fn data(&self) -> Result<&DmaBuffer, AhciError> {
+        if self.broken {
+            return Err(AhciError::Broken);
+        }
+        Ok(self.data.as_ref().expect("port has no data buffer"))
     }
 
     fn r(&self, reg: usize) -> u32 {
@@ -241,8 +278,12 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
 
     /// Runs `cmd` in slot 0 and waits for it, over the first `cmd.len`
     /// bytes of the data buffer. A failed command leaves the port
-    /// recovered and ready for the next one.
-    pub fn exec(&self, cmd: Command) -> Result<(), AhciError> {
+    /// recovered and ready for the next one or, if recovery fails, broken.
+    pub fn exec(&mut self, cmd: Command) -> Result<(), AhciError> {
+        if self.broken {
+            return Err(AhciError::Broken);
+        }
+        let data = if cmd.len == 0 { None } else { Some(self.data()?.device_addr().as_u64()) };
         let mem = &self.mem;
         let mut fis = [0u8; 20];
         fis[0] = FIS_REG_H2D;
@@ -255,10 +296,9 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
         fis[12..14].copy_from_slice(&cmd.count.to_le_bytes());
         mem.write(CT_OFFSET, &fis);
 
-        let prds = if cmd.len == 0 { 0 } else { 1 };
-        if prds != 0 {
+        let prds = if data.is_some() { 1 } else { 0 };
+        if let Some(data) = data {
             debug_assert!(cmd.len <= PRD_MAX && cmd.len % 2 == 0);
-            let data = self.data().device_addr().as_u64();
             mem.store::<u32>(PRDT_OFFSET, data as u32);
             mem.store::<u32>(PRDT_OFFSET + 4, (data >> 32) as u32);
             mem.store::<u32>(PRDT_OFFSET + 8, 0);
@@ -284,12 +324,13 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
             Ok(()) if failed || tfd & STS_ERR != 0 => {
                 Err(AhciError::Device { status: tfd as u8, error: (tfd >> 8) as u8 })
             }
+            // Data in must all have arrived, or the buffer is partly stale.
+            Ok(()) if !cmd.write && mem.load::<u32>(CL_OFFSET + 4) != cmd.len as u32 => Err(AhciError::ShortTransfer),
             Ok(()) => Ok(()),
         };
-        if result.is_err() {
-            // A port that cannot even be restarted fails its next command
-            // the same way, so the error to report is still this one.
-            let _ = self.recover();
+        if result.is_err() && self.recover().is_err() {
+            // The error to report is still the command's.
+            self.broken = true;
         }
         result
     }
@@ -306,23 +347,12 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
                 self.w(CMD, self.r(CMD) | CMD_CLO);
                 self.poll(|p| p.r(CMD) & CMD_CLO == 0)?;
             } else {
-                self.comreset()?;
+                comreset(&self.io, self.base, self.clock);
+                self.poll(|p| p.r(SSTS) & DET_MASK == DET_ESTABLISHED)?;
+                self.clear_errors();
             }
         }
         self.start()
-    }
-
-    /// Resets the link and the device on it.
-    fn comreset(&self) -> Result<(), AhciError> {
-        let sctl = self.r(SCTL) & !DET_MASK;
-        self.w(SCTL, sctl | DET_COMRESET);
-        for _ in 0..COMRESET_READS {
-            let _ = self.r(SSTS);
-        }
-        self.w(SCTL, sctl);
-        self.poll(|p| p.r(SSTS) & DET_MASK == DET_ESTABLISHED)?;
-        self.clear_errors();
-        Ok(())
     }
 }
 
@@ -355,6 +385,37 @@ fn stop(io: &IoMem, base: usize) -> Result<(), AhciError> {
     wait(CMD_CR)?;
     w32(io, base + CMD, r(CMD) & !CMD_FRE);
     wait(CMD_FR)
+}
+
+/// Resets the link at `base`, and the device on it, by holding COMRESET
+/// for long enough. The port must be stopped; the link comes back up
+/// later.
+fn comreset(io: &IoMem, base: usize, clock: Option<&dyn Clock>) {
+    let sctl = r32(io, base + SCTL) & !DET_MASK;
+    w32(io, base + SCTL, sctl | DET_COMRESET);
+    wait(clock, COMRESET_NS, COMRESET_POLLS, || {
+        let _ = r32(io, base + SSTS);
+        false
+    });
+    w32(io, base + SCTL, sctl);
+}
+
+/// Polls `done` until it holds, for at most `ns` by `clock` or, without
+/// one, `polls` times. True if it held.
+fn wait(clock: Option<&dyn Clock>, ns: u64, polls: u32, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = clock.map(|c| c.now_ns().saturating_add(ns));
+    let mut n = 0;
+    loop {
+        if done() {
+            return true;
+        }
+        n += 1;
+        match (clock, deadline) {
+            (Some(c), Some(end)) if c.now_ns() > end => return false,
+            (None, _) if n >= polls => return false,
+            _ => osmium_arch::cpu::spin_hint(),
+        }
+    }
 }
 
 /// Checks that the HBA can reach `buf`: aligned to `align`, and below

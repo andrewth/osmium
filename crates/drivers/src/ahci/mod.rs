@@ -20,7 +20,10 @@
 //! The caller enables memory decoding and bus mastering on the PCI
 //! function. The [`DmaAllocator`] must hand out 1 KiB-aligned memory (any
 //! page allocator does), below 4 GiB if the HBA lacks 64-bit addressing.
-//! Waits on the hardware are bounded by a poll count, not a clock.
+//! Waits on the hardware are bounded by a poll count, except the ones the
+//! link protocol times (holding COMRESET, waiting for the PHY), which use
+//! the [`Clock`] given to [`Ahci::new`] or, without one, a generous poll
+//! count.
 //!
 //! Not yet supported: interrupts, native command queuing, port
 //! multipliers, ATAPI devices, hot plug, and disks without 48-bit LBA.
@@ -34,6 +37,7 @@ mod fake;
 use osmium_hal::dma::DmaAllocator;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::Class;
+use osmium_hal::timer::Clock;
 
 pub use disk::{AhciDisk, DATA_LEN};
 pub use port::DeviceKind;
@@ -94,6 +98,11 @@ pub enum AhciError {
     /// The device is not a disk this driver handles: not ATA (an ATAPI
     /// drive, say), no 48-bit LBA, or an odd sector size.
     Unsupported,
+    /// The device moved fewer bytes than the command asked for.
+    ShortTransfer,
+    /// An earlier command could not be recovered from, so the port no
+    /// longer runs commands.
+    Broken,
     /// The device failed a command, with these ATA status and error
     /// register values.
     Device {
@@ -136,8 +145,9 @@ pub struct Ahci<'d, D: DmaAllocator + ?Sized> {
 impl<'d, D: DmaAllocator + ?Sized> Ahci<'d, D> {
     /// Initializes the HBA whose registers `io` maps (ABAR) and probes its
     /// ports, allocating their memory from `dma`. A port whose device never
-    /// becomes ready is left stopped and reports no device.
-    pub fn new(io: IoMem, dma: &'d D) -> Result<Self, AhciError> {
+    /// becomes ready is left stopped and reports no device. `clock`, if
+    /// there is one, times the link resets.
+    pub fn new(io: IoMem, dma: &'d D, clock: Option<&'d dyn Clock>) -> Result<Self, AhciError> {
         if io.len() < PORT_BASE {
             return Err(AhciError::BadRegisters);
         }
@@ -157,7 +167,7 @@ impl<'d, D: DmaAllocator + ?Sized> Ahci<'d, D> {
         let mut hba = Self { version: r32(&io, VS), io, dma, cap, pi, ports: core::array::from_fn(|_| None) };
         for i in 0..MAX_PORTS {
             if pi & 1 << i != 0 {
-                hba.ports[i] = match Port::probe(&hba.io, i as u8, cap, dma) {
+                hba.ports[i] = match Port::probe(&hba.io, i as u8, cap, dma, clock) {
                     Err(AhciError::Timeout) => None,
                     other => other?,
                 };
@@ -230,8 +240,8 @@ fn take_from_firmware(io: &IoMem) {
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{self, FakeDev, FakeHba};
-    use super::port::{CLB, CMD, CMD_FR, CMD_FRE, CMD_ST, PORT_MEM_LEN};
+    use super::fake::{self, FakeClock, FakeDev, FakeHba};
+    use super::port::{CLB, CMD, CMD_FR, CMD_FRE, CMD_ST, CMD_SUD, PORT_MEM_LEN};
     use super::*;
     use crate::virtio::testing::HostDma;
 
@@ -247,7 +257,7 @@ mod tests {
         hba.running(0);
         let io = fake::install(hba);
         let dma = HostDma::default();
-        let mut ahci = Ahci::new(io, &dma).unwrap();
+        let mut ahci = Ahci::new(io, &dma, None).unwrap();
         fake::with(|f| {
             assert!(f.handed_off, "firmware was asked to let go");
             assert_eq!(f.ghc() & (GHC_AE | GHC_IE), GHC_AE);
@@ -281,6 +291,49 @@ mod tests {
     }
 
     #[test]
+    fn staggered_spin_up_waits_for_the_phy() {
+        for clock in [None, Some(&FakeClock as &dyn Clock)] {
+            let dma = HostDma::default();
+            let mut hba = FakeHba::new(5);
+            hba.cap |= cap::SSS;
+            // A slow PHY; one stuck negotiating; one left offline; an
+            // empty port; and a link in a state COMRESET is not tried on.
+            for p in 0..3 {
+                hba.attach(p, FakeDev::disk(8, 512));
+            }
+            hba.ports[0].link_reads = 50;
+            hba.ports[1].stuck_det = Some(port::DET_PRESENT);
+            hba.ports[2].stuck_det = Some(port::DET_OFFLINE);
+            hba.attach(4, FakeDev::Atapi);
+            hba.ports[4].stuck_det = Some(7); // not a state a COMRESET fixes
+            let ahci = Ahci::new(fake::install(hba), &dma, clock).unwrap();
+            assert!(ahci.disks().eq([0, 1, 2]));
+            assert_eq!(ahci.device(4), None);
+            fake::with(|f| {
+                assert_eq!(f.ports.iter().map(|p| p.comresets).collect::<std::vec::Vec<_>>(), [0, 1, 1, 0, 0]);
+                for p in 0..5 {
+                    assert_ne!(f.port_reg(p, CMD) & CMD_SUD, 0, "port {p} spun up");
+                }
+                if clock.is_some() {
+                    assert!(f.ports[1].comreset_held_ns.unwrap() >= 1_000_000);
+                }
+            });
+            drop(ahci);
+            fake::uninstall();
+        }
+
+        // Without SSS a port that reads empty is empty: no waiting for it.
+        let dma = HostDma::default();
+        let mut hba = FakeHba::new(1);
+        hba.attach(0, FakeDev::disk(8, 512));
+        hba.ports[0].link_reads = 50;
+        let ahci = Ahci::new(fake::install(hba), &dma, None).unwrap();
+        assert_eq!(ahci.device(0), None);
+        drop(ahci);
+        fake::uninstall();
+    }
+
+    #[test]
     fn needs_64bit_addressing_for_high_memory() {
         let dma = HostDma::default();
         let probe = std::boxed::Box::new([0u8; PORT_MEM_LEN]);
@@ -292,7 +345,7 @@ mod tests {
         hba.attach(0, FakeDev::disk(8, 512));
         hba.attach(1, FakeDev::disk(8, 512));
         let io = fake::install(hba);
-        assert_eq!(Ahci::new(io, &dma).err(), Some(AhciError::BadDmaAddress));
+        assert_eq!(Ahci::new(io, &dma, None).err(), Some(AhciError::BadDmaAddress));
         assert_eq!(dma.live.get(), 0);
         fake::with(|f| assert_eq!(f.port_reg(0, CMD) & (CMD_ST | CMD_FRE), 0));
         fake::uninstall();
@@ -305,9 +358,9 @@ mod tests {
         hba.attach(3, FakeDev::disk(8, 512));
         let io = fake::install(hba);
         let short = io.slice(0, PORT_BASE + 3 * PORT_STRIDE).unwrap();
-        assert_eq!(Ahci::new(short, &dma).err(), Some(AhciError::BadRegisters));
-        assert_eq!(Ahci::new(io.slice(0, 0x80).unwrap(), &dma).err(), Some(AhciError::BadRegisters));
-        assert!(Ahci::new(io, &dma).is_ok());
+        assert_eq!(Ahci::new(short, &dma, None).err(), Some(AhciError::BadRegisters));
+        assert_eq!(Ahci::new(io.slice(0, 0x80).unwrap(), &dma, None).err(), Some(AhciError::BadRegisters));
+        assert!(Ahci::new(io, &dma, None).is_ok());
         assert_eq!(dma.live.get(), 0);
         fake::uninstall();
     }
@@ -320,7 +373,7 @@ mod tests {
         hba.attach(1, FakeDev::disk(8, 512));
         hba.ports[0].busy_forever = true;
         let io = fake::install(hba);
-        let ahci = Ahci::new(io, &dma).unwrap();
+        let ahci = Ahci::new(io, &dma, None).unwrap();
         assert!(ahci.disks().eq([1]));
         assert_eq!(dma.live.get(), 1, "the skipped port's memory is freed");
         drop(ahci);
@@ -333,7 +386,7 @@ mod tests {
         let mut hba = FakeHba::new(1);
         hba.attach(0, FakeDev::disk(8, 512));
         let io = fake::install(hba);
-        let ahci = Ahci::new(io, &dma).unwrap();
+        let ahci = Ahci::new(io, &dma, None).unwrap();
         fake::with(|f| f.ports[0].wont_stop = true);
         drop(ahci);
         assert_eq!(dma.live.get(), 1, "not freed under a running HBA");

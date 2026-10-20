@@ -12,6 +12,9 @@
 //! driver could make (moving the command list under a running port, setting
 //! ST while the device is busy, issuing a command on a stopped port)
 //! panic the test.
+//!
+//! [`FakeClock`] keeps the fake's time, which moves only when the driver
+//! reads the clock.
 
 use core::cell::{Cell, RefCell};
 use std::boxed::Box;
@@ -20,6 +23,7 @@ use std::vec;
 use std::vec::Vec;
 
 use osmium_hal::mmio::IoMem;
+use osmium_hal::timer::Clock;
 
 use super::disk::{DEVICE_LBA, FLUSH_CACHE_EXT, IDENTIFY_DEVICE, READ_DMA_EXT, WRITE_DMA_EXT};
 use super::port::*;
@@ -110,10 +114,20 @@ pub struct FakePort {
     pub busy_forever: bool,
     /// The command engine never stops (CR stays set).
     pub wont_stop: bool,
+    /// PxSSTS reads it takes the link to come up after spin-up or COMRESET.
+    pub link_reads: u32,
+    /// PxSSTS.DET sticks at this (1 or 4) until a COMRESET.
+    pub stuck_det: Option<u32>,
+    /// Reads and IDENTIFY move this many bytes less than asked for.
+    pub short_by: u32,
+    /// IDENTIFY DEVICE words to replace: (index, value).
+    pub identify_words: Vec<(usize, u16)>,
 
     pub starts: u32,
     pub clos: u32,
     pub comresets: u32,
+    /// How long, on the clock, the last COMRESET was held.
+    pub comreset_held_ns: Option<u64>,
 
     cmd: u32,
     is: u32,
@@ -128,6 +142,9 @@ pub struct FakePort {
     /// A command failed; nothing runs until ST is cleared.
     latched: bool,
     in_comreset: bool,
+    comreset_at: u64,
+    /// SSTS reads left before the link comes up.
+    link_in: Option<u32>,
 }
 
 /// The register file.
@@ -159,6 +176,20 @@ pub struct FakeHba {
     pub handed_off: bool,
     pub ports: Vec<FakePort>,
     pub log: Vec<Cmd>,
+    /// Nanoseconds on [`FakeClock`].
+    pub now: u64,
+}
+
+/// A clock on the fake HBA's time, which each reading moves on by 1 µs.
+pub struct FakeClock;
+
+impl Clock for FakeClock {
+    fn now_ns(&self) -> u64 {
+        with(|f| {
+            f.now += 1000;
+            f.now
+        })
+    }
 }
 
 std::thread_local! {
@@ -223,6 +254,7 @@ impl FakeHba {
             handed_off: false,
             ports: (0..ports).map(|_| FakePort { fail_from: u64::MAX, ..FakePort::default() }).collect(),
             log: Vec::new(),
+            now: 0,
         }
     }
 
@@ -243,6 +275,19 @@ impl FakeHba {
         self.regs.port_reg(port, reg)
     }
 
+    /// Slot 0's command header and table and the data buffer its PRD
+    /// points at, as they are now in DMA memory.
+    pub fn slot0(&self, port: usize) -> Vec<u8> {
+        let clb = self.port_reg(port, CLB) as u64 | (self.port_reg(port, CLBU) as u64) << 32;
+        let hdr = mem(clb, 32);
+        let ctba = dword(hdr, 8) as u64 | (dword(hdr, 12) as u64) << 32;
+        let table = mem(ctba, 0x80 + 16);
+        let prd = &table[0x80..];
+        let dba = dword(prd, 0) as u64 | (dword(prd, 4) as u64) << 32;
+        let data = mem(dba, (dword(prd, 12) & 0x3f_ffff) as usize + 1);
+        [&*hdr, &*table, &*data].concat()
+    }
+
     /// Power-on register values.
     fn reset(&mut self) {
         let regs = &self.regs;
@@ -251,10 +296,14 @@ impl FakeHba {
         regs.set(VS, 0x0001_0300);
         regs.set(CAP2, if self.bios_owned { CAP2_BOH } else { 0 });
         regs.set(BOHC, if self.bios_owned { BOHC_BOS } else { 0 });
-        for (p, port) in self.ports.iter().enumerate() {
+        let spun_down = self.cap & cap::SSS != 0;
+        for (p, port) in self.ports.iter_mut().enumerate() {
             let present = port.dev.is_some();
             regs.pset(p, CMD, port.cmd);
-            regs.pset(p, SSTS, if present { 0x113 } else { 0 });
+            regs.pset(p, SSTS, 0);
+            if !spun_down || port.cmd & CMD_SUD != 0 {
+                link_start(regs, p, port);
+            }
             regs.pset(p, TFD, if present { STS_BSY } else { 0x7f });
             regs.pset(p, SIG, !0);
         }
@@ -277,6 +326,14 @@ impl FakeHba {
                 port.cmd = v;
                 regs.pset(p, CMD, v);
             }
+            SSTS => match port.link_in {
+                Some(0) => {
+                    port.link_in = None;
+                    regs.pset(p, SSTS, 0x113);
+                }
+                Some(n) => port.link_in = Some(n - 1),
+                None => {}
+            },
             TFD => match port.busy_reads {
                 Some(0) => {
                     port.busy_reads = None;
@@ -368,6 +425,9 @@ impl FakeHba {
             port.pending = None;
             regs.pset(p, CI, 0);
         }
+        if new & CMD_SUD != 0 && prev & CMD_SUD == 0 {
+            link_start(regs, p, port);
+        }
         if new & CMD_FRE != 0
             && prev & CMD_FRE == 0
             && let Some(dev) = &port.dev
@@ -395,17 +455,22 @@ impl FakeHba {
         let port = &mut self.ports[p];
         match v & DET_MASK {
             1 => {
+                assert_eq!(port.cmd & CMD_ST, 0, "COMRESET on a running port");
                 port.in_comreset = true;
+                port.comreset_at = self.now;
+                port.link_in = None;
                 regs.pset(p, SSTS, 0);
                 regs.pset(p, TFD, STS_BSY);
             }
             0 if port.in_comreset => {
                 port.in_comreset = false;
                 port.comresets += 1;
+                port.comreset_held_ns = Some(self.now - port.comreset_at);
+                port.stuck_det = None;
                 port.serr |= 1 << 26; // X: device exchanged
                 port.busy_reads = Some(LAG);
                 regs.pset(p, SERR, port.serr);
-                regs.pset(p, SSTS, 0x113);
+                link_start(regs, p, port);
             }
             _ => {}
         }
@@ -443,9 +508,13 @@ impl FakeHba {
         let result = match (port.dev.as_mut(), command) {
             (Some(FakeDev::Disk { .. }), IDENTIFY_DEVICE) => {
                 assert!(!write);
-                let id = identify(port.dev.as_ref().unwrap());
-                scatter(&prds, &id);
-                Ok(id.len())
+                let mut id = identify(port.dev.as_ref().unwrap());
+                for &(i, w) in &port.identify_words {
+                    id[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+                }
+                let n = id.len() - port.short_by as usize;
+                scatter(&prds, &id[..n]);
+                Ok(n)
             }
             (Some(FakeDev::Disk { data, sectors, sector_size, .. }), READ_DMA_EXT | WRITE_DMA_EXT) => {
                 assert_ne!(fis[7] & DEVICE_LBA, 0, "LBA mode");
@@ -462,8 +531,9 @@ impl FakeHba {
                     gather(&prds, &mut data[start..start + bytes]);
                     Ok(bytes)
                 } else {
-                    scatter(&prds, &data[start..start + bytes]);
-                    Ok(bytes)
+                    let n = bytes - port.short_by as usize;
+                    scatter(&prds, &data[start..start + n]);
+                    Ok(n)
                 }
             }
             (Some(FakeDev::Disk { .. }), FLUSH_CACHE_EXT) => {
@@ -490,6 +560,21 @@ impl FakeHba {
         }
         regs.pset(p, CI, port.ci);
         regs.pset(p, IS, port.is);
+    }
+}
+
+/// Starts bringing up the link on port `p`: at once, after
+/// [`FakePort::link_reads`] reads of PxSSTS, or never while DET is stuck.
+fn link_start(regs: &Regs, p: usize, port: &mut FakePort) {
+    if port.dev.is_none() {
+        regs.pset(p, SSTS, 0);
+    } else if let Some(det) = port.stuck_det {
+        regs.pset(p, SSTS, 0x100 | det);
+    } else if port.link_reads > 0 {
+        regs.pset(p, SSTS, 0);
+        port.link_in = Some(port.link_reads);
+    } else {
+        regs.pset(p, SSTS, 0x113);
     }
 }
 

@@ -27,7 +27,12 @@ const ID_SERIAL: usize = 10;
 const ID_MODEL: usize = 27;
 const ID_COMMAND_SETS: usize = 83;
 const ID_LBA48: u16 = 1 << 10;
+/// Words 83 and 106 are valid when their bits 15:14 are 01.
+const ID_VALID_MASK: u16 = 0xc000;
+const ID_VALID: u16 = 0x4000;
 const ID_MAX_LBA48: usize = 100;
+/// Sectors a 48-bit LBA reaches.
+const MAX_SECTORS: u64 = 1 << 48;
 const ID_SECTOR_SIZES: usize = 106;
 const ID_LOGICAL_SECTOR: usize = 117;
 
@@ -48,17 +53,20 @@ impl<'d, D: DmaAllocator + ?Sized> AhciDisk<'d, D> {
         let cmd = Command { command: IDENTIFY_DEVICE, lba: 0, count: 0, device: 0, len: IDENTIFY_LEN, write: false };
         port.exec(cmd)?;
         let mut id = [0u8; IDENTIFY_LEN];
-        port.data().read(0, &mut id);
+        port.data()?.read(0, &mut id);
         let word = |i: usize| u16::from_le_bytes([id[2 * i], id[2 * i + 1]]);
 
-        if word(ID_COMMAND_SETS) & ID_LBA48 == 0 {
+        let sets = word(ID_COMMAND_SETS);
+        if sets & ID_VALID_MASK != ID_VALID || sets & ID_LBA48 == 0 {
             return Err(AhciError::Unsupported);
         }
-        let sectors = (0..4).fold(0u64, |n, i| n | (word(ID_MAX_LBA48 + i) as u64) << (16 * i));
-        // Word 106 is valid when bits 15:14 are 01; bit 12 says words
-        // 117–118 hold the logical sector size, in words.
+        // Words 100–103 count sectors in 64 bits, beyond what the commands
+        // can address.
+        let sectors = (0..4).fold(0u64, |n, i| n | (word(ID_MAX_LBA48 + i) as u64) << (16 * i)).min(MAX_SECTORS);
+        // Bit 12 of word 106 says words 117–118 hold the logical sector
+        // size, in words.
         let sizes = word(ID_SECTOR_SIZES);
-        let sector_size = if sizes & 0xc000 == 0x4000 && sizes & 1 << 12 != 0 {
+        let sector_size = if sizes & ID_VALID_MASK == ID_VALID && sizes & 1 << 12 != 0 {
             2 * (word(ID_LOGICAL_SECTOR) as usize | (word(ID_LOGICAL_SECTOR + 1) as usize) << 16)
         } else {
             SECTOR_SIZE
@@ -122,7 +130,7 @@ impl<D: DmaAllocator + ?Sized> BlockDevice for AhciDisk<'_, D> {
         for (i, chunk) in buf.chunks_mut(DATA_LEN).enumerate() {
             let sector = lba + (i * DATA_LEN / self.sector_size) as u64;
             self.transfer(READ_DMA_EXT, sector, chunk.len(), false)?;
-            self.port.data().read(0, chunk);
+            self.port.data().map_err(|_| BlockError::Io)?.read(0, chunk);
         }
         Ok(())
     }
@@ -131,7 +139,7 @@ impl<D: DmaAllocator + ?Sized> BlockDevice for AhciDisk<'_, D> {
         self.check_range(lba, buf.len())?;
         for (i, chunk) in buf.chunks(DATA_LEN).enumerate() {
             let sector = lba + (i * DATA_LEN / self.sector_size) as u64;
-            self.port.data().write(0, chunk);
+            self.port.data().map_err(|_| BlockError::Io)?.write(0, chunk);
             self.transfer(WRITE_DMA_EXT, sector, chunk.len(), true)?;
         }
         Ok(())
@@ -145,7 +153,7 @@ impl<D: DmaAllocator + ?Sized> BlockDevice for AhciDisk<'_, D> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fake::{self, Cmd, FakeDev, FakeHba};
+    use super::super::fake::{self, Cmd, FakeClock, FakeDev, FakeHba};
     use super::super::port::{CMD, CMD_FRE, CMD_ST, SERR};
     use super::super::{Ahci, cap};
     use super::*;
@@ -171,7 +179,7 @@ mod tests {
         let mut hba = FakeHba::new(1);
         hba.attach(0, dev);
         setup(&mut hba);
-        let mut ahci = Ahci::new(fake::install(hba), &dma).unwrap();
+        let mut ahci = Ahci::new(fake::install(hba), &dma, None).unwrap();
         let mut disk = ahci.take_disk(0).unwrap();
         body(&mut disk);
         drop((disk, ahci));
@@ -212,7 +220,7 @@ mod tests {
             let dma = HostDma::default();
             let mut hba = FakeHba::new(1);
             hba.attach(0, dev);
-            let mut ahci = Ahci::new(fake::install(hba), &dma).unwrap();
+            let mut ahci = Ahci::new(fake::install(hba), &dma, None).unwrap();
             assert_eq!(ahci.take_disk(0).err(), Some(AhciError::Unsupported));
             assert_eq!(ahci.device(0), None, "the port is gone");
             assert_eq!(dma.live.get(), 0, "and its memory freed");
@@ -343,12 +351,121 @@ mod tests {
     }
 
     #[test]
+    fn identify_needs_valid_word_83_and_48_bit_lbas() {
+        // LBA48 set, but bits 15:14 do not say the word is valid.
+        for w83 in [ID_LBA48, 0xc000 | ID_LBA48] {
+            let dma = HostDma::default();
+            let mut hba = FakeHba::new(1);
+            hba.attach(0, FakeDev::disk(SECTORS, 512));
+            hba.ports[0].identify_words = vec![(ID_COMMAND_SETS, w83)];
+            let mut ahci = Ahci::new(fake::install(hba), &dma, None).unwrap();
+            assert_eq!(ahci.take_disk(0).err(), Some(AhciError::Unsupported), "word 83 {w83:#x}");
+            drop(ahci);
+            fake::uninstall();
+        }
+
+        // Words 100–103 count past what a 48-bit LBA reaches.
+        for sectors in [(1 << 48) + 1, u64::MAX] {
+            let (log, _) = with_disk(
+                FakeDev::disk(sectors, 512),
+                |_| {},
+                |d| {
+                    assert_eq!(d.num_blocks(), 1 << 48);
+                    let mut buf = [0u8; 512];
+                    assert_eq!(d.read_blocks(1 << 48, &mut buf), Err(BlockError::OutOfRange));
+                },
+            );
+            assert_eq!(log.len(), 1, "nothing past IDENTIFY reaches the disk");
+        }
+    }
+
+    #[test]
+    fn short_reads_fail() {
+        let data = pattern(8 * 512, 3);
+        let (log, _) = with_disk(
+            FakeDev::disk(8, 512).with_data(data.clone()),
+            |_| {},
+            |d| {
+                let mut buf = [0u8; 1024];
+                d.read_blocks(0, &mut buf).unwrap();
+                fake::with(|f| f.ports[0].short_by = 512);
+                // The bounce buffer still holds sectors 0–1 past the first
+                // 512 bytes; none of that may come back as sector 3.
+                assert_eq!(d.read_blocks(2, &mut buf), Err(BlockError::Io));
+                fake::with(|f| assert_eq!(f.ports[0].starts, 2, "recovered"));
+                // Writes are not checked.
+                assert_eq!(d.write_blocks(4, &data[..512]), Ok(()));
+                fake::with(|f| f.ports[0].short_by = 0);
+                d.read_blocks(2, &mut buf).unwrap();
+                assert_eq!(buf[..], data[2 * 512..4 * 512]);
+            },
+        );
+        assert_eq!(log.len(), 5);
+
+        let dma = HostDma::default();
+        let mut hba = FakeHba::new(1);
+        hba.attach(0, FakeDev::disk(8, 512));
+        hba.ports[0].short_by = 2;
+        let mut ahci = Ahci::new(fake::install(hba), &dma, None).unwrap();
+        assert_eq!(ahci.take_disk(0).err(), Some(AhciError::ShortTransfer), "short IDENTIFY");
+        drop(ahci);
+        fake::uninstall();
+    }
+
+    #[test]
+    fn a_port_that_cannot_recover_is_broken() {
+        let dma = HostDma::default();
+        let mut hba = FakeHba::new(1);
+        hba.attach(0, FakeDev::disk(8, 512));
+        let mut ahci = Ahci::new(fake::install(hba), &dma, None).unwrap();
+        let mut d = ahci.take_disk(0).unwrap();
+        let mut buf = [0u8; 512];
+        // The command never finishes and the engine will not stop, so the
+        // HBA may still be running it.
+        fake::with(|f| (f.ports[0].hang, f.ports[0].wont_stop) = (true, true));
+        assert_eq!(d.read_blocks(0, &mut buf), Err(BlockError::Io));
+        let (slot0, commands) = fake::with(|f| (f.slot0(0), f.log.len()));
+        assert_eq!(d.write_blocks(1, &[0x55; 512]), Err(BlockError::Io));
+        assert_eq!(d.read_blocks(2, &mut buf), Err(BlockError::Io));
+        assert_eq!(d.flush(), Err(BlockError::Io));
+        // Even once the HBA settles down, the port stays broken.
+        fake::with(|f| f.ports[0].hang = false);
+        assert_eq!(d.read_blocks(2, &mut buf), Err(BlockError::Io));
+        fake::with(|f| {
+            assert_eq!(f.slot0(0), slot0, "command table and bounce buffer untouched");
+            assert_eq!(f.log.len(), commands, "nothing more issued");
+        });
+        drop((d, ahci));
+        assert_eq!(dma.live.get(), 2, "port memory and bounce buffer leaked, not freed under the HBA");
+        fake::uninstall();
+    }
+
+    #[test]
+    fn comreset_is_held_for_a_millisecond() {
+        let dma = HostDma::default();
+        let mut hba = FakeHba::new(1);
+        hba.cap &= !cap::SCLO;
+        hba.attach(0, FakeDev::disk(8, 512));
+        hba.ports[0].fail_from = 0;
+        hba.ports[0].busy_after_error = true;
+        let mut ahci = Ahci::new(fake::install(hba), &dma, Some(&FakeClock)).unwrap();
+        let mut d = ahci.take_disk(0).unwrap();
+        assert_eq!(d.read_blocks(0, &mut [0; 512]), Err(BlockError::Io));
+        fake::with(|f| {
+            assert_eq!(f.ports[0].comresets, 1);
+            assert!(f.ports[0].comreset_held_ns.unwrap() >= 1_000_000);
+        });
+        drop((d, ahci));
+        fake::uninstall();
+    }
+
+    #[test]
     fn disks_outlive_the_hba() {
         let dma = HostDma::default();
         let mut hba = FakeHba::new(2);
         hba.attach(0, FakeDev::disk(8, 512));
         hba.attach(1, FakeDev::disk(16, 512));
-        let mut ahci = Ahci::new(fake::install(hba), &dma).unwrap();
+        let mut ahci = Ahci::new(fake::install(hba), &dma, None).unwrap();
         let mut a = ahci.take_disk(0).unwrap();
         assert_eq!(ahci.take_disk(0).err(), Some(AhciError::NoDevice), "taken");
         let mut b = ahci.take_disk(1).unwrap();
