@@ -8,11 +8,13 @@
 mod block;
 mod console;
 mod mmio;
+mod net;
 pub mod queue;
 
 pub use block::VirtioBlock;
 pub use console::VirtioConsole;
 pub use mmio::{DeviceCtx, MMIO_SIZE, VirtioMmio};
+pub use net::{NetBackend, VirtioNetDevice};
 pub use queue::{Desc, DescChain, QueueError, SplitQueue};
 
 pub use osmium_hal::virtio::{device_id, feature, status};
