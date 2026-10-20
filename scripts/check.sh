@@ -343,10 +343,42 @@ if command -v qemu-system-x86_64 >/dev/null && [ -r /dev/kvm ] && [ -w /dev/kvm 
     sed -n '/^osmium/,$p' "$vmxlog"
     for line in 'VMX on: EPT, VPID and unrestricted guest' '\[guest\] hello from VMX over port I/O' \
         '\[guest\] and over MMIO (EPT violations)' 'guest exit Shutdown: 1 hypercall, LSR 0x60 (port) 0x60 (MMIO)' \
-        'KERNEL_GS_BASE 0x12345678' 'VMX hidden' '\[done\]'; do
+        'KERNEL_GS_BASE 0x12345678' 'guest hardware breakpoint hit 1 time' 'VMX hidden' '\[done\]'; do
         grep -q "$line" "$vmxlog" || { echo "x86_64-vmx: missing '$line'"; exit 1; }
     done
     rm -f "$vmxlog"
+    # The SVM hypervisor on an Intel CPU picks VMX: the same demos, then the
+    # x86_64-pc kernel as a two-vCPU guest. Nested exits are slow, so allow time.
+    echo "== boot examples/x86_64-hyp on VMX under QEMU/KVM"
+    hyplog=$(mktemp)
+    timeout 150 qemu-system-x86_64 -machine q35 -accel kvm -cpu host -smp 2 -m 128M -nographic -no-reboot -display none \
+        -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp \
+        -serial "file:$hyplog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$hyplog"
+    for line in 'VMX on: EPT, VPID and unrestricted guest' '\[guest\] hello from SVM over port I/O' \
+        'guest exit Shutdown: 1 hypercall, LSR 0x60 (port) 0x60 (MMIO)' \
+        '\[guest\] 3 local APIC timer interrupts through a 64-bit IDT' \
+        '\[guest\] COM1 IRQ 4 through the I/O APIC, received: z' \
+        'SSE guests interleaved on one CPU: vCPU edi=1 got 12, edi=2 got 14 (expected 12 and 14)' \
+        'vCPU moved from host CPU 0 to 1 between runs, SSE result 12 (expected 12)' \
+        '\[smp-guest\] cpu 0: IPI 0x41 from cpu 1 through the local APICs' '\[done\]'; do
+        grep -q "$line" "$hyplog" || { echo "x86_64-hyp on VMX: missing '$line'"; exit 1; }
+    done
+    rm -f "$hyplog"
+    echo "== boot examples/x86_64-pc as a guest of examples/x86_64-hyp on VMX under QEMU/KVM"
+    hyplog=$(mktemp)
+    timeout 300 qemu-system-x86_64 -machine q35 -accel kvm -cpu host -smp 2 -m 512M -nographic \
+        -no-reboot -display none -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp \
+        -device loader,file=examples/x86_64-pc/target/x86_64-unknown-none/release/x86_64-pc,addr=0x18000000,force-raw=on \
+        -serial "file:$hyplog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$hyplog"
+    for line in 'guest kernel: [0-9]* KiB loaded, PVH entry 0x[0-9a-f]*, 2 vCPUs' '| osmium x86_64-pc example' \
+        '| \[smp\]   2 CPUs online' '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' \
+        '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' \
+        '| \[uart\]  interrupt-driven input: "hello from the host"' '| \[done\]' 'guest powered off'; do
+        grep -q "$line" "$hyplog" || { echo "x86_64-hyp on VMX (guest kernel): missing '$line'"; exit 1; }
+    done
+    rm -f "$hyplog"
 else
     echo "== skipping examples/x86_64-vmx: needs /dev/kvm and nested VMX"
 fi

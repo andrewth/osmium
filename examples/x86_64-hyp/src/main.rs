@@ -17,6 +17,7 @@ extern crate alloc;
 
 mod kernel;
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -35,17 +36,19 @@ use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::{print, println};
 use osmium::mm::heap::LockedHeap;
-use osmium::mm::paging::formats::X86_64;
-use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
-use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
+use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MemoryMap, OffsetMapper};
+use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind};
 use osmium::sync::{IrqSpinLock, Once};
 use osmium::virt::devices::{
     IOAPIC_WINDOW, IpiKind, IpiTarget, LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualIoApic, VirtualLapic,
     VirtualPic, VirtualPit, decode_icr,
 };
 use osmium::virt::smp::GuestCpus;
-use osmium::virt::x86::{self as svm, SvmPages, SvmVcpu};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
+
+mod backend;
+
+use backend::{Backend, Cpu, Pages, Stage2};
 
 osmium::boot::pvh_start!(kmain, ap: ap_main);
 
@@ -232,7 +235,7 @@ lm_guest:
     movl $0x1ff, 0xf0(%rdi)         // SVR: enabled, spurious vector 0xff
     movl $0xb, 0x3e0(%rdi)          // timer divide by 1
     movl $0x20040, 0x320(%rdi)      // LVT timer: periodic, vector 0x40
-    movl $100000, 0x380(%rdi)       // initial count: 1 ms at 100 MHz
+    movl $10000000, 0x380(%rdi)     // initial count: 100 ms at 100 MHz (nested guests exit slowly)
 5:  sti
     hlt
     cli
@@ -569,11 +572,11 @@ extern "C" fn kmain(start_info: usize) -> ! {
     }
     HEAP.init(&FRAMES);
 
-    let hsave = FRAMES.lock().alloc(0).expect("host save area");
-    match svm::enable(hsave.0) {
-        Ok(()) => println!("[svm]   SVM on, nested paging available, host save area {:#x}", hsave.0),
+    match backend::enable() {
+        Ok(Backend::Svm) => println!("[svm]   SVM on, nested paging available"),
+        Ok(Backend::Vmx) => println!("[vmx]   VMX on: EPT, VPID and unrestricted guest available"),
         Err(e) => {
-            println!("[svm]   cannot enable SVM: {e:?} (run QEMU with -cpu max)");
+            println!("[hyp]   {e}");
             shutdown()
         }
     }
@@ -601,12 +604,18 @@ extern "C" fn kmain(start_info: usize) -> ! {
         fp_demo();
         if ncpus > 1 {
             start_host_cpu(1);
+            if backend::backend() == Backend::Vmx {
+                migrate_demo();
+            }
             smp_demo();
         } else {
             println!("[smp]   one host CPU: skipping the SMP guest (run QEMU with -smp 2)");
         }
     }
 
+    if HOST_NMIS.load(Ordering::Relaxed) > 0 {
+        println!("[hyp]   host NMIs taken: {}", HOST_NMIS.load(Ordering::Relaxed));
+    }
     println!("[done]  {} free frames; shutting down", FRAMES.lock().free_frames());
     shutdown()
 }
@@ -618,6 +627,8 @@ const GUEST_IOAPIC: u64 = 0xfec0_0000;
 /// The emulated local APIC timer's input clock.
 const LAPIC_TIMER_HZ: u64 = 100_000_000;
 
+/// NMIs the host took (injected from QEMU's monitor, say), during guest runs or not.
+static HOST_NMIS: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 
 static LAPIC: Once<LocalApic> = Once::new();
@@ -648,7 +659,7 @@ fn start_host_cpu(cpu: usize) {
     while ONLINE.load(Ordering::Acquire) <= cpu {
         core::hint::spin_loop();
     }
-    println!("[smp]   host CPU {cpu} (APIC id {id}) online with SVM on");
+    println!("[smp]   host CPU {cpu} (APIC id {id}) online with {:?} on", backend::backend());
 }
 
 /// Rust entry of the second host CPU: SVM on, then run vCPUs it is given.
@@ -659,8 +670,7 @@ extern "C" fn ap_main(cpu: usize) -> ! {
     // SAFETY: we are on the stack the boot CPU allocated for us.
     unsafe { trap::install() };
     LAPIC.get().expect("LAPIC initialised").enable(SPURIOUS_VECTOR);
-    let hsave = FRAMES.lock().alloc(0).expect("host save area");
-    svm::enable(hsave.0).expect("SVM on the second CPU");
+    backend::enable().expect("virtualization on the second CPU");
     irq::enable();
     ONLINE.fetch_add(1, Ordering::Release);
     loop {
@@ -681,7 +691,40 @@ extern "C" fn ap_main(cpu: usize) -> ! {
                 core::hint::spin_loop();
             }
         }
+        let job = JOB.lock().take();
+        if let Some(job) = job {
+            job();
+            JOBS_DONE.fetch_add(1, Ordering::Release);
+        }
         core::hint::spin_loop();
+    }
+}
+
+/// Work for the second host CPU, run by its idle loop.
+static JOB: IrqSpinLock<Option<Box<dyn FnOnce() + Send>>> = IrqSpinLock::new(None);
+static JOBS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+/// Runs `f` on host CPU 1 and waits for it to finish.
+fn on_cpu1(f: impl FnOnce() + Send) {
+    let before = JOBS_DONE.load(Ordering::Acquire);
+    let job: Box<dyn FnOnce() + Send + '_> = Box::new(f);
+    // SAFETY: this function waits for the job, so whatever it borrows outlives it.
+    let job: Box<dyn FnOnce() + Send + 'static> = unsafe { core::mem::transmute(job) };
+    *JOB.lock() = Some(job);
+    while JOBS_DONE.load(Ordering::Acquire) == before {
+        core::hint::spin_loop();
+    }
+}
+
+/// A pointer the second host CPU may use while this one waits for it.
+struct Handoff<T>(*mut T);
+
+// SAFETY: only used by `on_cpu1` callers that wait, with nothing else touching the target.
+unsafe impl<T> Send for Handoff<T> {}
+
+impl<T> Handoff<T> {
+    fn get(&self) -> *mut T {
+        self.0
     }
 }
 
@@ -716,13 +759,12 @@ fn guest_demo() {
         let start = &raw const x86_guest;
         core::slice::from_raw_parts(start, (&raw const x86_guest_end).offset_from(start) as usize)
     };
-    mem.write(GuestPhysAddr(GUEST_ENTRY), image).expect("write failed");
+    backend::load(&mem, GUEST_ENTRY, image);
 
     // Nested page table: guest-physical 0..2 MiB onto the block. NPT walks
     // are user accesses, so the leaves need USER.
-    let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
-    let flags = MapFlags::RW | MapFlags::EXEC | MapFlags::USER;
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, flags).expect("map_range failed");
+    let mut npt = Stage2::new();
+    npt.map_ram(0, ram.0, len);
 
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let out = line.clone();
@@ -750,12 +792,11 @@ fn guest_demo() {
     let mmio = Bus::new();
     mmio.insert(GUEST_MMIO_UART, 8, Arc::new(Uart16550Model::new(console))).expect("insert failed");
 
-    let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
-    // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-    let mut vcpu =
-        unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
-            .with_memory(mem.clone())
-            .with_irq_line(intr);
+    let pages = Pages::alloc();
+    // SAFETY: fresh blocks of the required sizes, owned by the vCPU.
+    let mut vcpu = unsafe { Cpu::new(pages, npt.root(), GUEST_ENTRY as u32, len as u32) }
+        .with_memory(mem.clone())
+        .with_irq_line(intr);
     // The PIC's output is the vCPU's INTR line; delivery acknowledges it.
     let p = pic.clone();
     vcpu.connect_intr(move || p.acknowledge());
@@ -791,8 +832,8 @@ fn guest_demo() {
     });
     println!(
         "[hyp]   guest exit {exit:?}: {hypercalls} hypercall, LSR {:#x} (port) {:#x} (MMIO); {halts} halts, TSC {} MHz",
-        vcpu.regs.rdi,
-        vcpu.regs.rcx,
+        vcpu.reg(7),
+        vcpu.reg(1),
         TSC_HZ.load(Ordering::Relaxed) / 1_000_000
     );
 
@@ -801,12 +842,8 @@ fn guest_demo() {
     drop(mem);
     // SAFETY: the guest has stopped; nothing references these blocks.
     unsafe {
-        let mut f = FRAMES.lock();
-        f.dealloc(PhysAddr::new(vmcb.1), 0);
-        f.dealloc(PhysAddr::new(iopm.1), 2);
-        f.dealloc(PhysAddr::new(msrpm.1), 1);
-        f.dealloc(PhysAddr::new(host.1), 0);
-        f.dealloc(ram, GUEST_RAM_ORDER);
+        pages.free();
+        FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER);
     }
 }
 
@@ -820,36 +857,32 @@ fn fp_demo() {
     // and the guests until it is freed below.
     unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image.
-    mem.write(GuestPhysAddr(GUEST_ENTRY), unsafe { image(&fp_guest, &fp_guest_end) }).expect("write failed");
+    backend::load(&mem, GUEST_ENTRY, unsafe { image(&fp_guest, &fp_guest_end) });
     let mem = Arc::new(mem);
-    let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER)
-        .expect("map_range failed");
+    let mut npt = Stage2::new();
+    npt.map_ram(0, ram.0, len);
     let (mmio, pio) = (Bus::new(), Bus::new());
 
     let mut pages = Vec::new();
-    let mut vcpus: Vec<SvmVcpu> = (1..=2)
+    let mut vcpus: Vec<Cpu> = (1..=2)
         .map(|input| {
-            let p = (block(0), block(2), block(1), block(0));
+            let p = Pages::alloc();
             pages.push(p);
-            let (vmcb, iopm, msrpm, host) = p;
-            // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-            let mut v = unsafe {
-                SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32)
-            }
-            .with_memory(mem.clone())
-            .with_fp_switching();
-            v.regs.rdi = input;
+            // SAFETY: fresh blocks of the required sizes, owned by the vCPU.
+            let mut v = unsafe { Cpu::new(p, npt.root(), GUEST_ENTRY as u32, len as u32) }
+                .with_memory(mem.clone())
+                .with_fp_switching();
+            v.set_reg(7, input);
             v
         })
         .collect();
-    let step = |v: &mut SvmVcpu| {
+    let step = |v: &mut Cpu| {
         let exit = run_vcpu(v, &mmio, &pio, |_, exit| match exit {
             VmExit::Hypercall { nr: 2 | 3, .. } => ControlFlow::Break(exit),
             VmExit::ExternalInterrupt => ControlFlow::Continue(()),
             other => ControlFlow::Break(other),
         });
-        (exit, v.regs.rbx)
+        (exit, v.reg(3))
     };
     let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
     let is = |s: &(VmExit, u64), n| matches!(s.0, VmExit::Hypercall { nr, .. } if nr == n);
@@ -865,14 +898,70 @@ fn fp_demo() {
     drop(mem);
     // SAFETY: the guests have stopped; nothing references these blocks.
     unsafe {
-        let mut f = FRAMES.lock();
-        for (vmcb, iopm, msrpm, host) in pages {
-            f.dealloc(PhysAddr::new(vmcb.1), 0);
-            f.dealloc(PhysAddr::new(iopm.1), 2);
-            f.dealloc(PhysAddr::new(msrpm.1), 1);
-            f.dealloc(PhysAddr::new(host.1), 0);
+        for p in pages {
+            p.free();
         }
-        f.dealloc(ram, GUEST_RAM_ORDER);
+        FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER);
+    }
+}
+
+/// Runs one vCPU of the SSE guest on host CPU 0 up to its yield and on host
+/// CPU 1 from there on: VMX binds a VMCS to the CPU that runs it, so the
+/// vCPU is released after each run. Its registers, x87/SSE state and
+/// pending event state have to arrive intact.
+fn migrate_demo() {
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guest until it is freed below.
+    unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image.
+    backend::load(&mem, GUEST_ENTRY, unsafe { image(&fp_guest, &fp_guest_end) });
+    let mem = Arc::new(mem);
+    let mut npt = Stage2::new();
+    npt.map_ram(0, ram.0, len);
+    let (mmio, pio) = (Bus::new(), Bus::new());
+    let pages = Pages::alloc();
+    // SAFETY: fresh blocks of the required sizes, owned by the vCPU.
+    let mut vcpu = unsafe { Cpu::new(pages, npt.root(), GUEST_ENTRY as u32, len as u32) }
+        .with_memory(mem.clone())
+        .with_fp_switching()
+        .with_migration();
+    vcpu.set_reg(7, 1);
+    let step = |v: &mut Cpu| {
+        let exit = run_vcpu(v, &mmio, &pio, |_, exit| match exit {
+            VmExit::Hypercall { nr: 2 | 3, .. } => ControlFlow::Break(exit),
+            VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+            other => ControlFlow::Break(other),
+        });
+        (exit, v.reg(3), cpu::current_id())
+    };
+    let first = step(&mut vcpu);
+    let mut second = None;
+    let (v, out) = (Handoff(&raw mut vcpu), Handoff(&raw mut second));
+    on_cpu1(move || {
+        // SAFETY: the boot CPU waits in `on_cpu1` and touches neither.
+        unsafe { *out.get() = Some(step(&mut *v.get())) };
+    });
+    let second = second.expect("the job ran");
+    let is = |s: &(VmExit, u64, usize), n| matches!(s.0, VmExit::Hypercall { nr, .. } if nr == n);
+    let fine = is(&first, 2) && is(&second, 3) && (first.2, second.2) == (0, 1) && second.1 == 12;
+    println!(
+        "[hyp]   vCPU moved from host CPU {} to {} between runs, SSE result {} (expected 12){}",
+        first.2,
+        second.2,
+        second.1,
+        if fine { "" } else { "; MISMATCH" }
+    );
+
+    drop(vcpu);
+    drop(npt);
+    drop(mem);
+    // SAFETY: the guest has stopped; nothing references these blocks.
+    unsafe {
+        pages.free();
+        FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER);
     }
 }
 
@@ -890,7 +979,7 @@ fn long_mode_demo() {
         let start = &raw const lm_guest;
         core::slice::from_raw_parts(start, (&raw const lm_guest_end).offset_from(start) as usize)
     };
-    mem.write(GuestPhysAddr(GUEST_ENTRY), image).expect("write failed");
+    backend::load(&mem, GUEST_ENTRY, image);
     // Guest page tables: PML4 0x1000 -> PDPT 0x2000. PDPT[0] -> PD 0x3000
     // mapping 0..2 MiB (RAM); PDPT[3] -> PD 0x4000 mapping the 2 MiB page
     // holding the MMIO UART, uncached.
@@ -904,9 +993,8 @@ fn long_mode_demo() {
     pte(0x4000 + ((GUEST_LAPIC >> 21) & 0x1ff) * 8, (GUEST_LAPIC & !0x1f_ffff) | 0x9b);
     let mem = Arc::new(mem);
 
-    let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER)
-        .expect("map_range failed");
+    let mut npt = Stage2::new();
+    npt.map_ram(0, ram.0, len);
 
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let out = line.clone();
@@ -947,12 +1035,11 @@ fn long_mode_demo() {
     let pio = Bus::new();
     pio.insert(0x3f8, 8, com1.clone()).expect("insert failed");
 
-    let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
-    // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-    let mut vcpu =
-        unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
-            .with_memory(mem.clone())
-            .with_irq_line(intr);
+    let pages = Pages::alloc();
+    // SAFETY: fresh blocks of the required sizes, owned by the vCPU.
+    let mut vcpu = unsafe { Cpu::new(pages, npt.root(), GUEST_ENTRY as u32, len as u32) }
+        .with_memory(mem.clone())
+        .with_irq_line(intr);
     vcpu.set_long_mode(0x1000);
     let a = apic.clone();
     vcpu.connect_intr(move || a.acknowledge());
@@ -978,19 +1065,15 @@ fn long_mode_demo() {
         VmExit::ExternalInterrupt => ControlFlow::Continue(()),
         other => ControlFlow::Break(other),
     });
-    println!("[hyp]   64-bit guest exit {exit:?}, LSR {:#x} in r12", vcpu.regs.r12);
+    println!("[hyp]   64-bit guest exit {exit:?}, LSR {:#x} in r12", vcpu.reg(12));
 
     drop(vcpu);
     drop(npt);
     drop(mem);
     // SAFETY: the guest has stopped; nothing references these blocks.
     unsafe {
-        let mut f = FRAMES.lock();
-        f.dealloc(PhysAddr::new(vmcb.1), 0);
-        f.dealloc(PhysAddr::new(iopm.1), 2);
-        f.dealloc(PhysAddr::new(msrpm.1), 1);
-        f.dealloc(PhysAddr::new(host.1), 0);
-        f.dealloc(ram, GUEST_RAM_ORDER);
+        pages.free();
+        FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER);
     }
 }
 
@@ -1004,7 +1087,7 @@ fn image(start: &u8, end: &u8) -> &'static [u8] {
 struct SmpVm {
     cpus: Arc<GuestCpus>,
     mem: Arc<GuestMemory>,
-    ncr3: u64,
+    stage2: u64,
     ram_len: u64,
     pio: Bus,
     /// Per vCPU: its MMIO bus (its own local APIC), its INTR line, its APIC.
@@ -1026,19 +1109,18 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             core::hint::spin_loop();
             continue;
         };
-        let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
-        // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-        let mut v =
-            unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, vm.ncr3, entry as u32, vm.ram_len as u32) }
-                .with_memory(vm.mem.clone())
-                .with_irq_line(vm.lines[me].clone());
+        let pages = Pages::alloc();
+        // SAFETY: fresh blocks of the required sizes, owned by the vCPU.
+        let mut v = unsafe { Cpu::new(pages, vm.stage2, entry as u32, vm.ram_len as u32) }
+            .with_memory(vm.mem.clone())
+            .with_irq_line(vm.lines[me].clone());
         v.set_apic_id(me as u8);
         if me > 0 {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
         }
         let a = vm.apics[me].get().expect("get returned None").clone();
         v.connect_intr(move || a.acknowledge());
-        vm.cpus.attach_svm(me, &mut v);
+        v.attach(&vm.cpus, me);
         let exit = run_vcpu(&mut v, &vm.buses[me], &vm.pio, |v, exit| match exit {
             VmExit::Hypercall { nr: 1 | 2, .. } => ControlFlow::Break(exit),
             VmExit::Halt => loop {
@@ -1059,13 +1141,7 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
         });
         drop(v);
         // SAFETY: the vCPU that owned these blocks is gone.
-        unsafe {
-            let mut f = FRAMES.lock();
-            f.dealloc(PhysAddr::new(vmcb.1), 0);
-            f.dealloc(PhysAddr::new(iopm.1), 2);
-            f.dealloc(PhysAddr::new(msrpm.1), 1);
-            f.dealloc(PhysAddr::new(host.1), 0);
-        }
+        unsafe { pages.free() };
         match exit {
             VmExit::Hypercall { nr: 2, .. } => vm.cpus.stopped(me),
             VmExit::Hypercall { nr: 1, .. } => vm.done.store(true, Ordering::Release),
@@ -1095,11 +1171,10 @@ fn smp_demo() {
     unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the two images.
     let (bsp, ap) = unsafe { (image(&smp_bsp, &smp_bsp_end), image(&smp_ap, &smp_ap_end)) };
-    mem.write(GuestPhysAddr(GUEST_ENTRY), bsp).expect("write failed");
-    mem.write(GuestPhysAddr(0x8000), ap).expect("write failed");
-    let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER)
-        .expect("map_range failed");
+    backend::load(&mem, GUEST_ENTRY, bsp);
+    backend::load(&mem, 0x8000, ap);
+    let mut npt = Stage2::new();
+    npt.map_ram(0, ram.0, len);
 
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let com1 = Arc::new(Uart16550Model::new(move |b| {
@@ -1154,7 +1229,7 @@ fn smp_demo() {
     let vm = SmpVm {
         cpus,
         mem: Arc::new(mem),
-        ncr3: npt.root().0,
+        stage2: npt.root(),
         ram_len: len,
         pio,
         buses,
@@ -1187,6 +1262,11 @@ fn on_trap(frame: &mut TrapFrame) {
         // A kick, or the host tick that makes a busy guest exit.
         KICK_VECTOR | kernel::HOST_TICK_VECTOR => return LAPIC.get().expect("LAPIC initialised").eoi(),
         SPURIOUS_VECTOR => return,
+        // An NMI that arrived while a guest ran is the host's: count it.
+        2 => {
+            HOST_NMIS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         _ => {}
     }
     panic!("unexpected trap {:?} at rip {:#x}, error {:#x}", frame.cause(), frame.pc(), frame.error_code)

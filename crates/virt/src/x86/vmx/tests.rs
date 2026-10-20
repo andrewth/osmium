@@ -233,16 +233,34 @@ fn control_registers() {
 #[test]
 fn debug_registers_and_reflected_exits() {
     let mut v = vcpu();
-    // mov dr0, rbx reads zero; mov dr7, rcx is remembered without arming anything.
+    // Until the guest touches a debug register, MOV DR exits.
+    let no_exit = |v: &VmxVcpu| v.read(vmcs::PROC_CTLS) & caps::proc::MOV_DR as u64 == 0;
+    v.prepare_entry();
+    assert!(!no_exit(&v));
+    // mov dr0, rbx; mov rax, dr0; mov dr7, rcx.
     v.regs.rbx = 0x1234;
-    exit_with(&mut v, exit::DR_ACCESS, 0x10 | 3 << 8, 3);
+    exit_with(&mut v, exit::DR_ACCESS, 3 << 8, 3);
     assert!(v.reflect(exit::DR_ACCESS));
-    assert_eq!(v.regs.rbx, 0);
+    exit_with(&mut v, exit::DR_ACCESS, 0x10, 3);
+    assert!(v.reflect(exit::DR_ACCESS));
+    assert_eq!(v.regs.rax, 0x1234);
     v.regs.rcx = 0x455;
     exit_with(&mut v, exit::DR_ACCESS, 7 | 1 << 8, 3);
     assert!(v.reflect(exit::DR_ACCESS));
-    assert_eq!(v.dr7, 0x455);
-    assert_eq!(v.read(vmcs::GUEST_DR7), 0x400, "the real DR7 stays disarmed");
+    assert_eq!(v.read(vmcs::GUEST_DR7), 0x455);
+    assert_eq!(v.debug_registers().0[0], 0x1234);
+    // The registers are the hardware's from then on.
+    v.prepare_entry();
+    assert!(no_exit(&v));
+    // A non-canonical breakpoint address and a wide DR7 are #GP.
+    v.regs.rbx = 1 << 50;
+    exit_with(&mut v, exit::DR_ACCESS, 3 << 8, 3);
+    assert!(v.reflect(exit::DR_ACCESS));
+    assert_eq!(v.pending_exception.take(), Some(GP));
+    v.regs.rcx = 1 << 32;
+    exit_with(&mut v, exit::DR_ACCESS, 7 | 1 << 8, 3);
+    assert!(v.reflect(exit::DR_ACCESS));
+    assert_eq!(v.pending_exception.take(), Some(GP));
 
     for code in [exit::VMCLEAR, exit::VMXON, exit::INVEPT, exit::INVVPID, exit::XSETBV, exit::MWAIT, exit::MONITOR] {
         assert!(v.reflect(code));
@@ -266,6 +284,34 @@ fn debug_registers_and_reflected_exits() {
     assert!(!v.reflect(exit::EXCEPTION_NMI));
     assert_eq!(v.classify(), VmExit::ExternalInterrupt);
     assert!(!v.reflect(exit::HLT));
+}
+
+#[test]
+fn guest_breakpoints_are_reflected() {
+    let mut v = vcpu();
+    // DR0 armed for execution (L0, RW0 = 0) and DR1 for writes (L1, RW1 = 1).
+    v.set_debug_registers([0x1000, 0x2000, 0, 0], 0, 0x1 | 0x4 | 1 << 20);
+    assert_eq!(v.read(vmcs::GUEST_DR7), 0x1 | 0x4 | 1 << 20 | 0x400);
+    v.prepare_entry();
+    assert_eq!(v.read(vmcs::PROC_CTLS) & caps::proc::MOV_DR as u64, 0);
+    let db = |v: &mut VmxVcpu, q: u64| {
+        v.write(vmcs::EXIT_INTR_INFO, EVENT_VALID | 3 << 8 | 1);
+        v.write(vmcs::EXIT_QUAL, q);
+        assert!(v.reflect(exit::EXCEPTION_NMI));
+        assert_eq!(v.pending_exception.take(), Some(1 | 3 << 8 | EVENT_VALID));
+    };
+    // The instruction breakpoint is a fault, so RF keeps it from firing again.
+    db(&mut v, 1);
+    assert_eq!(v.debug_registers().1 & 0xf, 1);
+    assert_ne!(v.rflags() & RFLAGS_RF, 0);
+    // A data breakpoint is a trap.
+    v.write(vmcs::GUEST_RFLAGS, 2);
+    db(&mut v, 2);
+    assert_eq!(v.rflags() & RFLAGS_RF, 0);
+    // General detect disarms itself.
+    v.write(vmcs::GUEST_DR7, 0x400 | 1 << 13);
+    db(&mut v, 1 << 13);
+    assert_eq!(v.read(vmcs::GUEST_DR7), 0x400);
 }
 
 #[test]
@@ -453,7 +499,7 @@ fn mov_dr_needs_ring_0() {
     let rip = v.rip();
     assert!(v.reflect(exit::DR_ACCESS));
     assert_eq!(v.pending_exception.take(), Some(GP));
-    assert_eq!((v.dr7, v.rip()), (0x400, rip), "nothing changed, not stepped over");
+    assert_eq!((v.read(vmcs::GUEST_DR7), v.rip()), (0x400, rip), "nothing changed, not stepped over");
     // With CR4.DE, DR4 and DR5 do not exist.
     v.write(vmcs::GUEST_AR + 2 * Seg::Ss as u32, 0x93);
     v.set_cr4(CR4_DE);

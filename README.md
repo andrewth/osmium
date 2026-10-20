@@ -127,7 +127,8 @@ features.
   enabled (`neon`, `d`). Soft-float kernels are unaffected.
 - The hypervisor has RISC-V H, AArch64 EL2, AMD SVM and Intel VMX backends.
   The VMX backend has only run under nested KVM (QEMU's TCG does not emulate
-  VMX); none of the backends has run on physical hardware.
+  VMX); `x86_64-hyp` uses SVM or VMX, whichever the CPU has. None of the
+  backends has run on physical hardware.
 - When the heap is backed by `LockedFrames`, it can return large blocks to
   the frame allocator only if the mapper implements `virt_to_phys`
   (`OffsetMapper` does).

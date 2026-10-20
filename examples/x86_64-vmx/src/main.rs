@@ -80,10 +80,42 @@ vmx_guest:
     xor %eax, %eax
     rdmsr
     mov %eax, %esi
-    mov $1, %eax                    // vmcall 1: done (edi, ebx, ebp, esi report)
+    call 7f                         // a hardware breakpoint: GDT and IDT first
+7:  pop %eax                        // eax = 7b
+    movl $0, 0x3200
+    movl $0, 0x3204
+    movl $0x0000ffff, 0x3208        // GDT entry 1: flat 32-bit code
+    movl $0x00cf9b00, 0x320c
+    lgdt (gdtr - 7b)(%eax)
+    lea (db_handler - 7b)(%eax), %edx
+    movw %dx, 0x3008                // IDT vector 1: interrupt gate to db_handler
+    movw $0x08, 0x300a
+    movw $0x8e00, 0x300c
+    shr $16, %edx
+    movw %dx, 0x300e
+    lidt (idtr - 7b)(%eax)
+    lea (bp_target - 7b)(%eax), %eax
+    mov %eax, %dr0                  // the first debug register access exits
+    mov $0x401, %eax                // L0, break on execution
+    mov %eax, %dr7                  // after that they are the hardware's
+    xor %edx, %edx
+bp_target:
+    nop                             // #DB here, once
+    xor %eax, %eax
+    mov %eax, %dr7
+    mov $1, %eax                    // vmcall 1: done (edi, ebx, ebp, esi, edx report)
     vmcall
 6:  hlt
     jmp 6b
+db_handler:
+    inc %edx
+    iret
+gdtr:
+    .word 0xf
+    .long 0x3200
+idtr:
+    .word 0xf
+    .long 0x3000
 9:  .asciz "[guest] hello from VMX over port I/O\n"
     .asciz "[guest] and over MMIO (EPT violations)\n"
 vmx_guest_end:
@@ -245,6 +277,7 @@ fn guest_demo() {
         "[hyp]   guest exit {exit:?}: {hypercalls} hypercall, LSR {:#x} (port) {:#x} (MMIO); KERNEL_GS_BASE {:#x}",
         r.rdi, r.rbx, r.rsi
     );
+    println!("[hyp]   guest hardware breakpoint hit {} time(s)", r.rdx);
     // CPUID.1:ECX as the guest saw it: hypervisor bit set, VMX (bit 5) clear.
     println!(
         "[hyp]   guest CPUID.1:ECX {:#x}: VMX {}",

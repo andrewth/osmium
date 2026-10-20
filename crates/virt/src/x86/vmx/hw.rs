@@ -228,11 +228,194 @@ fn load(v: &mut VmxVcpu) {
     CURRENT[cpu].store(0, Ordering::Relaxed);
     make_current(pa);
     v.vmcs.loaded = true;
+    v.vmcs.forget_all();
     v.cpu = Some(cpu);
+    v.host_cache = None;
     for (f, val) in core::mem::take(&mut v.vmcs.pending) {
-        vmwrite(pa, f, val);
+        // Exit information (field type 1) is read-only.
+        if f >> 10 & 3 != 1 {
+            vmwrite(pa, f, val);
+        }
     }
 }
+
+/// Every field the vCPU writes, plus the exit information it reads, for
+/// [`unbind`] to carry to another CPU.
+fn fields() -> impl Iterator<Item = u32> {
+    use vmcs::*;
+    let single = [
+        VPID,
+        MSR_BITMAP,
+        EXIT_MSR_STORE_ADDR,
+        EXIT_MSR_LOAD_ADDR,
+        ENTRY_MSR_LOAD_ADDR,
+        EPTP,
+        GUEST_PHYS_ADDR,
+        LINK_POINTER,
+        GUEST_DEBUGCTL,
+        GUEST_PAT,
+        GUEST_EFER,
+        PIN_CTLS,
+        PROC_CTLS,
+        EXCEPTION_BITMAP,
+        PF_MASK,
+        PF_MATCH,
+        CR3_TARGET_COUNT,
+        EXIT_CTLS,
+        EXIT_MSR_STORE_COUNT,
+        EXIT_MSR_LOAD_COUNT,
+        ENTRY_CTLS,
+        ENTRY_MSR_LOAD_COUNT,
+        ENTRY_INTR_INFO,
+        ENTRY_ERRCODE,
+        ENTRY_INSN_LEN,
+        PROC2_CTLS,
+        INSN_ERROR,
+        EXIT_REASON,
+        EXIT_INTR_INFO,
+        EXIT_INTR_ERRCODE,
+        EXIT_INSN_LEN,
+        GUEST_GDTR_LIMIT,
+        GUEST_IDTR_LIMIT,
+        GUEST_INTERRUPTIBILITY,
+        GUEST_ACTIVITY,
+        GUEST_SYSENTER_CS,
+        CR0_MASK,
+        CR4_MASK,
+        CR0_SHADOW,
+        CR4_SHADOW,
+        EXIT_QUAL,
+        GUEST_CR0,
+        GUEST_CR3,
+        GUEST_CR4,
+        GUEST_GDTR_BASE,
+        GUEST_IDTR_BASE,
+        GUEST_DR7,
+        GUEST_RSP,
+        GUEST_RIP,
+        GUEST_RFLAGS,
+        GUEST_PENDING_DBG,
+        GUEST_SYSENTER_ESP,
+        GUEST_SYSENTER_EIP,
+    ];
+    let segments = (0..8).flat_map(|i| [GUEST_SEL, GUEST_LIMIT, GUEST_AR, GUEST_BASE].map(|f| f + 2 * i));
+    single.into_iter().chain(segments).chain((0..4).map(|i| GUEST_PDPTE0 + 2 * i))
+}
+
+/// Releases `v`'s VMCS from this CPU so that any CPU can run the vCPU next:
+/// the fields move into memory (where [`VmxVcpu::read`] and `write` still
+/// reach them), the VMCS is cleared, and the next run launches it afresh on
+/// whichever CPU that is. Call on the CPU the vCPU is bound to.
+pub(super) fn unbind(v: &mut VmxVcpu) {
+    if !v.vmcs.loaded {
+        return;
+    }
+    let cpu = osmium_arch::cpu::current_id();
+    assert_eq!(v.cpu, Some(cpu), "a VMX vCPU is unbound on the CPU it is bound to");
+    let flags: u64;
+    // SAFETY: reads RFLAGS, then no host code runs between the VMCS reads
+    // and the VMCLEAR that could make another VMCS current.
+    unsafe {
+        asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem));
+    }
+    let pa = v.vmcs.pa;
+    v.saved_vectoring = Some((vmread(pa, vmcs::IDT_VECTORING_INFO), vmread(pa, vmcs::IDT_VECTORING_ERRCODE)));
+    for f in fields() {
+        v.vmcs.pending.insert(f, vmread(pa, f));
+    }
+    // SAFETY: `pa` is a VMCS page with the right revision identifier.
+    unsafe { asm!("vmclear [{}]", in(reg) &pa, options(nostack)) };
+    CURRENT[cpu].store(0, Ordering::Relaxed);
+    v.vmcs.loaded = false;
+    v.vmcs.forget_all();
+    v.cpu = None;
+    v.launched = false;
+    // The next CPU may hold translations from an earlier stay.
+    v.flush = true;
+    if flags & (1 << 9) != 0 {
+        // SAFETY: restores the caller's interrupt state.
+        unsafe { asm!("sti", options(nomem, nostack)) };
+    }
+}
+
+/// Clears `v`'s VMCS from this CPU if it is active here, so that its page
+/// can be reused: an active VMCS may be written back to memory at any time.
+pub(super) fn release(v: &mut VmxVcpu) {
+    let cpu = osmium_arch::cpu::current_id();
+    if v.vmcs.loaded && v.cpu == Some(cpu) {
+        let pa = v.vmcs.pa;
+        // SAFETY: `pa` is a VMCS page with the right revision identifier.
+        unsafe { asm!("vmclear [{}]", in(reg) &pa, options(nostack)) };
+        CURRENT[cpu].store(0, Ordering::Relaxed);
+        v.vmcs.loaded = false;
+        v.vmcs.forget_all();
+    }
+}
+
+/// Runs the host's NMI handler as the CPU would have: on this stack, with a
+/// frame of SS, RSP, RFLAGS, CS and a return RIP, which the handler's
+/// `iretq` pops. (The VM exit already blocked NMIs until that `iretq`.) The
+/// gate's stack-table slot is not honoured.
+///
+/// # Safety
+/// `idt` is the loaded IDT; interrupts are off.
+unsafe fn deliver_nmi(idt: u64) {
+    // SAFETY: vector 2's 16-byte gate is in the loaded IDT.
+    let g = unsafe { ((idt + 2 * 16) as *const [u16; 6]).read_unaligned() };
+    if g[2] & 0x8000 == 0 {
+        return; // not present: the host has no NMI handler
+    }
+    let handler = g[0] as u64 | (g[3] as u64) << 16 | (g[4] as u64 | (g[5] as u64) << 16) << 32;
+    // SAFETY: the handler follows the interrupt convention and preserves
+    // every register but RSP, which its `iretq` restores.
+    unsafe {
+        asm!(
+            "mov {old}, rsp",
+            "and rsp, -16",
+            "mov {t:e}, ss",
+            "push {t}",
+            "push {old}",
+            "pushfq",
+            "push {cs}",
+            "lea {t}, [rip + 2f]",
+            "push {t}",
+            "jmp {h}",
+            "2:",
+            old = out(reg) _, t = out(reg) _, cs = in(reg) g[1] as u64, h = in(reg) handler,
+        )
+    }
+}
+
+/// The host's debug registers `DR0`-`DR3` and `DR6`.
+struct HostDr([u64; 4], u64);
+
+impl HostDr {
+    fn save() -> Self {
+        let (d0, d1, d2, d3, d6): (u64, u64, u64, u64, u64);
+        // SAFETY: reading debug registers has no side effects.
+        unsafe {
+            asm!("mov {}, dr0", "mov {}, dr1", "mov {}, dr2", "mov {}, dr3", "mov {}, dr6",
+                out(reg) d0, out(reg) d1, out(reg) d2, out(reg) d3, out(reg) d6,
+                options(nomem, nostack, preserves_flags));
+        }
+        Self([d0, d1, d2, d3], d6)
+    }
+
+    /// # Safety
+    /// `DR7` must not arm the addresses being loaded (or they must be meant).
+    unsafe fn load(&self) {
+        // SAFETY: as the caller says.
+        unsafe {
+            asm!("mov dr0, {}", "mov dr1, {}", "mov dr2, {}", "mov dr3, {}", "mov dr6, {}",
+                in(reg) self.0[0], in(reg) self.0[1], in(reg) self.0[2], in(reg) self.0[3], in(reg) self.1,
+                options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+const IA32_DEBUGCTL: u32 = 0x1d9;
+/// `DR7` with nothing armed, which is also what a VM exit leaves.
+const DR7_IDLE: u64 = 0x400;
 
 #[repr(C, packed)]
 struct DescTable {
@@ -253,11 +436,25 @@ fn segment_selectors() -> [u16; 6] {
     s
 }
 
+/// Host-state fields [`write_host_state`] writes.
+const HOST_FIELDS: usize = 24;
+
 /// Writes the host state a VM exit restores, and refreshes the host's MSR list.
+/// A field is written only if it differs from the last run's (a `VMWRITE` can
+/// cost a VM exit when this host itself runs under a hypervisor).
 /// Returns the GDTR and IDTR to put back (VM exit leaves their limits at 0xffff).
 fn write_host_state(v: &mut VmxVcpu) -> (DescTable, DescTable) {
     let pa = v.vmcs.pa;
-    let w = |f, x: u64| vmwrite(pa, f, x);
+    let fresh = v.host_cache.is_none();
+    let mut cache = v.host_cache.take().unwrap_or([0; HOST_FIELDS]);
+    let mut n = 0;
+    let mut w = |f, x: u64| {
+        if fresh || cache[n] != x {
+            vmwrite(pa, f, x);
+            cache[n] = x;
+        }
+        n += 1;
+    };
     let (mut gdt, mut idt) = (DescTable { limit: 0, base: 0 }, DescTable { limit: 0, base: 0 });
     let (cr0, cr3, cr4): (u64, u64, u64);
     let tr: u16;
@@ -300,6 +497,7 @@ fn write_host_state(v: &mut VmxVcpu) -> (DescTable, DescTable) {
     w(vmcs::HOST_GDTR_BASE, gdt.base);
     w(vmcs::HOST_IDTR_BASE, idt.base);
     w(vmcs::HOST_RIP, osmium_vmx_exit as *const () as u64);
+    v.host_cache = Some(cache);
     (gdt, idt)
 }
 
@@ -310,7 +508,11 @@ pub(super) fn run(v: &mut VmxVcpu) -> Result<(), ()> {
     if !v.vmcs.loaded {
         load(v);
     }
-    assert_eq!(v.cpu, Some(cpu), "a VMX vCPU runs only on the CPU it was first run on");
+    assert_eq!(
+        v.cpu,
+        Some(cpu),
+        "a VMX vCPU runs only on the CPU it is bound to; unbind it first or use with_migration"
+    );
     let flags: u64;
     // SAFETY: reads RFLAGS.
     unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
@@ -327,6 +529,12 @@ pub(super) fn run(v: &mut VmxVcpu) -> Result<(), ()> {
         }
     }
     let (gdt, idt) = write_host_state(v);
+    // VM exit disarms DR7 and clears DEBUGCTL; put the host's back after.
+    let host_dr7: u64;
+    // SAFETY: reading DR7 has no side effects.
+    unsafe { asm!("mov {}, dr7", out(reg) host_dr7, options(nomem, nostack, preserves_flags)) };
+    // SAFETY: DEBUGCTL exists wherever VMX does.
+    let host_ctl = unsafe { x86::rdmsr(IA32_DEBUGCTL) };
     let resume = core::mem::replace(&mut v.launched, true) as u64;
     // SAFETY: the guest's registers are in `v.regs`; the assembly preserves
     // every callee-saved register. FXSAVE/FXRSTOR switch x87/SSE state, which
@@ -335,7 +543,26 @@ pub(super) fn run(v: &mut VmxVcpu) -> Result<(), ()> {
         if v.switch_fp {
             asm!("fxrstor64 [{}]", in(reg) v.fpu.0.as_ptr(), options(nostack, readonly));
         }
+        // The guest has debug registers of its own: disarm the host's before
+        // its addresses are replaced.
+        let host_dr = v.dr_switch.then(|| {
+            asm!("mov dr7, {}", in(reg) DR7_IDLE, options(nomem, nostack, preserves_flags));
+            let host = HostDr::save();
+            HostDr(v.dr, v.dr6).load();
+            host
+        });
         let failed = osmium_vmx_run(&mut v.regs, resume) != 0;
+        if let Some(host) = host_dr {
+            let guest = HostDr::save();
+            (v.dr, v.dr6) = (guest.0, guest.1);
+            host.load();
+        }
+        if host_dr7 != DR7_IDLE {
+            asm!("mov dr7, {}", in(reg) host_dr7, options(nomem, nostack, preserves_flags));
+        }
+        if host_ctl != 0 {
+            x86::wrmsr(IA32_DEBUGCTL, host_ctl);
+        }
         if v.switch_fp {
             asm!("fxsave64 [{}]", in(reg) v.fpu.0.as_mut_ptr(), options(nostack));
         }
@@ -343,6 +570,7 @@ pub(super) fn run(v: &mut VmxVcpu) -> Result<(), ()> {
         asm!("lgdt [{}]", "lidt [{}]", in(reg) &gdt, in(reg) &idt, options(readonly, nostack));
         failed
     };
+    v.vmcs.forget_volatile();
     if failed {
         v.launched = resume != 0;
         // SAFETY: restores the caller's interrupt state.
@@ -354,11 +582,10 @@ pub(super) fn run(v: &mut VmxVcpu) -> Result<(), ()> {
         return Err(());
     }
     // An NMI that exited is the host's: run its handler (the vector is in the IDT).
-    let info = vmread(v.vmcs.pa, vmcs::EXIT_INTR_INFO);
-    if vmread(v.vmcs.pa, vmcs::EXIT_REASON) as u32 == exit::EXCEPTION_NMI && info & (1 << 31) != 0 && info >> 8 & 7 == 2
-    {
-        // SAFETY: vector 2 is the host's NMI gate.
-        unsafe { asm!("int 2") };
+    let info = v.vmcs.read(vmcs::EXIT_INTR_INFO);
+    if v.vmcs.read(vmcs::EXIT_REASON) as u32 == exit::EXCEPTION_NMI && info & (1 << 31) != 0 && info >> 8 & 7 == 2 {
+        // SAFETY: the IDT was loaded above; interrupts are still off.
+        unsafe { deliver_nmi({ idt.base }) };
     }
     // SAFETY: a host interrupt that arrived during the run is delivered now.
     unsafe {

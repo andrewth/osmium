@@ -84,6 +84,8 @@ pub mod proc2 {
 
 /// VM-exit control bits.
 pub mod exit_ctl {
+    /// Save the guest's `DR7` and `IA32_DEBUGCTL`.
+    pub const SAVE_DEBUG: u32 = 1 << 2;
     /// The host is in 64-bit mode.
     pub const HOST_64: u32 = 1 << 9;
     /// Save the guest's PAT.
@@ -98,6 +100,8 @@ pub mod exit_ctl {
 
 /// VM-entry control bits.
 pub mod entry_ctl {
+    /// Load the guest's `DR7` and `IA32_DEBUGCTL`.
+    pub const LOAD_DEBUG: u32 = 1 << 2;
     /// The guest is in IA-32e mode (EFER.LMA).
     pub const IA32E_GUEST: u32 = 1 << 9;
     /// Load the guest's PAT.
@@ -131,6 +135,9 @@ pub struct Caps {
     pub pin: u32,
     /// Primary processor-based controls (without the interrupt window).
     pub proc: u32,
+    /// [`Caps::proc`] without debug-register exiting, for guests that use
+    /// the debug registers; equal to `proc` if the CPU insists on the exits.
+    pub proc_dr: u32,
     /// Secondary processor-based controls.
     pub proc2: u32,
     /// VM-exit controls.
@@ -175,10 +182,14 @@ impl Caps {
     /// See [`Caps::PIN`].
     pub const PROC2: u32 = proc2::EPT | proc2::RDTSCP | proc2::VPID | proc2::WBINVD | proc2::UNRESTRICTED_GUEST;
     /// See [`Caps::PIN`].
-    pub const EXIT: u32 =
-        exit_ctl::HOST_64 | exit_ctl::SAVE_PAT | exit_ctl::LOAD_PAT | exit_ctl::SAVE_EFER | exit_ctl::LOAD_EFER;
+    pub const EXIT: u32 = exit_ctl::SAVE_DEBUG
+        | exit_ctl::HOST_64
+        | exit_ctl::SAVE_PAT
+        | exit_ctl::LOAD_PAT
+        | exit_ctl::SAVE_EFER
+        | exit_ctl::LOAD_EFER;
     /// See [`Caps::PIN`].
-    pub const ENTRY: u32 = entry_ctl::LOAD_PAT | entry_ctl::LOAD_EFER;
+    pub const ENTRY: u32 = entry_ctl::LOAD_DEBUG | entry_ctl::LOAD_PAT | entry_ctl::LOAD_EFER;
 
     /// Reads the capability MSRs through `rdmsr` and picks the controls.
     pub fn from_msrs(rdmsr: impl Fn(u32) -> u64) -> Result<Self, VmxError> {
@@ -188,6 +199,9 @@ impl Caps {
             |want, std, tru, name| adjust(want, rdmsr(if t { tru } else { std })).ok_or(VmxError::MissingControl(name));
         let pin = pick(Self::PIN, msr::PINBASED, msr::TRUE_PINBASED, msr::TRUE_PINBASED)?;
         let proc = pick(Self::PROC, msr::PROCBASED, msr::TRUE_PROCBASED, msr::TRUE_PROCBASED)?;
+        let proc_dr = adjust(Self::PROC & !proc::MOV_DR, rdmsr(if t { msr::TRUE_PROCBASED } else { msr::PROCBASED }))
+            .filter(|p| p & proc::MOV_DR == 0)
+            .unwrap_or(proc);
         let exit = pick(Self::EXIT, msr::EXIT, msr::TRUE_EXIT, msr::TRUE_EXIT)?;
         let entry = pick(Self::ENTRY, msr::ENTRY, msr::TRUE_ENTRY, msr::TRUE_ENTRY)?;
         // The IA-32e guest bit is set and cleared at run time.
@@ -206,6 +220,7 @@ impl Caps {
             revision: basic as u32 & 0x7fff_ffff,
             pin,
             proc,
+            proc_dr,
             proc2,
             exit,
             entry,

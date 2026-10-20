@@ -10,10 +10,10 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
+use crate::backend::{Cpu, Pages, Stage2};
 use osmium::boot::elf::Elf;
 use osmium::hal::println;
-use osmium::mm::paging::formats::X86_64;
-use osmium::mm::{FrameAllocator, MapFlags, PAGE_SIZE, PageTable, PhysAddr, VirtAddr};
+use osmium::mm::{FrameAllocator, PAGE_SIZE};
 use osmium::sync::{IrqSpinLock, Once};
 use osmium::virt::devices::{
     IOAPIC_WINDOW, IpiKind, IpiTarget, LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualIoApic, VirtualLapic,
@@ -21,10 +21,9 @@ use osmium::virt::devices::{
 };
 use osmium::virt::smp::GuestCpus;
 use osmium::virt::x86::pc::{PcBoot, pvh_entry};
-use osmium::virt::x86::{SvmPages, SvmVcpu};
 use osmium::virt::{Bus, BusDevice, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
-use crate::{FRAMES, Frames, HOST_APIC_IDS, KICK_VECTOR, LAPIC, block, clock};
+use crate::{FRAMES, HOST_APIC_IDS, KICK_VECTOR, LAPIC, clock};
 
 /// Where QEMU's loader puts the guest kernel, and the window kept free for it.
 pub const IMAGE_BASE: u64 = 0x1800_0000;
@@ -43,13 +42,16 @@ const MAX_CPUS: usize = 2;
 /// virtual timers are delivered on time: vector and period.
 pub const HOST_TICK_VECTOR: u8 = 0xef;
 const HOST_TICK_NS: u64 = 1_000_000;
+/// Under VMX the tick is slower: a host that is itself virtualized (without
+/// VMCS shadowing) can need milliseconds for one entry and exit.
+const HOST_TICK_NS_VMX: u64 = 50_000_000;
 static HOST_TICK_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// A guest shared by every host CPU, each running one of its vCPUs.
 pub struct KernelVm {
     cpus: Arc<GuestCpus>,
     mem: Arc<GuestMemory>,
-    ncr3: u64,
+    stage2: u64,
     pio: Bus,
     buses: Vec<Bus>,
     lines: Vec<Arc<AtomicBool>>,
@@ -131,14 +133,14 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             core::hint::spin_loop();
             continue;
         };
-        let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
-        // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-        let mut v = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, vm.ncr3, entry as u32, 0) }
+        let pages = Pages::alloc();
+        // SAFETY: fresh blocks of the required sizes, owned by the vCPU.
+        let mut v = unsafe { Cpu::new(pages, vm.stage2, entry as u32, 0) }
             .with_memory(vm.mem.clone())
             .with_irq_line(vm.lines[me].clone());
         v.set_apic_id(me as u8); // CPUID agrees with the vCPU's APIC
         if me == 0 {
-            v.regs.rbx = info; // PVH: ebx = hvm_start_info
+            v.set_reg(3, info); // PVH: ebx = hvm_start_info
         } else {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
             v.set_application_processor();
@@ -146,7 +148,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
         let apic = vm.apics[me].get().expect("get returned None").clone();
         let a = apic.clone();
         v.connect_intr(move || a.acknowledge());
-        vm.cpus.attach_svm(me, &mut v);
+        v.attach(&vm.cpus, me);
         let poll = |vm: &KernelVm| {
             apic.poll();
             if me == 0 {
@@ -181,24 +183,11 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             }
         });
         if !vm.done.load(Ordering::Acquire) {
-            use osmium::virt::x86::vmcb;
-            println!(
-                "[hyp]   vCPU {me}: {exit:?} at rip {:#x}, info1 {:#x}, info2 {:#x}, cr3 {:#x}",
-                v.rip(),
-                v.read64(vmcb::EXITINFO1),
-                v.read64(vmcb::EXITINFO2),
-                v.read64(vmcb::CR3)
-            );
+            println!("[hyp]   vCPU {me}: {exit:?} at {}", v.describe());
         }
         drop(v);
         // SAFETY: the vCPU that owned these blocks is gone.
-        unsafe {
-            let mut f = FRAMES.lock();
-            f.dealloc(PhysAddr::new(vmcb.1), 0);
-            f.dealloc(PhysAddr::new(iopm.1), 2);
-            f.dealloc(PhysAddr::new(msrpm.1), 1);
-            f.dealloc(PhysAddr::new(host.1), 0);
-        }
+        unsafe { pages.free() };
         if !vm.done.swap(true, Ordering::AcqRel) {
             for i in 0..vm.lines.len() {
                 vm.cpus.kick(i);
@@ -225,7 +214,8 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     let pit = osmium::drivers::pit::Pit::new(unsafe { osmium::drivers::pit::Pio::new() });
     let hz = pit.calibrate(10_000_000, || u32::MAX as u64 - lapic.timer_remaining() as u64);
     lapic.stop_timer();
-    HOST_TICK_COUNT.store((hz * HOST_TICK_NS / 1_000_000_000).max(1) as u32, Ordering::Relaxed);
+    let tick = if crate::backend::backend() == crate::backend::Backend::Vmx { HOST_TICK_NS_VMX } else { HOST_TICK_NS };
+    HOST_TICK_COUNT.store((hz * tick / 1_000_000_000).max(1) as u32, Ordering::Relaxed);
 
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -256,10 +246,9 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     mem.write(GuestPhysAddr(BOOT_INFO), &blob.bytes).expect("write failed");
     let mem = Arc::new(mem);
 
-    let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
-    let flags = MapFlags::RW | MapFlags::EXEC | MapFlags::USER;
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, flags).expect("map_range failed");
-    let ncr3 = npt.root().0;
+    let mut npt = Stage2::new();
+    npt.map_ram(0, ram.0, len);
+    let stage2 = npt.root();
     core::mem::forget(npt); // in use until power-off
 
     let done = Arc::new(AtomicBool::new(false));
@@ -319,13 +308,17 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     pio.insert(0xf4, 1, Arc::new(PowerOff(done.clone()))).expect("insert failed");
 
     cpus.request_start(0, entry as u64, blob.start_info).expect("request_start failed");
-    let vm = KernelVm { cpus, mem, ncr3, pio, buses, lines, apics, pit, com1, done, running: AtomicUsize::new(ncpus) };
+    let vm =
+        KernelVm { cpus, mem, stage2, pio, buses, lines, apics, pit, com1, done, running: AtomicUsize::new(ncpus) };
     KERNEL_VM.store(&raw const vm as *mut KernelVm, Ordering::Release);
     let exit = vcpu_loop(&vm, 0);
     while vm.running.load(Ordering::Acquire) > 0 {
         core::hint::spin_loop();
     }
     KERNEL_VM.store(core::ptr::null_mut(), Ordering::Release);
+    if crate::HOST_NMIS.load(Ordering::Relaxed) > 0 {
+        println!("[hyp]   host NMIs taken: {}", crate::HOST_NMIS.load(Ordering::Relaxed));
+    }
     match exit {
         _ if POWERED_OFF.load(Ordering::Acquire) => println!("[hyp]   guest powered off"),
         Some(e) => println!("[hyp]   guest exit {e:?} from vCPU 0"),

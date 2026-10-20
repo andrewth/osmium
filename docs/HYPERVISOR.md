@@ -147,9 +147,18 @@ recipe is the same on each:
   mode or long mode). It differs from SVM in four ways: no decode assists (MMIO
   instructions are always fetched from guest memory), `vmcall` for hypercalls,
   EPT violations for MMIO, and the host's task register (`CpuTables::load`) must
-  be loaded before `vmx::enable`. The VMCS stays bound to the host CPU that
-  first runs the vCPU. QEMU's TCG does not emulate VMX, so it has only run
-  under nested KVM (`examples/x86_64-vmx`).
+  be loaded before `vmx::enable`. The VMCS is bound to the host CPU that
+  runs the vCPU; `with_migration` (or `unbind`, on that CPU) releases it so
+  another CPU can run the vCPU next, at the cost of a `VMCLEAR` and a
+  `VMLAUNCH` per run. The guest's debug registers work: the first `MOV DR` is
+  emulated and from then on each run swaps `DR0`-`DR3`, `DR6`, `DR7` and
+  `IA32_DEBUGCTL` with the host's, so hardware breakpoints fire in the guest
+  and the host's are disarmed meanwhile. A host NMI during a guest run is
+  delivered to the host's IDT vector 2 with an NMI-style stack frame (the
+  gate's IST slot is not used). `examples/x86_64-hyp` picks SVM or VMX at
+  boot (`backend.rs`) and runs all of its demos and the x86_64-pc guest kernel
+  on either; QEMU's TCG does not emulate VMX, so VMX has only run under nested
+  KVM (`examples/x86_64-vmx`, `x86_64-hyp` with `-accel kvm -cpu host`).
 - FP/SIMD state is switched per vCPU on the assumption that the host
   kernel itself never uses those registers (soft-float targets): always on
   RISC-V and AArch64 (where SVE is not switched and traps), and on x86 for

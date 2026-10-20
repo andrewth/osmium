@@ -109,7 +109,7 @@ assembly. Copy them from whichever example is closest to your platform:
 | `uefi` | see below | A UEFI application for OVMF (x86_64) and AAVMF (AArch64): sets a GOP mode and draws colour bars on the framebuffer, or with Blt where the GOP has no framebuffer. |
 | `riscv-firmware` | `cargo run --release` | M-mode firmware with no heap and no scheduler: two async tasks on `osmium-exec` await CLINT timer and UART interrupts. |
 | `aarch64-hyp` | `cargo run --release` (add `-smp 2` for the SMP guest), or see below | An EL2 hypervisor: emulated 16550 and GICv2, a virtual timer, PSCI, a 2-vCPU guest. Given the aarch64-virt image and 512 MiB, it boots that kernel as a two-vCPU guest instead. |
-| `x86_64-hyp` | `cargo run --release` | AMD SVM with nested paging: port-I/O and MMIO UARTs, an 8259 PIC pair with an 8254 PIT, a local APIC timer and COM1 through the I/O APIC for the 64-bit guest, and a 2-vCPU guest (add `-smp 2`). Given the x86_64-pc image and 512 MiB, it boots that kernel as a two-vCPU PVH guest instead. |
+| `x86_64-hyp` | `cargo run --release` | AMD SVM with nested paging (or Intel VMX with EPT, chosen at boot; VMX needs `-accel kvm -cpu host`): port-I/O and MMIO UARTs, an 8259 PIC pair with an 8254 PIT, a local APIC timer and COM1 through the I/O APIC for the 64-bit guest, and a 2-vCPU guest (add `-smp 2`). Given the x86_64-pc image and 512 MiB, it boots that kernel as a two-vCPU PVH guest instead. |
 | `riscv-hyp` | see below | A RISC-V hypervisor that boots the riscv-virt kernel itself as a guest: generated device tree, emulated 16550 and PLIC, SBI, virtio-blk and a virtio-net card bridged to the host NIC, one vCPU per host hart (up to 4). Guest lines start with `\| `. |
 
 Shared code lives in two places:

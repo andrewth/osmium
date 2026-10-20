@@ -13,7 +13,7 @@
 //! | `HLT` | [`VmExit::Halt`] |
 //! | `VMCALL` | [`VmExit::Hypercall`]: `nr` = `rax`, `args` = `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, `r8` |
 //! | EPT violation on an unmapped page | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], from the instruction ([`decode`]) |
-//! | External interrupt, NMI | [`VmExit::ExternalInterrupt`] |
+//! | External interrupt, NMI | [`VmExit::ExternalInterrupt`], after the host's own handler has run (an NMI gets a hardware-style frame and is delivered through IDT vector 2) |
 //! | Triple fault | [`VmExit::Shutdown`] |
 //! | Anything else | [`VmExit::Unhandled`] with the exit reason |
 //!
@@ -23,17 +23,32 @@
 //! `#UD`.
 //!
 //! The VMCS is bound to the host CPU that first runs the vCPU, because it is
-//! `VMPTRLD`ed there and stays active; use the vCPU only from that CPU. Fields
-//! written before then are kept in memory and copied in.
+//! `VMPTRLD`ed there and stays active; use the vCPU only from that CPU, or
+//! move it with [`VmxVcpu::unbind`] (on that CPU), or have it unbound after
+//! every run with [`VmxVcpu::with_migration`]. Fields written while it is
+//! unbound are kept in memory and copied in by the next run.
 //!
 //! The host's `STAR`, `LSTAR`, `SFMASK`, `KernelGsBase` and `TSC_AUX` are
 //! swapped with the guest's by the VM-entry and VM-exit MSR lists; the
-//! rest of the host state comes back from the VMCS's host-state area. The host
-//! must not use hardware debug registers (the CPU clears `DR7` on every exit).
+//! rest of the host state comes back from the VMCS's host-state area.
+//!
+//! Debug registers: the guest's `MOV DR` instructions exit until the first
+//! one, which is emulated and then turns the exiting off. From then on each
+//! run swaps the host's `DR0`-`DR3`, `DR6`, `DR7` and `IA32_DEBUGCTL` (the CPU
+//! clears `DR7` and `DEBUGCTL` on every exit) for the guest's, so the guest's
+//! hardware breakpoints and single-steps work; a breakpoint's `#DB` exits and
+//! is reflected into the guest. The host's own breakpoints are disarmed while
+//! the guest runs, and come back at the exit.
+//!
+//! A `VMREAD` or `VMWRITE` is a VM exit when the host itself runs under a
+//! hypervisor without VMCS shadowing, so the vCPU keeps a cache of field
+//! values, writes the host-state fields only when they change, and never
+//! rewrites a value the VMCS already holds.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use core::cell::Cell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -320,6 +335,7 @@ const HOST_LIST: usize = 0x100;
 
 const EVENT_VALID: u64 = 1 << 31;
 const RFLAGS_IF: u64 = 1 << 9;
+const RFLAGS_RF: u64 = 1 << 16;
 const APIC_BASE_BSP: u64 = 1 << 8;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
 const EFER_LME: u64 = 1 << 8;
@@ -362,13 +378,36 @@ struct Vmcs {
     pending: BTreeMap<u32, u64>,
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     loaded: bool,
+    /// Recent field values, so that a loaded VMCS is not read or written
+    /// again for a value it holds (a `VMREAD` or `VMWRITE` can cost a VM exit
+    /// when this host runs under a hypervisor). Direct-mapped by field.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    shadow: [Cell<(u32, u64)>; SHADOW],
 }
 
+const SHADOW: usize = 64;
+const NO_FIELD: u32 = u32::MAX;
+
 impl Vmcs {
+    fn new(pa: u64) -> Self {
+        Self { pa, pending: BTreeMap::new(), loaded: false, shadow: [const { Cell::new((NO_FIELD, 0)) }; SHADOW] }
+    }
+
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    fn slot(&self, field: u32) -> &Cell<(u32, u64)> {
+        &self.shadow[((field >> 1) ^ (field >> 7)) as usize % SHADOW]
+    }
+
     fn read(&self, field: u32) -> u64 {
         #[cfg(all(target_arch = "x86_64", target_os = "none"))]
         if self.loaded {
-            return hw::vmread(self.pa, field);
+            let slot = self.slot(field);
+            if slot.get().0 == field {
+                return slot.get().1;
+            }
+            let v = hw::vmread(self.pa, field);
+            slot.set((field, v));
+            return v;
         }
         self.pending.get(&field).copied().unwrap_or(0)
     }
@@ -376,9 +415,33 @@ impl Vmcs {
     fn write(&mut self, field: u32, v: u64) {
         #[cfg(all(target_arch = "x86_64", target_os = "none"))]
         if self.loaded {
-            return hw::vmwrite(self.pa, field, v);
+            let slot = self.slot(field);
+            if slot.get() != (field, v) {
+                hw::vmwrite(self.pa, field, v);
+                slot.set((field, v));
+            }
+            return;
         }
         self.pending.insert(field, v);
+    }
+
+    /// Forgets the values the CPU changes: guest state, exit information
+    /// (field types 1 and 2), and the entry interruption (VM entry clears its
+    /// valid bit).
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    fn forget_volatile(&self) {
+        for s in &self.shadow {
+            let f = s.get().0;
+            if f != NO_FIELD && (f >> 10 & 3 != 0 || f == vmcs::ENTRY_INTR_INFO) {
+                s.set((NO_FIELD, 0));
+            }
+        }
+    }
+
+    /// Forgets everything.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    fn forget_all(&self) {
+        self.shadow.iter().for_each(|s| s.set((NO_FIELD, 0)));
     }
 }
 
@@ -415,18 +478,42 @@ pub struct VmxVcpu {
     apic_id: u8,
     /// An exception to raise in the guest at the next entry.
     pending_exception: Option<u64>,
-    /// State the hardware does not keep for the guest.
+    /// State the hardware does not keep for the guest: `DR0`-`DR3` and `DR6`
+    /// (`DR7` lives in the VMCS). The hardware registers hold them only
+    /// while the guest runs, once `dr_switch` is set.
+    dr: [u64; 4],
     dr6: u64,
-    dr7: u64,
+    /// The guest has used the debug registers: they are swapped around each
+    /// entry and `MOV DR` no longer exits.
+    dr_switch: bool,
     cr8: u64,
     cstar: u64,
     /// Bare-metal only: the host CPU the VMCS is bound to.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     cpu: Option<usize>,
+    /// Unbind from the host CPU after every run.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    migratable: bool,
+    /// The IDT-vectoring information of the last exit, kept across an unbind
+    /// (it is read-only and so cannot be copied back into a VMCS).
+    saved_vectoring: Option<(u64, u64)>,
+    /// The host-state fields as last written to the VMCS.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    host_cache: Option<[u64; 24]>,
 }
 
 // SAFETY: the vCPU owns its VMCS and MSR pages exclusively.
 unsafe impl Send for VmxVcpu {}
+
+impl Drop for VmxVcpu {
+    /// Clears the VMCS from the CPU it is bound to, so its page can be
+    /// reused. Drop the vCPU on that CPU (or [`unbind`](Self::unbind) it
+    /// first); a VMCS still active on another CPU must not be freed.
+    fn drop(&mut self) {
+        #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+        hw::release(self);
+    }
+}
 
 impl VmxVcpu {
     /// A vCPU in 32-bit protected mode with paging off and flat 4 GiB
@@ -449,7 +536,7 @@ impl VmxVcpu {
             pages.msr_area.0.as_ptr().write_bytes(0, 4096);
         }
         let mut v = Self {
-            vmcs: Vmcs { pa: pages.vmcs.1, pending: BTreeMap::new(), loaded: false },
+            vmcs: Vmcs::new(pages.vmcs.1),
             caps,
             msr_area: pages.msr_area.0,
             regs: VmxRegs::default(),
@@ -468,11 +555,15 @@ impl VmxVcpu {
             apic_base: 0xfee0_0000 | APIC_BASE_ENABLE | APIC_BASE_BSP,
             apic_id: 0,
             pending_exception: None,
+            dr: [0; 4],
             dr6: 0xffff_0ff0,
-            dr7: 0x400,
+            dr_switch: false,
             cr8: 0,
             cstar: 0,
             cpu: None,
+            migratable: false,
+            saved_vectoring: None,
+            host_cache: None,
         };
         use vmcs::*;
         for (i, m) in SWITCHED.into_iter().enumerate() {
@@ -808,6 +899,33 @@ impl VmxVcpu {
         self
     }
 
+    /// Lets the vCPU run on any host CPU: its VMCS is released from the CPU
+    /// after every [`Vcpu::run`], at the cost of a `VMCLEAR`, a copy of the
+    /// fields and a `VMLAUNCH` (rather than `VMRESUME`) on the next run.
+    pub fn with_migration(mut self) -> Self {
+        self.migratable = true;
+        self
+    }
+
+    /// Releases the VMCS from the host CPU it is bound to, so that another
+    /// CPU can run the vCPU. Call on the CPU that last ran it; a no-op if the
+    /// vCPU is not bound. Fields written afterwards, from any CPU, are kept
+    /// in memory and take effect at the next run.
+    pub fn unbind(&mut self) {
+        #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+        hw::unbind(self);
+    }
+
+    /// Gives the guest `DR0`-`DR3`, `DR6` and `DR7` (hardware breakpoints
+    /// armed in `dr7` fire from the next run). They are swapped with the
+    /// host's around each entry from now on.
+    pub fn set_debug_registers(&mut self, dr: [u64; 4], dr6: u64, dr7: u64) {
+        self.dr = dr;
+        self.dr6 = 0xffff_0ff0 | (dr6 & 0xe00f);
+        self.vmcs.write(vmcs::GUEST_DR7, dr7 & 0xffff_ffff & !(1 << 11 | 1 << 12 | 1 << 14 | 1 << 15) | 0x400);
+        self.dr_switch = true;
+    }
+
     /// Sets the local APIC ID CPUID reports to the guest.
     pub fn set_apic_id(&mut self, id: u8) {
         self.apic_id = id;
@@ -883,7 +1001,10 @@ impl VmxVcpu {
         let mut window = false;
         let mut info = 0u64;
         let mut code = 0u64;
-        let vectoring = self.vmcs.read(IDT_VECTORING_INFO);
+        let (vectoring, vectoring_code) = self
+            .saved_vectoring
+            .take()
+            .unwrap_or_else(|| (self.vmcs.read(IDT_VECTORING_INFO), self.vmcs.read(IDT_VECTORING_ERRCODE)));
         if !core::mem::replace(&mut self.vectoring_done, true)
             && vectoring & EVENT_VALID != 0
             && !(4..=6).contains(&(vectoring >> 8 & 7))
@@ -891,7 +1012,7 @@ impl VmxVcpu {
             // A software interrupt or exception is not injected again: RIP
             // still points at its instruction, which runs again.
             info = vectoring & 0xffff_ffff;
-            code = self.vmcs.read(IDT_VECTORING_ERRCODE);
+            code = vectoring_code;
             window = self.irq.load(Ordering::Acquire);
         } else if let Some(e) = self.pending_exception.take() {
             info = e & 0xffff_ffff;
@@ -906,7 +1027,8 @@ impl VmxVcpu {
         }
         self.vmcs.write(ENTRY_INTR_INFO, info);
         self.vmcs.write(ENTRY_ERRCODE, code);
-        let proc = self.caps.proc | if window { caps::proc::INTERRUPT_WINDOW } else { 0 };
+        let base = if self.dr_switch { self.caps.proc_dr } else { self.caps.proc };
+        let proc = base | if window { caps::proc::INTERRUPT_WINDOW } else { 0 };
         self.vmcs.write(PROC_CTLS, proc as u64);
     }
 
@@ -1087,8 +1209,8 @@ impl VmxVcpu {
     }
 
     /// Emulates the debug-register access that caused a `MOV DR` exit and
-    /// steps past it. Breakpoint addresses (DR0-DR3) read as zero and
-    /// ignore writes, and no breakpoint ever fires; DR6 and DR7 are kept.
+    /// steps past it. The registers then belong to the hardware: the exiting
+    /// is turned off and each run swaps them in and out ([`VmxVcpu::debug_registers`]).
     fn emulate_dr(&mut self) {
         let q = self.vmcs.read(vmcs::EXIT_QUAL);
         let (dr, read, gpr) = (q & 7, q & 0x10 != 0, (q >> 8 & 0xf) as u8);
@@ -1102,20 +1224,29 @@ impl VmxVcpu {
         }
         if read {
             let v = match dr {
+                0..=3 => self.dr[dr as usize],
                 6 | 4 => self.dr6,
-                7 | 5 => self.dr7,
-                _ => 0,
+                _ => self.vmcs.read(vmcs::GUEST_DR7),
             };
             self.set_reg(gpr, v);
         } else {
             let v = self.reg(gpr);
             match dr {
+                0..=3 if !canonical(v) => return self.inject_gp(),
+                0..=3 => self.dr[dr as usize] = v,
+                4..=7 if v >> 32 != 0 => return self.inject_gp(),
                 6 | 4 => self.dr6 = 0xffff_0ff0 | (v & 0xe00f),
-                7 | 5 => self.dr7 = (v & 0xffff_ffff) | 0x400,
-                _ => {}
+                _ => self.vmcs.write(vmcs::GUEST_DR7, v & !(1 << 11 | 1 << 12 | 1 << 14 | 1 << 15) | 0x400),
             }
         }
+        self.dr_switch = true;
         self.skip();
+    }
+
+    /// The guest's `DR0`-`DR3` and `DR6` as of its last exit, once it has
+    /// touched the debug registers (zero and the reset value before that).
+    pub fn debug_registers(&self) -> ([u64; 4], u64) {
+        (self.dr, self.dr6)
     }
 
     /// Handles the exits the guest must never see the host for: VMX
@@ -1141,7 +1272,19 @@ impl VmxVcpu {
                 match (info >> 8 & 7, info & 0xff) {
                     (3, 1) => {
                         let q = self.vmcs.read(vmcs::EXIT_QUAL);
-                        self.dr6 = 0xffff_0ff0 | (q & 0x600f);
+                        self.dr6 |= q & 0x600f;
+                        let mut dr7 = self.vmcs.read(vmcs::GUEST_DR7);
+                        if q & 1 << 13 != 0 {
+                            // The general-detect fault disarms itself.
+                            dr7 &= !(1 << 13);
+                            self.vmcs.write(vmcs::GUEST_DR7, dr7);
+                        }
+                        // An instruction breakpoint is a fault: RF in the
+                        // pushed flags keeps it from firing again on return.
+                        if (0..4).any(|i| q >> i & 1 != 0 && dr7 >> (16 + 4 * i) & 3 == 0 && dr7 >> (2 * i) & 3 != 0) {
+                            let f = self.rflags();
+                            self.vmcs.write(vmcs::GUEST_RFLAGS, f | RFLAGS_RF);
+                        }
                         self.pending_exception = Some(1 | 3 << 8 | EVENT_VALID);
                     }
                     (3, 17) => {
@@ -1258,6 +1401,9 @@ impl Vcpu for VmxVcpu {
                 },
             }
         };
+        if self.migratable {
+            hw::unbind(self);
+        }
         if let Some(r) = &self.running {
             r.store(crate::smp::NOT_RUNNING, Ordering::Release);
         }
