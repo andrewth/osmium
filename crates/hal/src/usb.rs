@@ -472,6 +472,8 @@ pub enum UsbError {
     NoDevice,
     /// The controller has no free slots, ring space or buffers.
     NoResources,
+    /// The endpoint already has an outstanding transfer.
+    Busy,
     /// The endpoint has not been configured.
     BadEndpoint,
     /// The device or its descriptors are malformed.
@@ -547,6 +549,137 @@ pub trait UsbHost {
 
     /// Bulk or interrupt OUT transfer on endpoint address `endpoint`.
     fn transfer_out(&mut self, dev: DeviceId, endpoint: u8, data: &[u8]) -> Result<(), UsbError>;
+
+    /// Starts a bulk or interrupt IN transfer of up to `len` bytes on
+    /// endpoint address `endpoint` without waiting for it, as a keyboard's
+    /// interrupt endpoint needs. One may be outstanding per endpoint; other
+    /// transfers on it fail with [`UsbError::Busy`] until it is collected.
+    fn submit_in(&mut self, dev: DeviceId, endpoint: u8, len: usize) -> Result<(), UsbError>;
+
+    /// Collects the transfer started by [`submit_in`](Self::submit_in):
+    /// `None` while it is still pending, else the bytes copied into `buf`.
+    /// Returns `Some(Err(BadEndpoint))` if none was submitted.
+    fn poll_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>>;
+}
+
+/// A borrowed host controller, so a class driver can use one it does not own.
+impl<H: UsbHost + ?Sized> UsbHost for &mut H {
+    fn num_ports(&self) -> u8 {
+        (**self).num_ports()
+    }
+    fn port_status(&self, port: u8) -> PortStatus {
+        (**self).port_status(port)
+    }
+    fn attach(&mut self, port: u8) -> Result<DeviceId, UsbError> {
+        (**self).attach(port)
+    }
+    fn detach(&mut self, dev: DeviceId) {
+        (**self).detach(dev)
+    }
+    fn configure_endpoints(&mut self, dev: DeviceId, endpoints: &[EndpointDescriptor]) -> Result<(), UsbError> {
+        (**self).configure_endpoints(dev, endpoints)
+    }
+    fn control_in(&mut self, dev: DeviceId, setup: SetupPacket, buf: &mut [u8]) -> Result<usize, UsbError> {
+        (**self).control_in(dev, setup, buf)
+    }
+    fn control_out(&mut self, dev: DeviceId, setup: SetupPacket, data: &[u8]) -> Result<(), UsbError> {
+        (**self).control_out(dev, setup, data)
+    }
+    fn transfer_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbError> {
+        (**self).transfer_in(dev, endpoint, buf)
+    }
+    fn transfer_out(&mut self, dev: DeviceId, endpoint: u8, data: &[u8]) -> Result<(), UsbError> {
+        (**self).transfer_out(dev, endpoint, data)
+    }
+    fn submit_in(&mut self, dev: DeviceId, endpoint: u8, len: usize) -> Result<(), UsbError> {
+        (**self).submit_in(dev, endpoint, len)
+    }
+    fn poll_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
+        (**self).poll_in(dev, endpoint, buf)
+    }
+}
+
+/// A host controller behind a lock, so that several class drivers (a disk
+/// and a keyboard, say) can each hold the controller they share. Every
+/// call holds the lock for its whole duration.
+impl<H: UsbHost + ?Sized, G: osmium_sync::Guardian> UsbHost for &osmium_sync::SpinLock<H, G> {
+    fn num_ports(&self) -> u8 {
+        self.lock().num_ports()
+    }
+    fn port_status(&self, port: u8) -> PortStatus {
+        self.lock().port_status(port)
+    }
+    fn attach(&mut self, port: u8) -> Result<DeviceId, UsbError> {
+        self.lock().attach(port)
+    }
+    fn detach(&mut self, dev: DeviceId) {
+        self.lock().detach(dev)
+    }
+    fn configure_endpoints(&mut self, dev: DeviceId, endpoints: &[EndpointDescriptor]) -> Result<(), UsbError> {
+        self.lock().configure_endpoints(dev, endpoints)
+    }
+    fn control_in(&mut self, dev: DeviceId, setup: SetupPacket, buf: &mut [u8]) -> Result<usize, UsbError> {
+        self.lock().control_in(dev, setup, buf)
+    }
+    fn control_out(&mut self, dev: DeviceId, setup: SetupPacket, data: &[u8]) -> Result<(), UsbError> {
+        self.lock().control_out(dev, setup, data)
+    }
+    fn transfer_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Result<usize, UsbError> {
+        self.lock().transfer_in(dev, endpoint, buf)
+    }
+    fn transfer_out(&mut self, dev: DeviceId, endpoint: u8, data: &[u8]) -> Result<(), UsbError> {
+        self.lock().transfer_out(dev, endpoint, data)
+    }
+    fn submit_in(&mut self, dev: DeviceId, endpoint: u8, len: usize) -> Result<(), UsbError> {
+        self.lock().submit_in(dev, endpoint, len)
+    }
+    fn poll_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
+        self.lock().poll_in(dev, endpoint, buf)
+    }
+}
+
+/// An interface's alternate setting 0 and its endpoints, as found by
+/// [`find_interface`].
+#[derive(Clone, Copy, Debug)]
+pub struct Interface {
+    /// The interface descriptor.
+    pub descriptor: InterfaceDescriptor,
+    endpoints: [Option<EndpointDescriptor>; 16],
+}
+
+impl Interface {
+    /// The interface's endpoints.
+    pub fn endpoints(&self) -> impl Iterator<Item = EndpointDescriptor> + '_ {
+        self.endpoints.iter().flatten().copied()
+    }
+
+    /// The first endpoint of type `ty` in direction `dir`.
+    pub fn endpoint(&self, ty: TransferType, dir: Direction) -> Option<EndpointDescriptor> {
+        self.endpoints().find(|e| e.transfer_type() == ty && e.direction() == dir)
+    }
+}
+
+/// Finds the first interface (alternate setting 0) in a configuration
+/// descriptor set for which `matches` holds, with its endpoints.
+pub fn find_interface(config: &[u8], matches: impl Fn(&InterfaceDescriptor) -> bool) -> Option<Interface> {
+    let mut found: Option<Interface> = None;
+    for d in Descriptors::new(config) {
+        match d.ok()? {
+            // The next interface (or alternate setting) starts: the
+            // endpoints that follow are not ours.
+            Descriptor::Interface(_) if found.is_some() => break,
+            Descriptor::Interface(i) if i.alternate == 0 && matches(&i) => {
+                found = Some(Interface { descriptor: i, endpoints: [None; 16] });
+            }
+            Descriptor::Endpoint(e) => {
+                if let Some(slot) = found.as_mut().and_then(|f| f.endpoints.iter_mut().find(|s| s.is_none())) {
+                    *slot = Some(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// A device after [`enumerate`]: addressed, configured, and with the
@@ -721,6 +854,22 @@ mod tests {
         fn transfer_out(&mut self, _: DeviceId, _: u8, _: &[u8]) -> Result<(), UsbError> {
             unimplemented!()
         }
+        fn submit_in(&mut self, _: DeviceId, _: u8, _: usize) -> Result<(), UsbError> {
+            unimplemented!()
+        }
+        fn poll_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Option<Result<usize, UsbError>> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn find_interface_and_endpoints() {
+        let msc = find_interface(&CONFIG, |i| i.class == 8 && i.protocol == 0x50).unwrap();
+        assert_eq!(msc.endpoints().count(), 2, "alternate setting 1's endpoint is excluded");
+        assert_eq!(msc.endpoint(TransferType::Bulk, Direction::In).map(|e| e.address), Some(0x81));
+        assert_eq!(msc.endpoint(TransferType::Bulk, Direction::Out).map(|e| e.address), Some(0x02));
+        assert!(msc.endpoint(TransferType::Interrupt, Direction::In).is_none());
+        assert!(find_interface(&CONFIG, |i| i.class == 3).is_none());
     }
 
     #[test]

@@ -97,10 +97,41 @@ pub enum XhciError {
 struct Slot<'d, D: DmaAllocator + ?Sized> {
     output: OwnedDma<'d, D>,
     input: OwnedDma<'d, D>,
-    /// Transfer rings by DCI - 1 (endpoint 0 is DCI 1).
-    rings: [Option<ProducerRing<'d, D>>; 31],
+    /// Configured endpoints, endpoint 0 first. A short table rather than
+    /// one entry per possible DCI keeps the controller struct small enough
+    /// to build on a boot stack.
+    endpoints: [Option<Endpoint<'d, D>>; MAX_ENDPOINTS],
     speed: Speed,
 }
+
+impl<'d, D: DmaAllocator + ?Sized> Slot<'d, D> {
+    fn endpoint(&mut self, dci: usize) -> Option<&mut Endpoint<'d, D>> {
+        self.endpoints.iter_mut().flatten().find(|e| e.dci == dci)
+    }
+}
+
+/// A configured endpoint: its transfer ring and any `submit_in` transfer.
+struct Endpoint<'d, D: DmaAllocator + ?Sized> {
+    dci: usize,
+    ring: ProducerRing<'d, D>,
+    pending: Option<Pending<'d, D>>,
+}
+
+/// Endpoints per device, including endpoint 0.
+pub const MAX_ENDPOINTS: usize = 8;
+
+/// A transfer started by `submit_in`, with its own buffer so it can stay
+/// outstanding while other transfers use the bounce buffer.
+struct Pending<'d, D: DmaAllocator + ?Sized> {
+    buf: OwnedDma<'d, D>,
+    trb: u64,
+    len: usize,
+    /// Its Transfer Event, once the event ring has delivered it.
+    done: Option<Trb>,
+}
+
+/// Largest transfer [`UsbHost::submit_in`] accepts (one page).
+pub const MAX_SUBMIT_LEN: usize = 4096;
 
 /// An xHCI controller.
 pub struct Xhci<'d, D: DmaAllocator + ?Sized> {
@@ -353,11 +384,52 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
                 if matches(&ev) {
                     return Ok(ev);
                 }
+                self.route(ev);
             } else {
                 osmium_arch::cpu::spin_hint();
             }
         }
         Err(UsbError::Timeout)
+    }
+
+    /// Files an event nobody is waiting for: the completion of a
+    /// `submit_in` transfer is kept for `poll_in`; anything else is dropped.
+    fn route(&mut self, ev: Trb) {
+        if ev.kind() != kind::TRANSFER_EVENT {
+            return;
+        }
+        let i = ev.endpoint_id() as usize;
+        let pending = self.slot(DeviceId(ev.slot_id())).ok().and_then(|s| s.endpoint(i)?.pending.as_mut());
+        if let Some(p) = pending
+            && p.trb == ev.param
+        {
+            p.done = Some(ev);
+        }
+    }
+
+    /// Routes every event already on the ring, without waiting.
+    fn drain_events(&mut self) {
+        let mut any = false;
+        while let Some(ev) = self.events.pop() {
+            any = true;
+            self.route(ev);
+        }
+        if any {
+            self.write_erdp();
+        }
+    }
+
+    /// The ring for endpoint `endpoint`, if configured and not busy with a
+    /// `submit_in` transfer.
+    fn idle_ring(&mut self, dev: DeviceId, endpoint: u8) -> Result<&mut ProducerRing<'d, D>, UsbError> {
+        if endpoint & 0xf == 0 {
+            return Err(UsbError::BadEndpoint); // endpoint 0 carries control transfers only
+        }
+        let ep = self.slot(dev)?.endpoint(dci(endpoint)).ok_or(UsbError::BadEndpoint)?;
+        if ep.pending.is_some() {
+            return Err(UsbError::Busy);
+        }
+        Ok(&mut ep.ring)
     }
 
     /// Runs a command and returns its completion event.
@@ -420,8 +492,8 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     /// Recovers a halted endpoint: Reset Endpoint, then move its dequeue
     /// pointer past the failed transfer.
     fn recover(&mut self, dev: DeviceId, dci: usize) {
-        let (addr, cycle) = match self.slot(dev).ok().and_then(|s| s.rings[dci - 1].as_ref()) {
-            Some(r) => (r.enqueue_addr().as_u64(), r.cycle()),
+        let (addr, cycle) = match self.slot(dev).ok().and_then(|s| s.endpoint(dci)) {
+            Some(e) => (e.ring.enqueue_addr().as_u64(), e.ring.cycle()),
             None => return,
         };
         let _ = self.command(Trb::reset_endpoint(dev.0, dci as u8));
@@ -437,7 +509,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         }
         let dir_in = setup.direction() == Direction::In;
         let bounce = self.bounce.device_addr().as_u64();
-        let ring = self.slot(dev)?.rings[0].as_mut().ok_or(UsbError::BadEndpoint)?;
+        let ring = &mut self.slot(dev)?.endpoint(1).ok_or(UsbError::BadEndpoint)?.ring;
         ring.push(Trb::setup_stage(&setup));
         let data = (len > 0).then(|| ring.push(Trb::data_stage(bounce, len as u32, dir_in)).as_u64());
         let status = ring.push(Trb::status_stage(!(len > 0 && dir_in))).as_u64();
@@ -469,8 +541,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     fn transfer_chunk(&mut self, dev: DeviceId, endpoint: u8, len: usize) -> Result<usize, UsbError> {
         let i = dci(endpoint);
         let bounce = self.bounce.device_addr().as_u64();
-        let ring = self.slot(dev)?.rings.get_mut(i - 1).and_then(Option::as_mut).ok_or(UsbError::BadEndpoint)?;
-        let trb = ring.push(Trb::normal(bounce, len as u32)).as_u64();
+        let trb = self.idle_ring(dev, endpoint)?.push(Trb::normal(bounce, len as u32)).as_u64();
         self.ring_doorbell(dev.0, i as u32);
         let ev = self.wait_event(|e| e.kind() == kind::TRANSFER_EVENT && e.param == trb)?;
         match ev.completion_code() {
@@ -527,9 +598,9 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         self.init_input(&input, port, speed, &ep0);
         self.dcbaa.store(slot_id as usize * 8, output.device_addr().as_u64().to_le());
         let input_addr = input.device_addr().as_u64();
-        let mut rings = [const { None }; 31];
-        rings[0] = Some(ep0);
-        self.slots[slot_id as usize - 1] = Some(Slot { output, input, rings, speed });
+        let mut endpoints = [const { None }; MAX_ENDPOINTS];
+        endpoints[0] = Some(Endpoint { dci: 1, ring: ep0, pending: None });
+        self.slots[slot_id as usize - 1] = Some(Slot { output, input, endpoints, speed });
 
         let result = self.command(Trb::address_device(slot_id, input_addr)).and_then(|_| {
             // Learn endpoint 0's real packet size from the first 8 bytes of
@@ -571,10 +642,16 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         let dma = self.dma;
         let slot = self.slot(dev)?;
         let speed = slot.speed;
-        let mut new_rings: [Option<ProducerRing<'_, D>>; 31] = [const { None }; 31];
+        let mut new_rings: [Option<(usize, ProducerRing<'_, D>)>; MAX_ENDPOINTS] = [const { None }; MAX_ENDPOINTS];
+        // Endpoints the device keeps plus the new ones must fit the table.
+        let kept =
+            slot.endpoints.iter().flatten().filter(|e| endpoints.iter().all(|n| dci(n.address) != e.dci)).count();
+        if kept + endpoints.len() > MAX_ENDPOINTS {
+            return Err(UsbError::NoResources);
+        }
         let mut add = 1u32; // the slot context
         let mut last = 1;
-        for ep in endpoints {
+        for (k, ep) in endpoints.iter().enumerate() {
             let i = dci(ep.address);
             if i < 2 || ep.transfer_type() == TransferType::Isochronous {
                 return Err(UsbError::BadEndpoint);
@@ -601,7 +678,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             let esit = if periodic { mps * (mult + 1) } else { 0 };
             let avg = if periodic { mps } else { 3072 };
             ctx_set(&slot.input, ctx, 4, (esit & 0xffff) << 16 | avg);
-            new_rings[i - 1] = Some(ring);
+            new_rings[k] = Some((i, ring));
             add |= 1 << i;
             last = last.max(i);
         }
@@ -619,9 +696,12 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
 
         self.command(Trb::configure_endpoint(dev.0, input))?;
         let slot = self.slot(dev)?;
-        for (i, ring) in new_rings.into_iter().enumerate() {
-            if ring.is_some() {
-                slot.rings[i] = ring;
+        for (i, ring) in new_rings.into_iter().flatten() {
+            let ep = Endpoint { dci: i, ring, pending: None };
+            match slot.endpoint(i) {
+                Some(old) => *old = ep,
+                // Room was checked above.
+                None => *slot.endpoints.iter_mut().find(|e| e.is_none()).unwrap() = Some(ep),
             }
         }
         Ok(())
@@ -655,6 +735,48 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             }
         }
         Ok(done)
+    }
+
+    fn submit_in(&mut self, dev: DeviceId, endpoint: u8, len: usize) -> Result<(), UsbError> {
+        if len == 0 || len > MAX_SUBMIT_LEN {
+            return Err(UsbError::NoResources);
+        }
+        let endpoint = endpoint | 0x80;
+        let i = dci(endpoint);
+        let dma = self.dma;
+        self.idle_ring(dev, endpoint)?;
+        let buf = OwnedDma::new(dma, MAX_SUBMIT_LEN).ok_or(UsbError::NoResources)?;
+        let addr = buf.device_addr().as_u64();
+        let ep = self.slot(dev)?.endpoint(i).ok_or(UsbError::BadEndpoint)?;
+        let trb = ep.ring.push(Trb::normal(addr, len as u32)).as_u64();
+        ep.pending = Some(Pending { buf, trb, len, done: None });
+        self.ring_doorbell(dev.0, i as u32);
+        Ok(())
+    }
+
+    fn poll_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
+        let i = dci(endpoint | 0x80);
+        match self.slot(dev) {
+            _ if endpoint & 0xf == 0 => return Some(Err(UsbError::BadEndpoint)),
+            Ok(slot) if slot.endpoints.iter().flatten().any(|e| e.dci == i && e.pending.is_some()) => {}
+            Ok(_) => return Some(Err(UsbError::BadEndpoint)),
+            Err(e) => return Some(Err(e)),
+        }
+        self.drain_events();
+        let ep = self.slot(dev).ok()?.endpoint(i)?;
+        let ev = ep.pending.as_ref()?.done?;
+        let p = ep.pending.take()?;
+        Some(match ev.completion_code() {
+            completion::SUCCESS | completion::SHORT_PACKET => {
+                let n = (p.len - (ev.residual() as usize).min(p.len)).min(buf.len());
+                p.buf.read(0, &mut buf[..n]);
+                Ok(n)
+            }
+            code => {
+                self.recover(dev, i);
+                Err(error_from(code))
+            }
+        })
     }
 
     fn transfer_out(&mut self, dev: DeviceId, endpoint: u8, data: &[u8]) -> Result<(), UsbError> {
@@ -697,6 +819,15 @@ mod tests {
         // High speed: 2^(bInterval-1) microframes.
         assert_eq!(interval(&ep(3, 4), Speed::High), 3);
         assert_eq!(interval(&ep(2, 0), Speed::High), 0);
+    }
+
+    #[test]
+    fn small_enough_for_a_boot_stack() {
+        // A 31-entry table of rings and pending transfers per slot made the
+        // controller ~30 KiB, which overflowed the 64 KiB boot stack of the
+        // riscv-virt example when built and returned by value.
+        let size = size_of::<Xhci<'_, crate::virtio::testing::HostDma>>();
+        assert!(size < 16 * 1024, "Xhci is {size} bytes");
     }
 
     #[test]

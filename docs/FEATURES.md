@@ -152,9 +152,10 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ x86 I/O APIC (GSI routing, polarity/trigger, masking); the x86_64 example routes COM1's receive interrupt through it into an `SpscRing`
 - ✅ RAM disk `BlockDevice`
 - ✅ virtio-mmio transport (legacy and 1.x), split virtqueue, virtio-net `NetDevice`
-- ✅ xHCI USB host controller (`UsbHost`): polled command and event rings, root-port reset, control, bulk and interrupt transfers
+- ✅ xHCI USB host controller (`UsbHost`): polled command and event rings, root-port reset, control, bulk and interrupt transfers, interrupt endpoints that stay armed (`submit_in`/`poll_in`)
+- ✅ USB class drivers on any `UsbHost`: mass storage (SCSI over Bulk-Only) as a `BlockDevice`, and HID boot keyboards with US-layout key translation
 - ✅ Mellanox ConnectX-2/-3 (mlx4) Ethernet: reset, firmware start, ICM, polled raw Ethernet queue pair per port as a `NetDevice`; tested against a simulated HCA
-- 🗺 virtio-pci transport; virtio blk, console; xHCI interrupts, hubs and isochronous transfers; USB class drivers (HID, mass storage, CDC-ECM); GICv3; HPET; NVMe
+- 🗺 virtio-pci transport; virtio blk, console; xHCI interrupts, hubs and isochronous transfers; USB CDC-ECM networking and HID report descriptors; GICv3; HPET; NVMe
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)

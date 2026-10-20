@@ -243,7 +243,7 @@ fn pcie_host(fdt: &Fdt<'_>) -> Option<PcieHost> {
     let (base, len) = node.reg().next()?;
     // Each `ranges` entry: PCI address (3 cells), CPU address (2), size (2).
     let cells: Vec<u32> = node.property("ranges")?.as_u32_cells().collect();
-    let mem = cells.chunks_exact(7).find(|r| r[0] >> 24 & 3 == 2).map(|r| {
+    let mem = cells.as_chunks::<7>().0.iter().find(|r| r[0] >> 24 & 3 == 2).map(|r| {
         let cpu = (r[3] as u64) << 32 | r[4] as u64;
         let size = (r[5] as u64) << 32 | r[6] as u64;
         (cpu, size)

@@ -14,6 +14,8 @@
 //! | [`virtio::net::VirtioNet`] | virtio network card (MMIO, legacy and 1.x) | `NetDevice` |
 //! | [`xhci::Xhci`] | xHCI USB host controller | `UsbHost` |
 //! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet (PCI, polled) | `NetDevice` per port |
+//! | [`usb::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
+//! | [`usb::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
 //!
 //! Every driver is constructed from an [`osmium_hal::mmio::IoMem`] (or a
 //! port base), so it works the same under any memory map and can be tested
@@ -33,5 +35,6 @@ pub mod pl011;
 pub mod plic;
 pub mod ramdisk;
 pub mod uart16550;
+pub mod usb;
 pub mod virtio;
 pub mod xhci;
