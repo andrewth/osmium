@@ -37,7 +37,7 @@ use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_sync::SpinLock;
 
 use crate::dev::makedev;
-use crate::{DirEntry, Errno, File, FileKind, NAME_MAX, Stat};
+use crate::{DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat};
 use csum::{crc16, crc32c};
 
 const MAGIC: u16 = 0xef53;
@@ -469,16 +469,29 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
         if fs.inode_size < 128 || !fs.inode_size.is_power_of_two() || fs.inode_size > fs.block_size {
             return Err(Errno::EINVAL);
         }
-        if per_group == 0 || inodes_per_group == 0 || blocks <= first || per_group as usize > 8 * fs.block_size {
+        // Each group's bitmaps are one block, and every count a whole
+        // number of bitmap bytes.
+        let bits = 8 * fs.block_size as u32;
+        if per_group == 0 || per_group > bits || per_group % 8 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if inodes_per_group == 0 || inodes_per_group > bits || inodes_per_group % 8 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // Bounding the size by the device bounds the descriptor table too.
+        let dev_blocks = fs.dev.num_blocks().saturating_mul(dev_bs as u64) / fs.block_size as u64;
+        if blocks <= first || blocks > dev_blocks {
             return Err(Errno::EINVAL);
         }
         let groups = (blocks - first).div_ceil(per_group as u64);
-        if get32(&fs.sb, sb::INODES_COUNT) as u64 != groups * inodes_per_group as u64 {
+        if groups > u32::MAX as u64 || get32(&fs.sb, sb::INODES_COUNT) as u64 != groups * inodes_per_group as u64 {
             return Err(Errno::EINVAL);
         }
         fs.group_count = groups as u32;
         fs.gdt_block = first + 1;
-        fs.groups = vec![0; fs.group_count as usize * fs.desc_size];
+        let len = fs.group_count as usize * fs.desc_size;
+        fs.groups.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
+        fs.groups.resize(len, 0);
         // A descriptor block at a time, since `meta_bg` scatters them.
         let per_block = (fs.block_size / fs.desc_size) as u32;
         for first in (0..fs.group_count).step_by(per_block as usize) {
@@ -491,6 +504,7 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
         if fs.csum != Csum::None && (0..fs.group_count).any(|g| fs.group_csum(g) != get16(fs.desc(g), gd::CHECKSUM)) {
             return Err(Errno::EINVAL);
         }
+        fs.check_layout()?;
         let shared = Arc::new(Shared { fs: SpinLock::new(fs) });
         Ok(Ext2 { shared })
     }
@@ -688,6 +702,27 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             _ => self.gdt_block + k as u64,
         };
         block * self.block_size as u64 + (i as usize * self.desc_size) as u64
+    }
+
+    /// Checks that the primary superblock and descriptors fit in group 0,
+    /// and that every group's bitmaps and inode table lie past them and
+    /// inside the file system, as Linux's `ext4_check_descriptors` does.
+    fn check_layout(&self) -> Result<(), Errno> {
+        if self.base_meta_blocks(0) >= self.group_blocks(0) {
+            return Err(Errno::EINVAL);
+        }
+        let meta_end = self.group_start(0) + self.base_meta_blocks(0);
+        let itable =
+            (get32(&self.sb, sb::INODES_PER_GROUP) as u64 * self.inode_size as u64).div_ceil(self.block_size as u64);
+        for g in 0..self.group_count {
+            for (field, len) in [(gd::BLOCK_BITMAP, 1), (gd::INODE_BITMAP, 1), (gd::INODE_TABLE, itable)] {
+                let loc = self.group_get(g, field);
+                if loc < meta_end || loc.checked_add(len).is_none_or(|end| end > self.blocks_count()) {
+                    return Err(Errno::EINVAL);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Blocks at the start of group `g` holding a superblock backup and
@@ -911,13 +946,13 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             return bits;
         }
         let start = self.group_start(g);
-        set_bits(&mut bits, 0, self.base_meta_blocks(g) as usize);
+        set_bits(&mut bits, 0, (self.base_meta_blocks(g) as usize).min(used));
         // Under flex_bg any group's bitmaps and inode table may live here.
         let itable = (get32(&self.sb, sb::INODES_PER_GROUP) as usize * self.inode_size).div_ceil(self.block_size);
         for h in 0..self.group_count {
             for (field, len) in [(gd::BLOCK_BITMAP, 1), (gd::INODE_BITMAP, 1), (gd::INODE_TABLE, itable as u64)] {
                 let loc = self.group_get(h, field);
-                let (from, to) = (loc.max(start), (loc + len).min(start + used as u64));
+                let (from, to) = (loc.max(start), loc.saturating_add(len).min(start + used as u64));
                 if from < to {
                     set_bits(&mut bits, (from - start) as usize, (to - from) as usize);
                 }
@@ -968,7 +1003,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let goal = if goal >= first && goal < self.blocks_count() { goal - first } else { 0 };
         let (goal_g, goal_i) = ((goal / per_group) as u32, (goal % per_group) as u32);
         for k in 0..self.group_count {
-            let g = (goal_g + k) % self.group_count;
+            let g = ((goal_g as u64 + k as u64) % self.group_count as u64) as u32;
             if self.group_get(g, gd::FREE_BLOCKS) == 0 {
                 continue;
             }
@@ -1029,7 +1064,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         }
         let per_group = get32(&self.sb, sb::INODES_PER_GROUP);
         for k in 0..self.group_count {
-            let g = (goal + k) % self.group_count;
+            let g = ((goal as u64 + k as u64) % self.group_count as u64) as u32;
             if self.group_get(g, gd::FREE_INODES) == 0 {
                 continue;
             }
@@ -1045,7 +1080,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 self.adjust_group(g, gd::USED_DIRS, 1);
             }
             // The inode table past the last inode ever used may be garbage.
-            if self.csum != Csum::None && i as u64 >= per_group as u64 - self.group_get(g, gd::ITABLE_UNUSED) {
+            if self.csum != Csum::None
+                && i as u64 >= (per_group as u64).saturating_sub(self.group_get(g, gd::ITABLE_UNUSED))
+            {
                 self.group_set(g, gd::ITABLE_UNUSED, (per_group - i - 1) as u64);
             }
             self.write_group(g)?;
@@ -1100,7 +1137,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         }
         // e2fsck reads a deletion time below the inode count as an orphan
         // list link, so without a clock pick one above it.
-        let now = self.now().max(get32(&self.sb, sb::INODES_COUNT) + 1);
+        let now = self.now().max(get32(&self.sb, sb::INODES_COUNT).saturating_add(1));
         inode.set_times(now, &[ino::DTIME]);
         inode.set_size(0);
         self.write_inode(ino, &inode)?;
@@ -1301,6 +1338,10 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         }
         let len = ((size - off) as usize).min(buf.len());
         if self.is_inline(&inode) {
+            // The target must fit the 60-byte block map.
+            if size >= 60 {
+                return Err(Errno::EIO);
+            }
             let start = ino::BLOCK + off as usize;
             buf[..len].copy_from_slice(&inode.raw[start..start + len]);
             return Ok(len);
@@ -1469,7 +1510,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let ino = get32(data, off);
         let rec_len = get16(data, off + 4) as usize;
         let name_len = if self.filetype { data[off + 6] as usize } else { get16(data, off + 6) as usize };
-        if rec_len < 8 || off + rec_len > data.len() || 8 + name_len > rec_len {
+        if rec_len % 4 != 0 || rec_len < rec_len_for(name_len) || off + rec_len > data.len() {
             return Err(Errno::EIO);
         }
         Ok((ino, rec_len, &data[off + 8..off + 8 + name_len]))
@@ -1496,7 +1537,15 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             while off < space {
                 let (ino, rec_len, name) = fs.record(data, off)?;
                 off += rec_len;
-                if ino == 0 || name == b"." || name == b".." {
+                // A name that could not be a path component is skipped, as
+                // lookups could never reach it.
+                if ino == 0
+                    || name == b"."
+                    || name == b".."
+                    || name.is_empty()
+                    || name.contains(&b'/')
+                    || name.contains(&0)
+                {
                     continue;
                 }
                 if seen == index {
@@ -1825,6 +1874,10 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             let inode = fs.read_inode(self.ino)?;
             if inode.kind() != FileKind::Symlink {
                 return Err(Errno::EINVAL);
+            }
+            // Linux keeps targets under a block (and PATH_MAX).
+            if inode.size() > fs.block_size.min(PATH_MAX) as u64 {
+                return Err(Errno::EIO);
             }
             let mut target = vec![0; inode.size() as usize];
             let n = fs.read_data(self.ino, 0, &mut target)?;
@@ -2310,5 +2363,110 @@ mod tests {
         let ext2 = Ext2::mount(VecDisk(quota), 1).unwrap();
         assert!(ext2.is_read_only());
         assert_eq!(ext2.root().create("x", FileKind::Regular, 0o644).err(), Some(Errno::EROFS));
+    }
+
+    /// Edits the primary superblock of an image, keeping its checksum.
+    fn edit_super(mut image: Vec<u8>, f: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let sb = &mut image[1024..2048];
+        f(sb);
+        let sum = csum::crc32c(!0, &sb[..sb::CHECKSUM]);
+        put32(sb, sb::CHECKSUM, sum);
+        image
+    }
+
+    #[test]
+    fn corrupt_images_fail_cleanly() {
+        let scratch = Scratch::new("corrupt");
+        let Some(image) = mkfs(&scratch, EXT4, 1024, 4 << 20, None) else { return };
+
+        // Layout fields that would index past a bitmap or the device.
+        let bad_super: [fn(&mut [u8]); 4] = [
+            |sb| {
+                put32(sb, sb::INODES_PER_GROUP, 20_000);
+                let groups = get32(sb, sb::BLOCKS_COUNT).div_ceil(get32(sb, sb::BLOCKS_PER_GROUP));
+                put32(sb, sb::INODES_COUNT, groups * 20_000);
+            },
+            |sb| put16(sb, sb::RESERVED_GDT_BLOCKS, 60_000),
+            |sb| put32(sb, sb::BLOCKS_COUNT, u32::MAX),
+            |sb| put32(sb, sb::BLOCKS_PER_GROUP, 1),
+        ];
+        for edit in bad_super {
+            let bad = edit_super(image.clone(), edit);
+            assert_eq!(Ext2::mount(VecDisk(bad), 1).err(), Some(Errno::EINVAL));
+        }
+
+        // An inode table over the superblock.
+        let ext2 = Ext2::mount(VecDisk(image.clone()), 1).unwrap();
+        {
+            let mut fs = ext2.shared.fs.lock();
+            fs.group_set(0, gd::INODE_TABLE, 1);
+            fs.write_group(0).unwrap();
+        }
+        assert_eq!(Ext2::mount(VecDisk(unmount(ext2)), 1).err(), Some(Errno::EINVAL));
+
+        // Inodes and directory records corrupted after mounting, with their
+        // checksums kept valid so that only the values are wrong.
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root());
+        vfs.symlink("x", "/fast").unwrap();
+        vfs.open("/file", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, b"data").unwrap();
+        vfs.mkdir("/dir", 0o755).unwrap();
+        let ino_of = |name: &str| ext2.root().lookup(name).unwrap().stat().ino as u32;
+        let (fast, file, dir) = (ino_of("fast"), ino_of("file"), ino_of("dir"));
+        let edit_inode = |ino: u32, f: &dyn Fn(&mut Inode)| {
+            let mut fs = ext2.shared.fs.lock();
+            let mut inode = fs.read_inode(ino).unwrap();
+            f(&mut inode);
+            fs.write_inode(ino, &inode).unwrap();
+        };
+        edit_inode(fast, &|i| i.set_size(200));
+        edit_inode(file, &|i| put16(&mut i.raw, ino::BLOCK + 2, 50));
+        {
+            let mut fs = ext2.shared.fs.lock();
+            let mut inode = fs.read_inode(dir).unwrap();
+            let b = fs.bmap(dir, &mut inode, 0, false).unwrap();
+            let mut data = fs.read_block(b).unwrap();
+            // `.` claims 9 bytes, which no record can.
+            put16(&mut data, 4, 9);
+            fs.write_dir_block(dir, b, &mut data).unwrap();
+        }
+        assert_eq!(vfs.readlink("/fast").err(), Some(Errno::EIO));
+        assert_eq!(vfs.open("/fast", OpenFlags::READ, 0).err(), Some(Errno::EIO));
+        assert_eq!(vfs.lookup("/file").unwrap().read(0, &mut [0; 4]).err(), Some(Errno::EIO));
+        assert_eq!(vfs.unlink("/file").err(), Some(Errno::EIO));
+        assert_eq!(vfs.lookup("/dir").unwrap().readdir(0).err(), Some(Errno::EIO));
+        assert_eq!(vfs.open("/dir/new", OpenFlags::CREATE, 0o644).err(), Some(Errno::EIO));
+    }
+
+    #[test]
+    fn extent_splits_on_a_full_disk_leave_it_consistent() {
+        let scratch = Scratch::new("split-full");
+        let Some(image) = mkfs(&scratch, Kind("ext4", &["-g", "256"]), 1024, 1 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root());
+        let f = vfs.open("/holes", OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
+        // One block in every two: each write is a new extent, so the tree
+        // keeps splitting until a split finds the disk full.
+        let mut i = 0;
+        let err = loop {
+            if let Err(e) = f.write(2 * i * 1024, &[(i % 251) as u8 + 1]) {
+                break e;
+            }
+            i += 1;
+        };
+        assert_eq!(err, Errno::ENOSPC);
+        assert!(i > 300, "only {i} extents fit");
+        for j in [0, i / 2, i - 1] {
+            let mut b = [0];
+            f.read(2 * j * 1024, &mut b).unwrap();
+            assert_eq!(b[0], (j % 251) as u8 + 1);
+        }
+        drop((f, vfs));
+        let image = unmount(ext2);
+        fsck(&scratch, &image, &[]);
+
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        ext2.root().lookup("holes").unwrap().truncate(0).unwrap();
+        fsck(&scratch, &unmount(ext2), &[]);
     }
 }

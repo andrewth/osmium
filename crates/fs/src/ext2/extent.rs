@@ -143,6 +143,30 @@ struct Node {
 /// The nodes from the root to a leaf, each with the entry chosen in it.
 type Path = Vec<(Node, usize)>;
 
+fn check_root(data: &[u8]) -> Result<(), Errno> {
+    if get16(data, 0) != MAGIC || max(data) > ROOT_MAX as usize || entries(data) > max(data) || depth(data) > MAX_DEPTH
+    {
+        return Err(Errno::EIO);
+    }
+    Ok(())
+}
+
+/// The new nodes an insertion through `path` takes: one for each full node
+/// from the leaf up, the last of them the root growing a level.
+fn blocks_needed(path: &Path) -> Result<usize, Errno> {
+    let mut need = 0;
+    for (level, (node, _)) in path.iter().enumerate().rev() {
+        if entries(&node.data) < max(&node.data) {
+            break;
+        }
+        if level == 0 && depth(&node.data) + 1 > MAX_DEPTH {
+            return Err(Errno::EFBIG);
+        }
+        need += 1;
+    }
+    Ok(need)
+}
+
 impl<D: BlockDevice + Send + 'static> Fs<D> {
     fn ext_seed(&self, ino: u32, inode: &Inode) -> u32 {
         if self.csum == Csum::Crc32c { self.inode_seed(ino, inode) } else { 0 }
@@ -191,12 +215,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     /// in each node the last entry at or before it (or the first).
     fn ext_path(&mut self, seed: u32, inode: &Inode, lblk: u32) -> Result<Path, Errno> {
         let data = inode.raw[ino::BLOCK..ino::BLOCK + 60].to_vec();
-        if get16(&data, 0) != MAGIC || max(&data) > ROOT_MAX as usize || entries(&data) > max(&data) {
-            return Err(Errno::EIO);
-        }
-        if depth(&data) > MAX_DEPTH {
-            return Err(Errno::EIO);
-        }
+        check_root(&data)?;
         let mut node = Node { block: 0, data };
         let mut path = Vec::new();
         loop {
@@ -243,9 +262,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                     // Allocated but never written: reads as a hole.
                     return Ok(0);
                 }
+                self.ext_convert(seed, inode, path, lblk)?;
                 let zero = vec![0; self.block_size];
                 self.write_block(p, &zero)?;
-                self.ext_convert(seed, inode, path, lblk)?;
                 return Ok(p);
             }
             goal = p;
@@ -256,7 +275,11 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let p = self.alloc_block(goal)?;
         let sectors = (self.block_size / 512) as i64;
         inode.add_sectors(sectors);
-        if let Err(e) = self.ext_insert(seed, inode, path, Extent { block: lblk, len: 1, start: p, uninit: false }) {
+        let mut spare = Vec::new();
+        let result =
+            self.ext_insert(seed, inode, path, Extent { block: lblk, len: 1, start: p, uninit: false }, &mut spare);
+        self.release(spare)?;
+        if let Err(e) = result {
             self.free_run(p, 1)?;
             inode.add_sectors(-sectors);
             return Err(e);
@@ -264,9 +287,26 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok(p)
     }
 
+    /// Frees tree blocks reserved but not used.
+    fn release(&mut self, spare: Vec<u64>) -> Result<(), Errno> {
+        for b in spare {
+            self.free_run(b, 1)?;
+        }
+        Ok(())
+    }
+
     /// Adds `ext` to the tree, extending a neighbour when it continues one.
-    /// `path` leads to the leaf for `ext.block`, which is not mapped.
-    fn ext_insert(&mut self, seed: u32, inode: &mut Inode, mut path: Path, ext: Extent) -> Result<(), Errno> {
+    /// `path` leads to the leaf for `ext.block`, which is not mapped. New
+    /// nodes come from `spare`, topped up before anything changes so that a
+    /// full disk leaves the tree as it was; the caller releases what is left.
+    fn ext_insert(
+        &mut self,
+        seed: u32,
+        inode: &mut Inode,
+        mut path: Path,
+        ext: Extent,
+        spare: &mut Vec<u64>,
+    ) -> Result<(), Errno> {
         let level = path.len() - 1;
         let (leaf, i) = &mut path[level];
         let (n, i) = (entries(&leaf.data), *i);
@@ -296,11 +336,18 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             }
             0
         };
-        self.insert_entry(seed, inode, &mut path, level, pos, ext.bytes())
+        let need = blocks_needed(&path)?;
+        while spare.len() < need {
+            let b = self.alloc_block(self.group_start(0))?;
+            spare.push(b);
+        }
+        self.insert_entry(seed, inode, &mut path, level, pos, ext.bytes(), spare)
     }
 
     /// Puts `entry` at `pos` in the node at `level`, splitting full nodes
-    /// (and growing the tree at the root) as needed.
+    /// (and growing the tree at the root) as needed, with new nodes from
+    /// `spare`.
+    #[allow(clippy::too_many_arguments)]
     fn insert_entry(
         &mut self,
         seed: u32,
@@ -309,8 +356,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         level: usize,
         pos: usize,
         entry: [u8; ENTRY],
+        spare: &mut Vec<u64>,
     ) -> Result<(), Errno> {
-        let goal = self.group_start(0);
         let node = &mut path[level].0;
         let n = entries(&node.data);
         if n < max(&node.data) {
@@ -326,7 +373,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             if d + 1 > MAX_DEPTH {
                 return Err(Errno::EFBIG);
             }
-            let b = self.alloc_block(goal)?;
+            let b = spare.pop().ok_or(Errno::EIO)?;
             inode.add_sectors(sectors);
             let mut data = vec![0; self.block_size];
             header(&mut data, block_max, d);
@@ -341,13 +388,13 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             put_entry(&mut root.data, 0, &index_entry(first, b));
             self.write_node(seed, inode, root)?;
             path.insert(1, (below, chosen));
-            return self.insert_entry(seed, inode, path, 1, pos, entry);
+            return self.insert_entry(seed, inode, path, 1, pos, entry, spare);
         }
         // Split: the upper entries move to a new node to the right. An
         // append starts the new node empty, which keeps sequential files'
         // nodes full.
         let mid = if pos == n { n } else { n / 2 };
-        let b = self.alloc_block(goal)?;
+        let b = spare.pop().ok_or(Errno::EIO)?;
         inode.add_sectors(sectors);
         let node = &mut path[level].0;
         let mut data = vec![0; self.block_size];
@@ -368,7 +415,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             self.fix_keys(seed, inode, path, level)?;
         }
         let at = path[level - 1].1 + 1;
-        self.insert_entry(seed, inode, path, level - 1, at, index_entry(key(&right.data, 0), b))
+        self.insert_entry(seed, inode, path, level - 1, at, index_entry(key(&right.data, 0), b), spare)
     }
 
     /// After the first key of the node at `level` changed, updates the
@@ -394,7 +441,35 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     /// Marks block `lblk` of the uninitialized extent chosen in `path`'s
     /// leaf initialized, splitting the extent around it.
-    fn ext_convert(&mut self, seed: u32, inode: &mut Inode, mut path: Path, lblk: u32) -> Result<(), Errno> {
+    fn ext_convert(&mut self, seed: u32, inode: &mut Inode, path: Path, lblk: u32) -> Result<(), Errno> {
+        // Up to two entries go into this leaf. Without room for them, take
+        // enough nodes for two splits to the root (and a level more) first.
+        let leaf = &path.last().unwrap().0;
+        let mut spare = Vec::new();
+        if max(&leaf.data) - entries(&leaf.data) < 2 {
+            for _ in 0..2 * (path.len() + 1) {
+                match self.alloc_block(self.group_start(0)) {
+                    Ok(b) => spare.push(b),
+                    Err(e) => {
+                        self.release(spare)?;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let result = self.ext_split_uninit(seed, inode, path, lblk, &mut spare);
+        self.release(spare)?;
+        result
+    }
+
+    fn ext_split_uninit(
+        &mut self,
+        seed: u32,
+        inode: &mut Inode,
+        mut path: Path,
+        lblk: u32,
+        spare: &mut Vec<u64>,
+    ) -> Result<(), Errno> {
         let (leaf, i) = path.last_mut().unwrap();
         let i = *i;
         let e = Extent::get(&leaf.data, i);
@@ -424,31 +499,44 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         self.write_node(seed, inode, leaf)?;
         for ext in pending {
             let path = self.ext_path(seed, inode, ext.block)?;
-            self.ext_insert(seed, inode, path, ext)?;
+            self.ext_insert(seed, inode, path, ext, spare)?;
         }
         Ok(())
     }
 
-    /// The extent version of [`Fs::truncate_blocks`].
+    /// The extent version of [`Fs::truncate_blocks`]. Blocks are freed
+    /// only once no node and not the inode itself refers to them, so a
+    /// failure part way leaks blocks rather than leaving a reference to a
+    /// free one.
     pub(super) fn ext_truncate(&mut self, ino: u32, inode: &mut Inode, keep: u64) -> Result<(), Errno> {
         let seed = self.ext_seed(ino, inode);
         let mut root = inode.raw[ino::BLOCK..ino::BLOCK + 60].to_vec();
-        if get16(&root, 0) != MAGIC || depth(&root) > MAX_DEPTH {
-            return Err(Errno::EIO);
-        }
-        let mut freed = 0;
-        let result = self.trunc_node(seed, &mut root, keep, &mut freed);
+        check_root(&root)?;
+        let mut frees = Vec::new();
+        self.trunc_node(seed, &mut root, keep, &mut frees)?;
         if entries(&root) == 0 {
             put16(&mut root, 6, 0);
         }
         inode.raw[ino::BLOCK..ino::BLOCK + 60].copy_from_slice(&root);
+        let freed: u64 = frees.iter().map(|&(_, n)| n).sum();
         inode.add_sectors(-((freed * (self.block_size / 512) as u64) as i64));
-        result.map(|_| ())
+        self.write_inode(ino, inode)?;
+        for (start, n) in frees {
+            self.free_run(start, n)?;
+        }
+        Ok(())
     }
 
-    /// Frees the blocks under a node from logical block `keep` on, and
-    /// the children left empty; returns whether the node changed.
-    fn trunc_node(&mut self, seed: u32, data: &mut [u8], keep: u64, freed: &mut u64) -> Result<bool, Errno> {
+    /// Drops the mappings under a node from logical block `keep` on, and
+    /// the children left empty, noting the blocks to free in `frees`;
+    /// returns whether the node changed. Changed children are written.
+    fn trunc_node(
+        &mut self,
+        seed: u32,
+        data: &mut [u8],
+        keep: u64,
+        frees: &mut Vec<(u64, u64)>,
+    ) -> Result<bool, Errno> {
         let d = depth(data);
         // Only a run of trailing entries is ever removed: `n` is how many
         // stay.
@@ -464,24 +552,21 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 }
                 changed = true;
                 if k >= keep {
-                    self.free_run(e.start, e.len as u64)?;
-                    *freed += e.len as u64;
+                    frees.push((e.start, e.len as u64));
                     n = i;
                     continue;
                 }
                 let cut = (e.end() - keep) as u32;
-                self.free_run(e.start + (e.len - cut) as u64, cut as u64)?;
-                *freed += cut as u64;
+                frees.push((e.start + (e.len - cut) as u64, cut as u64));
                 Extent { len: e.len - cut, ..e }.put(data, i);
                 break;
             }
             let b = child(data, i);
             let mut below = self.read_node(seed, b, d - 1)?;
-            if self.trunc_node(seed, &mut below, keep, freed)? {
+            if self.trunc_node(seed, &mut below, keep, frees)? {
                 changed = true;
                 if entries(&below) == 0 {
-                    self.free_run(b, 1)?;
-                    *freed += 1;
+                    frees.push((b, 1));
                     n = i;
                     continue;
                 }
