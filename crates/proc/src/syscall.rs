@@ -160,8 +160,8 @@ pub fn dispatch(p: &Process, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Exit | Sys::ExitGroup => return Outcome::Exit(ExitStatus::Code(a[0] as i32)),
         Sys::Read => read(p, fd, a[1], a[2]),
         Sys::Write => write(p, fd, a[1], a[2]),
-        Sys::Readv => vectored(p, fd, a[1], a[2], read),
-        Sys::Writev => vectored(p, fd, a[1], a[2], write),
+        Sys::Readv => readv(p, fd, a[1], a[2]),
+        Sys::Writev => writev(p, fd, a[1], a[2]),
         Sys::Openat => openat(p, fd, a[1], a[2], a[3] as u32),
         Sys::Close => p.files().lock().close(fd).map(|()| 0),
         Sys::Lseek => lseek(p, fd, a[1] as i64, a[2]),
@@ -230,20 +230,54 @@ fn write(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
     Ok(done)
 }
 
-/// `readv`/`writev`: `op` over each `struct iovec { base, len }`.
-fn vectored(p: &Process, fd: i32, iov: u64, count: u64, op: fn(&Process, i32, u64, u64) -> SysResult) -> SysResult {
+/// The `struct iovec { base, len }` array at `iov`.
+fn iovecs(p: &Process, iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64)>, Errno> {
     if count > 1024 {
         return Err(Errno::EINVAL);
     }
+    (0..count).map(|i| Ok((get_u64(p, iov + i * 16)?, get_u64(p, iov + i * 16 + 8)?))).collect()
+}
+
+fn readv(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
     let mut total = 0;
-    for i in 0..count {
-        let [base, len] = [get_u64(p, iov + i * 16)?, get_u64(p, iov + i * 16 + 8)?];
-        let n = op(p, fd, base, len)?;
+    for (base, len) in iovecs(p, iov, count)? {
+        let n = read(p, fd, base, len)?;
         total += n;
         if n < len {
             break;
         }
     }
+    Ok(total)
+}
+
+/// Gathers the pieces and writes them together (in chunks of up to 64 KiB),
+/// so a short `writev` reaches a console or pipe as one write.
+fn writev(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
+    const GATHER: usize = 64 * 1024;
+    let f = p.files().lock().get(fd)?;
+    let mut pending = alloc::vec::Vec::new();
+    let mut total = 0;
+    let mut flush = |pending: &mut alloc::vec::Vec<u8>| -> Result<bool, Errno> {
+        let n = if pending.is_empty() { 0 } else { f.write(pending)? };
+        total += n as u64;
+        let complete = n == pending.len();
+        pending.clear();
+        Ok(complete)
+    };
+    for (base, len) in iovecs(p, iov, count)? {
+        let mut done = 0;
+        while done < len {
+            let n = ((len - done) as usize).min(GATHER - pending.len());
+            let start = pending.len();
+            pending.resize(start + n, 0);
+            p.memory().read(base + done, &mut pending[start..])?;
+            done += n as u64;
+            if pending.len() == GATHER && !flush(&mut pending)? {
+                return Ok(total);
+            }
+        }
+    }
+    flush(&mut pending)?;
     Ok(total)
 }
 

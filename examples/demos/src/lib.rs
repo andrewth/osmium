@@ -4,6 +4,8 @@
 
 extern crate alloc;
 
+pub mod user;
+
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
