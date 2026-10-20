@@ -22,6 +22,9 @@ use osmium::drivers::uart16550::{Mmio, Uart16550};
 use osmium::drivers::virtio::mmio::MmioTransport;
 use osmium::drivers::virtio::net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
+use osmium::drivers::xhci::Xhci;
+use osmium::hal::pci;
+use osmium::hal::usb::UsbHost;
 use osmium::hal::console::{Console, SerialConsole, set_console};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
@@ -174,6 +177,46 @@ struct SecondaryBoot {
 /// Timer interrupt period.
 const TICK_NS: u64 = 10_000_000;
 
+/// A PCIe host bridge from the device tree: the ECAM window and the 32-bit
+/// memory window BARs are assigned from (both as base and length).
+struct PcieHost {
+    ecam: (u64, u64),
+    mem: (u64, u64),
+}
+
+fn pcie_host(fdt: &Fdt<'_>) -> Option<PcieHost> {
+    let node = fdt.find_compatible(&["pci-host-ecam-generic"])?;
+    let (base, len) = node.reg().next()?;
+    // Each `ranges` entry: PCI address (3 cells), CPU address (2), size (2).
+    let cells: Vec<u32> = node.property("ranges")?.as_u32_cells().collect();
+    let mem = cells.chunks_exact(7).find(|r| r[0] >> 24 & 3 == 2).map(|r| {
+        let cpu = (r[3] as u64) << 32 | r[4] as u64;
+        let size = (r[5] as u64) << 32 | r[6] as u64;
+        (cpu, size)
+    })?;
+    Some(PcieHost { ecam: (base, len?), mem })
+}
+
+/// Finds the first xHCI controller, assigns its BARs and enables it; returns
+/// its address and BAR 0.
+fn find_xhci(host: &PcieHost) -> Option<(pci::Address, u64, u64)> {
+    // SAFETY: the device tree puts the ECAM window here, mapped as device
+    // memory; only this function uses it.
+    let ecam = pci::Ecam::new(unsafe { IoMem::new(host.ecam.0 as *mut u8, host.ecam.1 as usize) }, 0);
+    let mut found = None;
+    pci::for_each_function(&ecam, 0, |f| {
+        if found.is_none() && f.class() == pci::Class::XHCI {
+            found = Some(f.address());
+        }
+    });
+    let f = pci::Function::new(&ecam, found?)?;
+    // Firmware (OpenSBI) leaves BARs unassigned on this machine.
+    pci::BarAllocator::new(host.mem.0, host.mem.1).assign(&f).ok()?;
+    let bar = f.bar(0)?;
+    f.enable_memory_and_dma();
+    Some((f.address(), bar.address, bar.size))
+}
+
 /// Base and size of every virtio-mmio slot in the device tree.
 fn virtio_slots<'a>(fdt: &Fdt<'a>) -> impl Iterator<Item = (u64, u64)> + 'a {
     fdt.all_nodes()
@@ -265,6 +308,12 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         let page = base & !(PAGE_SIZE as u64 - 1);
         pt.map_range(va(page), pa(page), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
     }
+    let pcie = pcie_host(&fdt);
+    if let Some(h) = &pcie {
+        for (base, len) in [h.ecam, h.mem] {
+            pt.map_range(va(base), pa(base), len, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
+        }
+    }
     // SAFETY: the table identity-maps the running code, its stack, the heap and the UART.
     unsafe { riscv64::write_satp(SatpMode::Sv39, 0, pt.root().0) };
     SATP_ROOT.store(pt.root().0, Ordering::Release);
@@ -330,6 +379,20 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             demos::arp(&mut net, now_ns);
         }
         None => println!("[net]   no virtio-net device"),
+    }
+
+    // --- xHCI behind PCIe ------------------------------------------------------
+    match pcie.as_ref().and_then(find_xhci) {
+        Some((addr, base, len)) => {
+            // SAFETY: BAR 0 was just assigned this range inside the mapped
+            // window; nothing else uses it.
+            let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
+            let mut hc = Xhci::new(io, &FRAMES).expect("xHCI init failed");
+            hc.no_op().expect("xHCI command ring");
+            println!("[usb]   xHCI at {:02x}:{:02x}.{} BAR0 {base:#x}, {} ports", addr.bus, addr.device, addr.function, hc.num_ports());
+            demos::usb(&mut hc);
+        }
+        None => println!("[usb]   no xHCI controller"),
     }
 
     demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });

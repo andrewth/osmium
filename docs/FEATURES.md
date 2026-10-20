@@ -147,7 +147,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ x86 I/O APIC (GSI routing, polarity/trigger, masking); the x86_64 example routes COM1's receive interrupt through it into an `SpscRing`
 - ✅ RAM disk `BlockDevice`
 - ✅ virtio-mmio transport (legacy and 1.x), split virtqueue, virtio-net `NetDevice`
-- 🗺 virtio-pci transport; virtio blk, console; xHCI USB host controller and class drivers (HID, mass storage, CDC-ECM); GICv3; IO-APIC; HPET; NVMe
+- ✅ xHCI USB host controller (`UsbHost`): polled command and event rings, root-port reset, control, bulk and interrupt transfers
+- 🗺 virtio-pci transport; virtio blk, console; xHCI interrupts, hubs and isochronous transfers; USB class drivers (HID, mass storage, CDC-ECM); GICv3; IO-APIC; HPET; NVMe
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)

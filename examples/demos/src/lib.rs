@@ -172,3 +172,79 @@ pub fn arp(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     }
     println!("[net]   no ARP reply");
 }
+
+/// Enumerates every device on `host`'s root ports and prints what it finds.
+/// A mass-storage stick is also asked for its SCSI INQUIRY data, which
+/// exercises bulk transfers in both directions.
+pub fn usb(host: &mut impl osmium::hal::usb::UsbHost) {
+    use osmium::hal::usb::{Descriptor, Descriptors, Direction, TransferType, enumerate};
+    for port in 1..=host.num_ports() {
+        let status = host.port_status(port);
+        if !status.connected {
+            continue;
+        }
+        let mut config = [0u8; 256];
+        let dev = match enumerate(host, port, &mut config) {
+            Ok(dev) => dev,
+            Err(e) => {
+                println!("[usb]   port {port}: enumeration failed: {e}");
+                continue;
+            }
+        };
+        let d = dev.device;
+        println!("[usb]   port {port}: {:04x}:{:04x} {:?}-speed, {} interface(s)", d.vendor_id, d.product_id,
+            status.speed.unwrap(), dev.config.num_interfaces);
+
+        let (mut class, mut bulk_in, mut bulk_out) = (None, None, None);
+        for desc in Descriptors::new(&config[..dev.config_len]).flatten() {
+            match desc {
+                Descriptor::Interface(i) if i.alternate == 0 => {
+                    println!("[usb]     interface {}: class {:02x}/{:02x}/{:02x}", i.number, i.class, i.subclass, i.protocol);
+                    class = Some((i.class, i.subclass, i.protocol));
+                }
+                Descriptor::Endpoint(e) if class == Some((8, 6, 0x50)) && e.transfer_type() == TransferType::Bulk => {
+                    match e.direction() {
+                        Direction::In => bulk_in = Some(e.address),
+                        Direction::Out => bulk_out = Some(e.address),
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(i), Some(o)) = (bulk_in, bulk_out) {
+            match inquiry(host, dev.id, i, o) {
+                Ok((vendor, product)) => println!("[usb]     mass storage: INQUIRY \"{vendor}\" \"{product}\""),
+                Err(e) => println!("[usb]     mass storage: INQUIRY failed: {e}"),
+            }
+        }
+    }
+}
+
+/// SCSI INQUIRY over USB Bulk-Only Transport; returns the vendor and
+/// product strings.
+fn inquiry(
+    host: &mut impl osmium::hal::usb::UsbHost,
+    dev: osmium::hal::usb::DeviceId,
+    bulk_in: u8,
+    bulk_out: u8,
+) -> Result<(alloc::string::String, alloc::string::String), osmium::hal::usb::UsbError> {
+    use osmium::hal::usb::UsbError;
+    const LEN: u32 = 36;
+    let mut cbw = [0u8; 31];
+    cbw[0..4].copy_from_slice(b"USBC");
+    cbw[4..8].copy_from_slice(&0x0511_u32.to_le_bytes()); // tag
+    cbw[8..12].copy_from_slice(&LEN.to_le_bytes());
+    cbw[12] = 0x80; // data in
+    cbw[14] = 6; // command length
+    cbw[15..21].copy_from_slice(&[0x12, 0, 0, 0, LEN as u8, 0]); // INQUIRY
+    host.transfer_out(dev, bulk_out, &cbw)?;
+    let mut data = [0u8; LEN as usize];
+    let n = host.transfer_in(dev, bulk_in, &mut data)?;
+    let mut csw = [0u8; 13];
+    let m = host.transfer_in(dev, bulk_in, &mut csw)?;
+    if n < 32 || m != 13 || &csw[0..4] != b"USBS" || csw[4..8] != cbw[4..8] || csw[12] != 0 {
+        return Err(UsbError::Transaction);
+    }
+    let text = |b: &[u8]| alloc::string::String::from_utf8_lossy(b).trim_end().into();
+    Ok((text(&data[8..16]), text(&data[16..32])))
+}

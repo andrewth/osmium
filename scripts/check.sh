@@ -44,18 +44,24 @@ boot() {
         'mask 0b1111), mutex total 2000' 'visited CPUs \[0, 1, 2, 3, 0\]' 'PageFault' '\[done\]'; do
         grep -q "$line" "$log" || { echo "$name: missing '$line'"; exit 1; }
     done
-    # Lines only some kernels print, from the caller's $EXPECT.
-    if [ -n "${EXPECT:-}" ]; then
-        grep -q "$EXPECT" "$log" || { echo "$name: missing '$EXPECT'"; exit 1; }
-    fi
+    # Lines only some kernels print: the caller's $EXPECT, ';'-separated.
+    local extra=()
+    IFS=';' read -ra extra <<<"${EXPECT:-}"
+    for line in "${extra[@]}"; do
+        grep -q "$line" "$log" || { echo "$name: missing '$line'"; exit 1; }
+    done
     rm -f "$log"
 }
 
 # Multi-threaded TCG runs the four CPUs in parallel on host threads.
-# The virtio-net device on QEMU's user network answers the kernel's ARP request.
-EXPECT='ARP: 10.0.2.2 is at' boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
+# QEMU's user network answers the kernel's ARP request over virtio-net, and a
+# USB stick behind the xHCI controller answers a SCSI INQUIRY.
+EXPECT='ARP: 10.0.2.2 is at;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01' \
+boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi \
-    -netdev user,id=n0 -device virtio-net-device,netdev=n0
+    -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+    -device qemu-xhci -device usb-kbd \
+    -blockdev null-co,node-name=stick,size=1048576 -device usb-storage,drive=stick
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
 boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \

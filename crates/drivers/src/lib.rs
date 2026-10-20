@@ -11,6 +11,7 @@
 //! | [`ioapic::IoApic`] | x86 I/O APIC | GSI routing |
 //! | [`ramdisk::RamDisk`] | Memory-backed disk | `BlockDevice` |
 //! | [`virtio::net::VirtioNet`] | virtio network card (MMIO, legacy and 1.x) | `NetDevice` |
+//! | [`xhci::Xhci`] | xHCI USB host controller | `UsbHost` |
 //!
 //! Every driver is constructed from an [`osmium_hal::mmio::IoMem`] (or a
 //! port base), so it works the same under any memory map and can be tested
@@ -29,3 +30,4 @@ pub mod plic;
 pub mod ramdisk;
 pub mod uart16550;
 pub mod virtio;
+pub mod xhci;
