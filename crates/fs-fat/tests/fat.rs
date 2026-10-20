@@ -359,6 +359,22 @@ fn fsinfo_free_count_is_only_a_hint() {
 }
 
 #[test]
+fn creating_in_a_directory_without_a_chain_leaks_nothing() {
+    let disk = crafted(65535);
+    root_entry(&disk, 0, b"BADDIR     ", 0x10, 0, 0);
+    let fs = FatFs::mount(disk.clone(), 1).unwrap();
+    let bad = fs.root().lookup("baddir").unwrap();
+    for kind in [FileKind::Regular, FileKind::Directory] {
+        assert_eq!(bad.create("x", kind, 0o644).err(), Some(Errno::EIO));
+    }
+    drop(fs);
+    // Cluster 3 onwards is still free.
+    let mut fat = [0u8; 16];
+    disk.copy(FAT_START + 12, &mut fat, false);
+    assert_eq!(fat, [0; 16]);
+}
+
+#[test]
 fn cluster_cycles_are_errors() {
     let disk = crafted(65535);
     root_entry(&disk, 0, b"LOOP       ", 0x20, 3, 100);

@@ -49,35 +49,39 @@ fn align4(n: usize) -> usize {
 
 impl<'src> Entries<'src> {
     fn parse(&mut self) -> Result<Option<Entry<'src>>, Errno> {
-        // Several archives may be concatenated, with zero padding between.
-        while self.rest.len() >= 4 && self.rest[..4] == [0; 4] {
-            self.rest = &self.rest[4..];
-        }
-        if self.rest.is_empty() {
-            return Ok(None);
-        }
-        let header = self.rest.get(..HEADER_LEN).ok_or(Errno::EINVAL)?;
-        if &header[..6] != b"070701" && &header[..6] != b"070702" {
-            return Err(Errno::EINVAL);
-        }
-        let mode = field(header, 1)?;
-        let size = field(header, 6)? as usize;
-        let name_size = field(header, 11)? as usize;
-        let name_end = HEADER_LEN.checked_add(name_size).ok_or(Errno::EINVAL)?;
-        let data_start = align4(name_end);
-        let data_end = data_start.checked_add(size).ok_or(Errno::EINVAL)?;
-        if name_size == 0 || data_end > self.rest.len() {
-            return Err(Errno::EINVAL);
-        }
-        // The name is NUL-terminated.
-        let name = &self.rest[HEADER_LEN..name_end - 1];
-        let name = str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-        let data = &self.rest[data_start..data_end];
-        self.rest = &self.rest[align4(data_end).min(self.rest.len())..];
-        if name == TRAILER {
-            // Another archive may follow (an early microcode cpio, say).
-            return self.parse();
-        }
+        // A loop, not recursion: an archive may hold any number of trailers.
+        let (name, mode, data) = loop {
+            // Several archives may be concatenated, with zero padding between.
+            while self.rest.len() >= 4 && self.rest[..4] == [0; 4] {
+                self.rest = &self.rest[4..];
+            }
+            if self.rest.is_empty() {
+                return Ok(None);
+            }
+            let header = self.rest.get(..HEADER_LEN).ok_or(Errno::EINVAL)?;
+            if &header[..6] != b"070701" && &header[..6] != b"070702" {
+                return Err(Errno::EINVAL);
+            }
+            let mode = field(header, 1)?;
+            let size = field(header, 6)? as usize;
+            let name_size = field(header, 11)? as usize;
+            let name_end = HEADER_LEN.checked_add(name_size).ok_or(Errno::EINVAL)?;
+            let data_start = align4(name_end);
+            let data_end = data_start.checked_add(size).ok_or(Errno::EINVAL)?;
+            if name_size == 0 || data_end > self.rest.len() {
+                return Err(Errno::EINVAL);
+            }
+            // The name is NUL-terminated.
+            let name = &self.rest[HEADER_LEN..name_end - 1];
+            let name = str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
+            let data = &self.rest[data_start..data_end];
+            self.rest = &self.rest[align4(data_end).min(self.rest.len())..];
+            if name == TRAILER {
+                // Another archive may follow (an early microcode cpio, say).
+                continue;
+            }
+            break (name, mode, data);
+        };
         let kind = match mode & 0o170000 {
             0o010000 => FileKind::Fifo,
             0o020000 => FileKind::CharDevice,
@@ -110,7 +114,8 @@ impl<'src> Iterator for Entries<'src> {
 }
 
 /// Unpacks `archive` into the existing directory `at` of `vfs`, creating
-/// missing parent directories and replacing existing files; returns the
+/// missing parent directories and replacing existing files and symbolic
+/// links (a directory where a file belongs fails with `EISDIR`); returns the
 /// number of members. Device nodes get no device number: bind real devices
 /// with a [`DevDir`](crate::dev::DevDir) instead.
 pub fn unpack(vfs: &Vfs, at: &str, archive: &[u8]) -> Result<usize, Errno> {
@@ -134,6 +139,9 @@ pub fn unpack(vfs: &Vfs, at: &str, archive: &[u8]) -> Result<usize, Errno> {
                 result => result?,
             },
             FileKind::Regular => {
+                if vfs.stat(&path, false).is_ok_and(|s| s.kind == FileKind::Symlink) {
+                    vfs.unlink(&path)?;
+                }
                 let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNC | OpenFlags::NOFOLLOW;
                 let file = vfs.open(&path, flags, entry.mode)?;
                 if file.write(0, entry.data)? != entry.data.len() {
@@ -237,6 +245,16 @@ mod tests {
     }
 
     #[test]
+    fn many_trailers_do_not_recurse() {
+        let mut out = Vec::new();
+        for _ in 0..200_000 {
+            member(&mut out, TRAILER, 0, b"");
+        }
+        member(&mut out, "x", 0o100644, b"");
+        assert_eq!(entries(&out).count(), 1);
+    }
+
+    #[test]
     fn unpack_into_ramfs() {
         let vfs = Vfs::new(RamFs::new(1).root());
         let mut archive = archive();
@@ -253,6 +271,17 @@ mod tests {
         assert_eq!(vfs.stat("/dev/console", false).unwrap().kind, FileKind::CharDevice);
         // Unpacking again over the same tree works.
         unpack(&vfs, "/", &archive).unwrap();
+
+        // A symlink or a directory at a regular member's path.
+        let mut over = Vec::new();
+        member(&mut over, "sbin", 0o100644, b"file now");
+        member(&mut over, TRAILER, 0, b"");
+        unpack(&vfs, "/", &over).unwrap();
+        assert_eq!(vfs.stat("/sbin", false).unwrap().kind, FileKind::Regular);
+        assert_eq!(read_all(&vfs, "/sbin"), b"file now");
+        let mut dir = Vec::new();
+        member(&mut dir, "bin", 0o100644, b"x");
+        assert_eq!(unpack(&vfs, "/", &dir), Err(Errno::EISDIR));
 
         let mut evil = Vec::new();
         member(&mut evil, "../escape", 0o100644, b"");

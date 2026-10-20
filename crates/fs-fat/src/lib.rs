@@ -817,6 +817,11 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         name::validate(name)?;
         let mut vol = self.shared.vol.lock();
         let dir_first = self.dir_cluster(&mut vol)?;
+        // A damaged directory (first cluster 0, say) has no chain to grow:
+        // writing would start one that nothing links to.
+        if dir_first != ROOT_FIXED && !vol.geo.is_data_cluster(dir_first) {
+            return Err(Errno::EIO);
+        }
         let bytes = vol.dir_bytes(dir_first)?;
         if dir::parse(&bytes).iter().any(|e| name::same(&e.name, name)) {
             return Err(Errno::EEXIST);
@@ -839,17 +844,19 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         }
 
         // A directory gets its first cluster, with `.` and `..`, up front.
-        let first = if kind == FileKind::Directory {
-            let mut c = 0;
+        let mut first = 0;
+        if kind == FileKind::Directory {
             let parent = if self.state(&mut vol).ino == ROOT_INO { 0 } else { dir_first };
-            vol.write_chain(&mut c, 0, &dir::dot_entries(0, parent))?;
-            // Now that the cluster is known, record it in `.`.
-            let dot = dir::short_entry(b".          ", 0, attr::DIRECTORY, c, 0);
-            vol.write_chain(&mut c, 0, &dot)?;
-            c
-        } else {
-            0
-        };
+            let made = vol.write_chain(&mut first, 0, &dir::dot_entries(0, parent)).and_then(|()| {
+                // Now that the cluster is known, record it in `.`.
+                let dot = dir::short_entry(b".          ", 0, attr::DIRECTORY, first, 0);
+                vol.write_chain(&mut first, 0, &dot)
+            });
+            if let Err(e) = made {
+                let _ = vol.free_chain(first);
+                return Err(e);
+            }
+        }
         let attr_bits = if kind == FileKind::Directory { attr::DIRECTORY } else { attr::ARCHIVE };
         slots.push(dir::short_entry(&short, ntres, attr_bits, first, 0));
         let flat: Vec<u8> = slots.iter().flatten().copied().collect();
@@ -858,7 +865,19 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             let _ = vol.free_chain(first);
             return Err(e);
         }
-        let ino = vol.entry_ino(dir_first, at + flat.len() - ENTRY_SIZE)?;
+        let ino = match vol.entry_ino(dir_first, at + flat.len() - ENTRY_SIZE) {
+            Ok(ino) => ino,
+            Err(e) => {
+                // Take the entries back out before freeing what they name.
+                let mut freed = flat.clone();
+                for slot in freed.as_chunks_mut::<ENTRY_SIZE>().0 {
+                    slot[0] = dir::FREE;
+                }
+                let _ = vol.write_chain(&mut dir_first_mut, at as u64, &freed);
+                let _ = vol.free_chain(first);
+                return Err(e);
+            }
+        };
         let probe = Probe { kind, read_only: false, first, size: 0 };
         Ok(vol.node(&self.shared, ino, probe))
     }

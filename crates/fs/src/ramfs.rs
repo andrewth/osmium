@@ -362,6 +362,23 @@ mod tests {
         vfs.open("/abs", OpenFlags::CREATE | OpenFlags::WRITE, 0).unwrap();
         vfs.unlink("/abs").unwrap();
         assert!(vfs.lookup("/dir/target").is_ok());
+        // ... and through a dangling one it creates the target.
+        vfs.symlink("made", "/dir/dangling").unwrap();
+        vfs.symlink("/dir/dangling", "/chain").unwrap();
+        vfs.open("/chain", OpenFlags::CREATE | OpenFlags::WRITE, 0o600).unwrap();
+        assert_eq!(vfs.stat("/dir/made", false).unwrap().kind, FileKind::Regular);
+        assert_eq!(vfs.stat("/chain", false).unwrap().kind, FileKind::Symlink);
+        assert_eq!(vfs.open("/chain", OpenFlags::CREATE | OpenFlags::EXCL, 0).err(), Some(Errno::EEXIST));
+        vfs.symlink("gone", "/dir/nofollow").unwrap();
+        assert_eq!(vfs.open("/dir/nofollow", OpenFlags::CREATE | OpenFlags::NOFOLLOW, 0).err(), Some(Errno::ELOOP));
+        assert_eq!(vfs.lookup("/dir/gone").err(), Some(Errno::ENOENT));
+        vfs.symlink("/self", "/self").unwrap();
+        assert_eq!(vfs.open("/self", OpenFlags::CREATE, 0).err(), Some(Errno::ELOOP));
+        // A trailing slash is a directory request.
+        assert_eq!(vfs.open("/dir/made/", OpenFlags::CREATE, 0).err(), Some(Errno::ENOTDIR));
+        assert_eq!(vfs.open("/dir/new/", OpenFlags::CREATE, 0).err(), Some(Errno::EISDIR));
+        assert_eq!(vfs.open("/dir/", OpenFlags::CREATE, 0).err(), Some(Errno::EISDIR));
+        assert_eq!(vfs.lookup("/dir/new").err(), Some(Errno::ENOENT));
     }
 
     #[test]
@@ -375,6 +392,9 @@ mod tests {
         assert_eq!(vfs.stat("/mnt/inside", true).unwrap().dev, 2);
         assert_eq!(vfs.lookup("/mnt/hidden").err(), Some(Errno::ENOENT));
         assert_eq!(vfs.stat("/mnt", true).unwrap().dev, 2);
+        // O_CREAT on the mount point itself is the mounted root.
+        assert_eq!(vfs.open("/mnt", OpenFlags::CREATE, 0).unwrap().stat().dev, 2);
+        assert_eq!(vfs.open("/mnt", OpenFlags::CREATE | OpenFlags::EXCL, 0).err(), Some(Errno::EEXIST));
         // `..` leaves the mount.
         assert_eq!(vfs.stat("/mnt/..", true).unwrap().dev, 1);
         assert_eq!(vfs.canonicalize("/mnt/../mnt/inside").unwrap(), "/mnt/inside");

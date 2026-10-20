@@ -105,19 +105,7 @@ impl Vfs {
     pub fn open(&self, path: &str, flags: OpenFlags, mode: u32) -> Result<Arc<dyn File>, Errno> {
         let follow = !flags.contains(OpenFlags::NOFOLLOW);
         let node = if flags.contains(OpenFlags::CREATE) {
-            let parent = self.parent(path)?;
-            match parent.name {
-                Some(name) if name != "." && name != ".." => match parent.dir.lookup(name) {
-                    Ok(_) if flags.contains(OpenFlags::EXCL) => return Err(Errno::EEXIST),
-                    Ok(node) if node.stat().kind == FileKind::Symlink && follow => self.resolve(path, true)?.node,
-                    Ok(node) => node,
-                    Err(Errno::ENOENT) if parent.trailing_slash => return Err(Errno::EISDIR),
-                    Err(Errno::ENOENT) => parent.dir.create(name, FileKind::Regular, mode & 0o7777)?,
-                    Err(e) => return Err(e),
-                },
-                // `/`, `.` or `..`: always an existing directory.
-                _ => return Err(if flags.contains(OpenFlags::EXCL) { Errno::EEXIST } else { Errno::EISDIR }),
-            }
+            self.open_create(path, flags, mode, 0)?
         } else {
             self.resolve(path, follow)?.node
         };
@@ -134,6 +122,56 @@ impl Vfs {
         }
         if stat.kind == FileKind::Regular && flags.contains(OpenFlags::TRUNC | OpenFlags::WRITE) {
             node.truncate(0)?;
+        }
+        Ok(node)
+    }
+
+    /// The node `open` with [`OpenFlags::CREATE`] ends up on: the existing
+    /// one (through mounts, and through a final symbolic link unless
+    /// `NOFOLLOW`), or a new regular file; a dangling link creates its target.
+    fn open_create(&self, path: &str, flags: OpenFlags, mode: u32, depth: usize) -> Result<Arc<dyn File>, Errno> {
+        let follow = !flags.contains(OpenFlags::NOFOLLOW);
+        let parent = self.parent(path)?;
+        let name = match parent.name {
+            Some(name) if name != "." && name != ".." => name,
+            // `/`, `.` or `..`: always an existing directory.
+            _ => return Err(if flags.contains(OpenFlags::EXCL) { Errno::EEXIST } else { Errno::EISDIR }),
+        };
+        let mut node = match parent.dir.lookup(name) {
+            Ok(node) => node,
+            Err(Errno::ENOENT) if parent.trailing_slash => return Err(Errno::EISDIR),
+            Err(Errno::ENOENT) => return parent.dir.create(name, FileKind::Regular, mode & 0o7777),
+            Err(e) => return Err(e),
+        };
+        // A mount point shows the mounted root, not the covered directory.
+        if let Some(root) = Walker::covering(&self.snapshot(), &join(&parent.path, name)) {
+            node = root;
+        }
+        if flags.contains(OpenFlags::EXCL) {
+            return Err(Errno::EEXIST);
+        }
+        if parent.trailing_slash {
+            // `open("file/", O_CREAT)`: a directory was asked for.
+            let node = self.resolve(path, true)?.node;
+            return Err(if node.stat().kind == FileKind::Directory { Errno::EISDIR } else { Errno::ENOTDIR });
+        }
+        if node.stat().kind == FileKind::Symlink && follow {
+            return match self.resolve(path, true) {
+                Ok(resolved) => Ok(resolved.node),
+                Err(Errno::ENOENT) => {
+                    // Dangling: create what the link points at.
+                    if depth >= MAX_SYMLINKS {
+                        return Err(Errno::ELOOP);
+                    }
+                    let target = node.readlink()?;
+                    if target.is_empty() {
+                        return Err(Errno::ENOENT);
+                    }
+                    let target = if target.starts_with('/') { target } else { join(&parent.path, &target) };
+                    self.open_create(&target, flags, mode, depth + 1)
+                }
+                Err(e) => Err(e),
+            };
         }
         Ok(node)
     }

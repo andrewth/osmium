@@ -41,9 +41,9 @@ use alloc::vec::Vec;
 use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_sync::SpinLock;
 
+use csum::{crc16, crc32c};
 use osmium_fs::dev::makedev;
 use osmium_fs::{DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat};
-use csum::{crc16, crc32c};
 
 const MAGIC: u16 = 0xef53;
 const ROOT_INO: u32 = 2;
@@ -1422,11 +1422,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let new_end = off + done as u64;
         if new_end > inode.size() {
             inode.set_size(new_end);
-            if new_end > i32::MAX as u64 && get32(&self.sb, sb::FEATURE_RO_COMPAT) & RO_COMPAT_LARGE_FILE == 0 {
-                let ro = get32(&self.sb, sb::FEATURE_RO_COMPAT) | RO_COMPAT_LARGE_FILE;
-                put32(&mut self.sb, sb::FEATURE_RO_COMPAT, ro);
-                self.write_super()?;
-            }
+            self.note_file_size(new_end)?;
         }
         let now = self.now();
         inode.set_times(now, &[ino::MTIME, ino::CTIME]);
@@ -1436,6 +1432,17 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             Err(e) if done == 0 => Err(e),
             _ => Ok(done),
         }
+    }
+
+    /// Sets RO_COMPAT_LARGE_FILE (and persists the superblock) before a file
+    /// first grows past 2 GiB.
+    fn note_file_size(&mut self, size: u64) -> Result<(), Errno> {
+        if size > i32::MAX as u64 && get32(&self.sb, sb::FEATURE_RO_COMPAT) & RO_COMPAT_LARGE_FILE == 0 {
+            let ro = get32(&self.sb, sb::FEATURE_RO_COMPAT) | RO_COMPAT_LARGE_FILE;
+            put32(&mut self.sb, sb::FEATURE_RO_COMPAT, ro);
+            self.write_super()?;
+        }
+        Ok(())
     }
 
     fn truncate(&mut self, ino: u32, len: u64) -> Result<(), Errno> {
@@ -1466,6 +1473,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             // Beyond what the block map or extent tree can reach.
             return Err(Errno::EFBIG);
         }
+        self.note_file_size(len)?;
         inode.set_size(len);
         let now = self.now();
         inode.set_times(now, &[ino::MTIME, ino::CTIME]);
@@ -2348,6 +2356,21 @@ mod tests {
         assert_eq!(read_all(&*pre), want);
         drop((pre, vfs));
         assert_eq!(fsck(&scratch, &unmount(ext2), &["/pre"])[0], want);
+    }
+
+    #[test]
+    fn growing_past_2gib_sets_large_file() {
+        let scratch = Scratch::new("largefile");
+        let Some(image) = mkfs(&scratch, Kind("ext4", &["-O", "^large_file"]), 1024, 4 << 20, None) else { return };
+        assert_eq!(get32(&image[1024..2048], sb::FEATURE_RO_COMPAT) & RO_COMPAT_LARGE_FILE, 0);
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root());
+        let f = vfs.open("/big", OpenFlags::CREATE | OpenFlags::WRITE, 0o644).unwrap();
+        f.truncate(3 << 30).unwrap();
+        drop((f, vfs));
+        let image = unmount(ext2);
+        assert_ne!(get32(&image[1024..2048], sb::FEATURE_RO_COMPAT) & RO_COMPAT_LARGE_FILE, 0);
+        fsck(&scratch, &image, &[]);
     }
 
     #[test]
