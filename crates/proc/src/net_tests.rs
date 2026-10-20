@@ -88,6 +88,10 @@ impl UserMemory for Flat {
     fn fork(&self) -> Result<Box<dyn UserMemory>, Errno> {
         Err(Errno::ENOMEM)
     }
+
+    fn cow_fault(&self, _: u64) -> bool {
+        false
+    }
 }
 
 static NOW: AtomicU64 = AtomicU64::new(1_000_000);
