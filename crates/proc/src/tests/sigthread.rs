@@ -519,3 +519,30 @@ fn arch_prctl_sets_the_thread_pointer() {
     assert_eq!(callt(&p, &th, Sys::ArchPrctl, &[0x9999, 0]), EINVAL);
     assert_eq!(callt(&p, &th, Sys::SetTidAddress, &[DATA + 8]), p.pid().0 as i64);
 }
+
+#[test]
+fn a_signal_frame_on_a_shared_stack_copies_the_page_first() {
+    platform();
+    let (p, frames) = process("sig-cow");
+    let th = p.leader();
+    put(&p, STACK - 0x100, b"parent stack");
+    assert_eq!(sigaction(&p, SIGUSR1, handler(0, 0)), 0);
+    let Outcome::Fork { child, .. } = dispatch(&p, Sys::Fork.number(), [0; 6]) else { panic!("no fork") };
+    let c = Process::find(child).unwrap();
+    let shared = frames.live();
+
+    call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
+    let mut regs = Regs::<true>::new();
+    assert_eq!(signal::deliver_to(&p, &th, &mut regs), None);
+    assert_eq!(regs.pc, HANDLER);
+    assert_eq!(frames.live(), shared + 1, "writing the frame broke the sharing of the stack page");
+    // The child's stack is untouched, and it can run a handler of its own.
+    assert_eq!(get(&c, STACK - 0x100, 12), b"parent stack");
+    assert_eq!(get(&c, regs.args[1], 4), [0; 4], "no siginfo in the child's copy");
+    assert_eq!(get(&p, regs.args[1], 4), (SIGUSR1 as i32).to_ne_bytes());
+    call(&c, Sys::Kill, &[c.pid().0 as u64, SIGUSR1 as u64]);
+    let mut cregs = Regs::<true>::new();
+    assert_eq!(signal::deliver_to(&c, &c.leader(), &mut cregs), None);
+    assert_eq!(cregs.pc, HANDLER, "the child inherited the handler");
+    assert_eq!(get(&c, cregs.args[1], 4), (SIGUSR1 as i32).to_ne_bytes());
+}

@@ -391,6 +391,8 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     fn cow_fault(&self, va: u64) -> bool {
         let mut inner = self.inner.lock();
         self.break_cow(&mut inner, va & !(PAGE - 1))
+    }
+
     fn map_code(&self, va: u64, code: &[u8]) -> Result<(), Errno> {
         if !va.is_multiple_of(PAGE) || code.len() > PAGE_SIZE || !self.is_user_range(va, va + PAGE) {
             return Err(Errno::EINVAL);
