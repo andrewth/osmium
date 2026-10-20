@@ -55,7 +55,7 @@ const CTRL_L4_CSUM: u32 = 1 << 5;
 /// Bytes of a control or data segment, and of the LSO segment's fixed part.
 const SEG_LEN: usize = 16;
 const LSO_FIXED: usize = 4;
-/// Largest header the LSO segment can carry in a [`SQ_STRIDE`] entry with
+/// Largest header the LSO segment can carry in a 128-byte entry with
 /// a control segment and one data segment around it.
 pub const TSO_MAX_HEADER: usize = SQ_STRIDE - 2 * SEG_LEN - LSO_FIXED;
 /// Bytes of the buffer a segmentation frame is staged in.
