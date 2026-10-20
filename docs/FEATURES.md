@@ -174,7 +174,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ FDT writer (`alloc`), for hypervisors that generate guest device trees
 - ✅ Multiboot2 parser: memory map, command line, modules
 - ✅ Conversion of firmware memory maps into `osmium_mm::MemoryMap`
-- ✅ ELF64 executables: validated parsing of loadable segments, and `Elf::load_into` any `PageTable` (per-segment permissions, zeroed `.bss`, shared pages merged); the x86_64 example runs a Rust user program built as an ELF
+- ✅ ELF64 executables: validated parsing of loadable segments, and `Elf::load_into` any `PageTable` (per-segment permissions, zeroed `.bss`, shared pages merged); all three examples run the same Rust user program (`examples/user/hello.rs`) built as an ELF
 - ✅ PVH start-info parser and the `pvh_entry_note!` ELF-note macro
 - ✅ ACPI: RSDP/RSDT/XSDT with checksums, MADT (local APICs, x2APICs, I/O APICs), MCFG (PCI ECAM windows)
 - 🗺 UEFI boot services wrapper, Limine protocol, AML

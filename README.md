@@ -96,7 +96,7 @@ features.
 
 - User mode works on all three architectures: the examples run the same
   user programs, each in its own address space (sharing the kernel's root
-  page-table entries), with system calls; the x86_64 example also loads a
+  page-table entries), with system calls, and all three load the same
   Rust user program from an ELF file. There is no file system or process
   API yet; the examples hand-roll those parts. Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.

@@ -491,7 +491,7 @@ const USER_BASE: u64 = 0x80_0000_0000;
 struct Process {
     root: PhysAddr,
     pt: IrqSpinLock<PageTable<Aarch64, &'static Frames>>,
-    frames: [PhysAddr; 2],
+    frames: alloc::vec::Vec<PhysAddr>,
 }
 
 static PROCESSES_FREED: AtomicUsize = AtomicUsize::new(0);
@@ -500,7 +500,7 @@ impl Drop for Process {
     fn drop(&mut self) {
         PROCESSES_FREED.fetch_add(1, Ordering::Relaxed);
         let mut frames = FRAMES.lock();
-        for f in self.frames {
+        for &f in &self.frames {
             // SAFETY: the process's own frames; its page table, the only one
             // mapping them, is dropped with it and no longer active.
             unsafe { frames.dealloc(f, 0) };
@@ -540,12 +540,52 @@ fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> alloc
     unsafe { pt.share_root_entries(PT.lock().as_ref().unwrap(), 0..1) };
     pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().ignore();
     pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
-    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames: [code_pa, stack_pa] };
+    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames: alloc::vec![code_pa, stack_pa] };
     TaskBuilder::new(name).cpu(cpu).data(process).spawn(move || {
         let kernel_top = osmium::sched::current().kernel_stack_range().unwrap().end as u64;
         // SAFETY: vectors are installed, `kernel_top` is this task's own
         // kernel stack, and both pages are mapped EL0-accessible.
         unsafe { aarch64::enter_user(code_va, stack_va + PAGE_SIZE as u64, kernel_top) }
+    })
+}
+
+/// The Rust user program, built by `build.rs` from `examples/user/hello.rs`.
+static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
+
+/// Loads an ELF executable into a new address space and spawns a task on
+/// `cpu` that runs it in user mode.
+fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> alloc::sync::Arc<osmium::sched::Task> {
+    let elf = osmium::boot::elf::Elf::new(image).expect("bad user ELF");
+    let mut pt: PageTable<Aarch64, &'static Frames> = PageTable::new(&FRAMES).unwrap();
+    // SAFETY: the kernel table lives for the whole run.
+    unsafe { pt.share_root_entries(PT.lock().as_ref().unwrap(), 0..1) };
+    let mut frames = alloc::vec::Vec::new();
+    elf.load_into(&mut pt, MapFlags::USER, || {
+        let pa = FRAMES.lock().alloc_frame()?;
+        frames.push(pa);
+        Some(pa)
+    })
+    .expect("loading the user ELF failed");
+    // Make the loaded code visible to instruction fetch on every CPU.
+    for &pa in &frames {
+        for line in (pa.0..pa.0 + PAGE_SIZE as u64).step_by(64) {
+            // SAFETY: cache maintenance on an identity-mapped frame we own.
+            unsafe { core::arch::asm!("dc cvau, {}", in(reg) line) };
+        }
+    }
+    // SAFETY: barriers and instruction-cache invalidation only.
+    unsafe { core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb") };
+    let stack_top: u64 = 0xff_0000_0000;
+    let stack = FRAMES.lock().alloc_frame().unwrap();
+    pt.map(VirtAddr::new(stack_top - PAGE_SIZE as u64), stack, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
+    frames.push(stack);
+    let entry = elf.entry();
+    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames };
+    TaskBuilder::new(name).cpu(cpu).data(process).spawn(move || {
+        let kernel_top = osmium::sched::current().kernel_stack_range().unwrap().end as u64;
+        // SAFETY: vectors are installed, the switch hook installs this
+        // process's table, and its pages are mapped EL0-accessible.
+        unsafe { aarch64::enter_user(entry, stack_top, kernel_top) }
     })
 }
 
@@ -557,6 +597,7 @@ fn user_demo(ncpus: usize) {
         spawn_user("user-1", 1, hello, cpu),
         spawn_user("user-2", 2, hello, cpu),
         spawn_user("user-bad", 3, bad, cpu),
+        spawn_elf("user-elf", HELLO_ELF, cpu),
     ];
     println!("[user]  running 3 EL0 programs on CPU {cpu}");
     println!("[user]  each program has its own page table; all run at {USER_BASE:#x}");
@@ -565,7 +606,7 @@ fn user_demo(ncpus: usize) {
     }
     // Exited tasks (and their address spaces) are freed after the next switch.
     osmium::sched::yield_now();
-    println!("[user]  {} of 3 address spaces torn down with their tasks", PROCESSES_FREED.load(Ordering::Relaxed));
+    println!("[user]  {} of 4 address spaces torn down with their tasks", PROCESSES_FREED.load(Ordering::Relaxed));
 }
 
 /// Handles `svc #0` from EL0. ELR already points past the `svc`.
