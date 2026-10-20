@@ -101,7 +101,10 @@ loads a kernel image.
 
 ## Current limits
 
-- x86 guests are single-vCPU. x86 MMIO emulation without
+- x86 multi-vCPU guests start their APs the PC way (INIT and STARTUP through
+  `VirtualLapic`, decoded by `decode_icr`; the AP starts with
+  `SvmVcpu::set_real_mode`); the example time-shares both vCPUs on one host
+  CPU. x86 MMIO emulation without
   decode assists walks 4-level (long-mode) guest page tables, or none; 32-bit
   paging is not walked.
 - No VMX backend (QEMU's TCG does not emulate VMX).

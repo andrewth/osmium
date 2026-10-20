@@ -135,6 +135,49 @@ impl State {
 
 type Ipi = Box<dyn Fn(u32, u32) + Send + Sync>;
 
+/// Whom an ICR write addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpiTarget {
+    /// The APIC with this ID (physical destination mode; a logical
+    /// destination is passed through unchanged as well).
+    Apic(u8),
+    /// Every APIC including the sender.
+    All,
+    /// Every APIC except the sender.
+    AllButSelf,
+}
+
+/// What an ICR write asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpiKind {
+    /// A fixed interrupt with this vector.
+    Fixed(u8),
+    /// INIT (level assert): reset the target to wait for STARTUP.
+    Init,
+    /// STARTUP: start the target in real mode at `page << 12`.
+    Startup(u8),
+    /// Any other delivery mode (SMI, NMI, INIT de-assert, ...), by number.
+    Other(u8),
+}
+
+/// Decodes the `(icr_high, icr_low)` pair that [`VirtualLapic::with_ipi`]
+/// reports.
+pub fn decode_icr(high: u32, low: u32) -> (IpiTarget, IpiKind) {
+    let target = match (low >> 18) & 3 {
+        2 => IpiTarget::All,
+        3 => IpiTarget::AllButSelf,
+        _ => IpiTarget::Apic((high >> 24) as u8),
+    };
+    let mode = ((low >> 8) & 7) as u8;
+    let kind = match mode {
+        0 => IpiKind::Fixed(low as u8),
+        5 if low & (1 << 14) != 0 => IpiKind::Init,
+        6 => IpiKind::Startup(low as u8),
+        m => IpiKind::Other(m),
+    };
+    (target, kind)
+}
+
 /// An emulated local APIC in xAPIC (MMIO) mode, for one vCPU: task and
 /// processor priority, IRR/ISR, EOI, the spurious-vector enable, and the
 /// timer in one-shot and periodic modes. Put it on the vCPU's MMIO bus at
@@ -473,6 +516,10 @@ mod tests {
         r.w(ICR_HIGH, 1 << 24);
         r.w(ICR_LOW, 0x61);
         assert_eq!(*sent.lock(), [(1, 0x61)]);
+        // INIT then STARTUP at page 8, as an OS starts an AP.
+        assert_eq!(decode_icr(1 << 24, 0x4500), (IpiTarget::Apic(1), IpiKind::Init));
+        assert_eq!(decode_icr(1 << 24, 0x0500), (IpiTarget::Apic(1), IpiKind::Other(5)), "INIT de-assert");
+        assert_eq!(decode_icr(0, 3 << 18 | 0x0608), (IpiTarget::AllButSelf, IpiKind::Startup(8)));
         assert_eq!(r.apic.acknowledge(), None);
         // Vectors 0-15 are illegal: refused, and the error recorded.
         r.apic.deliver(0x05);

@@ -34,7 +34,10 @@ use osmium::mm::paging::formats::X86_64;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
-use osmium::virt::devices::{LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualLapic, VirtualPic, VirtualPit};
+use osmium::virt::devices::{
+    IpiKind, IpiTarget, LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualLapic, VirtualPic, VirtualPit, decode_icr,
+};
+use osmium::virt::smp::GuestCpus;
 use osmium::virt::x86::{self as svm, SvmPages, SvmVcpu};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
@@ -275,6 +278,111 @@ lm_guest_end:
     options(att_syntax)
 );
 
+// A two-vCPU guest started the PC way. The BSP (32-bit, at GBASE) enables
+// its local APIC and sends the AP INIT and STARTUP with vector 8; the AP
+// starts in real mode at 0x8000 (the host copies `smp_ap` there), prints,
+// switches to protected mode, sends the BSP a fixed IPI (vector 0x41)
+// through its own APIC's ICR, and asks to be stopped (hypercall 2). The BSP
+// takes the IPI in its IDT, prints, and powers off.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .globl smp_bsp, smp_bsp_end, smp_ap, smp_ap_end
+    .code32
+    .set SBASE, 0x100000
+smp_bsp:
+    lgdt SBASE + smp_gdtr - smp_bsp
+    lidt SBASE + smp_idtr - smp_bsp
+    mov $0xfee00000, %edi           // local APIC
+    movl $0x1ff, 0xf0(%edi)         // SVR: enabled
+    movl $0x01000000, 0x310(%edi)   // ICR destination: APIC 1
+    movl $0x00004500, 0x300(%edi)   // INIT
+    movl $0x00004608, 0x300(%edi)   // STARTUP, vector 8: real mode at 0x8000
+1:  sti
+    hlt                             // wait for the AP's IPI
+    cli
+    cmpb $0, SBASE + smp_flag - smp_bsp
+    je 1b
+    mov $0x3f8, %dx
+    mov $SBASE + 3f - smp_bsp, %esi
+2:  lodsb
+    test %al, %al
+    jz 4f
+    out %al, %dx
+    jmp 2b
+4:  mov $1, %eax                    // hypercall 1: power off
+    vmmcall
+5:  jmp 5b
+smp_ipi:
+    movb $1, SBASE + smp_flag - smp_bsp
+    movl $0, 0xb0(%edi)             // EOI
+    iret
+3:  .asciz "[smp-guest] cpu 0: IPI 0x41 from cpu 1 through the local APICs\n"
+smp_flag:
+    .byte 0
+    .balign 8
+smp_gdt:
+    .quad 0
+    .quad 0x00cf9a000000ffff        // 0x08: flat 32-bit code
+    .quad 0x00cf92000000ffff        // 0x10: flat data
+smp_gdtr:
+    .word smp_gdtr - smp_gdt - 1
+    .long SBASE + smp_gdt - smp_bsp
+    .balign 8
+smp_idt:
+    .space 0x41 * 8
+    .word (SBASE + smp_ipi - smp_bsp) & 0xffff
+    .word 0x08
+    .word 0x8e00
+    .word (SBASE + smp_ipi - smp_bsp) >> 16
+smp_idt_end:
+smp_idtr:
+    .word smp_idt_end - smp_idt - 1
+    .long SBASE + smp_idt - smp_bsp
+smp_bsp_end:
+
+    .code16
+    .set ABASE, 0x8000
+smp_ap:
+    cli
+    mov %cs, %ax
+    mov %ax, %ds                    // DS = CS: offsets from smp_ap
+    mov $0x3f8, %dx
+    mov $(6f - smp_ap), %si
+7:  lodsb
+    test %al, %al
+    jz 8f
+    out %al, %dx
+    jmp 7b
+8:  lgdtl (smp_ap_gdtr - smp_ap)
+    mov %cr0, %eax
+    or $1, %eax
+    mov %eax, %cr0                  // protected mode
+    ljmpl $0x08, $(ABASE + 9f - smp_ap)
+    .code32
+9:  mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %ss
+    movl $0, 0xfee00310             // ICR destination: APIC 0
+    movl $0x41, 0xfee00300          // fixed IPI, vector 0x41
+    mov $2, %eax                    // hypercall 2: stop this vCPU
+    vmmcall
+10: jmp 10b
+6:  .asciz "[smp-guest] cpu 1: up in real mode at 0x8000 after INIT/STARTUP\n"
+    .balign 8
+smp_ap_gdt:
+    .quad 0
+    .quad 0x00cf9a000000ffff
+    .quad 0x00cf92000000ffff
+smp_ap_gdtr:
+    .word smp_ap_gdtr - smp_ap_gdt - 1
+    .long ABASE + smp_ap_gdt - smp_ap
+smp_ap_end:
+    .code64
+"#,
+    options(att_syntax)
+);
+
 unsafe extern "C" {
     static _kernel_start: u8;
     static _kernel_end: u8;
@@ -282,6 +390,10 @@ unsafe extern "C" {
     static x86_guest_end: u8;
     static lm_guest: u8;
     static lm_guest_end: u8;
+    static smp_bsp: u8;
+    static smp_bsp_end: u8;
+    static smp_ap: u8;
+    static smp_ap_end: u8;
 }
 
 fn sym(s: &u8) -> u64 {
@@ -350,6 +462,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     }
     guest_demo();
     long_mode_demo();
+    smp_demo();
 
     println!("[done]  {} free frames; shutting down", FRAMES.lock().free_frames());
     shutdown()
@@ -574,6 +687,141 @@ fn long_mode_demo() {
         f.dealloc(PhysAddr::new(iopm.1), 2);
         f.dealloc(PhysAddr::new(msrpm.1), 1);
         f.dealloc(PhysAddr::new(host.1), 0);
+        f.dealloc(ram, GUEST_RAM_ORDER);
+    }
+}
+
+/// The bytes between two linker symbols.
+fn image(start: &u8, end: &u8) -> &'static [u8] {
+    // SAFETY: symbol pairs bounding images in .rodata.
+    unsafe { core::slice::from_raw_parts(start, (end as *const u8).offset_from(start) as usize) }
+}
+
+/// Runs a two-vCPU guest whose BSP starts its AP with INIT and STARTUP
+/// through emulated local APICs. Both vCPUs share this host CPU: each runs
+/// until it halts with nothing to do, then the other gets a turn.
+fn smp_demo() {
+    const N: usize = 2;
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guest until it is freed below.
+    unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the two images.
+    let (bsp, ap) = unsafe { (image(&smp_bsp, &smp_bsp_end), image(&smp_ap, &smp_ap_end)) };
+    mem.write(GuestPhysAddr(GUEST_ENTRY), bsp).unwrap();
+    mem.write(GuestPhysAddr(0x8000), ap).unwrap();
+    let mem = Arc::new(mem);
+    let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
+    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER).unwrap();
+
+    let line = Arc::new(IrqSpinLock::new(Vec::new()));
+    let com1 = Arc::new(Uart16550Model::new(move |b| {
+        let mut l = line.lock();
+        l.push(b);
+        if b == b'\n' {
+            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
+            l.clear();
+        }
+    }));
+    let pio = Bus::new();
+    pio.insert(0x3f8, 8, com1).unwrap();
+
+    // One local APIC per vCPU. An ICR write the sender cannot deliver
+    // itself lands in the hook: STARTUP becomes a start request, a fixed
+    // IPI is delivered to the target's APIC.
+    let cpus = GuestCpus::new(N);
+    let apics: Arc<[Once<Arc<VirtualLapic>>; N]> = Arc::new([const { Once::new() }; N]);
+    let lines: Vec<Arc<AtomicBool>> = (0..N).map(|_| Arc::new(AtomicBool::new(false))).collect();
+    let mut buses = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        // Weak: the APICs hold these hooks, so a strong reference would be a cycle.
+        let (l, c, a) = (l.clone(), cpus.clone(), Arc::downgrade(&apics));
+        let apic = VirtualLapic::new(i as u8, LAPIC_TIMER_HZ, clock(), move |level| l.store(level, Ordering::Release))
+            .with_ipi(move |high, low| match decode_icr(high, low) {
+                (IpiTarget::Apic(n), IpiKind::Startup(page)) => {
+                    let _ = c.request_start(n as usize, (page as u64) << 12, 0);
+                }
+                (IpiTarget::Apic(n), IpiKind::Fixed(v)) => {
+                    if let Some(apic) = a.upgrade().and_then(|a| a.get(n as usize).and_then(|o| o.get()).cloned()) {
+                        apic.deliver(v);
+                        c.kick(n as usize);
+                    }
+                }
+                _ => {} // INIT: the target is already waiting for STARTUP
+            });
+        let apic = apics[i].call_once(|| Arc::new(apic)).clone();
+        let mmio = Bus::new();
+        mmio.insert(GUEST_LAPIC, LAPIC_WINDOW, apic).unwrap();
+        buses.push(mmio);
+    }
+
+    let mut pages = Vec::new();
+    let mut make = |i: usize, entry: u32| {
+        let p = (block(0), block(2), block(1), block(0));
+        pages.push(p);
+        let (vmcb, iopm, msrpm, host) = p;
+        // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
+        let mut v = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, entry, len as u32) }
+            .with_memory(mem.clone())
+            .with_irq_line(lines[i].clone());
+        let a = apics[i].get().unwrap().clone();
+        v.connect_intr(move || a.acknowledge());
+        cpus.attach_svm(i, &mut v);
+        v
+    };
+    cpus.request_start(0, GUEST_ENTRY, 0).unwrap();
+    let mut vcpus: [Option<SvmVcpu>; N] = [const { None }; N];
+    let mut switches = 0;
+    let result = 'outer: loop {
+        for i in 0..N {
+            if vcpus[i].is_none() {
+                let Some((entry, _)) = cpus.take_start(i) else { continue };
+                let mut v = make(i, entry as u32);
+                if i > 0 {
+                    v.set_real_mode((entry >> 12) as u8);
+                }
+                vcpus[i] = Some(v);
+            }
+            let v = vcpus[i].as_mut().unwrap();
+            switches += 1;
+            let exit = run_vcpu(v, &buses[i], &pio, |v, exit| match exit {
+                VmExit::Hypercall { nr: 1 | 2, .. } => ControlFlow::Break(exit),
+                VmExit::Halt if v.interrupt_pending() => ControlFlow::Continue(()),
+                VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+                other => ControlFlow::Break(other),
+            });
+            match exit {
+                VmExit::Hypercall { nr: 1, .. } => break 'outer VmExit::Shutdown,
+                VmExit::Hypercall { nr: 2, .. } => {
+                    vcpus[i] = None;
+                    cpus.stopped(i);
+                }
+                VmExit::Halt => {} // the other vCPU's turn
+                other => break 'outer other,
+            }
+        }
+    };
+    println!(
+        "[hyp]   SMP guest exit {result:?}: {N} vCPUs on one host CPU, {switches} turns; cpu 1 status {:?}",
+        cpus.status(1)
+    );
+
+    drop(vcpus);
+    drop(buses);
+    drop(apics);
+    drop(npt);
+    drop(mem);
+    // SAFETY: the guest has stopped; nothing references these blocks.
+    unsafe {
+        let mut f = FRAMES.lock();
+        for (vmcb, iopm, msrpm, host) in pages {
+            f.dealloc(PhysAddr::new(vmcb.1), 0);
+            f.dealloc(PhysAddr::new(iopm.1), 2);
+            f.dealloc(PhysAddr::new(msrpm.1), 1);
+            f.dealloc(PhysAddr::new(host.1), 0);
+        }
         f.dealloc(ram, GUEST_RAM_ORDER);
     }
 }

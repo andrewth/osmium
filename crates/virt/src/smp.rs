@@ -130,6 +130,11 @@ impl GuestCpus {
         vcpu.running = Some(self.slots[cpu].running.clone());
     }
 
+    /// Connects an SVM vCPU as CPU `cpu`, so kicks find it.
+    pub fn attach_svm(&self, cpu: usize, vcpu: &mut crate::x86::SvmVcpu) {
+        vcpu.running = Some(self.slots[cpu].running.clone());
+    }
+
     /// Takes hart `hart`'s pending start request (entry, opaque), marking it
     /// started; `None` if there is none.
     pub fn take_start(&self, hart: usize) -> Option<(u64, u64)> {

@@ -15,7 +15,8 @@
 //!
 //! FS, GS, TR, LDTR, `KernelGsBase` and the syscall MSRs are switched with
 //! VMLOAD/VMSAVE around every run, keeping the host's in a page of its own.
-//! Guests start in 32-bit protected mode ([`SvmVcpu::new`]) or, after
+//! Guests start in 32-bit protected mode ([`SvmVcpu::new`]), in real mode
+//! like an AP after STARTUP ([`SvmVcpu::set_real_mode`]) or, after
 //! [`SvmVcpu::set_long_mode`], in 64-bit mode on their own page tables;
 //! MMIO instructions are fetched through those tables when the CPU has no
 //! decode assists.
@@ -206,6 +207,9 @@ pub struct SvmVcpu {
     ack: Option<Ack>,
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     flush: bool,
+    /// The host CPU running this vCPU's guest code, for kicks.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
 }
 
 // SAFETY: the vCPU owns its VMCB page exclusively.
@@ -239,6 +243,7 @@ impl SvmVcpu {
             irq: Arc::new(AtomicBool::new(false)),
             ack: None,
             flush: true,
+            running: None,
         };
         use vmcb::*;
         // INTR, NMI, HLT, IOIO, MSR, SHUTDOWN; VMRUN (required), VMMCALL.
@@ -302,6 +307,21 @@ impl SvmVcpu {
             self.at(off + 4).cast::<u32>().write_volatile(limit);
             self.at(off + 8).cast::<u64>().write_volatile(base);
         }
+    }
+
+    /// Starts the guest in real mode instead, at `page << 12` (CS =
+    /// `page << 8`, IP = 0): the state a STARTUP IPI with vector `page`
+    /// leaves an application processor in. The real-mode IDT is at 0.
+    pub fn set_real_mode(&mut self, page: u8) {
+        let sel = (page as u16) << 8;
+        self.segment(vmcb::CS, (sel, 0x9b, 0xffff, (page as u64) << 12));
+        for s in [vmcb::ES, vmcb::SS, vmcb::DS, vmcb::FS, vmcb::GS] {
+            self.segment(s, (0, 0x93, 0xffff, 0));
+        }
+        self.segment(vmcb::IDTR, (0, 0, 0x3ff, 0));
+        self.write64(vmcb::CR0, 0x10); // ET
+        self.write64(vmcb::RIP, 0);
+        self.write64(vmcb::RSP, 0);
     }
 
     /// Starts the guest in 64-bit mode instead, with paging on through the
@@ -596,7 +616,10 @@ impl SvmVcpu {
 impl Vcpu for SvmVcpu {
     #[cfg(all(target_arch = "x86_64", target_os = "none"))]
     fn run(&mut self) -> VmExit {
-        loop {
+        if let Some(r) = &self.running {
+            r.store(osmium_arch::cpu::current_id(), Ordering::Release);
+        }
+        let exit = loop {
             let flush = core::mem::take(&mut self.flush);
             self.write32(vmcb::TLB_CONTROL, flush as u32);
             self.write32(vmcb::CLEAN, 0);
@@ -604,9 +627,13 @@ impl Vcpu for SvmVcpu {
             hw::run(self);
             // An interrupt window opened: deliver on the next entry.
             if self.read64(vmcb::EXITCODE) != exit::VINTR {
-                return self.classify();
+                break self.classify();
             }
+        };
+        if let Some(r) = &self.running {
+            r.store(crate::smp::NOT_RUNNING, Ordering::Release);
         }
+        exit
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
@@ -663,7 +690,9 @@ mod tests {
             (NonNull::new(ptr).unwrap(), ptr as u64)
         };
         // SAFETY: leaked, exclusively owned test pages.
-        unsafe { SvmVcpu::new(SvmPages { vmcb: p(1), iopm: p(3), msrpm: p(2), host: p(1) }, 0x1000, 0x10_0000, 0x20_0000) }
+        unsafe {
+            SvmVcpu::new(SvmPages { vmcb: p(1), iopm: p(3), msrpm: p(2), host: p(1) }, 0x1000, 0x10_0000, 0x20_0000)
+        }
     }
 
     #[test]
