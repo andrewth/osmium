@@ -310,6 +310,10 @@ fn sockets_over_a_simulated_link() {
     assert_eq!(call(&p, Sys::Setsockopt, &[dup, 1, 999, BUF, 4]), err(Errno::ENOPROTOOPT));
     assert_eq!(call(&p, Sys::Getsockopt, &[dup, 1, 3, BUF, LEN]), 0);
     assert_eq!(get(&p, BUF, 4), 2i32.to_ne_bytes());
+    let tv: Vec<u8> = [1u64, 500_000].iter().flat_map(|v| v.to_ne_bytes()).collect();
+    put(&p, BUF, &tv);
+    assert_eq!(call(&p, Sys::Setsockopt, &[dup, 1, 20, BUF, 16]), 0, "SO_RCVTIMEO");
+    assert_eq!(call(&p, Sys::Setsockopt, &[dup, 1, 20, BUF, 8]), err(Errno::EINVAL));
     assert_eq!(call(&p, Sys::Close, &[u]), 0);
     assert_eq!(call(&p, Sys::Close, &[dup]), 0);
     pump(&net, &mut peer);

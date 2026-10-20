@@ -1,0 +1,257 @@
+//! A user program that uses sockets: it round-trips a message through a TCP
+//! echo server, and reads a file from a TFTP server over UDP (QEMU's user
+//! network serves both). System calls follow Linux numbering and conventions
+//! for each architecture.
+#![no_std]
+#![no_main]
+
+use core::fmt::Write;
+
+#[cfg(target_arch = "riscv64")]
+mod sys {
+    pub const WRITE: u64 = 64;
+    pub const EXIT: u64 = 93;
+    pub const CLOSE: u64 = 57;
+    pub const SOCKET: u64 = 198;
+    pub const CONNECT: u64 = 203;
+    pub const GETSOCKNAME: u64 = 204;
+    pub const SENDTO: u64 = 206;
+    pub const RECVFROM: u64 = 207;
+    pub const SETSOCKOPT: u64 = 208;
+    pub const SHUTDOWN: u64 = 210;
+    pub const READ: u64 = 63;
+
+    pub fn call(nr: u64, a: [u64; 6]) -> i64 {
+        let ret: u64;
+        // SAFETY: a7 = number, a0-a5 = arguments, a0 = result.
+        unsafe {
+            core::arch::asm!("ecall", in("a7") nr, inlateout("a0") a[0] => ret, in("a1") a[1], in("a2") a[2],
+                in("a3") a[3], in("a4") a[4], in("a5") a[5], options(nostack))
+        };
+        ret as i64
+    }
+
+    #[unsafe(naked)]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn _start() -> ! {
+        core::arch::naked_asm!("j {}", sym super::main)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod sys {
+    pub const WRITE: u64 = 64;
+    pub const EXIT: u64 = 93;
+    pub const CLOSE: u64 = 57;
+    pub const SOCKET: u64 = 198;
+    pub const CONNECT: u64 = 203;
+    pub const GETSOCKNAME: u64 = 204;
+    pub const SENDTO: u64 = 206;
+    pub const RECVFROM: u64 = 207;
+    pub const SETSOCKOPT: u64 = 208;
+    pub const SHUTDOWN: u64 = 210;
+    pub const READ: u64 = 63;
+
+    pub fn call(nr: u64, a: [u64; 6]) -> i64 {
+        let ret: u64;
+        // SAFETY: x8 = number, x0-x5 = arguments, x0 = result.
+        unsafe {
+            core::arch::asm!("svc #0", in("x8") nr, inlateout("x0") a[0] => ret, in("x1") a[1], in("x2") a[2],
+                in("x3") a[3], in("x4") a[4], in("x5") a[5], options(nostack))
+        };
+        ret as i64
+    }
+
+    #[unsafe(naked)]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn _start() -> ! {
+        core::arch::naked_asm!("b {}", sym super::main)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod sys {
+    pub const WRITE: u64 = 1;
+    pub const EXIT: u64 = 60;
+    pub const CLOSE: u64 = 3;
+    pub const SOCKET: u64 = 41;
+    pub const CONNECT: u64 = 42;
+    pub const GETSOCKNAME: u64 = 51;
+    pub const SENDTO: u64 = 44;
+    pub const RECVFROM: u64 = 45;
+    pub const SETSOCKOPT: u64 = 54;
+    pub const SHUTDOWN: u64 = 48;
+    pub const READ: u64 = 0;
+
+    pub fn call(nr: u64, a: [u64; 6]) -> i64 {
+        let ret: u64;
+        // SAFETY: rax = number, rdi/rsi/rdx/r10/r8/r9 = arguments; the CPU
+        // clobbers rcx and r11.
+        unsafe {
+            core::arch::asm!("syscall", inlateout("rax") nr => ret, in("rdi") a[0], in("rsi") a[1], in("rdx") a[2],
+                in("r10") a[3], in("r8") a[4], in("r9") a[5], out("rcx") _, out("r11") _, options(nostack))
+        };
+        ret as i64
+    }
+
+    #[unsafe(naked)]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn _start() -> ! {
+        core::arch::naked_asm!("and rsp, -16", "call {}", sym super::main)
+    }
+}
+
+/// Formats into a fixed buffer (there is no heap here).
+struct Buf {
+    bytes: [u8; 160],
+    len: usize,
+}
+
+impl Write for Buf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.len + s.len();
+        self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Writes one formatted line to standard output.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        let mut buf = Buf { bytes: [0; 160], len: 0 };
+        let _ = write!(buf, $($arg)*);
+        sys::call(sys::WRITE, [1, buf.bytes.as_ptr() as u64, buf.len as u64, 0, 0, 0]);
+    }};
+}
+
+fn exit(code: u64) -> ! {
+    sys::call(sys::EXIT, [code, 0, 0, 0, 0, 0]);
+    loop {}
+}
+
+const AF_INET: u64 = 2;
+const SOCK_STREAM: u64 = 1;
+const SOCK_DGRAM: u64 = 2;
+const SOL_SOCKET: u64 = 1;
+const SO_RCVTIMEO: u64 = 20;
+
+/// A `struct sockaddr_in`.
+fn sockaddr(ip: [u8; 4], port: u16) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    a[2..4].copy_from_slice(&port.to_be_bytes());
+    a[4..8].copy_from_slice(&ip);
+    a
+}
+
+fn socket(ty: u64) -> i64 {
+    sys::call(sys::SOCKET, [AF_INET, ty, 0, 0, 0, 0])
+}
+
+fn recv_timeout(fd: u64, secs: u64) {
+    let tv = [secs, 0];
+    sys::call(sys::SETSOCKOPT, [fd, SOL_SOCKET, SO_RCVTIMEO, tv.as_ptr() as u64, 16, 0]);
+}
+
+/// A TCP echo round trip with the server at `ip:7`.
+fn tcp_echo() {
+    const MESSAGE: &[u8] = b"hello over sockets";
+    let fd = socket(SOCK_STREAM);
+    if fd < 0 {
+        say!("net: socket failed: {fd}");
+        return;
+    }
+    let fd = fd as u64;
+    recv_timeout(fd, 5);
+    let server = sockaddr([10, 0, 2, 100], 7);
+    let r = sys::call(sys::CONNECT, [fd, server.as_ptr() as u64, 16, 0, 0, 0]);
+    if r < 0 {
+        say!("net: TCP connect failed: {r}");
+        return;
+    }
+    let mut local = [0u8; 16];
+    let mut len = 16u32;
+    sys::call(sys::GETSOCKNAME, [fd, local.as_mut_ptr() as u64, &mut len as *mut u32 as u64, 0, 0, 0]);
+    let sent = sys::call(sys::SENDTO, [fd, MESSAGE.as_ptr() as u64, MESSAGE.len() as u64, 0, 0, 0]);
+    let mut buf = [0u8; 64];
+    let mut got = 0;
+    while got < MESSAGE.len() {
+        let n = sys::call(sys::READ, [fd, buf[got..].as_mut_ptr() as u64, (buf.len() - got) as u64, 0, 0, 0]);
+        if n <= 0 {
+            break;
+        }
+        got += n as usize;
+    }
+    let text = core::str::from_utf8(&buf[..got]).unwrap_or("?");
+    say!(
+        "net: TCP echo from 10.0.2.100:7 via {}.{}.{}.{}:{}: sent {sent}, got \"{text}\"",
+        local[4],
+        local[5],
+        local[6],
+        local[7],
+        u16::from_be_bytes([local[2], local[3]])
+    );
+    // The server closes when we do, which ends our reads.
+    sys::call(sys::SHUTDOWN, [fd, 1, 0, 0, 0, 0]);
+    let eof = sys::call(sys::READ, [fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0]);
+    say!("net: TCP read after the server closed: {eof}");
+    sys::call(sys::CLOSE, [fd, 0, 0, 0, 0, 0]);
+}
+
+/// Reads `osmium.txt` from the TFTP server at 10.0.2.2:69: a read request
+/// from an unbound socket, answered with DATA, which we ACK to its sender.
+fn udp_tftp() {
+    let fd = socket(SOCK_DGRAM);
+    if fd < 0 {
+        say!("net: UDP socket failed: {fd}");
+        return;
+    }
+    let fd = fd as u64;
+    recv_timeout(fd, 5);
+    let server = sockaddr([10, 0, 2, 2], 69);
+    let request = b"\0\x01osmium.txt\0octet\0";
+    let r = sys::call(sys::SENDTO, [fd, request.as_ptr() as u64, request.len() as u64, 0, server.as_ptr() as u64, 16]);
+    if r < 0 {
+        say!("net: UDP sendto failed: {r}");
+        return;
+    }
+    let mut buf = [0u8; 600];
+    let mut from = [0u8; 16];
+    let mut len = 16u32;
+    let n = sys::call(
+        sys::RECVFROM,
+        [fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0, from.as_mut_ptr() as u64, &mut len as *mut u32 as u64],
+    );
+    if n < 4 {
+        say!("net: UDP recvfrom failed: {n}");
+        return;
+    }
+    let n = n as usize;
+    let port = u16::from_be_bytes([from[2], from[3]]);
+    let text = core::str::from_utf8(&buf[4..n]).unwrap_or("?").trim_end();
+    say!(
+        "net: UDP TFTP from {}.{}.{}.{}:{port}: opcode {} block {}: \"{text}\"",
+        from[4],
+        from[5],
+        from[6],
+        from[7],
+        buf[1],
+        buf[3]
+    );
+    // ACK block 1 to whoever answered, so the server is done.
+    let ack = [0, 4, buf[2], buf[3]];
+    sys::call(sys::SENDTO, [fd, ack.as_ptr() as u64, 4, 0, from.as_ptr() as u64, 16]);
+    sys::call(sys::CLOSE, [fd, 0, 0, 0, 0, 0]);
+}
+
+extern "C" fn main() -> ! {
+    tcp_echo();
+    udp_tftp();
+    exit(0)
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    exit(101)
+}

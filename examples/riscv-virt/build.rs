@@ -9,10 +9,10 @@ fn main() {
     build_user_program("riscv64imac-unknown-none-elf", "0x1000000000", &["-Ccode-model=medium"]);
 }
 
-/// Compiles `../user/hello.rs` and `../user/init.rs` into static ELFs for
+/// Compiles `../user/hello.rs`, `../user/init.rs` and `../user/net.rs` into static ELFs for
 /// `target` at `base`.
 fn build_user_program(target: &str, base: &str, extra: &[&str]) {
-    for name in ["hello", "init"] {
+    for name in ["hello", "init", "net"] {
         build_one(name, target, base, extra);
     }
 }

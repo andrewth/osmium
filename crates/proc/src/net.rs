@@ -104,10 +104,25 @@ impl NetStack {
         self.poll();
     }
 
-    /// Blocks until `ready` returns true. `ready` is evaluated under the
-    /// stack's lock, without polling, after each wake-up.
-    pub(crate) fn wait(&self, mut ready: impl FnMut(&SocketSet) -> bool) {
-        self.events.wait_until(|| ready(&self.inner.lock().sockets).then_some(()));
+    /// Blocks until `ready` returns true, or until the clock reaches
+    /// `deadline` (nanoseconds), and returns whether it did. `ready` is
+    /// evaluated under the stack's lock, without polling, after each wake-up;
+    /// every poll wakes the waiters, so a deadline is noticed within one.
+    pub(crate) fn wait(&self, deadline: Option<u64>, mut ready: impl FnMut(&SocketSet) -> bool) -> bool {
+        self.events.wait_until(|| {
+            if ready(&self.inner.lock().sockets) {
+                Some(true)
+            } else if deadline.is_some_and(|d| (self.now_ns)() >= d) {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The time `timeout_ns` from now, or `None` for no timeout (0).
+    pub(crate) fn deadline(&self, timeout_ns: u64) -> Option<u64> {
+        (timeout_ns != 0).then(|| (self.now_ns)().saturating_add(timeout_ns))
     }
 }
 

@@ -609,6 +609,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             demos::arp(&mut net, now_ns);
             demos::net(&mut net, now_ns);
             demos::iscsi(&mut net, now_ns);
+            *NETDEV.lock() = Some(alloc::boxed::Box::new(net));
         }
         None => println!("[net]   no virtio-net device"),
     }
@@ -946,6 +947,60 @@ fn user_demo() {
     let freed = demos::user::freed(&processes);
     println!("[user]  {freed} of 4 address spaces torn down with their tasks");
     fork_exec_demo(cpu);
+    socket_demo();
+}
+
+/// The virtio-net device, kept for the socket demo once the others are done
+/// with it.
+static NETDEV: osmium::sync::IrqSpinLock<Option<alloc::boxed::Box<dyn osmium::hal::net::NetDevice + Send>>> =
+    osmium::sync::IrqSpinLock::new(None);
+
+/// The Rust program that uses sockets, from `examples/user/net.rs`.
+static NET_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net.elf"));
+
+/// Gives the virtio-net device to osmium-proc's socket calls (after a DHCP
+/// lease), polls it from a task, and runs `/bin/net`, which does a TCP echo
+/// round trip and reads a file by TFTP over UDP.
+fn socket_demo() {
+    use osmium::net::{DhcpClient, Instant, Interface, SocketSet};
+    use osmium::proc::net::{NetStack, set_stack};
+
+    let Some(mut dev) = NETDEV.lock().take() else { return };
+    let mut iface = Interface::new(&*dev, now_ns());
+    let mut sockets = SocketSet::new();
+    sockets.add(DhcpClient::new());
+    let start = now_ns();
+    while iface.config().is_none() && now_ns() - start < 5_000_000_000 {
+        iface.poll(Instant::from_nanos(now_ns()), &mut *dev, &mut sockets);
+    }
+    let Some(config) = iface.config() else {
+        println!("[sock]  no DHCP lease");
+        return;
+    };
+    println!("[sock]  {} on the socket stack", config.address);
+    let stack = Arc::new(NetStack::new(iface, dev, sockets, now_ns));
+    set_stack(stack.clone());
+    static STOP: AtomicBool = AtomicBool::new(false);
+    let poller = TaskBuilder::new("net-poll").spawn(move || {
+        while !STOP.load(Ordering::Acquire) {
+            stack.poll();
+            TIMERS.sleep_until(now_ns() + 1_000_000);
+        }
+    });
+    demos::user::install("net", NET_ELF);
+    let process = Process::new_boxed("net", (platform().new_memory)().unwrap(), 0);
+    let task = process.spawn(TaskBuilder::new("net"), || {
+        let entry = osmium::proc::current().unwrap().exec("/bin/net", &[b"net"], &[]).expect("exec /bin/net");
+        // SAFETY: exec activated the new table; traps are installed and the
+        // switch hook keeps TrapCpu's kernel stack on this task.
+        unsafe { riscv64::enter_user(entry.pc as usize, entry.sp as usize) }
+    });
+    drop(process);
+    task.join();
+    drop(task);
+    STOP.store(true, Ordering::Release);
+    poller.join();
+    println!("[sock]  net exited; its sockets are closed");
 }
 
 /// Handles `ecall` from U-mode.

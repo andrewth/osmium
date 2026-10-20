@@ -1,11 +1,11 @@
 //! Sockets: `AF_INET` streams (TCP) and datagrams (UDP) over the
-//! [`NetStack`](crate::net::NetStack), as files in the descriptor table.
+//! [`NetStack`], as files in the descriptor table.
 
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddrV4};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use osmium_fs::{Errno, File, FileKind, Stat};
 use osmium_net::{Error, Socket, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket};
@@ -35,6 +35,8 @@ const SO_KEEPALIVE: u64 = 9;
 const SO_SNDBUF: u64 = 7;
 const SO_RCVBUF: u64 = 8;
 const SO_REUSEPORT: u64 = 15;
+const SO_RCVTIMEO: u64 = 20;
+const SO_SNDTIMEO: u64 = 21;
 const TCP_NODELAY: u64 = 1;
 /// `O_NONBLOCK` in `fcntl` status flags.
 pub(crate) const O_NONBLOCK: u64 = 0o4000;
@@ -69,6 +71,9 @@ pub struct SocketFile {
     net: Arc<NetStack>,
     kind: IrqSpinLock<Kind>,
     nonblock: AtomicBool,
+    /// `SO_RCVTIMEO` and `SO_SNDTIMEO` in nanoseconds; 0 waits for ever.
+    rcv_timeout: AtomicU64,
+    snd_timeout: AtomicU64,
 }
 
 fn net_errno(e: Error) -> Errno {
@@ -104,7 +109,13 @@ fn in_use(sockets: &SocketSet, port: u16, udp: bool) -> bool {
 
 impl SocketFile {
     fn new(net: Arc<NetStack>, kind: Kind, nonblock: bool) -> Self {
-        Self { net, kind: IrqSpinLock::new(kind), nonblock: AtomicBool::new(nonblock) }
+        Self {
+            net,
+            kind: IrqSpinLock::new(kind),
+            nonblock: AtomicBool::new(nonblock),
+            rcv_timeout: AtomicU64::new(0),
+            snd_timeout: AtomicU64::new(0),
+        }
     }
 
     /// A new, unconnected stream socket on `net`.
@@ -219,6 +230,7 @@ impl SocketFile {
                 .iter()
                 .position(|&h| !matches!(s.get::<TcpSocket>(h).state(), TcpState::Listen | TcpState::SynReceived))
         };
+        let deadline = self.net.deadline(self.rcv_timeout.load(Ordering::Relaxed));
         loop {
             let taken = self.net.op(|_, s| {
                 let i = ready(s)?;
@@ -239,7 +251,9 @@ impl SocketFile {
             if !wait {
                 return Err(Errno::EAGAIN);
             }
-            self.net.wait(|s| ready(s).is_some());
+            if !self.net.wait(deadline, |s| ready(s).is_some()) {
+                return Err(Errno::EAGAIN);
+            }
         }
     }
 
@@ -297,7 +311,7 @@ impl SocketFile {
             if self.is_nonblocking() {
                 return Err(Errno::EINPROGRESS);
             }
-            self.net.wait(|s| s.get::<TcpSocket>(h).state() != TcpState::SynSent);
+            self.net.wait(None, |s| s.get::<TcpSocket>(h).state() != TcpState::SynSent);
         }
         self.net.peek(|_, s| {
             let t = s.get::<TcpSocket>(h);
@@ -327,6 +341,7 @@ impl SocketFile {
             return self.send_datagram(h, data, to.or(peer), wait);
         }
         let h = self.tcp_handle()?;
+        let deadline = self.net.deadline(self.snd_timeout.load(Ordering::Relaxed));
         let mut done = 0;
         loop {
             let r = self.net.op(|_, s| s.get_mut::<TcpSocket>(h).send(&data[done..]));
@@ -335,10 +350,13 @@ impl SocketFile {
                 Err(Error::WouldBlock) if done > 0 => return Ok(done),
                 Err(Error::WouldBlock) if !wait => return Err(Errno::EAGAIN),
                 Err(Error::WouldBlock) => {
-                    self.net.wait(|s| {
+                    let ready = |s: &SocketSet| {
                         let t = s.get::<TcpSocket>(h);
                         t.can_send() || !t.may_send()
-                    });
+                    };
+                    if !self.net.wait(deadline, ready) {
+                        return Err(Errno::EAGAIN);
+                    }
                     continue;
                 }
                 Err(_) if done > 0 => return Ok(done),
@@ -363,10 +381,11 @@ impl SocketFile {
             let a = self.bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), true)?;
             self.net.op(|_, s| s.get_mut::<UdpSocket>(h).bind_addr(a)).map_err(net_errno)?;
         }
+        let deadline = self.net.deadline(self.snd_timeout.load(Ordering::Relaxed));
         loop {
             match self.net.op(|_, s| s.get_mut::<UdpSocket>(h).send_to(data, to)) {
                 Ok(()) => return Ok(data.len()),
-                Err(Error::WouldBlock) if wait => self.net.wait(|s| s.get::<UdpSocket>(h).can_send()),
+                Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_send()) => {}
                 Err(e) => return Err(net_errno(e)),
             }
         }
@@ -380,12 +399,14 @@ impl SocketFile {
             Kind::Udp { handle, peer } => Some((*handle, *peer)),
             _ => None,
         };
+        let deadline = self.net.deadline(self.rcv_timeout.load(Ordering::Relaxed));
         if let Some((h, peer)) = udp {
             loop {
                 match self.net.op(|_, s| s.get_mut::<UdpSocket>(h).recv_from(buf)) {
                     Ok((_, from)) if peer.is_some_and(|p| p != from) => continue,
                     Ok((n, from)) => return Ok((n.min(buf.len()), Some(from))),
-                    Err(Error::WouldBlock) if wait => self.net.wait(|s| s.get::<UdpSocket>(h).can_recv()),
+                    Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_recv()) => {
+                    }
                     Err(e) => return Err(net_errno(e)),
                 }
             }
@@ -394,7 +415,7 @@ impl SocketFile {
         loop {
             match self.net.op(|_, s| s.get_mut::<TcpSocket>(h).recv(buf)) {
                 Ok(n) => return Ok((n, None)),
-                Err(Error::WouldBlock) if wait => self.net.wait(|s| readable(s.get::<TcpSocket>(h))),
+                Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| readable(s.get::<TcpSocket>(h))) => {}
                 Err(Error::InvalidState) => return Err(Errno::ENOTCONN),
                 Err(e) => return Err(net_errno(e)),
             }
@@ -653,7 +674,24 @@ fn known_option(level: u64, name: u64) -> bool {
 
 pub(crate) fn setsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, len: u64) -> SysResult {
     let of = open(p, fd)?;
-    sock(&of)?;
+    let s = sock(&of)?;
+    if level == SOL_SOCKET && matches!(name, SO_RCVTIMEO | SO_SNDTIMEO) {
+        // struct timeval { time_t sec; suseconds_t usec; }
+        if len < 16 {
+            return Err(Errno::EINVAL);
+        }
+        let mut tv = [0u8; 16];
+        p.memory().read(val, &mut tv)?;
+        let sec = u64::from_ne_bytes(tv[..8].try_into().unwrap());
+        let usec = u64::from_ne_bytes(tv[8..].try_into().unwrap());
+        if usec >= 1_000_000 || sec > u64::MAX / 2_000_000_000 {
+            return Err(Errno::EINVAL);
+        }
+        let ns = sec * 1_000_000_000 + usec * 1000;
+        let timeout = if name == SO_RCVTIMEO { &s.rcv_timeout } else { &s.snd_timeout };
+        timeout.store(ns, Ordering::Relaxed);
+        return Ok(0);
+    }
     if !known_option(level, name) {
         return Err(Errno::ENOPROTOOPT);
     }
