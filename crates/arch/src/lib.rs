@@ -19,6 +19,7 @@ extern crate std;
 pub mod cpu;
 pub mod irq;
 pub mod mmu;
+pub mod trap;
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;

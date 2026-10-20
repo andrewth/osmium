@@ -10,13 +10,12 @@
 
 extern crate alloc;
 
-mod trap;
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use osmium::arch::riscv64::{self, SatpMode, sbi};
+use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
 use osmium::arch::{cpu, irq};
 use osmium::boot::fdt::Fdt;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
@@ -109,7 +108,9 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: a single hart runs this kernel; id 0 is unique.
     unsafe { cpu::set_current_id(0) };
     // Before anything can fault: OpenSBI leaves stvec pointing at `_start`.
-    trap::init();
+    trap::set_handler(on_trap);
+    // SAFETY: we run on a valid kernel stack from here on.
+    unsafe { trap::install() };
     set_console(&SbiConsole);
     println!("\nosmium riscv-virt example (hart {hartid})");
 
@@ -199,6 +200,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     mutex_demo();
     preemption_demo();
     sleep_demo();
+    fault_demo();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     sbi::shutdown()
@@ -266,7 +268,41 @@ fn sleep_demo() {
     t.join();
 }
 
-/// Called from the trap handler on every supervisor timer interrupt.
+/// The last synchronous trap that `on_trap` recovered from.
+static RECOVERED: osmium::sync::IrqSpinLock<Option<Trap>> = osmium::sync::IrqSpinLock::new(None);
+static RECOVER: AtomicBool = AtomicBool::new(false);
+
+fn fault_demo() {
+    RECOVER.store(true, Ordering::SeqCst);
+    // SAFETY: the handler steps over the breakpoint.
+    unsafe { core::arch::asm!("ebreak") };
+    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().unwrap());
+    // Nothing is mapped at 0x1000: a load page fault.
+    // SAFETY: the read faults and the handler skips it; the value is never used.
+    let _ = unsafe { core::ptr::read_volatile(0x1000 as *const u64) };
+    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().unwrap());
+    RECOVER.store(false, Ordering::SeqCst);
+}
+
+fn on_trap(frame: &mut TrapFrame) {
+    match frame.cause() {
+        cause @ (Trap::Breakpoint | Trap::PageFault { .. }) if RECOVER.load(Ordering::SeqCst) => {
+            *RECOVERED.lock() = Some(cause);
+            // Step over the instruction: 2 bytes if compressed, else 4.
+            // SAFETY: the faulting instruction is mapped executable code.
+            let insn = unsafe { (frame.pc() as *const u16).read() };
+            frame.set_pc(frame.pc() + if insn & 3 == 3 { 4 } else { 2 });
+        }
+        Trap::Interrupt(Interrupt::Timer) => {
+            on_timer();
+            // Leaving an interrupt is a preemption point.
+            osmium::sched::preempt_if_needed();
+        }
+        cause => panic!("unhandled trap {cause:?} at pc {:#x}", frame.pc()),
+    }
+}
+
+/// Called on every supervisor timer interrupt.
 fn on_timer() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     let rate = RATE.get().unwrap();
