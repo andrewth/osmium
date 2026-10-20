@@ -73,6 +73,17 @@ fn exercise<F: PageTableFormat>(high_va: u64) {
         assert_eq!(pt.translate(va(0x8000_0000)).unwrap().size, PageSize::Size2M);
         assert_eq!(pt.translate(va(0x8020_2000)).unwrap().size, PageSize::Size4K);
         assert_eq!(pt.translate(va(0x8020_2000)).unwrap().pa, pa(0xc020_2000));
+
+        // Punch a 4 KiB hole into the 1 GiB page: two splits.
+        let (t, f) = pt.unmap_4k(va(0x4123_4567)).unwrap();
+        f.ignore();
+        assert_eq!((t.pa, t.size), (pa(0x8123_4000), PageSize::Size4K));
+        assert!(pt.translate(va(0x4123_4000)).is_none());
+        let around = pt.translate(va(0x4123_5008)).unwrap();
+        assert_eq!((around.pa, around.size, around.flags), (pa(0x8123_5008), PageSize::Size4K, MapFlags::RW | MapFlags::READ));
+        assert_eq!(pt.translate(va(0x4000_0000)).unwrap().size, PageSize::Size2M, "the rest stays 2 MiB");
+        assert_eq!(pt.translate(va(0x7fff_ffff)).unwrap().pa, pa(0xbfff_ffff));
+        assert_eq!(pt.split(va(0x4123_5000)), Ok(PageSize::Size4K));
     }
     assert_eq!(frames.lock().free_frames(), before, "drop frees every table");
 }

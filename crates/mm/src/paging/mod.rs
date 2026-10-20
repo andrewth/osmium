@@ -331,6 +331,44 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         Ok((t, Flush(va.align_down(size.bytes()))))
     }
 
+    /// Replaces the huge-page leaf that maps `va` with a table of 512
+    /// next-smaller leaves covering the same range with the same flags, so
+    /// that part of it can be unmapped or reprotected. Returns the size of
+    /// the leaf now mapping `va`; already-4 KiB mappings are left alone.
+    ///
+    /// The translation does not change, so no TLB flush is required, but
+    /// the caller should flush before relying on the finer granularity.
+    pub fn split(&mut self, va: VirtAddr) -> Result<PageSize, MapError> {
+        let (e, level) = self.find_leaf(va).map_err(|_| MapError::InvalidAddress)?;
+        if level == 0 {
+            return Ok(PageSize::Size4K);
+        }
+        let pte = e.load(Ordering::Acquire);
+        let (base, flags) = (F::addr(pte, level), F::flags(pte, level));
+        let table = Self::new_table(&self.alloc)?;
+        let child = PageSize::from_level(level - 1);
+        for i in 0..ENTRIES as u64 {
+            let cva = VirtAddr::new(i << (12 + 9 * (level - 1)));
+            self.entry(table, cva, level - 1).store(F::leaf(base + i * child.bytes(), flags, level - 1), Ordering::Relaxed);
+        }
+        // Re-find the entry: `entry` borrows `self`.
+        let (e, _) = self.find_leaf(va).map_err(|_| MapError::InvalidAddress)?;
+        e.store(F::table(table), Ordering::Release);
+        Ok(child)
+    }
+
+    /// Unmaps the 4 KiB page at `va`, splitting huge pages around it first.
+    pub fn unmap_4k(&mut self, va: VirtAddr) -> Result<(Translation, Flush), UnmapError> {
+        loop {
+            match self.translate(va).ok_or(UnmapError::NotMapped)?.size {
+                PageSize::Size4K => return self.unmap(va.align_down(PAGE_SIZE as u64)),
+                _ => {
+                    self.split(va).map_err(|_| UnmapError::NotMapped)?;
+                }
+            }
+        }
+    }
+
     /// Changes the flags of the leaf that maps `va`.
     pub fn protect(&mut self, va: VirtAddr, flags: MapFlags) -> Result<Flush, UnmapError> {
         let (e, level) = self.find_leaf(va)?;

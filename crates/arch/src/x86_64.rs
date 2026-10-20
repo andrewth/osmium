@@ -170,3 +170,119 @@ pub fn has_vmx() -> bool {
 pub fn has_svm() -> bool {
     cpuid(0x8000_0000, 0).eax >= 0x8000_0001 && cpuid(0x8000_0001, 0).ecx & (1 << 2) != 0
 }
+
+/// Segment selectors of the GDT built by [`CpuTables`]. The order (kernel
+/// code, kernel data, user data, user code) is what `syscall`/`sysret`
+/// require.
+pub mod selectors {
+    /// Kernel 64-bit code.
+    pub const KERNEL_CODE: u16 = 0x08;
+    /// Kernel data.
+    pub const KERNEL_DATA: u16 = 0x10;
+    /// User data (RPL 3).
+    pub const USER_DATA: u16 = 0x18 | 3;
+    /// User 64-bit code (RPL 3).
+    pub const USER_CODE: u16 = 0x20 | 3;
+    /// The task-state segment.
+    pub const TSS: u16 = 0x28;
+}
+
+/// The 64-bit task-state segment: the stacks the CPU switches to on a
+/// privilege change (`rsp`) or for IST interrupt gates (`ist`).
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tss {
+    _reserved0: u32,
+    /// Stack pointers loaded on entry to rings 0–2 from a less privileged ring.
+    pub rsp: [u64; 3],
+    _reserved1: u64,
+    /// Interrupt stack table: `ist[n - 1]` is used by gates with IST index `n`.
+    pub ist: [u64; 7],
+    _reserved2: u64,
+    _reserved3: u16,
+    /// Offset of the I/O permission bitmap (beyond the limit = none).
+    pub iomap_base: u16,
+}
+
+const _: () = assert!(size_of::<Tss>() == 104);
+
+/// One CPU's GDT and TSS. Each CPU needs its own, because the TSS holds
+/// per-CPU stacks and `ltr` marks its descriptor busy.
+#[repr(C, align(16))]
+pub struct CpuTables {
+    gdt: [u64; 7],
+    /// This CPU's task-state segment.
+    pub tss: Tss,
+}
+
+impl CpuTables {
+    /// Flat kernel and user segments, and an empty TSS.
+    pub const fn new() -> Self {
+        Self {
+            gdt: [
+                0,
+                0x00af_9a00_0000_ffff, // kernel code: present, DPL 0, 64-bit
+                0x00cf_9200_0000_ffff, // kernel data
+                0x00cf_f200_0000_ffff, // user data: DPL 3
+                0x00af_fa00_0000_ffff, // user code: DPL 3, 64-bit
+                0,
+                0, // TSS descriptor, filled in by `load`
+            ],
+            tss: Tss {
+                _reserved0: 0,
+                rsp: [0; 3],
+                _reserved1: 0,
+                ist: [0; 7],
+                _reserved2: 0,
+                _reserved3: 0,
+                iomap_base: size_of::<Tss>() as u16,
+            },
+        }
+    }
+
+    /// Loads the GDT and TSS on this CPU and reloads every segment register.
+    ///
+    /// # Safety
+    /// Must run on the CPU that will use these tables, with interrupts
+    /// disabled; the tables must never be loaded on another CPU.
+    pub unsafe fn load(&'static mut self) {
+        let base = &raw const self.tss as u64;
+        let limit = size_of::<Tss>() as u64 - 1;
+        // Available 64-bit TSS (type 9), present.
+        self.gdt[5] = limit & 0xffff | (base & 0xff_ffff) << 16 | 0x89 << 40 | (base >> 24 & 0xff) << 56;
+        self.gdt[6] = base >> 32;
+        #[repr(C, packed)]
+        struct Pointer {
+            limit: u16,
+            base: u64,
+        }
+        let ptr = Pointer { limit: (size_of::<[u64; 7]>() - 1) as u16, base: self.gdt.as_ptr() as u64 };
+        // SAFETY: the GDT is valid and 'static; the far return reloads CS
+        // with the kernel code selector it contains.
+        unsafe {
+            asm!(
+                "lgdt [{ptr}]",
+                "push {cs}",
+                "lea {tmp}, [rip + 2f]",
+                "push {tmp}",
+                "retfq",
+                "2:",
+                "mov ds, {ds:x}",
+                "mov es, {ds:x}",
+                "mov ss, {ds:x}",
+                "ltr {tss:x}",
+                ptr = in(reg) &ptr,
+                cs = in(reg) selectors::KERNEL_CODE as u64,
+                ds = in(reg) selectors::KERNEL_DATA as u64,
+                tss = in(reg) selectors::TSS as u64,
+                tmp = out(reg) _,
+            );
+        }
+    }
+}
+
+impl Default for CpuTables {
+    fn default() -> Self {
+        Self::new()
+    }
+}

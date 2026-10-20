@@ -142,7 +142,7 @@ pub use aarch64::{TrapFrame, VectorKind, install};
 #[cfg(all(bare, target_arch = "x86_64"))]
 mod x86_64;
 #[cfg(all(bare, target_arch = "x86_64"))]
-pub use x86_64::{SYSCALL_VECTOR, TrapFrame, install};
+pub use x86_64::{SYSCALL_VECTOR, TrapFrame, install, set_ist};
 
 #[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64", all(bare, target_arch = "x86_64"))))]
 mod host;

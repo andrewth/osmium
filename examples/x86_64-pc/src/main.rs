@@ -29,9 +29,13 @@ use osmium::hal::println;
 use osmium::hal::timer::TickRate;
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::formats::X86_64;
+use osmium::mm::frame::order_for;
+use osmium::mm::paging::PageSize;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
-use osmium::sched::FifoScheduler;
+use core::ptr::NonNull;
+
+use osmium::sched::{FifoScheduler, StackAllocator, TaskBuilder};
 use osmium::sched::timer::TimerQueue;
 use osmium::sync::{IrqSpinLock, Once};
 
@@ -237,6 +241,9 @@ const COM1: u16 = 0x3f8;
 /// Physical address the AP trampoline is copied to (STARTUP vector 0x08).
 const TRAMPOLINE: u64 = 0x8000;
 const IPI_VECTOR: u8 = 33;
+const DOUBLE_FAULT: u8 = 8;
+/// IST slot for the double-fault handler's stack.
+const DOUBLE_FAULT_IST: u8 = 1;
 const TIMER_VECTOR: u8 = 32;
 const SPURIOUS_VECTOR: u8 = 0xff;
 /// Timer interrupt period.
@@ -249,6 +256,47 @@ static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMap
 
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
+
+/// The kernel page table, shared by all CPUs.
+static PT: IrqSpinLock<Option<PageTable<X86_64, &'static Frames>>> = IrqSpinLock::new(None);
+
+/// Gives this CPU its own GDT and TSS, with a fresh stack for double faults.
+fn load_cpu_tables() {
+    let tables = alloc::boxed::Box::leak(alloc::boxed::Box::new(x86::CpuTables::new()));
+    let stack = alloc::vec![0u8; 16 * 1024].leak();
+    tables.tss.ist[DOUBLE_FAULT_IST as usize - 1] = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
+    // SAFETY: called once per CPU, with interrupts disabled.
+    irq::without(|| unsafe { tables.load() });
+}
+
+/// Task stacks with an unmapped guard page below them, so an overflow
+/// faults instead of silently overwriting whatever lies beneath.
+struct GuardedStacks;
+
+// SAFETY: blocks come from the frame allocator (exclusive, page aligned) and
+// the usable part stays mapped read/write.
+unsafe impl StackAllocator for GuardedStacks {
+    fn alloc(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
+        let order = order_for(size + PAGE_SIZE);
+        let guard = FRAMES.lock().alloc(order)?;
+        let mut pt = PT.lock();
+        let (_, flush) = pt.as_mut()?.unmap_4k(VirtAddr::new(guard.0)).ok()?;
+        flush.flush();
+        Some((NonNull::new((guard.0 + PAGE_SIZE as u64) as *mut u8)?, (PAGE_SIZE << order) - PAGE_SIZE))
+    }
+
+    unsafe fn free(&self, base: NonNull<u8>, len: usize) {
+        let guard = base.as_ptr() as u64 - PAGE_SIZE as u64;
+        {
+            let mut pt = PT.lock();
+            let flags = MapFlags::RW | MapFlags::GLOBAL;
+            let pt = pt.as_mut().unwrap();
+            pt.map(VirtAddr::new(guard), PhysAddr::new(guard), PageSize::Size4K, flags).unwrap().flush();
+        }
+        // SAFETY: the block came from `alloc` with the same order.
+        unsafe { FRAMES.lock().dealloc(PhysAddr::new(guard), order_for(len + PAGE_SIZE)) };
+    }
+}
 
 static UART: Once<SerialConsole<Uart16550<Pio>>> = Once::new();
 static LAPIC: Once<LocalApic> = Once::new();
@@ -366,8 +414,13 @@ extern "C" fn kmain(start_info: usize) -> ! {
     CR3.store(pt.root().0, Ordering::Release);
     let t = pt.translate(va(kmain as *const () as u64)).unwrap();
     println!("[mmu]   CR3 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
-    // The table must outlive the kernel.
-    alloc::boxed::Box::leak(alloc::boxed::Box::new(pt));
+    *PT.lock() = Some(pt);
+    load_cpu_tables();
+    // SAFETY: this CPU's TSS now has a double-fault stack; APs load theirs
+    // before enabling interrupts.
+    unsafe { trap::set_ist(DOUBLE_FAULT, DOUBLE_FAULT_IST) };
+    osmium::sched::set_stack_allocator(&GuardedStacks);
+    println!("[guard] task stacks get unmapped guard pages; double faults run on IST{DOUBLE_FAULT_IST}");
 
     // --- Timers: calibrate TSC and APIC timer against the PIT ---------------
     // SAFETY: the PIT and port 0x61 belong to this kernel.
@@ -435,6 +488,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
         demos::smp(ncpus);
     }
     fault_demo();
+    overflow_demo();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     shutdown()
@@ -459,6 +513,7 @@ extern "C" fn ap_main(cpu: usize) -> ! {
     unsafe { x86::write_cr3(CR3.load(Ordering::Acquire)) };
     // SAFETY: the boot CPU hands out distinct indices.
     unsafe { cpu::set_current_id(cpu) };
+    load_cpu_tables();
     // SAFETY: we are on the stack the boot CPU allocated for us.
     unsafe { trap::install() };
     let apic = LAPIC.get().unwrap();
@@ -498,8 +553,34 @@ fn fault_demo() {
     RECOVER.store(false, Ordering::SeqCst);
 }
 
+/// A task that recurses until it runs off the bottom of its stack.
+fn overflow_demo() {
+    #[inline(never)]
+    fn recurse(depth: u64) -> u64 {
+        let frame = core::hint::black_box([depth; 32]);
+        if core::hint::black_box(true) { recurse(depth + 1) + frame[7] } else { 0 }
+    }
+    let t = TaskBuilder::new("deep").stack_size(16 * 1024).spawn(|| {
+        recurse(0);
+    });
+    t.join();
+    println!("[guard] the other tasks keep running: {}", alloc::format!("{} free frames", FRAMES.lock().free_frames()));
+}
+
 fn on_trap(frame: &mut TrapFrame) {
     match (frame.vector(), frame.cause()) {
+        (DOUBLE_FAULT, _) => {
+            // Reached through IST1: the task's own stack is unusable. A
+            // double fault cannot be resumed, so end only the faulting task.
+            let task = osmium::sched::current();
+            println!(
+                "[guard] task {:?} overflowed its stack (rsp {:#x} hit the guard page); killed",
+                task.name(),
+                frame.sp()
+            );
+            drop(task);
+            osmium::sched::exit();
+        }
         (TIMER_VECTOR, _) => {
             // Acknowledge before a possible task switch, or no further
             // timer interrupts would be delivered.

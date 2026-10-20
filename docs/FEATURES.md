@@ -100,7 +100,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Host simulation backend
 - ✅ Trap entry (RISC-V S/M-mode, AArch64 EL1/EL2): full `TrapFrame`, registered handler, portable `Trap` cause decoding
 - ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
-- ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction); 🗺 IST stacks and a TSS
+- ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction), per-CPU GDT/TSS (`CpuTables`) with IST stacks (`trap::set_ist`)
+- 🗺 Separate exception stacks on RISC-V and AArch64 (needed to survive a kernel stack overflow there)
 - 🗺 FPU/SIMD state save and restore; user-mode entry/return
 
 ### `osmium-sync`: synchronization
@@ -115,7 +116,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Typed `PhysAddr`/`VirtAddr` with alignment helpers and canonical-address checks
 - ✅ `MemoryMap`: a fixed-capacity, heap-free region list that merges, carves and reserves (OSKit's LMM/AMM role, used at boot)
 - ✅ Frame allocators: a bitmap allocator, and a buddy allocator (orders 0–N, intrusive free lists, coalescing)
-- ✅ Generic multi-level page table `PageTable<F, A>` with map, unmap, translate and protect, huge pages (2 MiB / 1 GiB), and freeing of intermediate tables
+- ✅ Generic multi-level page table `PageTable<F, A>` with map, unmap, translate, protect, huge-page `split` and `unmap_4k`, huge pages (2 MiB / 1 GiB), and freeing of intermediate tables
 - ✅ PTE formats: x86_64 4-level, AArch64 stage 1 (4 KiB granule), RISC-V Sv39/Sv48, Intel EPT, AArch64 stage 2
 - ✅ Heap: a size-class slab front-end plus a large-allocation path over any `PageSource`; `LockedHeap` implements `GlobalAlloc`; works from a static arena (firmware) or the frame allocator (kernels)
 - 🗺 Virtual memory areas (VMA tree), demand paging, copy-on-write, typed frame metadata (as in OSTD's `Frame<M>`), 5-level paging, IOMMU tables
@@ -143,6 +144,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)
 - ✅ `Task`, built with `TaskBuilder` (name, priority, stack size, home CPU)
 - ✅ Injectable `Scheduler` trait (as in OSTD) and the core operations: `yield_now`, `block`/`wake`, `exit`, tick-driven preemption, and `on_cpu` hand-off so global run queues are safe on SMP
+- ✅ Pluggable `StackAllocator` (for example, stacks with guard pages; the x86_64 example kills a task that overflows into its guard page and keeps running)
 - ✅ Remote-wake hook so kernels can IPI a CPU when work is queued there; task migration with `Task::set_cpu`
 - ✅ Ready-made policies: `FifoScheduler` (round-robin with a time slice) and `PriorityScheduler` (O(1) bitmap, 64 levels)
 - ✅ `WaitQueue` (no lost wake-ups), sleeping `Mutex`, `Semaphore`

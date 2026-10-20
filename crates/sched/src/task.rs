@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::MaybeUninit;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::context::Context;
@@ -39,6 +40,67 @@ impl TaskState {
 
 type Entry = Box<dyn FnOnce() + Send>;
 
+/// Supplies task stacks, for kernels that want guard pages or stacks in a
+/// dedicated virtual region. Without one, stacks come from the heap.
+///
+/// # Safety
+/// `alloc` must return memory that is exclusively owned, writable, 16-byte
+/// aligned and at least `size` bytes long, until passed to `free`.
+pub unsafe trait StackAllocator: Sync {
+    /// Allocates a stack of at least `size` bytes; returns its lowest
+    /// usable address and its usable length.
+    fn alloc(&self, size: usize) -> Option<(NonNull<u8>, usize)>;
+    /// Frees a stack returned by `alloc`.
+    ///
+    /// # Safety
+    /// `base` and `len` must come from `alloc`, and nothing may run on the
+    /// stack any more.
+    unsafe fn free(&self, base: NonNull<u8>, len: usize);
+}
+
+static STACK_ALLOCATOR: osmium_sync::Once<&'static dyn StackAllocator> = osmium_sync::Once::new();
+
+/// Installs the stack allocator used for tasks created from now on. Panics
+/// if called twice.
+pub fn set_stack_allocator(alloc: &'static dyn StackAllocator) {
+    assert!(STACK_ALLOCATOR.set(alloc).is_ok(), "stack allocator already set");
+}
+
+enum Stack {
+    Heap(Box<[MaybeUninit<u128>]>),
+    Custom { base: NonNull<u8>, len: usize, alloc: &'static dyn StackAllocator },
+}
+
+impl Stack {
+    fn new(size: usize) -> Self {
+        match STACK_ALLOCATOR.get() {
+            Some(a) => {
+                let (base, len) = a.alloc(size).expect("out of memory for a task stack");
+                Stack::Custom { base, len, alloc: *a }
+            }
+            None => Stack::Heap(Box::new_uninit_slice(size.div_ceil(16))),
+        }
+    }
+
+    /// One past the highest usable byte, 16-byte aligned.
+    fn top(&self) -> usize {
+        match self {
+            Stack::Heap(s) => s.as_ptr() as usize + s.len() * 16,
+            Stack::Custom { base, len, .. } => (base.as_ptr() as usize + len) & !15,
+        }
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        if let Stack::Custom { base, len, alloc } = *self {
+            // SAFETY: the stack came from this allocator, and the task that
+            // used it has exited (its last reference is gone).
+            unsafe { alloc.free(base, len) }
+        }
+    }
+}
+
 /// A schedulable thread of execution with its own kernel stack.
 pub struct Task {
     id: TaskId,
@@ -55,7 +117,7 @@ pub struct Task {
     /// Remaining ticks of the current time slice; policies use it.
     pub(crate) slice_left: AtomicU32,
     pub(crate) entry: UnsafeCell<Option<Entry>>,
-    _stack: Option<Box<[MaybeUninit<u128>]>>,
+    _stack: Option<Stack>,
     pub(crate) exit_waiters: WaitQueue,
 }
 
@@ -124,10 +186,10 @@ impl Task {
     }
 
     fn raw(name: &'static str, stack_size: Option<usize>, entry: Option<Entry>, cpu: usize, is_idle: bool) -> Self {
-        let stack = stack_size.map(|s| Box::new_uninit_slice(s.div_ceil(16)));
+        let stack = stack_size.map(Stack::new);
         let ctx = match &stack {
             Some(s) => {
-                let top = s.as_ptr() as usize + s.len() * 16;
+                let top = s.top();
                 let entry_fn = if is_idle { crate::core_sched::idle_entry } else { crate::core_sched::task_entry };
                 // SAFETY: the stack is owned by the task and outlives its context.
                 unsafe { Context::new(top, entry_fn) }

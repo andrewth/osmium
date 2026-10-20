@@ -111,6 +111,22 @@ impl TrapFrame {
     }
 }
 
+/// Makes `vector` switch to stack `ist` (1–7) from the TSS on entry, on
+/// every CPU. Use it for faults that can happen with a broken stack, such as
+/// double fault (8), NMI (2) and machine check (18).
+///
+/// # Safety
+/// [`install`] must have run, and every CPU that can take `vector` must
+/// have loaded a TSS whose `ist[ist - 1]` points at a valid stack, for
+/// example with `osmium_arch::x86_64::CpuTables`.
+pub unsafe fn set_ist(vector: u8, ist: u8) {
+    assert!((1..=7).contains(&ist), "IST indices are 1-7");
+    let gate = IDT.0.get().cast::<u64>().wrapping_add(2 * vector as usize);
+    // SAFETY: the IDT is built (per the contract); the write is one aligned
+    // u64, and gates are only consulted by the CPU on interrupt delivery.
+    unsafe { gate.write_volatile(gate.read_volatile() & !(0b111 << 32) | (ist as u64) << 32) };
+}
+
 #[repr(C, align(16))]
 struct Idt(UnsafeCell<[u64; 512]>);
 

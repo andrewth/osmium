@@ -50,4 +50,4 @@ pub use core_sched::{
 };
 pub use policy::{FifoScheduler, PriorityScheduler};
 pub use sync::{Mutex, MutexGuard, Semaphore, WaitQueue};
-pub use task::{Task, TaskBuilder, TaskId, TaskState};
+pub use task::{StackAllocator, Task, TaskBuilder, TaskId, TaskState, set_stack_allocator};
