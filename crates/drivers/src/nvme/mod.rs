@@ -520,7 +520,9 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
                 return Ok(csts);
             }
             if self.clock.now_ns() > deadline {
-                return Err(NvmeError::Timeout);
+                // One last look, in case the clock moved while this was descheduled.
+                let csts = self.regs.read(CSTS);
+                return if done(csts) { Ok(csts) } else { Err(NvmeError::Timeout) };
             }
             osmium_arch::cpu::spin_hint();
         }
@@ -666,8 +668,9 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
             if let Some(tail) = tail {
                 // The entries (and PRP lists) before the doorbell.
                 barrier::mb();
-                self.regs.doorbell(qid, false, tail);
+                // Read before the doorbell: the controller may take its time from the ring on.
                 deadline = self.clock.now_ns().saturating_add(COMMAND_TIMEOUT_NS);
+                self.regs.doorbell(qid, false, tail);
             }
             if slots.iter().all(Option::is_none) {
                 return if failed { Err(BlockError::Io) } else { Ok(()) };

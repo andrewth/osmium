@@ -452,11 +452,18 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
     }
 
     /// Whether data in to `slot` all arrived, or the buffer is partly stale.
-    fn check_transferred(&self, slot: usize, cmd: &Command) -> Result<(), AhciError> {
-        if !cmd.write && self.mem.load::<u32>(header(slot) + 4) != cmd.len as u32 {
-            return Err(AhciError::ShortTransfer);
+    ///
+    /// The byte count the device leaves in the command header is cleared
+    /// when the command is built. A queued command's count is optional
+    /// (AHCI 1.3.1 §5.3.2 only requires it for the others, and QEMU leaves
+    /// it at zero), so for those a zero means "not reported" and only a
+    /// different, non-zero count is a short transfer.
+    fn check_transferred(&self, slot: usize, cmd: &Command, queued: bool) -> Result<(), AhciError> {
+        if cmd.write {
+            return Ok(());
         }
-        Ok(())
+        let done = self.mem.load::<u32>(header(slot) + 4);
+        if done == cmd.len as u32 || (queued && done == 0) { Ok(()) } else { Err(AhciError::ShortTransfer) }
     }
 
     /// Runs `cmd` in slot 0 and waits for it, with no recovery.
@@ -469,7 +476,7 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
         self.finish(failed);
         barrier::dma_rmb();
         self.outcome(done, failed)?;
-        self.check_transferred(0, cmd)
+        self.check_transferred(0, cmd, false)
     }
 
     /// Runs `cmd` in slot 0 and waits for it, over `cmd.len` bytes of the
@@ -512,7 +519,7 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
         barrier::dma_rmb();
         let result = self
             .outcome(done, failed)
-            .and_then(|()| cmds.iter().enumerate().try_for_each(|(slot, cmd)| self.check_transferred(slot, cmd)));
+            .and_then(|()| cmds.iter().enumerate().try_for_each(|(slot, cmd)| self.check_transferred(slot, cmd, true)));
         if let Err(e) = result
             && self.recover(matches!(e, AhciError::Device { .. })).is_err()
         {

@@ -540,6 +540,20 @@ fn digests(header: DigestPolicy, data: DigestPolicy) -> Options {
 }
 
 #[test]
+fn an_unanswered_required_digest_fails_the_login() {
+    use DigestPolicy::*;
+    let cfg = TargetConfig { header_digest: "Omit", data_digest: "Omit", ..TargetConfig::default() };
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let e = IscsiDisk::connect(&mut net, PORTAL, &digests(Require, Off)).err().unwrap();
+    assert!(matches!(e, IscsiError::Negotiation(_)), "{e:?}");
+    let e = IscsiDisk::connect(&mut net, PORTAL, &digests(Off, Require)).err().unwrap();
+    assert!(matches!(e, IscsiError::Negotiation(_)), "{e:?}");
+    // Otherwise the omission means no digests.
+    let disk = IscsiDisk::connect(&mut net, PORTAL, &digests(Prefer, Prefer)).unwrap();
+    assert_eq!((disk.params().header_digest, disk.params().data_digest), (false, false));
+}
+
+#[test]
 fn digests_are_negotiated_and_checked() {
     use DigestPolicy::*;
     let crc = TargetConfig { header_digest: "CRC32C", data_digest: "CRC32C", ..TargetConfig::default() };

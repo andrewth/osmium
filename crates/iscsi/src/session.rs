@@ -395,6 +395,7 @@ impl<N: Net> Session<N> {
                 }
                 match resp.nsg {
                     stage::FULL_FEATURE => {
+                        neg.finish()?;
                         self.tsih = resp.tsih;
                         self.params = neg.params;
                         return Ok(());

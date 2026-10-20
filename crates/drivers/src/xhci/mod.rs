@@ -1118,6 +1118,8 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             return Err(UsbError::NoResources);
         }
         let mut add = 1u32; // the slot context
+        // Endpoints being replaced are dropped and re-added (xHCI 1.2 section 4.6.6).
+        let mut drop = 0u32;
         let mut last = 1;
         for (k, ep) in endpoints.iter().enumerate() {
             let i = dci(ep.address);
@@ -1181,12 +1183,15 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             let avg = if periodic { esit } else { 3072 };
             ctx_set(&slot.input, ctx, 4, (esit & 0xffff) << 16 | avg);
             new_rings[k] = Some((i, ring));
+            if slot.endpoints.iter().flatten().any(|e| e.dci == i) {
+                drop |= 1 << i;
+            }
             add |= 1 << i;
             last = last.max(i);
         }
         // The slot context is copied from the output context with the
         // context-entry count raised to cover the new endpoints.
-        ctx_set(&slot.input, 0, 0, 0);
+        ctx_set(&slot.input, 0, 0, drop);
         ctx_set(&slot.input, 0, 1, add);
         for n in 0..4 {
             ctx_set(&slot.input, c, n, ctx_get(&slot.output, 0, n));

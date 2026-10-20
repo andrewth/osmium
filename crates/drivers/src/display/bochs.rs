@@ -102,8 +102,11 @@ impl BochsVbe {
             return Err(DisplayError::Unsupported);
         }
         if dev.read(reg::ENABLE) & enable::ENABLED != 0 {
-            // Keep the firmware's mode (set through the VBE BIOS, say).
-            dev.fb = dev.current()?;
+            // Keep the firmware's mode (set through the VBE BIOS, say). One this driver cannot
+            // describe leaves the placeholder framebuffer: `set_mode` still works.
+            if let Ok(fb) = dev.current() {
+                dev.fb = fb;
+            }
         }
         Ok(dev)
     }
@@ -298,5 +301,19 @@ mod tests {
 
         d(reg::ID, 0x1234);
         assert!(BochsVbe::new_mmio(io, vram_io, false).is_err());
+    }
+
+    #[test]
+    fn unsupported_firmware_mode_is_no_mode() {
+        let mut regs = vec![0u16; 0x800];
+        let mut vram = vec![0u32; 0x4000];
+        let io = mmio(&mut regs);
+        io.write(MMIO_DISPI + 2 * reg::BPP as usize, 8u16).unwrap();
+        io.write(MMIO_DISPI + 2 * reg::ENABLE as usize, enable::ENABLED).unwrap();
+        // SAFETY: as above.
+        let vram_io = unsafe { IoMem::new(vram.as_mut_ptr().cast(), vram.len() * 4) };
+        let mut vbe = BochsVbe::new_mmio(io, vram_io, false).unwrap();
+        assert_eq!(vbe.info().width, 0);
+        assert!(vbe.set_mode(64, 32, 32).is_ok());
     }
 }

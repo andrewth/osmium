@@ -185,7 +185,7 @@ pub(crate) struct TargetConfig {
     pub(crate) skip_operational: bool,
     /// Require CHAP, with these credentials.
     pub(crate) chap: Option<TargetChap>,
-    /// The HeaderDigest and DataDigest value the target answers with.
+    /// The HeaderDigest and DataDigest value the target answers with (`Omit`: no answer to either).
     pub(crate) header_digest: &'static str,
     pub(crate) data_digest: &'static str,
 }
@@ -669,6 +669,7 @@ impl Target {
                     let num = || text::number(v).unwrap() as usize;
                     let yes = || text::boolean(v).unwrap();
                     let reply: String = match k.as_str() {
+                        "HeaderDigest" | "DataDigest" if cfg.header_digest == "Omit" => continue,
                         "HeaderDigest" => {
                             c.agreed.0 = cfg.header_digest == "CRC32C";
                             cfg.header_digest.into()

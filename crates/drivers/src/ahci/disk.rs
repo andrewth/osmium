@@ -469,6 +469,25 @@ mod tests {
         }
     }
 
+    /// QEMU never fills in the byte count of a queued command; that is not
+    /// a short transfer, while a different non-zero count still is.
+    #[test]
+    fn queued_reads_without_a_byte_count_succeed() {
+        let data = pattern(8 * 512, 9);
+        with_disk(
+            FakeDev::disk(8, 512).with_data(data.clone()).with_ncq(4),
+            |hba| hba.ports[0].ncq_no_prdbc = true,
+            |d| {
+                let mut buf = [0u8; 1024];
+                d.read_blocks(2, &mut buf).unwrap();
+                assert_eq!(buf[..], data[2 * 512..4 * 512]);
+                fake::with(|f| f.ports[0].ncq_no_prdbc = false);
+                fake::with(|f| f.ports[0].short_by = 512);
+                assert_eq!(d.read_blocks(2, &mut buf), Err(BlockError::Io), "a short count is still caught");
+            },
+        );
+    }
+
     #[test]
     fn short_reads_fail() {
         let data = pattern(8 * 512, 3);

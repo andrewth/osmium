@@ -59,6 +59,8 @@ impl PciTransport {
             *bar = func.bar(i as u8);
         }
         let mut windows: [Option<IoMem>; 6] = Default::default();
+        // Whether `map` was already tried for each BAR, so a failure is not retried.
+        let mut mapped = [false; 6];
         let mut found: [Option<IoMem>; 5] = Default::default();
         let mut notify_multiplier = 0;
         for (_, cap) in func.capabilities().filter(|&(id, _)| id == cap::VENDOR) {
@@ -68,7 +70,8 @@ impl PciTransport {
                 continue;
             }
             let Some(b) = bars[bar].filter(|b| b.kind != BarKind::Io) else { continue };
-            if windows[bar].is_none() {
+            if !mapped[bar] {
+                mapped[bar] = true;
                 windows[bar] = map(&b);
             }
             let (offset, length) = (func.read32(cap + CAP_OFFSET) as usize, func.read32(cap + CAP_LENGTH) as usize);

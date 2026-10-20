@@ -637,13 +637,13 @@ impl FakeHca {
         let cqns = core::mem::take(&mut s.fw.notify);
         for cqn in cqns {
             let eqn = s.fw.cqs[&cqn].eqn;
-            self.post_event(s, eqn, 0x00, 0, cqn);
+            self.post_event(s, eqn, 0x00, 0, 4, cqn);
         }
     }
 
-    /// Writes an event of `kind` to event queue `eqn` (dword 3 is `word`,
-    /// `head` the low 16 bits of dword 0), then interrupts if it is armed.
-    fn post_event(&self, s: &mut State, eqn: u32, kind: u32, head: u32, word: u32) {
+    /// Writes an event of `kind` to event queue `eqn` (the dword at byte
+    /// `at` is `word`, `head` the low 16 bits of dword 0), then interrupts if it is armed.
+    fn post_event(&self, s: &mut State, eqn: u32, kind: u32, head: u32, at: usize, word: u32) {
         let doorbell = 0x800 + 4096 * (eqn as usize / 4) + 8 * (eqn as usize % 4);
         let db = self.uar_reg(doorbell);
         let eq = s.fw.eqs.get_mut(&eqn).unwrap();
@@ -660,7 +660,7 @@ impl FakeHca {
         }
         let pa = Self::translate(&s.fw, mtt, (pi % n) as usize * 32);
         wr(pa, kind << 16 | head);
-        wr(pa + 12, word);
+        wr(pa + at as u64, word);
         wr(pa + 28, ((pi / n) & 1) << 7);
         if fire {
             if self.msix_open(s, intr) {
@@ -786,7 +786,7 @@ impl FakeHca {
         let mut s = self.state.borrow_mut();
         s.link[port as usize - 1] = up;
         let eqn = s.fw.async_eqn.expect("event queue mapped");
-        self.post_event(&mut s, eqn, 0x09, if up { 4 } else { 1 }, (port as u32) << 28);
+        self.post_event(&mut s, eqn, 0x09, if up { 4 } else { 1 }, 12, (port as u32) << 28);
     }
 
     /// Keeps the flash semaphore taken, as during a firmware update.

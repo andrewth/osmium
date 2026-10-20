@@ -717,7 +717,7 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
         let mut signalled = 0u8;
         self.drain_eq(eqn, ring, &self.comp_eq_ci, true, |kind, off| {
             if kind == EVENT_COMPLETION {
-                let index = (get32(ring, off + 12) & 0xff_ffff).wrapping_sub(self.caps.reserved_cqs);
+                let index = (get32(ring, off + 4) & 0xff_ffff).wrapping_sub(self.caps.reserved_cqs);
                 if let Some(sn) = self.arm_sn.get(index as usize) {
                     sn.set(sn.get().wrapping_add(1));
                     signalled |= 1 << index;

@@ -224,6 +224,43 @@ impl Negotiator {
         out
     }
 
+    /// Settles the keys of a declined offer: the RFC 7143 default stays in
+    /// effect, except that where it is more than we offered we keep to our
+    /// offer (a smaller burst, or no immediate data, is always allowed).
+    /// `InitialR2T` keeps its default of Yes, the safe side of its OR function.
+    fn keep_default(&mut self, key: &str) {
+        let (p, o) = (&mut self.params, &self.offer);
+        match key {
+            "MaxBurstLength" => p.max_burst_length = p.max_burst_length.min(o.max_burst_length),
+            "FirstBurstLength" => p.first_burst_length = p.first_burst_length.min(o.first_burst_length),
+            "ImmediateData" => p.immediate_data &= o.immediate_data,
+            "InitialR2T" => p.initial_r2t = true,
+            _ => {}
+        }
+    }
+
+    /// Ends the operational negotiation. A key we offered that the target
+    /// never answered is treated like a declined one ([`keep_default`]), and
+    /// for the digests that means none: so a [`DigestPolicy::Require`]
+    /// the target did not answer with `CRC32C` fails the login rather than
+    /// running without the digest.
+    pub(crate) fn finish(&mut self) -> Result<(), IscsiError> {
+        for key in core::mem::take(&mut self.offered) {
+            match key {
+                "HeaderDigest" if self.offer.header_digest == DigestPolicy::Require => {
+                    return Err(IscsiError::Negotiation("target did not answer our required HeaderDigest"));
+                }
+                "DataDigest" if self.offer.data_digest == DigestPolicy::Require => {
+                    return Err(IscsiError::Negotiation("target did not answer our required DataDigest"));
+                }
+                _ => self.keep_default(key),
+            }
+        }
+        let p = &mut self.params;
+        p.first_burst_length = p.first_burst_length.min(p.max_burst_length);
+        Ok(())
+    }
+
     /// Applies the keys of a Login Response and returns the answers owed
     /// for keys the target offered itself.
     pub(crate) fn respond(&mut self, data: &[u8]) -> Result<Vec<u8>, IscsiError> {
@@ -238,8 +275,6 @@ impl Negotiator {
                 }
                 None => false,
             };
-            let p = &mut self.params;
-            let o = &self.offer;
             if matches!(value, "Reject" | "Irrelevant" | "NotUnderstood") {
                 // The default stays in effect (RFC 7143 §6.2), which is
                 // fine for anything but authentication and digests. Where
@@ -248,13 +283,12 @@ impl Negotiator {
                 match key {
                     "AuthMethod" => return Err(bad("target rejected our AuthMethod")),
                     "HeaderDigest" | "DataDigest" => return Err(bad("target rejected our digest offer")),
-                    "MaxBurstLength" => p.max_burst_length = p.max_burst_length.min(o.max_burst_length),
-                    "FirstBurstLength" => p.first_burst_length = p.first_burst_length.min(o.first_burst_length),
-                    "ImmediateData" => p.immediate_data &= o.immediate_data,
-                    _ => {}
+                    _ => self.keep_default(key),
                 }
                 continue;
             }
+            let p = &mut self.params;
+            let o = &self.offer;
             let num =
                 |min: u64, max: u64| number(value).filter(|v| (min..=max).contains(v)).ok_or(bad("bad numeric value"));
             // A key with the minimum function: the target's answer to our

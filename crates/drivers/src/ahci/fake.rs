@@ -171,6 +171,8 @@ pub struct FakePort {
     pub stuck_det: Option<u32>,
     /// Reads and IDENTIFY move this many bytes less than asked for.
     pub short_by: u32,
+    /// Queued commands leave the header's byte count at zero, as QEMU does.
+    pub ncq_no_prdbc: bool,
     /// IDENTIFY DEVICE words to replace: (index, value).
     pub identify_words: Vec<(usize, u16)>,
 
@@ -680,7 +682,9 @@ impl FakeHba {
         };
         match result {
             Ok(bytes) => {
-                hdr[4..8].copy_from_slice(&(bytes as u32).to_le_bytes());
+                if !(queued && port.ncq_no_prdbc) {
+                    hdr[4..8].copy_from_slice(&(bytes as u32).to_le_bytes());
+                }
                 port.ci &= !(1 << slot);
                 if queued {
                     port.sact &= !(1 << slot);

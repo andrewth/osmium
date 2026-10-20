@@ -76,7 +76,7 @@ pub struct Config {
     /// Posts a completion with a wrong command identifier before each
     /// I/O completion.
     pub stray: bool,
-    /// Never completes I/O commands (and an hour passes).
+    /// Never completes I/O commands (and an hour passes, once).
     pub ignore_io: bool,
     /// Sets CSTS.CFS instead of completing I/O commands.
     pub fatal_io: bool,
@@ -167,6 +167,8 @@ pub struct Fake {
     start: Instant,
     /// Nanoseconds skipped ahead.
     skipped: AtomicU64,
+    /// Whether the hour for ignored I/O has passed.
+    hour_passed: AtomicBool,
     /// Clock readings so far, so a slow command can wait for the driver to
     /// see the time it took.
     readings: AtomicU64,
@@ -253,6 +255,7 @@ impl Fake {
             disables: AtomicU32::new(0),
             start: Instant::now(),
             skipped: AtomicU64::new(0),
+            hour_passed: AtomicBool::new(false),
             readings: AtomicU64::new(0),
             signal: IrqSignal::new(),
             max_inflight: AtomicU32::new(0),
@@ -375,12 +378,12 @@ impl Fake {
                     } else {
                         if self.cfg.ignore_io || self.cfg.fatal_io {
                             self.record(1, &sqe, 0);
-                            match self.cfg.fatal_io {
-                                true => self.set_reg(CSTS, self.reg(CSTS) | 2),
+                            if self.cfg.fatal_io {
+                                self.set_reg(CSTS, self.reg(CSTS) | 2);
+                            } else if !self.hour_passed.swap(true, Ordering::AcqRel) {
                                 // Once is enough to time the driver out. Later jumps would race with its
                                 // shutdown and push that past its own deadline.
-                                false if self.skipped.load(Ordering::Acquire) == 0 => self.skip(3_600_000_000_000),
-                                false => {}
+                                self.skip(3_600_000_000_000);
                             }
                             continue;
                         }
