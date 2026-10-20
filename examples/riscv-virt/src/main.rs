@@ -606,9 +606,9 @@ fn user_demo() {
         task.join();
         processes.push(process);
     }
-    // Exited tasks (and their address spaces) are freed after the next switch.
-    osmium::sched::yield_now();
-    let freed = processes.iter().filter(|p| p.strong_count() == 0).count();
+    // Exited tasks (and their address spaces) are freed once their CPU has
+    // switched away from them.
+    let freed = demos::user::freed(&processes);
     println!("[user]  {freed} of 4 address spaces torn down with their tasks");
 }
 
