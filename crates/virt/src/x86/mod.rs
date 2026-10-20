@@ -22,8 +22,10 @@ mod hw;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub use hw::{SvmError, enable};
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
@@ -46,14 +48,20 @@ pub mod vmcb {
     /// Virtual interrupt control: V_IRQ (bit 8), V_INTR_MASKING (bit 24),
     /// vector (bits 39:32).
     pub const V_INTR: usize = 0x060;
+    /// Interrupt shadow (bit 0): the guest just executed STI or MOV SS.
+    pub const INT_STATE: usize = 0x068;
     /// Exit code.
     pub const EXITCODE: usize = 0x070;
     /// Exit information 1.
     pub const EXITINFO1: usize = 0x078;
     /// Exit information 2.
     pub const EXITINFO2: usize = 0x080;
+    /// An event whose delivery the exit interrupted.
+    pub const EXITINTINFO: usize = 0x088;
     /// Nested paging enable (bit 0).
     pub const NP_ENABLE: usize = 0x090;
+    /// Event to inject on the next VMRUN.
+    pub const EVENTINJ: usize = 0x0a8;
     /// Nested page table root (N_CR3).
     pub const N_CR3: usize = 0x0b0;
     /// Clean bits.
@@ -112,6 +120,8 @@ pub mod vmcb {
 pub mod exit {
     /// Physical interrupt.
     pub const INTR: u64 = 0x60;
+    /// The guest can take a virtual interrupt (interrupt window).
+    pub const VINTR: u64 = 0x64;
     /// CPUID.
     pub const CPUID: u64 = 0x72;
     /// HLT.
@@ -168,6 +178,12 @@ pub struct SvmPages {
     pub msrpm: (NonNull<u8>, u64),
 }
 
+type Ack = Box<dyn Fn() -> Option<u8> + Send + Sync>;
+
+const INTERCEPT_VINTR: u32 = 1 << 4;
+const EVENT_VALID: u64 = 1 << 31;
+const RFLAGS_IF: u64 = 1 << 9;
+
 /// A virtual x86 CPU on AMD SVM.
 pub struct SvmVcpu {
     vmcb: NonNull<u8>,
@@ -177,6 +193,8 @@ pub struct SvmVcpu {
     pending_in: Option<u8>,
     pending_mmio: Option<Access>,
     mem: Option<Arc<GuestMemory>>,
+    irq: Arc<AtomicBool>,
+    ack: Option<Ack>,
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     flush: bool,
 }
@@ -208,6 +226,8 @@ impl SvmVcpu {
             pending_in: None,
             pending_mmio: None,
             mem: None,
+            irq: Arc::new(AtomicBool::new(false)),
+            ack: None,
             flush: true,
         };
         use vmcb::*;
@@ -376,6 +396,73 @@ impl SvmVcpu {
         }
     }
 
+    /// The vCPU's INTR line, for an interrupt controller (a
+    /// [`VirtualPic`](crate::devices::VirtualPic) output) to drive.
+    pub fn irq_line(&self) -> Arc<AtomicBool> {
+        self.irq.clone()
+    }
+
+    /// Uses `line` as the INTR line, for a controller created before the vCPU.
+    pub fn with_irq_line(mut self, line: Arc<AtomicBool>) -> Self {
+        self.irq = line;
+        self
+    }
+
+    /// Sets how to acknowledge an interrupt when it is delivered (the INTA
+    /// cycle): returns the vector, e.g. [`VirtualPic::acknowledge`](crate::devices::VirtualPic::acknowledge).
+    pub fn connect_intr(&mut self, ack: impl Fn() -> Option<u8> + Send + Sync + 'static) {
+        self.ack = Some(Box::new(ack));
+    }
+
+    /// Whether a vCPU halted in `hlt` should run again: its INTR line is up
+    /// and the guest has interrupts enabled.
+    pub fn interrupt_pending(&self) -> bool {
+        self.irq.load(Ordering::Acquire) && self.read64(vmcb::RFLAGS) & RFLAGS_IF != 0
+    }
+
+    fn intercepts(&self) -> u32 {
+        // SAFETY: a field of the owned VMCB.
+        unsafe { self.at(vmcb::INTERCEPT_MISC1).cast::<u32>().read_volatile() }
+    }
+
+    /// Prepares interrupt delivery for the next entry: re-injects an event
+    /// the last exit interrupted, injects the PIC's interrupt if the guest
+    /// can take it now, or else asks for an exit when it can.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    fn prepare_interrupts(&mut self) {
+        // An undelivered injection comes back in EXITINTINFO, never here.
+        self.write64(vmcb::EVENTINJ, 0);
+        let pending = self.read64(vmcb::EXITINTINFO);
+        self.write64(vmcb::EXITINTINFO, 0);
+        if pending & EVENT_VALID != 0 {
+            self.write64(vmcb::EVENTINJ, pending);
+            return;
+        }
+        let mut window = false;
+        if self.irq.load(Ordering::Acquire) {
+            let open = self.read64(vmcb::RFLAGS) & RFLAGS_IF != 0 && self.read64(vmcb::INT_STATE) & 1 == 0;
+            if open {
+                if let Some(vector) = self.ack.as_ref().and_then(|a| a()) {
+                    self.write64(vmcb::EVENTINJ, vector as u64 | EVENT_VALID); // type 0: external interrupt
+                }
+            } else {
+                window = true;
+            }
+        }
+        let v = self.read64(vmcb::V_INTR) & !(1 << 8);
+        self.write64(vmcb::V_INTR, if window { v | 1 << 8 } else { v });
+        let i = self.intercepts() & !INTERCEPT_VINTR;
+        self.write32(vmcb::INTERCEPT_MISC1, if window { i | INTERCEPT_VINTR } else { i });
+    }
+
+    /// Moves the guest past an instruction the hypervisor completed for it.
+    /// Like the CPU retiring it, this ends an STI or MOV SS interrupt shadow
+    /// (`sti; hlt` would otherwise never let an interrupt in).
+    fn skip_to(&mut self, rip: u64) {
+        self.write64(vmcb::RIP, rip);
+        self.write64(vmcb::INT_STATE, 0);
+    }
+
     /// Physical address of the VMCB.
     pub fn vmcb_pa(&self) -> u64 {
         self.vmcb_pa
@@ -418,16 +505,16 @@ impl SvmVcpu {
                     VmExit::PioIn { port, size }
                 } else {
                     let data = (self.rax() & (u32::MAX as u64 >> (32 - 8 * size as u32))) as u32;
-                    self.write64(vmcb::RIP, next);
+                    self.skip_to(next);
                     VmExit::PioOut { port, size, data }
                 }
             }
             exit::HLT => {
-                self.write64(vmcb::RIP, rip + 1);
+                self.skip_to(rip + 1);
                 VmExit::Halt
             }
             exit::VMMCALL => {
-                self.write64(vmcb::RIP, rip + 3);
+                self.skip_to(rip + 3);
                 let r = &self.regs;
                 VmExit::Hypercall { nr: self.rax(), args: [r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.r8] }
             }
@@ -439,7 +526,7 @@ impl SvmVcpu {
                 };
                 if a.store {
                     let data = self.operand_value(&a) & (u64::MAX >> (64 - 8 * a.size as u32));
-                    self.write64(vmcb::RIP, rip + a.len as u64);
+                    self.skip_to(rip + a.len as u64);
                     VmExit::MmioWrite { addr, size: a.size, data }
                 } else {
                     self.pending_mmio = Some(a);
@@ -456,14 +543,17 @@ impl SvmVcpu {
 impl Vcpu for SvmVcpu {
     #[cfg(all(target_arch = "x86_64", target_os = "none"))]
     fn run(&mut self) -> VmExit {
-        if core::mem::take(&mut self.flush) {
-            self.write32(vmcb::TLB_CONTROL, 1);
-        } else {
-            self.write32(vmcb::TLB_CONTROL, 0);
+        loop {
+            let flush = core::mem::take(&mut self.flush);
+            self.write32(vmcb::TLB_CONTROL, flush as u32);
+            self.write32(vmcb::CLEAN, 0);
+            self.prepare_interrupts();
+            hw::run(self);
+            // An interrupt window opened: deliver on the next entry.
+            if self.read64(vmcb::EXITCODE) != exit::VINTR {
+                return self.classify();
+            }
         }
-        self.write32(vmcb::CLEAN, 0);
-        hw::run(self);
-        self.classify()
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
@@ -487,7 +577,7 @@ impl Vcpu for SvmVcpu {
                 self.set_reg(r, (old & !mask) | value);
             }
             let rip = self.rip();
-            self.write64(vmcb::RIP, rip + a.len as u64);
+            self.skip_to(rip + a.len as u64);
             return;
         }
         if let Some(size) = self.pending_in.take() {
@@ -496,7 +586,7 @@ impl Vcpu for SvmVcpu {
             let rax = if size == 4 { value & mask } else { (self.rax() & !mask) | (value & mask) };
             self.write64(vmcb::RAX, rax);
             let next = self.read64(vmcb::EXITINFO2);
-            self.write64(vmcb::RIP, next);
+            self.skip_to(next);
         }
     }
 
@@ -592,5 +682,40 @@ mod tests {
 
         v.write64(vmcb::EXITCODE, exit::INVALID);
         assert_eq!(v.classify(), VmExit::Unhandled { reason: exit::INVALID });
+    }
+
+    #[test]
+    fn interrupt_injection() {
+        let mut v = vcpu();
+        let next = Arc::new(core::sync::atomic::AtomicU8::new(0x24));
+        let n = next.clone();
+        v.connect_intr(move || Some(n.load(Ordering::SeqCst)));
+        let line = v.irq_line();
+
+        // Nothing pending: nothing injected, no window requested.
+        v.prepare_interrupts();
+        assert_eq!(v.read64(vmcb::EVENTINJ), 0);
+
+        // Pending but IF clear: ask for an interrupt window.
+        line.store(true, Ordering::SeqCst);
+        assert!(!v.interrupt_pending());
+        v.prepare_interrupts();
+        assert_eq!(v.read64(vmcb::EVENTINJ), 0);
+        assert_ne!(v.read64(vmcb::V_INTR) & 1 << 8, 0);
+        assert_ne!(v.intercepts() & INTERCEPT_VINTR, 0);
+
+        // IF set: inject vector 0x24 and drop the window request.
+        v.write64(vmcb::RFLAGS, 2 | RFLAGS_IF);
+        assert!(v.interrupt_pending());
+        v.prepare_interrupts();
+        assert_eq!(v.read64(vmcb::EVENTINJ), 0x24 | EVENT_VALID);
+        assert_eq!(v.intercepts() & INTERCEPT_VINTR, 0);
+
+        // An injection cut short by an exit is re-injected first.
+        v.write64(vmcb::EVENTINJ, 0);
+        v.write64(vmcb::EXITINTINFO, 0x30 | EVENT_VALID);
+        v.prepare_interrupts();
+        assert_eq!(v.read64(vmcb::EVENTINJ), 0x30 | EVENT_VALID);
+        assert_eq!(v.read64(vmcb::EXITINTINFO), 0);
     }
 }
