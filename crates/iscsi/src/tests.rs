@@ -9,7 +9,7 @@ use osmium_net::{Ipv4Addr, SocketAddrV4};
 
 use crate::pdu::RESERVED_TAG;
 use crate::scsi::{self, Sense, op, sense_key};
-use crate::testing::{INITIATOR_NAME, PORTAL, TARGET_NAME, TargetConfig, TestNet};
+use crate::testing::{Fault, INITIATOR_NAME, PORTAL, TARGET_NAME, TargetConfig, TestNet};
 use crate::{Data, IscsiDisk, IscsiError, Options, discover};
 
 const BLOCKS: usize = 2048;
@@ -251,6 +251,156 @@ fn send_targets_discovery() {
     // A normal session can follow on a new connection.
     let disk = connect(&mut net);
     assert_eq!(disk.num_blocks(), BLOCKS as u64);
+}
+
+#[test]
+fn endless_login_text_is_refused() {
+    // 4 KiB more each time: the text cap ends it.
+    let cfg = TargetConfig { login_flood: Some(4096), ..TargetConfig::default() };
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let e = IscsiDisk::connect(&mut net, PORTAL, &options()).err().unwrap();
+    assert_eq!(e, IscsiError::Protocol("login text too long"));
+    // A little more each time: the exchange limit ends it.
+    let cfg = TargetConfig { login_flood: Some(32), ..TargetConfig::default() };
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let e = IscsiDisk::connect(&mut net, PORTAL, &options()).err().unwrap();
+    assert_eq!(e, IscsiError::Protocol("login did not finish"));
+    assert_eq!(sockets(&net), 0);
+}
+
+#[test]
+fn skipping_operational_negotiation_is_refused() {
+    // We ask for LoginOperationalNegotiation next; the target may not go
+    // further.
+    let cfg = TargetConfig { skip_operational: true, ..TargetConfig::default() };
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let e = IscsiDisk::connect(&mut net, PORTAL, &options()).err().unwrap();
+    assert_eq!(e, IscsiError::Protocol("Login Response with a bad next stage"));
+}
+
+#[test]
+fn endless_send_targets_text_is_refused() {
+    let cfg = TargetConfig { text_flood: true, ..TargetConfig::default() };
+    let mut net = TestNet::new(cfg, BLOCKS);
+    assert_eq!(discover(&mut net, PORTAL, &options()), Err(IscsiError::Protocol("SendTargets text too long")));
+}
+
+#[test]
+fn a_trickling_target_times_out() {
+    // Each Data-In comes well within the timeout, but the command as a
+    // whole takes longer.
+    let cfg = TargetConfig { trickle: 50, data_in_segment: 512, ..TargetConfig::default() };
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let opts = Options { timeout: core::time::Duration::from_millis(500), ..options() };
+    let mut disk = IscsiDisk::connect(&mut net, PORTAL, &opts).unwrap();
+    let start = disk.net_mut().now;
+    let mut buf = vec![0u8; 64 * 512];
+    assert_eq!(disk.execute(&scsi::read(0, 64), Data::In(&mut buf)), Err(IscsiError::TimedOut));
+    let took = disk.net_mut().now - start;
+    assert!(took >= opts.timeout && took < opts.timeout * 2, "{took:?}");
+    assert!(!disk.is_logged_in());
+}
+
+/// Runs a read or write against a target that misbehaves with `fault`,
+/// returning the command's result and whether the session survived.
+fn faulty(cfg: TargetConfig, fault: Fault, write: bool, blocks: u32) -> (Result<usize, IscsiError>, bool) {
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let mut disk = connect(&mut net);
+    disk.net_mut().target.fault = Some(fault);
+    let mut buf = pattern(blocks as usize * 512, 4);
+    let r = if write {
+        disk.execute(&scsi::write(16, blocks), Data::Out(&buf))
+    } else {
+        disk.execute(&scsi::read(16, blocks), Data::In(&mut buf))
+    };
+    (r, disk.is_logged_in())
+}
+
+#[test]
+fn data_in_out_of_order_or_short_fails() {
+    let small = TargetConfig { data_in_segment: 1024, ..TargetConfig::default() };
+    for (fault, why) in [
+        (Fault::DataInLastOnly, "Data-In out of order"),
+        (Fault::DataInSkipSn, "Data-In out of order"),
+        (Fault::DataInShort, "residual does not match the data moved"),
+    ] {
+        assert_eq!(faulty(small.clone(), fault, false, 8), (Err(IscsiError::Protocol(why)), false), "{fault:?}");
+    }
+    // The same with the status in a separate SCSI Response.
+    let separate = TargetConfig { status_in_data_in: false, ..small };
+    let r = faulty(separate, Fault::DataInShort, false, 8);
+    assert_eq!(r, (Err(IscsiError::Protocol("residual does not match the data moved")), false));
+}
+
+#[test]
+fn underflows_are_short_and_fail_block_io() {
+    // A reported underflow is no protocol error: the command moved less.
+    assert_eq!(faulty(TargetConfig::default(), Fault::DataInUnderflow, false, 8), (Ok(7 * 512), true));
+    assert_eq!(faulty(TargetConfig::default(), Fault::WriteUnderflow, true, 8), (Ok(7 * 512), true));
+    // But a block read or write that comes up short fails.
+    let mut net = TestNet::new(TargetConfig::default(), BLOCKS);
+    let mut disk = connect(&mut net);
+    let mut buf = vec![0u8; 8 * 512];
+    disk.net_mut().target.fault = Some(Fault::DataInUnderflow);
+    assert_eq!(disk.read_blocks(0, &mut buf), Err(BlockError::Io));
+    disk.net_mut().target.fault = Some(Fault::WriteUnderflow);
+    assert_eq!(disk.write_blocks(0, &buf), Err(BlockError::Io));
+    assert!(disk.is_logged_in());
+    disk.read_blocks(0, &mut buf).unwrap();
+}
+
+#[test]
+fn bad_r2ts_fail() {
+    let cfg = TargetConfig {
+        initial_r2t: true,
+        immediate_data: false,
+        max_burst: 4096,
+        first_burst: 4096,
+        ..TargetConfig::default()
+    };
+    for (fault, why) in [
+        (Fault::R2tZeroLength, "R2T length outside 1..=MaxBurstLength"),
+        (Fault::R2tReservedTtt, "R2T out of step"),
+        (Fault::R2tSkipSn, "R2T out of step"),
+        (Fault::R2tGap, "R2T out of step"),
+        (Fault::R2tPastEnd, "R2T beyond the buffer"),
+    ] {
+        assert_eq!(faulty(cfg.clone(), fault, true, 4), (Err(IscsiError::Protocol(why)), false), "{fault:?}");
+    }
+}
+
+#[test]
+fn a_skipped_stat_sn_fails() {
+    let mut net = TestNet::new(TargetConfig::default(), BLOCKS);
+    let mut disk = connect(&mut net);
+    disk.net_mut().target.skip_stat_sn = true;
+    let e = disk.execute(&scsi::test_unit_ready(), Data::None).unwrap_err();
+    assert_eq!(e, IscsiError::Protocol("StatSN out of sequence"));
+    assert!(!disk.is_logged_in());
+}
+
+#[test]
+fn data_segments_are_held_to_our_mrdsl() {
+    let cfg = TargetConfig { ignore_mrdsl: true, data_in_segment: 8192, ..TargetConfig::default() };
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let offer = crate::Offer { max_recv_data_segment_length: 4096, ..crate::Offer::default() };
+    let opts = Options { offer, ..options() };
+    let mut disk = IscsiDisk::connect(&mut net, PORTAL, &opts).unwrap();
+    let mut buf = vec![0u8; 16 * 512];
+    let e = disk.execute(&scsi::read(0, 16), Data::In(&mut buf)).unwrap_err();
+    assert_eq!(e, IscsiError::Protocol("data segment too long"));
+}
+
+#[test]
+fn odd_block_sizes_are_refused() {
+    for (size, ok) in [(300, false), (520, false), (256, false), (1 << 17, false), (4096, true)] {
+        let cfg = TargetConfig { reported_block_size: Some(size), ..TargetConfig::default() };
+        let mut net = TestNet::new(cfg, BLOCKS);
+        match IscsiDisk::connect(&mut net, PORTAL, &options()) {
+            Ok(d) => assert!(ok && d.block_size() == size as usize, "{size}"),
+            Err(e) => assert!(!ok && e == IscsiError::Protocol("unusable capacity"), "{size}: {e:?}"),
+        }
+    }
 }
 
 /// The initiator against scripts/iscsi-target.py, over stdin/stdout as

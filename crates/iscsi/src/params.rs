@@ -187,18 +187,31 @@ impl Negotiator {
                 }
                 None => false,
             };
+            let p = &mut self.params;
+            let o = &self.offer;
             if matches!(value, "Reject" | "Irrelevant" | "NotUnderstood") {
-                // The default stays in effect, which is fine for anything
-                // but authentication and digests.
+                // The default stays in effect (RFC 7143 §6.2), which is
+                // fine for anything but authentication and digests. Where
+                // the default is more than we offered, we keep to our offer:
+                // a smaller burst, or no immediate data, is always allowed.
                 match key {
                     "AuthMethod" => return Err(bad("target rejected AuthMethod=None")),
                     "HeaderDigest" | "DataDigest" => return Err(bad("target rejected digest None")),
-                    _ => continue,
+                    "MaxBurstLength" => p.max_burst_length = p.max_burst_length.min(o.max_burst_length),
+                    "FirstBurstLength" => p.first_burst_length = p.first_burst_length.min(o.first_burst_length),
+                    "ImmediateData" => p.immediate_data &= o.immediate_data,
+                    _ => {}
                 }
+                continue;
             }
-            let p = &mut self.params;
-            let o = &self.offer;
-            let num = |max: u64| number(value).filter(|v| *v <= max).ok_or(bad("bad numeric value"));
+            let num =
+                |min: u64, max: u64| number(value).filter(|v| (min..=max).contains(v)).ok_or(bad("bad numeric value"));
+            // A key with the minimum function: the target's answer to our
+            // offer may not exceed it, and its own offer is cut to ours.
+            let least = |min: u64, max: u64, offered: u64| match num(min, max)? {
+                v if ours && v > offered => Err(bad("target chose more than we offered")),
+                v => Ok(v.min(offered)),
+            };
             let flag = || boolean(value).ok_or(bad("bad boolean value"));
             // The result, to send back if the target offered the key.
             let result: Option<String> = match key {
@@ -215,38 +228,39 @@ impl Negotiator {
                     Some("None".into())
                 }
                 "MaxRecvDataSegmentLength" => {
-                    p.max_xmit_data_segment_length = num(MAX_DSL)?.max(MIN_DSL) as u32;
+                    p.max_xmit_data_segment_length = num(MIN_DSL, MAX_DSL)? as u32;
                     None
                 }
                 "MaxBurstLength" => {
-                    p.max_burst_length = (num(MAX_DSL)?.max(MIN_DSL) as u32).min(o.max_burst_length);
+                    p.max_burst_length = least(MIN_DSL, MAX_DSL, o.max_burst_length.into())? as u32;
                     Some(p.max_burst_length.to_string())
                 }
                 "FirstBurstLength" => {
-                    p.first_burst_length = (num(MAX_DSL)?.max(MIN_DSL) as u32).min(o.first_burst_length);
+                    p.first_burst_length = least(MIN_DSL, MAX_DSL, o.first_burst_length.into())? as u32;
                     Some(p.first_burst_length.to_string())
                 }
                 "MaxOutstandingR2T" => {
-                    p.max_outstanding_r2t = num(65535)?.clamp(1, 1) as u32;
+                    p.max_outstanding_r2t = least(1, 65535, 1)? as u32;
                     Some("1".into())
                 }
                 "MaxConnections" => {
-                    p.max_connections = num(65535)?.clamp(1, 1) as u16;
+                    p.max_connections = least(1, 65535, 1)? as u16;
                     Some("1".into())
                 }
                 "ErrorRecoveryLevel" => {
-                    num(2)?;
-                    p.error_recovery_level = 0;
+                    p.error_recovery_level = least(0, 2, 0)? as u8;
                     Some("0".into())
                 }
                 "DefaultTime2Wait" => {
-                    p.default_time2wait = (num(3600)? as u16).max(TIME2WAIT);
+                    // The maximum function: the answer may not be below ours.
+                    p.default_time2wait = match num(0, 3600)? as u16 {
+                        v if ours && v < TIME2WAIT => return Err(bad("target chose less than we offered")),
+                        v => v.max(TIME2WAIT),
+                    };
                     Some(p.default_time2wait.to_string())
                 }
                 "DefaultTime2Retain" => {
-                    // The minimum of the target's value and our 0.
-                    num(3600)?;
-                    p.default_time2retain = TIME2RETAIN;
+                    p.default_time2retain = least(0, 3600, TIME2RETAIN.into())? as u16;
                     Some(p.default_time2retain.to_string())
                 }
                 "InitialR2T" => {
@@ -271,7 +285,7 @@ impl Negotiator {
                     None
                 }
                 "TargetPortalGroupTag" => {
-                    p.target_portal_group_tag = Some(num(65535)? as u16);
+                    p.target_portal_group_tag = Some(num(0, 65535)? as u16);
                     None
                 }
                 "TargetAddress" | "SessionType" | "TargetName" | "InitiatorName" | "InitiatorAlias" => None,
@@ -325,7 +339,7 @@ mod tests {
             ("InitialR2T", "Yes"),
             ("ImmediateData", "No"),
             ("MaxBurstLength", "131072"),
-            ("FirstBurstLength", "0x40000"),
+            ("FirstBurstLength", "0x8000"),
             ("DefaultTime2Wait", "5"),
             ("DefaultTime2Retain", "0"),
             ("ErrorRecoveryLevel", "0"),
@@ -336,8 +350,7 @@ mod tests {
         let p = &n.params;
         assert_eq!((p.max_recv_data_segment_length, p.max_xmit_data_segment_length), (65536, 4096));
         assert_eq!((p.initial_r2t, p.immediate_data), (true, false));
-        // A first burst beyond our offer is cut to it, and to MaxBurstLength.
-        assert_eq!((p.max_burst_length, p.first_burst_length), (131_072, 65536));
+        assert_eq!((p.max_burst_length, p.first_burst_length), (131_072, 32768));
         assert_eq!(p.default_time2wait, 5);
     }
 
@@ -378,5 +391,43 @@ mod tests {
         n.operational_keys(false);
         n.respond(b"ImmediateData=Reject\0InitialR2T=Irrelevant\0").unwrap();
         assert_eq!((n.params.immediate_data, n.params.initial_r2t), (true, true));
+    }
+
+    #[test]
+    fn rejected_keys_keep_to_our_offer() {
+        let offer =
+            Offer { max_burst_length: 16384, first_burst_length: 4096, immediate_data: false, ..Offer::default() };
+        let mut n = Negotiator::new(offer);
+        n.operational_keys(false);
+        n.respond(b"MaxBurstLength=Reject\0FirstBurstLength=Irrelevant\0ImmediateData=Reject\0").unwrap();
+        let p = &n.params;
+        assert_eq!((p.max_burst_length, p.first_burst_length, p.immediate_data), (16384, 4096, false));
+    }
+
+    #[test]
+    fn answers_beyond_our_offer_fail() {
+        for reply in [
+            &b"ErrorRecoveryLevel=2\0"[..],
+            b"MaxBurstLength=262145\0",
+            b"FirstBurstLength=65537\0",
+            b"MaxOutstandingR2T=2\0",
+            b"MaxConnections=4\0",
+            b"DefaultTime2Retain=20\0",
+            b"DefaultTime2Wait=1\0",
+            b"MaxBurstLength=256\0",
+            b"MaxRecvDataSegmentLength=100\0",
+        ] {
+            let mut n = Negotiator::new(Offer::default());
+            n.operational_keys(false);
+            assert!(matches!(n.respond(reply), Err(IscsiError::Negotiation(_))), "{reply:?}");
+        }
+        // The same values offered by the target are cut to ours.
+        let mut n = Negotiator::new(Offer::default());
+        n.security_keys("i", Some("t"));
+        let replies = n.respond(b"ErrorRecoveryLevel=2\0DefaultTime2Retain=20\0MaxOutstandingR2T=2\0").unwrap();
+        assert_eq!(
+            keys(&replies),
+            [("ErrorRecoveryLevel", "0"), ("DefaultTime2Retain", "0"), ("MaxOutstandingR2T", "1")]
+        );
     }
 }

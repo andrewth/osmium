@@ -12,10 +12,13 @@ network forwarding, launched once per connection:
 
 Logs go to stderr (or --log FILE), and nowhere when stderr is the TCP stream
 as well, which is how QEMU's guestfwd launches commands. For manual
-testing it can listen on a port instead (and serves connections one after another):
+testing it can listen on a port instead, on 127.0.0.1 unless --bind says
+otherwise, and serves connections one after another:
 
     python3 scripts/iscsi-target.py --listen 3260 disk.img
     qemu-img info iscsi://127.0.0.1:3260/iqn.2026-10.org.osmium:disk0/0
+
+A connection that misbehaves is logged and dropped; the next one is served.
 
     python3 scripts/iscsi-target.py --self-test
 
@@ -37,6 +40,7 @@ import struct
 import sys
 import tempfile
 import threading
+import traceback
 
 TARGET_NAME = "iqn.2026-10.org.osmium:disk0"
 BLOCK = 512
@@ -64,6 +68,18 @@ TARGET_KEYS = {
     "DefaultTime2Retain": 0,
     "DataPDUInOrder": "Yes",
     "DataSequenceInOrder": "Yes",
+}
+# The admissible range of each numeric key (RFC 7143 §13); a value outside
+# it, or not a number, is answered with Reject.
+RANGES = {
+    "MaxRecvDataSegmentLength": (512, 2**24 - 1),
+    "MaxBurstLength": (512, 2**24 - 1),
+    "FirstBurstLength": (512, 2**24 - 1),
+    "MaxOutstandingR2T": (1, 65535),
+    "MaxConnections": (1, 65535),
+    "ErrorRecoveryLevel": (0, 2),
+    "DefaultTime2Wait": (0, 3600),
+    "DefaultTime2Retain": (0, 3600),
 }
 MIN_KEYS = {"MaxBurstLength", "FirstBurstLength", "MaxOutstandingR2T", "MaxConnections", "ErrorRecoveryLevel",
             "DefaultTime2Retain"}
@@ -95,6 +111,20 @@ def make_text(pairs):
 
 def number(v):
     return int(v, 16) if v.lower().startswith("0x") else int(v)
+
+
+def admissible(key, value):
+    """The value of a key, or None if it is malformed or out of range."""
+    if key in RANGES:
+        try:
+            n = number(value)
+        except ValueError:
+            return None
+        lo, hi = RANGES[key]
+        return n if lo <= n <= hi else None
+    if key in OR_KEYS or key in AND_KEYS:
+        return value if value in ("Yes", "No") else None
+    return value
 
 
 def u32(b, off):
@@ -246,6 +276,12 @@ class Session:
             out.append((key, "None"))
         elif key in ("HeaderDigest", "DataDigest"):
             out.append((key, "None" if "None" in value.split(",") else "Reject"))
+        elif admissible(key, value) is None:
+            # The key keeps its current value (RFC 7143 §6.2). A declaration
+            # is not answered, so a bad one is only ignored.
+            log(f"rejecting {key}={value}")
+            if key != "MaxRecvDataSegmentLength":
+                out.append((key, "Reject"))
         elif key == "MaxRecvDataSegmentLength":
             self.initiator_mrdsl = number(value)
         elif key in MIN_KEYS:
@@ -416,9 +452,11 @@ class Session:
         itt = req.get(16)
         buf = bytearray(length)
         got = len(req.data)
-        buf[:got] = req.data[:length]
-        final = bool(req.flags & 0x80)
         first_burst = min(self.params["FirstBurstLength"], length)
+        if got > first_burst:
+            raise ProtocolError(f"{got} bytes of immediate data, at most {first_burst} allowed")
+        buf[:got] = req.data
+        final = bool(req.flags & 0x80)
         # Unsolicited Data-Out until the F bit, when the command did not have it.
         while not final:
             pdu = self.s.recv()
@@ -430,12 +468,14 @@ class Session:
                 continue
             if pdu.opcode != DATA_OUT or pdu.get(16) != itt:
                 raise ProtocolError(f"expected unsolicited Data-Out, got opcode {pdu.opcode:#x}")
-            off = pdu.get(40)
-            buf[off:off + len(pdu.data)] = pdu.data
-            got = max(got, off + len(pdu.data))
+            # In order (DataPDUInOrder=Yes) and within FirstBurstLength, so
+            # never past the command's data.
+            off, n = pdu.get(40), len(pdu.data)
+            if off != got or off + n > first_burst:
+                raise ProtocolError(f"unsolicited Data-Out at {off}+{n}, expected {got}, burst {first_burst}")
+            buf[off:off + n] = pdu.data
+            got += n
             final = bool(pdu.flags & 0x80)
-        if got > first_burst and got > len(req.data):
-            log(f"warning: {got} bytes unsolicited, FirstBurstLength {first_burst}")
         r2t_sn = 0
         while got < length:
             want = min(self.params["MaxBurstLength"], length - got)
@@ -454,6 +494,7 @@ class Session:
             self.s.send(r2t)
             r2t_sn += 1
             end = got + want
+            at = got
             while True:
                 pdu = self.s.recv()
                 if pdu is None:
@@ -464,12 +505,15 @@ class Session:
                     continue
                 if pdu.opcode != DATA_OUT or pdu.get(16) != itt or pdu.get(20) != ttt:
                     raise ProtocolError(f"expected Data-Out for R2T {ttt:#x}")
-                off = pdu.get(40)
-                if off + len(pdu.data) > end:
-                    raise ProtocolError("Data-Out beyond the R2T")
-                buf[off:off + len(pdu.data)] = pdu.data
+                off, n = pdu.get(40), len(pdu.data)
+                if off != at or off + n > end:
+                    raise ProtocolError(f"Data-Out at {off}+{n} outside R2T {got}..{end}, expected {at}")
+                buf[off:off + n] = pdu.data
+                at += n
                 if pdu.flags & 0x80:
                     break
+            if at != end:
+                raise ProtocolError(f"R2T {got}..{end} answered with {at - got} bytes")
             got = end
         return bytes(buf)
 
@@ -628,27 +672,40 @@ class ProtocolError(Exception):
 
 
 def serve(stream, disk, address):
+    """Runs one connection to its end. Whatever the initiator sends, the
+    connection is only dropped: a bug it trips is logged, not raised."""
     try:
         Session(stream, disk, address).run()
     except ProtocolError as e:
         log(f"protocol error: {e}")
     except (BrokenPipeError, ConnectionResetError) as e:
         log(f"connection lost: {e}")
+    except Exception:
+        log("connection failed:\n" + traceback.format_exc().rstrip())
 
 
-def listen(port, disk, address):
+def bind(host, port):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", port))
+    srv.bind((host, port))
     srv.listen(1)
-    log(f"listening on port {srv.getsockname()[1]}, {disk.blocks} blocks")
+    return srv
+
+
+def listen(srv, disk, address):
+    """Serves connections on `srv` one after another, for ever."""
+    host, port = srv.getsockname()
+    log(f"listening on {host}:{port}, {disk.blocks} blocks")
     while True:
         conn, peer = srv.accept()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log(f"connection from {peer[0]}:{peer[1]}")
-        here = address or f"{conn.getsockname()[0]}:{conn.getsockname()[1]},1"
-        with conn, conn.makefile("rb") as r, conn.makefile("wb") as w:
-            serve(Stream(r, w), disk, here)
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            log(f"connection from {peer[0]}:{peer[1]}")
+            here = address or f"{conn.getsockname()[0]}:{conn.getsockname()[1]},1"
+            with conn, conn.makefile("rb") as r, conn.makefile("wb") as w:
+                serve(Stream(r, w), disk, here)
+        except Exception as e:
+            log(f"connection from {peer[0]}:{peer[1]} failed: {e!r}")
 
 
 # A minimal initiator, for --self-test.
@@ -824,8 +881,51 @@ def self_test():
                 assert i.simple(LOGOUT_REQ).opcode == LOGOUT_RESP
             return run
 
+        def bad_keys(i):
+            # Malformed or out-of-range values are rejected, the defaults kept.
+            assert i.login([("MaxBurstLength", "0"), ("FirstBurstLength", "lots"), ("ErrorRecoveryLevel", "9"),
+                            ("InitialR2T", "Maybe"), ("MaxRecvDataSegmentLength", "0x10")]) == (0, 0)
+            for k in ("MaxBurstLength", "FirstBurstLength", "ErrorRecoveryLevel", "InitialR2T"):
+                assert i.params[k] == "Reject", (k, i.params[k])
+            assert i.command(bytes(6))[0] == CHECK_CONDITION  # the unit attention
+            status, back, _ = i.command(bytes([0x28, 0, 0, 0, 0, 0, 0, 0, 64, 0]), read_len=64 * BLOCK)
+            assert status == GOOD and back == bytes(i % 251 for i in range(64 * BLOCK))
+            assert i.simple(LOGOUT_REQ).opcode == LOGOUT_RESP
+
+        def overrun(i):
+            # Unsolicited Data-Out past the command's one block, at the
+            # disk's last LBA: the target drops the connection.
+            assert i.login([("InitialR2T", "No")]) == (0, 0)
+            assert i.command(bytes(6))[0] == CHECK_CONDITION
+            req = Pdu()
+            req.bhs[0], req.bhs[1] = SCSI_CMD, 0x20 | 1
+            req.set(16, i.next_itt())
+            req.set(20, BLOCK)
+            req.set(24, i.cmd_sn)
+            req.bhs[32:42] = bytes([0x2A, 0]) + (blocks - 1).to_bytes(4, "big") + bytes([0, 0, 1, 0])
+            i.s.send(req)
+            d = Pdu()
+            d.bhs[0], d.bhs[1] = DATA_OUT, 0x80
+            d.set(16, req.get(16))
+            d.set(20, RESERVED)
+            d.set(40, BLOCK)
+            d.data = b"\xee" * BLOCK
+            i.s.send(d)
+            assert i.s.recv() is None, "connection dropped"
+            assert os.path.getsize(path) == blocks * BLOCK
+
+        def over_tcp(*fns):
+            # Through --listen's loop, which must outlive a bad connection.
+            srv = bind("127.0.0.1", 0)
+            threading.Thread(target=listen, args=(srv, disk, "127.0.0.1:3260,1"), daemon=True).start()
+            for fn in fns:
+                with socket.create_connection(srv.getsockname(), timeout=5) as a:
+                    fn(Initiator(a))
+
         session(discovery)
         session(refused)
+        session(bad_keys)
+        over_tcp(overrun, bad_keys, discovery)
         # Unsolicited data up to FirstBurstLength, the rest by R2T.
         session(io([("InitialR2T", "No"), ("ImmediateData", "Yes"), ("MaxRecvDataSegmentLength", "8192"),
                     ("FirstBurstLength", "65536"), ("MaxBurstLength", "65536")], 1))
@@ -842,6 +942,8 @@ def main():
     ap = argparse.ArgumentParser(description="A minimal single-LUN iSCSI target.")
     ap.add_argument("image", nargs="?", help="raw disk image to serve as LUN 0")
     ap.add_argument("--listen", type=int, metavar="PORT", help="listen on a TCP port instead of stdin/stdout")
+    ap.add_argument("--bind", default="127.0.0.1", metavar="ADDR",
+                    help="address to listen on with --listen (default: 127.0.0.1)")
     ap.add_argument("--address", help="TargetAddress for SendTargets (default: the connection's own)")
     ap.add_argument("--read-only", action="store_true", help="refuse writes")
     ap.add_argument("--self-test", action="store_true", help="test against a built-in initiator and exit")
@@ -861,7 +963,7 @@ def main():
         ap.error("an image is required")
     disk = Disk(args.image, args.read_only)
     if args.listen is not None:
-        listen(args.listen, disk, args.address)
+        listen(bind(args.bind, args.listen), disk, args.address)
     else:
         log(f"serving {args.image} ({disk.blocks} blocks) on stdin/stdout")
         serve(Stream(sys.stdin.buffer, sys.stdout.buffer), disk, args.address or "10.0.2.100:3260,1")

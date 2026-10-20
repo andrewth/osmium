@@ -160,6 +160,18 @@ pub(crate) struct TargetConfig {
     pub(crate) extra_operational_round: bool,
     /// The block count READ CAPACITY reports, if not the RAM disk's.
     pub(crate) reported_blocks: Option<u64>,
+    /// The block size READ CAPACITY reports, if not 512.
+    pub(crate) reported_block_size: Option<u32>,
+    /// Every Login Response has the C bit, with this much more text.
+    pub(crate) login_flood: Option<usize>,
+    /// Every Text Response has the C bit, with 8 KiB more text.
+    pub(crate) text_flood: bool,
+    /// Send Data-In one PDU per this many polls (0: all at once).
+    pub(crate) trickle: usize,
+    /// Size Data-In segments ignoring the initiator's MRDSL.
+    pub(crate) ignore_mrdsl: bool,
+    /// Go from SecurityNegotiation straight to the full feature phase.
+    pub(crate) skip_operational: bool,
 }
 
 impl Default for TargetConfig {
@@ -176,8 +188,39 @@ impl Default for TargetConfig {
             extra_security_round: false,
             extra_operational_round: false,
             reported_blocks: None,
+            reported_block_size: None,
+            login_flood: None,
+            text_flood: false,
+            trickle: 0,
+            ignore_mrdsl: false,
+            skip_operational: false,
         }
     }
+}
+
+/// A one-off misbehaviour for the next read or write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// Only the last block of a read, at its offset, with status.
+    DataInLastOnly,
+    /// A read's second Data-In skips a DataSN.
+    DataInSkipSn,
+    /// A read one block short with GOOD status and no residual.
+    DataInShort,
+    /// A read one block short, reported as an underflow.
+    DataInUnderflow,
+    /// A write completes GOOD with a one-block underflow.
+    WriteUnderflow,
+    /// The write's first R2T asks for nothing.
+    R2tZeroLength,
+    /// The write's first R2T has the reserved TTT.
+    R2tReservedTtt,
+    /// The write's first R2T skips an R2TSN.
+    R2tSkipSn,
+    /// The write's first R2T runs a block past the command's data.
+    R2tPastEnd,
+    /// The write's first R2T starts a block later than it should.
+    R2tGap,
 }
 
 /// A write waiting for its data.
@@ -221,6 +264,10 @@ struct Conn {
     operational_rounds: usize,
     pending: Pending,
     closing: bool,
+    /// Encoded PDUs held back by [`TargetConfig::trickle`], and the polls
+    /// until the next goes out.
+    paced: VecDeque<Vec<u8>>,
+    pace_wait: usize,
 }
 
 /// Counts of what the target saw.
@@ -252,6 +299,10 @@ pub(crate) struct Target {
     pub(crate) ping: Option<u32>,
     /// Ignore the next SCSI command.
     pub(crate) ignore_next: bool,
+    /// Misbehave in the next read or write.
+    pub(crate) fault: Option<Fault>,
+    /// The next SCSI Response skips a StatSN.
+    pub(crate) skip_stat_sn: bool,
     attention_sent: bool,
     listener: Option<SocketHandle>,
     conns: Vec<Conn>,
@@ -268,6 +319,8 @@ impl Target {
             fail_next: None,
             ping: None,
             ignore_next: false,
+            fault: None,
+            skip_stat_sn: false,
             attention_sent: false,
             listener: None,
             conns: Vec::new(),
@@ -293,6 +346,8 @@ impl Target {
                     operational_rounds: 0,
                     pending: Pending::None,
                     closing: false,
+                    paced: VecDeque::new(),
+                    pace_wait: 0,
                 });
                 self.listener = None;
             }
@@ -314,6 +369,13 @@ impl Target {
             while let Some(pdu) = c.reader.next_pdu().unwrap() {
                 let m = Message::decode(pdu).expect("initiator sent an unknown PDU");
                 self.handle(c, m);
+            }
+            if !c.paced.is_empty() {
+                if c.pace_wait == 0 {
+                    c.out.extend(c.paced.pop_front().unwrap());
+                    c.pace_wait = self.cfg.trickle;
+                }
+                c.pace_wait -= 1;
             }
             let s = sockets.get_mut::<TcpSocket>(c.socket);
             if !c.out.is_empty()
@@ -396,23 +458,28 @@ impl Target {
             Message::TextRequest(t) => {
                 assert_eq!(t.cmd_sn, c.exp_cmd_sn);
                 c.exp_cmd_sn = t.cmd_sn.wrapping_add(1);
-                let keys = text::parse(&t.data).unwrap();
-                assert_eq!(keys, [("SendTargets", "All")]);
+                let flood = self.cfg.text_flood;
                 let mut data = Vec::new();
-                text::push(&mut data, "TargetName", TARGET_NAME);
-                text::push(&mut data, "TargetAddress", "192.168.1.2:3260,1");
-                text::push(&mut data, "TargetName", "iqn.2026-10.org.osmium:other");
-                text::push(&mut data, "TargetAddress", "10.9.8.7,1");
+                if flood {
+                    data = filler(8192);
+                } else {
+                    let keys = text::parse(&t.data).unwrap();
+                    assert_eq!(keys, [("SendTargets", "All")]);
+                    text::push(&mut data, "TargetName", TARGET_NAME);
+                    text::push(&mut data, "TargetAddress", "192.168.1.2:3260,1");
+                    text::push(&mut data, "TargetName", "iqn.2026-10.org.osmium:other");
+                    text::push(&mut data, "TargetAddress", "10.9.8.7,1");
+                }
                 let (exp, max) = Self::window(c);
                 let stat_sn = Self::stat_sn(c);
                 Self::send(
                     c,
                     Message::TextResponse(TextResponse {
-                        final_pdu: true,
-                        cont: false,
+                        final_pdu: !flood,
+                        cont: flood,
                         lun: [0; 8],
                         itt: t.itt,
-                        ttt: RESERVED_TAG,
+                        ttt: if flood { 0x77 } else { RESERVED_TAG },
                         stat_sn,
                         exp_cmd_sn: exp,
                         max_cmd_sn: max,
@@ -469,6 +536,8 @@ impl Target {
                 }
                 if self.cfg.extra_security_round && c.security_rounds == 1 {
                     (transit, nsg) = (false, 0);
+                } else if self.cfg.skip_operational {
+                    nsg = stage::FULL_FEATURE;
                 }
             }
             stage::OPERATIONAL => {
@@ -517,6 +586,12 @@ impl Target {
             }
             s => panic!("login in stage {s}"),
         }
+        let flood = self.cfg.login_flood;
+        if let Some(n) = flood {
+            // More text, always: no transit while it continues.
+            transit = false;
+            out.extend_from_slice(&filler(n));
+        }
         if transit && nsg == stage::FULL_FEATURE {
             self.stats.logins += 1;
         }
@@ -526,7 +601,7 @@ impl Target {
             c,
             Message::LoginResponse(LoginResponse {
                 transit: transit && class == 0,
-                cont: false,
+                cont: flood.is_some() && class == 0,
                 csg: r.csg,
                 nsg: if transit { nsg } else { 0 },
                 isid: r.isid,
@@ -564,6 +639,7 @@ impl Target {
             return self.respond(c, cmd.itt, scsi::status::CHECK_CONDITION, Some(sense), 0);
         }
         let reported = self.cfg.reported_blocks.unwrap_or(self.blocks());
+        let block_size = self.cfg.reported_block_size.unwrap_or(BLOCK as u32);
         match opcode {
             op::TEST_UNIT_READY => self.respond(c, cmd.itt, 0, None, 0),
             op::INQUIRY => {
@@ -579,13 +655,13 @@ impl Target {
             op::READ_CAPACITY_10 => {
                 let last = (reported - 1).min(u32::MAX as u64) as u32;
                 let mut d = last.to_be_bytes().to_vec();
-                d.extend_from_slice(&(BLOCK as u32).to_be_bytes());
+                d.extend_from_slice(&block_size.to_be_bytes());
                 self.data_in(c, &cmd, d);
             }
             op::SERVICE_ACTION_IN_16 if cmd.cdb[1] == scsi::SA_READ_CAPACITY_16 => {
                 let mut d = vec![0; 32];
                 d[..8].copy_from_slice(&(reported - 1).to_be_bytes());
-                d[8..12].copy_from_slice(&(BLOCK as u32).to_be_bytes());
+                d[8..12].copy_from_slice(&block_size.to_be_bytes());
                 self.data_in(c, &cmd, d);
             }
             op::READ_10 | op::READ_16 | op::WRITE_10 | op::WRITE_16 => {
@@ -598,7 +674,11 @@ impl Target {
                 assert_eq!(cmd.expected_len as usize, len);
                 assert!(len <= c.max_burst, "commands split to MaxBurstLength");
                 if cmd.read {
-                    let d = self.disk[at..at + len].to_vec();
+                    let mut d = self.disk[at..at + len].to_vec();
+                    if self.fault == Some(Fault::DataInUnderflow) {
+                        self.fault = None;
+                        d.truncate(len - BLOCK);
+                    }
                     return self.data_in(c, &cmd, d);
                 }
                 assert!(cmd.write);
@@ -664,10 +744,25 @@ impl Target {
     fn advance(&mut self, c: &mut Conn, mut w: Write) {
         if w.got == w.buf.len() && w.r2t_end.is_none() {
             self.disk[w.at..w.at + w.buf.len()].copy_from_slice(&w.buf);
-            return self.respond(c, w.itt, 0, None, 0);
+            let residual = if self.fault == Some(Fault::WriteUnderflow) {
+                self.fault = None;
+                BLOCK as u32
+            } else {
+                0
+            };
+            return self.respond(c, w.itt, 0, None, residual);
         }
         if w.unsolicited_done && w.r2t_end.is_none() {
             let len = (w.buf.len() - w.next_offset).min(c.max_burst);
+            let (mut ttt, mut r2t_sn, mut offset, mut desired) = (0x100 + w.r2t_sn, w.r2t_sn, w.next_offset, len);
+            match self.fault.take() {
+                Some(Fault::R2tZeroLength) => desired = 0,
+                Some(Fault::R2tReservedTtt) => ttt = RESERVED_TAG,
+                Some(Fault::R2tSkipSn) => r2t_sn += 1,
+                Some(Fault::R2tPastEnd) => desired = w.buf.len() - offset + BLOCK,
+                Some(Fault::R2tGap) => (offset, desired) = (offset + BLOCK, len - BLOCK),
+                f => self.fault = f,
+            }
             let (exp, max) = Self::window(c);
             let stat_sn = c.stat_sn;
             Self::send(
@@ -675,13 +770,13 @@ impl Target {
                 Message::R2t(R2t {
                     lun: w.lun,
                     itt: w.itt,
-                    ttt: 0x100 + w.r2t_sn,
+                    ttt,
                     stat_sn,
                     exp_cmd_sn: exp,
                     max_cmd_sn: max,
-                    r2t_sn: w.r2t_sn,
-                    offset: w.next_offset as u32,
-                    desired_len: len as u32,
+                    r2t_sn,
+                    offset: offset as u32,
+                    desired_len: desired as u32,
                 }),
             );
             self.stats.r2ts += 1;
@@ -695,14 +790,54 @@ impl Target {
         let expected = cmd.expected_len as usize;
         d.truncate(expected);
         let residual = (expected - d.len()) as u32;
-        let seg = self.cfg.data_in_segment.min(c.initiator_mrdsl);
+        let fault = match self.fault {
+            Some(f @ (Fault::DataInLastOnly | Fault::DataInSkipSn | Fault::DataInShort))
+                if cmd.cdb[0] == op::READ_10 =>
+            {
+                self.fault = None;
+                Some(f)
+            }
+            _ => None,
+        };
+        if fault == Some(Fault::DataInShort) {
+            d.truncate(d.len() - BLOCK);
+        }
+        let seg = if self.cfg.ignore_mrdsl {
+            self.cfg.data_in_segment
+        } else {
+            self.cfg.data_in_segment.min(c.initiator_mrdsl)
+        };
         let count = d.len().div_ceil(seg).max(1);
+        if fault == Some(Fault::DataInLastOnly) {
+            // Just the last block, claiming the command is done.
+            let (exp, max) = Self::window(c);
+            let stat_sn = Self::stat_sn(c);
+            let at = d.len() - BLOCK;
+            Self::send(
+                c,
+                Message::DataIn(DataIn {
+                    final_pdu: true,
+                    status: Some(0),
+                    lun: cmd.lun,
+                    itt: cmd.itt,
+                    ttt: RESERVED_TAG,
+                    stat_sn,
+                    exp_cmd_sn: exp,
+                    max_cmd_sn: max,
+                    offset: at as u32,
+                    data: d[at..].to_vec(),
+                    ..DataIn::default()
+                }),
+            );
+            return;
+        }
         for i in 0..count {
             let chunk = &d[(i * seg).min(d.len())..((i + 1) * seg).min(d.len())];
             let last = i + 1 == count;
             let with_status = last && self.cfg.status_in_data_in;
             let (exp, max) = Self::window(c);
             let stat_sn = if with_status { Self::stat_sn(c) } else { 0 };
+            let before = c.out.len();
             Self::send(
                 c,
                 Message::DataIn(DataIn {
@@ -717,12 +852,17 @@ impl Target {
                     stat_sn,
                     exp_cmd_sn: exp,
                     max_cmd_sn: max,
-                    data_sn: i as u32,
+                    data_sn: if fault == Some(Fault::DataInSkipSn) && i > 0 { i as u32 + 1 } else { i as u32 },
                     offset: (i * seg) as u32,
                     residual: if with_status { residual } else { 0 },
                     data: chunk.to_vec(),
                 }),
             );
+            if self.cfg.trickle > 0 {
+                // Hold it back, to go out at the trickle's pace.
+                let pdu = c.out.split_off(before);
+                c.paced.push_back(pdu);
+            }
             self.stats.data_in += 1;
         }
         if !self.cfg.status_in_data_in {
@@ -731,6 +871,9 @@ impl Target {
     }
 
     fn respond(&mut self, c: &mut Conn, itt: u32, status: u8, sense: Option<Sense>, residual: u32) {
+        if core::mem::take(&mut self.skip_stat_sn) {
+            c.stat_sn += 1;
+        }
         let data = match sense {
             Some(s) => {
                 let mut d = vec![0, 18];
@@ -758,6 +901,14 @@ impl Target {
             }),
         );
     }
+}
+
+/// `len` bytes of text: one private key with a long value.
+fn filler(len: usize) -> Vec<u8> {
+    let mut v = b"X-org.osmium.Pad=".to_vec();
+    v.resize(len - 1, b'a');
+    v.push(0);
+    v
 }
 
 /// Pipes TCP connections on port 3260 to and from a target process.

@@ -18,16 +18,18 @@ const READY_TRIES: usize = 10;
 /// capacity change reported once to each initiator).
 const ATTENTION_TRIES: usize = 3;
 
-/// The largest block size accepted.
+/// The block sizes accepted: powers of two in this range.
+const MIN_BLOCK_SIZE: u32 = 512;
 const MAX_BLOCK_SIZE: u32 = 64 * 1024;
 
 /// A disk on an iSCSI target: one session to one logical unit, driving its
 /// TCP connection through a [`Net`].
 ///
 /// Every operation blocks, pumping the network until the target answers or
-/// [`Options::timeout`] passes without progress. Reads and writes are split
-/// into commands of at most `MaxBurstLength` bytes. Dropping the disk logs
-/// out and closes the connection, which also pumps the network.
+/// a command has taken [`Options::timeout`]. Reads and writes are split into
+/// commands of at most `MaxBurstLength` bytes; one the target moves only
+/// part of (an underflow) fails. Dropping the disk logs out and closes the
+/// connection, which also pumps the network.
 pub struct IscsiDisk<N: Net> {
     session: Session<N>,
     inquiry: Inquiry,
@@ -66,7 +68,8 @@ impl<N: Net> IscsiDisk<N> {
             let n = session.command(&scsi::read_capacity_16(), Data::In(&mut d))?;
             capacity = Capacity::parse_16(&d[..n]).ok_or(IscsiError::Protocol("short READ CAPACITY data"))?;
         }
-        if capacity.block_size == 0 || capacity.block_size > MAX_BLOCK_SIZE || capacity.last_lba == u64::MAX {
+        let bs = capacity.block_size;
+        if !bs.is_power_of_two() || !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&bs) || capacity.last_lba == u64::MAX {
             return Err(IscsiError::Protocol("unusable capacity"));
         }
         Ok(Self { session, inquiry, capacity })
@@ -159,7 +162,9 @@ impl<N: Net> BlockDevice for IscsiDisk<N> {
         let (bs, step) = (self.block_size(), self.chunk_blocks());
         for (i, chunk) in buf.chunks(step * bs).enumerate() {
             let cdb = scsi::write(lba + (i * step) as u64, (chunk.len() / bs) as u32);
-            self.retried(&cdb, Data::Out(chunk))?;
+            if self.retried(&cdb, Data::Out(chunk))? != chunk.len() {
+                return Err(BlockError::Io); // the target took less
+            }
         }
         Ok(())
     }

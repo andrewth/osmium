@@ -24,8 +24,16 @@ use crate::pdu::{
 use crate::scsi::{Cdb, Sense, status};
 use crate::{IscsiError, text};
 
-/// Login rounds before giving up on a target that never finishes.
-const MAX_LOGIN_ROUNDS: usize = 8;
+/// Login Request/Response exchanges, continuations included, before giving
+/// up on a target that never finishes.
+const MAX_LOGIN_EXCHANGES: usize = 32;
+
+/// Text Request/Response exchanges for one SendTargets.
+const MAX_TEXT_EXCHANGES: usize = 32;
+
+/// The most text accepted in one login stage or one SendTargets reply,
+/// however many PDUs it is split across.
+const MAX_TEXT: usize = 64 * 1024;
 
 /// How long closing the TCP connection may take when a session ends.
 const CLOSE_TIME: Duration = Duration::from_secs(1);
@@ -47,7 +55,9 @@ pub struct Options {
     /// The initiator session ID. Concurrent sessions from one initiator to
     /// one target need distinct values.
     pub isid: [u8; 6],
-    /// How long to wait for the target at each step.
+    /// How long each step may take: connecting, the whole login, one
+    /// command (from issue to status, however the target paces its data),
+    /// one SendTargets, one logout.
     pub timeout: Duration,
     /// The operational parameters to ask for.
     pub offer: Offer,
@@ -85,6 +95,14 @@ pub enum Data<'a> {
     Out(&'a [u8]),
 }
 
+/// The U and O flags and residual count of a command's status.
+#[derive(Clone, Copy)]
+struct Residual {
+    underflow: bool,
+    overflow: bool,
+    count: u32,
+}
+
 /// A TCP connection carrying PDUs. Dropping it closes the connection and
 /// removes its socket.
 struct Conn<N: Net> {
@@ -98,8 +116,7 @@ impl<N: Net> Conn<N> {
     /// Connects to `target` and waits until the connection is established.
     fn open(mut net: N, target: SocketAddrV4, opts: &Options) -> Result<Self, IscsiError> {
         let socket = net.with_sockets(|s| s.add(TcpSocket::new(opts.rx_buffer, opts.tx_buffer)));
-        let max_data = (opts.offer.max_recv_data_segment_length as usize).max(LOGIN_DSL);
-        let mut c = Self { net, socket, reader: PduReader::new(max_data), timeout: opts.timeout };
+        let mut c = Self { net, socket, reader: PduReader::new(LOGIN_DSL), timeout: opts.timeout };
         c.tcp(|t| t.connect(target, 0))?;
         let deadline = c.deadline();
         loop {
@@ -128,10 +145,10 @@ impl<N: Net> Conn<N> {
         if self.net.poll() >= deadline { Err(IscsiError::TimedOut) } else { Ok(()) }
     }
 
-    /// Queues `m` on the connection, waiting for room in the send buffer.
-    fn send(&mut self, m: Message) -> Result<(), IscsiError> {
+    /// Queues `m` on the connection, waiting until `deadline` for room in
+    /// the send buffer.
+    fn send(&mut self, m: Message, deadline: Instant) -> Result<(), IscsiError> {
         let bytes = m.encode().to_bytes();
-        let deadline = self.deadline();
         let mut sent = 0;
         while sent < bytes.len() {
             match self.tcp(|t| t.send(&bytes[sent..])) {
@@ -186,6 +203,8 @@ pub(crate) struct Session<N: Net> {
     /// The CmdSN of the next non-immediate command.
     cmd_sn: u32,
     exp_stat_sn: u32,
+    /// The first Login Response has set `exp_stat_sn`.
+    stat_sn_known: bool,
     /// The highest CmdSN the target accepts now.
     max_cmd_sn: u32,
     itt: u32,
@@ -205,11 +224,14 @@ impl<N: Net> Session<N> {
             lun: lun_field(opts.lun),
             cmd_sn: 1,
             exp_stat_sn: 0,
+            stat_sn_known: false,
             max_cmd_sn: 1,
             itt: 0,
             open: false,
         };
         s.negotiate(opts, discovery)?;
+        // From now on the target's segments are bounded by what we declared.
+        s.conn.reader.set_max_data(s.params.max_recv_data_segment_length as usize);
         s.open = true;
         Ok(s)
     }
@@ -246,7 +268,8 @@ impl<N: Net> Session<N> {
         let mut keys = neg.security_keys(&opts.initiator_name, target_name);
         let mut current = stage::SECURITY;
         let mut operational_sent = false;
-        for _ in 0..MAX_LOGIN_ROUNDS {
+        let mut exchanges = 0;
+        loop {
             let next = if current == stage::SECURITY { stage::OPERATIONAL } else { stage::FULL_FEATURE };
             let mut req = LoginRequest {
                 transit: true,
@@ -263,9 +286,15 @@ impl<N: Net> Session<N> {
             };
             let mut text = Vec::new();
             let resp = loop {
-                self.conn.send(Message::LoginRequest(req.clone()))?;
+                // Continuations count too: a target that always has more
+                // text must not keep us here.
+                exchanges += 1;
+                if exchanges > MAX_LOGIN_EXCHANGES {
+                    return Err(IscsiError::Protocol("login did not finish"));
+                }
+                self.conn.send(Message::LoginRequest(req.clone()), deadline)?;
                 let msg = self.conn.recv(deadline)?;
-                self.absorb(&msg);
+                self.absorb(&msg)?;
                 let Message::LoginResponse(r) = msg else {
                     return Err(IscsiError::Protocol("expected a Login Response"));
                 };
@@ -274,6 +303,9 @@ impl<N: Net> Session<N> {
                 }
                 if r.itt != itt || r.csg != current {
                     return Err(IscsiError::Protocol("Login Response out of step"));
+                }
+                if text.len() + r.data.len() > MAX_TEXT {
+                    return Err(IscsiError::Protocol("login text too long"));
                 }
                 text.extend_from_slice(&r.data);
                 if !r.cont {
@@ -290,6 +322,13 @@ impl<N: Net> Session<N> {
             };
             keys = neg.respond(&text)?;
             if resp.transit {
+                // The target moves on only when we asked to, and to no
+                // later stage than we asked for (RFC 7143 §6.3): never
+                // from SecurityNegotiation straight to the full feature
+                // phase, skipping operational negotiation.
+                if !req.transit || resp.nsg != next {
+                    return Err(IscsiError::Protocol("Login Response with a bad next stage"));
+                }
                 match resp.nsg {
                     stage::FULL_FEATURE => {
                         self.tsih = resp.tsih;
@@ -305,12 +344,20 @@ impl<N: Net> Session<N> {
                 operational_sent = true;
             }
         }
-        Err(IscsiError::Protocol("login did not finish"))
     }
 
     /// Tracks StatSN and the command window from a target PDU.
-    fn absorb(&mut self, m: &Message) {
+    fn absorb(&mut self, m: &Message) -> Result<(), IscsiError> {
+        // Each PDU that advances StatSN must carry the one we expect: on
+        // one in-order connection at error recovery level 0 a gap or a
+        // repeat means we are out of step. The first Login Response sets
+        // the starting value. R2T, Data-In without status and NOP-In
+        // without an ITT carry the next StatSN without advancing it.
         if let Some(sn) = m.stat_sn() {
+            if self.stat_sn_known && sn != self.exp_stat_sn {
+                return Err(IscsiError::Protocol("StatSN out of sequence"));
+            }
+            self.stat_sn_known = true;
             self.exp_stat_sn = sn.wrapping_add(1);
         }
         // A window with MaxCmdSN = ExpCmdSN - 1 is closed; anything smaller
@@ -321,25 +368,29 @@ impl<N: Net> Session<N> {
         {
             self.max_cmd_sn = max;
         }
+        Ok(())
     }
 
     /// Reads one PDU and deals with what needs no caller: answers target
     /// pings, skips asynchronous events. Returns the rest.
     fn recv_one(&mut self, deadline: Instant) -> Result<Option<Message>, IscsiError> {
         let m = self.conn.recv(deadline)?;
-        self.absorb(&m);
+        self.absorb(&m)?;
         match m {
             Message::NopIn(n) => {
                 if n.ttt != RESERVED_TAG {
-                    self.conn.send(Message::NopOut(NopOut {
-                        immediate: true,
-                        lun: n.lun,
-                        itt: RESERVED_TAG,
-                        ttt: n.ttt,
-                        cmd_sn: self.cmd_sn,
-                        exp_stat_sn: self.exp_stat_sn,
-                        data: n.data,
-                    }))?;
+                    self.conn.send(
+                        Message::NopOut(NopOut {
+                            immediate: true,
+                            lun: n.lun,
+                            itt: RESERVED_TAG,
+                            ttt: n.ttt,
+                            cmd_sn: self.cmd_sn,
+                            exp_stat_sn: self.exp_stat_sn,
+                            data: n.data,
+                        }),
+                        deadline,
+                    )?;
                 }
                 Ok(None)
             }
@@ -386,14 +437,17 @@ impl<N: Net> Session<N> {
         r
     }
 
-    /// Runs one SCSI command and returns the bytes of data the target sent
-    /// for [`Data::In`], or the length of [`Data::Out`].
+    /// Runs one SCSI command and returns the bytes of data it moved: what
+    /// the target sent for [`Data::In`], or for [`Data::Out`] the length
+    /// less any residual the target reported. Either may be short.
     pub(crate) fn command(&mut self, cdb: &Cdb, data: Data<'_>) -> Result<usize, IscsiError> {
         self.guarded(|s| s.run_command(cdb, data))
     }
 
     fn run_command(&mut self, cdb: &Cdb, mut data: Data<'_>) -> Result<usize, IscsiError> {
-        let mut deadline = self.conn.deadline();
+        // One deadline for the whole command: a target trickling data or
+        // R2Ts cannot keep it alive past the timeout.
+        let deadline = self.conn.deadline();
         self.wait_window(deadline)?;
         let itt = self.next_itt();
         let p = &self.params;
@@ -402,6 +456,7 @@ impl<N: Net> Session<N> {
             Data::In(b) => (true, false, b.len()),
             Data::Out(b) => (false, true, b.len()),
         };
+        let max_burst = p.max_burst_length as usize;
         // Unsolicited data, up to FirstBurstLength: immediate data in the
         // command PDU if allowed, then Data-Out PDUs unless InitialR2T.
         let (immediate, unsolicited) = match &data {
@@ -416,94 +471,145 @@ impl<N: Net> Session<N> {
             Data::Out(b) => b[..immediate].to_vec(),
             _ => Vec::new(),
         };
-        self.conn.send(Message::ScsiCommand(ScsiCommand {
-            final_pdu: unsolicited == immediate,
-            read,
-            write,
-            attr: 1, // SIMPLE
-            lun: self.lun,
-            itt,
-            expected_len: expected as u32,
-            cmd_sn: self.cmd_sn,
-            exp_stat_sn: self.exp_stat_sn,
-            cdb: *cdb,
-            data: immediate_data,
-        }))?;
+        self.conn.send(
+            Message::ScsiCommand(ScsiCommand {
+                final_pdu: unsolicited == immediate,
+                read,
+                write,
+                attr: 1, // SIMPLE
+                lun: self.lun,
+                itt,
+                expected_len: expected as u32,
+                cmd_sn: self.cmd_sn,
+                exp_stat_sn: self.exp_stat_sn,
+                cdb: *cdb,
+                data: immediate_data,
+            }),
+            deadline,
+        )?;
         self.cmd_sn = self.cmd_sn.wrapping_add(1);
         if let Data::Out(b) = &data
             && unsolicited > immediate
         {
-            self.data_out(itt, RESERVED_TAG, &b[immediate..unsolicited], immediate)?;
+            self.data_out(itt, RESERVED_TAG, &b[immediate..unsolicited], immediate, deadline)?;
         }
 
-        // The furthest byte of Data-In received.
+        // DataPDUInOrder and DataSequenceInOrder are Yes, with one R2T at a
+        // time: Data-In arrives in order with consecutive DataSNs, and
+        // each R2T asks for the data after what we have sent.
         let mut received = 0;
+        let mut data_sn = 0u32;
+        let mut sent = unsolicited;
+        let mut r2t_sn = 0u32;
         loop {
-            let m = self.next(deadline)?;
-            deadline = self.conn.deadline();
-            match m {
+            match self.next(deadline)? {
                 Message::DataIn(d) if d.itt == itt => {
                     let Data::In(buf) = &mut data else {
                         return Err(IscsiError::Protocol("Data-In for a command without input"));
                     };
-                    let start = d.offset as usize;
-                    let end = start + d.data.len();
-                    let dst = buf.get_mut(start..end).ok_or(IscsiError::Protocol("Data-In beyond the buffer"))?;
+                    if d.data_sn != data_sn || d.offset as usize != received {
+                        return Err(IscsiError::Protocol("Data-In out of order"));
+                    }
+                    let end = received + d.data.len();
+                    let dst = buf.get_mut(received..end).ok_or(IscsiError::Protocol("Data-In beyond the buffer"))?;
                     dst.copy_from_slice(&d.data);
-                    received = received.max(end);
+                    received = end;
+                    data_sn = data_sn.wrapping_add(1);
                     if let Some(st) = d.status {
-                        return Self::status(0, st, &[], received);
+                        let residual = Residual { underflow: d.underflow, overflow: d.overflow, count: d.residual };
+                        return Self::status(0, st, &[], residual, expected, read, received);
                     }
                 }
                 Message::R2t(r) if r.itt == itt => {
                     let Data::Out(b) = &data else {
                         return Err(IscsiError::Protocol("R2T for a command without output"));
                     };
-                    let start = r.offset as usize;
-                    let end = start.saturating_add(r.desired_len as usize);
-                    let chunk = b.get(start..end).ok_or(IscsiError::Protocol("R2T beyond the buffer"))?;
-                    if chunk.len() > self.params.max_burst_length as usize {
-                        return Err(IscsiError::Protocol("R2T longer than MaxBurstLength"));
+                    if r.ttt == RESERVED_TAG || r.r2t_sn != r2t_sn || r.offset as usize != sent {
+                        return Err(IscsiError::Protocol("R2T out of step"));
                     }
-                    self.data_out(itt, r.ttt, chunk, start)?;
+                    let len = r.desired_len as usize;
+                    if len == 0 || len > max_burst {
+                        return Err(IscsiError::Protocol("R2T length outside 1..=MaxBurstLength"));
+                    }
+                    let chunk = b.get(sent..sent + len).ok_or(IscsiError::Protocol("R2T beyond the buffer"))?;
+                    self.data_out(itt, r.ttt, chunk, sent, deadline)?;
+                    sent += len;
+                    r2t_sn = r2t_sn.wrapping_add(1);
                 }
                 Message::ScsiResponse(r) if r.itt == itt => {
-                    let moved = if read { received } else { expected };
-                    return Self::status(r.response, r.status, &r.data, moved);
+                    let residual = Residual { underflow: r.underflow, overflow: r.overflow, count: r.residual };
+                    let moved = if read { received } else { sent };
+                    return Self::status(r.response, r.status, &r.data, residual, expected, read, moved);
                 }
                 _ => return Err(IscsiError::Protocol("unexpected PDU during a command")),
             }
         }
     }
 
-    /// The outcome of a command from its response code and status.
-    fn status(response: u8, st: u8, sense: &[u8], moved: usize) -> Result<usize, IscsiError> {
+    /// The outcome of a command from its response code, status and
+    /// residual. `moved` is the data that crossed the wire: for a read the
+    /// residual must account for exactly the bytes not received, and a
+    /// write cannot have used data we never sent. Returns the bytes the
+    /// target transferred, which is less than `expected` on an underflow.
+    fn status(
+        response: u8,
+        st: u8,
+        sense: &[u8],
+        residual: Residual,
+        expected: usize,
+        read: bool,
+        moved: usize,
+    ) -> Result<usize, IscsiError> {
         match (response, st) {
-            (0, status::GOOD | status::CONDITION_MET) => Ok(moved),
-            (0, status) => Err(IscsiError::Scsi {
-                status,
-                sense: if status == status::CHECK_CONDITION { Sense::from_response(sense) } else { None },
-            }),
-            (r, _) => Err(IscsiError::Response(r)),
+            (0, status::GOOD | status::CONDITION_MET) => {}
+            (0, status) => {
+                return Err(IscsiError::Scsi {
+                    status,
+                    sense: if status == status::CHECK_CONDITION { Sense::from_response(sense) } else { None },
+                });
+            }
+            (r, _) => return Err(IscsiError::Response(r)),
         }
+        let transferred = match (residual.underflow, residual.overflow) {
+            (true, true) => return Err(IscsiError::Protocol("both underflow and overflow")),
+            (true, false) => expected
+                .checked_sub(residual.count as usize)
+                .ok_or(IscsiError::Protocol("residual beyond the expected length"))?,
+            // An overflow leaves the whole expected length transferred.
+            _ => expected,
+        };
+        if (read && transferred != moved) || (!read && transferred > moved) {
+            return Err(IscsiError::Protocol("residual does not match the data moved"));
+        }
+        Ok(transferred)
     }
 
     /// Sends one data sequence, `data` at buffer offset `offset`, in
     /// Data-Out PDUs no larger than the target accepts.
-    fn data_out(&mut self, itt: u32, ttt: u32, data: &[u8], offset: usize) -> Result<(), IscsiError> {
+    fn data_out(
+        &mut self,
+        itt: u32,
+        ttt: u32,
+        data: &[u8],
+        offset: usize,
+        deadline: Instant,
+    ) -> Result<(), IscsiError> {
         let seg = (self.params.max_xmit_data_segment_length as usize).max(1);
         let count = data.len().div_ceil(seg);
         for (i, chunk) in data.chunks(seg).enumerate() {
-            self.conn.send(Message::DataOut(DataOut {
-                final_pdu: i + 1 == count,
-                lun: self.lun,
-                itt,
-                ttt,
-                exp_stat_sn: self.exp_stat_sn,
-                data_sn: i as u32,
-                offset: (offset + i * seg) as u32,
-                data: chunk.to_vec(),
-            }))?;
+            self.conn.send(
+                Message::DataOut(DataOut {
+                    final_pdu: i + 1 == count,
+                    lun: self.lun,
+                    itt,
+                    ttt,
+                    exp_stat_sn: self.exp_stat_sn,
+                    data_sn: i as u32,
+                    offset: (offset + i * seg) as u32,
+                    data: chunk.to_vec(),
+                }),
+                deadline,
+            )?;
         }
         Ok(())
     }
@@ -517,25 +623,31 @@ impl<N: Net> Session<N> {
             let mut keys = Vec::new();
             text::push(&mut keys, "SendTargets", "All");
             let mut out = Vec::new();
-            loop {
+            for _ in 0..MAX_TEXT_EXCHANGES {
                 s.wait_window(deadline)?;
-                s.conn.send(Message::TextRequest(TextRequest {
-                    immediate: false,
-                    final_pdu: true,
-                    cont: false,
-                    lun: [0; 8],
-                    itt,
-                    ttt,
-                    cmd_sn: s.cmd_sn,
-                    exp_stat_sn: s.exp_stat_sn,
-                    data: core::mem::take(&mut keys),
-                }))?;
+                s.conn.send(
+                    Message::TextRequest(TextRequest {
+                        immediate: false,
+                        final_pdu: true,
+                        cont: false,
+                        lun: [0; 8],
+                        itt,
+                        ttt,
+                        cmd_sn: s.cmd_sn,
+                        exp_stat_sn: s.exp_stat_sn,
+                        data: core::mem::take(&mut keys),
+                    }),
+                    deadline,
+                )?;
                 s.cmd_sn = s.cmd_sn.wrapping_add(1);
                 let Message::TextResponse(r) = s.next(deadline)? else {
                     return Err(IscsiError::Protocol("expected a Text Response"));
                 };
                 if r.itt != itt {
                     return Err(IscsiError::Protocol("Text Response for another task"));
+                }
+                if out.len() + r.data.len() > MAX_TEXT {
+                    return Err(IscsiError::Protocol("SendTargets text too long"));
                 }
                 out.extend_from_slice(&r.data);
                 if r.final_pdu && !r.cont {
@@ -544,6 +656,7 @@ impl<N: Net> Session<N> {
                 // More to come: an empty request with the target's tag.
                 ttt = r.ttt;
             }
+            Err(IscsiError::Protocol("SendTargets did not finish"))
         })
     }
 
@@ -553,13 +666,16 @@ impl<N: Net> Session<N> {
         let r = self.guarded(|s| {
             let deadline = s.conn.deadline();
             let itt = s.next_itt();
-            s.conn.send(Message::LogoutRequest(LogoutRequest {
-                reason: 0, // close the session
-                itt,
-                cid: 0,
-                cmd_sn: s.cmd_sn,
-                exp_stat_sn: s.exp_stat_sn,
-            }))?;
+            s.conn.send(
+                Message::LogoutRequest(LogoutRequest {
+                    reason: 0, // close the session
+                    itt,
+                    cid: 0,
+                    cmd_sn: s.cmd_sn,
+                    exp_stat_sn: s.exp_stat_sn,
+                }),
+                deadline,
+            )?;
             loop {
                 match s.next(deadline)? {
                     Message::LogoutResponse(r) if r.itt == itt => {
