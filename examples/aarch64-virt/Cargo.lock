@@ -25,6 +25,7 @@ dependencies = [
  "osmium-boot",
  "osmium-drivers",
  "osmium-exec",
+ "osmium-fs",
  "osmium-hal",
  "osmium-mm",
  "osmium-sched",
@@ -58,6 +59,14 @@ name = "osmium-exec"
 version = "0.1.0"
 dependencies = [
  "osmium-arch",
+ "osmium-sync",
+]
+
+[[package]]
+name = "osmium-fs"
+version = "0.1.0"
+dependencies = [
+ "osmium-hal",
  "osmium-sync",
 ]
 
