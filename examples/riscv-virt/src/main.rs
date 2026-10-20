@@ -153,6 +153,8 @@ impl Console for SbiConsole {
 
 type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
 
+static XHCI: Once<osmium::sync::SpinLock<Xhci<'static, Frames>>> = Once::new();
+
 // SAFETY: the kernel runs identity-mapped (before and after enabling
 // paging), so physical address = virtual address for all RAM.
 pub(crate) static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
@@ -446,7 +448,9 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             let mut hc = Xhci::new(io, &FRAMES).expect("xHCI init failed");
             hc.no_op().expect("xHCI command ring");
             println!("[usb]   xHCI at {:02x}:{:02x}.{} BAR0 {base:#x}, {} ports", addr.bus, addr.device, addr.function, hc.num_ports());
-            demos::usb(&mut hc);
+            // In a static, so drivers built on it (and a file system on the
+            // USB stick) can live as long as the kernel.
+            demos::usb(XHCI.call_once(|| osmium::sync::SpinLock::new(hc)));
         }
         None => println!("[usb]   no xHCI controller"),
     }

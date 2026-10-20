@@ -175,16 +175,18 @@ pub fn arp(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     println!("[net]   no ARP reply");
 }
 
-/// Enumerates every device on `host`'s root ports, then drives what it
+/// Enumerates every device on `shared`'s root ports, then drives what it
 /// recognises: a mass-storage device gets a block written and read back
 /// while a keyboard's interrupt transfer is outstanding, which checks that
-/// the two drivers can share the controller.
-pub fn usb<H: osmium::hal::usb::UsbHost>(host: &mut H) {
+/// the two drivers can share the controller, and is then mounted as FAT32
+/// (see [`fat`]).
+pub fn usb<H: osmium::hal::usb::UsbHost + Send + 'static>(shared: &'static osmium::sync::SpinLock<H>) {
     use osmium::drivers::usb::hid::BootKeyboard;
     use osmium::drivers::usb::storage::UsbStorage;
     use osmium::hal::block::BlockDevice;
-    use osmium::hal::usb::{Descriptor, Descriptors, enumerate};
+    use osmium::hal::usb::{Descriptor, Descriptors, UsbHost, enumerate};
 
+    let mut host = shared;
     let mut found = Vec::new();
     for port in 1..=host.num_ports() {
         let status = host.port_status(port);
@@ -192,7 +194,7 @@ pub fn usb<H: osmium::hal::usb::UsbHost>(host: &mut H) {
             continue;
         }
         let mut config = alloc::vec![0u8; 512];
-        let dev = match enumerate(host, port, &mut config) {
+        let dev = match enumerate(&mut host, port, &mut config) {
             Ok(dev) => dev,
             Err(e) => {
                 println!("[usb]   port {port}: enumeration failed: {e}");
@@ -218,11 +220,10 @@ pub fn usb<H: osmium::hal::usb::UsbHost>(host: &mut H) {
         found.push((dev.id, config));
     }
 
-    // Both drivers hold the controller through one lock.
-    let shared = osmium::sync::SpinLock::<_>::new(host);
+    // Both drivers hold the controller through its lock.
     let mut keyboard = None;
     for (id, config) in &found {
-        if let Ok(mut kb) = BootKeyboard::new(&shared, *id, config) {
+        if let Ok(mut kb) = BootKeyboard::new(shared, *id, config) {
             // Starts the interrupt transfer that stays outstanding below.
             match kb.poll() {
                 Ok(_) => println!("[usb]     boot keyboard ready"),
@@ -232,7 +233,7 @@ pub fn usb<H: osmium::hal::usb::UsbHost>(host: &mut H) {
         }
     }
     for (id, config) in &found {
-        let Ok(mut disk) = UsbStorage::new(&shared, *id, config) else { continue };
+        let Ok(mut disk) = UsbStorage::new(shared, *id, config) else { continue };
         if let Ok(inq) = disk.inquiry() {
             println!("[usb]     mass storage: INQUIRY \"{}\" \"{}\"", inq.vendor(), inq.product());
         }
@@ -247,6 +248,7 @@ pub fn usb<H: osmium::hal::usb::UsbHost>(host: &mut H) {
             Ok(()) => println!("[usb]     disk: block {lba} read back wrong"),
             Err(e) => println!("[usb]     disk: I/O failed: {e:?}"),
         }
+        fat(disk);
     }
     if let Some(kb) = &mut keyboard {
         match kb.poll() {
@@ -254,5 +256,41 @@ pub fn usb<H: osmium::hal::usb::UsbHost>(host: &mut H) {
             Ok(Some(ev)) => println!("[usb]     key event {ev:?}"),
             Err(e) => println!("[usb]     keyboard poll failed: {e}"),
         }
+    }
+}
+
+/// Mounts `disk` as FAT32, then creates `/osmium/Hello from osmium.txt`
+/// (a long name), writes it, reads it back and syncs, leaving the file for
+/// the host to check with `fsck.fat`.
+pub fn fat<D: osmium::hal::block::BlockDevice + Send + 'static>(disk: D) {
+    use osmium::fs::{Errno, OpenFlags, Vfs};
+    use osmium::fs_fat::FatFs;
+
+    let fs = match FatFs::mount(disk, 1) {
+        Ok(fs) => fs,
+        Err(e) => return println!("[fat]   not mounted: {e}"),
+    };
+    let free = fs.free_bytes().map_or(0, |b| b >> 20);
+    let vfs = Vfs::new(fs.root());
+    println!("[fat]   mounted FAT32, {free} MiB free");
+    let result = (|| {
+        match vfs.mkdir("/osmium", 0o755) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(e) => return Err(e),
+        }
+        let path = "/osmium/Hello from osmium.txt";
+        let text = b"Written by osmium over xHCI, USB mass storage and FAT32.\n";
+        let flags = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNC;
+        let f = vfs.open(path, flags, 0o644)?;
+        f.write(0, text)?;
+        let mut back = [0u8; 64];
+        let n = f.read(0, &mut back)?;
+        f.sync()?;
+        Ok((path, n == text.len() && back[..n] == text[..]))
+    })();
+    match result {
+        Ok((path, true)) => println!("[fat]   wrote and read back \"{path}\""),
+        Ok((path, false)) => println!("[fat]   {path} read back wrong"),
+        Err(e) => println!("[fat]   failed: {e}"),
     }
 }
