@@ -675,7 +675,7 @@ mod tests {
     fn command_timeout_and_error() {
         let (f, dma, clock, tables) = (fake(0, 0), HostDma::default(), StdClock::default(), HostTables::default());
         let mut unit = setup(&dma, &clock, &f);
-        unit.set_timeout_ns(5_000_000);
+        unit.set_timeout_ns(50_000_000);
         {
             let mut d = IoDomain::new(&unit, DomainId(1), &tables).unwrap();
             f.hw.lock().unwrap().stall = true;

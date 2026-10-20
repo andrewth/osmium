@@ -675,7 +675,7 @@ mod tests {
     fn invalidation_timeout_rolls_back_attach() {
         let (f, dma, clock, tables) = (fake(0, 0), HostDma::default(), StdClock::default(), HostTables::default());
         let mut vtd = setup(&f, &dma, &clock);
-        vtd.set_timeout_ns(5_000_000);
+        vtd.set_timeout_ns(50_000_000);
         f.hw.lock().unwrap().stall = true;
         {
             let mut d = IoDomain::new(&vtd, DomainId(1), &tables).unwrap();

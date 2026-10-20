@@ -127,8 +127,9 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Frame allocators: a bitmap allocator, and a buddy allocator (orders 0–N, intrusive free lists, coalescing)
 - ✅ Generic multi-level page table `PageTable<F, A>` with map, unmap, translate, protect, huge-page `split` and `unmap_4k`, huge pages (2 MiB / 1 GiB), and freeing of intermediate tables
 - ✅ PTE formats: x86_64 4-level, AArch64 stage 1 (4 KiB granule), RISC-V Sv39/Sv48, Intel EPT, AArch64 stage 2, AArch64 EL2 stage 1 (`Aarch64El2`), RISC-V G-stage Sv39x4/Sv48x4 (multi-page roots via `PageTableFormat::ROOT_PAGES` and `TableAlloc::alloc_root`)
+- ✅ IOMMU page-table formats: Intel VT-d second level (`VtdSecondLevel`), AMD-Vi I/O tables (`AmdVi`, 4 KiB pages; its entries record the child level, hence the level-aware `PageTableFormat::table_at` hook) and RISC-V IOMMU first stage (`Sv39Io`: Sv39 with `U` in every entry, which QEMU's model requires); Arm SMMUv3 stage 2 and RISC-V G-stage reuse `Aarch64Stage2` and `Sv39x4`
 - ✅ Heap: a size-class slab front-end plus a large-allocation path over any `PageSource`; `LockedHeap` implements `GlobalAlloc`; works from a static arena (firmware) or the frame allocator (kernels)
-- 🗺 Virtual memory areas (VMA tree), demand paging, copy-on-write, typed frame metadata (as in OSTD's `Frame<M>`), 5-level paging, IOMMU tables
+- 🗺 Virtual memory areas (VMA tree), demand paging, copy-on-write, typed frame metadata (as in OSTD's `Frame<M>`), 5-level paging
 
 ### `osmium-hal`: hardware abstraction
 - ✅ MMIO: `ReadOnly`/`WriteOnly`/`ReadWrite<T>` register cells for `#[repr(C)]` register blocks, and a bounds-checked `IoMem` window (safe after an `unsafe` constructor)
@@ -137,6 +138,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ IRQ dispatch table: register handlers by number, dispatch from the trap path
 - ✅ Global console with `print!`/`println!` that can be swapped at runtime
 - ✅ DMA buffer descriptor (`DmaBuffer` with CPU and device addresses), self-freeing `OwnedDma`, and a `DmaAllocator` over any `LockedFrames`
+- ✅ IOMMU model (`hal::iommu`): the `Iommu` trait (attach a device to a domain's page table, detach, invalidate a domain, `take_fault`), `IoDomain` (a table plus the devices attached to it; detaches before freeing, and leaks the table if a device will not detach), a page-granular `IovaAllocator`, and `IommuDma`, a `DmaAllocator` whose buffers a device reaches only at an I/O virtual address; host-tested with a fake unit
 - ✅ `NetDevice` trait and `MacAddress`
 - ✅ PCI: `ConfigAccess` over ECAM or x86 port I/O, brute-force enumeration, BAR probing and assignment (`BarAllocator`), capability lists
 - ✅ PCI MSI and MSI-X: an architecture-neutral `MsiMessage`, MSI programming (32/64-bit, multiple vectors, per-vector masks), MSI-X tables and pending bits in a BAR window, entry and function masks, all bounds-checked against the device; x86 messages from `lapic::msi_message`
@@ -166,6 +168,11 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Mellanox ConnectX-2/-3 (mlx4) Ethernet: reset, firmware start, ICM, raw Ethernet queue pair per port as a `NetDevice`, polled or interrupt-driven (`enable_msix`: async and completion event queues on two MSI-X vectors, `handle_interrupt`), IPv4/TCP/UDP checksum offload both ways and TCP segmentation offload through `EthPort::transmit_offload`/`receive_checked`/`offloads`; tested against a simulated HCA, not yet on hardware. Not supported: RSS, per-CPU completion vectors, MAC/VLAN steering, VLAN tag offload
 - ✅ AHCI (SATA): HBA handoff and port bring-up, IDENTIFY, READ/WRITE DMA EXT and FLUSH CACHE EXT, native command queuing (up to 8 commands in flight), interrupt-driven completion (INTx or MSI, polled fallback kept), ATAPI optical drives as read-only block devices (IDENTIFY PACKET DEVICE, READ(10), READ CAPACITY) for `osmium-fs-iso9660`; each disk is its own `BlockDevice` that outlives the HBA; error recovery with CLO or COMRESET; boots against QEMU `ich9-ahci` + `ide-hd`
 - ✅ NVMe: admin and one I/O queue pair (phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting with up to four commands in flight (out-of-order completions), optional MSI-X completion interrupts (`Nvme::with_interrupts`; polling remains the default), normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
+- ✅ Intel VT-d (`iommu::vtd::Vtd`): legacy-mode root and context tables, 48-bit four-level second-level tables, register-based context-cache and IOTLB invalidation (a firmware-enabled invalidation queue is switched off), fault-recording registers; refuses units without `ECAP.C` unless the caller vouches for coherency (`new_assuming_coherent`); boots against QEMU `intel-iommu` and `iommu-testdev`
+- ✅ AMD-Vi (`iommu::amdvi::AmdVi`): device table, command buffer (device-table and page invalidations, completion waits) and event log, four-level I/O tables; the first attach blocks every other requester ID with an explicit entry, since an invalid entry passes DMA through; boots against QEMU `amd-iommu,dma-remap=on`
+- ✅ Arm SMMUv3 (`iommu::smmuv3::Smmuv3`): linear stream table, command and event queues, stage-2-only contexts over `Aarch64Stage2` (`CFGI_STE`, `TLBI_S12_VMALL`, `CMD_SYNC`), command-error recovery; boots against QEMU `virt,iommu=smmuv3`
+- ✅ RISC-V IOMMU (`iommu::riscv::RiscvIommu`): two-level device directory with base or extended device contexts, first-stage Sv39 contexts (`PSCID` = domain), command queue (`IODIR.INVAL_DDT`, `IOTINVAL.VMA`, `IOFENCE.C`) and fault queue, `Bare` until the first attach; boots against QEMU `riscv-iommu-pci`, with NVMe running through it
+- 🗺 IOMMU: interrupt remapping, scalable-mode VT-d, SMMUv3 stage 1 and 2-level stream tables, PASIDs and ATS, RISC-V G-stage and MSI page tables, huge IOVA mappings, and cache maintenance for units that do not snoop the CPU caches
 - ✅ virtio-pci transport (modern, capability-located registers); tested against a fake function and on QEMU `virtio-gpu-pci`/`virtio-vga`
 - ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
 - ✅ Bochs DISPI display (`BochsVbe`): QEMU std VGA, `bochs-display` and `virtio-vga` modes over MMIO on any architecture or ports on x86
@@ -193,7 +200,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Conversion of firmware memory maps into `osmium_mm::MemoryMap`
 - ✅ ELF64 executables: validated parsing of loadable segments, and `Elf::load_into` any `PageTable` (per-segment permissions, zeroed `.bss`, shared pages merged); all three examples run the same Rust user program (`examples/user/hello.rs`) built as an ELF
 - ✅ PVH start-info parser and the `pvh_entry_note!` ELF-note macro
-- ✅ ACPI: RSDP/RSDT/XSDT with checksums, MADT (local APICs, x2APICs, I/O APICs), MCFG (PCI ECAM windows)
+- ✅ ACPI: RSDP/RSDT/XSDT with checksums, MADT (local APICs, x2APICs, I/O APICs), MCFG (PCI ECAM windows), DMAR (VT-d units), IVRS (AMD IOMMUs)
 - ✅ UEFI: system table, console output, `LocateProtocol`, `Stall`, `ResetSystem`, and the Graphics Output Protocol (mode list, mode set, framebuffer as `FramebufferInfo`, `Blt` fill for framebuffer-less modes)
 - 🗺 Fuller UEFI boot services (memory map, `ExitBootServices`), Limine protocol, AML
 
@@ -283,4 +290,5 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `examples/uefi`: a UEFI application for x86_64 (OVMF) and AArch64 (AAVMF) that sets a GOP mode and draws colour bars on its framebuffer (or with `Blt` on virtio-gpu); check.sh verifies the screen
 - ✅ `examples/riscv-firmware`: M-mode firmware with `-bios none`, no heap and no scheduler: async tasks on `osmium-exec` await CLINT timer and PLIC/UART interrupts, then power off
 - ✅ All three examples bring up 4 CPUs and run shared SMP demos (cross-CPU mutex wake-ups by IPI, task migration)
+- ✅ IOMMU boots in `scripts/check.sh`: QEMU's `iommu-testdev` behind `riscv-iommu-pci`, `intel-iommu`, `amd-iommu` and `virt,iommu=smmuv3` (`demos::iommu::testdev`: a DMA through a mapping reaches memory, an unmapped IOVA and a detached device are blocked); the RISC-V boot also runs the NVMe driver on IOVAs from an `IommuDma`
 - ✅ `scripts/check.sh`: tests, clippy, rustdoc, all targets, and the QEMU boot test

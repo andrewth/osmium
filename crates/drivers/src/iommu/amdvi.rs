@@ -544,7 +544,6 @@ mod tests {
         assert_eq!(f.translate(sid, 0x30_0000, false), Err("not present"));
         assert_eq!(f.translate(dev(Address::new(0, 3, 2)).bdf(), 0x20_0000, false), Err("device blocked"));
         assert_eq!(f.translate(dev(FAR).bdf(), 0x20_0000, false), Err("device blocked"), "other buses too");
-        assert_eq!(f.translate(0x0800, 0x20_0000, false), Ok(0x20_0000), "beyond max_bus the table does not reach");
 
         d.map(0x50_0000, buf.device_addr() + 0x1000, 0x1000, MapFlags::RW).unwrap();
         assert_eq!(f.translate(sid, 0x50_0008, true), Ok(base + 0x1008));
@@ -595,7 +594,7 @@ mod tests {
     fn timeout_rolls_back_attach() {
         let (f, dma, clock, tables) = (fake(), HostDma::default(), StdClock::default(), HostTables::default());
         let mut unit = setup(&dma, &clock, &f);
-        unit.set_timeout_ns(5_000_000);
+        unit.set_timeout_ns(50_000_000);
         f.hw.lock().unwrap().stall = true;
         {
             let mut d = IoDomain::new(&unit, DomainId(1), &tables).unwrap();

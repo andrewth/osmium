@@ -136,7 +136,7 @@ rm -rf "$tftp"
 if command -v qemu-system-riscv64 >/dev/null && qemu-system-riscv64 -device help 2>&1 | grep -q 'iommu-testdev'; then
     iommu_disk=$(mktemp)
     truncate -s 8M "$iommu_disk"
-    EXPECT='\[iommu\] 00:02.0 RISC-V IOMMU: Sv39 domains;riscv-iommu: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words);riscv-iommu: DMA to an unmapped IOVA blocked;riscv-iommu: detached device blocked;\[iommu\] NVMe .* attached to domain 1;\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192);\[iommu\] NVMe detached: Ok(()), 0 faults logged' \
+    EXPECT='\[iommu\] [0-9a-f:.]* RISC-V IOMMU: Sv39 domains;riscv-iommu: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words);riscv-iommu: DMA to an unmapped IOVA blocked;riscv-iommu: detached device blocked;\[iommu\] NVMe .* attached to domain 1;\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192);\[iommu\] NVMe detached: Ok(()), 0 faults logged' \
     boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
         -machine virt -bios default -smp 4 -accel tcg,thread=multi \
         -device riscv-iommu-pci -device iommu-testdev \

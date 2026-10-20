@@ -13,7 +13,7 @@
 //!   that does DMA on the unit (including the one holding the root file
 //!   system) before the first attach finishes, or accept that it stops.
 //! - Tables the hardware reads (device tables, queues) come from a
-//!   [`DmaAllocator`](osmium_hal::dma::DmaAllocator) that hands out physical
+//!   [`DmaAllocator`] that hands out physical
 //!   addresses the IOMMU can use directly, page-aligned and zeroed. Units
 //!   that report non-coherent table walks are refused.
 //! - Every wait is bounded by a [`Clock`]. If the
