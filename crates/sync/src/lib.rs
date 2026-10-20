@@ -33,5 +33,5 @@ pub use once::{Lazy, Once};
 pub use percpu::{PerCpu, PerCpuCell};
 pub use ring::{Consumer, Producer, SpscRing};
 pub use rwlock::{RwSpinLock, RwSpinLockReadGuard, RwSpinLockWriteGuard};
-pub use seqlock::SeqLock;
+pub use seqlock::{NoPadding, SeqLock};
 pub use spin::{IrqSpinLock, RawSpinLock, SpinLock, SpinLockGuard};

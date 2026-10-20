@@ -12,6 +12,11 @@ type TaskRef = Pin<&'static mut (dyn Future<Output = ()> + Send)>;
 /// One task slot. A waker is just a pointer to its slot.
 struct Slot {
     ready: AtomicBool,
+    /// True from the moment `spawn` claims the slot until its task has
+    /// finished and been removed. `spawn` and `tasks` read this instead of
+    /// `task`'s lock, which `poll_once` holds while the task runs (so a task
+    /// can spawn, or count tasks, without locking its own slot).
+    occupied: AtomicBool,
     /// The owning executor's `pending` flag, recorded at spawn (a `const`
     /// executor cannot point into itself at construction).
     owner: AtomicPtr<AtomicBool>,
@@ -45,7 +50,12 @@ impl<const N: usize> Executor<N> {
     pub const fn new() -> Self {
         Self {
             slots: [const {
-                Slot { ready: AtomicBool::new(false), owner: AtomicPtr::new(ptr::null_mut()), task: IrqSpinLock::new(None) }
+                Slot {
+                    ready: AtomicBool::new(false),
+                    occupied: AtomicBool::new(false),
+                    owner: AtomicPtr::new(ptr::null_mut()),
+                    task: IrqSpinLock::new(None),
+                }
             }; N],
             pending: AtomicBool::new(false),
         }
@@ -55,21 +65,25 @@ impl<const N: usize> Executor<N> {
     /// context, including other tasks and interrupt handlers.
     pub fn spawn(&'static self, task: TaskRef) -> Result<(), SpawnError> {
         for slot in &self.slots {
-            let mut t = slot.task.lock();
-            if t.is_none() {
-                *t = Some(task);
-                slot.owner.store((&raw const self.pending).cast_mut(), Ordering::Release);
-                drop(t);
-                slot.wake();
-                return Ok(());
+            // Claim a free slot without touching any lock: a busy slot's lock
+            // may be held by `poll_once` for the very task calling us.
+            if slot.occupied.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                continue;
             }
+            // The slot is ours now. Its lock can only be held briefly, by a
+            // `poll_once` on another CPU that found it empty (IRQs are masked
+            // while it is held, so never by code this call interrupted).
+            *slot.task.lock() = Some(task);
+            slot.owner.store((&raw const self.pending).cast_mut(), Ordering::Release);
+            slot.wake();
+            return Ok(());
         }
         Err(SpawnError)
     }
 
-    /// Number of tasks that have not finished.
+    /// Number of tasks that have not finished. Lock-free, so tasks may call it.
     pub fn tasks(&self) -> usize {
-        self.slots.iter().filter(|s| s.task.lock().is_some()).count()
+        self.slots.iter().filter(|s| s.occupied.load(Ordering::Acquire)).count()
     }
 
     /// Polls every ready task once. Returns how many were polled.
@@ -85,10 +99,15 @@ impl<const N: usize> Executor<N> {
             // SAFETY: the slot is 'static and the vtable treats data as `*const Slot`.
             let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::from_ref(slot).cast(), &VTABLE)) };
             polled += 1;
-            // The slot stays locked (IRQs masked) while its task runs; wakers
-            // only touch atomics, so nothing re-enters the lock.
+            // The slot stays locked (IRQs masked) while its task runs. Nothing
+            // the task can call re-enters the lock: wakers only touch atomics,
+            // and `spawn` and `tasks` skip occupied slots without locking.
             if task.as_mut().poll(&mut Context::from_waker(&waker)).is_ready() {
                 *guard = None;
+                drop(guard);
+                // Only now may `spawn` reuse the slot (and `tasks` stop
+                // counting it): the finished task is out of it.
+                slot.occupied.store(false, Ordering::Release);
             }
         }
         polled

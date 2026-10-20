@@ -18,10 +18,29 @@ pub fn disable() {
 }
 
 /// Re-enables preemption after a matching [`disable`].
+///
+/// Panics, in release builds too, if the count is already zero. An
+/// unmatched `enable` means some holder's critical section is no longer
+/// protected (its own later `enable` would reach zero early), so running on
+/// could preempt or migrate a task inside a spin lock or per-CPU access.
+/// Wrapping to `u32::MAX` would instead silently disable preemption forever,
+/// and saturating at zero would hide the imbalance. The count is left at
+/// zero, not wrapped, before the panic.
 #[inline]
 pub fn enable() {
-    let prev = irq::without(|| COUNT[cpu::current_id()].fetch_sub(1, Ordering::Relaxed));
-    debug_assert!(prev > 0, "preempt::enable without matching disable");
+    // A checked decrement: the count never goes below zero.
+    let ok = irq::without(|| {
+        let count = &COUNT[cpu::current_id()];
+        let mut cur = count.load(Ordering::Relaxed);
+        while cur > 0 {
+            match count.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
+        false
+    });
+    assert!(ok, "preempt::enable without matching disable");
 }
 
 /// Returns this CPU's preemption-disable depth.

@@ -18,15 +18,23 @@ impl AtomicWaker {
     /// Records the waker to call on the next [`AtomicWaker::wake`].
     pub fn register(&self, waker: &Waker) {
         let mut w = self.waker.lock();
-        match &*w {
-            Some(old) if old.will_wake(waker) => {}
-            _ => *w = Some(waker.clone()),
-        }
+        let old = match &*w {
+            Some(old) if old.will_wake(waker) => None,
+            _ => w.replace(waker.clone()),
+        };
+        // Drop the replaced waker outside the lock: dropping a waker runs
+        // its vtable code, which must not run with the lock held.
+        drop(w);
+        drop(old);
     }
 
     /// Wakes the registered task, if any.
     pub fn wake(&self) {
-        if let Some(w) = self.waker.lock().take() {
+        // Take the waker and release the lock before waking: the wake-up
+        // runs arbitrary vtable code, which might register again (and so
+        // deadlock on the lock) or simply run long with IRQs masked.
+        let w = self.waker.lock().take();
+        if let Some(w) = w {
             w.wake();
         }
     }
@@ -124,6 +132,29 @@ mod tests {
         assert_eq!(GOT.load(Ordering::SeqCst), 7);
         assert_eq!(EXEC.tasks(), 0);
         assert_eq!(LOG.lock().last(), Some(&"b got"));
+    }
+
+    #[test]
+    fn task_spawns_task() {
+        static EXEC: Executor<2> = Executor::new();
+        static OUTER: StaticCell<Pin<std::boxed::Box<Fut>>> = StaticCell::new();
+        static INNER: StaticCell<Pin<std::boxed::Box<Fut>>> = StaticCell::new();
+        static RAN: AtomicU32 = AtomicU32::new(0);
+
+        let outer = OUTER.init(std::boxed::Box::pin(async {
+            let inner = INNER.init(std::boxed::Box::pin(async {
+                RAN.fetch_add(10, Ordering::SeqCst);
+            }));
+            // Both run from inside a poll, while this task's slot is locked.
+            EXEC.spawn(inner.as_mut()).unwrap();
+            assert_eq!(EXEC.tasks(), 2);
+            yield_now().await;
+            RAN.fetch_add(1, Ordering::SeqCst);
+        }));
+        EXEC.spawn(outer.as_mut()).unwrap();
+        EXEC.run_until_idle();
+        assert_eq!(RAN.load(Ordering::SeqCst), 11, "both tasks ran to completion");
+        assert_eq!(EXEC.tasks(), 0);
     }
 
     #[test]
