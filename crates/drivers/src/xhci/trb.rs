@@ -19,6 +19,7 @@ pub struct Trb {
 pub mod kind {
     #![allow(missing_docs)]
     pub const NORMAL: u32 = 1;
+    pub const ISOCH: u32 = 5;
     pub const SETUP_STAGE: u32 = 2;
     pub const DATA_STAGE: u32 = 3;
     pub const STATUS_STAGE: u32 = 4;
@@ -48,14 +49,19 @@ pub mod completion {
     pub const TRB: u8 = 5;
     pub const STALL: u8 = 6;
     pub const RESOURCE: u8 = 7;
+    pub const BANDWIDTH_OVERRUN: u8 = 8;
     pub const NO_SLOTS: u8 = 9;
     pub const SLOT_NOT_ENABLED: u8 = 11;
     pub const ENDPOINT_NOT_ENABLED: u8 = 12;
     pub const SHORT_PACKET: u8 = 13;
+    pub const RING_UNDERRUN: u8 = 14;
+    pub const RING_OVERRUN: u8 = 15;
     pub const PARAMETER: u8 = 17;
     pub const CONTEXT_STATE: u8 = 19;
+    pub const MISSED_SERVICE: u8 = 23;
     pub const COMMAND_RING_STOPPED: u8 = 24;
     pub const COMMAND_ABORTED: u8 = 25;
+    pub const ISOCH_BUFFER_OVERRUN: u8 = 31;
 }
 
 /// Control-word bits.
@@ -73,6 +79,8 @@ pub mod flag {
     pub const IDT: u32 = 1 << 6;
     /// Data/Status Stage direction: IN.
     pub const DIR_IN: u32 = 1 << 16;
+    /// Isoch TRB: start as soon as possible instead of in a given frame.
+    pub const SIA: u32 = 1 << 31;
 }
 
 /// Setup Stage transfer type (TRT).
@@ -198,6 +206,33 @@ impl Trb {
         Self::new(kind::STATUS_STAGE, 0, 0, dir | flag::IOC)
     }
 
+    /// Isochronous TRB moving `len` bytes at `buf` in one service interval
+    /// (a whole TD in one TRB). `packets` is the number of max-size packets
+    /// the TD spans; `burst` the endpoint's Max Burst Size; `ss` whether the
+    /// device is SuperSpeed (which counts bursts; high speed puts the
+    /// transactions of the microframe in TLBPC). `frame` is the 11-bit frame
+    /// to send it in, or `None` for as soon as possible. Interrupts on
+    /// completion.
+    pub const fn isoch(
+        buf: u64,
+        len: u32,
+        packets: u32,
+        burst: u32,
+        ss: bool,
+        frame: Option<u16>,
+        dir_in: bool,
+    ) -> Self {
+        let packets = if packets == 0 { 1 } else { packets };
+        let (tbc, tlbpc) =
+            if ss { ((packets - 1) / (burst + 1), (packets - 1) % (burst + 1)) } else { (0, packets - 1) };
+        let when = match frame {
+            Some(f) => (f as u32 & 0x7ff) << 20,
+            None => flag::SIA,
+        };
+        let isp = if dir_in { flag::ISP } else { 0 };
+        Self::new(kind::ISOCH, buf, len & 0x1_ffff, isp | flag::IOC | tbc << 7 | tlbpc << 16 | when)
+    }
+
     /// Normal TRB for a bulk or interrupt transfer of `len` bytes at `buf`.
     pub const fn normal(buf: u64, len: u32) -> Self {
         Self::new(kind::NORMAL, buf, len, flag::ISP | flag::IOC)
@@ -223,6 +258,15 @@ mod tests {
         assert_eq!((ev.slot_id(), ev.endpoint_id(), ev.cycle()), (3, 2, true));
 
         assert_eq!(Trb::set_tr_dequeue(1, 3, 0x2000, true).param, 0x2001);
+        // A high-speed 3-packet TD in frame 5, and a SuperSpeed 7-packet one (burst 3) as soon as possible.
+        let hs = Trb::isoch(0x1000, 3072, 3, 2, false, Some(5), false);
+        assert_eq!((hs.kind(), hs.param, hs.status), (kind::ISOCH, 0x1000, 3072));
+        assert_eq!((hs.control >> 16 & 0xf, hs.control >> 7 & 3, hs.control >> 20 & 0x7ff), (2, 0, 5));
+        assert_eq!(hs.control & (flag::SIA | flag::IOC | flag::ISP), flag::IOC);
+        let ss = Trb::isoch(0x1000, 7000, 7, 3, true, None, true);
+        assert_eq!((ss.control >> 7 & 3, ss.control >> 16 & 0xf), (1, 2));
+        assert_eq!(ss.control & (flag::SIA | flag::IOC | flag::ISP), flag::SIA | flag::IOC | flag::ISP);
+
         assert_eq!(Trb::link(0x3000).control, (kind::LINK << 10) | flag::TOGGLE_CYCLE);
     }
 }

@@ -131,6 +131,11 @@ features.
 - When the heap is backed by `LockedFrames`, it can return large blocks to
   the frame allocator only if the mapper implements `virt_to_phys`
   (`OffsetMapper` does).
+- USB: hubs and isochronous endpoints are implemented but have only been
+  tested against a simulated xHCI controller, not QEMU or hardware.
+  Isochronous transfers are limited to 4 KiB per service interval, SuperSpeed
+  burst sizes from companion descriptors are ignored, and a SuperSpeed hub
+  port needing a warm reset is not recovered.
 
 ## License
 

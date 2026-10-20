@@ -68,6 +68,8 @@ pub mod descriptor_type {
     pub const INTERFACE_ASSOCIATION: u8 = 11;
     pub const BOS: u8 = 15;
     pub const SS_ENDPOINT_COMPANION: u8 = 48;
+    pub const HUB: u8 = 0x29;
+    pub const SS_HUB: u8 = 0x2a;
 }
 
 /// The 8-byte SETUP stage of a control transfer.
@@ -482,6 +484,9 @@ pub enum UsbError {
     Timeout,
     /// The controller reported an internal error.
     Controller,
+    /// The controller or device does not support the operation (a hub
+    /// request on a controller without hub support, say).
+    Unsupported,
 }
 
 impl From<BadDescriptor> for UsbError {
@@ -562,6 +567,89 @@ pub trait UsbHost {
     /// `None` while it is still pending, else the bytes copied into `buf`.
     /// Returns `Some(Err(BadEndpoint))` if none was submitted.
     fn poll_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>>;
+
+    /// Addresses the device on port `port` of the hub `hub` (already reset
+    /// by the hub class driver, at `speed`) and returns its handle, like
+    /// [`attach`](Self::attach) does for a root port. The controller derives
+    /// the device's route string and, for a low- or full-speed device behind
+    /// a high-speed hub, its transaction translator from `hub`.
+    ///
+    /// Controllers without hub support return [`UsbError::Unsupported`].
+    fn attach_hub_port(&mut self, hub: DeviceId, port: u8, speed: Speed) -> Result<DeviceId, UsbError> {
+        let _ = (hub, port, speed);
+        Err(UsbError::Unsupported)
+    }
+
+    /// Tells the controller that `hub` is a hub with `ports` downstream
+    /// ports, `think_time` being the 2-bit TT think time from its
+    /// descriptor and `multi_tt` whether it has one transaction translator
+    /// per port. Call after the hub is configured and before
+    /// [`attach_hub_port`](Self::attach_hub_port).
+    fn configure_hub(&mut self, hub: DeviceId, ports: u8, think_time: u8, multi_tt: bool) -> Result<(), UsbError> {
+        let _ = (hub, ports, think_time, multi_tt);
+        Err(UsbError::Unsupported)
+    }
+}
+
+/// When an isochronous transfer should go on the bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsochStart {
+    /// As soon as the controller can.
+    Asap,
+    /// In the (11-bit, millisecond) frame number given.
+    Frame(u16),
+    /// One service interval after the endpoint's previous transfer, so a
+    /// stream stays in step. The first transfer starts a few frames from
+    /// now; endpoints serviced more than once a frame start as soon as
+    /// possible, since frames cannot address microframes.
+    Next,
+}
+
+/// A host controller that supports isochronous endpoints (audio, video).
+///
+/// Enable the endpoint with [`UsbHost::configure_endpoints`] after selecting
+/// the alternate setting that gives it bandwidth. Each endpoint then queues
+/// a few transfers (one per service interval) that complete in order.
+pub trait IsochHost: UsbHost {
+    /// The current frame number (11 bits, wrapping every 2048 ms).
+    fn isoch_frame(&self) -> u16;
+
+    /// Queues an IN transfer of up to `len` bytes (one service interval's
+    /// worth) on endpoint address `endpoint`. Fails with
+    /// [`UsbError::Busy`] if the endpoint's queue is full.
+    fn isoch_submit_in(&mut self, dev: DeviceId, endpoint: u8, len: usize, start: IsochStart) -> Result<(), UsbError>;
+
+    /// Queues an OUT transfer of `data` (one service interval's worth).
+    fn isoch_submit_out(&mut self, dev: DeviceId, endpoint: u8, data: &[u8], start: IsochStart)
+    -> Result<(), UsbError>;
+
+    /// Collects the oldest queued transfer of `endpoint` once it is done:
+    /// `None` while it is pending, else the bytes moved (IN data is copied
+    /// into `buf`). A transfer the device or the schedule spoiled (a missed
+    /// service interval, say) yields `Err`; the endpoint keeps running.
+    /// `Some(Err(BadEndpoint))` if nothing is queued.
+    fn isoch_poll(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>>;
+}
+
+impl<H: IsochHost + ?Sized> IsochHost for &mut H {
+    fn isoch_frame(&self) -> u16 {
+        (**self).isoch_frame()
+    }
+    fn isoch_submit_in(&mut self, dev: DeviceId, endpoint: u8, len: usize, start: IsochStart) -> Result<(), UsbError> {
+        (**self).isoch_submit_in(dev, endpoint, len, start)
+    }
+    fn isoch_submit_out(
+        &mut self,
+        dev: DeviceId,
+        endpoint: u8,
+        data: &[u8],
+        start: IsochStart,
+    ) -> Result<(), UsbError> {
+        (**self).isoch_submit_out(dev, endpoint, data, start)
+    }
+    fn isoch_poll(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
+        (**self).isoch_poll(dev, endpoint, buf)
+    }
 }
 
 /// A borrowed host controller, so a class driver can use one it does not own.
@@ -598,6 +686,12 @@ impl<H: UsbHost + ?Sized> UsbHost for &mut H {
     }
     fn poll_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
         (**self).poll_in(dev, endpoint, buf)
+    }
+    fn attach_hub_port(&mut self, hub: DeviceId, port: u8, speed: Speed) -> Result<DeviceId, UsbError> {
+        (**self).attach_hub_port(hub, port, speed)
+    }
+    fn configure_hub(&mut self, hub: DeviceId, ports: u8, think_time: u8, multi_tt: bool) -> Result<(), UsbError> {
+        (**self).configure_hub(hub, ports, think_time, multi_tt)
     }
 }
 
@@ -637,6 +731,33 @@ impl<H: UsbHost + ?Sized, G: osmium_sync::Guardian> UsbHost for &osmium_sync::Sp
     }
     fn poll_in(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
         self.lock().poll_in(dev, endpoint, buf)
+    }
+    fn attach_hub_port(&mut self, hub: DeviceId, port: u8, speed: Speed) -> Result<DeviceId, UsbError> {
+        self.lock().attach_hub_port(hub, port, speed)
+    }
+    fn configure_hub(&mut self, hub: DeviceId, ports: u8, think_time: u8, multi_tt: bool) -> Result<(), UsbError> {
+        self.lock().configure_hub(hub, ports, think_time, multi_tt)
+    }
+}
+
+impl<H: IsochHost + ?Sized, G: osmium_sync::Guardian> IsochHost for &osmium_sync::SpinLock<H, G> {
+    fn isoch_frame(&self) -> u16 {
+        self.lock().isoch_frame()
+    }
+    fn isoch_submit_in(&mut self, dev: DeviceId, endpoint: u8, len: usize, start: IsochStart) -> Result<(), UsbError> {
+        self.lock().isoch_submit_in(dev, endpoint, len, start)
+    }
+    fn isoch_submit_out(
+        &mut self,
+        dev: DeviceId,
+        endpoint: u8,
+        data: &[u8],
+        start: IsochStart,
+    ) -> Result<(), UsbError> {
+        self.lock().isoch_submit_out(dev, endpoint, data, start)
+    }
+    fn isoch_poll(&mut self, dev: DeviceId, endpoint: u8, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
+        self.lock().isoch_poll(dev, endpoint, buf)
     }
 }
 

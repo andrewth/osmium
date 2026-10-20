@@ -541,7 +541,7 @@ port I/O.
 | Timers | `clint::Clint`, `pit::Pit` |
 | Block | `ramdisk::RamDisk`, `virtio::blk::VirtioBlk`, `usb::storage::UsbStorage` (fewer than 2^32 blocks, so under 2 TiB at 512 B; block sizes a power of two from 512 B to 64 KiB), `ahci::Ahci`, `nvme::Nvme`; iSCSI in `osmium::iscsi` |
 | Network | `virtio::net::VirtioNet`, `usb::ecm::UsbEthernet`, `mlx4::Mlx4` (polled, or MSI-X via `enable_msix`; checksum and segmentation offloads are inherent `EthPort` methods, since `NetDevice` has no offload flags) |
-| USB | `xhci::Xhci`, `usb::hid::BootKeyboard` |
+| USB | `xhci::Xhci` (polled, INTx, MSI or MSI-X via `enable_message_interrupts`), `usb::hid::BootKeyboard`, `usb::hub::Hub`, `usb::isoch::{IsochIn, IsochOut}` |
 | Display | `virtio::gpu::VirtioGpu` (virtio-gpu and virtio-vga, MMIO or PCI), `display::bochs::BochsVbe` (QEMU std VGA, bochs-display, virtio-vga in VGA mode), `display::vbe::Vbe` (VESA BIOS Extensions, x86) |
 
 Drivers that do DMA take a `DmaAllocator`, and `LockedFrames` is one.
@@ -965,6 +965,11 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
   opt-in (`with_fp_switching`: x87 and SSE, not AVX), and SVE is not
   switched on AArch64. See HYPERVISOR.md's
   [current limits](HYPERVISOR.md#current-limits).
+- USB hubs (`usb::hub`) and isochronous endpoints (`IsochHost`, `usb::isoch`)
+  have only been tested against a simulated xHCI controller. Isochronous
+  transfers carry at most 4 KiB per service interval, SuperSpeed burst sizes
+  from companion descriptors are ignored, and a SuperSpeed hub port that
+  needs a warm reset is not recovered.
 
 ### Troubleshooting
 

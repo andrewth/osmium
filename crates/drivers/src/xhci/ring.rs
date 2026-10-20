@@ -143,6 +143,17 @@ impl<'d, D: DmaAllocator + ?Sized> EventRing<'d, D> {
         store(&self.mem, i, trb);
     }
 
+    /// Appends an event after those already written but not yet taken, as
+    /// the controller would, for tests.
+    #[cfg(test)]
+    pub(crate) fn inject(&mut self, trb: Trb) {
+        let at = (0..RING_TRBS)
+            .map(|k| (self.dequeue + k) % RING_TRBS)
+            .find(|&i| load(&self.mem, i).cycle() != self.cycle)
+            .expect("event ring full");
+        self.controller_write(at, trb);
+    }
+
     /// Takes the next event, if the controller has written one. Tell the
     /// controller how far the ring was consumed by writing
     /// [`dequeue_addr`](Self::dequeue_addr) to `ERDP` afterwards.

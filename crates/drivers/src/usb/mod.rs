@@ -7,4 +7,6 @@
 
 pub mod ecm;
 pub mod hid;
+pub mod hub;
+pub mod isoch;
 pub mod storage;
