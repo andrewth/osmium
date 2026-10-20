@@ -66,6 +66,42 @@ pub fn read_mpidr_el1() -> u64 {
     v
 }
 
+/// Drops to user mode (EL0, using `SP_EL0`) at `entry` with stack
+/// `user_sp`, interrupts enabled. Exceptions from EL0 then arrive on
+/// `kernel_sp` (`SP_EL1`), which should be the top of the task's kernel
+/// stack. General-purpose registers are cleared. Does not return.
+///
+/// # Safety
+/// The Osmium vectors (EL1 build) must be installed, `kernel_sp` must be a
+/// valid kernel stack, and `entry`/`user_sp` must be mapped EL0-accessible.
+#[cfg(not(feature = "aarch64-el2"))]
+pub unsafe fn enter_user(entry: u64, user_sp: u64, kernel_sp: u64) -> ! {
+    // SAFETY: the caller upholds the contract. IRQs are masked before ELR/
+    // SPSR are written so no exception can overwrite them; eret unmasks
+    // them by restoring SPSR (EL0t, DAIF clear).
+    unsafe {
+        asm!(
+            "msr daifset, #0xf",
+            "msr sp_el0, {usp}",
+            "msr elr_el1, {entry}",
+            "msr spsr_el1, xzr",
+            "mov sp, {ksp}",
+            "mov x0, xzr", "mov x1, xzr", "mov x2, xzr", "mov x3, xzr", "mov x4, xzr",
+            "mov x5, xzr", "mov x6, xzr", "mov x7, xzr", "mov x8, xzr", "mov x9, xzr",
+            "mov x10, xzr", "mov x11, xzr", "mov x12, xzr", "mov x13, xzr", "mov x14, xzr",
+            "mov x15, xzr", "mov x16, xzr", "mov x17, xzr", "mov x18, xzr", "mov x19, xzr",
+            "mov x20, xzr", "mov x21, xzr", "mov x22, xzr", "mov x23, xzr", "mov x24, xzr",
+            "mov x25, xzr", "mov x26, xzr", "mov x27, xzr", "mov x28, xzr", "mov x29, xzr",
+            "mov x30, xzr",
+            "eret",
+            usp = in(reg) user_sp,
+            entry = in(reg) entry,
+            ksp = in(reg) kernel_sp,
+            options(noreturn),
+        )
+    }
+}
+
 /// Power State Coordination Interface: CPU power control through firmware
 /// or the hypervisor.
 pub mod psci {

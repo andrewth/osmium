@@ -76,7 +76,53 @@ boot_stack_top:
 "#
 );
 
+// User programs: position-independent EL0 code, copied into user pages.
+// System calls use `svc #0` with Linux numbering: x8 = number, x0-x2 = args.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.user, "a"
+    .balign 4
+    .globl user_hello, user_hello_end, user_bad, user_bad_end
+user_hello:
+    mov x19, #3
+1:  mov x8, #64                 // write(1, msg, 14)
+    mov x0, #1
+    adr x1, 3f
+    mov x2, #14
+    svc #0
+    movz x9, #0x2d00            // busy-wait 20M iterations: only the timer
+    movk x9, #0x131, lsl #16    // can switch us out
+2:  subs x9, x9, #1
+    b.ne 2b
+    subs x19, x19, #1
+    b.ne 1b
+    mov x8, #93                 // exit(0)
+    mov x0, #0
+    svc #0
+    udf #0
+3:  .ascii "hello from EL0"
+user_hello_end:
+
+    .balign 4
+user_bad:
+    mov x8, #64
+    mov x0, #1
+    adr x1, 1f
+    mov x2, #27
+    svc #0
+    movz x9, #0x4020, lsl #16   // kernel text: not EL0-accessible
+    ldr x10, [x9]
+    udf #0
+1:  .ascii "about to read kernel memory"
+user_bad_end:
+"#
+);
+
 unsafe extern "C" {
+    static user_hello: u8;
+    static user_hello_end: u8;
+    static user_bad: u8;
+    static user_bad_end: u8;
     fn secondary_start();
     static _kernel_start: u8;
     static _etext: u8;
@@ -319,6 +365,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     }
     fault_demo();
     overflow_demo();
+    user_demo(ncpus);
 
     println!(
         "[done]  {} timer ticks, {} IPIs, {} free frames; shutting down",
@@ -428,7 +475,103 @@ fn overflow_demo() {
     println!("[guard] the other tasks keep running: {} free frames", FRAMES.lock().free_frames());
 }
 
+/// Where user programs are mapped: 64 GiB, clear of RAM and devices.
+const USER_BASE: u64 = 0x10_0000_0000;
+
+/// Copies a user program into fresh pages, maps it EL0-accessible (code
+/// read/execute, stack read/write) at slot `n`, and spawns a task on `cpu`
+/// that drops to EL0 there.
+fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> alloc::sync::Arc<osmium::sched::Task> {
+    let (start, end) = (code.0 as *const u8, code.1 as *const u8);
+    let len = end as usize - start as usize;
+    assert!(len <= PAGE_SIZE);
+    let mut frames = FRAMES.lock();
+    let (code_pa, stack_pa) = (frames.alloc_frame().unwrap(), frames.alloc_frame().unwrap());
+    drop(frames);
+    // SAFETY: fresh frames, identity-mapped; the program fits in one page.
+    unsafe {
+        core::ptr::write_bytes(code_pa.0 as *mut u8, 0, PAGE_SIZE);
+        core::ptr::copy_nonoverlapping(start, code_pa.0 as *mut u8, len);
+        // Make the new code visible to instruction fetch on every CPU.
+        for line in (code_pa.0..code_pa.0 + len as u64).step_by(64) {
+            core::arch::asm!("dc cvau, {}", in(reg) line);
+        }
+        core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb");
+    }
+    let (code_va, stack_va) = (USER_BASE + n * 0x10000, USER_BASE + n * 0x10000 + 0x8000);
+    {
+        let mut pt = PT.lock();
+        let pt = pt.as_mut().unwrap();
+        pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().flush();
+        pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().flush();
+    }
+    TaskBuilder::new(name).cpu(cpu).spawn(move || {
+        let kernel_top = osmium::sched::current().kernel_stack_range().unwrap().end as u64;
+        // SAFETY: vectors are installed, `kernel_top` is this task's own
+        // kernel stack, and both pages are mapped EL0-accessible.
+        unsafe { aarch64::enter_user(code_va, stack_va + PAGE_SIZE as u64, kernel_top) }
+    })
+}
+
+fn user_demo(ncpus: usize) {
+    // SAFETY: linker symbols delimiting the user programs.
+    let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
+    let cpu = 1 % ncpus;
+    let tasks = [
+        spawn_user("user-1", 0, hello, cpu),
+        spawn_user("user-2", 1, hello, cpu),
+        spawn_user("user-bad", 2, bad, cpu),
+    ];
+    println!("[user]  running 3 EL0 programs on CPU {cpu}");
+    for t in tasks {
+        t.join();
+    }
+}
+
+/// Handles `svc #0` from EL0. ELR already points past the `svc`.
+fn syscall(frame: &mut TrapFrame) {
+    let (nr, a0, a1, a2) = (frame.x[8], frame.x[0], frame.x[1], frame.x[2]);
+    let task = osmium::sched::current();
+    match nr {
+        64 if a0 == 1 && a2 <= 256 && user_readable(a1, a2) => {
+            // SAFETY: every page of the buffer is mapped EL0-readable, and
+            // PAN is off, so EL1 can read it.
+            let bytes = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
+            println!("[user]  {}: {}", task.name(), core::str::from_utf8(bytes).unwrap_or("<not utf-8>"));
+            frame.set_return(a2);
+        }
+        93 => {
+            println!("[user]  {} exited with status {a0} (kernel sees CPU {})", task.name(), cpu::current_id());
+            drop(task);
+            osmium::sched::exit();
+        }
+        _ => frame.set_return(-38i64 as u64), // ENOSYS
+    }
+}
+
+fn user_readable(addr: u64, len: u64) -> bool {
+    let Some(end) = addr.checked_add(len) else { return false };
+    let pt = PT.lock();
+    let pt = pt.as_ref().unwrap();
+    (addr & !(PAGE_SIZE as u64 - 1)..end)
+        .step_by(PAGE_SIZE)
+        .all(|p| pt.translate(VirtAddr::new(p)).is_some_and(|t| t.flags.contains(MapFlags::USER)))
+}
+
 fn on_trap(frame: &mut TrapFrame) {
+    if frame.from_user() {
+        match frame.cause() {
+            Trap::Syscall => return syscall(frame),
+            Trap::Interrupt(_) => {}
+            cause => {
+                // A fault in user mode ends that task, not the kernel.
+                let task = osmium::sched::current();
+                println!("[user]  {} killed: {cause:?} at pc {:#x}", task.name(), frame.pc());
+                drop(task);
+                osmium::sched::exit();
+            }
+        }
+    }
     if TrapCpu::current().overflowed(frame) {
         // This frame lives on the exception stack; the task's own stack is
         // exhausted, so it cannot continue. End only that task.

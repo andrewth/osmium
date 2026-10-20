@@ -102,6 +102,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Trap entry (RISC-V S/M-mode, AArch64 EL1/EL2): full `TrapFrame`, registered handler, portable `Trap` cause decoding
 - ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
 - ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction), per-CPU GDT/TSS (`CpuTables`) with IST stacks (`trap::set_ist`)
+- ✅ AArch64 user mode (EL1 kernels): `aarch64::enter_user` (eret to EL0t), lower-EL vectors save and restore `SP_EL0` and `TPIDRRO_EL0` in the frame, `TrapFrame::from_user`
 - ✅ RISC-V user mode: `riscv64::enter_user` (sret to U-mode), traps from U-mode land on `TrapCpu`'s kernel stack with the kernel's `tp` restored, `with_user_access` (SUM) for copying user buffers, `TrapFrame::from_user`
 - ✅ x86_64 user mode: `enter_user` (ring 3 via `iretq`), `trap::allow_from_user` for `int 0x80` system calls, `TrapFrame::from_user`
 - ✅ RISC-V trap entry swaps through `sscratch` to a per-CPU `TrapCpu`: an exception stack when the interrupted kernel stack overflowed, a kernel stack for traps from U-mode, and a hook point for hypervisor guest exits

@@ -87,8 +87,9 @@ features.
 
 ## Current limitations
 
-- User mode works on x86_64 and RISC-V (the examples run user programs
-  with system calls); AArch64 EL0 is not done yet. Kernel stack overflows are caught on all three
+- User mode works on all three architectures (the examples run the same
+  user programs with system calls); there are no per-process address
+  spaces yet, so user programs share the kernel's page table. Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. The scheduler does no load balancing; tasks move only

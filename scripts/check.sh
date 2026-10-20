@@ -62,7 +62,7 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
     -device qemu-xhci -device usb-kbd \
     -blockdev null-co,node-name=stick,size=1048576 -device usb-storage,drive=stick
-EXPECT='\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack' \
+EXPECT='\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1)' \
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
 EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0;user-2 exited with status 0;\[uart\]  COM1 IRQ 4' \

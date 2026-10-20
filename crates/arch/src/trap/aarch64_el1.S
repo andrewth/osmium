@@ -88,49 +88,49 @@ osmium_vec_8:
     sub sp, sp, #304
     stp x0, x1, [sp, #0]
     mov x0, #8
-    b osmium_trap_common
+    b osmium_trap_common_el0
 .org osmium_trap_vectors + 0x480
 osmium_vec_9:
     sub sp, sp, #304
     stp x0, x1, [sp, #0]
     mov x0, #9
-    b osmium_trap_common
+    b osmium_trap_common_el0
 .org osmium_trap_vectors + 0x500
 osmium_vec_10:
     sub sp, sp, #304
     stp x0, x1, [sp, #0]
     mov x0, #10
-    b osmium_trap_common
+    b osmium_trap_common_el0
 .org osmium_trap_vectors + 0x580
 osmium_vec_11:
     sub sp, sp, #304
     stp x0, x1, [sp, #0]
     mov x0, #11
-    b osmium_trap_common
+    b osmium_trap_common_el0
 .org osmium_trap_vectors + 0x600
 osmium_vec_12:
     sub sp, sp, #304
     stp x0, x1, [sp, #0]
     mov x0, #12
-    b osmium_trap_common
+    b osmium_trap_common_el0
 .org osmium_trap_vectors + 0x680
 osmium_vec_13:
     sub sp, sp, #304
     stp x0, x1, [sp, #0]
     mov x0, #13
-    b osmium_trap_common
+    b osmium_trap_common_el0
 .org osmium_trap_vectors + 0x700
 osmium_vec_14:
     sub sp, sp, #304
     stp x0, x1, [sp, #0]
     mov x0, #14
-    b osmium_trap_common
+    b osmium_trap_common_el0
 .org osmium_trap_vectors + 0x780
 osmium_vec_15:
     sub sp, sp, #304
     stp x0, x1, [sp, #0]
     mov x0, #15
-    b osmium_trap_common
+    b osmium_trap_common_el0
 osmium_trap_common:
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -149,6 +149,29 @@ osmium_trap_common:
     str x30, [sp, #240]
     add x1, sp, #304
     str x1, [sp, #248]
+    b 3f
+osmium_trap_common_el0:
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
+    // From EL0: record the user's stack pointer and TPIDRRO_EL0 (which
+    // kernel-mode exceptions clobber) so the return path can restore them.
+    mrs x1, sp_el0
+    str x1, [sp, #248]
+    mrs x1, tpidrro_el0
+    str x1, [sp, #296]
     b 3f
 osmium_trap_common_sp_saved:
     stp x2, x3, [sp, #16]
@@ -182,6 +205,13 @@ osmium_trap_common_sp_saved:
     msr elr_el1, x1
     ldr x1, [sp, #264]
     msr spsr_el1, x1
+    tst x1, #0xf                    // returning to EL0t?
+    b.ne 6f
+    ldr x2, [sp, #248]
+    msr sp_el0, x2
+    ldr x2, [sp, #296]
+    msr tpidrro_el0, x2
+6:
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
     ldp x6, x7, [sp, #48]

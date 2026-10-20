@@ -52,7 +52,9 @@ pub struct TrapFrame {
     pub far: u64,
     /// Vector index (0–15).
     pub kind: u64,
-    _pad: u64,
+    /// `TPIDRRO_EL0` of the interrupted EL0 context (EL1 builds; restored
+    /// when returning to EL0). Unused otherwise.
+    pub tpidrro: u64,
 }
 
 const _: () = assert!(size_of::<TrapFrame>() == 304);
@@ -71,6 +73,13 @@ impl TrapFrame {
     /// The stack pointer at the time of the exception.
     pub fn sp(&self) -> usize {
         self.sp as usize
+    }
+
+    /// Returns true if the exception came from user mode (EL0). For EL1
+    /// kernels; in `aarch64-el2` builds lower-EL exceptions are guest exits.
+    #[cfg(not(feature = "aarch64-el2"))]
+    pub fn from_user(&self) -> bool {
+        self.vector().from_lower_el()
     }
 
     /// Which vector was taken.
