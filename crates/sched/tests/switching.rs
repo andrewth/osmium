@@ -206,3 +206,18 @@ fn migration_between_cpus() {
     assert_eq!(*visited, expected, "alternated between the two CPUs");
     assert!(HOOK_CALLS.load(Ordering::Relaxed) >= 50, "every hop notified the target CPU");
 }
+
+#[test]
+fn task_data() {
+    become_cpu();
+    #[derive(Debug, PartialEq)]
+    struct AddressSpace(u64);
+    let t = builder("with-data").data(AddressSpace(0x1234)).build(|| {});
+    assert_eq!(t.data::<AddressSpace>(), Some(&AddressSpace(0x1234)));
+    assert_eq!(t.data::<u32>(), None, "wrong type");
+    assert_eq!(t.set_data(7u32), Err(7), "already set");
+    let u = builder("later").build(|| {});
+    assert!(u.data::<u32>().is_none());
+    u.set_data(9u32).unwrap();
+    assert_eq!(u.data::<u32>(), Some(&9));
+}

@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use core::any::Any;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -127,6 +128,7 @@ pub struct Task {
     pub(crate) entry: UnsafeCell<Option<Entry>>,
     _stack: Option<Stack>,
     pub(crate) exit_waiters: WaitQueue,
+    data: osmium_sync::Once<Box<dyn Any + Send + Sync>>,
 }
 
 // SAFETY: `ctx` is only touched by the CPU switching the task in or out,
@@ -186,6 +188,24 @@ impl Task {
         self._stack.as_ref().map(|s| s.bottom()..s.top())
     }
 
+    /// Attaches kernel-defined data (an address space, credentials, a file
+    /// table, ...). Each task holds at most one value; returns it back if
+    /// one is already set.
+    pub fn set_data<T: Any + Send + Sync>(&self, value: T) -> Result<(), T> {
+        let mut value = Some(value);
+        self.data.call_once(|| Box::new(value.take().unwrap()));
+        match value {
+            None => Ok(()),
+            Some(v) => Err(v),
+        }
+    }
+
+    /// The data attached with [`Task::set_data`] or [`TaskBuilder::data`],
+    /// if it is a `T`.
+    pub fn data<T: Any>(&self) -> Option<&T> {
+        self.data.get()?.downcast_ref()
+    }
+
     /// Returns true if this is a CPU's idle task.
     pub fn is_idle(&self) -> bool {
         self.is_idle
@@ -229,6 +249,7 @@ impl Task {
             entry: UnsafeCell::new(entry),
             _stack: stack,
             exit_waiters: WaitQueue::new(),
+            data: osmium_sync::Once::new(),
         }
     }
 }
@@ -240,12 +261,18 @@ impl fmt::Debug for Task {
 }
 
 /// Configures and creates a [`Task`].
-#[derive(Clone, Debug)]
 pub struct TaskBuilder {
     name: &'static str,
     stack_size: usize,
     priority: u8,
     cpu: Option<usize>,
+    data: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for TaskBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskBuilder").field("name", &self.name).field("cpu", &self.cpu).finish_non_exhaustive()
+    }
 }
 
 impl TaskBuilder {
@@ -254,7 +281,7 @@ impl TaskBuilder {
 
     /// Starts building a task called `name`.
     pub fn new(name: &'static str) -> Self {
-        Self { name, stack_size: Self::DEFAULT_STACK, priority: 0, cpu: None }
+        Self { name, stack_size: Self::DEFAULT_STACK, priority: 0, cpu: None, data: None }
     }
 
     /// Sets the stack size in bytes.
@@ -275,11 +302,21 @@ impl TaskBuilder {
         self
     }
 
+    /// Attaches data before the task first runs, so a switch hook sees it
+    /// on the very first switch; see [`Task::data`].
+    pub fn data<T: Any + Send + Sync>(mut self, value: T) -> Self {
+        self.data = Some(Box::new(value));
+        self
+    }
+
     /// Creates the task without making it runnable; see [`crate::spawn`].
     pub fn build(self, f: impl FnOnce() + Send + 'static) -> Arc<Task> {
         let cpu = self.cpu.unwrap_or_else(osmium_arch::cpu::current_id);
         let t = Task::raw(self.name, Some(self.stack_size), Some(Box::new(f)), cpu, false);
         t.priority.store(self.priority, Ordering::Relaxed);
+        if let Some(d) = self.data {
+            t.data.call_once(|| d);
+        }
         Arc::new(t)
     }
 
