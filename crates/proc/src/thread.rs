@@ -7,7 +7,7 @@
 //! `exit` ends the calling thread; the process ends when its last thread
 //! does, or at once with `exit_group` or a fatal signal, which stops the
 //! other threads the next time each is in the kernel (a timer interrupt is
-//! enough, if the kernel calls [`crate::signal::deliver`] on it).
+//! enough, if the kernel calls `signal::deliver` on it).
 //!
 //! All of a process's threads run on one CPU: unmapping memory does not shoot
 //! down other CPUs' TLB entries yet. Joining uses `CLONE_CHILD_CLEARTID` and

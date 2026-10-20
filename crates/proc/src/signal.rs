@@ -3,10 +3,10 @@
 //!
 //! Signals do not queue: each signal number is pending or not. Process-wide
 //! state (dispositions, the process-directed pending set) lives in
-//! [`Signals`]; each thread has a mask and a pending set of its own
+//! `Signals`; each thread has a mask and a pending set of its own
 //! ([`crate::thread::Thread`]). Delivery happens when a thread returns to
-//! user mode, which is when [`deliver`] (after every system call, in
-//! [`crate::syscall::handle`]) or a kernel's own call to it runs.
+//! user mode, which is when `deliver` (after every system call, in
+//! `syscall::handle`) or a kernel's own call to it runs.
 //!
 //! The signal frame is Osmium's own layout, not Linux's `ucontext`: 128 bytes
 //! of `siginfo` (`si_signo`, `si_code`, and `si_pid` or `si_addr` where
@@ -556,7 +556,7 @@ pub(crate) fn on_exec(p: &Process) {
 use osmium_arch::trap::TrapFrame;
 
 /// Delivers a pending signal to the current thread, for a trap taken from
-/// user mode (other than a system call, which [`crate::syscall::handle`]
+/// user mode (other than a system call, which `syscall::handle`
 /// covers). Call it when about to return to user mode, for example after a
 /// timer interrupt: this is also where a process ended by a signal or
 /// `exit_group` stops its other threads. Returns `Some` if the process must
