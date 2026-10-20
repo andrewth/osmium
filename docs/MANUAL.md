@@ -675,7 +675,7 @@ vfs.mount("/cdrom", iso.root())?;
 | Read/write | yes, or read-only if the volume has an unknown read-only feature (`quota`, `bigalloc`, …) | yes | read-only |
 | Names | ext directories; hashed indexes are scanned linearly and dropped on change | VFAT long names, generated 8.3 aliases | Rock Ridge if present, else Joliet, else lower-cased ISO names (`names()` says which) |
 | Extras | extents, `64bit`, `flex_bg`, `metadata_csum` (verified and kept); `set_clock` for timestamps; `into_device` to unmount | `free_bytes` from FSInfo | Symlinks and device nodes via Rock Ridge; files over 4 GiB; any device block size |
-| Not supported | journal replay (a clean journal is left alone; a dirty one fails with `ENOSYS`), `inline_data`, encryption, casefolding, rename, hard links | FAT12/16, timestamps, rename; device block sizes that are not a power of two up to 4 KiB; directories over 65536 entries | interleaved files, timestamps, multi-session beyond the first, UDF |
+| Not supported | journal replay (a clean journal is left alone; a dirty one fails with `ENOSYS`), `inline_data`, encryption, casefolding, rename, hard links | FAT12/16, timestamps, rename; device block sizes that are not a power of two up to 4 KiB; directories over 65536 entries | timestamps, multi-session beyond the first, UDF |
 
 The ext driver writes changes in place and journals nothing, and there is
 no block cache. Call `sync()` before removing the device. A corrupt layout

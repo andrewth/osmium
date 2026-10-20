@@ -42,7 +42,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-net` | Polled IPv4 stack over any `NetDevice`: ARP, ICMP echo, UDP, TCP, DHCP client | yes |
 | `osmium-iscsi` | iSCSI initiator over `osmium-net` TCP as a `BlockDevice`: login and negotiation, R2T and immediate-data writes, SendTargets discovery | yes |
 | `osmium-fs-ext4` | ext2/ext3/ext4 (read and write) for the `osmium-fs` VFS over any `BlockDevice` | yes |
-| `osmium-fs-iso9660` | read-only ISO 9660 for the `osmium-fs` VFS over any `BlockDevice`: Rock Ridge, Joliet, deep-directory relocation, multi-extent files | yes |
+| `osmium-fs-iso9660` | read-only ISO 9660 for the `osmium-fs` VFS over any `BlockDevice`: Rock Ridge, Joliet, deep-directory relocation, multi-extent and interleaved files | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
 
 The library never defines an entry point, panic handler or global allocator;

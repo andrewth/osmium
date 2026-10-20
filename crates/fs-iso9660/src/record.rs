@@ -26,8 +26,9 @@ pub struct Record<'src> {
     pub size: u32,
     /// [`flag`] bits.
     pub flags: u8,
-    /// Recorded in interleaved mode, which is not supported.
-    pub interleaved: bool,
+    /// File unit size and interleave gap size, in logical blocks (both
+    /// non-zero for an interleaved file).
+    pub interleave: (u8, u8),
     /// The raw file identifier.
     pub name: &'src [u8],
     /// The system use area (SUSP and Rock Ridge entries).
@@ -52,7 +53,7 @@ impl<'src> Record<'src> {
             extent: le32(2).wrapping_add(r[1] as u32),
             size: le32(10),
             flags: r[25],
-            interleaved: r[26] != 0 || r[27] != 0,
+            interleave: (r[26], r[27]),
             name: &r[33..name_end],
             system_use: &r[su..],
         })

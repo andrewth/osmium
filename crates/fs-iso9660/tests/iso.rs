@@ -282,3 +282,123 @@ fn check_read_only(vfs: &Vfs) {
     assert_eq!(vfs.lookup("/hello.txt/x").err(), Some(Errno::ENOTDIR));
     assert_eq!(vfs.lookup("/missing").err(), Some(Errno::ENOENT));
 }
+
+/// A directory record (no system use area).
+fn record(name: &[u8], extent: u32, size: u32, flags: u8, unit: u8, gap: u8) -> Vec<u8> {
+    let pad = (name.len() + 1) % 2;
+    let len = 33 + name.len() + pad;
+    let mut r = vec![0u8; len];
+    r[0] = len as u8;
+    r[2..6].copy_from_slice(&extent.to_le_bytes());
+    r[10..14].copy_from_slice(&size.to_le_bytes());
+    r[25] = flags;
+    r[26] = unit;
+    r[27] = gap;
+    r[32] = name.len() as u8;
+    r[33..33 + name.len()].copy_from_slice(name);
+    r
+}
+
+/// One record of a synthetic file: `(extent, size, unit, gap)`.
+type Rec = (u32, u32, u8, u8);
+
+/// A synthetic image whose root (block 18) holds `files`, each a list of
+/// records; `data` is placed at the given blocks.
+fn synthetic(files: &[(&[u8], &[Rec])], data: &[(u32, &[u8])]) -> Arc<Vec<u8>> {
+    const B: usize = 2048;
+    let mut img = vec![0u8; 64 * B];
+    let root = record(&[0], 18, B as u32, 2, 0, 0);
+    let pvd = &mut img[16 * B..17 * B];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    pvd[40..72].fill(b' ');
+    pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+    pvd[156..156 + root.len()].copy_from_slice(&root);
+    let term = &mut img[17 * B..18 * B];
+    term[0] = 255;
+    term[1..6].copy_from_slice(b"CD001");
+    term[6] = 1;
+    let mut dir = record(&[0], 18, B as u32, 2, 0, 0);
+    dir.extend(record(&[1], 18, B as u32, 2, 0, 0));
+    for (name, recs) in files {
+        for (i, &(extent, size, unit, gap)) in recs.iter().enumerate() {
+            let flags = if i + 1 < recs.len() { 0x80 } else { 0 };
+            dir.extend(record(name, extent, size, flags, unit, gap));
+        }
+    }
+    assert!(dir.len() <= B);
+    img[18 * B..18 * B + dir.len()].copy_from_slice(&dir);
+    for &(block, bytes) in data {
+        img[block as usize * B..block as usize * B + bytes.len()].copy_from_slice(bytes);
+    }
+    Arc::new(img)
+}
+
+fn blocks(tag: u8, n: usize) -> Vec<u8> {
+    (0..n * 2048).map(|i| tag.wrapping_add((i / 2048) as u8 * 16).wrapping_add(i as u8)).collect()
+}
+
+#[test]
+fn interleaved_files() {
+    // Units of 2 blocks with a gap of 1 block: data blocks 0,1 at 20,21,
+    // 2,3 at 23,24, block 4 at 26; the gaps (22, 25) hold other data.
+    let file = blocks(1, 5);
+    let junk = vec![0xEEu8; 2048];
+    let mut data: Vec<(u32, &[u8])> = Vec::new();
+    for (i, at) in [20u32, 21, 23, 24, 26].into_iter().enumerate() {
+        data.push((at, &file[i * 2048..(i + 1) * 2048]));
+    }
+    data.push((22, &junk));
+    data.push((25, &junk));
+    // Not quite whole: 4 blocks + 100 bytes.
+    let size = 4 * 2048 + 100;
+    // The second file is two extents: 3 blocks at 30 (units of 1, gap 1:
+    // 30, 32, 34), then 2 contiguous blocks at 40.
+    let second = blocks(7, 5);
+    for (at, i) in [(30u32, 0usize), (32, 1), (34, 2), (40, 3), (41, 4)] {
+        data.push((at, &second[i * 2048..(i + 1) * 2048]));
+    }
+    let img = synthetic(
+        &[(b"A.BIN;1", &[(20, size, 2, 1)]), (b"B.BIN;1", &[(30, 3 * 2048, 1, 1), (40, 2 * 2048, 0, 0)])],
+        &data,
+    );
+    let fs = mount(&img, 2048);
+    let root = fs.root();
+    let a = root.lookup("a.bin").unwrap();
+    assert_eq!(a.stat().size, size as u64);
+    assert_eq!(read_all(&*a), file[..size as usize]);
+    // Reads that start and end inside units, crossing gaps.
+    let mut buf = vec![0u8; 3000];
+    for off in [0u64, 1, 2047, 2048, 4095, 4096, 5000, 8000] {
+        let n = a.read(off, &mut buf).unwrap();
+        let end = (off as usize + 3000).min(size as usize);
+        assert_eq!(&buf[..n], &file[off as usize..end], "offset {off}");
+    }
+    assert_eq!(a.read(size as u64, &mut buf).unwrap(), 0);
+    let b = root.lookup("b.bin").unwrap();
+    assert_eq!(b.stat().size, 5 * 2048);
+    assert_eq!(read_all(&*b), second);
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(b.read(2048 * 2 + 1000, &mut buf).unwrap(), 4096);
+    assert_eq!(buf, second[2048 * 2 + 1000..2048 * 2 + 1000 + 4096]);
+}
+
+#[test]
+fn interleave_needs_both_fields_and_bounds() {
+    let file = blocks(3, 2);
+    let data: Vec<(u32, &[u8])> = vec![(20, &file[..2048]), (21, &file[2048..])];
+    // A unit size without a gap (or the reverse) is contiguous data.
+    let img = synthetic(&[(b"U.BIN;1", &[(20, 4096, 1, 0)]), (b"G.BIN;1", &[(20, 4096, 0, 3)])], &data);
+    let fs = mount(&img, 2048);
+    assert_eq!(read_all(&*fs.root().lookup("u.bin").unwrap()), file);
+    assert_eq!(read_all(&*fs.root().lookup("g.bin").unwrap()), file);
+    // Units that run past the end of the image fail rather than wrap.
+    let img = synthetic(&[(b"X.BIN;1", &[(20, 40 * 2048, 1, 255)])], &data);
+    let fs = mount(&img, 2048);
+    let x = fs.root().lookup("x.bin").unwrap();
+    let mut buf = vec![0u8; 2048];
+    assert_eq!(x.read(0, &mut buf).unwrap(), 2048);
+    assert_eq!(x.read(2048, &mut buf), Err(Errno::EIO));
+    assert_eq!(x.read(39 * 2048, &mut buf), Err(Errno::EIO));
+}

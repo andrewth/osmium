@@ -9,15 +9,16 @@
 //! tree's Unicode names, else plain ISO 9660 names shown in lower case
 //! without their `;1` version (and looked up ignoring case).
 //!
-//! Files of several extents (ISO level 3, larger than 4 GiB) are read
-//! whole. The device can have any block size; reads are byte-addressed.
+//! Files of several extents (ISO level 3, larger than 4 GiB) and
+//! interleaved files (a file unit size and an interleave gap size in the
+//! directory record, each extent read unit by unit) are read whole. The device can have any block size; reads are byte-addressed.
 //!
 //! The volume is immutable, so nodes hold no shared state: a directory
 //! reads and caches its entries the first time it is listed or searched.
 //! Inode numbers are disk positions: a directory's is that of its extent,
 //! anything else's that of its directory record.
 //!
-//! Not supported: interleaved files (reading one is `EIO`), timestamps,
+//! Not supported: timestamps (`osmium_fs::Stat` has no fields for them),
 //! owners, multi-session discs beyond the first session's descriptors, and
 //! UDF.
 #![no_std]
@@ -77,12 +78,47 @@ pub enum Names {
     RockRidge,
 }
 
-/// Contiguous file data.
+/// File data of one directory record, contiguous or interleaved.
 #[derive(Clone, Copy)]
 struct Extent {
     /// Byte offset on the device.
     start: u64,
+    /// Bytes of data (the gaps of an interleaved extent are not counted).
     len: u64,
+    /// Bytes in each interleave unit; 0 if the data is contiguous.
+    unit: u64,
+    /// Bytes skipped between two units.
+    gap: u64,
+}
+
+impl Extent {
+    fn contiguous(start: u64, len: u64) -> Self {
+        Extent { start, len, unit: 0, gap: 0 }
+    }
+
+    fn of(rec: &Record, lbs: u64) -> Self {
+        let (unit, gap) = rec.interleave;
+        // Both fields must be set for the extent to be interleaved.
+        let (unit, gap) = if unit != 0 && gap != 0 { (unit as u64 * lbs, gap as u64 * lbs) } else { (0, 0) };
+        Extent { start: rec.extent as u64 * lbs, len: rec.size as u64, unit, gap }
+    }
+
+    /// The device offset of data byte `skip` (below `len`) and how many
+    /// bytes from there are contiguous; `EIO` if the arithmetic overflows.
+    fn locate(&self, skip: u64) -> Result<(u64, u64), Errno> {
+        let rest = self.len - skip;
+        if self.unit == 0 {
+            return Ok((self.start.checked_add(skip).ok_or(Errno::EIO)?, rest));
+        }
+        let stride = self.unit.checked_add(self.gap).ok_or(Errno::EIO)?;
+        let within = skip % self.unit;
+        let at = (skip / self.unit)
+            .checked_mul(stride)
+            .and_then(|o| o.checked_add(within))
+            .and_then(|o| self.start.checked_add(o))
+            .ok_or(Errno::EIO)?;
+        Ok((at, rest.min(self.unit - within)))
+    }
 }
 
 /// Everything known about one node, from its directory record.
@@ -97,7 +133,6 @@ struct Entry {
     size: u64,
     extents: Vec<Extent>,
     link: Option<String>,
-    interleaved: bool,
 }
 
 struct Shared<D: BlockDevice + Send + 'static> {
@@ -211,9 +246,8 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
             nlink: 2,
             rdev: 0,
             size: root.size as u64,
-            extents: vec![Extent { start, len: root.size as u64 }],
+            extents: vec![Extent::contiguous(start, root.size as u64)],
             link: None,
-            interleaved: false,
         };
         if shared.names == Names::RockRidge {
             let mut budget = SUSP_BUDGET;
@@ -303,9 +337,8 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             nlink: if dir { 2 } else { 1 },
             rdev: 0,
             size: rec.size as u64,
-            extents: vec![Extent { start: rec.extent as u64 * self.lbs, len: rec.size as u64 }],
+            extents: vec![Extent::of(rec, self.lbs)],
             link: None,
-            interleaved: rec.interleaved,
         };
         if self.names == Names::RockRidge {
             let mut rr = self.rock_ridge(rec.system_use, budget)?;
@@ -333,7 +366,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
                 }
                 e.kind = FileKind::Directory;
                 e.size = dot.size as u64;
-                e.extents = vec![Extent { start, len: e.size }];
+                e.extents = vec![Extent::contiguous(start, e.size)];
             }
             if e.kind == FileKind::Symlink {
                 e.link = rr.take_link();
@@ -368,9 +401,8 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             }
             let last = rec.flags & flag::MULTI_EXTENT == 0;
             if let Some(p) = &mut partial {
-                p.extents.push(Extent { start: rec.extent as u64 * self.lbs, len: rec.size as u64 });
+                p.extents.push(Extent::of(&rec, self.lbs));
                 p.size += rec.size as u64;
-                p.interleaved |= rec.interleaved;
                 if last {
                     out.extend(partial.take());
                 }
@@ -421,9 +453,6 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             FileKind::Directory => return Err(Errno::EISDIR),
             _ => return Err(Errno::EINVAL),
         }
-        if self.entry.interleaved {
-            return Err(Errno::EIO);
-        }
         if off >= self.entry.size {
             return Ok(0);
         }
@@ -437,9 +466,14 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
                 skip -= ext.len;
                 continue;
             }
-            let n = (ext.len - skip).min((want - done) as u64) as usize;
-            self.shared.read_at(ext.start + skip, &mut buf[done..done + n])?;
-            done += n;
+            // An interleaved extent is read one unit at a time.
+            while skip < ext.len && done < want {
+                let (at, run) = ext.locate(skip)?;
+                let n = run.min((want - done) as u64) as usize;
+                self.shared.read_at(at, &mut buf[done..done + n])?;
+                done += n;
+                skip += n as u64;
+            }
             skip = 0;
         }
         Ok(done)
