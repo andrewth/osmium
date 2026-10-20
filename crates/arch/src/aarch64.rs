@@ -62,7 +62,8 @@ sysreg!(read_cntp_tval_el0, write_cntp_tval_el0, "cntp_tval_el0");
 
 /// Makes FP/SIMD instructions trap at EL0 and EL1 (`CPACR_EL1.FPEN` = 0),
 /// for kernels that do not save FP state per task: otherwise one process's
-/// registers would be visible to the next. Call on each CPU.
+/// registers would be visible to the next. Call on each CPU. Kernels that do
+/// switch it use [`crate::fp::enable`] instead.
 ///
 /// # Safety
 /// Nothing running at EL1 may use FP/SIMD afterwards (softfloat targets

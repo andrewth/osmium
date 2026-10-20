@@ -85,6 +85,7 @@ mod at {
     pub const PHNUM: u64 = 5;
     pub const PAGESZ: u64 = 6;
     pub const ENTRY: u64 = 9;
+    pub const HWCAP: u64 = 16;
     pub const UID: u64 = 11;
     pub const EUID: u64 = 12;
     pub const GID: u64 = 13;
@@ -125,6 +126,7 @@ impl Process {
             (at::PHNUM, u64::from(le16(&image, 56))),
             (at::PAGESZ, 4096),
             (at::ENTRY, elf.entry()),
+            (at::HWCAP, hwcap()),
             (at::UID, 0),
             (at::EUID, 0),
             (at::GID, 0),
@@ -139,7 +141,30 @@ impl Process {
         let old = self.replace_image(name, memory, brk, platform.mmap_area.clone());
         (platform.activate)(root);
         drop(old);
+        if osmium_arch::fp::enabled() {
+            // The new program starts with cleared FP/SIMD registers.
+            // SAFETY: we run on the process's own task, whose registers these
+            // are; a kernel that enabled FP enables it on every CPU.
+            unsafe { osmium_arch::fp::FpState::new().restore() };
+        }
         Ok(UserEntry { pc: elf.entry(), sp })
+    }
+}
+
+/// `AT_HWCAP` in Linux's encoding. FP/SIMD is listed only once
+/// [`osmium_arch::fp::enable`] has run: until then FP instructions trap.
+fn hwcap() -> u64 {
+    let fp = osmium_arch::fp::enabled();
+    let ext = |s: &[u8]| s.iter().map(|c| 1 << (c - b'a')).sum::<u64>();
+    if cfg!(target_arch = "x86_64") {
+        // CPUID.1:EDX: FPU, FXSR, SSE, SSE2.
+        if fp { 1 | 1 << 24 | 1 << 25 | 1 << 26 } else { 0 }
+    } else if cfg!(target_arch = "aarch64") {
+        // HWCAP_FP, HWCAP_ASIMD.
+        if fp { 0b11 } else { 0 }
+    } else {
+        // One bit per single-letter extension.
+        ext(b"imac") | if fp { ext(b"fd") } else { 0 }
     }
 }
 

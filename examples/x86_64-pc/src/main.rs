@@ -150,9 +150,9 @@ fn load_cpu_tables() {
     }
     let ptr = &raw mut *tables;
     CPU_TABLES[cpu::current_id()].store(ptr, Ordering::Relaxed);
-    // SAFETY: the kernel is soft-float. FP state isn't switched per task, so
-    // user FP must fault rather than leak between processes.
-    unsafe { x86::trap_fp() };
+    // SAFETY: the kernel is soft-float. Processes may use x87 and SSE: each
+    // one's registers are switched with its task.
+    unsafe { osmium::arch::fp::enable() };
     // SAFETY: called once per CPU, with interrupts disabled.
     irq::without(|| unsafe { tables.load() });
     // SAFETY: the tables are loaded on this CPU and live forever; traps are

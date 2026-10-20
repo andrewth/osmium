@@ -249,9 +249,9 @@ extern "C" fn kmain(x0: usize) -> ! {
     trap::set_handler(on_trap);
     // SAFETY: we run on a valid kernel stack from here on.
     unsafe { trap::install() };
-    // SAFETY: the kernel is soft-float. FP state isn't switched per task, so
-    // user FP must trap rather than leak between processes.
-    unsafe { aarch64::trap_fp() };
+    // SAFETY: the kernel is soft-float. Processes may use FP: each one's
+    // registers are switched with its task.
+    unsafe { osmium::arch::fp::enable() };
 
     // SAFETY: QEMU virt's PL011 lives here and nothing else drives it.
     let mut uart = Pl011::new(unsafe { IoMem::new(EARLY_UART as *mut u8, 0x1000) }).unwrap();
@@ -448,7 +448,7 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     // SAFETY: we are on the stack the boot CPU allocated for us.
     unsafe { trap::install() };
     // SAFETY: as on the boot CPU.
-    unsafe { aarch64::trap_fp() };
+    unsafe { osmium::arch::fp::enable() };
     enable_mmu(PhysAddr::new(TTBR0.load(Ordering::Acquire)));
     set_exception_stack();
     osmium::sched::init_cpu();

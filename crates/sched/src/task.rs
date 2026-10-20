@@ -7,6 +7,8 @@ use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use osmium_arch::fp::FpState;
+
 use crate::context::Context;
 use crate::sync::WaitQueue;
 
@@ -135,10 +137,13 @@ pub struct Task {
     _stack: Option<Stack>,
     pub(crate) exit_waiters: WaitQueue,
     data: osmium_sync::Once<Box<dyn Any + Send + Sync>>,
+    /// FP/SIMD registers, saved while the task is switched out; see
+    /// [`TaskBuilder::fp_state`].
+    pub(crate) fp: Option<Box<UnsafeCell<FpState>>>,
 }
 
-// SAFETY: `ctx` is only touched by the CPU switching the task in or out,
-// serialized by `on_cpu`; `entry` is taken once by the task itself.
+// SAFETY: `ctx` and `fp` are only touched by the CPU switching the task in
+// or out, serialized by `on_cpu`; `entry` is taken once by the task itself.
 unsafe impl Sync for Task {}
 // SAFETY: as above.
 unsafe impl Send for Task {}
@@ -307,6 +312,7 @@ impl Task {
             _stack: stack,
             exit_waiters: WaitQueue::new(),
             data: osmium_sync::Once::new(),
+            fp: None,
         }
     }
 }
@@ -325,6 +331,7 @@ pub struct TaskBuilder {
     cpu: Option<usize>,
     affinity: u64,
     data: Option<Box<dyn Any + Send + Sync>>,
+    fp: Option<FpState>,
 }
 
 impl fmt::Debug for TaskBuilder {
@@ -339,7 +346,7 @@ impl TaskBuilder {
 
     /// Starts building a task called `name`.
     pub fn new(name: &'static str) -> Self {
-        Self { name, stack_size: Self::DEFAULT_STACK, priority: 0, cpu: None, affinity: ALL_CPUS, data: None }
+        Self { name, stack_size: Self::DEFAULT_STACK, priority: 0, cpu: None, affinity: ALL_CPUS, data: None, fp: None }
     }
 
     /// Sets the stack size in bytes.
@@ -376,13 +383,24 @@ impl TaskBuilder {
         self
     }
 
+    /// Gives the task its own FP/SIMD registers, starting as `state`: the
+    /// context switch saves them when the task leaves a CPU and loads them
+    /// when it arrives. For tasks that run user code that may use FP; every
+    /// CPU that runs the task must have had [`osmium_arch::fp::enable`]
+    /// succeed. Tasks without one leave the registers as they find them.
+    pub fn fp_state(mut self, state: FpState) -> Self {
+        self.fp = Some(state);
+        self
+    }
+
     /// Creates the task without making it runnable; see [`crate::spawn`].
     pub fn build(self, f: impl FnOnce() + Send + 'static) -> Arc<Task> {
         let mut cpu = self.cpu.unwrap_or_else(osmium_arch::cpu::current_id);
         if self.affinity & (1 << cpu) == 0 {
             cpu = self.affinity.trailing_zeros() as usize;
         }
-        let t = Task::raw(self.name, Some(self.stack_size), Some(Box::new(f)), cpu, false);
+        let mut t = Task::raw(self.name, Some(self.stack_size), Some(Box::new(f)), cpu, false);
+        t.fp = self.fp.map(|s| Box::new(UnsafeCell::new(s)));
         t.priority.store(self.priority, Ordering::Relaxed);
         t.affinity.store(self.affinity, Ordering::Relaxed);
         if let Some(d) = self.data {

@@ -26,7 +26,7 @@ hypervisor with `osmium-virt`.
 
 | Crate | What it provides | Needs `alloc` |
 |---|---|---|
-| `osmium-arch` | IRQ flag control, CPU id, trap entry with a portable `Trap` cause, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
+| `osmium-arch` | IRQ flag control, CPU id, trap entry with a portable `Trap` cause, per-task FP/SIMD state, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
 | `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA, display), linear framebuffers with pixel formats, `IrqTable`, global console with `println!` | no |

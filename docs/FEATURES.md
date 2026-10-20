@@ -109,7 +109,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ x86_64 user mode: `enter_user` (ring 3 via `iretq`), system calls by `syscall` (`CpuTables::enable_syscall`; the stub builds the same frame as `int 0x80`) or `int 0x80` (`trap::allow_from_user`), `TrapFrame::from_user`
 - ✅ RISC-V trap entry swaps through `sscratch` to a per-CPU `TrapCpu`: an exception stack when the interrupted kernel stack overflowed, a kernel stack for traps from U-mode, and a hook point for hypervisor guest exits
 - ✅ AArch64 current-EL vectors check `sp` against the same per-CPU `TrapCpu` before the first store and move to an exception stack on overflow (vector sizes enforced at assembly time)
-- 🗺 FPU/SIMD state save and restore; user-mode entry/return
+- ✅ Per-task FP/SIMD state (`fp::FpState`: x87/SSE by FXSAVE, AArch64 `q0`–`q31` with FPCR/FPSR, RISC-V D with `fcsr`) and `fp::enable` per CPU; the scheduler switches it for tasks built with `TaskBuilder::fp_state`, `osmium-proc` gives every process one (copied by `fork`, cleared by `execve`, advertised in `AT_HWCAP`), and all three examples' `init` checks it
+- 🗺 AVX/XSAVE, SVE and lazy FP switching
 
 ### `osmium-sync`: synchronization
 - ✅ `SpinLock<T, G>`: a fair ticket lock, generic over a *guardian* (`PreemptDisabled` by default, `IrqDisabled`, `NoGuard`)
@@ -180,7 +181,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `WaitQueue` (no lost wake-ups), sleeping `Mutex`, `Semaphore`
 - ✅ `TimerQueue`: deadline-ordered callbacks driven by the timer IRQ
 - ✅ `osmium-exec`: heap-free async executor (fixed task slots, interrupt-safe wakers, idle-until-interrupt without lost wake-ups, `run_with` for stack-pinned `async fn`s), `Signal`, `AtomicWaker`, `StaticCell`
-- 🗺 Load balancing, EDF policy
+- 🗺 EDF policy
 
 ### `osmium-boot`: boot protocols
 - ✅ Flattened Device Tree (DTB) parser: zero-copy nodes and properties, `reg` decoding with `#address-cells`/`#size-cells`, `compatible` search
@@ -224,7 +225,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ RISC-V H-extension `Vcpu` (`riscv64-hs`): world switch through the trap entry's guest-exit hook, VS CSR switching, MMIO emulation from guest-page faults (`htinst` or `hlvx`-fetched instruction, compressed forms included), `wfi` halts, host-interrupt exits, and a minimal SBI (BASE, TIME, SRST, DBCN, legacy), and multi-vCPU guests (`GuestHarts`: SBI HSM start/stop/status, IPIs injected as `VSSIP`, RFENCE as deferred `fence.i`/`hfence.vvma`, and kicks of vCPUs running on other host CPUs), and guest floating-point state (D) switched per run
 - ✅ AMD SVM `Vcpu`: VMCB setup for a 32-bit flat guest, nested paging with `X86_64` tables, VMRUN world switch under CLGI/STGI, port I/O, `hlt`, `vmmcall` and interrupt exits, MMIO from nested page faults (a decoder for the MOV/MOVZX forms drivers use, with decode assists or a fetch from guest memory), interrupt injection through `EVENTINJ` with interrupt-window exits and re-injection of interrupted events, 64-bit guests on their own page tables (MMIO instructions fetched through a guest page walk), and FS/GS/TR/syscall state switched with VMLOAD/VMSAVE
 - ✅ AArch64 EL2 `Vcpu` (`aarch64-el2`, non-VHE): world switch through guest-exit hooks in the lower-EL vectors, EL1 system-register switching, stage 2 via `VTTBR_EL2`, MMIO emulation from data-abort syndromes, trapped `wfi`, IRQ exits, a virtual-IRQ line (`HCR_EL2.VI`), and PSCI for guests, including `CPU_ON`/`CPU_OFF`/`AFFINITY_INFO` for multi-vCPU guests (`smp::GuestCpus`, shared with RISC-V), and guest FP/SIMD state switched per run
-- 🗺 VMX `Vcpu` backend, multi-vCPU x86 guests, kicks on AArch64 (a host SGI), virtual interrupt controllers (APLIC/IMSIC, vGIC)
+- 🗺 VMX `Vcpu` backend, virtual interrupt controllers (APLIC/IMSIC, GICv3)
 
 ### `osmium-proc`: processes and system calls
 - ✅ `Process`: a user address space, a descriptor table of `osmium_fs::File`s, working directory, program break, `mmap` area and exit status, attached to its task through `TaskBuilder::data`; `current`, `root_for` (the switch hook's table), `exit`, `wait`, lookup by `Pid`

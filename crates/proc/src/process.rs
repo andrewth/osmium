@@ -8,6 +8,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use osmium_arch::fp::FpState;
 use osmium_mm::addr::{PAGE_SIZE, PhysAddr};
 use osmium_mm::paging::MapFlags;
 use osmium_sched::{Mutex, Task, TaskBuilder, WaitQueue};
@@ -199,8 +200,20 @@ impl Process {
 
     /// Creates the process's task from `builder` and makes it runnable.
     /// `entry` runs in the kernel on the task's stack and normally drops to
-    /// user mode (`enter_user`).
+    /// user mode (`enter_user`). Once [`osmium_arch::fp::enable`] has run,
+    /// the task gets its own FP/SIMD registers, starting cleared.
     pub fn spawn(self: &Arc<Self>, builder: TaskBuilder, entry: impl FnOnce() + Send + 'static) -> Arc<Task> {
+        self.spawn_with_fp(builder, FpState::new(), entry)
+    }
+
+    /// [`Process::spawn`], with the FP/SIMD registers starting as `fp`.
+    pub(crate) fn spawn_with_fp(
+        self: &Arc<Self>,
+        builder: TaskBuilder,
+        fp: FpState,
+        entry: impl FnOnce() + Send + 'static,
+    ) -> Arc<Task> {
+        let builder = if osmium_arch::fp::enabled() { builder.fp_state(fp) } else { builder };
         builder.data(self.clone()).spawn(entry)
     }
 

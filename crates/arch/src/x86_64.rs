@@ -141,7 +141,8 @@ pub unsafe fn write_cr3(v: u64) {
 
 /// Makes x87, MMX and SSE instructions fault on this CPU (CR0.EM and
 /// CR0.TS: `#UD` or `#NM`), for kernels that do not save FP state per task:
-/// otherwise one process's registers would be visible to the next.
+/// otherwise one process's registers would be visible to the next. Kernels
+/// that do switch it use [`crate::fp::enable`] instead.
 ///
 /// # Safety
 /// Nothing in the kernel may use those instructions afterwards (the

@@ -18,6 +18,7 @@ extern crate std;
 
 pub mod barrier;
 pub mod cpu;
+pub mod fp;
 pub mod irq;
 pub mod mmu;
 pub mod trap;

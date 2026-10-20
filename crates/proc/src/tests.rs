@@ -528,6 +528,7 @@ fn execve_loads_a_program_with_its_arguments() {
     assert_eq!((aux[&3], aux[&4], aux[&5], aux[&6], aux[&9]), (0x40_0040, 56, 2, 4096, ENTRY));
     assert_eq!(get(&p, aux[&3], 4), 1u32.to_le_bytes(), "AT_PHDR points at the first program header");
     get(&p, aux[&25], 16);
+    assert!(aux.contains_key(&16), "AT_HWCAP");
 
     // Descriptors survive unless close-on-exec.
     assert_eq!(call(&p, Sys::Read, &[kept, sp, 0]), 0);

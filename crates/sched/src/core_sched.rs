@@ -282,6 +282,20 @@ fn schedule(requeue: Option<EnqueueReason>) {
     next.set_cpu(cpu);
     next.state.store(TaskState::Running as u8, Ordering::Release);
     NEED_RESCHED.get_for(cpu).store(false, Ordering::Relaxed);
+    // The kernel never uses FP, so the registers still hold `cur`'s user
+    // values. `finish_switch` publishes the saved copy (`on_cpu`) before
+    // another CPU may load it.
+    // SAFETY: IRQs are off and only the CPU switching a task touches its
+    // `fp`. If FP is off on this CPU (`fp_state` misused), the instructions
+    // trap; they cannot touch other memory.
+    unsafe {
+        if let Some(fp) = &cur.fp {
+            (*fp.get()).save();
+        }
+        if let Some(fp) = &next.fp {
+            (*fp.get()).restore();
+        }
+    }
     if let Some(hook) = SWITCH_HOOK.get() {
         hook(&next);
     }

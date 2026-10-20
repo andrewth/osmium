@@ -783,7 +783,15 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
             // platform is set.
             let child = Process::find(child).expect("the parent holds its child");
             let resume = crate::exec::platform().expect("fork needs a platform").resume;
-            child.spawn(osmium_sched::TaskBuilder::new(child.name()), move || resume(regs));
+            // The child continues with the parent's FP registers, which are
+            // still live: the kernel never uses them.
+            let fp = if osmium_arch::fp::enabled() {
+                // SAFETY: a kernel that enables FP enables it on every CPU.
+                unsafe { osmium_arch::fp::FpState::capture() }
+            } else {
+                osmium_arch::fp::FpState::new()
+            };
+            child.spawn_with_fp(osmium_sched::TaskBuilder::new(child.name()), fp, move || resume(regs));
             frame.set_return(child.pid().0 as u64);
         }
         Outcome::Exec { pc, sp } => start(frame, pc, sp),

@@ -48,6 +48,36 @@ fn yield_interleaves_tasks() {
 }
 
 #[test]
+fn fp_state_follows_its_task() {
+    use osmium_arch::fp::{FpState, host};
+    become_cpu();
+    // SAFETY: hosted, so the FP registers are a per-thread variable.
+    assert!(unsafe { osmium_arch::fp::enable() });
+    let ok = Arc::new(AtomicUsize::new(0));
+    let tasks: Vec<_> = [1u64, 2]
+        .into_iter()
+        .map(|v| {
+            let ok = ok.clone();
+            builder("fp").fp_state(FpState::new()).spawn(move || {
+                assert_eq!(host::live(), 0, "a new task starts from FpState::new");
+                host::set_live(v);
+                for _ in 0..3 {
+                    osmium_sched::yield_now();
+                    assert_eq!(host::live(), v);
+                    // A task without FP state runs between the two.
+                    builder("no-fp").spawn(|| {}).join();
+                }
+                ok.fetch_add(1, Ordering::Relaxed);
+            })
+        })
+        .collect();
+    for t in &tasks {
+        t.join();
+    }
+    assert_eq!(ok.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn exited_task_is_freed() {
     become_cpu();
     let payload = Arc::new(());

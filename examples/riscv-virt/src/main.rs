@@ -238,6 +238,18 @@ fn on_switch(next: &osmium::sched::Task) {
     cpu.set_kernel_stack(next.kernel_stack_range().map_or(0, |r| r.end));
 }
 
+/// Returns true if the first hart's `riscv,isa` names single-letter
+/// extension `letter`.
+fn isa_has(fdt: &osmium::boot::fdt::Fdt<'_>, letter: char) -> bool {
+    let isa = fdt
+        .find_node("/cpus")
+        .and_then(|cpus| cpus.children().find(|c| c.property("riscv,isa").is_some()))
+        .and_then(|c| c.property("riscv,isa"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    isa.strip_prefix("rv64").unwrap_or("").split('_').next().unwrap_or("").contains(letter)
+}
+
 /// Gives this hart an emergency stack for traps from an overflowed stack.
 fn set_exception_stack() {
     let stack = alloc::vec![0u8; 16 * 1024].leak();
@@ -532,6 +544,12 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     osmium::sched::set_stack_allocator(&GuardedStacks);
     osmium::sched::set_switch_hook(on_switch);
     println!("[guard] task stacks get unmapped guard pages; overflowing traps move to a per-hart exception stack");
+    // Processes may use FP: each one's registers are switched with its task.
+    if isa_has(&fdt, 'd') {
+        // SAFETY: the kernel is soft-float, and the harts have D.
+        let on = unsafe { osmium::arch::fp::enable() };
+        println!("[fp]    user FP/SIMD state switched per task: {on}");
+    }
 
     // --- Scheduler and timer interrupts -----------------------------------
     osmium::sched::inject_scheduler(&SCHED);
@@ -755,6 +773,10 @@ extern "C" fn secondary_main(hartid: usize, boot: &SecondaryBoot) -> ! {
     // SAFETY: the boot hart's table identity-maps everything we touch.
     unsafe { riscv64::write_satp(SatpMode::Sv39, 0, SATP_ROOT.load(Ordering::Acquire)) };
     set_exception_stack();
+    if osmium::arch::fp::enabled() {
+        // SAFETY: as on the boot hart.
+        unsafe { osmium::arch::fp::enable() };
+    }
     osmium::sched::init_cpu();
     sbi::set_timer(cpu::ticks() + RATE.get().unwrap().ns_to_ticks(TICK_NS));
     // SAFETY: as on the boot hart.
