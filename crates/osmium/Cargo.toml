@@ -29,7 +29,7 @@ exec = ["dep:osmium-exec"]
 ## Virtual file system and RAM file system (needs `alloc`).
 fs = ["dep:osmium-fs"]
 ## Processes, user address spaces and Linux-numbered system calls (needs `alloc`).
-proc = ["dep:osmium-proc", "sched", "fs", "mm", "boot"]
+proc = ["dep:osmium-proc", "sched", "fs", "mm", "boot", "net"]
 ## FAT32 on any block device (needs `alloc`).
 fs-fat = ["fs", "dep:osmium-fs-fat"]
 ## IPv4 network stack: ARP, ICMP, UDP, TCP, DHCP (needs `alloc`).

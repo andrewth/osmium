@@ -50,6 +50,19 @@ pub enum Sys {
     Dup2,
     Dup3,
     Fcntl,
+    Socket,
+    Bind,
+    Listen,
+    Accept,
+    Accept4,
+    Connect,
+    Sendto,
+    Recvfrom,
+    Shutdown,
+    Getsockname,
+    Getpeername,
+    Setsockopt,
+    Getsockopt,
 }
 
 /// Linux system-call numbers for x86_64.
@@ -89,6 +102,19 @@ const NUMBERS: &[(u64, Sys)] = &[
     (258, Sys::Mkdirat),
     (262, Sys::Newfstatat),
     (263, Sys::Unlinkat),
+    (41, Sys::Socket),
+    (42, Sys::Connect),
+    (43, Sys::Accept),
+    (44, Sys::Sendto),
+    (45, Sys::Recvfrom),
+    (48, Sys::Shutdown),
+    (49, Sys::Bind),
+    (50, Sys::Listen),
+    (51, Sys::Getsockname),
+    (52, Sys::Getpeername),
+    (54, Sys::Setsockopt),
+    (55, Sys::Getsockopt),
+    (288, Sys::Accept4),
 ];
 
 /// Linux system-call numbers for RISC-V and AArch64 (asm-generic).
@@ -125,6 +151,19 @@ const NUMBERS: &[(u64, Sys)] = &[
     (214, Sys::Brk),
     (215, Sys::Munmap),
     (222, Sys::Mmap),
+    (198, Sys::Socket),
+    (200, Sys::Bind),
+    (201, Sys::Listen),
+    (202, Sys::Accept),
+    (203, Sys::Connect),
+    (204, Sys::Getsockname),
+    (205, Sys::Getpeername),
+    (206, Sys::Sendto),
+    (207, Sys::Recvfrom),
+    (208, Sys::Setsockopt),
+    (209, Sys::Getsockopt),
+    (210, Sys::Shutdown),
+    (242, Sys::Accept4),
 ];
 
 impl Sys {
@@ -243,6 +282,19 @@ pub fn dispatch(p: &Process, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Dup2 => dup3(p, fd, a[1] as i32, 0, true),
         Sys::Dup3 => dup3(p, fd, a[1] as i32, a[2], false),
         Sys::Fcntl => fcntl(p, fd, a[1], a[2]),
+        Sys::Socket => crate::socket::socket(p, a[0], a[1], a[2]),
+        Sys::Bind => crate::socket::bind(p, fd, a[1], a[2]),
+        Sys::Listen => crate::socket::listen(p, fd, a[1]),
+        Sys::Accept => crate::socket::accept(p, fd, a[1], a[2], 0),
+        Sys::Accept4 => crate::socket::accept(p, fd, a[1], a[2], a[3]),
+        Sys::Connect => crate::socket::connect(p, fd, a[1], a[2]),
+        Sys::Sendto => crate::socket::sendto(p, fd, a[1], a[2], a[3], a[4], a[5]),
+        Sys::Recvfrom => crate::socket::recvfrom(p, fd, a[1], a[2], a[3], a[4], a[5]),
+        Sys::Shutdown => crate::socket::shutdown(p, fd, a[1]),
+        Sys::Getsockname => crate::socket::getsockname(p, fd, a[1], a[2]),
+        Sys::Getpeername => crate::socket::getpeername(p, fd, a[1], a[2]),
+        Sys::Setsockopt => crate::socket::setsockopt(p, fd, a[1], a[2], a[3], a[4]),
+        Sys::Getsockopt => crate::socket::getsockopt(p, fd, a[1], a[2], a[3], a[4]),
     };
     Outcome::Return(match r {
         Ok(v) => v as i64,
@@ -730,10 +782,13 @@ fn fcntl(p: &Process, fd: i32, cmd: u64, arg: u64) -> SysResult {
                 (false, true) => oflag::WRONLY,
                 _ => 0,
             };
-            Ok(mode | if a.append { oflag::APPEND } else { 0 })
+            Ok(mode | if a.append { oflag::APPEND } else { 0 } | crate::socket::status_flags(f.file()))
         }
-        // No status flag (O_NONBLOCK, O_APPEND) can be changed yet.
-        F_SETFL => Ok(0),
+        // Only a socket's O_NONBLOCK can be changed so far.
+        F_SETFL => {
+            crate::socket::set_status_flags(f.file(), arg);
+            Ok(0)
+        }
         _ => Err(Errno::EINVAL),
     }
 }

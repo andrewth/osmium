@@ -127,7 +127,9 @@ dependencies = [
  "osmium-arch",
  "osmium-boot",
  "osmium-fs",
+ "osmium-hal",
  "osmium-mm",
+ "osmium-net",
  "osmium-sched",
  "osmium-sync",
 ]

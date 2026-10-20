@@ -61,6 +61,23 @@ errnos! {
     ELOOP = 40, "Too many symbolic links encountered.";
     EOVERFLOW = 75, "Value too large for defined data type.";
     EOPNOTSUPP = 95, "Operation not supported.";
+    ENOTSOCK = 88, "Socket operation on non-socket.";
+    EDESTADDRREQ = 89, "Destination address required.";
+    EMSGSIZE = 90, "Message too long.";
+    EPROTOTYPE = 91, "Protocol wrong type for socket.";
+    ENOPROTOOPT = 92, "Protocol not available.";
+    EPROTONOSUPPORT = 93, "Protocol not supported.";
+    EAFNOSUPPORT = 97, "Address family not supported by protocol.";
+    EADDRINUSE = 98, "Address already in use.";
+    EADDRNOTAVAIL = 99, "Cannot assign requested address.";
+    ENETUNREACH = 101, "Network is unreachable.";
+    ECONNRESET = 104, "Connection reset by peer.";
+    EISCONN = 106, "Transport endpoint is already connected.";
+    ENOTCONN = 107, "Transport endpoint is not connected.";
+    ETIMEDOUT = 110, "Connection timed out.";
+    ECONNREFUSED = 111, "Connection refused.";
+    EALREADY = 114, "Operation already in progress.";
+    EINPROGRESS = 115, "Operation now in progress.";
 }
 
 impl fmt::Debug for Errno {

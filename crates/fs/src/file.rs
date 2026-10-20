@@ -122,6 +122,12 @@ pub trait File: Send + Sync {
         Ok(())
     }
 
+    /// The node as [`Any`](core::any::Any), for a layer that needs operations
+    /// specific to its type (the socket calls); `None` by default.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
+
     /// Device-specific control (`ioctl`); returns the call's result.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<usize, Errno> {
         let _ = (cmd, arg);

@@ -16,3 +16,5 @@ osmium-mm.workspace = true
 osmium-sched.workspace = true
 osmium-boot.workspace = true
 osmium-fs.workspace = true
+osmium-hal.workspace = true
+osmium-net.workspace = true

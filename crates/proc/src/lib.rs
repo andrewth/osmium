@@ -66,6 +66,8 @@ pub mod fd;
 mod memory;
 mod process;
 pub mod syscall;
+pub mod net;
+pub mod socket;
 
 pub use exec::{ARG_MAX, Platform, UserEntry, set_platform};
 pub use fd::{FdTable, OpenFile, set_console};
@@ -90,3 +92,6 @@ pub(crate) fn vfs() -> Option<&'static Vfs> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod net_tests;
