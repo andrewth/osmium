@@ -556,16 +556,13 @@ pub(crate) fn on_exec(p: &Process) {
 use osmium_arch::trap::TrapFrame;
 
 /// Delivers a pending signal to the current thread, for a trap taken from
-/// user mode (other than a system call, which `syscall::handle`
-/// covers). Call it when about to return to user mode, for example after a
+/// user mode (other than a system call, which `syscall::handle` covers).
+/// Call it when about to return to user mode, for example after a
 /// timer interrupt: this is also where a process ended by a signal or
 /// `exit_group` stops its other threads. Returns `Some` if the process must
 /// end, as that status: call [`crate::exit`] with it.
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64")))]
 pub fn deliver(frame: &mut TrapFrame) -> Option<ExitStatus> {
-    if !frame.from_user() {
-        return None;
-    }
     let p = crate::current()?;
     let th = crate::thread::current_thread(&p);
     deliver_to(&p, &th, frame)
