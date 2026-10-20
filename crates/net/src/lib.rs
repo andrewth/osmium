@@ -6,6 +6,8 @@
 //! - [`SocketSet`]: the sockets an interface serves, addressed by
 //!   [`SocketHandle`]: [`TcpSocket`], [`UdpSocket`], [`IcmpSocket`] (ping)
 //!   and [`DhcpClient`], which configures the interface from a DHCP lease.
+//! - [`DnsClient`]: a resolver for IPv4 addresses over a UDP socket, with
+//!   retries and a cache.
 //! - [`wire`]: the packet formats, usable on their own.
 //!
 //! The stack keeps no globals and never blocks or reads a clock: the caller
@@ -14,10 +16,12 @@
 //! [`Interface::poll_at`]. Locking is the caller's choice too; a kernel
 //! typically wraps the interface, the device and the socket set in one lock.
 //!
-//! Not supported: IP fragmentation and reassembly (fragments are dropped and
-//! packets are sent with DF set), IP options, TCP window scaling, SACK,
-//! out-of-order reassembly (TCP drops out-of-order segments and lets the peer
-//! retransmit), IPv6 and multicast.
+//! TCP reassembles out-of-order data, is congestion controlled (NewReno, or
+//! RFC 6675 recovery with SACK) and negotiates window scaling. Fragmented
+//! IPv4 datagrams are reassembled, and UDP and ICMP datagrams larger than the
+//! MTU are fragmented when sent.
+//!
+//! Not supported: IP options, IPv6, multicast, TCP timestamps, DNS over TCP.
 //!
 //! [`NetDevice`]: osmium_hal::net::NetDevice
 #![no_std]
@@ -40,6 +44,7 @@ mod testing;
 pub use error::Error;
 pub use iface::{Config, Interface};
 pub use socket::dhcp::{DhcpClient, DhcpEvent};
+pub use socket::dns::{DnsClient, DnsError, DnsQuery};
 pub use socket::icmp::{EchoReply, IcmpSocket};
 pub use socket::tcp::{State as TcpState, TcpSocket};
 pub use socket::udp::UdpSocket;

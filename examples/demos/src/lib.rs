@@ -191,7 +191,9 @@ pub fn arp_tagged(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u6
 /// `guestfwd=tcp:10.0.2.100:7-cmd:cat` echo service. Gives up after five
 /// seconds.
 pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
-    use osmium::net::{DhcpClient, DhcpEvent, IcmpSocket, Instant, Interface, Ipv4Addr, SocketAddrV4, SocketSet, TcpSocket};
+    use osmium::net::{
+        DhcpClient, DhcpEvent, DnsClient, IcmpSocket, Instant, Interface, Ipv4Addr, SocketAddrV4, SocketSet, TcpSocket,
+    };
 
     const ECHO: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 100), 7);
     const MESSAGE: &[u8] = b"hello over TCP";
@@ -201,18 +203,26 @@ pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     let dhcp = sockets.add(DhcpClient::new());
     let ping = sockets.add(IcmpSocket::new(0x05ef, 2));
     let tcp = sockets.add(TcpSocket::new(1024, 1024));
+    let mut dns = DnsClient::new(&mut iface, &mut sockets);
+    let mut lookup = None;
+    let mut asked = false;
     let start = now();
     let mut pinged_at = None;
     let mut echoed = Vec::new();
     let mut tcp_done = false;
-    while now() - start < core::time::Duration::from_secs(5) && !(tcp_done && pinged_at.is_none()) {
+    while now() - start < core::time::Duration::from_secs(5) && !(tcp_done && pinged_at.is_none() && !dns.is_busy()) {
         iface.poll(now(), dev, &mut sockets);
+        dns.poll(now(), &iface, &mut sockets);
         if let Some(DhcpEvent::Configured(c)) = sockets.get_mut::<DhcpClient>(dhcp).take_event() {
             println!("[net]   DHCP: {}/{} via {}", c.address, c.prefix_len, c.gateway.unwrap_or(Ipv4Addr::UNSPECIFIED));
             match c.gateway.map(|gw| sockets.get_mut::<IcmpSocket>(ping).send_echo(gw, 1, b"osmium")) {
                 Some(Ok(())) => pinged_at = Some(now()),
                 Some(Err(e)) => println!("[net]   ping: {e}"),
                 None => println!("[net]   no gateway to ping"),
+            }
+            if !asked && c.dns.is_some() {
+                lookup = dns.resolve("localhost", now()).ok();
+                asked = true;
             }
             // A renewed or changed lease must not reconnect.
             let s = sockets.get_mut::<TcpSocket>(tcp);
@@ -224,6 +234,13 @@ pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
                 s.abort();
                 tcp_done = true;
             }
+        }
+        if let Some(r) = lookup.and_then(|q| dns.result(q)) {
+            match r {
+                Ok(addrs) => println!("[net]   DNS: localhost is {}", addrs[0]),
+                Err(e) => println!("[net]   DNS: localhost: {e}"),
+            }
+            lookup = None;
         }
         if let Some(r) = sockets.get_mut::<IcmpSocket>(ping).recv()
             && let Some(t) = pinged_at.take()

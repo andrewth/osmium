@@ -9,6 +9,7 @@ use crate::Instant;
 use crate::rng::Rng;
 
 pub mod dhcp;
+pub mod dns;
 pub mod icmp;
 pub mod tcp;
 pub mod udp;
@@ -41,6 +42,7 @@ pub(crate) struct Packet {
 }
 
 /// Any socket.
+#[allow(clippy::large_enum_variant)] // the variants are public and not boxed
 pub enum Socket {
     /// A TCP connection or listener.
     Tcp(TcpSocket),

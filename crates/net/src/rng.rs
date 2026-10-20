@@ -7,7 +7,12 @@ use crate::Instant;
 
 /// SipHash-1-3 of `words` under the key `(k0, k1)`.
 fn siphash(k0: u64, k1: u64, words: &[u64]) -> u64 {
-    let mut v = [k0 ^ 0x736f_6d65_7073_6575, k1 ^ 0x646f_7261_6e64_6f6d, k0 ^ 0x6c79_6765_6e65_7261, k1 ^ 0x7465_6462_7974_6573];
+    let mut v = [
+        k0 ^ 0x736f_6d65_7073_6575,
+        k1 ^ 0x646f_7261_6e64_6f6d,
+        k0 ^ 0x6c79_6765_6e65_7261,
+        k1 ^ 0x7465_6462_7974_6573,
+    ];
     fn round(v: &mut [u64; 4]) {
         v[0] = v[0].wrapping_add(v[1]);
         v[1] = v[1].rotate_left(13) ^ v[0];

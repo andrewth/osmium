@@ -1055,7 +1055,9 @@ impl TcpSocket {
             return 0;
         }
         let len = sent.saturating_sub(offset).min(self.snd_mss).min(max);
-        let fin = self.fin_queued && offset + len == self.tx.len() && before(self.tx_seq.wrapping_add(self.tx.len() as u32), self.snd_max);
+        let fin = self.fin_queued
+            && offset + len == self.tx.len()
+            && before(self.tx_seq.wrapping_add(self.tx.len() as u32), self.snd_max);
         if len == 0 && !fin {
             return 0;
         }
@@ -1657,9 +1659,7 @@ mod tests {
         let (mut a, mut b, ca, cb, mut now) = connected(4096, 4096);
         // Drop the first data segment only.
         let mut first = true;
-        a.set_shaper(move |_, f| {
-            if data_frame(f) && std::mem::take(&mut first) { Fate::Drop } else { Fate::Deliver }
-        });
+        a.set_shaper(move |_, f| if data_frame(f) && std::mem::take(&mut first) { Fate::Drop } else { Fate::Deliver });
         tcp(&mut a, ca).send(&[1; 100]).unwrap();
         run(&mut a, &mut b, &mut now, 10, |_, _| false);
         tcp(&mut a, ca).send(&[2; 100]).unwrap();
@@ -1677,9 +1677,7 @@ mod tests {
     fn fin_ahead_of_data_waits_for_the_gap() {
         let (mut a, mut b, ca, cb, mut now) = connected(4096, 4096);
         let mut first = true;
-        a.set_shaper(move |_, f| {
-            if data_frame(f) && std::mem::take(&mut first) { Fate::Drop } else { Fate::Deliver }
-        });
+        a.set_shaper(move |_, f| if data_frame(f) && std::mem::take(&mut first) { Fate::Drop } else { Fate::Deliver });
         tcp(&mut a, ca).send(&[1; 100]).unwrap();
         run(&mut a, &mut b, &mut now, 5, |_, _| false);
         tcp(&mut a, ca).send(&[2; 100]).unwrap();

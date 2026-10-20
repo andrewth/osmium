@@ -237,10 +237,16 @@ Status: ✅ implemented in this release · 🗺 roadmap
 
 ### `osmium-net`: IPv4 networking
 - ✅ A polled `Interface` over any `NetDevice`: ARP with a neighbor cache, retries and a queue for unresolved packets, IPv4 routing to on-link hosts or the gateway, ICMP echo replies and port-unreachable errors; the caller supplies the time and decides when to poll (`poll_at`)
-- ✅ Sockets in a `SocketSet`: `TcpSocket` (RFC 9293 state machine, RFC 6298 retransmission timing with backoff, fast retransmit, zero-window probes, MSS option, RFC 5961 reset and SYN checks), `UdpSocket`, `IcmpSocket` (ping) and `DhcpClient` (discover, request, renew at T1, NAK and expiry), which configures the interface itself
-- ✅ `wire`: Ethernet, ARP, IPv4, ICMP, UDP and TCP headers and the Internet checksum, usable on their own
-- ✅ Tested on the host over a simulated lossy link, and under QEMU against the user-mode network (DHCP lease, ping, TCP echo)
-- 🗺 IP fragmentation, TCP window scaling, SACK, out-of-order reassembly and congestion control, a DNS resolver, IPv6, socket system calls in `osmium-proc`
+- ✅ Sockets in a `SocketSet`: `TcpSocket` (RFC 9293 state machine, RFC 6298 retransmission timing with backoff, zero-window probes, MSS option, RFC 5961 reset and SYN checks), `UdpSocket`, `IcmpSocket` (ping) and `DhcpClient` (discover, request, renew at T1, NAK and expiry), which configures the interface itself
+- ✅ TCP receive reassembly: data past a gap is held inside the window (merged ranges, bounded) and delivered in order once the gap fills, an early FIN waits for its data, and every out-of-order segment is acknowledged at once
+- ✅ TCP congestion control (RFC 5681, 6582, 6928): ten-segment initial window, slow start, congestion avoidance, fast retransmit and NewReno fast recovery with partial ACKs, and a one-segment restart after a timeout
+- ✅ TCP window scaling (RFC 7323, up to a 1 GiB receive buffer) and SACK (RFC 2018 blocks from the reassembly queue, a sender scoreboard and RFC 6675-style recovery that resends exactly the reported holes), both negotiated in the handshake
+- ✅ `DnsClient`: a pollable stub resolver for A records over a `UdpSocket`, using the DHCP-reported server or explicit ones, with random ids, question/source validation, CNAME chains, retries with backoff across servers, a TTL cache and short negative caching
+- ✅ IPv4 fragment reassembly (timeouts, bounded buffers, overlaps condemn the datagram) and send-side fragmentation of UDP and ICMP datagrams larger than the MTU
+- ✅ TCP initial sequence numbers follow RFC 6528 (a keyed SipHash of the four-tuple plus a clock); the generator is keyed from the seed and any entropy the caller supplies (`Interface::new_with_entropy`, `add_entropy`)
+- ✅ `wire`: Ethernet, ARP, IPv4 (with fragment fields), ICMP, UDP and TCP headers (MSS, window scale and SACK options) and the Internet checksum, usable on their own
+- ✅ Tested on the host over a simulated link that drops, duplicates and reorders frames (TCP bulk transfers, fragments, DNS), and under QEMU against the user-mode network (DHCP lease, ping, DNS lookup, TCP echo)
+- 🗺 IPv6, TCP timestamps and DNS over TCP, socket system calls in `osmium-proc`
 
 ### `osmium-iscsi`: iSCSI initiator
 - ✅ RFC 7143 login (AuthMethod None, operational negotiation honouring the target's answers), SendTargets discovery, full-feature phase with immediate data, unsolicited Data-Out and R2T-driven writes, multi-PDU Data-In, NOP-In replies and logout; SCSI INQUIRY, TEST UNIT READY, READ CAPACITY(10/16), READ/WRITE(10/16) and SYNCHRONIZE CACHE as a `BlockDevice` over an `osmium-net` TCP socket

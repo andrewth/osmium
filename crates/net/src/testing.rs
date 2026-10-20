@@ -119,7 +119,15 @@ pub(crate) fn config(address: Ipv4Addr) -> Config {
 pub(crate) fn link() -> (Host, Host) {
     let (ab, ba): (Queue, Queue) = Default::default();
     let host = |n: u8, rx: &Queue, tx: &Queue| {
-        let dev = Port { mac: MacAddress([2, 0, 0, 0, 0, n]), rx: rx.clone(), tx: tx.clone(), filter: None, shaper: None, held: Vec::new(), sent: 0 };
+        let dev = Port {
+            mac: MacAddress([2, 0, 0, 0, 0, n]),
+            rx: rx.clone(),
+            tx: tx.clone(),
+            filter: None,
+            shaper: None,
+            held: Vec::new(),
+            sent: 0,
+        };
         Host { iface: Interface::new(&dev, n.into()), dev, sockets: SocketSet::new() }
     };
     (host(1, &ba, &ab), host(2, &ab, &ba))

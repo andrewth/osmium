@@ -226,6 +226,10 @@ impl Interface {
         self.config = config;
     }
 
+    pub(crate) fn random_u64(&mut self) -> u64 {
+        self.rng.next_u64()
+    }
+
     /// A random port in the dynamic range, for binding a client socket.
     pub fn ephemeral_port(&mut self) -> u16 {
         self.rng.ephemeral_port()
@@ -494,7 +498,9 @@ impl Interface {
     fn reassemble(&mut self, now: Instant, ip: &Ipv4Header, fragment: Fragment, payload: &[u8]) -> Option<Vec<u8>> {
         // Every piece but the last is a whole number of 8-byte units, and
         // none is empty.
-        if payload.is_empty() || (fragment.more && payload.len() % 8 != 0) || fragment.offset + payload.len() > MAX_DATAGRAM
+        if payload.is_empty()
+            || (fragment.more && payload.len() % 8 != 0)
+            || fragment.offset + payload.len() > MAX_DATAGRAM
         {
             return None;
         }
@@ -829,7 +835,10 @@ mod tests {
         assert!(sent.borrow().is_empty(), "no replies");
     }
 
-    fn udp_pair(a: &mut crate::testing::Host, b: &mut crate::testing::Host) -> (crate::SocketHandle, crate::SocketHandle) {
+    fn udp_pair(
+        a: &mut crate::testing::Host,
+        b: &mut crate::testing::Host,
+    ) -> (crate::SocketHandle, crate::SocketHandle) {
         let ha = a.sockets.add(UdpSocket::new(4, 4));
         let hb = b.sockets.add(UdpSocket::new(4, 4));
         a.sockets.get_mut::<UdpSocket>(ha).bind(1000).unwrap();
@@ -909,8 +918,12 @@ mod tests {
     /// A fragment of datagram `ident` from A to B.
     fn fragment(ident: u16, offset: usize, more: bool, data: &[u8]) -> Vec<u8> {
         let mut f = vec![0; ETH_HEADER_LEN + IPV4_HEADER_LEN + data.len()];
-        EthernetHeader { dst: MacAddress([2, 0, 0, 0, 0, 2]), src: MacAddress([2, 0, 0, 0, 0, 9]), ethertype: ETHERTYPE_IPV4 }
-            .emit(&mut f);
+        EthernetHeader {
+            dst: MacAddress([2, 0, 0, 0, 0, 2]),
+            src: MacAddress([2, 0, 0, 0, 0, 9]),
+            ethertype: ETHERTYPE_IPV4,
+        }
+        .emit(&mut f);
         let h = Ipv4Header { src: A_IP, dst: B_IP, protocol: PROTO_UDP, ttl: 64, ident, payload_len: data.len() };
         h.emit_fragment(&mut f[ETH_HEADER_LEN..], Fragment { more, offset });
         f[ETH_HEADER_LEN + IPV4_HEADER_LEN..].copy_from_slice(data);

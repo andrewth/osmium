@@ -441,7 +441,7 @@ impl TcpHeader {
                         (3, 3) => header.wscale = Some(opts[2]),
                         (4, 2) => header.sack_permitted = true,
                         (5, _) if len >= 10 && (len - 2) % 8 == 0 => {
-                            for block in opts[2..len].chunks_exact(8) {
+                            for block in opts[2..len].as_chunks::<8>().0 {
                                 if usize::from(header.sack_len) == MAX_SACK_BLOCKS {
                                     break;
                                 }
@@ -576,7 +576,8 @@ mod tests {
     #[test]
     fn tcp_options_round_trip() {
         let (src, dst) = (Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8));
-        let syn = TcpHeader { flags: TCP_SYN, mss: Some(1460), wscale: Some(7), sack_permitted: true, ..Default::default() };
+        let syn =
+            TcpHeader { flags: TCP_SYN, mss: Some(1460), wscale: Some(7), sack_permitted: true, ..Default::default() };
         let b = syn.emit(src, dst, &[]);
         assert_eq!(TcpHeader::parse(&b, src, dst), Some((syn, &[][..])));
         let mut ack = TcpHeader { flags: TCP_ACK, sack_len: 3, ..Default::default() };
