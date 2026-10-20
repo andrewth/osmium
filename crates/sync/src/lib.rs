@@ -6,6 +6,7 @@
 //!   additionally masks local interrupts, which a lock shared with an
 //!   interrupt handler needs.
 //! - [`RwSpinLock`]: a writer-preferring reader/writer spin lock.
+//! - [`SeqLock`]: a sequence lock; readers retry instead of blocking the writer.
 //! - [`Once`] and [`Lazy`]: one-time initialization.
 //! - [`PerCpu`] and [`PerCpuCell`]: per-CPU storage indexed by
 //!   `osmium_arch::cpu::current_id`.
@@ -24,6 +25,7 @@ mod percpu;
 pub mod preempt;
 mod ring;
 mod rwlock;
+mod seqlock;
 mod spin;
 
 pub use guard::{Guardian, IrqDisabled, NoGuard, PreemptDisabled};
@@ -31,4 +33,5 @@ pub use once::{Lazy, Once};
 pub use percpu::{PerCpu, PerCpuCell};
 pub use ring::{Consumer, Producer, SpscRing};
 pub use rwlock::{RwSpinLock, RwSpinLockReadGuard, RwSpinLockWriteGuard};
+pub use seqlock::SeqLock;
 pub use spin::{IrqSpinLock, RawSpinLock, SpinLock, SpinLockGuard};

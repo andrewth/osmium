@@ -115,7 +115,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `Once<T>`, `Lazy<T>`
 - ✅ Per-CPU storage: `PerCpu<T>` (shared, `Sync` data) and `PerCpuCell<T>` (CPU-private mutable data, IRQ-masked access, re-entrancy checked), plus a per-CPU preemption counter
 - ✅ Lock-free SPSC ring buffer (for IRQ-to-task data such as UART receive)
-- 🗺 RCU, sequence locks, MCS/queued spinlocks
+- ✅ `SeqLock<T>`: readers retry instead of blocking the writer; byte-wise atomic copies keep racing reads sound
+- 🗺 RCU, MCS/queued spinlocks
 
 ### `osmium-mm`: memory management
 - ✅ Typed `PhysAddr`/`VirtAddr` with alignment helpers and canonical-address checks
