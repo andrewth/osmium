@@ -54,8 +54,8 @@ guest_image:
     li a2, 0
     ecall
     mv s1, a0               # SBI error code
-    rdtime t0               # spin 30 ms (10 MHz timebase) so host
-    li t1, 300000           # timer interrupts arrive mid-guest
+    rdtime t0               # spin 100 ms (10 MHz timebase) so host
+    li t1, 1000000          # timer interrupts (10 ms) arrive mid-guest
     add t1, t1, t0
 7:  rdtime t0
     bltu t0, t1, 7b
