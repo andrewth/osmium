@@ -142,7 +142,12 @@ pub(super) fn run(v: &mut SvmVcpu) {
         // and the syscall MSRs.
         asm!("vmsave rax", in("rax") v.host_pa, options(nostack));
         asm!("vmload rax", in("rax") v.vmcb_pa, options(nostack));
+        // TSC_AUX (what RDTSCP and RDPID return) is not in the VMCB: swap
+        // the guest's in while GIF is clear, so no host code sees it.
+        let host_aux = x86::rdmsr(msr::IA32_TSC_AUX);
+        x86::wrmsr(msr::IA32_TSC_AUX, v.tsc_aux);
         osmium_svm_run(&mut v.regs, v.vmcb_pa);
+        x86::wrmsr(msr::IA32_TSC_AUX, host_aux);
         asm!("vmsave rax", in("rax") v.vmcb_pa, options(nostack));
         asm!("vmload rax", in("rax") v.host_pa, options(nostack));
         asm!("cli", "stgi", options(nomem, nostack));

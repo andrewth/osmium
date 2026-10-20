@@ -2,7 +2,9 @@
 //! can be emulated as MMIO. Covers the moves drivers use for device
 //! registers: `MOV r/m, r` (88, 89), `MOV r, r/m` (8A, 8B), `MOV r/m, imm`
 //! (C6, C7), `MOVZX r, r/m8|16` (0F B6, 0F B7) and the `moffs` forms
-//! (A0-A3), with operand-size (66) and REX prefixes.
+//! (A0-A3), with operand-size (66) and REX prefixes; and `TEST r/m, r`
+//! (84, 85) and `TEST r/m, imm` (F6 /0, F7 /0), the way drivers poll a
+//! status bit, as loads that only set flags.
 
 /// Where the value of an emulated store comes from, or where a load goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +32,9 @@ pub struct Access {
     pub high_byte: bool,
     /// Instruction length.
     pub len: u8,
+    /// A `TEST`: the loaded value is ANDed with `operand` to set the flags,
+    /// and no register is written.
+    pub test: bool,
 }
 
 /// Decodes `code` (at least the instruction's bytes) executed with default
@@ -66,6 +71,7 @@ pub fn decode(code: &[u8], bits: u8) -> Option<Access> {
     };
     let op = *code.get(i)?;
     i += 1;
+    let mut test = false;
     let (store, size, imm, movzx) = match op {
         0x88 => (true, 1, 0, false),
         0x89 => (true, full, 0, false),
@@ -73,6 +79,12 @@ pub fn decode(code: &[u8], bits: u8) -> Option<Access> {
         0x8b => (false, full, 0, false),
         0xc6 => (true, 1, 1, false),
         0xc7 => (true, full, full.min(4), false),
+        0x84 | 0x85 | 0xf6 | 0xf7 => {
+            test = true;
+            let size = if op & 1 == 0 { 1 } else { full };
+            let imm = if op >= 0xf6 { size.min(4) } else { 0 };
+            (false, size, imm, false)
+        }
         0x0f => {
             let op2 = *code.get(i)?;
             i += 1;
@@ -94,6 +106,7 @@ pub fn decode(code: &[u8], bits: u8) -> Option<Access> {
                 dest_size: size,
                 high_byte: false,
                 len: len as u8,
+                test: false,
             });
         }
         _ => return None,
@@ -103,6 +116,9 @@ pub fn decode(code: &[u8], bits: u8) -> Option<Access> {
     let (md, reg, rm) = (modrm >> 6, (modrm >> 3) & 7 | (rex & 4) << 1, modrm & 7);
     if md == 3 {
         return None; // register to register: not a memory access
+    }
+    if op >= 0xf6 && (modrm >> 3) & 7 != 0 {
+        return None; // F6/F7 /2../7: NOT, NEG, MUL, DIV
     }
     // Addressing bytes: SIB and displacement.
     if addr_bits == 16 {
@@ -146,6 +162,7 @@ pub fn decode(code: &[u8], bits: u8) -> Option<Access> {
         dest_size: if movzx { full } else { size },
         high_byte: size == 1 && rex == 0 && imm == 0,
         len: i as u8,
+        test,
     })
 }
 
@@ -202,5 +219,19 @@ mod tests {
         assert_eq!(decode(&[0x89, 0xc3], 32), None, "mov ebx, eax");
         assert_eq!(decode(&[0x01, 0x03], 32), None, "add [ebx], eax");
         assert_eq!(decode(&[0x8b, 0x84, 0xb0], 32), None, "truncated");
+        assert_eq!(decode(&[0xf7, 0x10], 32), None, "not dword [eax]");
+    }
+
+    #[test]
+    fn tests() {
+        // test dword [rax + 0x300], 0x1000 (polling a LAPIC status bit)
+        let a = d(&[0xf7, 0x80, 0x00, 0x03, 0, 0, 0x00, 0x10, 0, 0], 64);
+        assert_eq!((a.test, a.store, a.size, a.operand, a.len), (true, false, 4, Operand::Imm(0x1000), 10));
+        // test byte [rdx], 0x20
+        let a = d(&[0xf6, 0x02, 0x20], 64);
+        assert_eq!((a.test, a.size, a.operand, a.len), (true, 1, Operand::Imm(0x20), 3));
+        // test [rbx], ecx
+        let a = d(&[0x85, 0x0b], 64);
+        assert_eq!((a.test, a.size, a.operand), (true, 4, Operand::Reg(1)));
     }
 }

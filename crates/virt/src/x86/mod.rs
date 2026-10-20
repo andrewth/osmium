@@ -24,6 +24,7 @@
 pub mod decode;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod hw;
+pub mod pc;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub use hw::{SvmError, enable};
 
@@ -35,6 +36,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 use decode::{Access, Operand};
+
+/// `IA32_APIC_BASE`: the bootstrap processor, and the APIC enabled.
+const APIC_BASE_BSP: u64 = 1 << 8;
+const APIC_BASE_ENABLE: u64 = 1 << 11;
 
 /// VMCB offsets (AMD64 APM vol. 2, appendix B).
 pub mod vmcb {
@@ -115,6 +120,18 @@ pub mod vmcb {
     pub const RAX: usize = 0x5f8;
     /// Guest PAT.
     pub const G_PAT: usize = 0x668;
+    /// STAR, LSTAR, CSTAR, SFMASK, KernelGsBase (switched by VMLOAD/VMSAVE).
+    pub const STAR: usize = 0x600;
+    /// LSTAR.
+    pub const LSTAR: usize = 0x608;
+    /// CSTAR.
+    pub const CSTAR: usize = 0x610;
+    /// SFMASK.
+    pub const SFMASK: usize = 0x618;
+    /// KernelGsBase.
+    pub const KERNEL_GS_BASE: usize = 0x620;
+    /// SYSENTER_CS, _ESP, _EIP.
+    pub const SYSENTER_CS: usize = 0x628;
     /// Instruction bytes fetched by decode assists: count, then 15 bytes.
     pub const INSN_LEN: usize = 0x0d0;
     /// The fetched bytes.
@@ -207,6 +224,11 @@ pub struct SvmVcpu {
     ack: Option<Ack>,
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     flush: bool,
+    /// The guest's `IA32_TSC_AUX`, swapped in around VMRUN.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    pub(crate) tsc_aux: u64,
+    /// The guest's `IA32_APIC_BASE`.
+    apic_base: u64,
     /// The host CPU running this vCPU's guest code, for kicks.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
@@ -244,6 +266,8 @@ impl SvmVcpu {
             ack: None,
             flush: true,
             running: None,
+            tsc_aux: 0,
+            apic_base: 0xfee0_0000 | APIC_BASE_ENABLE | APIC_BASE_BSP,
         };
         use vmcb::*;
         // INTR, NMI, HLT, IOIO, MSR, SHUTDOWN; VMRUN (required), VMMCALL.
@@ -531,6 +555,59 @@ impl SvmVcpu {
     /// Moves the guest past an instruction the hypervisor completed for it.
     /// Like the CPU retiring it, this ends an STI or MOV SS interrupt shadow
     /// (`sti; hlt` would otherwise never let an interrupt in).
+    /// Marks this vCPU as an application processor: `IA32_APIC_BASE.BSP`
+    /// reads as 0.
+    pub fn set_application_processor(&mut self) {
+        self.apic_base &= !APIC_BASE_BSP;
+    }
+
+    /// Emulates the RDMSR or WRMSR that caused an `MSR` exit and steps
+    /// past it. The syscall MSRs, FS/GS bases and PAT live in the VMCB;
+    /// EFER keeps SVME set (VMRUN requires it); TSC_AUX is per vCPU;
+    /// APIC_BASE reports the xAPIC at its default address. Other MSRs read
+    /// as zero and ignore writes.
+    pub fn emulate_msr(&mut self) {
+        use vmcb::*;
+        let write = self.read64(EXITINFO1) & 1 != 0;
+        let msr = self.regs.rcx as u32;
+        let field = match msr {
+            0xc000_0081 => Some(STAR),
+            0xc000_0082 => Some(LSTAR),
+            0xc000_0083 => Some(CSTAR),
+            0xc000_0084 => Some(SFMASK),
+            0xc000_0100 => Some(FS + 8),
+            0xc000_0101 => Some(GS + 8),
+            0xc000_0102 => Some(KERNEL_GS_BASE),
+            0x174..=0x176 => Some(SYSENTER_CS + 8 * (msr - 0x174) as usize),
+            0x277 => Some(G_PAT),
+            _ => None,
+        };
+        if write {
+            let v = (self.read64(RAX) & 0xffff_ffff) | self.regs.rdx << 32;
+            match msr {
+                0xc000_0080 => self.write64(EFER, v | EFER_SVME),
+                0xc000_0103 => self.tsc_aux = v & 0xffff_ffff,
+                0x1b => self.apic_base = (v & !APIC_BASE_BSP) | (self.apic_base & APIC_BASE_BSP),
+                _ => {
+                    if let Some(f) = field {
+                        self.write64(f, v);
+                    }
+                }
+            }
+        } else {
+            let v = match msr {
+                0xc000_0080 => self.read64(EFER) & !EFER_SVME,
+                0xc000_0103 => self.tsc_aux,
+                0x1b => self.apic_base,
+                _ => field.map_or(0, |f| self.read64(f)),
+            };
+            self.write64(RAX, v & 0xffff_ffff);
+            self.regs.rdx = v >> 32;
+        }
+        let rip = self.rip();
+        self.skip_to(rip + 2); // RDMSR and WRMSR are 0F 32 and 0F 30
+    }
+
     fn skip_to(&mut self, rip: u64) {
         self.write64(vmcb::RIP, rip);
         self.write64(vmcb::INT_STATE, 0);
@@ -625,9 +702,11 @@ impl Vcpu for SvmVcpu {
             self.write32(vmcb::CLEAN, 0);
             self.prepare_interrupts();
             hw::run(self);
-            // An interrupt window opened: deliver on the next entry.
-            if self.read64(vmcb::EXITCODE) != exit::VINTR {
-                break self.classify();
+            match self.read64(vmcb::EXITCODE) {
+                // An interrupt window opened: deliver on the next entry.
+                exit::VINTR => {}
+                exit::MSR => self.emulate_msr(),
+                _ => break self.classify(),
             }
         };
         if let Some(r) = &self.running {
@@ -643,8 +722,28 @@ impl Vcpu for SvmVcpu {
 
     fn complete_read(&mut self, value: u64) {
         if let Some(a) = self.pending_mmio.take() {
-            let Operand::Reg(r) = a.operand else { return };
             let value = value & (u64::MAX >> (64 - 8 * a.size as u32));
+            if a.test {
+                // TEST: flags from value & operand; CF and OF clear.
+                let bits = 8 * a.size as u32;
+                let r = value & self.operand_value(&a) & (u64::MAX >> (64 - bits));
+                let (cf, pf, zf, sf, of) = (1 << 0, 1 << 2, 1 << 6, 1 << 7, 1 << 11);
+                let mut f = self.read64(vmcb::RFLAGS) & !(cf | pf | zf | sf | of);
+                if (r as u8).count_ones() % 2 == 0 {
+                    f |= pf;
+                }
+                if r == 0 {
+                    f |= zf;
+                }
+                if r >> (bits - 1) & 1 != 0 {
+                    f |= sf;
+                }
+                self.write64(vmcb::RFLAGS, f);
+                let rip = self.rip();
+                self.skip_to(rip + a.len as u64);
+                return;
+            }
+            let Operand::Reg(r) = a.operand else { return };
             if a.high_byte && (4..8).contains(&r) {
                 let old = self.reg(r - 4);
                 self.set_reg(r - 4, (old & !0xff00) | value << 8);
@@ -693,6 +792,39 @@ mod tests {
         unsafe {
             SvmVcpu::new(SvmPages { vmcb: p(1), iopm: p(3), msrpm: p(2), host: p(1) }, 0x1000, 0x10_0000, 0x20_0000)
         }
+    }
+
+    #[test]
+    fn msrs() {
+        let mut v = vcpu();
+        let wrmsr = |v: &mut SvmVcpu, msr: u32, val: u64| {
+            v.regs.rcx = msr as u64;
+            v.write64(vmcb::RAX, val & 0xffff_ffff);
+            v.regs.rdx = val >> 32;
+            v.write64(vmcb::EXITINFO1, 1);
+            v.emulate_msr();
+        };
+        let rdmsr = |v: &mut SvmVcpu, msr: u32| {
+            v.regs.rcx = msr as u64;
+            v.write64(vmcb::EXITINFO1, 0);
+            v.emulate_msr();
+            v.read64(vmcb::RAX) | v.regs.rdx << 32
+        };
+        let rip = v.rip();
+        wrmsr(&mut v, 0xc000_0082, 0xffff_8000_0012_3456); // LSTAR
+        assert_eq!(v.read64(vmcb::LSTAR), 0xffff_8000_0012_3456, "in the VMCB, for VMLOAD");
+        assert_eq!(rdmsr(&mut v, 0xc000_0082), 0xffff_8000_0012_3456);
+        assert_eq!(v.rip(), rip + 4, "stepped past both");
+        // EFER: the guest sees and sets its own bits; SVME stays on.
+        wrmsr(&mut v, 0xc000_0080, 1 << 0);
+        assert_eq!(v.read64(vmcb::EFER), 1 | EFER_SVME);
+        assert_eq!(rdmsr(&mut v, 0xc000_0080), 1);
+        wrmsr(&mut v, 0xc000_0103, 3); // TSC_AUX
+        assert_eq!((v.tsc_aux, rdmsr(&mut v, 0xc000_0103)), (3, 3));
+        assert_eq!(rdmsr(&mut v, 0x1b), 0xfee0_0900, "xAPIC enabled, BSP");
+        v.set_application_processor();
+        assert_eq!(rdmsr(&mut v, 0x1b), 0xfee0_0800);
+        assert_eq!(rdmsr(&mut v, 0x8b), 0, "unknown MSRs read as zero");
     }
 
     #[test]

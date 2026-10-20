@@ -175,13 +175,20 @@ pub struct VirtualPit {
     channels: IrqSpinLock<[Channel; 3]>,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     output: Box<dyn Fn(bool) + Send + Sync>,
+    /// Port 0x61 bits 0 (channel 2 gate) and 1 (speaker data).
+    port_b: core::sync::atomic::AtomicU8,
 }
 
 impl VirtualPit {
     /// A PIT whose time comes from `clock` (monotonic nanoseconds) and whose
     /// channel 0 output drives `output`.
     pub fn new(clock: impl Fn() -> u64 + Send + Sync + 'static, output: impl Fn(bool) + Send + Sync + 'static) -> Self {
-        Self { channels: IrqSpinLock::new(Default::default()), clock: Box::new(clock), output: Box::new(output) }
+        Self {
+            channels: IrqSpinLock::new(Default::default()),
+            clock: Box::new(clock),
+            output: Box::new(output),
+            port_b: core::sync::atomic::AtomicU8::new(0),
+        }
     }
 
     /// Raises IRQ 0 for any channel 0 expiry since the last poll. Returns
@@ -203,6 +210,14 @@ impl VirtualPit {
         }
         (self.output)(true);
         true
+    }
+
+    /// The PC's port 0x61 ("port B"), for the port bus: bit 0 gates channel
+    /// 2 (raising it restarts the count), bit 1 is the speaker data, and
+    /// bit 5 reads channel 2's OUT, which is how firmware and kernels time
+    /// short intervals against the PIT.
+    pub fn port_b(self: &alloc::sync::Arc<Self>) -> alloc::sync::Arc<dyn BusDevice> {
+        alloc::sync::Arc::new(PortB(self.clone()))
     }
 
     /// When channel 0 next expires (in the clock's nanoseconds), if it is
@@ -261,6 +276,34 @@ impl BusDevice for VirtualPit {
             (self.output)(false);
         }
         self.poll();
+    }
+}
+
+/// Port 0x61 of a [`VirtualPit`].
+struct PortB(alloc::sync::Arc<VirtualPit>);
+
+impl BusDevice for PortB {
+    fn read(&self, _offset: u64, data: &mut [u8]) {
+        let now = (self.0.clock)();
+        let out2 = self.0.channels.lock()[2].out(now);
+        data.fill(0);
+        if let Some(b) = data.first_mut() {
+            *b = self.0.port_b.load(core::sync::atomic::Ordering::Relaxed) & 3 | (out2 as u8) << 5;
+        }
+    }
+
+    fn write(&self, _offset: u64, data: &[u8]) {
+        let v = data.first().copied().unwrap_or(0) & 3;
+        let old = self.0.port_b.swap(v, core::sync::atomic::Ordering::Relaxed);
+        if old & 1 == 0 && v & 1 != 0 {
+            // Gate rising: a loaded count starts (again) from here.
+            let now = (self.0.clock)();
+            let mut c = self.0.channels.lock();
+            if c[2].start.is_some() {
+                c[2].start = Some(now);
+                c[2].fired = 0;
+            }
+        }
     }
 }
 
@@ -356,5 +399,29 @@ mod tests {
         r.advance(ns(0x100));
         assert_eq!((r.inb(2), r.inb(2)), (0x00, 0x0f));
         assert_eq!(r.rising(), 0, "channel 2 has no interrupt");
+    }
+
+    #[test]
+    fn port_b_times_channel_2() {
+        // The one-shot calibration sequence osmium's own PIT driver uses.
+        let r = Rig::new();
+        let pit = alloc::sync::Arc::new(r.pit);
+        let b = pit.port_b();
+        let get = |b: &alloc::sync::Arc<dyn BusDevice>| {
+            let mut v = [0];
+            b.read(0, &mut v);
+            v[0]
+        };
+        b.write(0, &[0]);
+        pit.write(3, &[0xb0]); // channel 2, low/high, mode 0
+        pit.write(2, &[100]);
+        pit.write(2, &[0]);
+        r.now.fetch_add(ns(500), Ordering::SeqCst); // long before the gate rises
+        b.write(0, &[1]);
+        assert_eq!(get(&b) & 0x20, 0, "counting from the gate edge");
+        r.now.fetch_add(ns(99), Ordering::SeqCst);
+        assert_eq!(get(&b) & 0x20, 0);
+        r.now.fetch_add(ns(2), Ordering::SeqCst);
+        assert_eq!(get(&b), 0x21, "OUT2 high at the terminal count, gate still set");
     }
 }
