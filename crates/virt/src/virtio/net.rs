@@ -15,6 +15,10 @@ const TX: usize = osmium_hal::virtio::net::TX_QUEUE as usize;
 const HEADER: usize = header_len(true, false);
 /// Frames waiting for receive buffers, at most; older ones are dropped.
 const RX_BACKLOG: usize = 64;
+/// The longest frame a driver may send without GSO or an MTU feature,
+/// neither of which is offered: 1500 bytes of payload, an Ethernet header
+/// and a VLAN tag.
+const MAX_FRAME: usize = 1518;
 
 /// Where a [`VirtioNetDevice`]'s transmitted frames go: a host NIC, a
 /// software switch, another guest, or a responder in the hypervisor.
@@ -76,7 +80,14 @@ impl VirtioNetDevice {
     fn drain_tx(&mut self, ctx: &mut DeviceCtx<'_>) {
         while let Some(chain) = ctx.pop(TX) {
             let Ok(chain) = chain else { continue };
-            let mut buf = vec![0u8; chain.readable_len()];
+            // A frame longer than any valid one is dropped unread, so the
+            // guest's lengths never size more than one frame's allocation.
+            let len = chain.readable_len();
+            if len > HEADER + MAX_FRAME {
+                let _ = ctx.add_used(TX, chain.head, 0);
+                continue;
+            }
+            let mut buf = vec![0u8; len];
             if let Ok(n) = chain.read(ctx.mem(), 0, &mut buf)
                 && n > HEADER
             {
@@ -205,5 +216,11 @@ mod tests {
         let mut got = [0u8; 5];
         mem.read(GuestPhysAddr(DATA + 0x1000 + HEADER as u64), &mut got).unwrap();
         assert_eq!(&got, b"hello");
+
+        // A frame longer than any valid one is returned unread.
+        post(&mem, &mut tx, TXQ, &[(TXQ + DATA, u32::MAX, false)]);
+        notify(&net, 1);
+        assert_eq!(sent.lock().len(), 1);
+        assert_eq!(used_len(&mem, &tx, TXQ, 1), 0);
     }
 }

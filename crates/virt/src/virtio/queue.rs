@@ -5,7 +5,9 @@ use core::sync::atomic::{Ordering, fence};
 
 use crate::memory::{GuestMemory, GuestPhysAddr, OutOfBounds};
 
-use osmium_hal::virtio::queue::{AVAIL_F_NO_INTERRUPT, DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, DESC_SIZE, avail_entry, used_entry};
+use osmium_hal::virtio::queue::{
+    AVAIL_F_NO_INTERRUPT, DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, DESC_SIZE, avail_entry, used_entry,
+};
 
 /// Why a descriptor chain could not be used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,7 +104,9 @@ impl DescChain {
                 continue;
             }
             let n = (dlen - offset).min(len - at);
-            f(GuestPhysAddr(d.addr.0 + offset as u64), at, n)?;
+            // A buffer wrapping past the top of the address space is out of bounds.
+            let gpa = d.addr.0.checked_add(offset as u64).ok_or(OutOfBounds(d.addr))?;
+            f(GuestPhysAddr(gpa), at, n)?;
             at += n;
             offset = 0;
         }
@@ -145,7 +149,7 @@ impl SplitQueue {
         if !self.ready || self.size == 0 {
             return None;
         }
-        let avail_idx = match mem.read_obj::<u16>(GuestPhysAddr(self.avail.0 + 2)) {
+        let avail_idx = match mem.read_obj::<u16>(GuestPhysAddr(self.avail.0.wrapping_add(2))) {
             Ok(i) => i,
             Err(e) => return Some(Err(e.into())),
         };
@@ -157,7 +161,7 @@ impl SplitQueue {
         let slot = self.last_avail % self.size;
         self.last_avail = self.last_avail.wrapping_add(1);
         Some(
-            mem.read_obj::<u16>(GuestPhysAddr(self.avail.0 + avail_entry(slot) as u64))
+            mem.read_obj::<u16>(GuestPhysAddr(self.avail.0.wrapping_add(avail_entry(slot) as u64)))
                 .map_err(QueueError::from)
                 .and_then(|head| self.chain(mem, head)),
         )
@@ -173,7 +177,9 @@ impl SplitQueue {
             if descs.len() == self.size as usize {
                 return Err(QueueError::Loop);
             }
-            let raw = mem.read_obj::<[u8; DESC_SIZE]>(GuestPhysAddr(self.desc.0 + (DESC_SIZE * i as usize) as u64))?;
+            let raw = mem.read_obj::<[u8; DESC_SIZE]>(GuestPhysAddr(
+                self.desc.0.wrapping_add((DESC_SIZE * i as usize) as u64),
+            ))?;
             let addr = u64::from_le_bytes(raw[0..8].try_into().unwrap());
             let len = u32::from_le_bytes(raw[8..12].try_into().unwrap());
             let flags = u16::from_le_bytes([raw[12], raw[13]]);
@@ -194,11 +200,11 @@ impl SplitQueue {
     pub fn add_used(&mut self, mem: &GuestMemory, head: u16, len: u32) -> Result<bool, QueueError> {
         let slot = self.next_used % self.size;
         let elem = (head as u64) | (len as u64) << 32;
-        mem.write_obj(GuestPhysAddr(self.used.0 + used_entry(slot) as u64), elem.to_le())?;
+        mem.write_obj(GuestPhysAddr(self.used.0.wrapping_add(used_entry(slot) as u64)), elem.to_le())?;
         self.next_used = self.next_used.wrapping_add(1);
         // Publish the element before the index that exposes it.
         fence(Ordering::Release);
-        mem.write_obj(GuestPhysAddr(self.used.0 + 2), self.next_used.to_le())?;
+        mem.write_obj(GuestPhysAddr(self.used.0.wrapping_add(2)), self.next_used.to_le())?;
         fence(Ordering::SeqCst);
         let flags = mem.read_obj::<u16>(self.avail)?;
         Ok(flags & AVAIL_F_NO_INTERRUPT == 0)
@@ -283,7 +289,10 @@ pub(crate) mod tests {
 
         mem.write(GuestPhysAddr(DATA), b"hello ").unwrap();
         mem.write(GuestPhysAddr(DATA + 0x100), b"world").unwrap();
-        let head = drv.post(&mem, &[(DATA, 6, false), (DATA + 0x100, 5, false), (DATA + 0x200, 4, true), (DATA + 0x300, 8, true)]);
+        let head = drv.post(
+            &mem,
+            &[(DATA, 6, false), (DATA + 0x100, 5, false), (DATA + 0x200, 4, true), (DATA + 0x300, 8, true)],
+        );
 
         let c = q.pop(&mem).unwrap().unwrap();
         assert_eq!(c.head, head);

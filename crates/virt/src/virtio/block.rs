@@ -15,6 +15,9 @@ use osmium_hal::virtio::blk::{
 /// virtio-blk addresses the disk in 512-byte sectors whatever the block size.
 const SECTOR: u64 = SECTOR_SIZE as u64;
 const ID: &[u8; 20] = b"osmium-virtio-blk\0\0\0";
+/// Bytes moved per step of a read or write, so the guest's descriptor
+/// lengths never size a host allocation.
+const CHUNK: usize = 64 * 1024;
 
 /// A virtio block device that serves guest requests from a host
 /// [`BlockDevice`]. Requests are handled synchronously on notify.
@@ -52,24 +55,13 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
         let status_at = wlen - 1;
 
         let (status, data) = match ty {
-            T_IN => {
-                let mut buf = vec![0u8; status_at];
-                match self.lba(sector).and_then(|lba| self.disk.read_blocks(lba, &mut buf)) {
-                    Ok(()) => match chain.write(mem, 0, &buf) {
-                        Ok(n) => (S_OK, n),
-                        Err(_) => (S_IOERR, 0),
-                    },
-                    Err(_) => (S_IOERR, 0),
-                }
-            }
+            T_IN => match self.transfer(mem, chain, sector, status_at, false) {
+                Ok(n) => (S_OK, n),
+                Err(_) => (S_IOERR, 0),
+            },
             T_OUT if self.read_only => (S_IOERR, 0),
             T_OUT => {
-                let mut buf = vec![0u8; chain.readable_len() - HEADER];
-                let r = chain
-                    .read(mem, HEADER, &mut buf)
-                    .map_err(|_| BlockError::Io)
-                    .and_then(|_| self.lba(sector))
-                    .and_then(|lba| self.disk.write_blocks(lba, &buf));
+                let r = self.transfer(mem, chain, sector, chain.readable_len() - HEADER, true);
                 (if r.is_ok() { S_OK } else { S_IOERR }, 0)
             }
             T_FLUSH => (if self.disk.flush().is_ok() { S_OK } else { S_IOERR }, 0),
@@ -86,6 +78,44 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
             return data as u32;
         }
         data as u32 + 1
+    }
+
+    /// Moves `len` bytes between the disk at `sector` and the chain's data
+    /// buffers (the writable ones for a read, the readable ones after the
+    /// header for a write), [`CHUNK`] bytes at a time. Returns the bytes moved.
+    fn transfer(
+        &mut self,
+        mem: &GuestMemory,
+        chain: &DescChain,
+        sector: u64,
+        len: usize,
+        write: bool,
+    ) -> Result<usize, BlockError> {
+        let bs = self.disk.block_size();
+        if !len.is_multiple_of(bs) {
+            return Err(BlockError::BadBuffer);
+        }
+        let lba = self.lba(sector)?;
+        let step = (CHUNK / bs).max(1) * bs;
+        let mut buf = vec![0u8; step.min(len)];
+        let mut done = 0;
+        while done < len {
+            let n = step.min(len - done);
+            let at = lba.checked_add((done / bs) as u64).ok_or(BlockError::OutOfRange)?;
+            if write {
+                if chain.read(mem, HEADER + done, &mut buf[..n]) != Ok(n) {
+                    return Err(BlockError::Io);
+                }
+                self.disk.write_blocks(at, &buf[..n])?;
+            } else {
+                self.disk.read_blocks(at, &mut buf[..n])?;
+                if chain.write(mem, done, &buf[..n]) != Ok(n) {
+                    return Err(BlockError::Io);
+                }
+            }
+            done += n;
+        }
+        Ok(done)
     }
 
     /// Converts a 512-byte sector to a disk block, which must be aligned.
@@ -120,7 +150,8 @@ impl<B: BlockDevice + Send> VirtioDevice for VirtioBlock<B> {
         // capacity (u64, sectors) and blk_size (u32).
         let bs = self.disk.block_size() as u64;
         let mut cfg = [0u8; 24];
-        cfg[CONFIG_CAPACITY..CONFIG_CAPACITY + 8].copy_from_slice(&(self.disk.num_blocks() * bs / SECTOR).to_le_bytes());
+        cfg[CONFIG_CAPACITY..CONFIG_CAPACITY + 8]
+            .copy_from_slice(&(self.disk.num_blocks() * bs / SECTOR).to_le_bytes());
         cfg[CONFIG_BLK_SIZE..CONFIG_BLK_SIZE + 4].copy_from_slice(&(bs as u32).to_le_bytes());
         for (i, d) in data.iter_mut().enumerate() {
             *d = cfg.get(offset as usize + i).copied().unwrap_or(0);
@@ -246,6 +277,41 @@ mod tests {
         d.post(&mem, &[(HDR, 16, false), (STATUS, 1, true)]);
         notify(&blk, 0);
         assert_eq!(status(&mem), S_UNSUPP);
+    }
+
+    #[test]
+    fn large_requests_in_chunks() {
+        let mut ram = vec![0u8; 0x40000];
+        let mem = Arc::new(guest(&mut ram));
+        let blk = VirtioMmio::new(VirtioBlock::new(Disk(vec![0; 64 * 4096])), mem.clone(), |_| {});
+        bring_up(&blk, &[(0, 0)]);
+        let mut d = Driver::new(8);
+        // 128 KiB, twice CHUNK, written and read back.
+        const BIG: u64 = 0x10000;
+        let pattern: Vec<u8> = (0..0x20000u32).map(|i| (i % 251) as u8).collect();
+        mem.write(GuestPhysAddr(BIG), &pattern).unwrap();
+        header(&mem, T_OUT, 8);
+        d.post(&mem, &[(HDR, 16, false), (BIG, 0x20000, false), (STATUS, 1, true)]);
+        notify(&blk, 0);
+        assert_eq!(status(&mem), S_OK);
+        blk.with_device(|b, _| assert_eq!(&b.disk().0[4096..4096 + 0x20000], &pattern[..]));
+        mem.write(GuestPhysAddr(BIG), &[0; 0x20000]).unwrap();
+        header(&mem, T_IN, 8);
+        d.post(&mem, &[(HDR, 16, false), (BIG, 0x20000, true), (STATUS, 1, true)]);
+        notify(&blk, 0);
+        assert_eq!(status(&mem), S_OK);
+        assert_eq!(d.used(&mem, 1).1, 0x20001);
+        let mut back = vec![0u8; 0x20000];
+        mem.read(GuestPhysAddr(BIG), &mut back).unwrap();
+        assert_eq!(back, pattern);
+
+        // A 4 GiB buffer claim fails at the disk's end without the host
+        // allocating anything near that size.
+        header(&mem, T_IN, 0);
+        d.post(&mem, &[(HDR, 16, false), (BIG, 0xffff_f000, true), (STATUS, 1, true)]);
+        notify(&blk, 0);
+        assert_eq!(status(&mem), S_IOERR);
+        assert_eq!(d.used(&mem, 2).1, 1);
     }
 
     #[test]

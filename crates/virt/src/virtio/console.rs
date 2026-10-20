@@ -51,9 +51,12 @@ impl VirtioConsole {
     fn drain_tx(&mut self, ctx: &mut DeviceCtx<'_>) {
         while let Some(chain) = ctx.pop(TX) {
             let Ok(chain) = chain else { continue };
-            let mut buf = vec![0u8; chain.readable_len()];
-            if let Ok(n) = chain.read(ctx.mem(), 0, &mut buf) {
+            // In bounded pieces: the guest's lengths never size an allocation.
+            let mut buf = [0u8; 256];
+            let mut at = 0;
+            while let Ok(n @ 1..) = chain.read(ctx.mem(), at, &mut buf) {
                 (self.output)(&buf[..n]);
+                at += n;
             }
             let _ = ctx.add_used(TX, chain.head, 0);
         }
@@ -113,11 +116,10 @@ mod tests {
         let out = Arc::new(IrqSpinLock::new(Vec::new()));
         let line = Arc::new(AtomicBool::new(false));
         let (o, l) = (out.clone(), line.clone());
-        let con = VirtioMmio::new(
-            VirtioConsole::new(move |b| o.lock().extend_from_slice(b)),
-            mem.clone(),
-            move |lvl| l.store(lvl, Ordering::SeqCst),
-        );
+        let con =
+            VirtioMmio::new(VirtioConsole::new(move |b| o.lock().extend_from_slice(b)), mem.clone(), move |lvl| {
+                l.store(lvl, Ordering::SeqCst)
+            });
         bring_up(&con, &[(0, RXQ), (1, TXQ)]);
         let mut cfg = [0u8; 2];
         con.read(0x100, &mut cfg);
@@ -148,6 +150,12 @@ mod tests {
         mem.read(GuestPhysAddr(DATA + 0x100), &mut got[3..]).unwrap();
         assert_eq!(&got, b"typed");
         assert!(line.load(Ordering::SeqCst));
+
+        // A 4 GiB buffer claim is read in pieces until guest memory ends.
+        out.lock().clear();
+        rebase(&mem, &mut tx, TXQ, &[(TXQ + DATA, u32::MAX, false)]);
+        notify(&con, 1);
+        assert_eq!(out.lock().len(), 0x20000 - (TXQ + DATA) as usize);
     }
 
     /// Posts on a queue whose rings sit at `base` rather than 0.
