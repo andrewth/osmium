@@ -73,6 +73,8 @@ pub enum Sys {
     Tgkill,
     Futex,
     SetTidAddress,
+    SetRobustList,
+    GetRobustList,
     /// x86_64 only: sets the thread pointer (`FS.base`).
     #[cfg(target_arch = "x86_64")]
     ArchPrctl,
@@ -138,6 +140,8 @@ const NUMBERS: &[(u64, Sys)] = &[
     (202, Sys::Futex),
     (218, Sys::SetTidAddress),
     (158, Sys::ArchPrctl),
+    (273, Sys::SetRobustList),
+    (274, Sys::GetRobustList),
 ];
 
 /// Linux system-call numbers for RISC-V and AArch64 (asm-generic).
@@ -196,6 +200,8 @@ const NUMBERS: &[(u64, Sys)] = &[
     (131, Sys::Tgkill),
     (98, Sys::Futex),
     (96, Sys::SetTidAddress),
+    (99, Sys::SetRobustList),
+    (100, Sys::GetRobustList),
 ];
 
 impl Sys {
@@ -330,7 +336,7 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Clone => return crate::thread::clone(p, th, a[0], [a[1], a[2], a[3], a[4]]),
         #[cfg(not(target_arch = "x86_64"))]
         Sys::Clone => return crate::thread::clone(p, th, a[0], [a[1], a[2], a[4], a[3]]),
-        Sys::Execve => return outcome(execve(p, a[0], a[1], a[2])),
+        Sys::Execve => return outcome(execve(p, th, a[0], a[1], a[2])),
         Sys::Wait4 => wait4(p, a[0] as i32, a[1], a[2], a[3]),
         Sys::Dup => dup(p, fd),
         Sys::Dup2 => dup3(p, fd, a[1] as i32, 0, true),
@@ -357,7 +363,9 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Kill => crate::signal::kill(p, fd, a[1]),
         Sys::Tkill => crate::signal::tkill(p, fd, a[1]),
         Sys::Tgkill => crate::signal::tgkill(p, fd, a[1] as i32, a[2]),
-        Sys::Futex => crate::futex::futex(p, th, a[0], a[1], a[2], a[3]),
+        Sys::Futex => crate::futex::futex(p, th, a),
+        Sys::SetRobustList => crate::futex::set_robust_list(th, a[0], a[1]),
+        Sys::GetRobustList => crate::futex::get_robust_list(p, th, a[0], a[1], a[2]),
         Sys::SetTidAddress => {
             th.set_clear_tid(a[0]);
             Ok(th.tid() as u64)
@@ -779,7 +787,7 @@ fn user_strings(p: &Process, va: u64, total: &mut usize) -> Result<alloc::vec::V
     }
 }
 
-fn execve(p: &Process, path: u64, argv: u64, envp: u64) -> Result<Outcome, Errno> {
+fn execve(p: &Process, th: &Thread, path: u64, argv: u64, envp: u64) -> Result<Outcome, Errno> {
     crate::exec::platform()?;
     let path = path_at(p, AT_FDCWD, path)?;
     let mut total = 0;
@@ -788,7 +796,7 @@ fn execve(p: &Process, path: u64, argv: u64, envp: u64) -> Result<Outcome, Errno
     let argv: alloc::vec::Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let envp: alloc::vec::Vec<&[u8]> = envp.iter().map(|e| e.as_slice()).collect();
     if p.group.live() > 1 {
-        return Err(Errno::EBUSY);
+        crate::thread::exec_begin(p, th)?;
     }
     let entry = p.exec(&path, &argv, &envp)?;
     crate::signal::on_exec(p);

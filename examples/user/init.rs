@@ -457,6 +457,7 @@ fn catch(sig: u64, handler: extern "C" fn(i32, *const u8, *const u8)) {
 struct Stack([u8; 16384]);
 static mut WORKER_STACK: Stack = Stack([0; 16384]);
 static mut SPINNER_STACK: Stack = Stack([0; 16384]);
+static mut WAITER_STACKS: [Stack; 3] = [const { Stack([0; 16384]) }; 3];
 #[repr(C)]
 struct Tls {
     me: u64,
@@ -478,6 +479,23 @@ extern "C" fn worker(arg: u64) -> ! {
     let ok = tls as usize == (&raw const WORKER_TLS) as usize && unsafe { (*tls).tag } == 0xfeed;
     WORKER_TLS_OK.store(ok as u32, Ordering::SeqCst);
     // The kernel clears CTID and wakes the joiner.
+    exit(0)
+}
+
+/// The futex word the waiters sleep on (0 until released), the one they are
+/// requeued to, and how many have started and finished.
+static GATE: AtomicU32 = AtomicU32::new(0);
+static GATE2: AtomicU32 = AtomicU32::new(0);
+static STARTED: AtomicU32 = AtomicU32::new(0);
+static FINISHED: AtomicU32 = AtomicU32::new(0);
+static mut WAITER_CTIDS: [u32; 3] = [0; 3];
+
+extern "C" fn waiter(_: u64) -> ! {
+    STARTED.fetch_add(1, Ordering::SeqCst);
+    // FUTEX_WAIT | FUTEX_PRIVATE_FLAG while the gate is still 0; a gate that
+    // has opened already is `EAGAIN`.
+    sys::call(sys::FUTEX, [GATE.as_ptr() as u64, 128, 0, 0, 0]);
+    FINISHED.fetch_add(1, Ordering::SeqCst);
     exit(0)
 }
 
@@ -559,6 +577,37 @@ fn signals_and_threads() {
         && WORKER_TLS_OK.load(Ordering::SeqCst) == 1;
     say!(
         "threads: thread {tid} of process {pid} joined with futex; shared counter, thread id, TLS: {}",
+        if ok { "ok" } else { "FAILED" }
+    );
+
+    // Several threads sleep on one futex; FUTEX_REQUEUE wakes one and moves
+    // the rest to another word, and the joins use CLONE_CHILD_CLEARTID.
+    let mut tids = [0i64; 3];
+    for (i, t) in tids.iter_mut().enumerate() {
+        // SAFETY: statics only this program uses; each thread has its own stack.
+        *t = unsafe {
+            let top = (&raw mut WAITER_STACKS) as u64 + (i as u64 + 1) * 16384;
+            let ctid = (&raw mut WAITER_CTIDS) as u64 + i as u64 * 4;
+            sys::clone_thread(THREAD | CHILD_SETTID | CHILD_CLEARTID, top, 0, ctid, 0, waiter, 0)
+        };
+    }
+    while STARTED.load(Ordering::SeqCst) < 3 {
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+    }
+    GATE.store(1, Ordering::SeqCst);
+    // REQUEUE: wake 1, move up to 2 more to GATE2.
+    let moved = sys::call(sys::FUTEX, [GATE.as_ptr() as u64, 128 | 3, 1, 2, GATE2.as_ptr() as u64]);
+    sys::call(sys::FUTEX, [GATE2.as_ptr() as u64, 128 | 1, 10, 0, 0]);
+    for (i, &tid) in tids.iter().enumerate() {
+        // SAFETY: as above; the kernel clears the word when the thread ends.
+        let ctid = unsafe { (&raw mut WAITER_CTIDS) as *mut u32 }.wrapping_add(i);
+        while unsafe { core::ptr::read_volatile(ctid) } != 0 {
+            sys::call(sys::FUTEX, [ctid as u64, 128, tid as u64, 0, 0]);
+        }
+    }
+    let ok = tids.iter().all(|&t| t > 0) && (0..=3).contains(&moved) && FINISHED.load(Ordering::SeqCst) == 3;
+    say!(
+        "threads: 3 threads slept on a futex, were requeued and woken, and joined: {}",
         if ok { "ok" } else { "FAILED" }
     );
 

@@ -118,7 +118,7 @@ features.
   Rust user program from an ELF file as an `osmium-proc` process, which
   opens, writes and lists files in an `osmium-fs` RAM file system. On
   all three an init program also forks, waits and execs; `fork` copies
-  memory eagerly (no copy-on-write), and a process has one thread. Kernel stack overflows are caught on all three
+  memory eagerly (no copy-on-write), and a process can have several threads (`clone` with `CLONE_THREAD`, joined with `futex`). Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. Load balancing (`with_stealing`) is opt-in; by default tasks

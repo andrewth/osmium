@@ -256,7 +256,7 @@ pub(crate) fn child_exited(parent: &Process, child: Pid) {
 /// Whether `th` has a signal that a blocked call should be interrupted for,
 /// or the process is ending.
 pub(crate) fn interrupted(p: &Process, th: &Thread) -> bool {
-    if p.group.exiting.get().is_some() {
+    if p.group.exiting.get().is_some() || th.doomed.load(Ordering::SeqCst) {
         return true;
     }
     (th.pending.load(Ordering::SeqCst) | p.signals.pending.load(Ordering::SeqCst))
@@ -294,6 +294,10 @@ pub(crate) fn deliver_to<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) ->
     loop {
         if let Some(status) = p.group.exiting.get() {
             return Some(*status);
+        }
+        if th.doomed.load(Ordering::SeqCst) {
+            // Another thread's `execve` is replacing the program.
+            return Some(ExitStatus::Code(0));
         }
         let (sig, act) = take_next(p, th)?;
         match act.handler {

@@ -65,7 +65,7 @@ extern crate std;
 
 mod exec;
 pub mod fd;
-mod futex;
+pub mod futex;
 mod memory;
 mod process;
 pub mod signal;

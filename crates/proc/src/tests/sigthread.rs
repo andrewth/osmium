@@ -359,10 +359,6 @@ fn clone_makes_threads_with_their_own_ids() {
     };
     assert_eq!(p.group.find(t2).unwrap().signal_mask(), bit(SIGUSR2));
     assert_eq!(th.signal_mask(), 0);
-
-    // exec needs a single thread.
-    put(&p, DATA + 0x200, b"/bin/prog\0");
-    assert_eq!(callt(&p, &main, Sys::Execve, &[DATA + 0x200, 0, 0]), -(Errno::EBUSY.0 as i64));
 }
 
 #[test]
@@ -474,9 +470,12 @@ fn futex_wait_and_wake() {
     put(&p, addr, &7u32.to_ne_bytes());
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 0, 8, 0]), EAGAIN);
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr + 1, 0, 7, 0]), EINVAL, "unaligned");
-    assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 0, 7, DATA]), -(Errno::ENOSYS.0 as i64), "no timeouts yet");
     assert_eq!(callt(&p, &th, Sys::Futex, &[0xdead_0000, 0, 7, 0]), -(Errno::EFAULT.0 as i64));
-    assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 3, 7, 0]), -(Errno::ENOSYS.0 as i64), "requeue");
+    for pi in [6, 7, 8, 11, 12, 13] {
+        assert_eq!(callt(&p, &th, Sys::Futex, &[addr, pi, 0, 0]), -(Errno::ENOSYS.0 as i64), "PI futex {pi}");
+    }
+    assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 9, 7, 0, 0, 0]), EINVAL, "an empty bitset");
+    assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 10, 1, 0, 0, 0]), EINVAL, "an empty bitset");
 
     let a = futex::enqueue(&p, addr, 7).unwrap();
     let b = futex::enqueue(&p, addr, 7).unwrap();
@@ -545,4 +544,173 @@ fn a_signal_frame_on_a_shared_stack_copies_the_page_first() {
     assert_eq!(signal::deliver_to(&c, &c.leader(), &mut cregs), None);
     assert_eq!(cregs.pc, HANDLER, "the child inherited the handler");
     assert_eq!(get(&c, cregs.args[1], 4), (SIGUSR1 as i32).to_ne_bytes());
+}
+
+fn futex_call(p: &Process, th: &Thread, a: [u64; 6]) -> i64 {
+    callt(p, th, Sys::Futex, &a)
+}
+
+#[test]
+fn futex_bitsets_requeue_and_wake_op() {
+    let (p, _) = process("futex-ops");
+    let th = p.leader();
+    let (a1, a2) = (DATA + 0x400, DATA + 0x404);
+    put(&p, a1, &1u32.to_ne_bytes());
+    put(&p, a2, &5u32.to_ne_bytes());
+
+    // Bitsets: a wake only reaches waiters that share a bit.
+    let w = |addr, bits| {
+        let cur = u32::from_ne_bytes(get(&p, addr, 4).try_into().unwrap());
+        futex::enqueue_bits(&p, addr, cur, bits).unwrap()
+    };
+    let (x, y) = (w(a1, 0b01), w(a1, 0b10));
+    assert_eq!(futex_call(&p, &th, [a1, 10, 10, 0, 0, 0b100]), 0);
+    assert_eq!(futex_call(&p, &th, [a1, 10 | 128, 10, 0, 0, 0b10]), 1);
+    assert!(y.woken.load(Ordering::SeqCst) && !x.woken.load(Ordering::SeqCst));
+    assert_eq!(futex_call(&p, &th, [a1, 1, 10, 0, 0, 0]), 1);
+
+    // CMP_REQUEUE: one woken, the rest move to a2.
+    let ws: alloc::vec::Vec<_> = (0..4).map(|_| w(a1, u32::MAX)).collect();
+    assert_eq!(futex_call(&p, &th, [a1, 4, 1, 2, a2, 9]), EAGAIN, "the word is not 9");
+    assert_eq!(futex_call(&p, &th, [a1, 4, 1, 2, a2 + 1, 1]), EINVAL, "unaligned");
+    assert_eq!(futex_call(&p, &th, [a1, 4, 1, 2, a2, 1]), 3, "1 woken + 2 requeued");
+    assert!(ws[0].woken.load(Ordering::SeqCst) && !ws[1].woken.load(Ordering::SeqCst));
+    assert_eq!(futex_call(&p, &th, [a1, 1, 10, 0, 0, 0]), 1, "one stayed behind");
+    assert_eq!(futex_call(&p, &th, [a2, 1, 1, 0, 0, 0]), 1, "wakes a requeued one");
+    assert_eq!(futex_call(&p, &th, [a2, 3, 0, 10, a1, 0]), 1, "REQUEUE moves the last one back");
+    assert_eq!(futex_call(&p, &th, [a1, 1, 10, 0, 0, 0]), 1);
+
+    // WAKE_OP: *a2 += 1 and wake a1; if the old value was 5, wake a2 too.
+    let (p1, p2) = (w(a1, u32::MAX), w(a2, u32::MAX));
+    let val3 = (1 << 28) | (1 << 12) | 5;
+    assert_eq!(futex_call(&p, &th, [a1, 5, 1, 1, a2, val3]), 2);
+    assert!(p1.woken.load(Ordering::SeqCst) && p2.woken.load(Ordering::SeqCst));
+    assert_eq!(get(&p, a2, 4), 6u32.to_ne_bytes());
+    let p3 = w(a2, u32::MAX);
+    assert_eq!(futex_call(&p, &th, [a1, 5, 1, 1, a2, val3]), 0, "the old value is 6 now");
+    assert!(!p3.woken.load(Ordering::SeqCst));
+    // OPARG_SHIFT | OR 1<<3, compare >= 6 (always true for the old value 7).
+    let val3 = (1 << 31) | (2 << 28) | (5 << 24) | (3 << 12) | 6;
+    assert_eq!(futex_call(&p, &th, [a1, 5, 0, 1, a2, val3]), 1);
+    assert_eq!(get(&p, a2, 4), 15u32.to_ne_bytes());
+    assert_eq!(futex_call(&p, &th, [a1, 5, 0, 1, a2, 7 << 28]), -(Errno::ENOSYS.0 as i64), "bad op");
+}
+
+#[test]
+fn futex_timeouts_use_the_kernel_clock() {
+    use core::sync::atomic::AtomicU64;
+    static NOW: AtomicU64 = AtomicU64::new(5_000);
+    let (p, _) = process("futex-time");
+    let th = p.leader();
+    let addr = DATA + 0x440;
+    put(&p, addr, &1u32.to_ne_bytes());
+    futex::set_clock(|| NOW.load(Ordering::SeqCst));
+    let ts = |sec: i64, nsec: i64| [sec.to_ne_bytes(), nsec.to_ne_bytes()].concat();
+    put(&p, DATA + 0x460, &ts(0, 1_000));
+    put(&p, DATA + 0x480, &ts(0, 1_000_000_000));
+    put(&p, DATA + 0x4a0, &ts(-1, 0));
+    // Absolute deadline (FUTEX_WAIT_BITSET) already behind the clock.
+    assert_eq!(futex_call(&p, &th, [addr, 9 | 128, 1, DATA + 0x460, 0, u32::MAX as u64]), -(Errno::ETIMEDOUT.0 as i64));
+    let einval = -(Errno::EINVAL.0 as i64);
+    assert_eq!(futex_call(&p, &th, [addr, 0, 1, DATA + 0x480, 0, 0]), einval, "tv_nsec out of range");
+    assert_eq!(futex_call(&p, &th, [addr, 0, 1, DATA + 0x4a0, 0, 0]), einval, "negative time");
+    assert_eq!(futex_call(&p, &th, [addr, 0, 2, DATA + 0x460, 0, 0]), EAGAIN, "the value is checked first");
+}
+
+#[test]
+fn robust_lists_mark_owned_futexes_when_a_thread_dies() {
+    platform();
+    let (p, _) = process("robust");
+    let main = p.leader();
+    let Outcome::Thread { tid, .. } = clone_thread(&p, &main, clone_flags(), STACK, DATA + 0x10, DATA + 0x20, 0) else {
+        panic!()
+    };
+    let th = p.group.find(tid).unwrap();
+    let head = DATA + 0x500;
+    let (e1, e2, pending) = (DATA + 0x540, DATA + 0x560, DATA + 0x580);
+    // The futex word sits 8 bytes after its list entry.
+    let word = |e: u64| e + 8;
+    let q = |v: u64| v.to_ne_bytes();
+    put(&p, head, &q(e1));
+    put(&p, head + 8, &8u64.to_ne_bytes());
+    put(&p, head + 16, &q(pending));
+    put(&p, e1, &q(e2));
+    put(&p, e2, &q(head));
+    put(&p, word(e1), &(tid | 0x8000_0000).to_ne_bytes());
+    put(&p, word(e2), &(main.tid() | 0x8000_0000).to_ne_bytes());
+    put(&p, word(pending), &tid.to_ne_bytes());
+
+    assert_eq!(callt(&p, &th, Sys::SetRobustList, &[head, 16]), EINVAL, "wrong size");
+    assert_eq!(callt(&p, &th, Sys::SetRobustList, &[head, 24]), 0);
+    assert_eq!(callt(&p, &th, Sys::GetRobustList, &[0, DATA + 0x600, DATA + 0x608]), 0);
+    assert_eq!(get(&p, DATA + 0x600, 8), head.to_ne_bytes());
+    assert_eq!(get(&p, DATA + 0x608, 8), 24u64.to_ne_bytes());
+    assert_eq!(callt(&p, &main, Sys::GetRobustList, &[tid as u64, DATA + 0x600, DATA + 0x608]), 0);
+    assert_eq!(callt(&p, &main, Sys::GetRobustList, &[tid as u64 + 77, DATA + 0x600, DATA + 0x608]), ESRCH);
+
+    let w = futex::enqueue(&p, word(e1), tid | 0x8000_0000).unwrap();
+    thread::exit_thread(&p, &th, ExitStatus::Code(0));
+    assert!(w.woken.load(Ordering::SeqCst), "a waiter on an owned futex is woken");
+    assert_eq!(get(&p, word(e1), 4), 0xc000_0000u32.to_ne_bytes(), "OWNER_DIED, WAITERS kept");
+    assert_eq!(get(&p, word(e2), 4), (main.tid() | 0x8000_0000).to_ne_bytes(), "someone else's is left alone");
+    assert_eq!(get(&p, word(pending), 4), 0x4000_0000u32.to_ne_bytes(), "the pending entry too");
+}
+
+#[test]
+fn exec_from_a_non_leader_thread_ends_the_others_and_takes_over_the_pid() {
+    platform();
+    let (p, _) = process("exec-thread");
+    let main = p.leader();
+    let flags = clone_flags();
+    let Outcome::Thread { tid: t1, .. } = clone_thread(&p, &main, flags, STACK, DATA + 0x10, DATA + 0x20, 0) else {
+        panic!()
+    };
+    let Outcome::Thread { tid: t2, .. } = clone_thread(&p, &main, flags, STACK - 0x400, DATA + 0x10, DATA + 0x24, 0)
+    else {
+        panic!()
+    };
+    let (th1, th2) = (p.group.find(t1).unwrap(), p.group.find(t2).unwrap());
+    assert!(thread::doom_others(&p, &th1));
+    assert!(main.doomed.load(Ordering::SeqCst) && th2.doomed.load(Ordering::SeqCst));
+    assert!(!th1.doomed.load(Ordering::SeqCst));
+    assert!(!thread::doom_others(&p, &th2), "a doomed thread cannot exec");
+    let mut regs = Regs::<true>::new();
+    let status = signal::deliver_to(&p, &main, &mut regs).expect("the doomed leader stops");
+    thread::exit_thread(&p, &main, status);
+    let status = signal::deliver_to(&p, &th2, &mut regs).expect("the doomed thread stops");
+    thread::exit_thread(&p, &th2, status);
+    assert_eq!(p.exit_status(), None, "the exec'ing thread keeps the process alive");
+    assert_eq!(p.group.live(), 1);
+
+    thread::promote(&p, &th1);
+    assert_eq!(th1.tid(), p.pid().0, "it takes the process id");
+    assert_eq!(p.threads(), alloc::vec![p.pid().0]);
+    assert_eq!(p.leader().tid(), p.pid().0);
+    assert_eq!(callt(&p, &th1, Sys::Gettid, &[]), p.pid().0 as i64);
+    assert!(thread::find(t1).is_none(), "the old thread id is gone");
+    assert_eq!(thread::find(p.pid().0).map(|(_, t)| t.tid()), Some(p.pid().0));
+    thread::exit_thread(&p, &th1, ExitStatus::Code(0));
+    assert_eq!(p.exit_status(), Some(ExitStatus::Code(0)));
+}
+
+#[test]
+fn wait4_sees_a_process_only_when_its_last_thread_is_gone() {
+    platform();
+    let (parent, _) = process("wait-parent");
+    let pmain = parent.leader();
+    let Outcome::Fork { child, .. } = dispatch_as(&parent, &pmain, Sys::Fork.number(), [0; 6]) else { panic!() };
+    let c = Process::find(child).expect("a child");
+    let cmain = c.leader();
+    let Outcome::Thread { tid, .. } = clone_thread(&c, &cmain, clone_flags(), STACK, DATA + 0x10, DATA + 0x20, 0)
+    else {
+        panic!()
+    };
+    let th = c.group.find(tid).unwrap();
+    // The leader exits first (pthread_exit from main): not a zombie yet.
+    thread::exit_thread(&c, &cmain, ExitStatus::Code(1));
+    assert_eq!(callt(&parent, &pmain, Sys::Wait4, &[child.0 as u64, 0, 1, 0]), 0, "WNOHANG: still running");
+    assert_eq!(callt(&parent, &pmain, Sys::Wait4, &[tid as u64, 0, 1, 0]), -(Errno::ECHILD.0 as i64), "not a child");
+    thread::exit_thread(&c, &th, ExitStatus::Code(2));
+    assert_eq!(callt(&parent, &pmain, Sys::Wait4, &[child.0 as u64, DATA + 0x700, 1, 0]), child.0 as i64);
+    assert_eq!(get(&parent, DATA + 0x700, 4), (2i32 << 8).to_ne_bytes(), "the last thread's status");
 }

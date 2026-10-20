@@ -20,9 +20,10 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use osmium_fs::Errno;
+use osmium_sched::WaitQueue;
 use osmium_sync::{IrqSpinLock, Once};
 
 use crate::process::{ExitStatus, Pid, Process};
@@ -36,13 +37,17 @@ const THREADS_MAX: usize = 1024;
 
 /// One thread of a process.
 pub struct Thread {
-    tid: u32,
-    leader: bool,
+    /// Changes once, when a non-leader thread's `execve` makes it the leader.
+    tid: AtomicU32,
+    leader: AtomicBool,
     /// The task running it, plus one; 0 until it is known.
     task: AtomicU64,
     pub(crate) mask: AtomicU64,
     pub(crate) pending: AtomicU64,
     clear_tid: AtomicU64,
+    robust_list: AtomicU64,
+    /// Another thread's `execve` is ending this one.
+    pub(crate) doomed: AtomicBool,
     tls: AtomicU64,
     fault: IrqSpinLock<Option<(u8, u64)>>,
     alive: AtomicBool,
@@ -51,12 +56,14 @@ pub struct Thread {
 impl Thread {
     fn new(tid: u32, leader: bool) -> Self {
         Self {
-            tid,
-            leader,
+            tid: AtomicU32::new(tid),
+            leader: AtomicBool::new(leader),
             task: AtomicU64::new(0),
             mask: AtomicU64::new(0),
             pending: AtomicU64::new(0),
             clear_tid: AtomicU64::new(0),
+            robust_list: AtomicU64::new(0),
+            doomed: AtomicBool::new(false),
             tls: AtomicU64::new(0),
             fault: IrqSpinLock::new(None),
             alive: AtomicBool::new(true),
@@ -65,7 +72,7 @@ impl Thread {
 
     /// The thread id: the process id for the first thread.
     pub fn tid(&self) -> u32 {
-        self.tid
+        self.tid.load(Ordering::SeqCst)
     }
 
     /// The signals this thread blocks.
@@ -76,6 +83,14 @@ impl Thread {
     /// The user thread pointer last set for it (`CLONE_SETTLS`, `arch_prctl`).
     pub fn tls(&self) -> u64 {
         self.tls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn robust_list(&self) -> u64 {
+        self.robust_list.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_robust_list(&self, head: u64) {
+        self.robust_list.store(head, Ordering::SeqCst);
     }
 
     pub(crate) fn set_clear_tid(&self, addr: u64) {
@@ -101,19 +116,30 @@ pub(crate) struct ThreadGroup {
     /// Set once the whole process is ending: by `exit_group` or a fatal
     /// signal. Every thread then stops with this status.
     pub(crate) exiting: Once<ExitStatus>,
+    /// Woken whenever a thread ends: `execve` waits for the others here.
+    ended: WaitQueue,
 }
 
 impl ThreadGroup {
     pub(crate) fn new(pid: Pid) -> Self {
-        Self { threads: IrqSpinLock::new(alloc::vec![Arc::new(Thread::new(pid.0, true))]), exiting: Once::new() }
+        Self {
+            threads: IrqSpinLock::new(alloc::vec![Arc::new(Thread::new(pid.0, true))]),
+            exiting: Once::new(),
+            ended: WaitQueue::new(),
+        }
     }
 
     pub(crate) fn leader(&self) -> Arc<Thread> {
-        self.threads.lock().iter().find(|t| t.leader).expect("the leader is never removed").clone()
+        self.threads
+            .lock()
+            .iter()
+            .find(|t| t.leader.load(Ordering::SeqCst))
+            .expect("the leader is never removed")
+            .clone()
     }
 
     pub(crate) fn find(&self, tid: u32) -> Option<Arc<Thread>> {
-        self.threads.lock().iter().find(|t| t.tid == tid).cloned()
+        self.threads.lock().iter().find(|t| t.tid() == tid).cloned()
     }
 
     /// Threads that have not exited.
@@ -125,6 +151,7 @@ impl ThreadGroup {
         for t in self.threads.lock().iter() {
             t.tls.store(0, Ordering::SeqCst);
             t.clear_tid.store(0, Ordering::SeqCst);
+            t.robust_list.store(0, Ordering::SeqCst);
         }
     }
 }
@@ -137,7 +164,7 @@ impl Process {
 
     /// The ids of the process's live threads.
     pub fn threads(&self) -> Vec<u32> {
-        self.group.threads.lock().iter().filter(|t| t.alive.load(Ordering::SeqCst)).map(|t| t.tid).collect()
+        self.group.threads.lock().iter().filter(|t| t.alive.load(Ordering::SeqCst)).map(|t| t.tid()).collect()
     }
 }
 
@@ -160,7 +187,7 @@ pub(crate) fn current_thread(p: &Process) -> Arc<Thread> {
     if let Some(t) = threads.iter().find(|t| t.task.load(Ordering::SeqCst) == id) {
         return t.clone();
     }
-    let leader = threads.iter().find(|t| t.leader).expect("the leader is never removed");
+    let leader = threads.iter().find(|t| t.leader.load(Ordering::SeqCst)).expect("the leader is never removed");
     // The first thread's task is spawned before it can run and cannot be
     // named until then, so it is recognised by being the first to ask.
     let _ = leader.task.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst);
@@ -324,6 +351,7 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
     }
     let group_wide = p.group.exiting.get().copied();
     let status = group_wide.unwrap_or(status);
+    crate::futex::exit_robust_list(p, th);
     // Wake whoever waits for this thread, as `pthread_join` does.
     let addr = th.clear_tid.swap(0, Ordering::SeqCst);
     if addr != 0 {
@@ -333,17 +361,68 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
     let live = {
         let mut threads = p.group.threads.lock();
         th.alive.store(false, Ordering::SeqCst);
-        if !th.leader {
+        if !th.leader.load(Ordering::SeqCst) {
             threads.retain(|t| !Arc::ptr_eq(t, th));
         }
         threads.iter().filter(|t| t.alive.load(Ordering::SeqCst)).count()
     };
-    TIDS.lock().remove(&th.tid);
+    TIDS.lock().remove(&th.tid());
+    p.group.ended.wake_all();
     if live == 0 {
         p.set_exited(status);
     } else if group_wide.is_some() {
         crate::futex::interrupt();
     }
+}
+
+/// `execve` from a thread of a multi-threaded process: ends every other
+/// thread, waits until they are gone, and makes the caller the leader (it
+/// takes the process id as its thread id). `EINTR` if the process is ending
+/// anyway, or another thread's `execve` got there first.
+pub(crate) fn exec_begin(p: &Process, th: &Thread) -> Result<(), Errno> {
+    if !doom_others(p, th) {
+        return Err(Errno::EINTR);
+    }
+    crate::futex::interrupt();
+    p.child_exited.wake_all();
+    p.group.ended.wait_until(|| {
+        if th.doomed.load(Ordering::SeqCst) || p.group.exiting.get().is_some() {
+            Some(Err(Errno::EINTR))
+        } else if p.group.live() == 1 {
+            Some(Ok(()))
+        } else {
+            None
+        }
+    })?;
+    promote(p, th);
+    Ok(())
+}
+
+/// Marks every thread but `th` to end, unless `th` was itself marked.
+/// Returns whether it did.
+pub(crate) fn doom_others(p: &Process, th: &Thread) -> bool {
+    let threads = p.group.threads.lock();
+    if th.doomed.load(Ordering::SeqCst) {
+        return false;
+    }
+    for t in threads.iter().filter(|t| !core::ptr::eq(&***t, th)) {
+        t.doomed.store(true, Ordering::SeqCst);
+    }
+    true
+}
+
+/// Makes `th`, the only live thread, the leader.
+pub(crate) fn promote(p: &Process, th: &Thread) {
+    let old = th.tid();
+    let mut threads = p.group.threads.lock();
+    if th.leader.load(Ordering::SeqCst) {
+        return;
+    }
+    threads.retain(|t| core::ptr::eq(&**t, th));
+    th.tid.store(p.pid().0, Ordering::SeqCst);
+    th.leader.store(true, Ordering::SeqCst);
+    drop(threads);
+    TIDS.lock().remove(&old);
 }
 
 /// `exit_group`: ends every thread of `p`.
