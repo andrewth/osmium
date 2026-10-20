@@ -204,6 +204,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ An emulated 8259A PIC pair (`VirtualPic`: init sequence, masks, IRR/ISR, EOI, cascade) whose output and INTA drive the SVM vCPU
 - ✅ An emulated 8254 PIT (`VirtualPit`: modes 0, 2, 3 and 4, counter latch, read-back) counting in host time, channel 0 on IRQ 0; `poll` and `next_deadline` let the host deliver ticks on time
 - ✅ An emulated xAPIC local APIC (`VirtualLapic`: TPR/PPR, IRR/ISR, EOI, SVR, one-shot and periodic timer, self IPIs and an IPI hook for other vCPUs); the 64-bit x86_64-hyp guest takes its timer through a 64-bit IDT
+- ✅ An emulated I/O APIC (`VirtualIoApic`: 24 redirection entries, edge and level inputs, remote IRR cleared by the local APIC's EOI through `VirtualLapic::with_eoi`)
 - ✅ Multi-vCPU x86 guests: INIT/STARTUP decoded from the vLAPIC's ICR (`decode_icr`) into `GuestCpus` start requests, APs started in real mode (`SvmVcpu::set_real_mode`), fixed IPIs between vCPUs' APICs; x86_64-hyp runs a two-vCPU guest whose AP goes from real to protected mode and IPIs the BSP
 - ✅ An emulated GICv2 (`VirtualGicV2`: distributor and per-CPU interfaces for up to 8 vCPUs, banked SGIs/PPIs, SPI targets, `GICD_SGIR`, priorities, PMR, acknowledge/EOI) driving the AArch64 vCPU's virtual IRQ; the guest's virtual timer feeds it, with expiries during a guest run exiting through the host GIC
 - ✅ An emulated PLIC (`VirtualPlic`, QEMU `virt` register layout) whose S-mode context outputs drive vCPU external-interrupt lines (`hvip.VSEIP`)

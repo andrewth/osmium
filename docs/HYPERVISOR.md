@@ -42,7 +42,7 @@ claims returns all ones; a write to one is dropped, as on real hardware.
 | MMIO exits from | guest-page faults, decoded from `htinst` or the instruction (`hlvx`) | data aborts with a valid syndrome | nested page faults, decoded by `x86::decode` |
 | Hypercalls | `ecall` (SBI: `riscv::sbi`) | `hvc` (PSCI: `aarch64::psci`) | `vmmcall` |
 | Interrupt input | `external_irq()` line, becomes `hvip.VSEIP` | `irq_line()`, becomes `HCR_EL2.VI` | `irq_line()` plus `connect_intr` (injected through `EVENTINJ`) |
-| Interrupt controller to emulate | `VirtualPlic` | `VirtualGicV2` | `VirtualPic`, `VirtualLapic` |
+| Interrupt controller to emulate | `VirtualPlic` | `VirtualGicV2` | `VirtualPic`, or `VirtualLapic` per vCPU plus `VirtualIoApic` |
 | Guest timer | Sstc `vstimecmp`, switched per vCPU | virtual timer; `connect_timer` feeds it to the GIC | `VirtualPit` on the PIC's IRQ 0, or the `VirtualLapic` timer; either driven by `poll` at its `next_deadline` |
 
 Each backend saves the host's callee-saved registers, runs the guest, and

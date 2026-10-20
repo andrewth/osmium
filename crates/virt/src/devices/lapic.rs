@@ -201,6 +201,7 @@ pub struct VirtualLapic {
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     output: Box<dyn Fn(bool) + Send + Sync>,
     ipi: Option<Ipi>,
+    eoi: Option<Box<dyn Fn(u8) + Send + Sync>>,
     asserted: core::sync::atomic::AtomicBool,
 }
 
@@ -238,6 +239,7 @@ impl VirtualLapic {
             clock: Box::new(clock),
             output: Box::new(output),
             ipi: None,
+            eoi: None,
             asserted: core::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -247,6 +249,14 @@ impl VirtualLapic {
     /// delivery mode and shorthand in `icr_low`.
     pub fn with_ipi(mut self, ipi: impl Fn(u32, u32) + Send + Sync + 'static) -> Self {
         self.ipi = Some(Box::new(ipi));
+        self
+    }
+
+    /// Reports each EOI's vector to `eoi`, e.g. an
+    /// [`VirtualIoApic::eoi`](super::VirtualIoApic::eoi) so level-triggered
+    /// inputs can fire again.
+    pub fn with_eoi(mut self, eoi: impl Fn(u8) + Send + Sync + 'static) -> Self {
+        self.eoi = Some(Box::new(eoi));
         self
     }
 
@@ -351,12 +361,13 @@ impl BusDevice for VirtualLapic {
         let v = u32::from_le_bytes(b);
         let now = (self.clock)();
         let mut s = self.state.lock();
-        let mut ipi = None;
+        let (mut ipi, mut eoi) = (None, None);
         match offset {
             TPR => s.tpr = v as u8,
             EOI => {
                 if let Some(i) = s.isr.highest() {
                     s.isr.clear(i);
+                    eoi = Some(i);
                 }
             }
             LDR => s.ldr = v & 0xff00_0000,
@@ -404,6 +415,9 @@ impl BusDevice for VirtualLapic {
         drop(s);
         if let (Some((high, low)), Some(f)) = (ipi, &self.ipi) {
             f(high, low);
+        }
+        if let (Some(v), Some(f)) = (eoi, &self.eoi) {
+            f(v);
         }
         self.poll();
     }
