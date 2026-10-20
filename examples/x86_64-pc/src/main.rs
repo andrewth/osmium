@@ -112,6 +112,8 @@ const BOOT_MAPPED: u64 = 1 << 32;
 /// Physical address the AP trampoline is copied to (STARTUP vector 0x08).
 const TRAMPOLINE: u64 = x86::smp::TRAMPOLINE;
 const IPI_VECTOR: u8 = 33;
+/// Vector of the TLB shootdown IPI.
+const SHOOTDOWN_VECTOR: u8 = 34;
 /// Vector for COM1's receive interrupt, routed through the I/O APIC.
 const COM1_VECTOR: u8 = 40;
 /// COM1's ISA IRQ.
@@ -191,6 +193,48 @@ fn on_switch(next: &osmium::sched::Task) {
     }
 }
 
+/// CPUs that still owe an acknowledgement of the current shootdown.
+static SHOOT_PENDING: AtomicUsize = AtomicUsize::new(0);
+/// Page the current shootdown invalidates.
+static SHOOT_ADDR: AtomicUsize = AtomicUsize::new(0);
+/// Held by the CPU running a shootdown.
+static SHOOT_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Invalidates this CPU's entry for the pending shootdown page, if it owes one.
+fn shootdown_service() {
+    let me = 1usize << cpu::current_id();
+    if SHOOT_PENDING.load(Ordering::Acquire) & me != 0 {
+        osmium::arch::mmu::flush_page(SHOOT_ADDR.load(Ordering::Acquire));
+        SHOOT_PENDING.fetch_and(!me, Ordering::AcqRel);
+    }
+}
+
+/// Invalidates `va` on every online CPU and returns once all have done so.
+/// Waiting CPUs keep servicing requests, so two initiators cannot deadlock
+/// even when interrupts are off.
+fn shootdown(va: usize) {
+    osmium::arch::mmu::flush_page(va);
+    let me = cpu::current_id();
+    let others = ((1usize << ONLINE.load(Ordering::Acquire)) - 1) & !(1 << me);
+    if others == 0 {
+        return;
+    }
+    while SHOOT_BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        shootdown_service();
+        core::hint::spin_loop();
+    }
+    SHOOT_ADDR.store(va, Ordering::Release);
+    SHOOT_PENDING.store(others, Ordering::Release);
+    let apic = LAPIC.get().expect("LAPIC initialised");
+    for cpu in (0..MAX_CPUS).filter(|c| others & (1 << c) != 0) {
+        apic.send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, SHOOTDOWN_VECTOR);
+    }
+    while SHOOT_PENDING.load(Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+    SHOOT_BUSY.store(false, Ordering::Release);
+}
+
 /// Task stacks with an unmapped guard page below them, so an overflow
 /// faults instead of silently overwriting whatever lies beneath.
 struct GuardedStacks;
@@ -201,9 +245,13 @@ unsafe impl StackAllocator for GuardedStacks {
     fn alloc(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
         let order = order_for(size + PAGE_SIZE);
         let guard = FRAMES.lock().alloc(order)?;
-        let mut pt = PT.lock();
-        let (_, flush) = pt.as_mut()?.unmap_4k(VirtAddr::new(guard.0)).ok()?;
-        flush.flush();
+        {
+            let mut pt = PT.lock();
+            let (_, flush) = pt.as_mut()?.unmap_4k(VirtAddr::new(guard.0)).ok()?;
+            flush.flush();
+        }
+        // The old mapping was global and may be cached on any CPU.
+        shootdown(guard.0 as usize);
         Some((NonNull::new((guard.0 + PAGE_SIZE as u64) as *mut u8)?, (PAGE_SIZE << order) - PAGE_SIZE))
     }
 
@@ -646,21 +694,36 @@ fn on_timer() {
 }
 
 /// The last exception that `on_trap` recovered from.
-static RECOVERED: IrqSpinLock<Option<Trap>> = IrqSpinLock::new(None);
-static RECOVER: AtomicBool = AtomicBool::new(false);
+static RECOVERED: [IrqSpinLock<Option<Trap>>; MAX_CPUS] = [const { IrqSpinLock::new(None) }; MAX_CPUS];
+/// Whether this CPU expects a trap and may recover from it. Per CPU, so a real
+/// fault on another CPU is never taken for the demo's.
+static RECOVER: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Runs `f`, which must take one breakpoint or page fault, with recovery armed
+/// on this CPU only (interrupts off, so the task cannot migrate meanwhile).
+/// Returns the trap that was recovered from.
+fn recover_trap(f: impl FnOnce()) -> Trap {
+    irq::without(|| {
+        let cpu = cpu::current_id();
+        RECOVER[cpu].store(true, Ordering::SeqCst);
+        f();
+        RECOVER[cpu].store(false, Ordering::SeqCst);
+        RECOVERED[cpu].lock().take().expect("recovery recorded by the trap handler")
+    })
+}
 
 fn fault_demo() {
-    RECOVER.store(true, Ordering::SeqCst);
     // SAFETY: the handler steps over the breakpoint.
-    unsafe { core::arch::asm!("int3") };
-    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().expect("recovery recorded by the trap handler"));
+    let t = recover_trap(|| unsafe { core::arch::asm!("int3") });
+    println!("[trap]  recovered from {:?}", t);
     // The first 1 MiB is unmapped: a page fault.
-    // SAFETY: the read faults and the handler skips it; the value is never used.
-    let v: u64;
-    unsafe { core::arch::asm!("mov {}, qword ptr [0x1000]", out(reg) v) };
-    let _ = v;
-    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().expect("recovery recorded by the trap handler"));
-    RECOVER.store(false, Ordering::SeqCst);
+    let t = recover_trap(|| {
+        let v: u64;
+        // SAFETY: the read faults and the handler skips it; the value is never used.
+        unsafe { core::arch::asm!("mov {}, qword ptr [0x1000]", out(reg) v) };
+        let _ = v;
+    });
+    println!("[trap]  recovered from {:?}", t);
 }
 
 /// A task that recurses until it runs off the bottom of its stack.
@@ -939,6 +1002,10 @@ fn handle_trap(frame: &mut TrapFrame) {
             LAPIC.get().expect("LAPIC initialised").eoi();
             osmium::sched::preempt_if_needed();
         }
+        (SHOOTDOWN_VECTOR, _) => {
+            shootdown_service();
+            LAPIC.get().expect("LAPIC initialised").eoi();
+        }
         (COM1_VECTOR, _) => {
             // Drain the UART's FIFO into the ring, then wake the reader.
             if let Some(p) = RX_PRODUCER.lock().as_mut() {
@@ -955,8 +1022,10 @@ fn handle_trap(frame: &mut TrapFrame) {
         (SPURIOUS_VECTOR, _) => {}
         // A spurious IRQ from a masked PIC: no EOI (none was latched).
         (v, _) if PIC_VECTORS.contains(&v) => {}
-        (_, cause @ (Trap::Breakpoint | Trap::PageFault { .. })) if RECOVER.load(Ordering::SeqCst) => {
-            *RECOVERED.lock() = Some(cause);
+        (_, cause @ (Trap::Breakpoint | Trap::PageFault { .. }))
+            if RECOVER[cpu::current_id()].load(Ordering::SeqCst) =>
+        {
+            *RECOVERED[cpu::current_id()].lock() = Some(cause);
             // `int3` is 1 byte; the faulting `mov rax, [0x1000]` is 8.
             let len = if cause == Trap::Breakpoint { 1 } else { 8 };
             frame.set_pc(frame.pc() + len);

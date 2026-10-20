@@ -513,19 +513,34 @@ fn on_timer(_irq: u32) {
 }
 
 /// The last synchronous exception that `on_trap` recovered from.
-static RECOVERED: IrqSpinLock<Option<Trap>> = IrqSpinLock::new(None);
-static RECOVER: AtomicBool = AtomicBool::new(false);
+static RECOVERED: [IrqSpinLock<Option<Trap>>; MAX_CPUS] = [const { IrqSpinLock::new(None) }; MAX_CPUS];
+/// Whether this CPU expects a trap and may recover from it. Per CPU, so a real
+/// fault on another CPU is never taken for the demo's.
+static RECOVER: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Runs `f`, which must take one breakpoint or page fault, with recovery armed
+/// on this CPU only (interrupts off, so the task cannot migrate meanwhile).
+/// Returns the trap that was recovered from.
+fn recover_trap(f: impl FnOnce()) -> Trap {
+    irq::without(|| {
+        let cpu = cpu::current_id();
+        RECOVER[cpu].store(true, Ordering::SeqCst);
+        f();
+        RECOVER[cpu].store(false, Ordering::SeqCst);
+        RECOVERED[cpu].lock().take().expect("recovery recorded by the trap handler")
+    })
+}
 
 fn fault_demo() {
-    RECOVER.store(true, Ordering::SeqCst);
     // SAFETY: the handler steps over the breakpoint.
-    unsafe { core::arch::asm!("brk #0") };
-    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().expect("recovery recorded by the trap handler"));
+    let t = recover_trap(|| unsafe { core::arch::asm!("brk #0") });
+    println!("[trap]  recovered from {:?}", t);
     // Nothing is mapped at 0x1000: a data abort.
     // SAFETY: the read faults and the handler skips it; the value is never used.
-    let _ = unsafe { core::ptr::read_volatile(0x1000 as *const u64) };
-    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().expect("recovery recorded by the trap handler"));
-    RECOVER.store(false, Ordering::SeqCst);
+    let t = recover_trap(|| {
+        let _ = unsafe { core::ptr::read_volatile(0x1000 as *const u64) };
+    });
+    println!("[trap]  recovered from {:?}", t);
 }
 
 /// A task that recurses until it runs off the bottom of its stack.
@@ -755,7 +770,9 @@ fn handle_trap(frame: &mut TrapFrame) {
             Trap::Syscall => return syscall(frame),
             Trap::Interrupt(_) => {}
             // A write to a page `fork` shares gets its own copy; retry.
-            Trap::PageFault { addr, access: Access::Write } if osmium::proc::handle_page_fault(addr as u64, true) => return,
+            Trap::PageFault { addr, access: Access::Write } if osmium::proc::handle_page_fault(addr as u64, true) => {
+                return;
+            }
             cause => return user_fault(frame, cause),
         }
     }
@@ -770,14 +787,9 @@ fn handle_trap(frame: &mut TrapFrame) {
             frame.sp()
         );
         // A nested exception must stay on the exception stack.
-        RECOVER.store(true, Ordering::SeqCst);
         // SAFETY: the breakpoint arm below steps over it.
-        unsafe { core::arch::asm!("brk #0") };
-        RECOVER.store(false, Ordering::SeqCst);
-        println!(
-            "[guard] nested {:?} on the exception stack handled",
-            RECOVERED.lock().take().expect("recovery recorded by the trap handler")
-        );
+        let t = recover_trap(|| unsafe { core::arch::asm!("brk #0") });
+        println!("[guard] nested {t:?} on the exception stack handled");
         drop(task);
         osmium::sched::exit();
     }
@@ -787,8 +799,8 @@ fn handle_trap(frame: &mut TrapFrame) {
             // Leaving an interrupt is a preemption point.
             osmium::sched::preempt_if_needed();
         }
-        cause @ (Trap::Breakpoint | Trap::PageFault { .. }) if RECOVER.load(Ordering::SeqCst) => {
-            *RECOVERED.lock() = Some(cause);
+        cause @ (Trap::Breakpoint | Trap::PageFault { .. }) if RECOVER[cpu::current_id()].load(Ordering::SeqCst) => {
+            *RECOVERED[cpu::current_id()].lock() = Some(cause);
             // A64 instructions are always 4 bytes.
             frame.set_pc(frame.pc() + 4);
         }

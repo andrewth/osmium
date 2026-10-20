@@ -1194,7 +1194,13 @@ fn on_trap(frame: &mut TrapFrame) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
     irq::disable();
-    println!("\n[panic] {info}");
+    // Straight to COM1, not through the console: the panic may have come
+    // from inside println, with the console's lock held.
+    // SAFETY: the port is already set up; writes may interleave with
+    // another CPU's output, which is fine for a dying kernel.
+    let mut com1 = Uart16550::new(unsafe { Pio::new(COM1) });
+    let _ = writeln!(osmium::hal::serial::SerialWriter(&mut com1), "\n[panic] {info}");
     shutdown()
 }

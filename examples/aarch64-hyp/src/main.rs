@@ -894,7 +894,13 @@ fn on_trap(frame: &mut TrapFrame) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
     irq::disable();
-    println!("\n[panic] {info}");
+    // Straight to the PL011, not through the console: the panic may have
+    // come from inside println, with the console's lock held.
+    // SAFETY: the UART is already set up and mapped at this address.
+    if let Ok(mut uart) = Pl011::new(unsafe { IoMem::new(EARLY_UART as *mut u8, 0x1000) }) {
+        let _ = writeln!(osmium::hal::serial::SerialWriter(&mut uart), "\n[panic] {info}");
+    }
     shutdown()
 }

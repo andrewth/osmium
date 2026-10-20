@@ -138,6 +138,8 @@ static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMap
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 
 static UART: Once<SerialConsole<Uart16550<Mmio>>> = Once::new();
+/// Base and length of the console UART's registers, for the panic handler.
+static UART_REGS: (AtomicUsize, AtomicUsize) = (AtomicUsize::new(0), AtomicUsize::new(0));
 
 fn sym(s: &u8) -> u64 {
     s as *const u8 as u64
@@ -159,6 +161,8 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         uart_node.reg().next().map(|(a, s)| (a, s.unwrap_or(0x100))).expect("UART has a reg property");
     // SAFETY: the device tree says the UART's registers live here; nothing else uses them.
     let io = unsafe { IoMem::new(uart_base as *mut u8, uart_len as usize) };
+    UART_REGS.0.store(uart_base as usize, Ordering::Relaxed);
+    UART_REGS.1.store(uart_len as usize, Ordering::Relaxed);
     let mut uart = Uart16550::new(Mmio::new(io, 0));
     uart.init(None);
     set_console(UART.call_once(|| SerialConsole::new(uart)));
@@ -547,6 +551,15 @@ fn on_trap(frame: &mut TrapFrame) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    println!("\n[panic] {info}");
+    use core::fmt::Write;
+    // Straight to the UART, not through the console: the panic may have come
+    // from inside println, with the console's lock held.
+    let (base, len) = (UART_REGS.0.load(Ordering::Relaxed), UART_REGS.1.load(Ordering::Relaxed));
+    if base != 0 {
+        // SAFETY: the registers are the ones the console already drives; writes
+        // may interleave with its output, which is fine for a dying kernel.
+        let mut uart = Uart16550::new(Mmio::new(unsafe { IoMem::new(base as *mut u8, len) }, 0));
+        let _ = writeln!(osmium::hal::serial::SerialWriter(&mut uart), "\n[panic] {info}");
+    }
     host_sbi::shutdown()
 }

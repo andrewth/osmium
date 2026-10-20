@@ -194,6 +194,21 @@ static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 /// The kernel page table, shared by all harts.
 static PT: osmium::sync::IrqSpinLock<Option<PageTable<Sv39, &'static Frames>>> = osmium::sync::IrqSpinLock::new(None);
 
+/// Invalidates `[start, start + size)` on every other online hart (SBI RFENCE
+/// `remote_sfence_vma`, which returns once the harts have done it).
+fn remote_sfence_vma(start: usize, size: usize) {
+    const EID_RFENCE: usize = 0x5246_4e43;
+    let me = cpu::current_id();
+    for c in (0..ONLINE.load(Ordering::Acquire)).filter(|&c| c != me) {
+        let hart = HARTS[c].load(Ordering::Relaxed);
+        // SAFETY: an SBI remote fence only flushes TLB entries on the named hart.
+        unsafe {
+            core::arch::asm!("ecall", inlateout("a0") 1usize => _, inlateout("a1") hart => _,
+                in("a2") start, in("a3") size, in("a6") 1usize, in("a7") EID_RFENCE, options(nostack))
+        }
+    }
+}
+
 /// Task stacks with an unmapped guard page below them.
 struct GuardedStacks;
 
@@ -205,6 +220,8 @@ unsafe impl StackAllocator for GuardedStacks {
         let guard = FRAMES.lock().alloc(order)?;
         let (_, flush) = PT.lock().as_mut()?.unmap_4k(VirtAddr::new(guard.0)).ok()?;
         flush.flush();
+        // The old mapping was global and may be cached on any hart.
+        remote_sfence_vma(guard.0 as usize, PAGE_SIZE);
         Some((NonNull::new((guard.0 + PAGE_SIZE as u64) as *mut u8)?, (PAGE_SIZE << order) - PAGE_SIZE))
     }
 
@@ -885,19 +902,35 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 }
 
 /// The last synchronous trap that `on_trap` recovered from.
-static RECOVERED: osmium::sync::IrqSpinLock<Option<Trap>> = osmium::sync::IrqSpinLock::new(None);
-static RECOVER: AtomicBool = AtomicBool::new(false);
+static RECOVERED: [osmium::sync::IrqSpinLock<Option<Trap>>; MAX_CPUS] =
+    [const { osmium::sync::IrqSpinLock::new(None) }; MAX_CPUS];
+/// Whether this CPU expects a trap and may recover from it. Per CPU, so a real
+/// fault on another CPU is never taken for the demo's.
+static RECOVER: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Runs `f`, which must take one breakpoint or page fault, with recovery armed
+/// on this CPU only (interrupts off, so the task cannot migrate meanwhile).
+/// Returns the trap that was recovered from.
+fn recover_trap(f: impl FnOnce()) -> Trap {
+    irq::without(|| {
+        let cpu = cpu::current_id();
+        RECOVER[cpu].store(true, Ordering::SeqCst);
+        f();
+        RECOVER[cpu].store(false, Ordering::SeqCst);
+        RECOVERED[cpu].lock().take().expect("recovery recorded by the trap handler")
+    })
+}
 
 fn fault_demo() {
-    RECOVER.store(true, Ordering::SeqCst);
     // SAFETY: the handler steps over the breakpoint.
-    unsafe { core::arch::asm!("ebreak") };
-    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().expect("recovery recorded by the trap handler"));
+    let t = recover_trap(|| unsafe { core::arch::asm!("ebreak") });
+    println!("[trap]  recovered from {:?}", t);
     // Nothing is mapped at 0x1000: a load page fault.
     // SAFETY: the read faults and the handler skips it; the value is never used.
-    let _ = unsafe { core::ptr::read_volatile(0x1000 as *const u64) };
-    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().expect("recovery recorded by the trap handler"));
-    RECOVER.store(false, Ordering::SeqCst);
+    let t = recover_trap(|| {
+        let _ = unsafe { core::ptr::read_volatile(0x1000 as *const u64) };
+    });
+    println!("[trap]  recovered from {:?}", t);
 }
 
 /// Entry point of secondary harts, on their own stack with the MMU off.
@@ -1192,7 +1225,9 @@ fn handle_trap(frame: &mut TrapFrame) {
             Trap::Syscall => return syscall(frame),
             Trap::Interrupt(_) => {}
             // A write to a page `fork` shares gets its own copy; retry.
-            Trap::PageFault { addr, access: Access::Write } if osmium::proc::handle_page_fault(addr as u64, true) => return,
+            Trap::PageFault { addr, access: Access::Write } if osmium::proc::handle_page_fault(addr as u64, true) => {
+                return;
+            }
             cause => return user_fault(frame, cause),
         }
     }
@@ -1208,14 +1243,9 @@ fn handle_trap(frame: &mut TrapFrame) {
         );
         // A trap taken while on the exception stack must nest there, not be
         // mistaken for another overflow.
-        RECOVER.store(true, Ordering::SeqCst);
         // SAFETY: the breakpoint arm below steps over it.
-        unsafe { core::arch::asm!("ebreak") };
-        RECOVER.store(false, Ordering::SeqCst);
-        println!(
-            "[guard] nested {:?} on the exception stack handled",
-            RECOVERED.lock().take().expect("recovery recorded by the trap handler")
-        );
+        let t = recover_trap(|| unsafe { core::arch::asm!("ebreak") });
+        println!("[guard] nested {t:?} on the exception stack handled");
         drop(task);
         osmium::sched::exit();
     }
@@ -1227,8 +1257,8 @@ fn handle_trap(frame: &mut TrapFrame) {
             unsafe { riscv64::write_sip(riscv64::read_sip() & !riscv64::SIE_SSIE) };
             osmium::sched::preempt_if_needed();
         }
-        cause @ (Trap::Breakpoint | Trap::PageFault { .. }) if RECOVER.load(Ordering::SeqCst) => {
-            *RECOVERED.lock() = Some(cause);
+        cause @ (Trap::Breakpoint | Trap::PageFault { .. }) if RECOVER[cpu::current_id()].load(Ordering::SeqCst) => {
+            *RECOVERED[cpu::current_id()].lock() = Some(cause);
             // Step over the instruction: 2 bytes if compressed, else 4.
             // SAFETY: the faulting instruction is mapped executable code.
             let insn = unsafe { (frame.pc() as *const u16).read() };

@@ -193,8 +193,14 @@ fn on_trap(frame: &mut TrapFrame) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
     irq::disable();
-    println!("\n[panic] {info}");
+    // Straight to the UART, not through the console: the panic may have come
+    // from inside println, with the console's lock held.
+    // SAFETY: the registers are the ones the console already drives; writes
+    // may interleave with its output, which is fine for a dying kernel.
+    let mut uart = Uart16550::new(Mmio::new(unsafe { IoMem::new(UART_BASE as *mut u8, 0x100) }, 0));
+    let _ = writeln!(osmium::hal::serial::SerialWriter(&mut uart), "\n[panic] {info}");
     // SAFETY: SiFive test device: 0x3333 with a code means "fail".
     unsafe { (TEST_DEVICE as *mut u32).write_volatile(0x0001_3333) };
     cpu::halt_forever()
