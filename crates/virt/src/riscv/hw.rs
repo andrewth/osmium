@@ -49,6 +49,8 @@ osmium_hs_run:
     or t0, t0, t1
     csrw sstatus, t0
     csrr t0, sscratch    // this CPU's TrapCpu
+    // TrapCpu.guest stays non-null from here until osmium_hs_exit clears
+    // it: the trap entry's hook only looks at hstatus.SPV when it is set.
     sd a0, {guest}(t0)
     ld t0, {hstatus}(a0)
     csrw 0x600, t0
@@ -127,7 +129,7 @@ osmium_hs_exit:
     csrr t1, sscratch
     sd t1, 16(t0)
     csrw sscratch, sp
-    sd zero, {guest}(sp)
+    sd zero, {guest}(sp) // back in the host for good: see the sret path
     csrr t1, sepc
     sd t1, {pc}(t0)
     csrr t1, sstatus

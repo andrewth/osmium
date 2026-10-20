@@ -586,10 +586,14 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     overflow_demo();
     demos::user::boot_vfs();
     user_demo();
-    hyp::demo();
-    hyp::demo_irq();
-    hyp::demo_smp(ncpus);
-    hyp::demo_fp();
+    if hyp::available(&fdt) {
+        hyp::demo();
+        hyp::demo_irq();
+        hyp::demo_smp(ncpus);
+        hyp::demo_fp();
+    } else {
+        println!("[hyp]   no H extension in riscv,isa: skipping the guests (running as one?)");
+    }
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     sbi::shutdown()

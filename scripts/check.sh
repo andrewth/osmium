@@ -108,6 +108,27 @@ if command -v qemu-system-riscv64 >/dev/null; then
     rm -f "$fwlog"
 fi
 
+# RISC-V hypervisor booting a whole guest kernel: the riscv-virt kernel
+# built above runs in VS-mode under riscv-hyp (QEMU's loader places the ELF
+# raw in host RAM). Guest lines carry a "| " prefix.
+if command -v qemu-system-riscv64 >/dev/null; then
+    echo "== boot examples/riscv-virt as a guest of examples/riscv-hyp under QEMU"
+    nestlog=$(mktemp)
+    (cd examples/riscv-hyp && cargo build -q --release)
+    timeout 120 qemu-system-riscv64 -machine virt -bios default -smp 1 -m 512M -nographic \
+        -kernel examples/riscv-hyp/target/riscv64imac-unknown-none-elf/release/riscv-hyp \
+        -device loader,file=examples/riscv-virt/target/riscv64imac-unknown-none-elf/release/riscv-virt,addr=0x98000000,force-raw=on \
+        -serial "file:$nestlog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$nestlog"
+    for line in 'guest kernel: [0-9]* KiB loaded, entry 0x80200000' '| osmium riscv-virt example (hart 0)' \
+        '| \[mmu\]   Sv39 on' '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
+        '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' \
+        '| \[hyp\]   no H extension in riscv,isa: skipping the guests' '| \[done\]' 'guest exit Shutdown'; do
+        grep -q "$line" "$nestlog" || { echo "riscv-hyp: missing '$line'"; exit 1; }
+    done
+    rm -f "$nestlog"
+fi
+
 # EL2 hypervisor (QEMU starts it at EL2 with virtualization=on): checked for
 # its own lines, since it runs none of the scheduler demos.
 if command -v qemu-system-aarch64 >/dev/null; then

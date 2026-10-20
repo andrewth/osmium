@@ -11,18 +11,18 @@ use core::ops::ControlFlow;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use osmium::drivers::ramdisk::RamDisk;
+use osmium::hal::block::BlockDevice as _;
+use osmium::hal::dma::{DmaAllocator, DmaBuffer};
 use osmium::hal::{print, println};
 use osmium::mm::{FrameAllocator, MapFlags, PageTable, PhysAddr, VirtAddr};
+use osmium::sched::TaskBuilder;
 use osmium::sync::IrqSpinLock;
 use osmium::virt::devices::{Uart16550, VirtualPlic};
-use osmium::sched::TaskBuilder;
 use osmium::virt::riscv::fdt::GuestMachine;
 use osmium::virt::riscv::harts::GuestHarts;
 use osmium::virt::riscv::{self, RiscvVcpu, sbi};
 use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
-use osmium::hal::dma::{DmaAllocator, DmaBuffer};
-use osmium::drivers::ramdisk::RamDisk;
-use osmium::hal::block::BlockDevice as _;
 use osmium::virt::virtio::{MMIO_SIZE, VirtioBlock, VirtioMmio, VirtioNetDevice};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, Vcpu, VmExit, run_vcpu};
 
@@ -81,6 +81,20 @@ guest_image_end:
 unsafe extern "C" {
     static guest_image: u8;
     static guest_image_end: u8;
+}
+
+/// Whether the boot hart has the H extension, from its `riscv,isa` string
+/// (the single-letter extensions before the first `_`). Under a hypervisor
+/// that does not offer nested virtualization it is absent.
+pub fn available(fdt: &osmium::boot::fdt::Fdt<'_>) -> bool {
+    let isa = fdt
+        .find_node("/cpus")
+        .and_then(|cpus| cpus.children().find(|c| c.property("riscv,isa").is_some()))
+        .and_then(|c| c.property("riscv,isa"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    let letters = isa.strip_prefix("rv64").unwrap_or("").split('_').next().unwrap_or("");
+    letters.contains('h')
 }
 
 pub fn demo() {
@@ -200,7 +214,8 @@ pub fn demo_irq() {
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
     map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
     // SAFETY: linker symbols.
-    let (start, etext, erodata) = unsafe { (crate::sym(&crate::_kernel_start), crate::sym(&crate::_etext), crate::sym(&crate::_erodata)) };
+    let (start, etext, erodata) =
+        unsafe { (crate::sym(&crate::_kernel_start), crate::sym(&crate::_etext), crate::sym(&crate::_erodata)) };
     let rx = MapFlags::READ | MapFlags::EXEC;
     gstage.map_range(VirtAddr::new(start), PhysAddr::new(start), etext - start, rx).unwrap();
     gstage.map_range(VirtAddr::new(etext), PhysAddr::new(etext), erodata - etext, MapFlags::READ).unwrap();
@@ -240,9 +255,11 @@ pub fn demo_irq() {
     mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2), plic.clone()).unwrap();
     mmio.insert(GUEST_UART, 8, uart.clone()).unwrap();
     let p = plic.clone();
-    let net = VirtioMmio::new(VirtioNetDevice::new([0x52, 0x54, 0, 0x12, 0x34, 0x56], arp_responder), mem.clone(), move |level| {
-        p.set_level(NET_IRQ, level)
-    });
+    let net = VirtioMmio::new(
+        VirtioNetDevice::new([0x52, 0x54, 0, 0x12, 0x34, 0x56], arp_responder),
+        mem.clone(),
+        move |level| p.set_level(NET_IRQ, level),
+    );
     mmio.insert(NET_BASE, MMIO_SIZE, Arc::new(net)).unwrap();
     // A 32 KiB RAM disk behind virtio-blk. The device needs 'static data;
     // the buffer is reclaimed once the device is gone.
@@ -256,10 +273,12 @@ pub fn demo_irq() {
 
     let mut halts = 0;
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
-        VmExit::Hypercall { .. } => match sbi::handle(v, &mem, exit, &mut |b| print!("{}", core::str::from_utf8(b).unwrap_or("?"))) {
-            Some(sbi::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
-            _ => ControlFlow::Continue(()),
-        },
+        VmExit::Hypercall { .. } => {
+            match sbi::handle(v, &mem, exit, &mut |b| print!("{}", core::str::from_utf8(b).unwrap_or("?"))) {
+                Some(sbi::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
+                _ => ControlFlow::Continue(()),
+            }
+        }
         VmExit::Halt => {
             // The guest waits in wfi: run it again once it has an interrupt.
             halts += 1;
@@ -311,16 +330,16 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     use osmium::boot::fdt::Fdt;
     use osmium::drivers::plic::Plic;
     use osmium::drivers::uart16550::{Mmio, Uart16550 as UartDriver};
-    use osmium::hal::irq::InterruptController;
-    use osmium::hal::mmio::IoMem;
-    use osmium::hal::serial::{SerialPort, SerialWriter};
-    use osmium::drivers::virtio::Transport;
-    use osmium::drivers::virtio::mmio::MmioTransport;
     use osmium::drivers::virtio::DeviceType;
+    use osmium::drivers::virtio::Transport;
     use osmium::drivers::virtio::blk::VirtioBlk;
+    use osmium::drivers::virtio::mmio::MmioTransport;
     use osmium::drivers::virtio::net::VirtioNet;
     use osmium::hal::block::BlockDevice;
+    use osmium::hal::irq::InterruptController;
+    use osmium::hal::mmio::IoMem;
     use osmium::hal::net::{MacAddress, NetDevice};
+    use osmium::hal::serial::{SerialPort, SerialWriter};
 
     // SAFETY: the hypervisor put a device tree at `dtb`.
     let Ok(fdt) = (unsafe { Fdt::from_ptr(dtb as *const u8) }) else { sbi_shutdown() };
@@ -382,11 +401,17 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     let (ram_base, ram_size) = fdt.memory().next().unwrap();
     let dma = BumpDma { next: Cell::new(ram_base + ram_size / 2), end: ram_base + ram_size - 0x10000 };
     // SAFETY: the virtio-mmio window from the device tree.
-    let Ok(t) = MmioTransport::new(unsafe { IoMem::new(vbase as *mut u8, vsize.unwrap() as usize) }) else { sbi_shutdown() };
+    let Ok(t) = MmioTransport::new(unsafe { IoMem::new(vbase as *mut u8, vsize.unwrap() as usize) }) else {
+        sbi_shutdown()
+    };
     let Ok(mut net) = VirtioNet::new(t, &dma) else { sbi_shutdown() };
     plic.enable(virq);
     let mac = net.mac_address();
-    let _ = writeln!(SerialWriter(&mut uart), "[vguest] virtio-net {mac}, irq {virq}, link {}", if net.link_up() { "up" } else { "down" });
+    let _ = writeln!(
+        SerialWriter(&mut uart),
+        "[vguest] virtio-net {mac}, irq {virq}, link {}",
+        if net.link_up() { "up" } else { "down" }
+    );
     let me = [10, 0, 2, 15];
     let mut req = [0u8; 42];
     req[0..6].copy_from_slice(&[0xff; 6]);
@@ -429,7 +454,9 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     let mut sector = [0u8; 512];
     sector[..BLK_TEXT.len()].copy_from_slice(BLK_TEXT);
     let mut back = [0u8; 512];
-    let ok = disk.write_blocks(BLK_SECTOR, &sector).is_ok() && disk.read_blocks(BLK_SECTOR, &mut back).is_ok() && back == sector;
+    let ok = disk.write_blocks(BLK_SECTOR, &sector).is_ok()
+        && disk.read_blocks(BLK_SECTOR, &mut back).is_ok()
+        && back == sector;
     let _ = writeln!(
         SerialWriter(&mut uart),
         "[vguest] virtio-blk: {} sectors; sector {BLK_SECTOR} {}",
@@ -616,7 +643,8 @@ pub fn demo_smp(ncpus: usize) {
 
     let tasks: Vec<_> = (0..2usize)
         .map(|h| {
-            let (mem, harts, buses, done, results) = (mem.clone(), harts.clone(), buses.clone(), done.clone(), results.clone());
+            let (mem, harts, buses, done, results) =
+                (mem.clone(), harts.clone(), buses.clone(), done.clone(), results.clone());
             let cpu = if ncpus > 2 { h + 1 } else { 0 };
             TaskBuilder::new("vcpu").cpu(cpu).spawn(move || {
                 riscv::init_cpu();

@@ -9,6 +9,12 @@ osmium_trap_entry:
     // HOOK: guest exits (riscv64-hs) branch away here, before the
     // stack decision; t0/t1 are saved in TrapCpu.
 .if OSMIUM_RISCV_HS
+    // TrapCpu.guest is non-null for the whole time this hart can run in
+    // V=1 (osmium-virt sets it before the sret into a guest and clears it
+    // only in osmium_hs_exit), so null means "not from a guest" without
+    // touching hstatus, which a kernel running as a guest cannot read.
+    ld t0, 0x20(sp)      // TrapCpu.guest
+    beqz t0, 9f
     csrr t0, 0x600       // hstatus
     andi t0, t0, 0x80    // SPV: the trap came from a guest
     beqz t0, 9f

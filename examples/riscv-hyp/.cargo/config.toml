@@ -1,0 +1,7 @@
+[build]
+target = "riscv64imac-unknown-none-elf"
+
+# The guest kernel goes in raw at 0x98000000, e.g.
+#   -device loader,file=../riscv-virt/target/riscv64imac-unknown-none-elf/release/riscv-virt,addr=0x98000000,force-raw=on
+[target.riscv64imac-unknown-none-elf]
+runner = "qemu-system-riscv64 -machine virt -nographic -bios default -m 512M -kernel"

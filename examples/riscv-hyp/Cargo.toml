@@ -1,0 +1,16 @@
+[package]
+name = "riscv-hyp"
+description = "A hypervisor for QEMU's RISC-V virt machine that boots a guest kernel, assembled from Osmium components"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-2.0-only"
+
+[dependencies]
+osmium = { path = "../../crates/osmium", features = ["full", "riscv64-hs"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
