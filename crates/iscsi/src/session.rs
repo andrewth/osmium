@@ -1,0 +1,629 @@
+//! An iSCSI session over one TCP connection: login, commands in the full
+//! feature phase, and logout.
+//!
+//! The session runs at error recovery level 0 with one command
+//! outstanding: it sends a command, then pumps the network until the
+//! target's status arrives, answering R2Ts with Data-Out and target pings
+//! (NOP-In) with NOP-Out along the way. Any protocol failure drops the
+//! session; a SCSI error status does not.
+
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::net::SocketAddrV4;
+use core::time::Duration;
+
+use osmium_net::{Instant, SocketHandle, TcpSocket, TcpState};
+
+use crate::net::Net;
+use crate::params::{Negotiator, Offer, Params};
+use crate::pdu::{
+    DataOut, LoginRequest, LogoutRequest, Message, NopOut, PduReader, RESERVED_TAG, ScsiCommand, TextRequest,
+    lun_field, sn_lt, stage,
+};
+use crate::scsi::{Cdb, Sense, status};
+use crate::{IscsiError, text};
+
+/// Login rounds before giving up on a target that never finishes.
+const MAX_LOGIN_ROUNDS: usize = 8;
+
+/// How long closing the TCP connection may take when a session ends.
+const CLOSE_TIME: Duration = Duration::from_secs(1);
+
+/// The longest data segment accepted during login, whatever was offered
+/// (the login-phase default, RFC 7143 §13.12).
+const LOGIN_DSL: usize = 8192;
+
+/// How to log in.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Our iSCSI name, e.g. `iqn.2026-10.org.osmium:host`.
+    pub initiator_name: String,
+    /// The target to log in to, e.g. `iqn.2026-10.org.osmium:disk0`.
+    /// Discovery ignores it.
+    pub target_name: String,
+    /// The logical unit to drive.
+    pub lun: u16,
+    /// The initiator session ID. Concurrent sessions from one initiator to
+    /// one target need distinct values.
+    pub isid: [u8; 6],
+    /// How long to wait for the target at each step.
+    pub timeout: Duration,
+    /// The operational parameters to ask for.
+    pub offer: Offer,
+    /// TCP receive buffer, in bytes (at most 65535 is used).
+    pub rx_buffer: usize,
+    /// TCP send buffer, in bytes.
+    pub tx_buffer: usize,
+}
+
+impl Options {
+    /// Options to reach `target_name`'s LUN 0 as `initiator_name`, with a
+    /// ten-second timeout and the default [`Offer`].
+    pub fn new(initiator_name: &str, target_name: &str) -> Self {
+        Self {
+            initiator_name: initiator_name.into(),
+            target_name: target_name.into(),
+            lun: 0,
+            // Random format (type 10b), fixed bits: one session per target.
+            isid: [0x80, 0x6f, 0x73, 0x6d, 0x00, 0x01],
+            timeout: Duration::from_secs(10),
+            offer: Offer::default(),
+            rx_buffer: 65535,
+            tx_buffer: 65536,
+        }
+    }
+}
+
+/// The data stage of a SCSI command.
+pub enum Data<'a> {
+    /// No data.
+    None,
+    /// The target sends data into this buffer.
+    In(&'a mut [u8]),
+    /// The target receives this data.
+    Out(&'a [u8]),
+}
+
+/// A TCP connection carrying PDUs. Dropping it closes the connection and
+/// removes its socket.
+struct Conn<N: Net> {
+    net: N,
+    socket: SocketHandle,
+    reader: PduReader,
+    timeout: Duration,
+}
+
+impl<N: Net> Conn<N> {
+    /// Connects to `target` and waits until the connection is established.
+    fn open(mut net: N, target: SocketAddrV4, opts: &Options) -> Result<Self, IscsiError> {
+        let socket = net.with_sockets(|s| s.add(TcpSocket::new(opts.rx_buffer, opts.tx_buffer)));
+        let max_data = (opts.offer.max_recv_data_segment_length as usize).max(LOGIN_DSL);
+        let mut c = Self { net, socket, reader: PduReader::new(max_data), timeout: opts.timeout };
+        c.tcp(|t| t.connect(target, 0))?;
+        let deadline = c.deadline();
+        loop {
+            let (state, error) = c.tcp(|t| (t.state(), t.error()));
+            match (state, error) {
+                (TcpState::Established, _) => return Ok(c),
+                (_, Some(e)) => return Err(e.into()),
+                (TcpState::Closed, None) => return Err(IscsiError::Closed),
+                _ => c.pump(deadline)?,
+            }
+        }
+    }
+
+    fn tcp<R>(&mut self, f: impl FnOnce(&mut TcpSocket) -> R) -> R {
+        let h = self.socket;
+        self.net.with_sockets(|s| f(s.get_mut::<TcpSocket>(h)))
+    }
+
+    /// When a wait starting now times out.
+    fn deadline(&mut self) -> Instant {
+        self.net.poll() + self.timeout
+    }
+
+    /// Polls the network once, failing if `deadline` has passed.
+    fn pump(&mut self, deadline: Instant) -> Result<(), IscsiError> {
+        if self.net.poll() >= deadline { Err(IscsiError::TimedOut) } else { Ok(()) }
+    }
+
+    /// Queues `m` on the connection, waiting for room in the send buffer.
+    fn send(&mut self, m: Message) -> Result<(), IscsiError> {
+        let bytes = m.encode().to_bytes();
+        let deadline = self.deadline();
+        let mut sent = 0;
+        while sent < bytes.len() {
+            match self.tcp(|t| t.send(&bytes[sent..])) {
+                Ok(n) => sent += n,
+                Err(osmium_net::Error::WouldBlock) => self.pump(deadline)?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// The next PDU from the target.
+    fn recv(&mut self, deadline: Instant) -> Result<Message, IscsiError> {
+        loop {
+            if let Some(pdu) = self.reader.next_pdu().map_err(|_| IscsiError::Protocol("data segment too long"))? {
+                return Message::decode(pdu).map_err(|_| IscsiError::Protocol("unexpected opcode"));
+            }
+            let mut buf = [0u8; 2048];
+            match self.tcp(|t| t.recv(&mut buf)) {
+                Ok(0) | Err(osmium_net::Error::InvalidState) => return Err(IscsiError::Closed),
+                Ok(n) => self.reader.push(&buf[..n]),
+                Err(osmium_net::Error::WouldBlock) => self.pump(deadline)?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+impl<N: Net> Drop for Conn<N> {
+    fn drop(&mut self) {
+        self.tcp(TcpSocket::close);
+        // Give our FIN a moment to be acknowledged, then reset whatever is
+        // left rather than linger in TIME-WAIT.
+        let deadline = self.net.poll() + CLOSE_TIME.min(self.timeout);
+        while !matches!(self.tcp(|t| t.state()), TcpState::Closed | TcpState::FinWait2 | TcpState::TimeWait)
+            && self.net.poll() < deadline
+        {}
+        self.tcp(TcpSocket::abort);
+        self.net.poll();
+        let h = self.socket;
+        self.net.with_sockets(|s| s.remove(h));
+    }
+}
+
+/// A logged-in session. Dropping it logs out.
+pub(crate) struct Session<N: Net> {
+    conn: Conn<N>,
+    params: Params,
+    isid: [u8; 6],
+    tsih: u16,
+    lun: [u8; 8],
+    /// The CmdSN of the next non-immediate command.
+    cmd_sn: u32,
+    exp_stat_sn: u32,
+    /// The highest CmdSN the target accepts now.
+    max_cmd_sn: u32,
+    itt: u32,
+    /// Logged in and in step with the target.
+    open: bool,
+}
+
+impl<N: Net> Session<N> {
+    /// Connects to `target` and logs in: to `opts.target_name` in a normal
+    /// session, or to a discovery session if `discovery`.
+    pub(crate) fn login(net: N, target: SocketAddrV4, opts: &Options, discovery: bool) -> Result<Self, IscsiError> {
+        let mut s = Self {
+            conn: Conn::open(net, target, opts)?,
+            params: Params::default(),
+            isid: opts.isid,
+            tsih: 0,
+            lun: lun_field(opts.lun),
+            cmd_sn: 1,
+            exp_stat_sn: 0,
+            max_cmd_sn: 1,
+            itt: 0,
+            open: false,
+        };
+        s.negotiate(opts, discovery)?;
+        s.open = true;
+        Ok(s)
+    }
+
+    pub(crate) fn params(&self) -> &Params {
+        &self.params
+    }
+
+    pub(crate) fn net(&mut self) -> &mut N {
+        &mut self.conn.net
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
+    }
+
+    fn next_itt(&mut self) -> u32 {
+        self.itt = self.itt.wrapping_add(1);
+        if self.itt == RESERVED_TAG {
+            self.itt = 0;
+        }
+        self.itt
+    }
+
+    /// The login exchange (RFC 7143 §6.3): SecurityNegotiation with
+    /// AuthMethod=None, then LoginOperationalNegotiation, then the full
+    /// feature phase. The target may hold us in a stage for more rounds,
+    /// split its text across responses, or offer keys of its own.
+    fn negotiate(&mut self, opts: &Options, discovery: bool) -> Result<(), IscsiError> {
+        let deadline = self.conn.deadline();
+        let mut neg = Negotiator::new(opts.offer.clone());
+        let itt = self.next_itt();
+        let target_name = (!discovery).then_some(opts.target_name.as_str());
+        let mut keys = neg.security_keys(&opts.initiator_name, target_name);
+        let mut current = stage::SECURITY;
+        let mut operational_sent = false;
+        for _ in 0..MAX_LOGIN_ROUNDS {
+            let next = if current == stage::SECURITY { stage::OPERATIONAL } else { stage::FULL_FEATURE };
+            let mut req = LoginRequest {
+                transit: true,
+                cont: false,
+                csg: current,
+                nsg: next,
+                isid: self.isid,
+                tsih: 0,
+                itt,
+                cid: 0,
+                cmd_sn: self.cmd_sn,
+                exp_stat_sn: self.exp_stat_sn,
+                data: core::mem::take(&mut keys),
+            };
+            let mut text = Vec::new();
+            let resp = loop {
+                self.conn.send(Message::LoginRequest(req.clone()))?;
+                let msg = self.conn.recv(deadline)?;
+                self.absorb(&msg);
+                let Message::LoginResponse(r) = msg else {
+                    return Err(IscsiError::Protocol("expected a Login Response"));
+                };
+                if r.status_class != 0 {
+                    return Err(IscsiError::Login { class: r.status_class, detail: r.status_detail });
+                }
+                if r.itt != itt || r.csg != current {
+                    return Err(IscsiError::Protocol("Login Response out of step"));
+                }
+                text.extend_from_slice(&r.data);
+                if !r.cont {
+                    break r;
+                }
+                // The target has more text: an empty request fetches it.
+                req = LoginRequest {
+                    transit: false,
+                    data: Vec::new(),
+                    cmd_sn: self.cmd_sn,
+                    exp_stat_sn: self.exp_stat_sn,
+                    ..req
+                };
+            };
+            keys = neg.respond(&text)?;
+            if resp.transit {
+                match resp.nsg {
+                    stage::FULL_FEATURE => {
+                        self.tsih = resp.tsih;
+                        self.params = neg.params;
+                        return Ok(());
+                    }
+                    stage::OPERATIONAL if current == stage::SECURITY => current = stage::OPERATIONAL,
+                    _ => return Err(IscsiError::Protocol("Login Response with a bad next stage")),
+                }
+            }
+            if current == stage::OPERATIONAL && !operational_sent {
+                keys.extend_from_slice(&neg.operational_keys(discovery));
+                operational_sent = true;
+            }
+        }
+        Err(IscsiError::Protocol("login did not finish"))
+    }
+
+    /// Tracks StatSN and the command window from a target PDU.
+    fn absorb(&mut self, m: &Message) {
+        if let Some(sn) = m.stat_sn() {
+            self.exp_stat_sn = sn.wrapping_add(1);
+        }
+        // A window with MaxCmdSN = ExpCmdSN - 1 is closed; anything smaller
+        // is invalid and ignored, as is a MaxCmdSN that went backwards.
+        if let Some((exp, max)) = m.cmd_window()
+            && !sn_lt(max, exp.wrapping_sub(1))
+            && (matches!(m, Message::LoginResponse(_)) || !sn_lt(max, self.max_cmd_sn))
+        {
+            self.max_cmd_sn = max;
+        }
+    }
+
+    /// Reads one PDU and deals with what needs no caller: answers target
+    /// pings, skips asynchronous events. Returns the rest.
+    fn recv_one(&mut self, deadline: Instant) -> Result<Option<Message>, IscsiError> {
+        let m = self.conn.recv(deadline)?;
+        self.absorb(&m);
+        match m {
+            Message::NopIn(n) => {
+                if n.ttt != RESERVED_TAG {
+                    self.conn.send(Message::NopOut(NopOut {
+                        immediate: true,
+                        lun: n.lun,
+                        itt: RESERVED_TAG,
+                        ttt: n.ttt,
+                        cmd_sn: self.cmd_sn,
+                        exp_stat_sn: self.exp_stat_sn,
+                        data: n.data,
+                    }))?;
+                }
+                Ok(None)
+            }
+            // 2 and 3: the target is dropping the connection or session.
+            Message::AsyncMessage(a) if matches!(a.event, 2 | 3) => Err(IscsiError::Closed),
+            // A SCSI event, a logout request (we log out when dropped) or
+            // a vendor event.
+            Message::AsyncMessage(_) => Ok(None),
+            Message::Reject(r) => Err(IscsiError::Reject(r.reason)),
+            m => Ok(Some(m)),
+        }
+    }
+
+    fn next(&mut self, deadline: Instant) -> Result<Message, IscsiError> {
+        loop {
+            if let Some(m) = self.recv_one(deadline)? {
+                return Ok(m);
+            }
+        }
+    }
+
+    /// Waits until the target's window admits the next CmdSN.
+    fn wait_window(&mut self, deadline: Instant) -> Result<(), IscsiError> {
+        while sn_lt(self.max_cmd_sn, self.cmd_sn) {
+            if self.recv_one(deadline)?.is_some() {
+                return Err(IscsiError::Protocol("unexpected PDU while idle"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs `f` on an open session, dropping it if `f` failed in a way
+    /// that leaves us out of step with the target.
+    fn guarded<R>(&mut self, f: impl FnOnce(&mut Self) -> Result<R, IscsiError>) -> Result<R, IscsiError> {
+        if !self.open {
+            return Err(IscsiError::NoSession);
+        }
+        let r = f(self);
+        if let Err(e) = &r
+            && !matches!(e, IscsiError::Scsi { .. } | IscsiError::Response(_))
+        {
+            self.open = false;
+        }
+        r
+    }
+
+    /// Runs one SCSI command and returns the bytes of data the target sent
+    /// for [`Data::In`], or the length of [`Data::Out`].
+    pub(crate) fn command(&mut self, cdb: &Cdb, data: Data<'_>) -> Result<usize, IscsiError> {
+        self.guarded(|s| s.run_command(cdb, data))
+    }
+
+    fn run_command(&mut self, cdb: &Cdb, mut data: Data<'_>) -> Result<usize, IscsiError> {
+        let mut deadline = self.conn.deadline();
+        self.wait_window(deadline)?;
+        let itt = self.next_itt();
+        let p = &self.params;
+        let (read, write, expected) = match &data {
+            Data::None => (false, false, 0),
+            Data::In(b) => (true, false, b.len()),
+            Data::Out(b) => (false, true, b.len()),
+        };
+        // Unsolicited data, up to FirstBurstLength: immediate data in the
+        // command PDU if allowed, then Data-Out PDUs unless InitialR2T.
+        let (immediate, unsolicited) = match &data {
+            Data::Out(b) => {
+                let burst = (p.first_burst_length as usize).min(b.len());
+                let imm = if p.immediate_data { burst.min(p.max_xmit_data_segment_length as usize) } else { 0 };
+                (imm, if p.initial_r2t { imm } else { burst })
+            }
+            _ => (0, 0),
+        };
+        let immediate_data = match &data {
+            Data::Out(b) => b[..immediate].to_vec(),
+            _ => Vec::new(),
+        };
+        self.conn.send(Message::ScsiCommand(ScsiCommand {
+            final_pdu: unsolicited == immediate,
+            read,
+            write,
+            attr: 1, // SIMPLE
+            lun: self.lun,
+            itt,
+            expected_len: expected as u32,
+            cmd_sn: self.cmd_sn,
+            exp_stat_sn: self.exp_stat_sn,
+            cdb: *cdb,
+            data: immediate_data,
+        }))?;
+        self.cmd_sn = self.cmd_sn.wrapping_add(1);
+        if let Data::Out(b) = &data
+            && unsolicited > immediate
+        {
+            self.data_out(itt, RESERVED_TAG, &b[immediate..unsolicited], immediate)?;
+        }
+
+        // The furthest byte of Data-In received.
+        let mut received = 0;
+        loop {
+            let m = self.next(deadline)?;
+            deadline = self.conn.deadline();
+            match m {
+                Message::DataIn(d) if d.itt == itt => {
+                    let Data::In(buf) = &mut data else {
+                        return Err(IscsiError::Protocol("Data-In for a command without input"));
+                    };
+                    let start = d.offset as usize;
+                    let end = start + d.data.len();
+                    let dst = buf.get_mut(start..end).ok_or(IscsiError::Protocol("Data-In beyond the buffer"))?;
+                    dst.copy_from_slice(&d.data);
+                    received = received.max(end);
+                    if let Some(st) = d.status {
+                        return Self::status(0, st, &[], received);
+                    }
+                }
+                Message::R2t(r) if r.itt == itt => {
+                    let Data::Out(b) = &data else {
+                        return Err(IscsiError::Protocol("R2T for a command without output"));
+                    };
+                    let start = r.offset as usize;
+                    let end = start.saturating_add(r.desired_len as usize);
+                    let chunk = b.get(start..end).ok_or(IscsiError::Protocol("R2T beyond the buffer"))?;
+                    if chunk.len() > self.params.max_burst_length as usize {
+                        return Err(IscsiError::Protocol("R2T longer than MaxBurstLength"));
+                    }
+                    self.data_out(itt, r.ttt, chunk, start)?;
+                }
+                Message::ScsiResponse(r) if r.itt == itt => {
+                    let moved = if read { received } else { expected };
+                    return Self::status(r.response, r.status, &r.data, moved);
+                }
+                _ => return Err(IscsiError::Protocol("unexpected PDU during a command")),
+            }
+        }
+    }
+
+    /// The outcome of a command from its response code and status.
+    fn status(response: u8, st: u8, sense: &[u8], moved: usize) -> Result<usize, IscsiError> {
+        match (response, st) {
+            (0, status::GOOD | status::CONDITION_MET) => Ok(moved),
+            (0, status) => Err(IscsiError::Scsi {
+                status,
+                sense: if status == status::CHECK_CONDITION { Sense::from_response(sense) } else { None },
+            }),
+            (r, _) => Err(IscsiError::Response(r)),
+        }
+    }
+
+    /// Sends one data sequence, `data` at buffer offset `offset`, in
+    /// Data-Out PDUs no larger than the target accepts.
+    fn data_out(&mut self, itt: u32, ttt: u32, data: &[u8], offset: usize) -> Result<(), IscsiError> {
+        let seg = (self.params.max_xmit_data_segment_length as usize).max(1);
+        let count = data.len().div_ceil(seg);
+        for (i, chunk) in data.chunks(seg).enumerate() {
+            self.conn.send(Message::DataOut(DataOut {
+                final_pdu: i + 1 == count,
+                lun: self.lun,
+                itt,
+                ttt,
+                exp_stat_sn: self.exp_stat_sn,
+                data_sn: i as u32,
+                offset: (offset + i * seg) as u32,
+                data: chunk.to_vec(),
+            }))?;
+        }
+        Ok(())
+    }
+
+    /// Sends `SendTargets=All` and returns the target's text.
+    pub(crate) fn send_targets(&mut self) -> Result<Vec<u8>, IscsiError> {
+        self.guarded(|s| {
+            let deadline = s.conn.deadline();
+            let itt = s.next_itt();
+            let mut ttt = RESERVED_TAG;
+            let mut keys = Vec::new();
+            text::push(&mut keys, "SendTargets", "All");
+            let mut out = Vec::new();
+            loop {
+                s.wait_window(deadline)?;
+                s.conn.send(Message::TextRequest(TextRequest {
+                    immediate: false,
+                    final_pdu: true,
+                    cont: false,
+                    lun: [0; 8],
+                    itt,
+                    ttt,
+                    cmd_sn: s.cmd_sn,
+                    exp_stat_sn: s.exp_stat_sn,
+                    data: core::mem::take(&mut keys),
+                }))?;
+                s.cmd_sn = s.cmd_sn.wrapping_add(1);
+                let Message::TextResponse(r) = s.next(deadline)? else {
+                    return Err(IscsiError::Protocol("expected a Text Response"));
+                };
+                if r.itt != itt {
+                    return Err(IscsiError::Protocol("Text Response for another task"));
+                }
+                out.extend_from_slice(&r.data);
+                if r.final_pdu && !r.cont {
+                    return Ok(out);
+                }
+                // More to come: an empty request with the target's tag.
+                ttt = r.ttt;
+            }
+        })
+    }
+
+    /// Logs out, closing the session. Later commands fail with
+    /// [`IscsiError::NoSession`].
+    pub(crate) fn logout(&mut self) -> Result<(), IscsiError> {
+        let r = self.guarded(|s| {
+            let deadline = s.conn.deadline();
+            let itt = s.next_itt();
+            s.conn.send(Message::LogoutRequest(LogoutRequest {
+                reason: 0, // close the session
+                itt,
+                cid: 0,
+                cmd_sn: s.cmd_sn,
+                exp_stat_sn: s.exp_stat_sn,
+            }))?;
+            loop {
+                match s.next(deadline)? {
+                    Message::LogoutResponse(r) if r.itt == itt => {
+                        return if r.response == 0 { Ok(()) } else { Err(IscsiError::Response(r.response)) };
+                    }
+                    // Anything still in flight from before.
+                    _ => continue,
+                }
+            }
+        });
+        self.open = false;
+        r
+    }
+}
+
+impl<N: Net> Drop for Session<N> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.logout();
+        }
+    }
+}
+
+/// A target a portal reported in discovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredTarget {
+    /// The target's iSCSI name.
+    pub name: String,
+    /// Its `TargetAddress` values, `host[:port],portal-group-tag`. Empty
+    /// means the portal that was asked.
+    pub addresses: Vec<String>,
+}
+
+impl DiscoveredTarget {
+    /// The addresses that are IPv4 literals, with the default port 3260
+    /// where none is given.
+    pub fn portals(&self) -> impl Iterator<Item = SocketAddrV4> + '_ {
+        self.addresses.iter().filter_map(|a| {
+            let host_port = a.split(',').next()?;
+            match host_port.rsplit_once(':') {
+                Some((host, port)) => Some(SocketAddrV4::new(host.parse().ok()?, port.parse().ok()?)),
+                None => Some(SocketAddrV4::new(host_port.parse().ok()?, 3260)),
+            }
+        })
+    }
+}
+
+/// Asks the portal at `portal` which targets it offers (a discovery session
+/// and `SendTargets=All`), as `opts.initiator_name`. The target name and
+/// LUN in `opts` are not used.
+pub fn discover<N: Net>(net: N, portal: SocketAddrV4, opts: &Options) -> Result<Vec<DiscoveredTarget>, IscsiError> {
+    let mut s = Session::login(net, portal, opts, true)?;
+    let reply = s.send_targets()?;
+    let _ = s.logout();
+    let mut targets: Vec<DiscoveredTarget> = Vec::new();
+    for (key, value) in text::parse(&reply).ok_or(IscsiError::Protocol("malformed SendTargets text"))? {
+        match key {
+            "TargetName" => targets.push(DiscoveredTarget { name: value.into(), addresses: vec![] }),
+            "TargetAddress" => match targets.last_mut() {
+                Some(t) => t.addresses.push(value.into()),
+                None => return Err(IscsiError::Protocol("TargetAddress before TargetName")),
+            },
+            _ => {}
+        }
+    }
+    Ok(targets)
+}

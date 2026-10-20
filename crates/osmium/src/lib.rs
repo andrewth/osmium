@@ -20,6 +20,7 @@
 //! | `fs_iso9660` | `osmium-fs-iso9660` | read-only ISO 9660 with Rock Ridge and Joliet on any block device |
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
 //! | `net` | `osmium-net` | IPv4 stack: ARP, ICMP echo, UDP, TCP, DHCP client |
+//! | `iscsi` | `osmium-iscsi` | iSCSI initiator: a remote SCSI disk over TCP as a block device |
 //!
 //! The library never defines an entry point, panic handler or global
 //! allocator: the OS assembles those from the parts it uses.
@@ -42,6 +43,8 @@ pub use osmium_fs_fat as fs_fat;
 pub use osmium_net as net;
 #[cfg(feature = "fs-iso9660")]
 pub use osmium_fs_iso9660 as fs_iso9660;
+#[cfg(feature = "iscsi")]
+pub use osmium_iscsi as iscsi;
 #[cfg(feature = "hal")]
 pub use osmium_hal as hal;
 #[cfg(feature = "mm")]
