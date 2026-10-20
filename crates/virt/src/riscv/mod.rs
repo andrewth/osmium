@@ -19,6 +19,7 @@
 //! runs and guest FP instructions trap to the guest.
 
 pub mod fdt;
+pub mod harts;
 pub mod insn;
 pub mod sbi;
 
@@ -125,6 +126,7 @@ pub struct RiscvVcpu {
     hgatp: u64,
     pending: Option<MemOp>,
     external: Arc<AtomicBool>,
+    ipi: Option<Arc<AtomicBool>>,
 }
 
 /// SBI virtual-interrupt bits in `hvip`.
@@ -157,7 +159,7 @@ impl RiscvVcpu {
             htinst: 0,
             host: [0; 17],
         };
-        Self { state, csrs: VsCsrs::default(), hgatp, pending: None, external: Arc::new(AtomicBool::new(false)) }
+        Self { state, csrs: VsCsrs::default(), hgatp, pending: None, external: Arc::new(AtomicBool::new(false)), ipi: None }
     }
 
     /// The vCPU's supervisor external-interrupt line, for an interrupt
@@ -165,6 +167,14 @@ impl RiscvVcpu {
     /// output) to drive. Its level becomes `hvip.VSEIP` at the next entry.
     pub fn external_irq(&self) -> Arc<AtomicBool> {
         self.external.clone()
+    }
+
+    /// Connects the vCPU's software-interrupt line (from
+    /// [`GuestHarts::ipi_line`](harts::GuestHarts::ipi_line)): a raised
+    /// line becomes `hvip.VSSIP` at the next entry, and the guest clears it
+    /// by clearing `sip.SSIP`.
+    pub fn connect_ipi(&mut self, line: Arc<AtomicBool>) {
+        self.ipi = Some(line);
     }
 
     /// Copies the interrupt lines into `hvip` before entering the guest.
@@ -175,6 +185,9 @@ impl RiscvVcpu {
         } else {
             self.csrs.hvip &= !hvip::VSEIP;
         }
+        if self.ipi.as_ref().is_some_and(|l| l.swap(false, Ordering::AcqRel)) {
+            self.csrs.hvip |= hvip::VSSIP;
+        }
     }
 
     /// Whether an interrupt the guest has enabled is pending at time `now`
@@ -184,7 +197,8 @@ impl RiscvVcpu {
         let vsie = self.csrs.vsie;
         (vsie & (1 << 9) != 0 && self.external.load(Ordering::Acquire))
             || (vsie & (1 << 5) != 0 && now >= self.csrs.vstimecmp)
-            || (vsie & (1 << 1) != 0 && self.csrs.hvip & hvip::VSSIP != 0)
+            || (vsie & (1 << 1) != 0
+                && (self.csrs.hvip & hvip::VSSIP != 0 || self.ipi.as_ref().is_some_and(|l| l.load(Ordering::Acquire))))
     }
 
     /// The `hgatp` value this vCPU runs with.

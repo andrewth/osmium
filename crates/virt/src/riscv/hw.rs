@@ -197,16 +197,20 @@ macro_rules! csr_write {
     };
 }
 
+const HIDELEG: u64 = super::hvip::VSSIP | super::hvip::VSTIP | super::hvip::VSEIP;
+
 /// Prepares this hart to run guests: delegates the guest's own exceptions
 /// and VS-level interrupts to it, lets it read the counters, and enables
-/// `vstimecmp` (Sstc). Call once per hart before running a vCPU on it.
+/// `vstimecmp` (Sstc). Running a vCPU does this itself on a hart that has
+/// not been prepared (e.g. after its task migrated), so calling it is
+/// optional.
 pub fn init_cpu() {
     // Misaligned/access/page faults, illegal instruction, breakpoint, and
     // ecall from VU-mode go straight to the guest kernel.
     let hedeleg: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
         | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15);
     csr_write!("0x602", hedeleg);
-    csr_write!("0x603", super::hvip::VSSIP | super::hvip::VSTIP | super::hvip::VSEIP);
+    csr_write!("0x603", HIDELEG);
     csr_write!("0x606", 0xffff_ffffu64); // hcounteren
     csr_write!("0x60a", 1u64 << 63); // henvcfg.STCE
     csr_write!("0x605", 0u64); // htimedelta
@@ -250,6 +254,10 @@ fn save_vs(c: &mut VsCsrs) {
 
 /// Enters the guest and returns at its next exit.
 pub(super) fn run(v: &mut RiscvVcpu) {
+    // The vCPU's task may have moved to a hart that never ran a guest.
+    if csr_read!("0x603") != HIDELEG {
+        init_cpu();
+    }
     if csr_read!("0x680") != v.hgatp {
         csr_write!("0x680", v.hgatp);
         // SAFETY: hfence.gvma and hfence.vvma (all addresses, all VMIDs)

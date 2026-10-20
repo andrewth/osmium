@@ -150,8 +150,9 @@ pub const HCR_VI: u64 = 1 << 7;
 pub const VTCR_48: u64 = 16 | 2 << 6 | 1 << 8 | 1 << 10 | 3 << 12 | 5 << 16 | 1 << 31;
 
 /// Prepares this CPU to run guests: stage-2 geometry, EL1 access to the
-/// physical counter and timer, and a zero virtual-counter offset. Call
-/// once per CPU at EL2.
+/// physical counter and timer, and a zero virtual-counter offset. Running a
+/// vCPU does this itself on a CPU that has not been prepared, so calling it
+/// is optional.
 pub fn init_cpu() {
     msr!("vtcr_el2", VTCR_48);
     msr!("cnthctl_el2", 3u64); // EL1PCTEN | EL1PCEN
@@ -215,6 +216,10 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     let daif = mrs!("daif");
     // SAFETY: masks interrupts for the switch; restored below.
     unsafe { asm!("msr daifset, #0xf", options(nomem, nostack, preserves_flags)) };
+    // The vCPU's task may have moved to a CPU that never ran a guest.
+    if mrs!("vtcr_el2") != VTCR_48 {
+        init_cpu();
+    }
     let hcr = HCR_GUEST | if v.irq.load(core::sync::atomic::Ordering::Acquire) { HCR_VI } else { 0 };
     msr!("hcr_el2", hcr);
     if mrs!("vttbr_el2") != v.vttbr {
