@@ -6,7 +6,9 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::ops::ControlFlow;
+use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 use osmium::hal::{print, println};
@@ -16,6 +18,8 @@ use osmium::virt::devices::{Uart16550, VirtualPlic};
 use osmium::virt::riscv::fdt::GuestMachine;
 use osmium::virt::riscv::{self, RiscvVcpu, sbi};
 use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
+use osmium::hal::dma::{DmaAllocator, DmaBuffer};
+use osmium::virt::virtio::{MMIO_SIZE, VirtioMmio, VirtioNetDevice};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
 use crate::FRAMES;
@@ -146,6 +150,10 @@ pub fn demo() {
 
 const PLIC_BASE: u64 = 0x0c00_0000;
 const UART_IRQ: u32 = 10;
+const NET_BASE: u64 = 0x1000_1000;
+const NET_IRQ: u32 = 1;
+const GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 /// Guest RAM for the driver demo, clear of the host image the guest also sees.
 const GUEST2_RAM: GuestPhysAddr = GuestPhysAddr(0x1_0000_0000);
 
@@ -154,7 +162,9 @@ const GUEST2_RAM: GuestPhysAddr = GuestPhysAddr(0x1_0000_0000);
 /// guest at their own addresses (read-only), so `guest_main` runs in
 /// VS-mode exactly where it was linked, against an emulated PLIC and 16550.
 /// It takes a timer interrupt (Sstc), then a UART receive interrupt
-/// injected through the PLIC as `hvip.VSEIP`.
+/// injected through the PLIC as `hvip.VSEIP`, then brings up a virtio-net
+/// card with osmium's driver and resolves the gateway over ARP, answered by
+/// a responder in the hypervisor.
 pub fn demo_irq() {
     let free_before = FRAMES.lock().free_frames();
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
@@ -163,6 +173,7 @@ pub fn demo_irq() {
     // SAFETY: a fresh block owned by this demo, reached only through `mem`
     // and the guest until it is freed below.
     unsafe { mem.add_region(GUEST2_RAM, ram.0 as *mut u8, len) };
+    let mem = Arc::new(mem);
 
     let dtb = GuestMachine {
         harts: 1,
@@ -171,7 +182,7 @@ pub fn demo_irq() {
         memory: &[(GUEST2_RAM.0, len)],
         plic: Some((PLIC_BASE, 32)),
         uarts: &[(GUEST_UART, UART_IRQ)],
-        virtio: &[],
+        virtio: &[(NET_BASE, NET_IRQ)],
         bootargs: "",
     }
     .to_dtb();
@@ -219,6 +230,11 @@ pub fn demo_irq() {
     let mmio = Bus::new();
     mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2), plic.clone()).unwrap();
     mmio.insert(GUEST_UART, 8, uart.clone()).unwrap();
+    let p = plic.clone();
+    let net = VirtioMmio::new(VirtioNetDevice::new([0x52, 0x54, 0, 0x12, 0x34, 0x56], arp_responder), mem.clone(), move |level| {
+        p.set_level(NET_IRQ, level)
+    });
+    mmio.insert(NET_BASE, MMIO_SIZE, Arc::new(net)).unwrap();
     let pio = Bus::new();
 
     let mut halts = 0;
@@ -249,9 +265,11 @@ pub fn demo_irq() {
         VmExit::ExternalInterrupt => ControlFlow::Continue(()),
         other => ControlFlow::Break(other),
     });
+    drop(mmio);
     drop(gstage);
     drop(mem);
-    // SAFETY: the guest has stopped and nothing references its RAM.
+    // SAFETY: the guest has stopped, and the devices that could reach its
+    // RAM are gone.
     unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
     let used = free_before - FRAMES.lock().free_frames();
     println!("[hyp]   driver guest exit {exit:?} after {halts} halts; {used} frames still in use");
@@ -267,6 +285,10 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     use osmium::hal::irq::InterruptController;
     use osmium::hal::mmio::IoMem;
     use osmium::hal::serial::{SerialPort, SerialWriter};
+    use osmium::drivers::virtio::Transport;
+    use osmium::drivers::virtio::mmio::MmioTransport;
+    use osmium::drivers::virtio::net::VirtioNet;
+    use osmium::hal::net::{MacAddress, NetDevice};
 
     // SAFETY: the hypervisor put a device tree at `dtb`.
     let Ok(fdt) = (unsafe { Fdt::from_ptr(dtb as *const u8) }) else { sbi_shutdown() };
@@ -320,7 +342,88 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
         let line = core::str::from_utf8(&got[..n]).unwrap_or("?").trim_end();
         let _ = writeln!(SerialWriter(&mut uart), "[vguest] PLIC claim {claimed}: received {line:?}");
     }
+
+    // virtio-net with osmium's driver; DMA memory from the top half of RAM.
+    let vnode = fdt.all_nodes().find(|n| n.is_compatible("virtio,mmio")).unwrap();
+    let (vbase, vsize) = vnode.reg().next().unwrap();
+    let virq = vnode.interrupts().next().unwrap();
+    let (ram_base, ram_size) = fdt.memory().next().unwrap();
+    let dma = BumpDma { next: Cell::new(ram_base + ram_size / 2), end: ram_base + ram_size - 0x10000 };
+    // SAFETY: the virtio-mmio window from the device tree.
+    let Ok(t) = MmioTransport::new(unsafe { IoMem::new(vbase as *mut u8, vsize.unwrap() as usize) }) else { sbi_shutdown() };
+    let Ok(mut net) = VirtioNet::new(t, &dma) else { sbi_shutdown() };
+    plic.enable(virq);
+    let mac = net.mac_address();
+    let _ = writeln!(SerialWriter(&mut uart), "[vguest] virtio-net {mac}, irq {virq}, link {}", if net.link_up() { "up" } else { "down" });
+    let me = [10, 0, 2, 15];
+    let mut req = [0u8; 42];
+    req[0..6].copy_from_slice(&[0xff; 6]);
+    req[6..12].copy_from_slice(&mac.0);
+    req[12..14].copy_from_slice(&[0x08, 0x06]);
+    req[14..22].copy_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+    req[22..28].copy_from_slice(&mac.0);
+    req[28..32].copy_from_slice(&me);
+    req[38..42].copy_from_slice(&GATEWAY_IP);
+    let _ = net.transmit(&req);
+    let mut frame = [0u8; 1514];
+    loop {
+        while sip() & seie == 0 {
+            // SAFETY: waits for an interrupt.
+            unsafe { core::arch::asm!("wfi") };
+        }
+        let Some(claimed) = plic.claim() else { continue };
+        net.transport().ack_interrupt();
+        let reply = net.receive(&mut frame);
+        plic.complete(claimed);
+        if let Ok(n) = reply
+            && n >= 42
+            && frame[12..14] == [0x08, 0x06]
+            && frame[20..22] == [0, 2]
+        {
+            let gw = MacAddress(frame[22..28].try_into().unwrap());
+            let _ = writeln!(SerialWriter(&mut uart), "[vguest] PLIC claim {claimed}: ARP reply, 10.0.2.2 is at {gw}");
+            break;
+        }
+    }
     sbi_shutdown()
+}
+
+/// Hands out guest RAM for the guest's DMA (guest physical = guest virtual,
+/// paging off) and never frees it.
+struct BumpDma {
+    next: Cell<u64>,
+    end: u64,
+}
+
+impl DmaAllocator for BumpDma {
+    fn alloc_coherent(&self, len: usize) -> Option<DmaBuffer> {
+        let at = self.next.get().next_multiple_of(4096);
+        let end = at.checked_add(len as u64).filter(|&e| e <= self.end)?;
+        self.next.set(end);
+        // SAFETY: unused guest RAM, handed out once.
+        unsafe {
+            (at as *mut u8).write_bytes(0, len);
+            Some(DmaBuffer::new(NonNull::new(at as *mut u8)?, PhysAddr::new(at), len))
+        }
+    }
+
+    fn free_coherent(&self, _buf: DmaBuffer) {}
+}
+
+/// The hypervisor's side of the guest's link: answers ARP requests for the
+/// gateway address.
+fn arp_responder(f: &[u8], reply: &mut dyn FnMut(&[u8])) {
+    if f.len() < 42 || f[12..14] != [0x08, 0x06] || f[20..22] != [0, 1] || f[38..42] != GATEWAY_IP {
+        return;
+    }
+    let mut r = [0u8; 42];
+    r[0..6].copy_from_slice(&f[6..12]);
+    r[6..12].copy_from_slice(&GATEWAY_MAC);
+    r[12..22].copy_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, 2]);
+    r[22..28].copy_from_slice(&GATEWAY_MAC);
+    r[28..32].copy_from_slice(&GATEWAY_IP);
+    r[32..42].copy_from_slice(&f[22..32]);
+    reply(&r);
 }
 
 fn sip() -> usize {
