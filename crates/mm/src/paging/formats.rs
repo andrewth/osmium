@@ -4,6 +4,7 @@
 //! |---|---|---|---|
 //! | [`X86_64`] | x86_64 4-level paging | 4 | 48, sign-extended |
 //! | [`Aarch64`] | AArch64 stage 1, 4 KiB granule | 4 | 48, sign-extended |
+//! | [`Aarch64El2`] | AArch64 EL2 stage 1 (non-VHE), 4 KiB granule | 4 | 48 |
 //! | [`Sv39`] / [`Sv48`] | RISC-V supervisor paging | 3 / 4 | 39 / 48, sign-extended |
 //! | [`Sv39x4`] / [`Sv48x4`] | RISC-V G-stage (guest physical), 16 KiB root | 3 / 4 | 41 / 50 |
 //! | [`Ept`] | Intel extended page tables (guest physical) | 4 | 48 |
@@ -189,6 +190,68 @@ impl PageTableFormat for Aarch64 {
             f = f | MapFlags::GLOBAL;
         }
         if (user && pte & arm::UXN == 0) || (!user && pte & arm::PXN == 0) {
+            f = f | MapFlags::EXEC;
+        }
+        if pte & arm::ATTR_MASK == arm::ATTR_DEVICE {
+            f = f | MapFlags::DEVICE;
+        }
+        f
+    }
+}
+
+/// AArch64 stage 1 for the EL2 translation regime with `HCR_EL2.E2H` = 0:
+/// one VA range starting at 0, no ASIDs and no EL0. `AP[1]` is RES1, `nG`
+/// stays 0 and bit 54 is the only execute-never bit. `USER` and `GLOBAL`
+/// are ignored.
+pub struct Aarch64El2;
+
+impl PageTableFormat for Aarch64El2 {
+    const LEVELS: usize = 4;
+    const VA_BITS: u32 = 48;
+    const SIGN_EXTEND: bool = false;
+    const MAX_LEAF_LEVEL: usize = 2;
+
+    fn table(pa: PhysAddr) -> u64 {
+        Aarch64::table(pa)
+    }
+
+    fn leaf(pa: PhysAddr, f: MapFlags, level: usize) -> u64 {
+        let mut e = pa.0 | arm::VALID | arm::AF | arm::AP_EL0;
+        if level == 0 {
+            e |= arm::TABLE_OR_PAGE;
+        }
+        if f.contains(MapFlags::DEVICE) {
+            e |= arm::ATTR_DEVICE;
+        } else {
+            e |= arm::SH_INNER;
+        }
+        if !f.contains(MapFlags::WRITE) {
+            e |= arm::AP_RO;
+        }
+        if !f.contains(MapFlags::EXEC) || f.contains(MapFlags::DEVICE) {
+            e |= arm::UXN; // XN in this regime
+        }
+        e
+    }
+
+    fn is_valid(pte: u64) -> bool {
+        Aarch64::is_valid(pte)
+    }
+
+    fn is_leaf(pte: u64, level: usize) -> bool {
+        Aarch64::is_leaf(pte, level)
+    }
+
+    fn addr(pte: u64, level: usize) -> PhysAddr {
+        Aarch64::addr(pte, level)
+    }
+
+    fn flags(pte: u64, _level: usize) -> MapFlags {
+        let mut f = MapFlags::READ;
+        if pte & arm::AP_RO == 0 {
+            f = f | MapFlags::WRITE;
+        }
+        if pte & arm::UXN == 0 {
             f = f | MapFlags::EXEC;
         }
         if pte & arm::ATTR_MASK == arm::ATTR_DEVICE {

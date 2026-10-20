@@ -99,6 +99,11 @@ fn aarch64() {
 }
 
 #[test]
+fn aarch64_el2() {
+    exercise::<Aarch64El2>(0x0000_ffff_ffff_f000);
+}
+
+#[test]
 fn sv39() {
     exercise::<Sv39>(0xffff_ffff_ffff_f000);
 }
@@ -132,6 +137,10 @@ fn aarch64_stage2() {
 #[test]
 fn encodings() {
     // Values checked against the architecture manuals.
+    // EL2 kernel text: AF, AP[1] (RES1), RO, inner shareable, executable, nG = 0.
+    assert_eq!(Aarch64El2::leaf(pa(0x4008_0000), MapFlags::RX | MapFlags::GLOBAL, 0), 0x4008_07c3);
+    assert_eq!(Aarch64El2::leaf(pa(0x900_0000), MapFlags::RW | MapFlags::DEVICE, 0), 0x0040_0000_0900_0447);
+    assert_eq!(Aarch64El2::flags(0x4008_07c3, 0), MapFlags::RX | MapFlags::READ);
     assert_eq!(Sv39x4::leaf(pa(0x5000), MapFlags::RW | MapFlags::GLOBAL, 0), 0x14d7, "V|R|W|U|A|D, no G");
     assert_eq!(Sv39x4::flags(0x14d7, 0), MapFlags::RW | MapFlags::READ);
     assert_eq!(X86_64::leaf(pa(0x5000), MapFlags::RW, 0), 0x8000_0000_0000_5063);
