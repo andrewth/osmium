@@ -14,6 +14,8 @@
 
 extern crate alloc;
 
+mod kernel;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -333,11 +335,21 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     let gic = PHYS_GIC.get().unwrap();
     gic.init_cpu();
     gic.enable(KICK_SGI);
+    // A guest's timer expiring while it runs here exits it, as on CPU 0.
+    gic.enable(VTIMER_INTID);
     ONLINE.fetch_add(1, Ordering::Release);
     // Wait for a guest, then run its vCPU with our index while it lives.
     loop {
         if let Some(vm) = SMP_VM.get() {
             vcpu_loop(vm, boot.cpu);
+        }
+        // SAFETY: kernel::boot publishes the VM only while it lives, and
+        // waits for every vCPU loop to finish before dropping it.
+        if let Some(vm) = unsafe { kernel::KERNEL_VM.load(Ordering::Acquire).as_ref() } {
+            kernel::vcpu_loop(vm, boot.cpu);
+            while !kernel::KERNEL_VM.load(Ordering::Acquire).is_null() {
+                core::hint::spin_loop();
+            }
         }
         core::hint::spin_loop();
     }
@@ -385,6 +397,14 @@ extern "C" fn kmain(x0: usize) -> ! {
     let (kstart, etext, erodata, kend) =
         unsafe { (sym(&_kernel_start), sym(&_etext), sym(&_erodata), sym(&_kernel_end)) };
     map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
+    // With enough RAM, keep the window for a guest kernel image out of the
+    // allocator (QEMU's loader may have put one there).
+    let top = map.regions().iter().map(|r| r.end.0).max().unwrap_or(0);
+    let image_window = top >= kernel::IMAGE_BASE + kernel::IMAGE_WINDOW;
+    if image_window {
+        let (base, end) = (kernel::IMAGE_BASE, kernel::IMAGE_BASE + kernel::IMAGE_WINDOW);
+        map.reserve(PhysAddr::new(base), PhysAddr::new(end), RegionKind::Reserved).unwrap();
+    }
     map.page_align_usable();
     let (ram_start, ram_end) = map.regions().iter().fold((u64::MAX, 0), |(s, e), r| (s.min(r.start.0), e.max(r.end.0)));
     {
@@ -433,11 +453,8 @@ extern "C" fn kmain(x0: usize) -> ! {
     println!("[gic]   physical GICv2 at {gicd:#x}/{gicc:#x}; INTID {VTIMER_INTID} forces exits");
 
     vm::init_cpu();
-    guest_demo();
-    gic_guest_demo();
-    fp_demo();
 
-    // --- Secondary CPUs, then a two-vCPU guest ------------------------------
+    // --- Secondary CPUs -------------------------------------------------------
     let boot_mpidr = aarch64::read_mpidr_el1() & 0xff_00ff_ffff;
     let mpidrs = fdt
         .find_node("/cpus")
@@ -461,8 +478,18 @@ extern "C" fn kmain(x0: usize) -> ! {
         core::hint::spin_loop();
     }
     println!("[smp]   {ncpus} CPUs online at EL2");
-    if ncpus >= 2 {
-        smp_guest_demo();
+
+    // A whole guest kernel if QEMU's loader provided one, else the demos.
+    match image_window.then(kernel::image).flatten() {
+        Some(elf) => kernel::boot(&elf, ncpus),
+        None => {
+            guest_demo();
+            gic_guest_demo();
+            fp_demo();
+            if ncpus >= 2 {
+                smp_guest_demo();
+            }
+        }
     }
 
     println!("[done]  {} free frames; shutting down", FRAMES.lock().free_frames());

@@ -93,8 +93,7 @@ impl ArmMachine<'_> {
         // timers: PPIs 13, 14, 11 and 10 (INTIDs 29, 30, 27, 26).
         w.begin_node("timer");
         w.property_string_list("compatible", &["arm,armv8-timer", "arm,armv7-timer"]);
-        let timer: Vec<u32> =
-            [13, 14, 11, 10].iter().flat_map(|&p| [PPI, p, ppi_cpus | LEVEL_HIGH]).collect();
+        let timer: Vec<u32> = [13, 14, 11, 10].iter().flat_map(|&p| [PPI, p, ppi_cpus | LEVEL_HIGH]).collect();
         w.property_cells("interrupts", &timer);
         w.property_empty("always-on");
         w.end_node();

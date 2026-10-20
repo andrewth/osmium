@@ -167,6 +167,25 @@ if command -v qemu-system-aarch64 >/dev/null; then
         grep -q "$line" "$hyplog" || { echo "aarch64-hyp: missing '$line'"; exit 1; }
     done
     rm -f "$hyplog"
+    # The same hypervisor booting the aarch64-virt kernel built above as a
+    # two-vCPU EL1 guest (QEMU's loader places the ELF raw in host RAM).
+    echo "== boot examples/aarch64-virt as a guest of examples/aarch64-hyp under QEMU"
+    nestlog=$(mktemp)
+    timeout 120 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=2 -cpu max -smp 2 \
+        -accel tcg,thread=multi -m 512M -nographic \
+        -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp \
+        -device loader,file=examples/aarch64-virt/target/aarch64-unknown-none-softfloat/release/aarch64-virt,addr=0x58000000,force-raw=on \
+        -serial "file:$nestlog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$nestlog"
+    for line in 'guest kernel: [0-9]* KiB loaded, entry 0x40200000, 2 vCPUs' '| osmium aarch64-virt example (EL1)' \
+        '| \[uart\]  pl011 at 0x9000000' 'virtual timer is INTID 27; PSCI via Hvc' '| \[smp\]   2 CPUs online' \
+        '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
+        '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
+        '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' '| \[done\]' \
+        'guest exit Shutdown'; do
+        grep -q "$line" "$nestlog" || { echo "aarch64-hyp (guest kernel): missing '$line'"; exit 1; }
+    done
+    rm -f "$nestlog"
 fi
 
 # AMD SVM hypervisor (QEMU's TCG implements SVM with nested paging).
