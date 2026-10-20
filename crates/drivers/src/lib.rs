@@ -15,6 +15,7 @@
 //! | [`xhci::Xhci`] | xHCI USB host controller | `UsbHost` |
 //! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet (PCI, polled) | `NetDevice` per port |
 //! | [`nvme::Nvme`] | NVM Express SSD (PCI, polled) | `BlockDevice` |
+//! | [`ahci::AhciDisk`] | SATA disk on an AHCI HBA (PCI, polled) | `BlockDevice` per port |
 //! | [`usb::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
 //! | [`usb::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
 //! | [`usb::ecm::UsbEthernet`] | USB Ethernet (CDC-ECM) on any `UsbHost` | `NetDevice` |
@@ -27,6 +28,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod ahci;
 pub mod clint;
 pub mod gicv2;
 pub mod ioapic;
