@@ -694,20 +694,44 @@ fn syscall(frame: &mut TrapFrame) {
     }
 }
 
+/// A fault in user mode raises a signal: the program's handler runs, or the
+/// default action ends it (and only it, not the kernel).
+fn user_fault(frame: &mut TrapFrame, cause: Trap) {
+    let (sig, addr) = match cause {
+        Trap::PageFault { addr, .. } => (11, addr),
+        Trap::Misaligned { addr } => (7, addr),
+        Trap::IllegalInstruction => (4, frame.pc()),
+        Trap::Breakpoint => (5, frame.pc()),
+        _ => (11, frame.pc()),
+    };
+    if let Some(status) = osmium::proc::signal::user_fault(frame, sig, addr) {
+        let task = osmium::sched::current();
+        println!("[user]  {} killed: {cause:?} at pc {:#x}", task.name(), frame.pc());
+        drop(task);
+        osmium::proc::exit(status);
+    }
+}
+
+/// Runs the trap handler, then, before returning to user mode from an
+/// interrupt, delivers pending signals (and stops threads of a process that
+/// is ending).
 fn on_trap(frame: &mut TrapFrame) {
+    handle_trap(frame);
+    if frame.from_user() && matches!(frame.cause(), Trap::Interrupt(_)) {
+        if let Some(status) = osmium::proc::signal::deliver(frame) {
+            osmium::proc::exit(status);
+        }
+    }
+}
+
+fn handle_trap(frame: &mut TrapFrame) {
     if frame.from_user() {
         match frame.cause() {
             Trap::Syscall => return syscall(frame),
             Trap::Interrupt(_) => {}
             // A write to a page `fork` shares gets its own copy; retry.
             Trap::PageFault { addr, access: Access::Write } if osmium::proc::handle_page_fault(addr as u64, true) => return,
-            cause => {
-                // A fault in user mode ends that task, not the kernel.
-                let task = osmium::sched::current();
-                println!("[user]  {} killed: {cause:?} at pc {:#x}", task.name(), frame.pc());
-                drop(task);
-                osmium::proc::exit(ExitStatus::Signal(11));
-            }
+            cause => return user_fault(frame, cause),
         }
     }
     if TrapCpu::current().overflowed(frame) {

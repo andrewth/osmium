@@ -180,6 +180,9 @@ fn on_switch(next: &osmium::sched::Task) {
         // SAFETY: both kinds of table map the kernel (shared root entry 0).
         unsafe { x86::write_cr3(root) };
     }
+    // FS.base is the thread pointer of the incoming thread (0 for kernel tasks).
+    // SAFETY: a user-supplied base is checked to be canonical by `arch_prctl`.
+    unsafe { x86::wrmsr(x86::msr::IA32_FS_BASE, osmium::proc::thread::tls_for(next).unwrap_or(0)) };
     let tables = CPU_TABLES[cpu::current_id()].load(Ordering::Relaxed);
     if let (Some(top), false) = (next.kernel_stack_top(), tables.is_null()) {
         // SAFETY: this CPU's own tables; interrupts are off during a switch.
@@ -823,7 +826,37 @@ fn syscall(frame: &mut TrapFrame) {
     }
 }
 
+/// A fault in user mode raises a signal: the program's handler runs, or the
+/// default action ends it (and only it, not the kernel).
+fn user_fault(frame: &mut TrapFrame, cause: Trap) {
+    let (sig, addr) = match cause {
+        Trap::PageFault { addr, .. } => (11, addr),
+        Trap::Misaligned { addr } => (7, addr),
+        Trap::IllegalInstruction => (4, frame.pc()),
+        Trap::Breakpoint => (5, frame.pc()),
+        _ => (11, frame.pc()),
+    };
+    if let Some(status) = osmium::proc::signal::user_fault(frame, sig, addr) {
+        let task = osmium::sched::current();
+        println!("[user]  {} killed: {cause:?} at rip {:#x}", task.name(), frame.pc());
+        drop(task);
+        osmium::proc::exit(status);
+    }
+}
+
+/// Runs the trap handler, then, before returning to user mode from an
+/// interrupt, delivers pending signals (and stops threads of a process that
+/// is ending).
 fn on_trap(frame: &mut TrapFrame) {
+    handle_trap(frame);
+    if frame.from_user() && matches!(frame.cause(), Trap::Interrupt(_)) {
+        if let Some(status) = osmium::proc::signal::deliver(frame) {
+            osmium::proc::exit(status);
+        }
+    }
+}
+
+fn handle_trap(frame: &mut TrapFrame) {
     // A write to a page `fork` shares gets its own copy; retry.
     if let Trap::PageFault { addr, access: Access::Write } = frame.cause()
         && frame.from_user()
@@ -832,11 +865,8 @@ fn on_trap(frame: &mut TrapFrame) {
         return;
     }
     if frame.from_user() && frame.vector() < 32 && frame.cause() != Trap::Syscall {
-        // A fault in user mode ends that task, not the kernel.
-        let task = osmium::sched::current();
-        println!("[user]  {} killed: {:?} at rip {:#x}", task.name(), frame.cause(), frame.pc());
-        drop(task);
-        osmium::proc::exit(ExitStatus::Signal(11));
+        let cause = frame.cause();
+        return user_fault(frame, cause);
     }
     match (frame.vector(), frame.cause()) {
         (_, Trap::Syscall) if frame.from_user() => syscall(frame),
