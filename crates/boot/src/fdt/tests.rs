@@ -57,7 +57,10 @@ fn navigation_and_properties() {
     let blob = qemu_like();
     let fdt = Fdt::new(&blob).unwrap();
     assert_eq!(fdt.bootargs(), Some("console=ttyS0 quiet"));
-    assert_eq!(fdt.root().children().map(|n| n.name()).collect::<Vec<_>>(), ["chosen", "memory@80000000", "reserved-memory", "soc"]);
+    assert_eq!(
+        fdt.root().children().map(|n| n.name()).collect::<Vec<_>>(),
+        ["chosen", "memory@80000000", "reserved-memory", "soc"]
+    );
 
     let uart = fdt.find_compatible(&["ns16550a"]).unwrap();
     assert_eq!(uart.name(), "serial@10000000");
@@ -122,4 +125,19 @@ fn string_table_dedup() {
     let blob = w.finish(0);
     let fdt = Fdt::new(&blob).unwrap();
     assert_eq!(fdt.strings.len(), 4, "\"reg\\0\" stored once");
+}
+
+#[test]
+fn hostile_cell_counts_yield_no_regs() {
+    let mut w = FdtWriter::new();
+    w.begin_node("");
+    w.property_u32("#address-cells", 0xffff_ffff);
+    w.property_u32("#size-cells", 3);
+    w.begin_node("dev@0");
+    w.property_cells("reg", &[1, 2, 3, 4]);
+    w.end_node();
+    w.end_node();
+    let blob = w.finish(0);
+    let fdt = Fdt::new(&blob).unwrap();
+    assert_eq!(fdt.find_node("/dev").unwrap().reg().count(), 0);
 }

@@ -159,6 +159,8 @@ fn encodings() {
     // AArch64 kernel RX page: AF | SH inner | AP RO | nG clear | UXN | page | valid.
     assert_eq!(Aarch64::leaf(pa(0x4000_0000), MapFlags::RX | MapFlags::GLOBAL, 0), 0x0040_0000_4000_0783);
     assert_eq!(Ept::leaf(pa(0x1000), MapFlags::RW | MapFlags::EXEC, 0), 0x1077);
+    // EXEC alone is not encoded as execute-only.
+    assert_eq!(Ept::leaf(pa(0x1000), MapFlags::EXEC, 0) & 0x7, 0x5);
     assert!(Ept::flags(Ept::leaf(pa(0), MapFlags::READ | MapFlags::DEVICE, 0), 0).contains(MapFlags::DEVICE));
     assert!(Aarch64::flags(Aarch64::leaf(pa(0), MapFlags::RW | MapFlags::DEVICE, 0), 0).contains(MapFlags::DEVICE));
 }
@@ -302,4 +304,15 @@ fn sv39_io() {
     assert_ne!(Sv39Io::table(pa(0x5000)) & 0x10, 0);
     assert_ne!(Sv39Io::leaf(pa(0x5000), MapFlags::READ, 0) & 0x10, 0);
     assert_eq!(Sv39Io::flags(Sv39Io::leaf(pa(0x5000), MapFlags::RW, 0), 0), MapFlags::RW);
+}
+
+#[test]
+fn map_range_rejects_wrap() {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let mut pt = PageTable::<X86_64, _>::new(&frames).unwrap();
+    let top = 0xffff_ffff_ffff_f000;
+    assert_eq!(pt.map_range(va(top), pa(0x1000), 0x2000, MapFlags::RW), Err(MapError::InvalidAddress));
+    assert_eq!(pt.map_range(va(0x1000), pa(top), 0x2000, MapFlags::RW), Err(MapError::InvalidAddress));
+    assert!(pt.translate(va(0)).is_none());
 }

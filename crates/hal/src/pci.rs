@@ -454,9 +454,9 @@ pub struct BarAllocator {
 }
 
 impl BarAllocator {
-    /// Allocates from `[base, base + size)` (bus addresses).
+    /// Allocates from `[base, base + size)` (bus addresses). A window running past `u64::MAX` is clamped to it.
     pub const fn new(base: u64, size: u64) -> Self {
-        Self { next: base, end: base + size }
+        Self { next: base, end: base.saturating_add(size) }
     }
 
     /// Returns an address for a region of `size` bytes, aligned to `size`.
@@ -507,6 +507,14 @@ mod tests {
     use core::cell::RefCell;
     use std::collections::BTreeMap;
     use std::vec::Vec;
+
+    #[test]
+    fn bar_window_past_the_top_is_clamped() {
+        let mut a = BarAllocator::new(u64::MAX - 0xfff, u64::MAX);
+        assert_eq!(a.alloc(0x1000), None);
+        let mut a = BarAllocator::new(0x1000, u64::MAX);
+        assert_eq!(a.alloc(0x1000), Some(0x1000));
+    }
 
     /// Configuration space with BARs that decode like hardware: writes keep
     /// only the address bits above the BAR's size, and bits in `hardwired`

@@ -404,6 +404,10 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         {
             return Err(MapError::Misaligned);
         }
+        // A range that runs past the top of the address space would wrap and map low addresses.
+        if va.0.checked_add(len).is_none() || pa.0.checked_add(len).is_none() {
+            return Err(MapError::InvalidAddress);
+        }
         let mut done = 0;
         while done < len {
             let (v, p) = (va + done, pa + done);

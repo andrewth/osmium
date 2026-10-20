@@ -74,10 +74,17 @@ impl Channel {
     }
 
     fn encode(&self, v: u8) -> u32 {
+        if self.bits == 0 || self.bits > 8 {
+            return 0;
+        }
         (v as u32 >> (8 - self.bits)) << self.shift
     }
 
     fn decode(&self, pixel: u32) -> u8 {
+        // An invalid channel (see `fits`) carries no data; the replication loop below would never end on 0 bits.
+        if self.bits == 0 || self.bits > 8 {
+            return 0;
+        }
         let v = (pixel >> self.shift) & ((1 << self.bits) - 1);
         // Replicate the high bits into the low ones, so full scale stays
         // full scale (0x1f in 5 bits reads back as 0xff).
@@ -437,6 +444,15 @@ mod tests {
     fn fb(mem: &mut [u32], info: FramebufferInfo) -> Framebuffer {
         // SAFETY: the window covers a local buffer that outlives the test.
         Framebuffer::new(unsafe { IoMem::new(mem.as_mut_ptr().cast(), mem.len() * 4) }, info).unwrap()
+    }
+
+    #[test]
+    fn invalid_channels_do_not_hang() {
+        for bits in [0, 9, 200] {
+            let c = Channel { shift: 0, bits };
+            assert_eq!(c.decode(0xffff_ffff), 0);
+            assert_eq!(c.encode(0xff), 0);
+        }
     }
 
     #[test]

@@ -206,13 +206,17 @@ pub mod psci {
     /// PSCI calls start and stop CPUs and power the machine off.
     pub unsafe fn call(conduit: Conduit, fid: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         let ret: i64;
-        // SAFETY: the SMC Calling Convention preserves x4-x30 and sp.
+        // SAFETY: SMCCC 1.0 lets the callee clobber x0-x17 (x4-x17 are declared below); x18-x30 and sp are preserved.
         unsafe {
             match conduit {
                 Conduit::Hvc => asm!("hvc #0", inlateout("x0") fid as i64 => ret, inlateout("x1") a1 => _,
-                    inlateout("x2") a2 => _, inlateout("x3") a3 => _, options(nostack)),
+                    inlateout("x2") a2 => _, inlateout("x3") a3 => _,
+                    out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+                    out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _, options(nostack)),
                 Conduit::Smc => asm!("smc #0", inlateout("x0") fid as i64 => ret, inlateout("x1") a1 => _,
-                    inlateout("x2") a2 => _, inlateout("x3") a3 => _, options(nostack)),
+                    inlateout("x2") a2 => _, inlateout("x3") a3 => _,
+                    out("x4") _, out("x5") _, out("x6") _, out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+                    out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _, out("x17") _, options(nostack)),
             }
         }
         ret

@@ -411,8 +411,9 @@ impl<'src> Node<'src> {
     pub fn reg(&self) -> impl Iterator<Item = (u64, Option<u64>)> + 'src + use<'src> {
         let Cells { address, size } = self.parent_cells;
         let value = self.property("reg").map_or(&[][..], |p| p.value);
-        let stride = (address + size) as usize * 4;
-        let usable = address <= 2 && size <= 2 && stride > 0;
+        // The cell counts come from the blob: validate them before doing arithmetic on them.
+        let usable = address <= 2 && size <= 2 && address + size > 0;
+        let stride = if usable { (address + size) as usize * 4 } else { 1 };
         let chunks = if usable { value.chunks_exact(stride) } else { [].chunks_exact(1) };
         chunks.map(move |c| {
             let a = read_cells(&c[..address as usize * 4]);

@@ -56,7 +56,8 @@ impl<T: ?Sized, G: Guardian> SpinLock<T, G> {
     /// Acquires the lock if it is free.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T, G>> {
         let state = G::enter();
-        let serving = self.serving.load(Ordering::Relaxed);
+        // Acquire pairs with the Release in the previous unlock; the CAS alone only orders `next`.
+        let serving = self.serving.load(Ordering::Acquire);
         if self.next.compare_exchange(serving, serving.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed).is_ok() {
             Some(SpinLockGuard { lock: self, state: Some(state), _not_send: PhantomData })
         } else {

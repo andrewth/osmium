@@ -413,6 +413,8 @@ mod ept {
     pub const LARGE: u64 = 1 << 7;
 }
 
+/// EPT leaves: `EXEC` and `WRITE` both imply `READ`, because execute-only
+/// (X=1, R=0) is only valid on CPUs that report that capability.
 impl PageTableFormat for Ept {
     const LEVELS: usize = 4;
     const VA_BITS: u32 = 48;
@@ -432,7 +434,8 @@ impl PageTableFormat for Ept {
             e |= ept::W | ept::R;
         }
         if f.contains(MapFlags::EXEC) {
-            e |= ept::X;
+            // Execute-only (X=1, R=0) needs a CPU feature; EXEC implies READ, as WRITE does.
+            e |= ept::X | ept::R;
         }
         if !f.contains(MapFlags::DEVICE) {
             e |= ept::MT_WB | ept::IGNORE_PAT;
