@@ -1,16 +1,25 @@
-# Osmium
+<p><img src="docs/logo/osmium-horizontal-reversed.svg" alt="osmium" width="360"></p>
+
+```sh
+cargo add osmium
+```
+
+![no_std](https://img.shields.io/badge/no__std-yes-4E6984)
+![architectures](https://img.shields.io/badge/arch-x86__64%20%7C%20aarch64%20%7C%20riscv64-4E6984)
+![license](https://img.shields.io/badge/license-GPL--2.0--only-4E6984)
 
 A separable Rust toolkit for building operating systems, firmware and
 hypervisors: CPU primitives, synchronization, memory management, a hardware
 abstraction layer, drivers, scheduling, boot-protocol parsing and
 virtualization support. It runs on x86_64, AArch64 and RISC-V 64.
 
-Osmium takes its structure from [OSKit](https://www-old.cs.utah.edu/flux/oskit/)
+osmium takes its structure from [OSKit](https://www-old.cs.utah.edu/flux/oskit/)
 (independent components you link only as needed) and its safety model from
 [OSTD](https://asterinas.github.io/api-docs/) (a small `unsafe` core under
 sound, safe APIs, with policy injected by the OS). See
 [docs/FEATURES.md](docs/FEATURES.md) for the survey of prior art, the design
-principles and the full feature list with status.
+principles and the full feature list with status, and [DESIGN.md](DESIGN.md) for the logo,
+colors and type.
 
 ## Crates
 
@@ -113,5 +122,5 @@ features.
 
 ## License
 
-Osmium is licensed under the GNU General Public License, version 2 only
+osmium is licensed under the GNU General Public License, version 2 only
 (`GPL-2.0-only`). See [LICENSE](LICENSE).

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-16 -24 560 222" role="img" aria-label="osmium">
+  <rect x="-16" y="-24" width="560" height="222" rx="16" fill="#121A23"/>
+  <g stroke="#8FA7BF" stroke-width="7" stroke-linecap="round">
+    <line x1="100" y1="104" x2="150" y2="52" opacity=".5"/>
+    <line x1="100" y1="104" x2="100" y2="24"/>
+    <line x1="100" y1="104" x2="32" y2="150"/>
+    <line x1="100" y1="104" x2="168" y2="150"/>
+  </g>
+  <circle cx="150" cy="52" r="10" fill="#E07B4B" opacity=".5"/>
+  <polygon points="100,58 139.8,81 139.8,127 100,150 60.2,127 60.2,81" fill="#4E6984"/>
+  <polyline points="80,90 98,104 80,118" fill="none" stroke="#E6EEF6" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="104" y="111" width="20" height="8" rx="1.5" fill="#E07B4B"/>
+  <g fill="#E07B4B">
+    <circle cx="100" cy="24" r="16"/>
+    <circle cx="32" cy="150" r="16"/>
+    <circle cx="168" cy="150" r="16"/>
+  </g>
+  <text x="214" y="132" font-family="JetBrains Mono, ui-monospace, Menlo, monospace" font-weight="700" font-size="84" letter-spacing="-3" fill="#E6EEF6">osmium</text>
+</svg>

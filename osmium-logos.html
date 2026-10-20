@@ -1,0 +1,258 @@
+<title>Osmium Logo Studies</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..900&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: specimen sheet — a cool steel ground, ten numbered plates in a two-column grid, each with mark, lockup and favicon proof. */
+:root {
+  --bg: #EDF0F3;
+  --surface: #FFFFFF;
+  --fg: #17202A;
+  --muted: #5A6674;
+  --line: #D4DBE2;
+  --metal: #4E6984;
+  --metal-hi: #8FA7BF;
+  --metal-lo: #2B3D51;
+  --oxide: #B4552D;
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0E1319; --surface: #161D25; --fg: #E5EBF1; --muted: #92A0AF; --line: #25303B;
+    --metal: #89A4BF; --metal-hi: #C0D1E1; --metal-lo: #4B6683; --oxide: #E07B4B;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0E1319; --surface: #161D25; --fg: #E5EBF1; --muted: #92A0AF; --line: #25303B;
+  --metal: #89A4BF; --metal-hi: #C0D1E1; --metal-lo: #4B6683; --oxide: #E07B4B;
+  color-scheme: dark;
+}
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15px; line-height: 1.55;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 48px 64px;
+}
+.wrap { max-width: 1120px; margin: 0 auto; display: grid; gap: 40px; }
+header { display: grid; gap: 10px; max-width: 68ch; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+h1 { font-family: var(--display); font-variation-settings: "wdth" 125; font-weight: 800; font-size: clamp(32px, 6vw, 52px); line-height: 1.02; margin: 0; letter-spacing: -.01em; text-wrap: balance; }
+header p { margin: 0; color: var(--muted); }
+.facts { display: flex; flex-wrap: wrap; gap: 8px 20px; font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.facts b { color: var(--fg); font-weight: 500; }
+
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+@media (max-width: 760px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+
+.plate { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; display: grid; grid-template-rows: auto 1fr auto; overflow: hidden; }
+.stage { display: grid; grid-template-columns: 150px minmax(0, 1fr); align-items: center; gap: 24px; padding: 28px 28px 22px; border-bottom: 1px solid var(--line); }
+.stage svg.mark { width: 150px; height: 150px; display: block; }
+.lockup { display: grid; gap: 14px; min-width: 0; }
+.lockup .word { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.lockup .word svg { width: 36px; height: 36px; flex: none; }
+.lockup .word span { font-size: 30px; line-height: 1; color: var(--fg); white-space: nowrap; }
+.sizes { display: flex; align-items: end; gap: 12px; }
+.sizes svg { display: block; }
+.sizes .chip { background: var(--metal-lo); border-radius: 6px; padding: 5px; display: grid; place-items: center; }
+.sizes .chip svg { --metal: #C0D1E1; --metal-hi: #E6EEF6; --metal-lo: #6E8AA8; --surface: #2B3D51; --oxide: #E8875A; }
+.meta { padding: 18px 28px 22px; display: grid; gap: 6px; }
+.meta h2 { margin: 0; font-family: var(--display); font-variation-settings: "wdth" 100; font-weight: 700; font-size: 18px; display: flex; gap: 10px; align-items: baseline; }
+.meta h2 .no { font-family: var(--mono); font-weight: 500; font-size: 12px; color: var(--muted); letter-spacing: .06em; }
+.meta p { margin: 0; color: var(--muted); max-width: 60ch; }
+.foot { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 0 28px 20px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+button.copy { font: 500 12px var(--mono); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 6px 10px; cursor: pointer; }
+button.copy:hover { border-color: var(--metal); }
+button.copy:focus-visible { outline: 2px solid var(--oxide); outline-offset: 2px; }
+@media (max-width: 460px) {
+  .stage { grid-template-columns: minmax(0, 1fr); justify-items: center; text-align: center; }
+  .lockup { justify-items: center; }
+  .meta, .foot { padding-left: 20px; padding-right: 20px; }
+}
+.blink { animation: blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .blink { animation: none; } }
+footer { font-size: 13px; color: var(--muted); max-width: 68ch; }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Identity exploration · 10 directions</div>
+    <h1>Osmium</h1>
+    <p>Ten logo directions for a Rust library of operating-system code. Each one draws on something real about the element or about kernels: the periodic-table tile, its hexagonal crystal lattice, its record density, the tetroxide it forms when it oxidizes, CPU privilege rings, and page tables.</p>
+    <div class="facts"><span>Symbol <b>Os</b></span><span>Z <b>76</b></span><span>Mass <b>190.23</b></span><span>Density <b>22.59 g/cm³</b></span><span>Lattice <b>hcp</b></span><span>Shells <b>2·8·18·32·14·2</b></span></div>
+  </header>
+
+  <main class="grid" id="grid"></main>
+
+  <footer>Copy SVG gives you the mark with colors filled in for the current theme. Marks that contain lettering use Archivo or IBM Plex Mono, so convert that text to outlines before you use it in production.</footer>
+</div>
+
+<script>
+const MARKS = [
+  {
+    name: "Element Tile", font: "display:800:112",
+    note: "The literal periodic-table cell. “Os” is also the obvious abbreviation for an OS, so the tile works as a pun without explaining itself.",
+    tag: "Z 76 · 190.23",
+    svg: `<rect x="18" y="18" width="164" height="164" rx="6" fill="none" stroke="var(--metal)" stroke-width="7"/>
+      <text x="34" y="52" font-family="IBM Plex Mono, monospace" font-weight="600" font-size="20" fill="var(--oxide)">76</text>
+      <text x="100" y="138" text-anchor="middle" font-family="Archivo, sans-serif" font-weight="800" font-size="84" style="font-variation-settings:'wdth' 112" fill="var(--metal-lo)">Os</text>
+      <text x="100" y="166" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-weight="500" font-size="15" fill="var(--metal)">190.23</text>`
+  },
+  {
+    name: "Close-Packed", font: "display:600:125",
+    note: "Osmium crystallizes in a hexagonal close-packed lattice. Two atom layers, with the offset middle layer in oxide orange. It reads as structured, layered, low-level.",
+    tag: "hcp lattice",
+    svg: `<polygon points="170,100 135,160.6 65,160.6 30,100 65,39.4 135,39.4" fill="none" stroke="var(--metal-hi)" stroke-width="4"/>
+      <g fill="var(--metal)">
+        <circle cx="100" cy="100" r="17"/><circle cx="170" cy="100" r="15"/><circle cx="135" cy="160.6" r="15"/><circle cx="65" cy="160.6" r="15"/>
+        <circle cx="30" cy="100" r="15"/><circle cx="65" cy="39.4" r="15"/><circle cx="135" cy="39.4" r="15"/>
+      </g>
+      <g fill="var(--oxide)"><circle cx="134.6" cy="120" r="12"/><circle cx="65.4" cy="120" r="12"/><circle cx="100" cy="60" r="12"/></g>`
+  },
+  {
+    name: "Ingot", font: "display:900:62",
+    note: "Osmium is the densest natural element. An isometric block in three metal tones says solid, heavy and dependable, which is what you want from kernel code.",
+    tag: "22.59 g/cm³",
+    svg: `<polygon points="100,26 164,63 100,100 36,63" fill="var(--metal-hi)"/>
+      <polygon points="36,63 100,100 100,174 36,137" fill="var(--metal)"/>
+      <polygon points="100,100 164,63 164,137 100,174" fill="var(--metal-lo)"/>
+      <text x="0" y="11" text-anchor="middle" font-family="Archivo, sans-serif" font-weight="800" font-size="30" fill="var(--metal-lo)" transform="translate(100 63) matrix(0.866 0.5 -0.866 0.5 0 0)" style="font-variation-settings:'wdth' 100">Os</text>`
+  },
+  {
+    name: "Cog", font: "display:700:100",
+    note: "A twelve-tooth gear around the symbol nods to the Rust ecosystem without borrowing its mark. Familiar to Rust developers, and still clearly its own thing.",
+    tag: "crate mark",
+    svg: `<g fill="var(--metal)">${Array.from({length:12},(_,i)=>`<rect x="91" y="14" width="18" height="26" rx="3" transform="rotate(${i*30} 100 100)"/>`).join("")}</g>
+      <circle cx="100" cy="100" r="64" fill="var(--metal)"/>
+      <circle cx="100" cy="100" r="47" fill="var(--surface)"/>
+      <text x="100" y="117" text-anchor="middle" font-family="Archivo, sans-serif" font-weight="800" font-size="46" fill="var(--metal-lo)" style="font-variation-settings:'wdth' 100">Os</text>
+      <circle cx="131" cy="76" r="5" fill="var(--oxide)"/>`
+  },
+  {
+    name: "Ring Zero", font: "display:500:125",
+    note: "The x86 protection rings, with ring 0 (where the kernel runs) as the solid core. The outer rings fade out toward user space. It is also an “O”.",
+    tag: "ring 0 → ring 3",
+    svg: `<circle cx="100" cy="100" r="80" fill="none" stroke="var(--metal-hi)" stroke-width="6" opacity=".45"/>
+      <circle cx="100" cy="100" r="61" fill="none" stroke="var(--metal-hi)" stroke-width="8" opacity=".75"/>
+      <circle cx="100" cy="100" r="41" fill="none" stroke="var(--metal)" stroke-width="10"/>
+      <circle cx="100" cy="100" r="21" fill="var(--oxide)"/>`
+  },
+  {
+    name: "Tetroxide", font: "mono:600",
+    note: "OsO₄ is what osmium forms when it oxidizes, which makes it osmium’s version of rust. A central atom with four oxygen bonds, one set back for depth.",
+    tag: "OsO₄",
+    svg: `<g stroke="var(--metal-hi)" stroke-width="7" stroke-linecap="round">
+        <line x1="100" y1="100" x2="132" y2="58" opacity=".5"/>
+        <line x1="100" y1="100" x2="100" y2="30"/><line x1="100" y1="100" x2="36" y2="142"/><line x1="100" y1="100" x2="164" y2="142"/>
+      </g>
+      <circle cx="132" cy="58" r="11" fill="var(--oxide)" opacity=".5"/>
+      <circle cx="100" cy="100" r="30" fill="var(--metal-lo)"/>
+      <text x="100" y="110" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-weight="600" font-size="26" fill="var(--surface)">Os</text>
+      <g fill="var(--oxide)"><circle cx="100" cy="28" r="17"/><circle cx="34" cy="143" r="17"/><circle cx="166" cy="143" r="17"/></g>`
+  },
+  {
+    name: "Boot Prompt", font: "mono:500",
+    note: "A terminal prompt with a blinking cursor. Direct and developer-facing, and it reads well at 16px in a crates.io listing or a docs.rs sidebar.",
+    tag: "> os_",
+    svg: `<rect x="18" y="38" width="164" height="124" rx="14" fill="var(--metal-lo)"/>
+      <circle cx="38" cy="56" r="4" fill="var(--metal-hi)" opacity=".6"/><circle cx="52" cy="56" r="4" fill="var(--metal-hi)" opacity=".6"/>
+      <text x="36" y="132" font-family="IBM Plex Mono, monospace" font-weight="600" font-size="50" fill="var(--metal-hi)">&gt;os</text>
+      <rect class="blink" x="146" y="96" width="20" height="40" fill="var(--oxide)"/>`
+  },
+  {
+    name: "Six Shells", font: "display:400:112",
+    note: "Osmium’s six electron shells (2, 8, 18, 32, 14, 2), each with one electron placed further around the orbit. The result spirals outward like a boot sequence.",
+    tag: "2·8·18·32·14·2",
+    svg: `<g fill="none" stroke="var(--metal-hi)" stroke-width="2.5">
+        <circle cx="100" cy="100" r="28"/><circle cx="100" cy="100" r="40"/><circle cx="100" cy="100" r="52"/>
+        <circle cx="100" cy="100" r="64"/><circle cx="100" cy="100" r="76"/><circle cx="100" cy="100" r="88"/>
+      </g>
+      <circle cx="100" cy="100" r="15" fill="var(--metal-lo)"/>
+      <g fill="var(--metal)">
+        <circle cx="100" cy="72" r="5"/><circle cx="134.6" cy="80" r="5.5"/><circle cx="152" cy="100" r="6"/>
+        <circle cx="145.3" cy="145.3" r="6.5"/><circle cx="100" cy="176" r="7"/>
+      </g>
+      <circle cx="23.8" cy="144" r="8" fill="var(--oxide)"/>`
+  },
+  {
+    name: "Lustre", font: "display:700:88",
+    note: "A faceted hexagonal crystal, cut like the bluish metal itself. The hollow centre holds the symbol, so the mark still works as a solid gem at small sizes.",
+    tag: "bluish-white metal",
+    svg: `<polygon points="100,20 166,58 136,79 100,58" fill="var(--metal-hi)"/>
+      <polygon points="166,58 166,142 136,121 136,79" fill="var(--metal)"/>
+      <polygon points="166,142 100,180 100,142 136,121" fill="var(--metal-lo)"/>
+      <polygon points="100,180 34,142 64,121 100,142" fill="var(--metal)"/>
+      <polygon points="34,142 34,58 64,79 64,121" fill="var(--metal-hi)"/>
+      <polygon points="34,58 100,20 100,58 64,79" fill="var(--metal-hi)" opacity=".7"/>
+      <polygon points="100,58 136,79 136,121 100,142 64,121 64,79" fill="var(--surface)"/>
+      <text x="100" y="113" text-anchor="middle" font-family="Archivo, sans-serif" font-weight="800" font-size="34" fill="var(--oxide)" style="font-variation-settings:'wdth' 88">Os</text>`
+  },
+  {
+    name: "Page Table", font: "mono:600",
+    note: "“Os” drawn as set bits in an 8×7 grid, like a page table or framebuffer. The unset cells stay faintly visible so it reads as memory, not as a pixel font.",
+    tag: "8×7 bitmap",
+    svg: (() => {
+      const rows = ["0110 000","1001 000","1001 111","1001 100","1001 111","1001 001","0110 111"];
+      let out = "";
+      rows.forEach((r, y) => r.replace(" ", "0").split("").forEach((c, x) => {
+        const on = c === "1", accent = on && x >= 5 && y === 2;
+        out += `<rect x="${14 + x*22}" y="${25 + y*22}" width="18" height="18" rx="2.5" fill="${accent ? "var(--oxide)" : on ? "var(--metal)" : "var(--metal-hi)"}"${on ? "" : ' opacity=".22"'}/>`;
+      }));
+      return out;
+    })()
+  }
+];
+
+function wordStyle(f) {
+  const [kind, wght, wdth] = f.split(":");
+  if (kind === "mono") return `font-family:var(--mono);font-weight:${wght};letter-spacing:-.02em`;
+  return `font-family:var(--display);font-weight:${wght};font-variation-settings:'wdth' ${wdth};letter-spacing:${wdth > 110 ? "-.01em" : "-.02em"}`;
+}
+
+const svgOf = (m, cls, size) =>
+  `<svg class="${cls}" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg"${size ? ` width="${size}" height="${size}"` : ""} role="img" aria-label="Osmium ${m.name} mark">${m.svg}</svg>`;
+
+const grid = document.getElementById("grid");
+MARKS.forEach((m, i) => {
+  const el = document.createElement("article");
+  el.className = "plate";
+  el.innerHTML = `
+    <div class="stage">
+      ${svgOf(m, "mark")}
+      <div class="lockup">
+        <div class="word">${svgOf(m, "")}<span style="${wordStyle(m.font)}">osmium</span></div>
+        <div class="sizes" aria-label="Small-size proofs">
+          ${svgOf(m, "", 48)}${svgOf(m, "", 32)}${svgOf(m, "", 16)}
+          <span class="chip">${svgOf(m, "", 22)}</span>
+        </div>
+      </div>
+    </div>
+    <div class="meta">
+      <h2><span class="no">No. ${String(i + 1).padStart(2, "0")}</span>${m.name}</h2>
+      <p>${m.note}</p>
+    </div>
+    <div class="foot"><span>${m.tag}</span><button class="copy" id="copy-${i}" type="button">Copy SVG</button></div>`;
+  grid.appendChild(el);
+
+  el.querySelector("button.copy").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const cs = getComputedStyle(document.documentElement);
+    const src = `<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">${m.svg.replace(/ class="blink"/g, "")}</svg>`
+      .replace(/var\((--[\w-]+)\)/g, (_, v) => cs.getPropertyValue(v).trim());
+    try {
+      await navigator.clipboard.writeText(src);
+      btn.textContent = "Copied";
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = src; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); btn.textContent = "Copied"; } catch { btn.textContent = "Select and copy"; }
+      ta.remove();
+    }
+    setTimeout(() => (btn.textContent = "Copy SVG"), 1600);
+  });
+});
+</script>

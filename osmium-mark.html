@@ -1,0 +1,359 @@
+<title>Osmium Mark</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,300..900&family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: brand sheet — a slate hero holding the final mark, then stacked sections (lockups, color, sizes, clear space, palette, in use, origins) on a cool steel ground. */
+:root {
+  --bg: #EDF0F3;
+  --surface: #FFFFFF;
+  --fg: #17202A;
+  --muted: #5A6674;
+  --line: #D4DBE2;
+  --metal: #4E6984;
+  --metal-hi: #8FA7BF;
+  --metal-lo: #2B3D51;
+  --oxide: #B4552D;
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  /* fixed brand grounds used by specimen tiles in both themes */
+  --paper: #F4F6F8;
+  --ink: #121A23;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0E1319; --surface: #161D25; --fg: #E5EBF1; --muted: #92A0AF; --line: #25303B;
+    --metal: #89A4BF; --metal-hi: #C0D1E1; --metal-lo: #4B6683; --oxide: #E07B4B;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0E1319; --surface: #161D25; --fg: #E5EBF1; --muted: #92A0AF; --line: #25303B;
+  --metal: #89A4BF; --metal-hi: #C0D1E1; --metal-lo: #4B6683; --oxide: #E07B4B;
+  color-scheme: dark;
+}
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 15px; line-height: 1.55;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 64px;
+}
+.wrap { max-width: 1120px; margin: 0 auto; display: grid; gap: 56px; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+
+.hero { background: var(--ink); color: #E6EEF6; border-radius: 8px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); align-items: center; gap: 32px; padding: 40px clamp(20px, 4vw, 56px); }
+.hero svg { width: 100%; max-width: 340px; justify-self: center; display: block; }
+.hero .eyebrow { color: #8FA7BF; }
+.hero h1 { font-family: var(--display); font-variation-settings: "wdth" 125; font-weight: 800; font-size: clamp(34px, 5.5vw, 56px); line-height: 1; margin: 8px 0 14px; letter-spacing: -.01em; }
+.hero p { margin: 0; color: #B9C7D5; max-width: 52ch; }
+.hero ul { margin: 18px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.hero li { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 12px; font-size: 14px; color: #B9C7D5; }
+.hero li b { font-family: var(--mono); font-weight: 500; font-size: 12px; color: #E07B4B; letter-spacing: .04em; padding-top: 2px; }
+@media (max-width: 720px) { .hero { grid-template-columns: minmax(0, 1fr); } .hero svg { max-width: 220px; } }
+
+section { display: grid; gap: 18px; }
+section > header { display: grid; gap: 4px; max-width: 70ch; }
+h2 { font-family: var(--display); font-variation-settings: "wdth" 110; font-weight: 700; font-size: 24px; line-height: 1.15; margin: 0; text-wrap: balance; }
+section > header p { margin: 0; color: var(--muted); }
+
+.tiles { display: grid; gap: 16px; }
+.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 860px) { .cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .cols-2, .cols-4 { grid-template-columns: minmax(0, 1fr); } }
+
+.tile { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; display: grid; grid-template-rows: 1fr auto; background: var(--surface); }
+.tile .art { display: grid; place-items: center; padding: 28px; min-height: 180px; }
+.tile .art svg { display: block; max-width: 100%; height: auto; }
+.tile.paper .art { background: var(--paper); }
+.tile.ink .art { background: var(--ink); }
+.tile.oxide .art { background: #B4552D; }
+.tile .cap { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 16px; border-top: 1px solid var(--line); font-size: 13px; }
+.tile .cap span { color: var(--muted); }
+.tile .cap b { color: var(--fg); font-weight: 600; }
+button.copy { font: 500 12px var(--mono); color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 5px 9px; cursor: pointer; white-space: nowrap; }
+button.copy:hover { border-color: var(--metal); }
+button.copy:focus-visible { outline: 2px solid var(--oxide); outline-offset: 2px; }
+
+.sizes { display: flex; flex-wrap: wrap; align-items: end; gap: 28px 36px; padding: 28px; background: var(--paper); border: 1px solid var(--line); border-radius: 6px; }
+.sizes figure { margin: 0; display: grid; justify-items: center; gap: 10px; }
+.sizes figcaption { font-family: var(--mono); font-size: 11px; color: #5A6674; font-variant-numeric: tabular-nums; text-align: center; }
+.sizes .divider { width: 1px; align-self: stretch; background: #D4DBE2; }
+
+.spec { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+@media (max-width: 760px) { .spec { grid-template-columns: minmax(0, 1fr); } }
+.spec .art { background: var(--paper); border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
+.spec .art svg { width: 100%; height: auto; display: block; }
+dl.rules { margin: 0; display: grid; gap: 14px; }
+dl.rules div { display: grid; gap: 2px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+dl.rules dt { font-weight: 600; }
+dl.rules dd { margin: 0; color: var(--muted); }
+
+.swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+.swatch { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--surface); }
+.swatch .chip { height: 72px; }
+.swatch .info { padding: 10px 12px; display: grid; gap: 1px; font-size: 13px; }
+.swatch .info b { font-weight: 600; }
+.swatch .info code { font-family: var(--mono); font-size: 12px; color: var(--muted); user-select: all; }
+
+.inuse { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 760px) { .inuse { grid-template-columns: minmax(0, 1fr); } }
+.readme { background: var(--ink); border-radius: 6px; padding: 32px clamp(20px, 4vw, 40px); display: grid; gap: 18px; align-content: center; }
+.readme svg { height: 64px; width: auto; max-width: 100%; display: block; }
+.readme .cmd { font-family: var(--mono); font-size: 14px; color: #C0D1E1; background: #1B2632; border-radius: 4px; padding: 10px 14px; overflow-x: auto; white-space: nowrap; }
+.readme .cmd span { color: #E07B4B; }
+.readme .badges { display: flex; flex-wrap: wrap; gap: 8px; }
+.readme .badges span { font-family: var(--mono); font-size: 11px; color: #C0D1E1; border: 1px solid #2B3D51; border-radius: 3px; padding: 2px 7px; }
+.chrome { background: #DCE2E8; border-radius: 6px; padding: 14px 14px 0; display: grid; gap: 0; align-content: start; border: 1px solid var(--line); }
+.tab { background: #FFFFFF; border-radius: 8px 8px 0 0; padding: 10px 14px; display: flex; align-items: center; gap: 10px; font-size: 13px; color: #17202A; width: fit-content; max-width: 100%; }
+.tab svg { width: 16px; height: 16px; flex: none; }
+.page { background: #FFFFFF; min-height: 140px; padding: 16px; display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 14px; align-content: start; }
+.page svg { width: 40px; height: 40px; }
+.page .lines { display: grid; gap: 8px; padding-top: 4px; }
+.page .lines i { display: block; height: 8px; border-radius: 2px; background: #E3E8ED; }
+.page .lines i:first-child { width: 60%; background: #C9D3DD; height: 12px; }
+
+.origins { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 760px) { .origins { grid-template-columns: minmax(0, 1fr); } }
+.origin { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 16px; align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
+.origin svg { width: 72px; height: 72px; }
+.origin b { display: block; font-family: var(--display); font-weight: 700; font-size: 15px; }
+.origin .no { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: .06em; }
+.origin p { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
+footer { font-size: 13px; color: var(--muted); max-width: 70ch; }
+</style>
+
+<div class="wrap">
+  <div class="hero">
+    <div id="hero-mark"></div>
+    <div>
+      <div class="eyebrow">Final mark · v1</div>
+      <h1>Osmium</h1>
+      <p>A hexagonal core, bonded to four oxygen atoms, with a boot prompt inside. The mark combines three of the earlier directions: the crystal lattice, the tetroxide molecule and the terminal prompt. It is drawn entirely as shapes, with no lettering.</p>
+      <ul>
+        <li><b>HEXAGON</b><span>The core is the cell of osmium’s close-packed lattice (No. 02).</span></li>
+        <li><b>FOUR BONDS</b><span>OsO₄, osmium’s oxide. It works as a quiet nod to Rust (No. 06).</span></li>
+        <li><b>&gt;_</b><span>A prompt and cursor, where the OS hands control to you (No. 07).</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <section>
+    <header><h2>Lockups</h2><p>Use the horizontal lockup by default. The stacked lockup is for square spaces such as social avatars, stickers and title slides. The wordmark is set in JetBrains Mono SemiBold, in lowercase to match the crate name.</p></header>
+    <div class="tiles cols-2" id="lockups"></div>
+  </section>
+
+  <section>
+    <header><h2>Color variants</h2><p>Full color is the primary version. Use the reversed version on dark grounds. Use the one-color versions for single-ink printing, embossing and places where color isn’t available. In those, the hexagon becomes an outline so the bonds, prompt and atoms stay separate.</p></header>
+    <div class="tiles cols-4" id="variants"></div>
+  </section>
+
+  <section>
+    <header><h2>Small sizes</h2><p>Below 40px the oxygen atoms turn to noise, so the mark switches to the simplified core: the hexagon with its prompt, with heavier strokes. Use the core for favicons, the docs.rs sidebar, app icons and CLI badges.</p></header>
+    <div class="sizes" id="sizes"></div>
+  </section>
+
+  <section>
+    <header><h2>Clear space and construction</h2><p>The unit is <b>x</b>, the diameter of one oxygen atom. Every measurement scales with the mark.</p></header>
+    <div class="spec">
+      <div class="art" id="construction"></div>
+      <dl class="rules">
+        <div><dt>Clear space</dt><dd>Keep at least 1x of empty space on every side of the mark, measured from the outermost atoms.</dd></div>
+        <div><dt>Minimum size</dt><dd>Full mark: 40px or 10mm wide. Simplified core: 16px or 5mm.</dd></div>
+        <div><dt>Geometry</dt><dd>A pointy-top hexagon with a circumradius of 2.9x. The visible bonds run out from its centre to three atoms. A fourth, half-opacity atom sits behind it, up and to the right.</dd></div>
+        <div><dt>Don’t</dt><dd>Don’t rotate the mark, recolor the atoms individually, add a stroke around the hexagon, or swap the chevron for typed text.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section>
+    <header><h2>Palette</h2><p>Slate and lustre come from the metal itself. Oxide is the only warm color, and it is kept for the atoms and the cursor.</p></header>
+    <div class="swatches" id="swatches"></div>
+  </section>
+
+  <section>
+    <header><h2>In use</h2><p>A README header for GitHub and crates.io, and the favicon in a docs.rs browser tab.</p></header>
+    <div class="inuse">
+      <div class="readme">
+        <div id="readme-lockup"></div>
+        <div class="cmd"><span>$</span> cargo add osmium</div>
+        <div class="badges"><span>no_std</span><span>x86_64 · aarch64 · riscv64</span><span>MIT / Apache-2.0</span></div>
+      </div>
+      <div class="chrome">
+        <div class="tab"><span id="tab-icon"></span><span>osmium - Rust</span></div>
+        <div class="page"><span id="page-icon"></span><div class="lines"><i></i><i></i><i style="width:85%"></i><i style="width:70%"></i></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <header><h2>Where it came from</h2><p>The three studies you picked, and the part each one contributed.</p></header>
+    <div class="origins" id="origins"></div>
+  </section>
+
+  <footer>Copy SVG copies the exact artwork with its colors filled in. The marks are pure shapes. The lockups contain live text in JetBrains Mono, so convert that text to outlines before sending them to print or a vendor.</footer>
+</div>
+
+<script>
+const C = {
+  slate: "#2B3D51", metal: "#4E6984", lustre: "#8FA7BF", lustreLight: "#C0D1E1", frost: "#E6EEF6",
+  oxide: "#B4552D", oxideBright: "#E07B4B", ink: "#121A23", paper: "#F4F6F8"
+};
+const SCHEMES = {
+  color:    { hex: C.slate, chevron: C.lustreLight, cursor: C.oxideBright, atom: C.oxide, bond: C.lustre, word: C.slate },
+  reversed: { hex: C.metal, chevron: C.frost, cursor: C.oxideBright, atom: C.oxideBright, bond: C.lustre, word: C.frost },
+  monoDark: { mono: C.slate, word: C.slate },
+  monoLight:{ mono: "#FFFFFF", word: "#FFFFFF" }
+};
+let uid = 0;
+
+// Full mark, drawn in a 200×200 box. Hexagon centre (100,104), circumradius 46; atoms r16 (x = 32).
+function fullMark(s) {
+  const id = "k" + (++uid);
+  const hex = "100,58 139.8,81 139.8,127 100,150 60.2,127 60.2,81";
+  const chev = "80,90 98,104 80,118";
+  const cursor = `x="104" y="111" width="20" height="8" rx="1.5"`;
+  if (s.mono) {
+    const c = s.mono;
+    return `<defs><mask id="${id}"><rect width="200" height="200" fill="#fff"/><polygon points="${hex}" fill="#000" stroke="#000" stroke-width="18" stroke-linejoin="round"/></mask></defs>
+      <g mask="url(#${id})" stroke="${c}" stroke-width="7" stroke-linecap="round"><line x1="100" y1="104" x2="150" y2="52" opacity=".5"/><line x1="100" y1="104" x2="100" y2="24"/><line x1="100" y1="104" x2="32" y2="150"/><line x1="100" y1="104" x2="168" y2="150"/></g>
+      <polygon points="${hex}" fill="none" stroke="${c}" stroke-width="8" stroke-linejoin="round"/>
+      <polyline points="${chev}" fill="none" stroke="${c}" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+      <rect ${cursor} fill="${c}"/>
+      <circle cx="150" cy="52" r="10" fill="${c}" opacity=".5"/>
+      <g fill="${c}"><circle cx="100" cy="24" r="16"/><circle cx="32" cy="150" r="16"/><circle cx="168" cy="150" r="16"/></g>`;
+  }
+  return `<g stroke="${s.bond}" stroke-width="7" stroke-linecap="round">
+      <line x1="100" y1="104" x2="150" y2="52" opacity=".5"/>
+      <line x1="100" y1="104" x2="100" y2="24"/><line x1="100" y1="104" x2="32" y2="150"/><line x1="100" y1="104" x2="168" y2="150"/></g>
+    <circle cx="150" cy="52" r="10" fill="${s.atom}" opacity=".5"/>
+    <polygon points="${hex}" fill="${s.hex}"/>
+    <polyline points="${chev}" fill="none" stroke="${s.chevron}" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect ${cursor} fill="${s.cursor}"/>
+    <g fill="${s.atom}"><circle cx="100" cy="24" r="16"/><circle cx="32" cy="150" r="16"/><circle cx="168" cy="150" r="16"/></g>`;
+}
+
+// Simplified core, 100×100 box, heavier strokes for 16–32px.
+function coreMark(s) {
+  const id = "k" + (++uid);
+  const hex = "50,2 91.6,26 91.6,74 50,98 8.4,74 8.4,26";
+  const chev = "29,35 48,50 29,65";
+  const cursor = `x="54" y="59" width="22" height="10" rx="2"`;
+  if (s.mono) {
+    return `<polygon points="50,7 87.3,28.5 87.3,71.5 50,93 12.7,71.5 12.7,28.5" fill="none" stroke="${s.mono}" stroke-width="10" stroke-linejoin="round"/>
+      <polyline points="${chev}" fill="none" stroke="${s.mono}" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+      <rect ${cursor} fill="${s.mono}"/>`;
+  }
+  return `<polygon points="${hex}" fill="${s.hex}"/>
+    <polyline points="${chev}" fill="none" stroke="${s.chevron}" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect ${cursor} fill="${s.cursor}"/>`;
+}
+
+const svg = (vb, body, attrs = "") => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${vb}" ${attrs}>${body}</svg>`;
+const word = (x, y, size, fill, anchor = "start") =>
+  `<text x="${x}" y="${y}" text-anchor="${anchor}" font-family="JetBrains Mono, monospace" font-weight="700" font-size="${size}" letter-spacing="-3" fill="${fill}">osmium</text>`;
+
+const horizontal = s => svg("0 0 540 200", fullMark(s) + word(214, 132, 84, s.word), 'role="img" aria-label="Osmium horizontal lockup"');
+const stacked = s => svg("0 0 320 300", `<g transform="translate(60 0)">${fullMark(s)}</g>` + word(160, 278, 64, s.word, "middle"), 'role="img" aria-label="Osmium stacked lockup"');
+const markSvg = (s, attrs = "") => svg("0 0 200 200", fullMark(s), `role="img" aria-label="Osmium mark" ${attrs}`);
+const coreSvg = (s, attrs = "") => svg("0 0 100 100", coreMark(s), `role="img" aria-label="Osmium core mark" ${attrs}`);
+
+function tile(ground, label, detail, art, width) {
+  const el = document.createElement("div");
+  el.className = "tile " + ground;
+  el.innerHTML = `<div class="art">${art}</div><div class="cap"><div><b>${label}</b> <span>${detail}</span></div><button class="copy" type="button">Copy SVG</button></div>`;
+  const s = el.querySelector(".art svg");
+  if (width) s.style.width = width;
+  el.querySelector("button").addEventListener("click", e => copy(e.currentTarget, art));
+  return el;
+}
+
+async function copy(btn, text) {
+  try { await navigator.clipboard.writeText(text); btn.textContent = "Copied"; }
+  catch {
+    const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); btn.textContent = "Copied"; } catch { btn.textContent = "Copy failed"; }
+    ta.remove();
+  }
+  setTimeout(() => (btn.textContent = "Copy SVG"), 1600);
+}
+
+document.getElementById("hero-mark").outerHTML = markSvg(SCHEMES.reversed);
+
+const lockups = document.getElementById("lockups");
+lockups.append(
+  tile("paper", "Horizontal", "on light", horizontal(SCHEMES.color), "min(100%, 380px)"),
+  tile("ink", "Horizontal", "reversed", horizontal(SCHEMES.reversed), "min(100%, 380px)"),
+  tile("paper", "Stacked", "on light", stacked(SCHEMES.color), "min(100%, 200px)"),
+  tile("ink", "Stacked", "reversed", stacked(SCHEMES.reversed), "min(100%, 200px)")
+);
+
+const variants = document.getElementById("variants");
+variants.append(
+  tile("paper", "Full color", "primary", markSvg(SCHEMES.color), "140px"),
+  tile("ink", "Reversed", "dark grounds", markSvg(SCHEMES.reversed), "140px"),
+  tile("paper", "One color", "slate", markSvg(SCHEMES.monoDark), "140px"),
+  tile("oxide", "One color", "knockout", markSvg(SCHEMES.monoLight), "140px")
+);
+
+const sizes = document.getElementById("sizes");
+const fig = (art, cap) => `<figure>${art}<figcaption>${cap}</figcaption></figure>`;
+sizes.innerHTML =
+  fig(markSvg(SCHEMES.color, 'width="96" height="96"'), "Full · 96") +
+  fig(markSvg(SCHEMES.color, 'width="64" height="64"'), "Full · 64") +
+  fig(markSvg(SCHEMES.color, 'width="40" height="40"'), "Full · 40 min") +
+  `<span class="divider" aria-hidden="true"></span>` +
+  fig(coreSvg(SCHEMES.color, 'width="32" height="32"'), "Core · 32") +
+  fig(coreSvg(SCHEMES.color, 'width="24" height="24"'), "Core · 24") +
+  fig(coreSvg(SCHEMES.color, 'width="16" height="16"'), "Core · 16") +
+  fig(`<span style="display:grid;place-items:center;width:40px;height:40px;border-radius:9px;background:${C.ink}">${coreSvg(SCHEMES.reversed, 'width="26" height="26"')}</span>`, "App icon") +
+  fig(coreSvg(SCHEMES.monoDark, 'width="24" height="24"'), "Core · mono");
+
+// Construction: mark bbox x 16–184, y 8–166; clear space 1x (32) beyond it.
+document.getElementById("construction").innerHTML = svg("-44 -44 288 254", `
+  <rect x="-16" y="-24" width="232" height="222" fill="none" stroke="${C.oxide}" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <rect x="16" y="8" width="168" height="158" fill="none" stroke="${C.lustre}" stroke-width="1"/>
+  <circle cx="100" cy="104" r="46" fill="none" stroke="${C.lustre}" stroke-width="1" stroke-dasharray="3 4"/>
+  <line x1="100" y1="104" x2="146" y2="104" stroke="${C.lustre}" stroke-width="1"/>
+  ${fullMark(SCHEMES.color)}
+  <circle cx="100" cy="24" r="16" fill="none" stroke="${C.oxide}" stroke-width="1.5"/>
+  <g font-family="JetBrains Mono, monospace" font-size="11" fill="${C.metal}">
+    <text x="124" y="28">x</text>
+    <text x="196" y="100" text-anchor="middle">1x</text>
+    <line x1="184" y1="88" x2="216" y2="88" stroke="${C.oxide}" stroke-width="1.5"/>
+    <text x="0" y="-8" text-anchor="middle">1x</text>
+    <line x1="-16" y1="0" x2="16" y2="0" stroke="${C.oxide}" stroke-width="1.5"/>
+    <text x="123" y="99">2.9x</text>
+    <text x="-12" y="202">clear space</text>
+  </g>`, 'role="img" aria-label="Osmium mark construction and clear space"');
+
+const swatches = [
+  ["Slate", C.slate, "Hexagon, wordmark"],
+  ["Metal", C.metal, "Hexagon on dark"],
+  ["Lustre", C.lustre, "Bonds"],
+  ["Lustre Light", C.lustreLight, "Chevron"],
+  ["Oxide", C.oxide, "Atoms on light"],
+  ["Oxide Bright", C.oxideBright, "Cursor, atoms on dark"],
+  ["Ink", C.ink, "Dark ground"],
+  ["Paper", C.paper, "Light ground"]
+];
+document.getElementById("swatches").innerHTML = swatches.map(([n, h, r]) =>
+  `<div class="swatch"><div class="chip" style="background:${h}"></div><div class="info"><b>${n}</b><code>${h}</code><span style="color:var(--muted)">${r}</span></div></div>`).join("");
+
+document.getElementById("readme-lockup").innerHTML = horizontal(SCHEMES.reversed);
+document.getElementById("tab-icon").outerHTML = coreSvg(SCHEMES.color);
+document.getElementById("page-icon").outerHTML = markSvg(SCHEMES.color);
+
+const ORIGINS = [
+  ["02", "Close-Packed", "The hexagon, which is the lattice cell, became the body of the mark.",
+   `<polygon points="170,100 135,160.6 65,160.6 30,100 65,39.4 135,39.4" fill="none" stroke="var(--metal-hi)" stroke-width="4"/><g fill="var(--metal)"><circle cx="100" cy="100" r="17"/><circle cx="170" cy="100" r="15"/><circle cx="135" cy="160.6" r="15"/><circle cx="65" cy="160.6" r="15"/><circle cx="30" cy="100" r="15"/><circle cx="65" cy="39.4" r="15"/><circle cx="135" cy="39.4" r="15"/></g><g fill="var(--oxide)"><circle cx="134.6" cy="120" r="12"/><circle cx="65.4" cy="120" r="12"/><circle cx="100" cy="60" r="12"/></g>`],
+  ["06", "Tetroxide", "The four bonds and the oxide atoms, including the faded one set back for depth.",
+   `<g stroke="var(--metal-hi)" stroke-width="7" stroke-linecap="round"><line x1="100" y1="100" x2="132" y2="58" opacity=".5"/><line x1="100" y1="100" x2="100" y2="30"/><line x1="100" y1="100" x2="36" y2="142"/><line x1="100" y1="100" x2="164" y2="142"/></g><circle cx="132" cy="58" r="11" fill="var(--oxide)" opacity=".5"/><circle cx="100" cy="100" r="30" fill="var(--metal-lo)"/><g fill="var(--oxide)"><circle cx="100" cy="28" r="17"/><circle cx="34" cy="143" r="17"/><circle cx="166" cy="143" r="17"/></g>`],
+  ["07", "Boot Prompt", "The chevron and cursor, now drawn as shapes instead of typed text.",
+   `<rect x="18" y="38" width="164" height="124" rx="14" fill="var(--metal-lo)"/><polyline points="44,82 72,100 44,118" fill="none" stroke="var(--metal-hi)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/><rect x="84" y="110" width="30" height="10" fill="var(--oxide)"/>`]
+];
+document.getElementById("origins").innerHTML = ORIGINS.map(([no, name, text, body]) =>
+  `<div class="origin">${svg("0 0 200 200", body, 'aria-hidden="true"')}<div><span class="no">No. ${no}</span><b>${name}</b><p>${text}</p></div></div>`).join("");
+</script>
