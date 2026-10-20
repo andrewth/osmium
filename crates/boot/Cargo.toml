@@ -1,0 +1,18 @@
+[package]
+name = "osmium-boot"
+description = "Osmium: device tree and Multiboot2 parsing, FDT writer, boot memory maps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["alloc"]
+## FDT writer.
+alloc = []
+
+[dependencies]
+osmium-mm.workspace = true

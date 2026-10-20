@@ -1,0 +1,14 @@
+[package]
+name = "osmium-mm"
+description = "Osmium: physical/virtual addresses, memory maps, frame allocators, page tables and kernel heap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-arch.workspace = true
+osmium-sync.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "riscv-virt"
+description = "A tiny kernel for QEMU's RISC-V virt machine, assembled from Osmium components"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-2.0-only"
+
+[dependencies]
+osmium = { path = "../../crates/osmium", features = ["full"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

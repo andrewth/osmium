@@ -1,0 +1,17 @@
+[package]
+name = "osmium-arch"
+description = "Osmium: CPU primitives (IRQ flags, CPU id, MMU control) for x86_64, AArch64 and RISC-V"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+
+[features]
+## Use machine-mode CSRs (`mstatus`, `mscratch`) on RISC-V instead of supervisor mode.
+riscv-m-mode = []
+## Use EL2 system registers (`TPIDR_EL2`, `TLBI ALLE2`) on AArch64, for hypervisors.
+aarch64-el2 = []

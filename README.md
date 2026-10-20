@@ -1,0 +1,94 @@
+# Osmium
+
+A separable Rust toolkit for building operating systems, firmware and
+hypervisors: CPU primitives, synchronization, memory management, a hardware
+abstraction layer, drivers, scheduling, boot-protocol parsing and
+virtualization support. It runs on x86_64, AArch64 and RISC-V 64.
+
+Osmium takes its structure from [OSKit](https://www-old.cs.utah.edu/flux/oskit/)
+(independent components you link only as needed) and its safety model from
+[OSTD](https://asterinas.github.io/api-docs/) (a small `unsafe` core under
+sound, safe APIs, with policy injected by the OS). See
+[docs/FEATURES.md](docs/FEATURES.md) for the survey of prior art, the design
+principles and the full feature list with status.
+
+## Crates
+
+| Crate | What it provides | Needs `alloc` |
+|---|---|---|
+| `osmium-arch` | IRQ flag control, CPU id, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs, RISC-V CSRs and SBI | no |
+| `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
+| `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2), slab heap as `#[global_allocator]` | no |
+| `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA), `IrqTable`, global console with `println!` | no |
+| `osmium-drivers` | NS16550A, PL011, RISC-V PLIC, GICv2, x86 local APIC, RAM disk | no |
+| `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 parser; both fill a `MemoryMap` | writer only |
+| `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
+| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550 | yes |
+| `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
+
+The library never defines an entry point, panic handler or global allocator;
+your OS assembles those from the parts it uses.
+
+## Example: a kernel in ~300 lines
+
+[`examples/riscv-virt`](examples/riscv-virt) boots on QEMU's RISC-V `virt`
+machine. It discovers hardware from the device tree, builds a memory map,
+feeds the buddy allocator, turns on the heap, enables W^X Sv39 paging, moves
+the console to the UART driver, and runs tasks with timer-interrupt
+preemption:
+
+```console
+$ cd examples/riscv-virt && cargo run --release
+osmium riscv-virt example (hart 0)
+[fdt]   riscv-virtio,qemu, 9271 bytes, bootargs ""
+[uart]  ns16550a at 0x10000000, console switched from SBI
+[frame] buddy allocator: 32625 free frames (127 MiB)
+[mmu]   Sv39 on, root 0x80062000; kmain mapped R|X|G via Size4K page
+[sched] FIFO scheduler, 10 ms tick
+[task]  A0
+[task]  B0
+...
+[mutex] 4 tasks x 1000 increments across yields = 4000
+[preempt] busy-looping task was preempted after 2 ticks
+[timer] slept 50 ms (asked for 50)
+[done]  9 timer ticks, 32610 free frames; shutting down
+```
+
+(Press `Ctrl-A X` to leave QEMU if it does not exit on its own.)
+
+## Testing
+
+Every crate builds and runs its tests on the host. `osmium-arch` replaces
+privileged instructions with a simulation there: a per-thread IRQ flag and
+CPU id. Memory code runs against simulated physical memory, and the context
+switch is the real one, running on host threads.
+
+```sh
+cargo test --workspace --all-features
+./scripts/check.sh   # tests, clippy, rustdoc, all bare-metal targets, QEMU boot
+```
+
+Requires a nightly toolchain (pinned in `rust-toolchain.toml`) for the
+example and the bare-metal targets; the crates themselves use only stable
+features.
+
+## Current limitations
+
+- There is no trap or exception framework yet. The example writes its own
+  trap entry, and user mode is not supported.
+- SMP is designed in (per-CPU state, `on_cpu` hand-off, IRQ-safe locks), but
+  secondary-CPU bring-up has not been exercised on hardware. The scheduler
+  does no load balancing, and a cross-CPU wake-up waits until the target CPU
+  next schedules unless the kernel sends an IPI.
+- The context switch saves FP registers only on targets that have them
+  enabled (`neon`, `d`). Soft-float kernels are unaffected.
+- The hypervisor crate supplies the plumbing (memory, buses, exits, stage-2
+  tables) but not the VMX, SVM, EL2 or H-extension `Vcpu` backends.
+- When the heap is backed by `LockedFrames`, it can return large blocks to
+  the frame allocator only if the mapper implements `virt_to_phys`
+  (`OffsetMapper` does).
+
+## License
+
+Osmium is licensed under the GNU General Public License, version 2 only
+(`GPL-2.0-only`). See [LICENSE](LICENSE).

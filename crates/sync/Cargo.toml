@@ -1,0 +1,13 @@
+[package]
+name = "osmium-sync"
+description = "Osmium: spin locks, once cells, per-CPU data and lock-free rings for kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-arch.workspace = true

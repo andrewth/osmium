@@ -1,0 +1,40 @@
+[package]
+name = "osmium"
+description = "A separable toolkit for building operating systems, firmware and hypervisors in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+keywords = ["os", "kernel", "no_std", "hypervisor", "firmware"]
+categories = ["no-std", "embedded", "hardware-support", "os"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["sync", "mm", "hal", "drivers", "boot"]
+## Everything, including the parts that need `alloc`.
+full = ["sync", "mm", "hal", "drivers", "boot", "sched", "virt"]
+sync = ["dep:osmium-sync"]
+mm = ["dep:osmium-mm"]
+hal = ["dep:osmium-hal"]
+drivers = ["dep:osmium-drivers"]
+boot = ["dep:osmium-boot"]
+## Tasks and scheduling (needs `alloc`).
+sched = ["dep:osmium-sched"]
+## Hypervisor building blocks (needs `alloc`).
+virt = ["dep:osmium-virt"]
+## RISC-V machine-mode CSRs.
+riscv-m-mode = ["osmium-arch/riscv-m-mode"]
+## AArch64 EL2 registers.
+aarch64-el2 = ["osmium-arch/aarch64-el2"]
+
+[dependencies]
+osmium-arch.workspace = true
+osmium-sync = { workspace = true, optional = true }
+osmium-mm = { workspace = true, optional = true }
+osmium-hal = { workspace = true, optional = true }
+osmium-drivers = { workspace = true, optional = true }
+osmium-boot = { workspace = true, optional = true }
+osmium-sched = { workspace = true, optional = true }
+osmium-virt = { workspace = true, optional = true }
