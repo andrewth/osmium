@@ -78,7 +78,50 @@ boot_stack_top:
 "#
 );
 
+// User programs: position-independent U-mode code, copied into user pages.
+// System calls use `ecall` with Linux numbering: a7 = number, a0-a2 = args.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.user, "a"
+    .globl user_hello, user_hello_end, user_bad, user_bad_end
+user_hello:
+    li s0, 3
+1:  li a7, 64               // write(1, msg, 17)
+    li a0, 1
+    lla a1, 3f
+    li a2, 17
+    ecall
+    li t0, 20000000         // busy-wait: only the timer can switch us out
+2:  addi t0, t0, -1
+    bnez t0, 2b
+    addi s0, s0, -1
+    bnez s0, 1b
+    li a7, 93               // exit(0)
+    li a0, 0
+    ecall
+    unimp
+3:  .ascii "hello from U-mode"
+user_hello_end:
+
+user_bad:
+    li a7, 64
+    li a0, 1
+    lla a1, 1f
+    li a2, 27
+    ecall
+    li t0, 0x80200000       // kernel text: not user-accessible
+    ld t1, 0(t0)
+    unimp
+1:  .ascii "about to read kernel memory"
+user_bad_end:
+"#
+);
+
 unsafe extern "C" {
+    static user_hello: u8;
+    static user_hello_end: u8;
+    static user_bad: u8;
+    static user_bad_end: u8;
     fn secondary_start();
     static _kernel_start: u8;
     static _etext: u8;
@@ -146,7 +189,10 @@ unsafe impl StackAllocator for GuardedStacks {
 /// Tells the trap entry where the incoming task's stack ends, so a trap
 /// taken below it moves to the exception stack.
 fn on_switch(next: &osmium::sched::Task) {
-    TrapCpu::current().set_stack_limit(next.kernel_stack_range().map_or(0, |r| r.start));
+    let cpu = TrapCpu::current();
+    cpu.set_stack_limit(next.kernel_stack_range().map_or(0, |r| r.start));
+    // Where traps from U-mode land while `next` runs user code.
+    cpu.set_kernel_stack(next.kernel_stack_range().map_or(0, |r| r.end));
 }
 
 /// Gives this hart an emergency stack for traps from an overflowed stack.
@@ -401,6 +447,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
     fault_demo();
     overflow_demo();
+    user_demo();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     sbi::shutdown()
@@ -458,7 +505,111 @@ fn overflow_demo() {
     println!("[guard] the other tasks keep running: {} free frames", FRAMES.lock().free_frames());
 }
 
+/// Where user programs are mapped: 64 GiB, inside Sv39's lower half and
+/// clear of RAM (0x8000_0000) and the PCIe windows (0x3000_0000-0x7fff_ffff).
+const USER_BASE: u64 = 0x10_0000_0000;
+
+/// Copies a user program into fresh pages, maps it user-accessible (code
+/// read/execute, stack read/write) at slot `n`, and spawns a task that drops
+/// to U-mode there.
+fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> alloc::sync::Arc<osmium::sched::Task> {
+    let (start, end) = (code.0 as *const u8, code.1 as *const u8);
+    let len = end as usize - start as usize;
+    assert!(len <= PAGE_SIZE);
+    let mut frames = FRAMES.lock();
+    let (code_pa, stack_pa) = (frames.alloc_frame().unwrap(), frames.alloc_frame().unwrap());
+    drop(frames);
+    // SAFETY: fresh frames, identity-mapped; the program fits in one page.
+    unsafe {
+        core::ptr::write_bytes(code_pa.0 as *mut u8, 0, PAGE_SIZE);
+        core::ptr::copy_nonoverlapping(start, code_pa.0 as *mut u8, len);
+    }
+    let (code_va, stack_va) = (USER_BASE + n * 0x10000, USER_BASE + n * 0x10000 + 0x8000);
+    {
+        let mut pt = PT.lock();
+        let pt = pt.as_mut().unwrap();
+        pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().flush();
+        pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().flush();
+    }
+    TaskBuilder::new(name).cpu(cpu).spawn(move || {
+        // The code was written through the identity map, possibly by another
+        // hart: make it visible to this hart's instruction fetch.
+        // SAFETY: fence.i only synchronizes this hart's instruction stream.
+        unsafe { core::arch::asm!("fence.i") };
+        // SAFETY: traps are installed, the switch hook keeps TrapCpu's kernel
+        // stack on this task, and both pages are mapped user-accessible.
+        unsafe { riscv64::enter_user(code_va as usize, (stack_va as usize) + PAGE_SIZE) }
+    })
+}
+
+fn user_demo() {
+    // SAFETY: linker symbols delimiting the user programs.
+    let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
+    // Run them on another hart (when there is one): user code owns `tp`, so
+    // traps from U-mode must restore the kernel's CPU id, and a wrong id
+    // would only go unnoticed on CPU 0.
+    let cpu = 1 % ONLINE.load(Ordering::Acquire);
+    let tasks = [
+        spawn_user("user-1", 0, hello, cpu),
+        spawn_user("user-2", 1, hello, cpu),
+        spawn_user("user-bad", 2, bad, cpu),
+    ];
+    println!("[user]  running 3 U-mode programs on CPU {cpu}");
+    for t in tasks {
+        t.join();
+    }
+}
+
+/// Handles `ecall` from U-mode.
+fn syscall(frame: &mut TrapFrame) {
+    let [a0, a1, a2, _, _, _, _, nr] = frame.syscall_args();
+    // Resume after the 4-byte `ecall`.
+    frame.set_pc(frame.pc() + 4);
+    let task = osmium::sched::current();
+    match nr {
+        64 if a0 == 1 && a2 <= 256 && user_readable(a1, a2) => {
+            let mut buf = [0u8; 256];
+            // SAFETY: every page of the buffer is mapped user-readable; SUM
+            // lets S-mode read it.
+            riscv64::with_user_access(|| unsafe {
+                core::ptr::copy_nonoverlapping(a1 as *const u8, buf.as_mut_ptr(), a2 as usize)
+            });
+            let text = core::str::from_utf8(&buf[..a2 as usize]).unwrap_or("<not utf-8>");
+            println!("[user]  {}: {text}", task.name());
+            frame.set_return(a2);
+        }
+        93 => {
+            println!("[user]  {} exited with status {a0} (kernel sees CPU {})", task.name(), cpu::current_id());
+            drop(task);
+            osmium::sched::exit();
+        }
+        _ => frame.set_return(-38i64 as u64), // ENOSYS
+    }
+}
+
+fn user_readable(addr: u64, len: u64) -> bool {
+    let Some(end) = addr.checked_add(len) else { return false };
+    let pt = PT.lock();
+    let pt = pt.as_ref().unwrap();
+    (addr & !(PAGE_SIZE as u64 - 1)..end)
+        .step_by(PAGE_SIZE)
+        .all(|p| pt.translate(VirtAddr::new(p)).is_some_and(|t| t.flags.contains(MapFlags::USER)))
+}
+
 fn on_trap(frame: &mut TrapFrame) {
+    if frame.from_user() {
+        match frame.cause() {
+            Trap::Syscall => return syscall(frame),
+            Trap::Interrupt(_) => {}
+            cause => {
+                // A fault in user mode ends that task, not the kernel.
+                let task = osmium::sched::current();
+                println!("[user]  {} killed: {cause:?} at pc {:#x}", task.name(), frame.pc());
+                drop(task);
+                osmium::sched::exit();
+            }
+        }
+    }
     if TrapCpu::current().overflowed(frame) {
         // This frame lives on the exception stack; the task's own stack is
         // exhausted, so it cannot continue. End only that task.

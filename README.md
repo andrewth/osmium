@@ -87,8 +87,8 @@ features.
 
 ## Current limitations
 
-- User mode works on x86_64 only (the example runs ring-3 programs with
-  system calls). Kernel stack overflows are caught on all three
+- User mode works on x86_64 and RISC-V (the examples run user programs
+  with system calls); AArch64 EL0 is not done yet. Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. The scheduler does no load balancing; tasks move only

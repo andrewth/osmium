@@ -42,6 +42,11 @@ impl TrapFrame {
         self.x[2] as usize
     }
 
+    /// Returns true if the trap came from user mode (U-mode).
+    pub fn from_user(&self) -> bool {
+        self.status & SPP_OR_MPP == 0
+    }
+
     /// System-call argument registers `a0`..=`a7`.
     pub fn syscall_args(&self) -> [u64; 8] {
         self.x[10..18].try_into().unwrap()

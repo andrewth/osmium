@@ -135,3 +135,58 @@ pub mod sbi {
         crate::cpu::halt_forever()
     }
 }
+
+/// `sstatus.SUM`: lets S-mode access user pages.
+const SSTATUS_SUM: usize = 1 << 18;
+
+/// Runs `f` with supervisor access to user pages enabled (`sstatus.SUM`),
+/// for copying system-call buffers. Restores the previous setting.
+pub fn with_user_access<R>(f: impl FnOnce() -> R) -> R {
+    let was = read_sstatus() & SSTATUS_SUM;
+    // SAFETY: SUM only widens what S-mode may access; restored below.
+    unsafe { asm!("csrs sstatus, {}", in(reg) SSTATUS_SUM, options(nostack)) };
+    let r = f();
+    if was == 0 {
+        // SAFETY: restores the previous setting.
+        unsafe { asm!("csrc sstatus, {}", in(reg) SSTATUS_SUM, options(nostack)) };
+    }
+    r
+}
+
+/// Drops to user mode (U-mode) at `entry` with stack `user_sp` and
+/// interrupts enabled. General-purpose registers are cleared. Does not
+/// return: the next kernel entry is a trap, on the stack set with
+/// `osmium_arch::trap::TrapCpu::set_kernel_stack`.
+///
+/// # Safety
+/// `osmium_arch::trap::install` must have run on this CPU, the kernel stack
+/// in its `TrapCpu` must be valid, and `entry`/`user_sp` must be mapped
+/// user-accessible.
+#[cfg(not(feature = "riscv-m-mode"))]
+pub unsafe fn enter_user(entry: usize, user_sp: usize) -> ! {
+    // SAFETY: the caller upholds the contract; sret switches to U-mode.
+    unsafe {
+        asm!(
+            // Mask interrupts first: once sp is the user stack, a trap taken
+            // in S-mode would try to save its frame there and fault forever.
+            // SPIE re-enables them atomically at sret.
+            "csrci sstatus, 0x2",
+            // Consume both operands before clobbering any register.
+            "csrw sepc, {entry}",
+            "mv sp, {sp}",
+            "li t0, 0x100",
+            "csrc sstatus, t0", // SPP = U
+            "li t0, 0x20",
+            "csrs sstatus, t0", // SPIE: interrupts on after sret
+            "li ra, 0", "li gp, 0", "li tp, 0", "li t0, 0", "li t1, 0", "li t2, 0",
+            "li s0, 0", "li s1, 0", "li a0, 0", "li a1, 0", "li a2, 0", "li a3, 0",
+            "li a4, 0", "li a5, 0", "li a6, 0", "li a7, 0", "li s2, 0", "li s3, 0",
+            "li s4, 0", "li s5, 0", "li s6, 0", "li s7, 0", "li s8, 0", "li s9, 0",
+            "li s10, 0", "li s11, 0", "li t3, 0", "li t4, 0", "li t5, 0", "li t6, 0",
+            "sret",
+            entry = in(reg) entry,
+            sp = in(reg) user_sp,
+            options(noreturn),
+        )
+    }
+}

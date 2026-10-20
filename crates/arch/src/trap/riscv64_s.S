@@ -76,6 +76,16 @@ osmium_trap_entry:
     sd t0, 272(sp)
     csrr t0, stval
     sd t0, 280(sp)
+    // From U-mode, tp holds the user's value (saved in the frame); give
+    // the kernel its CPU id back: (&TrapCpu - OSMIUM_TRAP_CPUS) / 64.
+    ld t0, 264(sp)
+    andi t0, t0, 0x100
+    bnez t0, 5f
+    la t0, OSMIUM_TRAP_CPUS
+    csrr t1, sscratch
+    sub t1, t1, t0
+    srli tp, t1, 6
+5:
     mv a0, sp
     call osmium_trap_dispatch
     ld t0, 256(sp)
