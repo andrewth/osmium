@@ -141,7 +141,8 @@ if command -v qemu-system-x86_64 >/dev/null; then
     sed -n '/^osmium/,$p' "$svmlog"
     for line in 'SVM on, nested paging' '\[guest\] hello from SVM over port I/O' \
         '\[guest\] and over MMIO (nested page faults)' '\[guest\] IRQ 4 through the 8259 PIC, received: k' \
-        'guest exit Shutdown: 1 hypercall, 1 halt, LSR 0x60 (port) 0x60 (MMIO)' \
+        '\[guest\] 5 ticks from the 8254 PIT on IRQ 0' \
+        'guest exit Shutdown: 1 hypercall, LSR 0x60 (port) 0x60 (MMIO)' \
         "\\[guest\\] 64-bit, paging on, MMIO through the guest's page tables" \
         '64-bit guest exit Shutdown, LSR 0x60 in r12' '\[done\]'; do
         grep -q "$line" "$svmlog" || { echo "x86_64-hyp: missing '$line'"; exit 1; }

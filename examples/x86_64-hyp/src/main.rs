@@ -8,7 +8,8 @@
 //! the nested page table leaves unmapped (each access a nested page fault,
 //! decoded and emulated), then programs an emulated 8259 PIC pair and an
 //! IDT and takes COM1's receive interrupt (injected through `EVENTINJ`),
-//! and asks to be shut down with `vmmcall`.
+//! then counts ticks of an emulated 8254 PIT on IRQ 0, and asks to be
+//! shut down with `vmmcall`.
 #![no_std]
 #![no_main]
 
@@ -17,13 +18,14 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicBool, Ordering};
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::arch::x86_64 as x86;
 use osmium::arch::{cpu, irq};
 use osmium::boot::pvh::StartInfo;
+use osmium::drivers::pit::{Pio as PitPio, Pit};
 use osmium::drivers::uart16550::{Pio, Uart16550};
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::{print, println};
@@ -32,7 +34,7 @@ use osmium::mm::paging::formats::X86_64;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
-use osmium::virt::devices::{Uart16550 as Uart16550Model, VirtualPic};
+use osmium::virt::devices::{Uart16550 as Uart16550Model, VirtualPic, VirtualPit};
 use osmium::virt::x86::{self as svm, SvmPages, SvmVcpu};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
@@ -106,9 +108,40 @@ x86_guest:
     out %al, %dx
     mov $0x0a, %al
     out %al, %dx
-    mov $1, %eax                    // hypercall 1: power off
+    // 8254 PIT channel 0: rate generator, 1193 ticks (1 ms); IRQ 0 on.
+    mov $0x34, %al
+    out %al, $0x43
+    mov $(1193 & 0xff), %al
+    out %al, $0x40
+    mov $(1193 >> 8), %al
+    out %al, $0x40
+    mov $0xee, %al
+    out %al, $0x21
+12: sti
+    hlt
+    cli
+    cmpb $5, GBASE + ticks - x86_guest
+    jb 12b
+    mov $0xff, %al                  // mask the PIC again
+    out %al, $0x21
+    mov $0x3f8, %dx
+    mov $GBASE + 13f - x86_guest, %esi
+14: lodsb
+    test %al, %al
+    jz 15f
+    out %al, %dx
+    jmp 14b
+15: mov $1, %eax                    // hypercall 1: power off
     vmmcall
 5:  jmp 5b
+
+irq0:                               // PIT: count, EOI, return
+    push %eax
+    incb GBASE + ticks - x86_guest
+    mov $0x20, %al
+    out %al, $0x20
+    pop %eax
+    iret
 
 irq4:                               // COM1: read the byte, EOI, return
     push %eax
@@ -125,11 +158,19 @@ irq4:                               // COM1: read the byte, EOI, return
 4:  .asciz "[guest] hello from SVM over port I/O\n"
     .asciz "[guest] and over MMIO (nested page faults)\n"
 9:  .asciz "[guest] IRQ 4 through the 8259 PIC, received: "
+13: .asciz "[guest] 5 ticks from the 8254 PIT on IRQ 0\n"
 received:
+    .byte 0
+ticks:
     .byte 0
     .balign 8
 idt:
-    .space 0x24 * 8
+    .space 0x20 * 8
+    .word (GBASE + irq0 - x86_guest) & 0xffff
+    .word 0x08
+    .word 0x8e00
+    .word (GBASE + irq0 - x86_guest) >> 16
+    .space 3 * 8
     .word (GBASE + irq4 - x86_guest) & 0xffff
     .word 0x08                      // the guest's flat code segment
     .word 0x8e00                    // present, 32-bit interrupt gate
@@ -309,18 +350,26 @@ fn guest_demo() {
     pio.insert(0x3f8, 8, com1.clone()).unwrap();
     pio.insert(0x20, 2, pic.master()).unwrap();
     pio.insert(0xa0, 2, pic.slave()).unwrap();
+    // The PIT counts in host time: the TSC, calibrated against the real PIT.
+    // SAFETY: nothing else uses the host's PIT now.
+    let tsc_hz = unsafe { Pit::new(PitPio::new()) }.calibrate(10_000_000, cpu::ticks);
+    let clock = move || (cpu::ticks() as u128 * 1_000_000_000 / tsc_hz as u128) as u64;
+    let p = pic.clone();
+    let pit = Arc::new(VirtualPit::new(clock, move |level| p.set_level(0, level)));
+    pio.insert(0x40, 4, pit.clone()).unwrap();
     let mmio = Bus::new();
     mmio.insert(GUEST_MMIO_UART, 8, Arc::new(Uart16550Model::new(console))).unwrap();
 
     let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-    let mut vcpu = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
-        .with_memory(mem.clone())
-        .with_irq_line(intr);
+    let mut vcpu =
+        unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
+            .with_memory(mem.clone())
+            .with_irq_line(intr);
     // The PIC's output is the vCPU's INTR line; delivery acknowledges it.
     let p = pic.clone();
     vcpu.connect_intr(move || p.acknowledge());
-    let (mut hypercalls, mut halts) = (0, 0);
+    let (mut hypercalls, mut halts, mut typed) = (0, 0, false);
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { nr: 1, .. } => {
             hypercalls += 1;
@@ -328,17 +377,33 @@ fn guest_demo() {
         }
         VmExit::Halt => {
             halts += 1;
-            // The guest waits with interrupts on: "type" a key, which raises
-            // COM1's IRQ 4 at the PIC.
-            com1.push_input(b'k');
-            if v.interrupt_pending() { ControlFlow::Continue(()) } else { ControlFlow::Break(VmExit::Halt) }
+            // The guest waits with interrupts on. The first time, "type" a
+            // key, which raises COM1's IRQ 4 at the PIC.
+            if !typed {
+                com1.push_input(b'k');
+                typed = true;
+            }
+            // Then sleep until the PIT's next expiry: a host with other work
+            // would arm a timer for the deadline and run something else.
+            loop {
+                pit.poll();
+                if v.interrupt_pending() {
+                    break ControlFlow::Continue(());
+                }
+                let Some(deadline) = pit.next_deadline() else { break ControlFlow::Break(VmExit::Halt) };
+                while clock() < deadline {
+                    core::hint::spin_loop();
+                }
+            }
         }
         VmExit::ExternalInterrupt => ControlFlow::Continue(()),
         other => ControlFlow::Break(other),
     });
     println!(
-        "[hyp]   guest exit {exit:?}: {hypercalls} hypercall, {halts} halt, LSR {:#x} (port) {:#x} (MMIO)",
-        vcpu.regs.rdi, vcpu.regs.rcx
+        "[hyp]   guest exit {exit:?}: {hypercalls} hypercall, LSR {:#x} (port) {:#x} (MMIO); {halts} halts, TSC {} MHz",
+        vcpu.regs.rdi,
+        vcpu.regs.rcx,
+        tsc_hz / 1_000_000
     );
 
     drop(vcpu);
@@ -401,8 +466,9 @@ fn long_mode_demo() {
 
     let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-    let mut vcpu = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
-        .with_memory(mem.clone());
+    let mut vcpu =
+        unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
+            .with_memory(mem.clone());
     vcpu.set_long_mode(0x1000);
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |_, exit| match exit {
         VmExit::Hypercall { nr: 1, .. } => ControlFlow::Break(VmExit::Shutdown),

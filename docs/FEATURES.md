@@ -201,6 +201,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Normalized `VmExit` enum, `Vcpu` trait, and a generic `run_vcpu` loop that services MMIO and PIO exits
 - ✅ An emulated 16550 UART device, with an optional receive-interrupt line
 - ✅ An emulated 8259A PIC pair (`VirtualPic`: init sequence, masks, IRR/ISR, EOI, cascade) whose output and INTA drive the SVM vCPU
+- ✅ An emulated 8254 PIT (`VirtualPit`: modes 0, 2, 3 and 4, counter latch, read-back) counting in host time, channel 0 on IRQ 0; `poll` and `next_deadline` let the host deliver ticks on time
 - ✅ An emulated GICv2 (`VirtualGicV2`: distributor and per-CPU interfaces for up to 8 vCPUs, banked SGIs/PPIs, SPI targets, `GICD_SGIR`, priorities, PMR, acknowledge/EOI) driving the AArch64 vCPU's virtual IRQ; the guest's virtual timer feeds it, with expiries during a guest run exiting through the host GIC
 - ✅ An emulated PLIC (`VirtualPlic`, QEMU `virt` register layout) whose S-mode context outputs drive vCPU external-interrupt lines (`hvip.VSEIP`)
 - ✅ RISC-V guest device trees (`riscv::fdt::GuestMachine`): harts, memory, PLIC, 16550s and virtio-mmio, in the layout Linux expects

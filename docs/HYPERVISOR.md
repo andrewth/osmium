@@ -15,7 +15,7 @@ they see, what happens when they halt. The three `*-hyp` examples
 | `Bus` | MMIO and port-I/O address spaces of `BusDevice`s |
 | `Vcpu` + `VmExit` | A backend runs guest code until the next exit, normalized into `MmioRead`, `MmioWrite`, `PioIn`, `PioOut`, `Hypercall`, `Halt`, `ExternalInterrupt`, `Shutdown` or `Unhandled` |
 | `run_vcpu` | The loop: services MMIO and port I/O from the buses and hands every other exit to your closure |
-| Devices (`devices`, `virtio`) | 16550 UART, PLIC, GICv2, 8259 PIC pair; virtio-mmio console, block and net |
+| Devices (`devices`, `virtio`) | 16550 UART, PLIC, GICv2, 8259 PIC pair, 8254 PIT; virtio-mmio console, block and net |
 
 ## The run loop
 
@@ -43,7 +43,7 @@ claims returns all ones; a write to one is dropped, as on real hardware.
 | Hypercalls | `ecall` (SBI: `riscv::sbi`) | `hvc` (PSCI: `aarch64::psci`) | `vmmcall` |
 | Interrupt input | `external_irq()` line, becomes `hvip.VSEIP` | `irq_line()`, becomes `HCR_EL2.VI` | `irq_line()` plus `connect_intr` (injected through `EVENTINJ`) |
 | Interrupt controller to emulate | `VirtualPlic` | `VirtualGicV2` | `VirtualPic` |
-| Guest timer | Sstc `vstimecmp`, switched per vCPU | virtual timer; `connect_timer` feeds it to the GIC | (none yet) |
+| Guest timer | Sstc `vstimecmp`, switched per vCPU | virtual timer; `connect_timer` feeds it to the GIC | `VirtualPit` on the PIC's IRQ 0, driven by `poll` at its `next_deadline` |
 
 Each backend saves the host's callee-saved registers, runs the guest, and
 returns to the caller of `Vcpu::run` with interrupts restored. A host
