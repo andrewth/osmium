@@ -180,6 +180,63 @@ pub fn arp_tagged(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u6
     println!("{tag}no ARP reply");
 }
 
+/// Brings up osmium-net on `dev` under QEMU's user-mode network: a DHCP
+/// lease, a ping to the gateway, and a TCP round trip through the
+/// `guestfwd=tcp:10.0.2.100:7-cmd:cat` echo service. Gives up after five
+/// seconds.
+pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
+    use osmium::net::{DhcpClient, DhcpEvent, IcmpSocket, Instant, Interface, Ipv4Addr, SocketAddrV4, SocketSet, TcpSocket};
+
+    const ECHO: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 100), 7);
+    const MESSAGE: &[u8] = b"hello over TCP";
+    let now = || Instant::from_nanos(now_ns());
+    let mut iface = Interface::new(dev, now_ns());
+    let mut sockets = SocketSet::new();
+    let dhcp = sockets.add(DhcpClient::new());
+    let ping = sockets.add(IcmpSocket::new(0x05ef, 2));
+    let tcp = sockets.add(TcpSocket::new(1024, 1024));
+    let start = now();
+    let mut pinged_at = None;
+    let mut echoed = Vec::new();
+    let mut tcp_done = false;
+    while now() - start < core::time::Duration::from_secs(5) && !(tcp_done && pinged_at.is_none()) {
+        iface.poll(now(), dev, &mut sockets);
+        if let Some(DhcpEvent::Configured(c)) = sockets.get_mut::<DhcpClient>(dhcp).take_event() {
+            let gw = c.gateway.unwrap_or(Ipv4Addr::UNSPECIFIED);
+            println!("[net]   DHCP: {}/{} via {gw}", c.address, c.prefix_len);
+            sockets.get_mut::<IcmpSocket>(ping).send_echo(gw, 1, b"osmium").unwrap();
+            pinged_at = Some(now());
+            let s = sockets.get_mut::<TcpSocket>(tcp);
+            s.connect(ECHO, 0).unwrap();
+            s.send(MESSAGE).unwrap();
+        }
+        if let Some(r) = sockets.get_mut::<IcmpSocket>(ping).recv()
+            && let Some(t) = pinged_at.take()
+        {
+            println!("[net]   ping {}: seq {} in {} ms", r.from, r.seq, (r.at - t).as_millis());
+        }
+        let s = sockets.get_mut::<TcpSocket>(tcp);
+        let mut buf = [0u8; 64];
+        if let Ok(n) = s.recv(&mut buf) {
+            echoed.extend_from_slice(&buf[..n]);
+            if echoed.len() == MESSAGE.len() && !tcp_done {
+                println!("[net]   TCP echo from {ECHO}: \"{}\"", core::str::from_utf8(&echoed).unwrap_or("?"));
+                s.close();
+                tcp_done = true;
+            }
+        }
+        if let Some(e) = s.error()
+            && !tcp_done
+        {
+            println!("[net]   TCP to {ECHO}: {e}");
+            tcp_done = true;
+        }
+    }
+    if iface.config().is_none() {
+        println!("[net]   no DHCP lease");
+    }
+}
+
 /// Enumerates every device on `shared`'s root ports, then drives what it
 /// recognises: a mass-storage device gets a block written and read back
 /// while a keyboard's interrupt transfer is outstanding, which checks that

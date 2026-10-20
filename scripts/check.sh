@@ -54,7 +54,9 @@ boot() {
 }
 
 # Multi-threaded TCG runs the four CPUs in parallel on host threads.
-# QEMU's user network answers the kernel's ARP request over virtio-net. Behind
+# QEMU's user network answers the kernel's ARP request over virtio-net, then
+# osmium-net gets a DHCP lease, pings the gateway and round-trips a TCP echo
+# through a guestfwd to cat. Behind
 # the xHCI controller, a USB stick on a scratch image answers a SCSI INQUIRY and
 # takes a block write while the keyboard's interrupt transfer stays pending. A
 # guest runs in VS-mode under the H extension. With dosfstools installed the
@@ -69,10 +71,10 @@ if PATH=$PATH:/usr/sbin command -v mkfs.fat >/dev/null; then
     PATH=$PATH:/usr/sbin mkfs.fat -F 32 -s 1 "$stick" >/dev/null
     fat_expect=';\[fat\]   wrote and read back "/osmium/Hello from osmium.txt"'
 fi
-EXPECT='ARP: 10.0.2.2 is at;\[blk\]   virtio-blk .*: 16384 sectors;wrote and read back sector 8192;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01;wrote and read back block 79999;keyboard transfer still pending after disk I/O;\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/riscv64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[guest\] hello over MMIO;\[guest\] hello over SBI;guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0;\[vguest\] timer interrupt after;\[vguest\] PLIC claim 10: received "ping";\[vguest\] PLIC claim 1: ARP reply, 10.0.2.2 is at 52:55:0a:00:02:02;\[vguest\] virtio-blk: 64 sectors; sector 3 written and read back;the host RAM disk holds the sector the guest wrote;driver guest exit Shutdown;\[smp-guest\] hart 0: got the IPI; hart 1 is stopped;SMP guest: 2 vCPUs on .*hart_start returned 0, hart 1 got opaque 0x1234;xHCI interrupts: [1-9];FP guests interleaved on one hart: vCPU a0=1 got 12, a0=2 got 14 (expected 12 and 14);\[usb\]     ecm: ARP: 10.0.2.2 is at'"$fat_expect" \
+EXPECT='ARP: 10.0.2.2 is at;DHCP: 10.0.2.15/24 via 10.0.2.2;ping 10.0.2.2: seq 1 in;TCP echo from 10.0.2.100:7: "hello over TCP";\[blk\]   virtio-blk .*: 16384 sectors;wrote and read back sector 8192;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01;wrote and read back block 79999;keyboard transfer still pending after disk I/O;\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/riscv64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[guest\] hello over MMIO;\[guest\] hello over SBI;guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0;\[vguest\] timer interrupt after;\[vguest\] PLIC claim 10: received "ping";\[vguest\] PLIC claim 1: ARP reply, 10.0.2.2 is at 52:55:0a:00:02:02;\[vguest\] virtio-blk: 64 sectors; sector 3 written and read back;the host RAM disk holds the sector the guest wrote;driver guest exit Shutdown;\[smp-guest\] hart 0: got the IPI; hart 1 is stopped;SMP guest: 2 vCPUs on .*hart_start returned 0, hart 1 got opaque 0x1234;xHCI interrupts: [1-9];FP guests interleaved on one hart: vCPU a0=1 got 12, a0=2 got 14 (expected 12 and 14);\[usb\]     ecm: ARP: 10.0.2.2 is at'"$fat_expect" \
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi \
-    -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
+    -netdev user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat -device virtio-net-device,netdev=n0 \
     -device qemu-xhci -device usb-kbd \
     -drive if=none,id=vd0,format=raw,file="$vdisk" -device virtio-blk-device,drive=vd0 \
     -netdev user,id=n1 -device usb-net,netdev=n1 \

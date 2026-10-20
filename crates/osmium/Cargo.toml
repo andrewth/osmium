@@ -14,7 +14,7 @@ workspace = true
 [features]
 default = ["sync", "mm", "hal", "drivers", "boot"]
 ## Everything, including the parts that need `alloc`.
-full = ["sync", "mm", "hal", "drivers", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat"]
+full = ["sync", "mm", "hal", "drivers", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net"]
 sync = ["dep:osmium-sync"]
 mm = ["dep:osmium-mm"]
 hal = ["dep:osmium-hal"]
@@ -32,6 +32,8 @@ fs = ["dep:osmium-fs"]
 proc = ["dep:osmium-proc", "sched", "fs", "mm", "boot"]
 ## FAT32 on any block device (needs `alloc`).
 fs-fat = ["fs", "dep:osmium-fs-fat"]
+## IPv4 network stack: ARP, ICMP, UDP, TCP, DHCP (needs `alloc`).
+net = ["hal", "dep:osmium-net"]
 ## RISC-V machine-mode CSRs.
 riscv-m-mode = ["osmium-arch/riscv-m-mode"]
 ## AArch64 EL2 registers.
@@ -52,3 +54,4 @@ osmium-exec = { workspace = true, optional = true }
 osmium-fs = { workspace = true, optional = true }
 osmium-proc = { workspace = true, optional = true }
 osmium-fs-fat = { workspace = true, optional = true }
+osmium-net = { workspace = true, optional = true }

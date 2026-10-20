@@ -217,6 +217,13 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `fork`, `vfork` and `clone` (processes only, `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`), with an eager copy of the address space and shared open file descriptions; `execve` of static ELF executables from the VFS, with argv, envp and auxv (`AT_PHDR`, `AT_ENTRY`, `AT_RANDOM`, ...) on a fresh stack; `wait4` (pid or any, `WNOHANG`); `dup`, `dup2`, `dup3`, `fcntl` and close-on-exec. The kernel supplies a `Platform` (address-space factory, table activation, child resume via `resume_user` in `osmium-arch`); riscv-virt and aarch64-virt run an init that forks, waits and execs itself
 - 🗺 Copy-on-write `fork`, `fork`/`execve` on x86_64-pc, threads, signals, PIE and dynamically linked executables, file-backed `mmap`
 
+### `osmium-net`: IPv4 networking
+- ✅ A polled `Interface` over any `NetDevice`: ARP with a neighbor cache, retries and a queue for unresolved packets, IPv4 routing to on-link hosts or the gateway, ICMP echo replies and port-unreachable errors; the caller supplies the time and decides when to poll (`poll_at`)
+- ✅ Sockets in a `SocketSet`: `TcpSocket` (RFC 9293 state machine, RFC 6298 retransmission timing with backoff, fast retransmit, zero-window probes, MSS option, RFC 5961 reset and SYN checks), `UdpSocket`, `IcmpSocket` (ping) and `DhcpClient` (discover, request, renew at T1, NAK and expiry), which configures the interface itself
+- ✅ `wire`: Ethernet, ARP, IPv4, ICMP, UDP and TCP headers and the Internet checksum, usable on their own
+- ✅ Tested on the host over a simulated lossy link, and under QEMU against the user-mode network (DHCP lease, ping, TCP echo)
+- 🗺 IP fragmentation, TCP window scaling, SACK, out-of-order reassembly and congestion control, a DNS resolver, IPv6, socket system calls in `osmium-proc`
+
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name
 

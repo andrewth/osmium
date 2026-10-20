@@ -14,6 +14,7 @@ dependencies = [
  "osmium-fs-fat",
  "osmium-hal",
  "osmium-mm",
+ "osmium-net",
  "osmium-proc",
  "osmium-sched",
  "osmium-sync",
@@ -81,6 +82,13 @@ version = "0.1.0"
 dependencies = [
  "osmium-arch",
  "osmium-sync",
+]
+
+[[package]]
+name = "osmium-net"
+version = "0.1.0"
+dependencies = [
+ "osmium-hal",
 ]
 
 [[package]]

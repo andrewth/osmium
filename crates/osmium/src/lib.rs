@@ -18,6 +18,7 @@
 //! | `fs` | `osmium-fs` | virtual file system, mounts, RAM file system, initramfs |
 //! | `fs_fat` | `osmium-fs-fat` | FAT32 with long names on any block device |
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
+//! | `net` | `osmium-net` | IPv4 stack: ARP, ICMP echo, UDP, TCP, DHCP client |
 //!
 //! The library never defines an entry point, panic handler or global
 //! allocator: the OS assembles those from the parts it uses.
@@ -36,6 +37,8 @@ pub use osmium_fs as fs;
 pub use osmium_proc as proc;
 #[cfg(feature = "fs-fat")]
 pub use osmium_fs_fat as fs_fat;
+#[cfg(feature = "net")]
+pub use osmium_net as net;
 #[cfg(feature = "hal")]
 pub use osmium_hal as hal;
 #[cfg(feature = "mm")]

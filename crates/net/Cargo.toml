@@ -1,0 +1,13 @@
+[package]
+name = "osmium-net"
+description = "Osmium: a polled IPv4 network stack (ARP, ICMP, UDP, TCP, DHCP) over any NetDevice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-hal.workspace = true
