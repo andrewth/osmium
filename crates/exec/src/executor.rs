@@ -119,10 +119,36 @@ impl<const N: usize> Executor<N> {
         self.run()
     }
 
+    /// Like [`Executor::run_with`], but returns once every task in the
+    /// executor has finished, so firmware can go on (for example, hand off
+    /// to an OS). Sound because no slot can still refer to the caller's
+    /// futures when it returns. Requires `panic = "abort"`.
+    pub fn run_to_completion(&'static self, tasks: &mut [Pin<&mut (dyn Future<Output = ()> + Send)>]) {
+        for task in tasks.iter_mut() {
+            // SAFETY: we return only when all slots are empty (every task
+            // completed and was dropped from its slot), so the extended
+            // lifetime never outlives the caller's futures.
+            let task: TaskRef = unsafe { core::mem::transmute(task.as_mut()) };
+            self.spawn(task).expect("too many tasks for the executor");
+        }
+        self.run_until(|| self.tasks() == 0);
+    }
+
     /// Runs tasks forever, waiting for an interrupt whenever none is ready.
     pub fn run(&'static self) -> ! {
+        self.run_until(|| false);
+        unreachable!()
+    }
+
+    /// Runs tasks, waiting for interrupts when none is ready, until `done`
+    /// returns true after a pass. Firmware uses this to finish its work and
+    /// then hand off (to an OS, for example).
+    pub fn run_until(&'static self, done: impl Fn() -> bool) {
         loop {
             self.run_until_idle();
+            if done() {
+                return;
+            }
             // Check with interrupts masked, then wait atomically: a wake-up
             // from an interrupt after the check still ends the wait.
             irq::disable();

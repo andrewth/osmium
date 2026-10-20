@@ -143,6 +143,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 ### `osmium-drivers`: reference drivers
 - ✅ NS16550A UART (port I/O and MMIO backends)
 - ✅ Arm PL011 UART
+- ✅ RISC-V CLINT (machine timer and software interrupts, for M-mode firmware)
 - ✅ RISC-V PLIC
 - ✅ Arm GICv2 (distributor + CPU interface, SGIs with correct source-CPU EOI)
 - ✅ x86 local APIC (xAPIC MMIO, INIT/STARTUP IPIs)
@@ -192,5 +193,6 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps
 - ✅ `examples/aarch64-virt`: the same on QEMU AArch64 `virt` (GICv2, PL011, generic timer, stage-1 paging, PSCI)
 - ✅ `examples/x86_64-pc`: the same on QEMU q35 (PVH boot, COM1, local APIC timer, 4-level paging, ACPI MADT, INIT/SIPI trampoline)
+- ✅ `examples/riscv-firmware`: M-mode firmware with `-bios none`, no heap and no scheduler: async tasks on `osmium-exec` await CLINT timer and PLIC/UART interrupts, then power off
 - ✅ All three examples bring up 4 CPUs and run shared SMP demos (cross-CPU mutex wake-ups by IPI, task migration)
 - ✅ `scripts/check.sh`: tests, clippy, rustdoc, all targets, and the QEMU boot test

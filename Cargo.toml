@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["examples/riscv-virt", "examples/aarch64-virt", "examples/demos", "examples/x86_64-pc"]
+exclude = ["examples/riscv-virt", "examples/aarch64-virt", "examples/demos", "examples/x86_64-pc", "examples/riscv-firmware"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,6 +18,7 @@ osmium-drivers = { path = "crates/drivers", version = "0.1.0" }
 osmium-sched = { path = "crates/sched", version = "0.1.0" }
 osmium-boot = { path = "crates/boot", version = "0.1.0" }
 osmium-virt = { path = "crates/virt", version = "0.1.0" }
+osmium-exec = { path = "crates/exec", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

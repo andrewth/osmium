@@ -20,10 +20,11 @@ principles and the full feature list with status.
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
 | `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA), `IrqTable`, global console with `println!` | no |
-| `osmium-drivers` | NS16550A, PL011, RISC-V PLIC, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, i8254 PIT, RAM disk | no |
+| `osmium-drivers` | NS16550A, PL011, RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, i8254 PIT, RAM disk | no |
 | `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG reader | writer only |
 | `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
 | `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550 | yes |
+| `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
 
 The library never defines an entry point, panic handler or global allocator;

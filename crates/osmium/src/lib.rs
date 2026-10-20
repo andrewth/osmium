@@ -14,6 +14,7 @@
 //! | `boot` | `osmium-boot` | FDT and Multiboot2 parsing, FDT writer |
 //! | `sched` | `osmium-sched` | tasks, context switch, schedulers, wait queues, timers |
 //! | `virt` | `osmium-virt` | guest memory, stage-2 tables, device buses, VM exits |
+//! | `exec` | `osmium-exec` | heap-free async executor for firmware |
 //!
 //! The library never defines an entry point, panic handler or global
 //! allocator: the OS assembles those from the parts it uses.
@@ -24,6 +25,8 @@ pub use osmium_arch as arch;
 pub use osmium_boot as boot;
 #[cfg(feature = "drivers")]
 pub use osmium_drivers as drivers;
+#[cfg(feature = "exec")]
+pub use osmium_exec as exec;
 #[cfg(feature = "hal")]
 pub use osmium_hal as hal;
 #[cfg(feature = "mm")]

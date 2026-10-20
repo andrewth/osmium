@@ -1,0 +1,17 @@
+[package]
+name = "riscv-firmware"
+description = "Machine-mode, heap-free RISC-V firmware for QEMU virt, built from Osmium components"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-2.0-only"
+
+[dependencies]
+# No heap and no scheduler: just what firmware needs.
+osmium = { path = "../../crates/osmium", default-features = false, features = ["sync", "hal", "drivers", "exec", "riscv-m-mode"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

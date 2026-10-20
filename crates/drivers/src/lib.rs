@@ -8,6 +8,7 @@
 //! | [`gicv2::GicV2`] | Arm Generic Interrupt Controller v2 | `InterruptController` |
 //! | [`lapic::LocalApic`] | x86 local APIC (xAPIC MMIO) | EOI, IPIs, timer |
 //! | [`pit::Pit`] | Intel 8254 PIT | calibration delays |
+//! | [`clint::Clint`] | RISC-V CLINT (M-mode timer, software IRQs) | firmware timers |
 //! | [`ioapic::IoApic`] | x86 I/O APIC | GSI routing |
 //! | [`ramdisk::RamDisk`] | Memory-backed disk | `BlockDevice` |
 //! | [`virtio::net::VirtioNet`] | virtio network card (MMIO, legacy and 1.x) | `NetDevice` |
@@ -21,6 +22,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod clint;
 pub mod gicv2;
 pub mod ioapic;
 pub mod lapic;

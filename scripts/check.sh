@@ -69,4 +69,20 @@ EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exite
 boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
     -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot
 
+# Heap-free M-mode firmware (no OpenSBI): checked for its own lines, since it
+# runs none of the scheduler demos.
+if command -v qemu-system-riscv64 >/dev/null; then
+    echo "== boot examples/riscv-firmware under QEMU"
+    fwlog=$(mktemp)
+    (cd examples/riscv-firmware && cargo build -q --release)
+    timeout 60 qemu-system-riscv64 -machine virt -bios none -smp 1 -m 128M -nographic \
+        -kernel examples/riscv-firmware/target/riscv64imac-unknown-none-elf/release/riscv-firmware \
+        -serial "file:$fwlog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$fwlog"
+    for line in 'awaited 5 timer interrupts' 'console task:' 'all tasks finished'; do
+        grep -q "$line" "$fwlog" || { echo "riscv-firmware: missing '$line'"; exit 1; }
+    done
+    rm -f "$fwlog"
+fi
+
 echo "all checks passed"
