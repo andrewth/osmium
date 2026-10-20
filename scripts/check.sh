@@ -211,6 +211,24 @@ if command -v qemu-system-x86_64 >/dev/null; then
         grep -q "$line" "$svmlog" || { echo "x86_64-hyp: missing '$line'"; exit 1; }
     done
     rm -f "$svmlog"
+    # The same hypervisor booting the x86_64-pc kernel built above as a
+    # two-vCPU PVH guest (QEMU's loader places the ELF raw in host RAM).
+    echo "== boot examples/x86_64-pc as a guest of examples/x86_64-hyp under QEMU"
+    nestlog=$(mktemp)
+    timeout 120 qemu-system-x86_64 -machine q35 -cpu max -smp 2 -accel tcg,thread=multi -m 512M -nographic \
+        -no-reboot -display none -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp \
+        -device loader,file=examples/x86_64-pc/target/x86_64-unknown-none/release/x86_64-pc,addr=0x18000000,force-raw=on \
+        -serial "file:$nestlog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$nestlog"
+    for line in 'guest kernel: [0-9]* KiB loaded, PVH entry 0x[0-9a-f]*, 2 vCPUs' '| osmium x86_64-pc example' \
+        '| \[acpi\]  MADT lists 2 enabled CPUs' '| \[smp\]   2 CPUs online' \
+        '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
+        '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
+        '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' \
+        '| \[uart\]  interrupt-driven input: "hello from the host"' '| \[done\]' 'guest powered off'; do
+        grep -q "$line" "$nestlog" || { echo "x86_64-hyp (guest kernel): missing '$line'"; exit 1; }
+    done
+    rm -f "$nestlog"
 fi
 
 echo "all checks passed"

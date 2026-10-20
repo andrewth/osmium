@@ -15,6 +15,8 @@
 
 extern crate alloc;
 
+mod kernel;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -494,6 +496,14 @@ extern "C" fn kmain(start_info: usize) -> ! {
     map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
     // The AP trampoline's page (and the rest of low memory) stays out of the allocator.
     map.reserve(PhysAddr::new(0), PhysAddr::new(0x10_0000), RegionKind::Reserved).unwrap();
+    // With enough RAM, so does the window for a guest kernel image (QEMU's
+    // loader may have put one there).
+    let top = map.regions().iter().map(|r| r.end.0).max().unwrap_or(0);
+    let image_window = top >= kernel::IMAGE_BASE + kernel::IMAGE_WINDOW;
+    if image_window {
+        let (base, end) = (kernel::IMAGE_BASE, kernel::IMAGE_BASE + kernel::IMAGE_WINDOW);
+        map.reserve(PhysAddr::new(base), PhysAddr::new(end), RegionKind::Reserved).unwrap();
+    }
     let my_apic = x86::cpuid(1, 0).ebx >> 24;
     HOST_APIC_IDS[0].store(my_apic as u8, Ordering::Relaxed);
     let mut ncpus = 1;
@@ -540,13 +550,21 @@ extern "C" fn kmain(start_info: usize) -> ! {
     apic.enable(SPURIOUS_VECTOR);
     irq::enable();
 
-    guest_demo();
-    long_mode_demo();
-    if ncpus > 1 {
-        start_host_cpu(1);
-        smp_demo();
+    // A whole guest kernel if QEMU's loader provided one, else the demos.
+    if let Some((elf, entry)) = image_window.then(kernel::image).flatten() {
+        if ncpus > 1 {
+            start_host_cpu(1);
+        }
+        kernel::boot(&elf, entry, ncpus);
     } else {
-        println!("[smp]   one host CPU: skipping the SMP guest (run QEMU with -smp 2)");
+        guest_demo();
+        long_mode_demo();
+        if ncpus > 1 {
+            start_host_cpu(1);
+            smp_demo();
+        } else {
+            println!("[smp]   one host CPU: skipping the SMP guest (run QEMU with -smp 2)");
+        }
     }
 
     println!("[done]  {} free frames; shutting down", FRAMES.lock().free_frames());
@@ -612,6 +630,14 @@ extern "C" fn ap_main(cpu: usize) -> ! {
             vcpu_loop(vm, cpu);
             vm.released.store(true, Ordering::Release);
             while !SMP_VM.load(Ordering::Acquire).is_null() {
+                core::hint::spin_loop();
+            }
+        }
+        // SAFETY: kernel::boot publishes its VM only while it lives, and
+        // waits for every vCPU loop to finish before dropping it.
+        if let Some(vm) = unsafe { kernel::KERNEL_VM.load(Ordering::Acquire).as_ref() } {
+            kernel::vcpu_loop(vm, cpu);
+            while !kernel::KERNEL_VM.load(Ordering::Acquire).is_null() {
                 core::hint::spin_loop();
             }
         }
@@ -1042,7 +1068,8 @@ fn smp_demo() {
 fn on_trap(frame: &mut TrapFrame) {
     match frame.vector() {
         // A kick: taking it is all it is for (the guest has already exited).
-        KICK_VECTOR => return LAPIC.get().unwrap().eoi(),
+        // A kick, or the host tick that makes a busy guest exit.
+        KICK_VECTOR | kernel::HOST_TICK_VECTOR => return LAPIC.get().unwrap().eoi(),
         SPURIOUS_VECTOR => return,
         _ => {}
     }

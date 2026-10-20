@@ -5,11 +5,12 @@ policy to you: how many VMs, where their memory comes from, which devices
 they see, what happens when they halt. The three `*-hyp` examples
 (`examples/riscv-virt/src/hyp.rs`, `examples/aarch64-hyp`,
 `examples/x86_64-hyp`) put the pieces together; this page explains them.
-`examples/riscv-hyp` and `examples/aarch64-hyp` (when QEMU's loader
-provides an image at 0x58000000) go further and boot a whole kernel:
-Osmium's own `riscv-virt` (with a virtio-blk disk and a virtio-net card
-bridged to the host's network card) or `aarch64-virt`, from ELF, with a
-generated device tree and one vCPU per host CPU.
+`examples/riscv-hyp`, and `examples/aarch64-hyp` and `examples/x86_64-hyp`
+when QEMU's loader provides an image, go further and boot a whole kernel
+from ELF with one vCPU per host CPU: Osmium's own `riscv-virt` (with a
+virtio-blk disk and a virtio-net card bridged to the host's network card)
+and `aarch64-virt` under a generated device tree, and `x86_64-pc` through
+PVH with generated ACPI tables.
 
 ## The pieces
 
