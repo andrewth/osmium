@@ -322,8 +322,9 @@ impl Process {
         let _ = self.status.set(status);
         self.exited.wake_all();
         if let Some(parent) = self.parent.and_then(Process::find) {
-            parent.child_exited.wake_all();
+            // Queue the signal first: a parent woken from `wait4` must already see it pending.
             crate::signal::child_exited(&parent, self.pid);
+            parent.child_exited.wake_all();
         }
     }
 
