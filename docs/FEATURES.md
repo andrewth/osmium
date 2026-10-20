@@ -192,6 +192,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ cpio `newc` archives: zero-copy iteration and initramfs unpacking (concatenated archives, `..` refused), tested against GNU cpio
 - ✅ ext2, read and write, over any `BlockDevice`: indirect block maps, sparse files, fast and slow symlinks, allocation, truncation, orphaned open files; tested with `mkfs.ext2 -d`, `e2fsck` and `debugfs`
 - ✅ FAT32 (`osmium-fs-fat`), read and write, over any `BlockDevice`: VFAT long names with generated `~N` short names, case-insensitive lookup, every FAT copy and the FSInfo free count kept current, orphaned open files; tested with `mkfs.fat` and `fsck.fat`
+- ✅ ISO 9660 (`osmium-fs-iso9660`), read-only, over any `BlockDevice` of any block size: Rock Ridge (names, modes, link counts, symlinks, device nodes, `CE` continuations, `CL`/`RE` deep-directory relocation), else Joliet Unicode names, else plain names shown like Linux `map=normal`; multi-extent (over 4 GiB) files; tested with `xorriso` and `genisoimage` images
 - 🗺 A block cache, rename and hard links, timestamps from a clock in the VFS
 
 ### `osmium-virt`: hypervisor building blocks

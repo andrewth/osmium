@@ -1,0 +1,15 @@
+[package]
+name = "osmium-fs-iso9660"
+description = "Osmium: a read-only ISO 9660 file system (Rock Ridge, Joliet) on any block device, for the osmium-fs VFS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-fs.workspace = true
+osmium-hal.workspace = true
+osmium-sync.workspace = true
