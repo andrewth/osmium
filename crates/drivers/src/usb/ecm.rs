@@ -239,9 +239,17 @@ impl<H: UsbHost> UsbEthernet<H> {
     /// bulk alternate setting, enables its endpoints and starts receiving.
     ///
     /// Fails with [`UsbError::BadDescriptor`] if `config` has no ECM
-    /// function (see [`EcmFunction::parse`]) or the MAC string is malformed.
+    /// function (see [`EcmFunction::parse`]), its frames do not fit
+    /// [`RX_BUF_LEN`], or the MAC string is malformed.
     pub fn new(mut host: H, dev: DeviceId, config: &[u8]) -> Result<Self, UsbError> {
         let function = EcmFunction::parse(config).ok_or(UsbError::BadDescriptor)?;
+        let mps = (function.bulk_in.max_packet_size() as usize).max(1);
+        let rx_len = (function.max_segment as usize).div_ceil(mps).saturating_mul(mps).clamp(mps, RX_BUF_LEN);
+        if rx_len < function.max_segment as usize {
+            // A frame longer than a transfer would be split, and its tail
+            // taken for a frame of its own.
+            return Err(UsbError::BadDescriptor);
+        }
         let mac = read_mac(&mut host, dev, function.mac_string)?;
 
         let set = SetupPacket::set_interface(function.data_interface, function.data_alternate);
@@ -263,8 +271,6 @@ impl<H: UsbHost> UsbEthernet<H> {
         );
         let _ = host.control_out(dev, setup, &[]);
 
-        let mps = (function.bulk_in.max_packet_size() as usize).max(1);
-        let rx_len = (function.max_segment as usize).div_ceil(mps).saturating_mul(mps).clamp(mps, RX_BUF_LEN);
         let mut eth = Self {
             host,
             dev,
@@ -618,6 +624,18 @@ mod tests {
             UsbEthernet::new(FakeNic::default(), DeviceId(3), &CONFIG[..9]).err(),
             Some(UsbError::BadDescriptor)
         );
+    }
+
+    #[test]
+    fn rejects_frames_larger_than_the_buffer() {
+        let mut big = CONFIG;
+        // wMaxSegmentSize of the Ethernet Networking descriptor.
+        big[9 + 9 + 5 + 5 + 8..][..2].copy_from_slice(&(RX_BUF_LEN as u16 + 1).to_le_bytes());
+        let host = FakeNic::default();
+        assert_eq!(UsbEthernet::new(host, DeviceId(3), &big).err(), Some(UsbError::BadDescriptor));
+        big[9 + 9 + 5 + 5 + 8..][..2].copy_from_slice(&(RX_BUF_LEN as u16).to_le_bytes());
+        let eth = UsbEthernet::new(FakeNic::default(), DeviceId(3), &big).unwrap();
+        assert_eq!(eth.max_frame_len(), RX_BUF_LEN);
     }
 
     #[test]

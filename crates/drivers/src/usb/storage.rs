@@ -41,6 +41,12 @@ pub enum StorageError {
     },
     /// The device's status made no sense; it was reset.
     Phase,
+    /// The device moved less data than the command asked for, or said
+    /// (in `dCSWDataResidue`) that it processed less.
+    Short,
+    /// The medium needs READ CAPACITY(16) (2^32 blocks or more), or its
+    /// block size is not a power of two from 512 bytes to 64 KiB.
+    Unsupported,
     /// The device has no mass-storage (Bulk-Only, SCSI) interface.
     NotMassStorage,
 }
@@ -136,7 +142,7 @@ impl<H: UsbHost> UsbStorage<H> {
         // The first commands after power-on report UNIT ATTENTION.
         let mut ready = Err(StorageError::Phase);
         for _ in 0..5 {
-            ready = s.command(&[TEST_UNIT_READY, 0, 0, 0, 0, 0], Data::None);
+            ready = s.command(&[TEST_UNIT_READY, 0, 0, 0, 0, 0], Data::None).map(drop);
             if ready.is_ok() {
                 break;
             }
@@ -144,12 +150,16 @@ impl<H: UsbHost> UsbStorage<H> {
         ready?;
 
         let mut cap = [0u8; 8];
-        s.command(&[READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], Data::In(&mut cap))?;
+        if s.command(&[READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], Data::In(&mut cap))? < cap.len() {
+            return Err(StorageError::Short);
+        }
         let last = u32::from_be_bytes(cap[0..4].try_into().unwrap());
         s.block_size = u32::from_be_bytes(cap[4..8].try_into().unwrap()) as usize;
         s.blocks = last as u64 + 1;
-        if s.block_size == 0 || s.block_size > MAX_COMMAND_BYTES {
-            return Err(StorageError::Phase);
+        // A last LBA of 0xffffffff means "too many to say here".
+        if last == u32::MAX || !s.block_size.is_power_of_two() || !(512..=MAX_COMMAND_BYTES).contains(&s.block_size)
+        {
+            return Err(StorageError::Unsupported);
         }
         Ok(s)
     }
@@ -195,22 +205,37 @@ impl<H: UsbHost> UsbStorage<H> {
     fn sense_key(&mut self) -> u8 {
         let mut sense = [0u8; 18];
         match self.transport(&[REQUEST_SENSE, 0, 0, 0, 18, 0], Data::In(&mut sense)) {
-            Ok(0) => sense[2] & 0xf,
+            Ok((0, n)) if n >= 3 => sense[2] & 0xf,
             _ => 0,
         }
     }
 
-    /// Runs a SCSI command; on a failed status, fetches the sense key.
-    fn command(&mut self, cb: &[u8], data: Data<'_>) -> Result<(), StorageError> {
+    /// Runs a SCSI command and returns how many bytes of its data stage the
+    /// device processed; on a failed status, fetches the sense key.
+    fn command(&mut self, cb: &[u8], data: Data<'_>) -> Result<usize, StorageError> {
         match self.transport(cb, data)? {
-            0 => Ok(()),
+            (0, n) => Ok(n),
             _ => Err(StorageError::Failed { sense_key: self.sense_key() }),
         }
     }
 
+    /// Runs a command that must process all of its data.
+    fn command_all(&mut self, cb: &[u8], data: Data<'_>) -> Result<(), StorageError> {
+        let len = match &data {
+            Data::None => 0,
+            Data::In(b) => b.len(),
+            Data::Out(b) => b.len(),
+        };
+        if self.command(cb, data)? < len {
+            return Err(StorageError::Short);
+        }
+        Ok(())
+    }
+
     /// One CBW, data stage, CSW exchange; returns the CSW status (0 passed,
-    /// 1 failed).
-    fn transport(&mut self, cb: &[u8], data: Data<'_>) -> Result<u8, StorageError> {
+    /// 1 failed) and the bytes processed: those the data stage moved, less
+    /// any the device reports as residue.
+    fn transport(&mut self, cb: &[u8], data: Data<'_>) -> Result<(u8, usize), StorageError> {
         self.tag = self.tag.wrapping_add(1);
         let (len, flags) = match &data {
             Data::None => (0, 0),
@@ -232,21 +257,22 @@ impl<H: UsbHost> UsbStorage<H> {
 
         // A stalled data stage still ends with a status (§6.7.2, §6.7.3).
         let stage = match data {
-            Data::None => Ok(()),
-            Data::In(b) => self.host.transfer_in(self.dev, self.bulk_in, b).map(drop),
-            Data::Out(b) => self.host.transfer_out(self.dev, self.bulk_out, b),
+            Data::None => Ok(0),
+            Data::In(b) => self.host.transfer_in(self.dev, self.bulk_in, b).map(|n| n.min(len)),
+            Data::Out(b) => self.host.transfer_out(self.dev, self.bulk_out, b).map(|()| len),
         };
-        match stage {
-            Ok(()) => {}
+        let moved = match stage {
+            Ok(n) => n,
             Err(UsbError::Stall) => {
                 let ep = if flags != 0 { self.bulk_in } else { self.bulk_out };
                 self.clear_halt(ep);
+                0
             }
             Err(e) => {
                 self.reset_recovery();
                 return Err(e.into());
             }
-        }
+        };
 
         let mut csw = [0u8; 13];
         let mut got = self.host.transfer_in(self.dev, self.bulk_in, &mut csw);
@@ -259,7 +285,8 @@ impl<H: UsbHost> UsbStorage<H> {
             self.reset_recovery();
             return Err(StorageError::Phase);
         }
-        Ok(csw[12])
+        let residue = u32::from_le_bytes(csw[8..12].try_into().unwrap()) as usize;
+        Ok((csw[12], moved.min(len.saturating_sub(residue))))
     }
 
     fn rw_command(op: u8, lba: u64, blocks: usize) -> [u8; 10] {
@@ -268,8 +295,9 @@ impl<H: UsbHost> UsbStorage<H> {
         [op, 0, lba[0], lba[1], lba[2], lba[3], 0, n[0], n[1], 0]
     }
 
+    /// Blocks per READ(10)/WRITE(10), whose count field is 16 bits.
     fn chunk_blocks(&self) -> usize {
-        (MAX_COMMAND_BYTES / self.block_size).max(1)
+        (MAX_COMMAND_BYTES / self.block_size).clamp(1, 0xffff)
     }
 }
 
@@ -298,7 +326,7 @@ impl<H: UsbHost> BlockDevice for UsbStorage<H> {
         for (i, chunk) in buf.chunks_mut(step * self.block_size).enumerate() {
             let at = lba + (i * step) as u64;
             let cb = Self::rw_command(READ_10, at, chunk.len() / self.block_size);
-            self.command(&cb, Data::In(chunk)).map_err(block_error)?;
+            self.command_all(&cb, Data::In(chunk)).map_err(block_error)?;
         }
         Ok(())
     }
@@ -312,7 +340,7 @@ impl<H: UsbHost> BlockDevice for UsbStorage<H> {
         for (i, chunk) in buf.chunks(step * self.block_size).enumerate() {
             let at = lba + (i * step) as u64;
             let cb = Self::rw_command(WRITE_10, at, chunk.len() / self.block_size);
-            self.command(&cb, Data::Out(chunk)).map_err(block_error)?;
+            self.command_all(&cb, Data::Out(chunk)).map_err(block_error)?;
         }
         Ok(())
     }
@@ -320,7 +348,7 @@ impl<H: UsbHost> BlockDevice for UsbStorage<H> {
     fn flush(&mut self) -> Result<(), BlockError> {
         match self.command(&[SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], Data::None) {
             // Many sticks have no cache and reject the command.
-            Ok(()) | Err(StorageError::Failed { sense_key: 5 }) => Ok(()),
+            Ok(_) | Err(StorageError::Failed { sense_key: 5 }) => Ok(()),
             Err(e) => Err(block_error(e)),
         }
     }
@@ -359,6 +387,12 @@ mod tests {
         sense: u8,
         /// Stall the next data stage.
         stall_data: bool,
+        /// Send this many bytes fewer in the next data-in stage.
+        short_by: usize,
+        /// `dCSWDataResidue` of the next status.
+        residue: u32,
+        /// READ CAPACITY(10) data in place of the disk's.
+        capacity: Option<[u8; 8]>,
         halted: bool,
         commands: Vec<u8>,
         resets: usize,
@@ -373,6 +407,9 @@ mod tests {
                 fail_next: Some((TEST_UNIT_READY, 6)), // unit attention
                 sense: 0,
                 stall_data: false,
+                short_by: 0,
+                residue: 0,
+                capacity: None,
                 halted: false,
                 commands: Vec::new(),
                 resets: 0,
@@ -407,7 +444,7 @@ mod tests {
                 }
                 READ_CAPACITY_10 => {
                     let last = (self.disk.len() / 512 - 1) as u32;
-                    [last.to_be_bytes(), 512u32.to_be_bytes()].concat()
+                    self.capacity.map_or_else(|| [last.to_be_bytes(), 512u32.to_be_bytes()].concat(), |c| c.to_vec())
                 }
                 REQUEST_SENSE => {
                     let mut d = std::vec![0u8; 18];
@@ -473,7 +510,7 @@ mod tests {
                     Err(UsbError::Stall)
                 }
                 Phase::DataIn(reply) => {
-                    let n = reply.len().min(buf.len());
+                    let n = reply.len().saturating_sub(core::mem::take(&mut self.short_by)).min(buf.len());
                     buf[..n].copy_from_slice(&reply[..n]);
                     self.phase = Phase::Status(0);
                     Ok(n)
@@ -481,7 +518,7 @@ mod tests {
                 Phase::Status(status) => {
                     buf[0..4].copy_from_slice(CSW_SIGNATURE);
                     buf[4..8].copy_from_slice(&self.tag);
-                    buf[8..12].fill(0);
+                    buf[8..12].copy_from_slice(&core::mem::take(&mut self.residue).to_le_bytes());
                     buf[12] = status;
                     Ok(13)
                 }
@@ -555,6 +592,42 @@ mod tests {
         assert_eq!(b, [1; 512], "the device works afterwards");
         assert_eq!(s.host.resets, 0, "a stall is not a phase error");
         assert_eq!(s.host.sense, 3);
+    }
+
+    #[test]
+    fn short_transfers_fail() {
+        let mut stick = FakeStick::new(8);
+        let mut s = UsbStorage::new(&mut stick, DeviceId(1), &CONFIG).unwrap();
+        // A data stage that stops short, with a passing status, is not a read.
+        s.host.short_by = 100;
+        assert_eq!(s.read_blocks(0, &mut [0; 512]), Err(BlockError::Io));
+        // Nor is a full data stage the device says it did not all process.
+        s.host.residue = 512;
+        assert_eq!(s.write_blocks(0, &[0; 1024]), Err(BlockError::Io));
+        s.host.residue = 1;
+        assert_eq!(s.read_blocks(0, &mut [0; 512]), Err(BlockError::Io));
+        let mut b = [0u8; 512];
+        s.read_blocks(2, &mut b).unwrap();
+        assert_eq!(b, [2; 512]);
+    }
+
+    #[test]
+    fn unusable_capacities() {
+        let probe = |capacity: [u8; 8], short_by| {
+            let mut stick = FakeStick::new(8);
+            stick.fail_next = None;
+            stick.capacity = Some(capacity);
+            stick.short_by = short_by;
+            UsbStorage::new(&mut stick, DeviceId(1), &CONFIG).err()
+        };
+        let cap = |last: u32, size: u32| [last.to_be_bytes(), size.to_be_bytes()].concat().try_into().unwrap();
+        assert_eq!(probe(cap(7, 512), 0), None);
+        assert_eq!(probe(cap(7, 4096), 0), None);
+        assert_eq!(probe(cap(7, 512), 1), Some(StorageError::Short));
+        assert_eq!(probe(cap(u32::MAX, 512), 0), Some(StorageError::Unsupported), "needs READ CAPACITY(16)");
+        for size in [0, 1, 256, 520, 128 * 1024] {
+            assert_eq!(probe(cap(7, size), 0), Some(StorageError::Unsupported), "{size}-byte blocks");
+        }
     }
 
     #[test]

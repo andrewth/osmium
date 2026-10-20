@@ -164,13 +164,11 @@ impl<H: UsbHost> BootKeyboard<H> {
             Some(r) => r,
         };
         self.submitted = false;
-        let n = got?;
-        if n < 3 {
+        // A boot report is 8 bytes; anything shorter is ignored, not padded.
+        if got? < 8 {
             return Ok(None);
         }
-        let mut report = [0u8; 8];
-        report[..n.min(8)].copy_from_slice(&buf[..n.min(8)]);
-        Ok(Some(report))
+        Ok(Some(buf[..8].try_into().unwrap()))
     }
 
     /// The next key event, if any, without waiting.
@@ -233,7 +231,8 @@ mod tests {
     /// A keyboard whose reports arrive one per completed submission.
     #[derive(Default)]
     struct FakeKeyboard {
-        reports: VecDeque<Report>,
+        /// Reports, or shorter transfers.
+        reports: VecDeque<Vec<u8>>,
         outstanding: bool,
         requests: Vec<(u8, u16)>,
     }
@@ -275,8 +274,8 @@ mod tests {
             assert!(self.outstanding);
             let r = self.reports.pop_front()?;
             self.outstanding = false;
-            buf[..8].copy_from_slice(&r);
-            Some(Ok(8))
+            buf[..r.len()].copy_from_slice(&r);
+            Some(Ok(r.len()))
         }
     }
 
@@ -294,7 +293,7 @@ mod tests {
         assert_eq!(kb.poll(), Ok(None));
         // "Hi" then everything released.
         for r in [[0x02, 0, 0x0b, 0, 0, 0, 0, 0], [0; 8], [0, 0, 0x0c, 0, 0, 0, 0, 0], [0; 8]] {
-            kb.host.reports.push_back(r);
+            kb.host.reports.push_back(r.to_vec());
         }
         let mut typed = std::string::String::new();
         while let Some(ev) = kb.poll().unwrap() {
@@ -304,5 +303,18 @@ mod tests {
         assert!(kb.host.outstanding, "a new transfer is always waiting");
         drop(kb);
         assert_eq!(fake.requests, [(SET_PROTOCOL, 0), (SET_IDLE, 0)]);
+    }
+
+    #[test]
+    fn short_reports_are_ignored() {
+        let mut fake = FakeKeyboard::default();
+        let mut kb = BootKeyboard::new(&mut fake, DeviceId(2), &CONFIG).unwrap();
+        // Read as a full report, this would release nothing and press 'a'.
+        kb.host.reports.push_back(std::vec![0, 0, 0x04]);
+        assert_eq!(kb.poll(), Ok(None));
+        assert_eq!(kb.last, [0; 8]);
+        kb.host.reports.push_back(std::vec![0, 0, 0x05, 0, 0, 0, 0, 0]);
+        assert_eq!(kb.poll().unwrap().map(|e| (e.usage, e.pressed)), Some((0x05, true)));
+        assert_eq!(kb.poll(), Ok(None));
     }
 }
