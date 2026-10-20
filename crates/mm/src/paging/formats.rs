@@ -128,6 +128,7 @@ impl PageTableFormat for Aarch64 {
     const VA_BITS: u32 = 48;
     const SIGN_EXTEND: bool = true;
     const MAX_LEAF_LEVEL: usize = 2;
+    const BREAK_BEFORE_MAKE: bool = true;
 
     fn table(pa: PhysAddr) -> u64 {
         pa.0 | arm::VALID | arm::TABLE_OR_PAGE
@@ -210,6 +211,7 @@ impl PageTableFormat for Aarch64El2 {
     const VA_BITS: u32 = 48;
     const SIGN_EXTEND: bool = false;
     const MAX_LEAF_LEVEL: usize = 2;
+    const BREAK_BEFORE_MAKE: bool = true;
 
     fn table(pa: PhysAddr) -> u64 {
         Aarch64::table(pa)
@@ -483,6 +485,7 @@ impl PageTableFormat for Aarch64Stage2 {
     const VA_BITS: u32 = 48;
     const SIGN_EXTEND: bool = false;
     const MAX_LEAF_LEVEL: usize = 2;
+    const BREAK_BEFORE_MAKE: bool = true;
 
     fn table(pa: PhysAddr) -> u64 {
         Aarch64::table(pa)

@@ -105,12 +105,14 @@ impl<'a> BootInfo<'a> {
         let mut off = 8;
         core::iter::from_fn(move || {
             let typ = le32(data, off)?;
-            let size = le32(data, off + 4)? as usize;
+            let size = le32(data, off.checked_add(4)?)? as usize;
             if typ == TAG_END || size < 8 {
                 return None;
             }
-            let payload = data.get(off + 8..off + size)?;
-            off = (off + size + 7) & !7;
+            // A size running past the structure (or past `usize`) is malformed.
+            let end = off.checked_add(size)?;
+            let payload = data.get(off + 8..end)?;
+            off = end.checked_next_multiple_of(8)?;
             Some(Tag { typ, payload })
         })
     }
@@ -149,11 +151,18 @@ impl<'a> BootInfo<'a> {
 
     /// Adds the memory map, the info structure itself (if `info_at` is given)
     /// and the modules to `map`.
+    ///
+    /// RAM entries whose end overflows are malformed and skipped; reserved
+    /// ranges that overflow are clamped to the top of the address space. If
+    /// the map runs out of room, it gives up detail or RAM as
+    /// [`MemoryMap::add_lossy`] describes; the result is the number of usable
+    /// bytes dropped, worth logging if not zero.
     pub fn fill_memory_map<const N: usize>(
         &self,
         map: &mut MemoryMap<N>,
         info_at: Option<PhysAddr>,
-    ) -> Result<(), osmium_mm::map::MapFull> {
+    ) -> Result<u64, osmium_mm::map::MapFull> {
+        let mut lost = 0;
         for (base, len, typ) in self.memory_map() {
             let kind = match typ {
                 1 => RegionKind::Usable,
@@ -162,15 +171,18 @@ impl<'a> BootInfo<'a> {
                 5 => RegionKind::BadMemory,
                 _ => RegionKind::Reserved,
             };
-            map.add(PhysAddr::new(base), PhysAddr::new(base.saturating_add(len)), kind)?;
+            if kind != RegionKind::Usable || base.checked_add(len).is_some() {
+                lost += map.add_lossy(PhysAddr::new(base), PhysAddr::new(base.saturating_add(len)), kind)?;
+            }
         }
         for m in self.modules() {
-            map.reserve(m.start, m.end, RegionKind::Bootloader)?;
+            lost += map.add_lossy(m.start, m.end, RegionKind::Bootloader)?;
         }
         if let Some(at) = info_at {
-            map.reserve(at, at + self.total_size() as u64, RegionKind::Bootloader)?;
+            let end = PhysAddr::new(at.0.saturating_add(self.total_size() as u64));
+            lost += map.add_lossy(at, end, RegionKind::Bootloader)?;
         }
-        Ok(())
+        Ok(lost)
     }
 
     /// The ACPI RSDP copied by the loader (v2 preferred).
@@ -216,6 +228,36 @@ mod tests {
     }
 
     #[test]
+    fn malformed_sizes() {
+        // A memory map with an entry whose end overflows, then a tag whose
+        // size runs past the structure.
+        let mut mm = Vec::new();
+        mm.extend_from_slice(&24u32.to_le_bytes());
+        mm.extend_from_slice(&0u32.to_le_bytes());
+        for (base, len) in [(0x10_0000u64, 0x10_0000u64), (0x1_0000_0000, u64::MAX)] {
+            mm.extend_from_slice(&base.to_le_bytes());
+            mm.extend_from_slice(&len.to_le_bytes());
+            mm.extend_from_slice(&1u32.to_le_bytes());
+            mm.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let mut b = std::vec![0u8; 8];
+        tag(&mut b, TAG_MMAP, &mm);
+        b.extend_from_slice(&TAG_CMDLINE.to_le_bytes());
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&[0; 8]);
+        let total = b.len() as u32;
+        b[..4].copy_from_slice(&total.to_le_bytes());
+
+        let info = BootInfo::new(&b).unwrap();
+        assert_eq!(info.tags().count(), 1, "the oversized tag ends the walk");
+        assert!(info.cmdline().is_none());
+        let mut map = MemoryMap::<16>::new();
+        assert_eq!(info.fill_memory_map(&mut map, None), Ok(0));
+        let ram = osmium_mm::Region::new(PhysAddr::new(0x10_0000), PhysAddr::new(0x20_0000), RegionKind::Usable);
+        assert_eq!(map.regions(), [ram]);
+    }
+
+    #[test]
     fn parse_tags() {
         let mut b = std::vec![0u8; 8];
         tag(&mut b, TAG_CMDLINE, b"root=/dev/vda\0");
@@ -246,7 +288,7 @@ mod tests {
         );
         assert_eq!(info.memory_map().count(), 3);
         let mut map = MemoryMap::<16>::new();
-        info.fill_memory_map(&mut map, None).unwrap();
+        assert_eq!(info.fill_memory_map(&mut map, None), Ok(0));
         assert_eq!(map.total(RegionKind::Usable), 0x9_fc00 + 0x7ef_0000 - 0x10_0000);
         assert_eq!(map.total(RegionKind::Bootloader), 0x10_0000);
         assert!(info.rsdp().is_none());

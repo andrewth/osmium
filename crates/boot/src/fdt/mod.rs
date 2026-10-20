@@ -60,15 +60,27 @@ impl<'a> Fdt<'a> {
         if total > data.len() {
             return Err(FdtError::Truncated);
         }
-        if h(6)? > 17 || h(5)? < 16 {
+        let version = h(5)?;
+        if h(6)? > 17 || version < 16 {
             return Err(FdtError::BadVersion);
         }
         let data = &data[..total];
         let (s_off, st_off, rsv) = (h(2)? as usize, h(3)? as usize, h(4)? as usize);
-        let (st_size, s_size) = (h(8)? as usize, h(9)? as usize);
-        let structs = Span { start: s_off, end: s_off.checked_add(s_size).ok_or(FdtError::Truncated)? };
+        let st_size = h(8)? as usize;
+        // `size_dt_struct` only exists from version 17 (in a version 16
+        // header that word is already the reservation block or padding).
+        // Without it, the struct block runs to the strings block if that
+        // follows it, else to the end; parsing stops at the END token anyway.
+        let s_end = if version >= 17 {
+            s_off.checked_add(h(9)? as usize).ok_or(FdtError::Truncated)?
+        } else if st_off >= s_off {
+            st_off
+        } else {
+            total
+        };
+        let structs = Span { start: s_off, end: s_end };
         let strings = Span { start: st_off, end: st_off.checked_add(st_size).ok_or(FdtError::Truncated)? };
-        if structs.end > total || strings.end > total || rsv > total {
+        if structs.start > structs.end || structs.end > total || strings.end > total || rsv > total {
             return Err(FdtError::Truncated);
         }
         Ok(Self { data, structs, strings, rsvmap: rsv, boot_cpu: h(7)? })
@@ -149,37 +161,66 @@ impl<'a> Fdt<'a> {
     pub fn reservations(&self) -> impl Iterator<Item = (u64, u64)> + 'a + use<'a> {
         let data = self.data;
         let base = self.rsvmap;
-        (0..)
-            .map(move |i| Some((be64(data, base + i * 16)?, be64(data, base + i * 16 + 8)?)))
+        (0usize..)
+            .map(move |i| {
+                let off = base.checked_add(i.checked_mul(16)?)?;
+                Some((be64(data, off)?, be64(data, off.checked_add(8)?)?))
+            })
             .map_while(|e| e.filter(|&(a, s)| a != 0 || s != 0))
     }
 
-    /// Adds RAM, reserved ranges (the reservation block and
-    /// `/reserved-memory` children) and, if given, the blob itself to `map`.
+    /// `[start, end)` of the initial ramdisk, from `/chosen`'s
+    /// `linux,initrd-start` and `linux,initrd-end` (one or two cells each).
+    pub fn initrd(&self) -> Option<(u64, u64)> {
+        let chosen = self.chosen()?;
+        let start = chosen.property("linux,initrd-start")?.as_u64()?;
+        let end = chosen.property("linux,initrd-end")?.as_u64()?;
+        (start < end).then_some((start, end))
+    }
+
+    /// Adds RAM, reserved ranges (the reservation block and the static
+    /// `/reserved-memory` children, those with a `reg`), the initrd and, if
+    /// given, the blob itself to `map`.
+    ///
+    /// RAM ranges whose end overflows are malformed and skipped; reserved
+    /// ranges that overflow are clamped to the top of the address space. If
+    /// the map runs out of room, it gives up detail or RAM as
+    /// [`MemoryMap::add_lossy`] describes; the result is the number of usable
+    /// bytes dropped, worth logging if not zero.
+    ///
+    /// Dynamic `/reserved-memory` children (a `size` but no `reg`) ask the OS
+    /// to allocate a pool, for drivers that want one; firmware uses no memory
+    /// for them, so they need no entry here.
     pub fn fill_memory_map<const N: usize>(
         &self,
         map: &mut MemoryMap<N>,
         blob_at: Option<PhysAddr>,
-    ) -> Result<(), osmium_mm::map::MapFull> {
-        let range = |a: u64, s: u64| (PhysAddr::new(a), PhysAddr::new(a.saturating_add(s)));
+    ) -> Result<u64, osmium_mm::map::MapFull> {
+        let mut lost = 0;
+        let mut add = |map: &mut MemoryMap<N>, a: u64, s: u64, kind| -> Result<(), osmium_mm::map::MapFull> {
+            lost += map.add_lossy(PhysAddr::new(a), PhysAddr::new(a.saturating_add(s)), kind)?;
+            Ok(())
+        };
         for (a, s) in self.memory() {
-            let (lo, hi) = range(a, s);
-            map.add(lo, hi, RegionKind::Usable)?;
+            if a.checked_add(s).is_some() {
+                add(map, a, s, RegionKind::Usable)?;
+            }
         }
         for (a, s) in self.reservations() {
-            let (lo, hi) = range(a, s);
-            map.reserve(lo, hi, RegionKind::Reserved)?;
+            add(map, a, s, RegionKind::Reserved)?;
         }
         if let Some(rm) = self.find_node("/reserved-memory") {
             for (a, s) in rm.children().flat_map(|c| c.reg()) {
-                let (lo, hi) = range(a, s.unwrap_or(0));
-                map.reserve(lo, hi, RegionKind::Reserved)?;
+                add(map, a, s.unwrap_or(0), RegionKind::Reserved)?;
             }
         }
-        if let Some(at) = blob_at {
-            map.reserve(at, at + self.total_size() as u64, RegionKind::Bootloader)?;
+        if let Some((start, end)) = self.initrd() {
+            add(map, start, end - start, RegionKind::Bootloader)?;
         }
-        Ok(())
+        if let Some(at) = blob_at {
+            add(map, at.0, self.total_size() as u64, RegionKind::Bootloader)?;
+        }
+        Ok(lost)
     }
 
     fn token(&self, off: usize) -> Option<u32> {
@@ -203,10 +244,13 @@ impl<'a> Fdt<'a> {
 
     /// Parses the property at `off`; returns it and the offset after it.
     fn prop_at(&self, off: usize) -> Option<(Property<'a>, usize)> {
-        let len = be32(self.data, off + 4)? as usize;
-        let name = self.string(be32(self.data, off + 8)? as usize)?;
-        let value = self.data.get(off + 12..off + 12 + len)?;
-        Some((Property { name, value }, align4(off + 12 + len)))
+        let len = be32(self.data, off.checked_add(4)?)? as usize;
+        let name = self.string(be32(self.data, off.checked_add(8)?)? as usize)?;
+        let start = off.checked_add(12)?;
+        let end = start.checked_add(len)?;
+        let value = self.data.get(start..end)?;
+        // `end` is within the blob, so rounding it up cannot overflow.
+        Some((Property { name, value }, align4(end)))
     }
 
     /// Returns the offset just past the END_NODE matching the BEGIN_NODE at `begin`.

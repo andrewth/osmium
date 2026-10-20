@@ -163,6 +163,35 @@ fn encodings() {
     assert!(Aarch64::flags(Aarch64::leaf(pa(0), MapFlags::RW | MapFlags::DEVICE, 0), 0).contains(MapFlags::DEVICE));
 }
 
+/// Splits a 2 MiB page and returns what another view of the same tables
+/// saw at `va` while the TLB was being invalidated, and the address passed.
+fn split_ordering<F: PageTableFormat>() -> Option<(Option<PageSize>, VirtAddr)> {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let mut pt: PageTable<F, _> = PageTable::new(&frames).unwrap();
+    pt.map(va(0x4000_0000), pa(0x8000_0000), PageSize::Size2M, MapFlags::RW).unwrap().ignore();
+    let mut view: PageTable<F, _> = PageTable::new(&frames).unwrap();
+    // SAFETY: `pt` outlives `view`, which is declared after it.
+    unsafe { view.share_root_entries(&pt, 0..1) };
+    let mut seen = None;
+    let size =
+        pt.split_with(va(0x4012_3456), |base| seen = Some((view.translate(va(0x4012_3456)).map(|t| t.size), base)));
+    assert_eq!(size, Ok(PageSize::Size4K));
+    assert_eq!(pt.translate(va(0x4012_3456)).unwrap().pa, pa(0x8012_3456));
+    let mut called = false;
+    assert_eq!(pt.split_with(va(0x4012_3456), |_| called = true), Ok(PageSize::Size4K));
+    assert!(!called, "nothing to split, nothing to invalidate");
+    seen
+}
+
+#[test]
+fn split_invalidates_in_order() {
+    // Break-before-make: the entry is invalid while the TLB is flushed.
+    assert_eq!(split_ordering::<Aarch64>(), Some((None, va(0x4000_0000))));
+    // In place: the new table is already there.
+    assert_eq!(split_ordering::<X86_64>(), Some((Some(PageSize::Size4K), va(0x4000_0000))));
+}
+
 #[test]
 fn shared_kernel_entries() {
     let ram = SimRam::new(0x8000_0000, 2 << 20);

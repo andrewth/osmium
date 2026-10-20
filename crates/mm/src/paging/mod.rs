@@ -142,6 +142,12 @@ pub trait PageTableFormat {
     /// extra page widens the root index by one bit (RISC-V G-stage roots
     /// are 4 pages, 16 KiB aligned).
     const ROOT_PAGES: usize = 1;
+    /// Whether replacing a valid leaf with a table needs break-before-make:
+    /// invalidate the entry and the TLB before writing the new one.
+    /// AArch64 requires it (without FEAT_BBM, a TLB holding both the old
+    /// block and the new pages may raise a TLB conflict abort). x86 and
+    /// RISC-V allow the replacement in place, followed by a TLB flush.
+    const BREAK_BEFORE_MAKE: bool = false;
 
     /// Encodes an entry pointing at the next-level table at `pa`.
     fn table(pa: PhysAddr) -> u64;
@@ -419,9 +425,37 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     /// that part of it can be unmapped or reprotected. Returns the size of
     /// the leaf now mapping `va`; already-4 KiB mappings are left alone.
     ///
-    /// The translation does not change, so no TLB flush is required, but
-    /// the caller should flush before relying on the finer granularity.
+    /// Invalidates the huge page in the TLB with
+    /// [`osmium_arch::mmu::flush_page`], which is right for an active stage-1
+    /// table (and harmless for an inactive one). See [`PageTable::split_with`]
+    /// for the ordering, the hazards of splitting a live mapping, and how to
+    /// supply another invalidation (stage 2, or other CPUs).
     pub fn split(&mut self, va: VirtAddr) -> Result<PageSize, MapError> {
+        self.split_with(va, |base| osmium_arch::mmu::flush_page(base.as_usize()))
+    }
+
+    /// [`PageTable::split`], with `invalidate` performing the TLB
+    /// invalidation of the huge page. It is called with the huge page's base
+    /// address (invalidating any address inside a huge page drops its TLB
+    /// entry on every supported architecture), and not at all if nothing is
+    /// split.
+    ///
+    /// On formats that need break-before-make ([`PageTableFormat::BREAK_BEFORE_MAKE`],
+    /// AArch64), the huge-page entry is cleared, then `invalidate` runs, then
+    /// the table is installed. In between the range is unmapped, so nothing
+    /// may touch it: not the code doing the split, its stack, the page
+    /// tables as seen through the [`PhysMapper`], interrupt handlers, or
+    /// other CPUs. Splitting a huge page the running kernel lives in (an
+    /// identity or direct map holding its stack or tables) faults there;
+    /// map such ranges with small pages from the start instead. On other
+    /// formats the table replaces the leaf in place and `invalidate` runs
+    /// afterwards, before any part of the range is changed further.
+    ///
+    /// `invalidate` covers the current CPU, plus whatever else it does
+    /// itself. If other CPUs may hold the old translation, it must also shoot
+    /// them down: this library has no cross-CPU TLB shootdown, so that is the
+    /// caller's job. For an inactive table, pass `|_| {}`.
+    pub fn split_with(&mut self, va: VirtAddr, invalidate: impl FnOnce(VirtAddr)) -> Result<PageSize, MapError> {
         if self.is_shared(va) {
             return Err(MapError::InvalidAddress);
         }
@@ -439,11 +473,21 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         }
         // Re-find the entry: `entry` borrows `self`.
         let (e, _) = self.find_leaf(va).map_err(|_| MapError::InvalidAddress)?;
-        e.store(F::table(table), Ordering::Release);
+        let huge = va.align_down(PageSize::from_level(level).bytes());
+        if F::BREAK_BEFORE_MAKE {
+            e.store(0, Ordering::Release);
+            invalidate(huge);
+            e.store(F::table(table), Ordering::Release);
+        } else {
+            e.store(F::table(table), Ordering::Release);
+            invalidate(huge);
+        }
         Ok(child)
     }
 
-    /// Unmaps the 4 KiB page at `va`, splitting huge pages around it first.
+    /// Unmaps the 4 KiB page at `va`, splitting huge pages around it first
+    /// with [`PageTable::split`] (which flushes this CPU's TLB as it goes;
+    /// mind its break-before-make hazards on AArch64).
     pub fn unmap_4k(&mut self, va: VirtAddr) -> Result<(Translation, Flush), UnmapError> {
         loop {
             match self.translate(va).ok_or(UnmapError::NotMapped)?.size {

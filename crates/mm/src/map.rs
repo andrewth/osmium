@@ -63,16 +63,27 @@ pub struct MapFull;
 /// usable RAM never overrides an existing region, while [`MemoryMap::reserve`]
 /// always does, so the order in which firmware entries and reservations are
 /// added does not matter.
+///
+/// When firmware reports more ranges than fit, [`MemoryMap::add_lossy`]
+/// makes room by giving up detail or usable RAM, never by losing a
+/// reservation.
 #[derive(Clone)]
 pub struct MemoryMap<const N: usize> {
     regions: [Region; N],
     len: usize,
+    /// A reservation could not be recorded: refuse all further usable RAM,
+    /// which might cover it.
+    overflowed: bool,
 }
 
 impl<const N: usize> MemoryMap<N> {
     /// Creates an empty map.
     pub const fn new() -> Self {
-        Self { regions: [Region::new(PhysAddr::ZERO, PhysAddr::ZERO, RegionKind::Reserved); N], len: 0 }
+        Self {
+            regions: [Region::new(PhysAddr::ZERO, PhysAddr::ZERO, RegionKind::Reserved); N],
+            len: 0,
+            overflowed: false,
+        }
     }
 
     /// Returns the regions in address order.
@@ -92,9 +103,15 @@ impl<const N: usize> MemoryMap<N> {
 
     /// Adds a firmware-reported range. Usable RAM only fills gaps; any other
     /// kind overrides what is there.
+    ///
+    /// Usable RAM is refused with [`MapFull`] once [`MemoryMap::add_lossy`]
+    /// has failed to record a reservation.
     pub fn add(&mut self, start: PhysAddr, end: PhysAddr, kind: RegionKind) -> Result<(), MapFull> {
         if kind != RegionKind::Usable {
             return self.reserve(start, end, kind);
+        }
+        if self.overflowed {
+            return Err(MapFull);
         }
         let mut cursor = start;
         while cursor < end {
@@ -121,14 +138,75 @@ impl<const N: usize> MemoryMap<N> {
         self.set(start, end, kind)
     }
 
+    /// Like [`MemoryMap::add`], but when the map is full it makes room
+    /// instead of failing, always erring towards treating memory as unusable:
+    ///
+    /// 1. it merges two touching non-usable regions into one
+    ///    [`RegionKind::Reserved`] region (losing only their kinds);
+    /// 2. failing that, it drops the smallest usable region, or, when adding
+    ///    usable RAM smaller than every usable region, the new range.
+    ///
+    /// Dropped RAM becomes a gap, which nothing allocates from. Returns the
+    /// usable bytes dropped (a dropped new range counts in full, even the
+    /// parts that overlapped existing regions).
+    ///
+    /// Fails only when a non-usable range does not fit even with no usable
+    /// regions left. The range is then not recorded, and from then on the
+    /// map refuses usable RAM, so it can never report that memory as free.
+    pub fn add_lossy(&mut self, start: PhysAddr, end: PhysAddr, kind: RegionKind) -> Result<u64, MapFull> {
+        let usable = kind == RegionKind::Usable;
+        let len = end.0.saturating_sub(start.0);
+        let mut lost = 0;
+        loop {
+            if usable && self.overflowed {
+                return Ok(lost + len);
+            }
+            if self.add(start, end, kind).is_ok() {
+                return Ok(lost);
+            }
+            if self.merge_touching_reserved() {
+                continue;
+            }
+            let smallest = (0..self.len)
+                .filter(|&i| self.regions[i].kind == RegionKind::Usable)
+                .min_by_key(|&i| self.regions[i].len());
+            match smallest {
+                Some(i) if !usable || self.regions[i].len() < len => {
+                    lost += self.regions[i].len();
+                    self.remove(i);
+                }
+                _ if usable => return Ok(lost + len),
+                _ => {
+                    self.overflowed = true;
+                    return Err(MapFull);
+                }
+            }
+        }
+    }
+
+    /// Merges the first two touching non-usable regions into one
+    /// `Reserved` region. Returns false if there are none.
+    fn merge_touching_reserved(&mut self) -> bool {
+        let unusable = |r: &Region| r.kind != RegionKind::Usable;
+        let Some(i) =
+            self.regions().windows(2).position(|w| unusable(&w[0]) && unusable(&w[1]) && w[0].end == w[1].start)
+        else {
+            return false;
+        };
+        self.regions[i] = Region::new(self.regions[i].start, self.regions[i + 1].end, RegionKind::Reserved);
+        self.remove(i + 1);
+        true
+    }
+
     /// Shrinks each usable region inward to page boundaries and drops those
-    /// that become empty.
+    /// that become empty (including any that start in the last page of the
+    /// address space, where rounding up would overflow).
     pub fn page_align_usable(&mut self) {
         let mut i = 0;
         while i < self.len {
             let r = &mut self.regions[i];
             if r.kind == RegionKind::Usable {
-                r.start = r.start.align_up(PAGE_SIZE as u64);
+                r.start = r.start.checked_align_up(PAGE_SIZE as u64).unwrap_or(r.end);
                 r.end = r.end.align_down(PAGE_SIZE as u64);
                 if r.is_empty() {
                     self.remove(i);
@@ -144,7 +222,7 @@ impl<const N: usize> MemoryMap<N> {
     /// early boot structures before a real allocator exists.
     pub fn allocate(&mut self, size: u64, align: u64) -> Option<PhysAddr> {
         let start = self.usable().find_map(|r| {
-            let s = r.start.align_up(align);
+            let s = r.start.checked_align_up(align)?;
             (s.0.checked_add(size)? <= r.end.0).then_some(s)
         })?;
         self.reserve(start, start + size, RegionKind::Allocated).ok()?;
@@ -269,5 +347,55 @@ mod tests {
         m.add(pa(0x2000), pa(0x3000), Reserved).unwrap();
         assert_eq!(m.add(pa(0x5000), pa(0x6000), Kernel), Err(MapFull));
         assert_eq!(m.regions().len(), 2);
+    }
+
+    #[test]
+    fn top_of_address_space() {
+        let mut m = MemoryMap::<4>::new();
+        m.add(pa(0x1000), pa(0x3000), Usable).unwrap();
+        m.add(pa(u64::MAX - 0x800), pa(u64::MAX), Usable).unwrap();
+        m.page_align_usable();
+        assert_eq!(m.regions(), [Region::new(pa(0x1000), pa(0x3000), Usable)], "not wrapped to [0, end)");
+
+        let mut m = MemoryMap::<4>::new();
+        m.add(pa(u64::MAX - 0x2fff), pa(u64::MAX), Usable).unwrap();
+        assert_eq!(m.allocate(0x1000, 1 << 63), None, "not wrapped to 0");
+        assert_eq!(m.total(Allocated), 0);
+    }
+
+    #[test]
+    fn lossy_add_makes_room() {
+        let mut m = MemoryMap::<4>::new();
+        m.add(pa(0x0000), pa(0x1000), Usable).unwrap();
+        m.add(pa(0x1000), pa(0x2000), Reserved).unwrap();
+        m.add(pa(0x2000), pa(0x3000), AcpiNvs).unwrap();
+        m.add(pa(0x10_0000), pa(0x100_0000), Usable).unwrap();
+        // Full. Touching non-usable regions merge first, keeping all RAM.
+        assert_eq!(m.add_lossy(pa(0x8000), pa(0x9000), Mmio), Ok(0));
+        assert_eq!(m.total(Reserved), 0x2000);
+        assert_eq!(m.total(Usable), 0x1000 + 0xf0_0000);
+        // Then the smallest usable region goes, for a reservation.
+        assert_eq!(m.add_lossy(pa(0xa000), pa(0xb000), Kernel), Ok(0x1000));
+        assert_eq!(m.total(Usable), 0xf0_0000);
+        // Usable RAM smaller than any usable region is dropped itself...
+        assert_eq!(m.add_lossy(pa(0x4000), pa(0x5000), Usable), Ok(0x1000));
+        // ...and bigger RAM replaces the smallest region.
+        assert_eq!(m.add_lossy(pa(0x1_0000_0000), pa(0x2_0000_0000), Usable), Ok(0xf0_0000));
+        assert_eq!(m.total(Usable), 0x1_0000_0000);
+        // A reservation inside RAM is always honoured.
+        assert_eq!(m.add_lossy(pa(0x1_8000_0000), pa(0x1_8000_1000), Kernel), Ok(0x1_0000_0000));
+        assert!(
+            m.regions().iter().all(|r| r.kind != Usable || r.end <= pa(0x1_8000_0000) || r.start >= pa(0x1_8000_1000))
+        );
+
+        // With no usable region left to drop, the reservation fails and the
+        // map refuses RAM from then on.
+        let mut m = MemoryMap::<2>::new();
+        m.add(pa(0x0000), pa(0x1000), Reserved).unwrap();
+        m.add(pa(0x3000), pa(0x4000), AcpiNvs).unwrap();
+        assert_eq!(m.add_lossy(pa(0x8000), pa(0x9000), Kernel), Err(MapFull));
+        assert_eq!(m.add_lossy(pa(0x8000), pa(0x10000), Usable), Ok(0x8000));
+        assert_eq!(m.add(pa(0x8000), pa(0x10000), Usable), Err(MapFull));
+        assert_eq!(m.total(Usable), 0);
     }
 }

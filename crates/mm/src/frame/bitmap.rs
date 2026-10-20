@@ -37,7 +37,9 @@ impl<'a> BitmapAllocator<'a> {
     /// # Safety
     /// The range must be unused RAM.
     pub unsafe fn add_free(&mut self, start: PhysAddr, end: PhysAddr) {
-        let lo = start.align_up(PAGE_SIZE as u64).max(self.base);
+        // A start in the last page of the address space leaves nothing.
+        let Some(lo) = start.checked_align_up(PAGE_SIZE as u64) else { return };
+        let lo = lo.max(self.base);
         let hi = end.align_down(PAGE_SIZE as u64).min(self.base + (self.frames * PAGE_SIZE) as u64);
         let mut f = self.index(lo);
         while lo < hi && f < self.index(hi) {
@@ -80,7 +82,7 @@ unsafe impl FrameAllocator for BitmapAllocator<'_> {
             return None;
         }
         // Frame indices whose absolute address is suitably aligned.
-        let first_aligned = self.index(self.base.align_up(align));
+        let first_aligned = self.index(self.base.checked_align_up(align)?);
         let candidates = (first_aligned..self.frames.saturating_sub(count - 1)).step_by(count);
         let n = candidates.len();
         let start_at = (self.hint.saturating_sub(first_aligned) / count).min(n);
@@ -98,13 +100,16 @@ unsafe impl FrameAllocator for BitmapAllocator<'_> {
         None
     }
 
+    /// Panics on a double free (any frame of the block already free), in
+    /// release builds too: carrying on would hand the frames out twice.
     unsafe fn dealloc(&mut self, pa: PhysAddr, order: u32) {
         let f = self.index(pa);
-        for i in f..f + (1 << order) {
-            debug_assert!(!self.is_free(i), "double free of frame {i}");
+        let count = 1 << order;
+        assert!((f..f + count).all(|i| !self.is_free(i)), "double free of {pa:?} (order {order})");
+        for i in f..f + count {
             self.set(i, true);
         }
-        self.free += 1 << order;
+        self.free += count;
     }
 
     fn free_frames(&self) -> usize {
@@ -135,5 +140,20 @@ mod tests {
         }
         assert_eq!(a.free_frames(), 99);
         assert!(a.alloc(7).is_none(), "128 frames cannot fit in 100");
+    }
+
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn double_free_is_caught() {
+        let mut bits = [0u64; 1];
+        let mut a = BitmapAllocator::new(PhysAddr::new(0x10_0000), 16, &mut bits);
+        // SAFETY: test allocator over nothing real.
+        unsafe { a.add_free(PhysAddr::new(0x10_0000), PhysAddr::new(0x11_0000)) };
+        let f = a.alloc(0).unwrap();
+        // SAFETY: the first free is legitimate; the second is the bug under test.
+        unsafe {
+            a.dealloc(f, 0);
+            a.dealloc(f, 0);
+        }
     }
 }

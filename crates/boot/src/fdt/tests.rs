@@ -11,6 +11,8 @@ fn qemu_like() -> Vec<u8> {
     w.property_string("compatible", "riscv-virtio");
     w.begin_node("chosen");
     w.property_string("bootargs", "console=ttyS0 quiet");
+    w.property_u64("linux,initrd-start", 0x8400_0000);
+    w.property_u32("linux,initrd-end", 0x8410_0000);
     w.end_node();
     w.begin_node("memory@80000000");
     w.property_string("device_type", "memory");
@@ -77,11 +79,35 @@ fn memory_map() {
     let fdt = Fdt::new(&blob).unwrap();
     assert_eq!(fdt.memory().collect::<Vec<_>>(), [(0x8000_0000, 0x800_0000)]);
     assert_eq!(fdt.reservations().collect::<Vec<_>>(), [(0x8000_0000, 0x8_0000)]);
+    assert_eq!(fdt.initrd(), Some((0x8400_0000, 0x8410_0000)));
     let mut map = MemoryMap::<16>::new();
-    fdt.fill_memory_map(&mut map, Some(PhysAddr::new(0x8700_0000))).unwrap();
+    assert_eq!(fdt.fill_memory_map(&mut map, Some(PhysAddr::new(0x8700_0000))), Ok(0));
     assert_eq!(map.total(RegionKind::Reserved), 0x8_0000);
-    assert_eq!(map.total(RegionKind::Bootloader), blob.len() as u64);
-    assert_eq!(map.total(RegionKind::Usable), 0x800_0000 - 0x8_0000 - blob.len() as u64);
+    assert_eq!(map.total(RegionKind::Bootloader), 0x10_0000 + blob.len() as u64, "initrd and blob");
+    assert_eq!(map.total(RegionKind::Usable), 0x800_0000 - 0x8_0000 - 0x10_0000 - blob.len() as u64);
+
+    // Too many regions for the map: RAM is given up, never a reservation.
+    let mut map = MemoryMap::<3>::new();
+    let lost = fdt.fill_memory_map(&mut map, Some(PhysAddr::new(0x8700_0000))).unwrap();
+    assert!(lost > 0);
+    assert_eq!(map.total(RegionKind::Bootloader), 0x10_0000 + blob.len() as u64);
+    assert!(map.usable().all(|r| r.start >= PhysAddr::new(0x8008_0000)));
+}
+
+#[test]
+fn version_16_has_no_struct_size() {
+    let mut blob = qemu_like();
+    let nodes = Fdt::new(&blob).unwrap().all_nodes().count();
+    // Version 16, last compatible 16; the word that would be
+    // `size_dt_struct` is garbage.
+    blob[20..24].copy_from_slice(&16u32.to_be_bytes());
+    blob[24..28].copy_from_slice(&16u32.to_be_bytes());
+    blob[36..40].copy_from_slice(&8u32.to_be_bytes());
+    let fdt = Fdt::new(&blob).unwrap();
+    assert_eq!(fdt.all_nodes().count(), nodes);
+    assert_eq!(fdt.bootargs(), Some("console=ttyS0 quiet"));
+    blob[20..24].copy_from_slice(&15u32.to_be_bytes());
+    assert_eq!(Fdt::new(&blob).err(), Some(FdtError::BadVersion));
 }
 
 #[test]

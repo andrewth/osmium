@@ -39,9 +39,24 @@ macro_rules! address {
             }
 
             /// Rounds up to a multiple of `align` (a power of two).
+            ///
+            /// Overflows for addresses in the last `align` bytes of the
+            /// address space (a panic in debug builds, 0 in release). Use
+            /// [`Self::checked_align_up`] for addresses that come from
+            /// firmware or other untrusted sources.
             pub const fn align_up(self, align: u64) -> Self {
                 debug_assert!(align.is_power_of_two());
                 Self((self.0 + align - 1) & !(align - 1))
+            }
+
+            /// Rounds up to a multiple of `align` (a power of two), or
+            /// returns `None` if the result does not fit in 64 bits.
+            pub const fn checked_align_up(self, align: u64) -> Option<Self> {
+                debug_assert!(align.is_power_of_two());
+                match self.0.checked_add(align - 1) {
+                    Some(x) => Some(Self(x & !(align - 1))),
+                    None => None,
+                }
             }
 
             /// Returns true if the address is a multiple of `align`.
@@ -137,6 +152,9 @@ mod tests {
         assert_eq!(a.align_up(0x1000), PhysAddr::new(0x2000));
         assert!(PhysAddr::new(0x2000).is_aligned(0x1000));
         assert_eq!(a.page_offset(), 0x234);
+        assert_eq!(a.checked_align_up(0x1000), Some(PhysAddr::new(0x2000)));
+        assert_eq!(PhysAddr::new(u64::MAX - 0x7ff).checked_align_up(0x1000), None);
+        assert_eq!(PhysAddr::new(u64::MAX - 0xfff).checked_align_up(0x1000), Some(PhysAddr::new(u64::MAX - 0xfff)));
     }
 
     #[test]

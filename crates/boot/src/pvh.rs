@@ -218,10 +218,16 @@ pub struct StartInfo<'a> {
     memmap: &'a [u8],
     modules: &'a [u8],
     cmdline: Option<&'a str>,
+    /// Bytes of the command line, NUL included.
+    cmdline_len: usize,
+    /// Physical address of the header, if known.
+    at: Option<PhysAddr>,
 }
 
 const HEADER_V0: usize = 40;
 const HEADER_V1: usize = 56;
+const MODULE_SIZE: u64 = 32;
+const MEMMAP_ENTRY_SIZE: u64 = 24;
 
 impl<'a> StartInfo<'a> {
     /// Parses a start-info header plus the memory map, module list and
@@ -230,7 +236,8 @@ impl<'a> StartInfo<'a> {
         if le32(header, 0) != Some(MAGIC) || header.len() < HEADER_V0 {
             return Err(InvalidStartInfo);
         }
-        Ok(Self { header, memmap, modules, cmdline: cmdline.and_then(cstr) })
+        let cmdline_len = cmdline.map_or(0, |c| c.iter().position(|&b| b == 0).map_or(c.len(), |n| n + 1));
+        Ok(Self { header, memmap, modules, cmdline: cmdline.and_then(cstr), cmdline_len, at: None })
     }
 
     /// Parses the structure at `ptr`, following its physical pointers as
@@ -258,17 +265,40 @@ impl<'a> StartInfo<'a> {
                 unsafe { core::slice::from_raw_parts(pa as usize as *const u8, n) }
             }
         };
-        let nr_modules = le32(header, 12).unwrap_or(0) as usize;
-        let modules = slice(le64(header, 16).unwrap_or(0), nr_modules * 32);
-        let (memmap_pa, entries) =
-            if version >= 1 { (le64(header, 40).unwrap_or(0), le32(header, 48).unwrap_or(0) as usize) } else { (0, 0) };
-        let memmap = slice(memmap_pa, entries * 24);
+        // Lengths and ends that overflow are malformed.
+        let checked = |(pa, len): (u64, u64)| -> Result<(u64, usize), InvalidStartInfo> {
+            pa.checked_add(len).ok_or(InvalidStartInfo)?;
+            Ok((pa, usize::try_from(len).map_err(|_| InvalidStartInfo)?))
+        };
+        let (modules_pa, modules_len) = checked(Self::modules_range(header))?;
+        let modules = slice(modules_pa, modules_len);
+        let (memmap_pa, memmap_len) = checked(Self::memmap_range(header))?;
+        let memmap = slice(memmap_pa, memmap_len);
         let cmdline_pa = le64(header, 24).unwrap_or(0);
         let cmdline = (cmdline_pa != 0).then(|| {
             // SAFETY: a NUL-terminated string at a caller-guaranteed readable address.
             unsafe { core::ffi::CStr::from_ptr(cmdline_pa as usize as *const core::ffi::c_char) }.to_bytes_with_nul()
         });
-        Self::parse(header, memmap, modules, cmdline)
+        let mut info = Self::parse(header, memmap, modules, cmdline)?;
+        info.at = Some(PhysAddr::new(ptr as usize as u64));
+        Ok(info)
+    }
+
+    /// Physical address and length in bytes of the module list. A `u32`
+    /// count times the entry size cannot overflow a `u64`; the end can.
+    fn modules_range(header: &[u8]) -> (u64, u64) {
+        let count = le32(header, 12).unwrap_or(0) as u64;
+        (le64(header, 16).unwrap_or(0), count * MODULE_SIZE)
+    }
+
+    /// Physical address and length in bytes of the memory map (version 1
+    /// and later; empty before).
+    fn memmap_range(header: &[u8]) -> (u64, u64) {
+        if le32(header, 4).unwrap_or(0) < 1 {
+            return (0, 0);
+        }
+        let count = le32(header, 48).unwrap_or(0) as u64;
+        (le64(header, 40).unwrap_or(0), count * MEMMAP_ENTRY_SIZE)
     }
 
     /// Structure version (0 has no memory map; the loader then provides
@@ -305,10 +335,26 @@ impl<'a> StartInfo<'a> {
             .filter_map(|m| Some(Module { addr: PhysAddr::new(le64(m, 0)?), size: le64(m, 8)? }))
     }
 
-    /// Adds the memory map and modules to `map`, and reserves the first
-    /// 1 MiB (real-mode IVT, BIOS data, option ROMs), which E820 maps often
-    /// report as partly usable.
-    pub fn fill_memory_map<const N: usize>(&self, map: &mut MemoryMap<N>) -> Result<(), osmium_mm::map::MapFull> {
+    /// Adds the memory map to `map` and reserves, as
+    /// [`RegionKind::Bootloader`], the modules and the loader's own
+    /// structures: the start-info header (when parsed with
+    /// [`StartInfo::from_ptr`], which knows its address), the module list,
+    /// the memory map and the command line. Also reserves the first 1 MiB
+    /// (real-mode IVT, BIOS data, option ROMs), which E820 maps often report
+    /// as partly usable. Module command lines are not reserved: their
+    /// lengths are only known by reading them.
+    ///
+    /// RAM entries whose end overflows are malformed and skipped; reserved
+    /// ranges that overflow are clamped to the top of the address space. If
+    /// the map runs out of room, it gives up detail or RAM as
+    /// [`MemoryMap::add_lossy`] describes; the result is the number of usable
+    /// bytes dropped, worth logging if not zero.
+    pub fn fill_memory_map<const N: usize>(&self, map: &mut MemoryMap<N>) -> Result<u64, osmium_mm::map::MapFull> {
+        let mut lost = 0;
+        let mut add = |map: &mut MemoryMap<N>, a: u64, s: u64, kind| -> Result<(), osmium_mm::map::MapFull> {
+            lost += map.add_lossy(PhysAddr::new(a), PhysAddr::new(a.saturating_add(s)), kind)?;
+            Ok(())
+        };
         for e in self.memory_map() {
             let kind = match e.typ {
                 1 => RegionKind::Usable,
@@ -317,12 +363,27 @@ impl<'a> StartInfo<'a> {
                 5 => RegionKind::BadMemory,
                 _ => RegionKind::Reserved,
             };
-            map.add(PhysAddr::new(e.addr), PhysAddr::new(e.addr.saturating_add(e.size)), kind)?;
+            if kind != RegionKind::Usable || e.addr.checked_add(e.size).is_some() {
+                add(map, e.addr, e.size, kind)?;
+            }
         }
         for m in self.modules() {
-            map.reserve(m.addr, m.addr + m.size, RegionKind::Bootloader)?;
+            add(map, m.addr.0, m.size, RegionKind::Bootloader)?;
         }
-        map.reserve(PhysAddr::new(0), PhysAddr::new(0x10_0000), RegionKind::Reserved)
+        if let Some(at) = self.at {
+            add(map, at.0, self.header.len() as u64, RegionKind::Bootloader)?;
+        }
+        let header = self.header;
+        for (pa, len) in [Self::modules_range(header), Self::memmap_range(header)] {
+            if pa != 0 {
+                add(map, pa, len, RegionKind::Bootloader)?;
+            }
+        }
+        if let Some(pa) = le64(header, 24).filter(|&pa| pa != 0) {
+            add(map, pa, self.cmdline_len.max(1) as u64, RegionKind::Bootloader)?;
+        }
+        add(map, 0, 0x10_0000, RegionKind::Reserved)?;
+        Ok(lost)
     }
 }
 
@@ -364,5 +425,39 @@ mod tests {
         assert_eq!(map.total(RegionKind::Usable), 0x7ee_0000 - 0x1234);
         assert!(map.usable().all(|r| r.start.0 >= 0x10_0000), "low 1 MiB reserved");
         assert!(StartInfo::parse(&h[..8], &[], &[], None).is_err());
+    }
+
+    #[test]
+    fn loader_structures_are_reserved() {
+        // Module list, command line and memory map above 1 MiB, in RAM.
+        let mut h = Vec::new();
+        for v in [MAGIC, 1, 0, 1] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0x20_0000u64, 0x20_1000, 0, 0x20_2000] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        h.extend_from_slice(&2u32.to_le_bytes());
+        h.extend_from_slice(&0u32.to_le_bytes());
+        let mut mm = Vec::new();
+        // RAM, and a malformed entry whose end overflows.
+        for (a, s) in [(0x10_0000u64, 0x7f0_0000u64), (0x1_0000_0000, u64::MAX)] {
+            mm.extend_from_slice(&a.to_le_bytes());
+            mm.extend_from_slice(&s.to_le_bytes());
+            mm.extend_from_slice(&1u32.to_le_bytes());
+            mm.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let mut modl = Vec::new();
+        for v in [0x400_0000u64, 0x1000, 0, 0] {
+            modl.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut info = StartInfo::parse(&h, &mm, &modl, Some(b"quiet\0")).unwrap();
+        info.at = Some(PhysAddr::new(0x20_3000));
+        let mut map = MemoryMap::<16>::new();
+        assert_eq!(info.fill_memory_map(&mut map), Ok(0));
+        // Module, module list, command line, memory map and header.
+        assert_eq!(map.total(RegionKind::Bootloader), 0x1000 + 32 + 6 + 2 * 24 + HEADER_V1 as u64);
+        assert_eq!(map.total(RegionKind::Usable), 0x7f0_0000 - (0x1000 + 32 + 6 + 2 * 24 + HEADER_V1 as u64));
+        assert!(map.usable().all(|r| r.end.0 <= 0x800_0000), "overflowing entry skipped");
     }
 }

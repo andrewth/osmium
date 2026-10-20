@@ -62,7 +62,8 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
     /// The range must be unused RAM, reachable through the mapper, and must
     /// not overlap any range given before.
     pub unsafe fn add_region(&mut self, start: PhysAddr, end: PhysAddr) -> bool {
-        let start_pfn = start.align_up(PAGE_SIZE as u64).0 / PAGE_SIZE as u64;
+        let Some(start) = start.checked_align_up(PAGE_SIZE as u64) else { return false };
+        let start_pfn = start.0 / PAGE_SIZE as u64;
         let end_pfn = end.align_down(PAGE_SIZE as u64).0 / PAGE_SIZE as u64;
         if self.nzones == MAX_ZONES || end_pfn <= start_pfn {
             return false;
@@ -104,6 +105,21 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
         self.mapper.phys_to_virt(z.meta + (pfn - z.first))
     }
 
+    /// Whether the block of order `k` at `pfn` is already free, in full or
+    /// in part: its first frame heads a free block of any order, or a larger
+    /// free block contains it.
+    fn is_free(&self, zone: Zone, pfn: u64, k: u32) -> bool {
+        // SAFETY: `pfn` lies in `zone`, so its metadata byte exists.
+        if unsafe { *self.meta(pfn) } != NOT_HEAD {
+            return true;
+        }
+        (k + 1..ORDERS as u32).any(|j| {
+            let head = pfn & !((1 << j) - 1);
+            // SAFETY: checked to lie in `zone`, between its first frame and `pfn`.
+            head >= zone.first && unsafe { *self.meta(head) } == j as u8
+        })
+    }
+
     fn node(&self, pfn: u64) -> *mut FreeNode {
         self.mapper.phys_to_virt(PhysAddr::new(pfn * PAGE_SIZE as u64)).cast()
     }
@@ -140,7 +156,8 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
 }
 
 // SAFETY: a block is either on exactly one free list (and marked in the
-// metadata) or allocated; `alloc` removes it from its list before returning.
+// metadata) or allocated; `alloc` removes it from its list before returning,
+// and `dealloc` panics rather than list a block that is already free.
 unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocator<M, ORDERS> {
     fn alloc(&mut self, order: u32) -> Option<PhysAddr> {
         let mut k = (order as usize..ORDERS).find(|&k| self.heads[k] != NIL)? as u32;
@@ -154,9 +171,22 @@ unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocato
         Some(PhysAddr::new(pfn * PAGE_SIZE as u64))
     }
 
+    /// Panics, in release builds too, on a double free (the block, or a
+    /// larger free block around it, is already free), on a block misaligned
+    /// for `order`, and on frames this allocator does not manage. Listing a
+    /// free block a second time would hand the same frames out twice, so
+    /// stopping is the safer choice: the caller's ownership tracking is
+    /// already broken, and something may still be using the memory. A block
+    /// that is only partly free (a smaller free block inside it, not at its
+    /// start) is not detected.
     unsafe fn dealloc(&mut self, pa: PhysAddr, order: u32) {
         let mut pfn = pa.0 / PAGE_SIZE as u64;
         let zone = self.zone_of(pfn);
+        assert!(
+            pa.is_aligned(PAGE_SIZE as u64) && pfn.is_multiple_of(1 << order) && pfn + (1 << order) <= zone.end,
+            "free of {pa:?} with the wrong order {order}"
+        );
+        assert!(!self.is_free(zone, pfn, order), "double free of {pa:?} (order {order})");
         let mut k = order;
         while (k as usize) + 1 < ORDERS {
             let buddy = pfn ^ (1 << k);
@@ -209,6 +239,39 @@ mod tests {
         // Everything coalesced back: a 2 MiB block is available again.
         let big = b.alloc(9).unwrap();
         assert!(big.is_aligned(2 << 20));
+    }
+
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn double_free_is_caught() {
+        let ram = SimRam::new(0x8000_0000, 1 << 20);
+        let mut b: BuddyAllocator<_, 12> = BuddyAllocator::new(&ram);
+        // SAFETY: simulated RAM, owned by this test.
+        unsafe { b.add_region(ram.base, ram.end()) };
+        let a = b.alloc(0).unwrap();
+        // SAFETY: the first free is legitimate; the second is the bug under test.
+        unsafe {
+            b.dealloc(a, 0);
+            b.dealloc(a, 0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn double_free_after_coalescing_is_caught() {
+        let ram = SimRam::new(0x8000_0000, 1 << 20);
+        let mut b: BuddyAllocator<_, 12> = BuddyAllocator::new(&ram);
+        // SAFETY: simulated RAM, owned by this test.
+        unsafe { b.add_region(ram.base, ram.end()) };
+        let a = b.alloc(0).unwrap();
+        let c = b.alloc(0).unwrap();
+        // SAFETY: `a` and `c` are buddies and merge into one free block, which
+        // the second free of `c` falls inside: the bug under test.
+        unsafe {
+            b.dealloc(a, 0);
+            b.dealloc(c, 0);
+            b.dealloc(c, 0);
+        }
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub struct Table<'a> {
 }
 
 const HEADER: usize = 36;
+/// Largest table length believed. Real tables are at most a few hundred
+/// KiB (the DSDT is usually the biggest).
+const MAX_TABLE: usize = 1 << 20;
 
 impl<'a> Table<'a> {
     /// The four-byte signature (`b"APIC"`, `b"MCFG"`, ...).
@@ -59,13 +62,16 @@ pub struct Acpi<'a, F> {
 
 impl<'a, F: Fn(u64, usize) -> Option<&'a [u8]>> Acpi<'a, F> {
     /// Validates the RSDP at physical address `rsdp` and its root table.
+    ///
+    /// `read(pa, len)` should return exactly `len` bytes; a slice of any
+    /// other length counts as unreadable.
     pub fn new(rsdp: u64, read: F) -> Result<Self, AcpiError> {
-        let r = read(rsdp, 20).ok_or(AcpiError::Unreadable)?;
+        let r = Self::read_exact(&read, rsdp, 20).ok_or(AcpiError::Unreadable)?;
         if &r[..8] != b"RSD PTR " || !checksum_ok(r) {
             return Err(AcpiError::BadRsdp);
         }
         let (root_pa, wide) = if r[15] >= 2 {
-            let r2 = read(rsdp, 36).ok_or(AcpiError::Unreadable)?;
+            let r2 = Self::read_exact(&read, rsdp, 36).ok_or(AcpiError::Unreadable)?;
             if !checksum_ok(r2) {
                 return Err(AcpiError::BadRsdp);
             }
@@ -77,9 +83,19 @@ impl<'a, F: Fn(u64, usize) -> Option<&'a [u8]>> Acpi<'a, F> {
         Ok(Self { read, root, wide })
     }
 
+    /// Calls `read`, rejecting slices of the wrong length.
+    fn read_exact(read: &F, pa: u64, len: usize) -> Option<&'a [u8]> {
+        read(pa, len).filter(|d| d.len() == len)
+    }
+
     fn table_at(read: &F, pa: u64) -> Option<Table<'a>> {
-        let len = le32(read(pa, HEADER)?, 4)? as usize;
-        let data = read(pa, len.max(HEADER))?;
+        let len = le32(Self::read_exact(read, pa, HEADER)?, 4)? as usize;
+        // A length shorter than the header, or implausibly long (a corrupt
+        // header could otherwise ask for gigabytes), is malformed.
+        if !(HEADER..=MAX_TABLE).contains(&len) {
+            return None;
+        }
+        let data = Self::read_exact(read, pa, len)?;
         checksum_ok(data).then_some(Table { data })
     }
 
@@ -329,6 +345,26 @@ mod tests {
         assert_eq!(m.isa_irq(4), (4, false, false), "no override: identity");
         let ecam = Mcfg::parse(acpi.find(b"MCFG").unwrap()).unwrap().entries().next().unwrap();
         assert_eq!((ecam.base, ecam.end_bus), (0xb000_0000, 0xff));
+
+        // A reader that returns less than asked for is not trusted (indexing
+        // a short RSDP would panic).
+        let short = |pa: u64, len: usize| mem.get(pa as usize..pa as usize + len.min(8));
+        assert_eq!(Acpi::new(0, short).err(), Some(AcpiError::Unreadable));
+        let long = |pa: u64, len: usize| mem.get(pa as usize..pa as usize + len + 1);
+        assert_eq!(Acpi::new(0, long).err(), Some(AcpiError::Unreadable));
+
+        // A table claiming more than 1 MiB is skipped before being read.
+        let mut big = mem.clone();
+        big[mcfg_at as usize + 4..][..4].copy_from_slice(&(2u32 << 20).to_le_bytes());
+        let asked = core::cell::Cell::new(0);
+        let read = |pa: u64, len: usize| {
+            asked.set(asked.get().max(len));
+            big.get(pa as usize..pa as usize + len)
+        };
+        let acpi = Acpi::new(0, read).unwrap();
+        assert!(acpi.find(b"MCFG").is_none());
+        assert!(acpi.find(b"APIC").is_some());
+        assert!(asked.get() <= 0x400);
 
         // A corrupted table is skipped, a corrupted RSDP rejected.
         mem[madt_at as usize + 40] ^= 1;

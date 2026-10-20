@@ -57,8 +57,15 @@ unsafe impl<S: PageSource + ?Sized> PageSource for &S {
 // SAFETY: blocks come from the frame allocator, which returns exclusive,
 // naturally aligned blocks; the mapper makes them addressable.
 unsafe impl<A: FrameAllocator, M: PhysMapper> PageSource for LockedFrames<A, M> {
+    /// Allocates a block of `2^order` frames, the smallest that holds
+    /// `count` pages. Blocks are aligned to their size, so an `align` larger
+    /// than that fails: `free_pages` only learns `count`, and must free the
+    /// same order. [`LockedHeap`] asks for enough pages to cover its alignment.
     fn alloc_pages(&self, count: usize, align: usize) -> Option<NonNull<u8>> {
-        let order = order_for(count.max(align / PAGE_SIZE) * PAGE_SIZE);
+        let order = order_for(count * PAGE_SIZE);
+        if align > PAGE_SIZE << order {
+            return None;
+        }
         let pa = self.lock().alloc(order)?;
         NonNull::new(self.phys_to_virt(pa))
     }
@@ -68,8 +75,7 @@ unsafe impl<A: FrameAllocator, M: PhysMapper> PageSource for LockedFrames<A, M> 
         // leaked rather than corrupting the allocator.
         if let Some(pa) = self.virt_to_phys(ptr.as_ptr()) {
             // SAFETY: the block came from `alloc_pages(count, ..)`, which used
-            // this order (alignment does not change the order for frees,
-            // because `alloc` rounded to at least `count` pages).
+            // this order.
             unsafe { self.lock().dealloc(pa, order_for(count * PAGE_SIZE)) }
         }
     }
@@ -105,14 +111,18 @@ impl<const PAGES: usize> Default for StaticArena<PAGES> {
     }
 }
 
-// SAFETY: runs are marked used before being returned; the arena is
-// page-aligned, so aligned indices give aligned addresses.
+// SAFETY: runs are marked used before being returned; candidate indices are
+// `first + k * step`, and page `first` is `align`-aligned, so every candidate
+// address is too.
 unsafe impl<const PAGES: usize> PageSource for StaticArena<PAGES> {
     fn alloc_pages(&self, count: usize, align: usize) -> Option<NonNull<u8>> {
         let step = (align / PAGE_SIZE).max(1);
         let base_addr = self.base() as usize;
         let mut used = self.used.lock();
-        let mut i = (base_addr.next_multiple_of(align) - base_addr) / PAGE_SIZE;
+        // The first page whose address is aligned; the arena itself is only
+        // page aligned.
+        let first = (base_addr.next_multiple_of(align) - base_addr) / PAGE_SIZE;
+        let mut i = first;
         while i + count <= PAGES {
             match used[i..i + count].iter().rposition(|&u| u) {
                 None => {
@@ -120,8 +130,8 @@ unsafe impl<const PAGES: usize> PageSource for StaticArena<PAGES> {
                     // SAFETY: in bounds of the arena.
                     return NonNull::new(unsafe { self.base().add(i * PAGE_SIZE) });
                 }
-                // Skip past the used page, keeping alignment.
-                Some(j) => i = (i + j + 1).next_multiple_of(step),
+                // Skip past the used page to the next aligned candidate.
+                Some(j) => i = first + (i + j + 1 - first).next_multiple_of(step),
             }
         }
         None
@@ -179,6 +189,14 @@ impl<S: PageSource> LockedHeap<S> {
         let size = layout.size().max(layout.align()).max(1 << MIN_CLASS_SHIFT);
         (size <= MAX_CLASS).then(|| size.next_power_of_two().trailing_zeros() as usize - MIN_CLASS_SHIFT)
     }
+
+    /// Pages requested from the source for a large `layout`. `alloc` and
+    /// `dealloc` must agree, so both use this. It covers the alignment too,
+    /// which lets sources that align blocks to their size (the frame
+    /// allocator) free by page count alone.
+    fn large_pages(layout: &Layout) -> usize {
+        layout.size().div_ceil(PAGE_SIZE).max(layout.align() / PAGE_SIZE)
+    }
 }
 
 impl<S: PageSource> Default for LockedHeap<S> {
@@ -218,7 +236,7 @@ unsafe impl<S: PageSource + Sync + Send> GlobalAlloc for LockedHeap<S> {
                 block as *mut u8
             }
             None => {
-                let pages = layout.size().div_ceil(PAGE_SIZE);
+                let pages = Self::large_pages(&layout);
                 match source.alloc_pages(pages, layout.align().max(PAGE_SIZE)) {
                     Some(p) => {
                         st.stats.allocated += pages * PAGE_SIZE;
@@ -247,7 +265,7 @@ unsafe impl<S: PageSource + Sync + Send> GlobalAlloc for LockedHeap<S> {
                 st.stats.allocated -= 1 << (c + MIN_CLASS_SHIFT);
             }
             None => {
-                let pages = layout.size().div_ceil(PAGE_SIZE);
+                let pages = Self::large_pages(&layout);
                 st.stats.allocated -= pages * PAGE_SIZE;
                 st.stats.reserved -= pages * PAGE_SIZE;
                 drop(st);
@@ -276,6 +294,41 @@ mod tests {
         unsafe { arena.free_pages(a, 1) };
         assert_eq!(arena.alloc_pages(1, PAGE_SIZE), Some(a));
         assert!(arena.alloc_pages(65, PAGE_SIZE).is_none());
+    }
+
+    #[test]
+    fn arena_alignment_is_by_address() {
+        // Place arenas one and two pages past a 64 KiB boundary: whatever
+        // the field order inside `StaticArena`, one of them starts at an odd
+        // page, so its index and address alignments differ.
+        #[repr(C, align(65536))]
+        struct At<const PAD: usize> {
+            _pad: [Page; PAD],
+            arena: StaticArena<64>,
+        }
+        fn check(arena: &StaticArena<64>) {
+            let align = 2 * PAGE_SIZE;
+            let a = arena.alloc_pages(1, align).unwrap();
+            // The aligned candidate after `a` is two pages on; the one in
+            // between must not be taken.
+            let b = arena.alloc_pages(1, align).unwrap();
+            let c = arena.alloc_pages(3, 4 * PAGE_SIZE).unwrap();
+            for p in [a, b] {
+                assert_eq!(p.as_ptr() as usize % align, 0);
+            }
+            assert_eq!(c.as_ptr() as usize % (4 * PAGE_SIZE), 0);
+        }
+        let one =
+            std::boxed::Box::new(At::<1> { _pad: [const { Page([0; PAGE_SIZE]) }; 1], arena: StaticArena::new() });
+        let two =
+            std::boxed::Box::new(At::<2> { _pad: [const { Page([0; PAGE_SIZE]) }; 2], arena: StaticArena::new() });
+        let odd = [one.arena.base(), two.arena.base()]
+            .iter()
+            .filter(|b| !(**b as usize).is_multiple_of(2 * PAGE_SIZE))
+            .count();
+        assert_eq!(odd, 1, "one arena starts at an odd page");
+        check(&one.arena);
+        check(&two.arena);
     }
 
     #[test]
@@ -341,5 +394,32 @@ mod frame_source_tests {
             heap.dealloc(p, layout);
         }
         assert_eq!(frames.lock().free_frames(), free);
+    }
+
+    #[test]
+    fn heap_on_frame_allocator_alignment_above_size() {
+        let ram: &'static SimRam = std::boxed::Box::leak(std::boxed::Box::new(SimRam::new(0x8000_0000, 1 << 20)));
+        let mut buddy = BuddyAllocator::<_, 12>::new(ram);
+        // SAFETY: simulated RAM owned by the test.
+        unsafe { buddy.add_region(ram.base, ram.end()) };
+        // SAFETY: `ram` maps every frame the buddy returns.
+        let frames: &'static _ = std::boxed::Box::leak(std::boxed::Box::new(unsafe { LockedFrames::new(buddy, ram) }));
+        let heap = LockedHeap::new();
+        heap.init(frames);
+        let free = frames.lock().free_frames();
+        // One page of data, 16 KiB aligned: alloc and dealloc must agree on
+        // the order (4 frames).
+        let layout = Layout::from_size_align(3000, 4 * PAGE_SIZE).unwrap();
+        // SAFETY: non-zero size; freed with the same layout.
+        unsafe {
+            let p = heap.alloc(layout);
+            assert!(!p.is_null());
+            assert_eq!(p as usize % (4 * PAGE_SIZE), 0);
+            assert_eq!(frames.lock().free_frames(), free - 4);
+            heap.dealloc(p, layout);
+        }
+        assert_eq!(frames.lock().free_frames(), free);
+        assert_eq!(heap.stats().allocated, 0);
+        assert!(frames.alloc_pages(1, 4 * PAGE_SIZE).is_none(), "cannot be freed by count alone");
     }
 }
