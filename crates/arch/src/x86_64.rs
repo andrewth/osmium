@@ -425,3 +425,138 @@ pub unsafe fn resume_user(frame: &crate::trap::TrapFrame) -> ! {
         )
     }
 }
+
+/// Starting application processors: the real-mode trampoline a STARTUP IPI
+/// points them at, which takes them to long mode and into the kernel.
+///
+/// A boot CPU calls [`install`](smp::install) once, then for each AP
+/// [`prepare`](smp::prepare) followed by INIT, STARTUP, STARTUP (for example
+/// `osmium_drivers::lapic::LocalApic::start_ap`), and waits for the AP to
+/// check in before preparing the next one: they share the trampoline's slots.
+#[cfg(bare)]
+pub mod smp {
+    /// Physical address the trampoline runs at (STARTUP vector 0x08). The
+    /// page must be free RAM, identity-mapped and writable while installing,
+    /// and identity-mapped in the table passed as [`ApBoot::cr3`].
+    pub const TRAMPOLINE: u64 = 0x8000;
+
+    /// Where an AP goes once in long mode.
+    #[derive(Clone, Copy, Debug)]
+    pub struct ApBoot {
+        /// A page table that identity-maps the trampoline page and `entry`
+        /// (below 4 GiB: it is loaded in 32-bit mode), such as the one built by
+        /// `osmium_boot::pvh_start!` (`boot_pml4`).
+        pub cr3: u64,
+        /// The AP's stack (16-byte aligned).
+        pub stack_top: u64,
+        /// 64-bit code entered with `rdi` = `cpu` and `rsp` = `stack_top`,
+        /// still on the trampoline's GDT, such as the `ap_start64` of
+        /// `pvh_start!(kmain, ap: ap_main)`.
+        pub entry: u64,
+        /// Passed to `entry` in `rdi`.
+        pub cpu: usize,
+    }
+
+    // Real mode -> protected mode -> long mode on `cr3`, then a jump to
+    // `entry`. Assembled here, but it runs as a copy at TRAMPOLINE, so every
+    // absolute address is computed relative to that copy.
+    core::arch::global_asm!(
+        r#"
+    .section .rodata.osmium_trampoline, "a"
+    .code16
+    .globl osmium_tramp_start
+osmium_tramp_start:
+    cli
+    cld
+    mov %cs, %ax
+    mov %ax, %ds
+    lgdtl 4f - osmium_tramp_start
+    mov %cr0, %eax
+    or $1, %eax
+    mov %eax, %cr0
+    ljmpl $0x18, $({base} + 1f - osmium_tramp_start)
+
+    .code32
+1:  mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    mov {base} + (osmium_tramp_cr3 - osmium_tramp_start), %eax
+    mov %eax, %cr3
+    mov %cr4, %eax
+    or $(1 << 5), %eax
+    mov %eax, %cr4
+    mov $0xc0000080, %ecx
+    rdmsr
+    or $((1 << 8) | (1 << 11)), %eax
+    wrmsr
+    mov %cr0, %eax
+    or $((1 << 31) | (1 << 16)), %eax
+    mov %eax, %cr0
+    ljmp $0x08, $({base} + 2f - osmium_tramp_start)
+
+    .code64
+2:  mov {base} + (osmium_tramp_stack - osmium_tramp_start), %rsp
+    mov {base} + (osmium_tramp_cpu - osmium_tramp_start), %rdi
+    mov {base} + (osmium_tramp_entry - osmium_tramp_start), %rax
+    jmp *%rax
+
+    .balign 8
+3:  .quad 0
+    .quad 0x00af9a000000ffff
+    .quad 0x00cf92000000ffff
+    .quad 0x00cf9a000000ffff
+4:  .word 31
+    .long {base} + (3b - osmium_tramp_start)
+    .balign 8
+    .globl osmium_tramp_cr3, osmium_tramp_stack, osmium_tramp_entry, osmium_tramp_cpu, osmium_tramp_end
+osmium_tramp_cr3:   .quad 0
+osmium_tramp_stack: .quad 0
+osmium_tramp_entry: .quad 0
+osmium_tramp_cpu:   .quad 0
+osmium_tramp_end:
+    .text
+"#,
+        base = const TRAMPOLINE,
+        options(att_syntax)
+    );
+
+    unsafe extern "C" {
+        static osmium_tramp_start: u8;
+        static osmium_tramp_cr3: u8;
+        static osmium_tramp_stack: u8;
+        static osmium_tramp_entry: u8;
+        static osmium_tramp_cpu: u8;
+        static osmium_tramp_end: u8;
+    }
+
+    /// Copies the trampoline to [`TRAMPOLINE`].
+    ///
+    /// # Safety
+    /// The trampoline page must be free, identity-mapped and writable, and no
+    /// AP may be starting.
+    pub unsafe fn install() {
+        let (start, end) = (&raw const osmium_tramp_start, &raw const osmium_tramp_end);
+        // SAFETY: the caller owns the page; the image is far smaller than one.
+        unsafe { core::ptr::copy_nonoverlapping(start, TRAMPOLINE as *mut u8, end as usize - start as usize) };
+    }
+
+    /// Fills the installed trampoline's slots for the next AP.
+    ///
+    /// # Safety
+    /// [`install`] must have run, and the previous AP (if any) must be past
+    /// the trampoline, that is, running at its `entry`.
+    pub unsafe fn prepare(boot: &ApBoot) {
+        let start = &raw const osmium_tramp_start as u64;
+        let slot = |s: *const u8| (TRAMPOLINE + (s as u64 - start)) as *mut u64;
+        debug_assert!(boot.cr3 < 1 << 32 && boot.stack_top.is_multiple_of(16));
+        // SAFETY: slots inside the installed copy; the AP reads them only
+        // after the STARTUP IPI that follows these writes.
+        unsafe {
+            slot(&raw const osmium_tramp_cr3).write_volatile(boot.cr3);
+            slot(&raw const osmium_tramp_stack).write_volatile(boot.stack_top);
+            slot(&raw const osmium_tramp_entry).write_volatile(boot.entry);
+            slot(&raw const osmium_tramp_cpu).write_volatile(boot.cpu as u64);
+        }
+    }
+}

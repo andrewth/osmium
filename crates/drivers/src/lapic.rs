@@ -76,6 +76,28 @@ impl LocalApic {
         self.send_icr(dest, ICR_STARTUP | page as u32);
     }
 
+    /// Starts the application processor with APIC id `dest` through the
+    /// trampoline in `osmium_arch::x86_64::smp`: fills its slots from `boot`,
+    /// then INIT, 10 ms, and STARTUP twice, 200 µs apart. `delay_ns` busy-waits
+    /// (a calibrated PIT or TSC). Returns once the IPIs are sent; the caller
+    /// waits for the AP to check in before starting the next one.
+    ///
+    /// # Safety
+    /// As for `smp::prepare`: the trampoline is installed and no other AP is
+    /// still in it. `boot` must describe a valid stack and entry.
+    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+    pub unsafe fn start_ap(&self, dest: u8, boot: &osmium_arch::x86_64::smp::ApBoot, delay_ns: impl Fn(u64)) {
+        use osmium_arch::x86_64::smp;
+        // SAFETY: the caller upholds `prepare`'s contract.
+        unsafe { smp::prepare(boot) };
+        self.send_init(dest);
+        delay_ns(10_000_000);
+        for _ in 0..2 {
+            self.send_startup(dest, (smp::TRAMPOLINE >> 12) as u8);
+            delay_ns(200_000);
+        }
+    }
+
     fn send_icr(&self, dest: u8, low: u32) {
         self.write(ICR_HIGH, (dest as u32) << 24);
         self.write(ICR_LOW, low);

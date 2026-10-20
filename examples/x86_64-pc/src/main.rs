@@ -43,73 +43,6 @@ use osmium::sync::{IrqSpinLock, Once};
 
 osmium::boot::pvh_start!(kmain, ap: ap_main);
 
-// Real-mode AP trampoline. It is assembled here but runs as a copy at
-// `TRAMPOLINE` (0x8000), so every absolute address is computed relative to
-// that copy. Real mode -> protected mode -> long mode on the boot page tables,
-// then a jump to `tramp_entry`.
-core::arch::global_asm!(
-    r#"
-    .section .rodata.trampoline, "a"
-    .code16
-    .globl tramp_start
-tramp_start:
-    cli
-    cld
-    mov %cs, %ax
-    mov %ax, %ds
-    lgdtl tramp_gdtr - tramp_start
-    mov %cr0, %eax
-    or $1, %eax
-    mov %eax, %cr0
-    ljmpl $0x18, $(0x8000 + tramp_pm32 - tramp_start)
-
-    .code32
-tramp_pm32:
-    mov $0x10, %ax
-    mov %ax, %ds
-    mov %ax, %es
-    mov %ax, %ss
-    mov 0x8000 + (tramp_cr3 - tramp_start), %eax
-    mov %eax, %cr3
-    mov %cr4, %eax
-    or $(1 << 5), %eax
-    mov %eax, %cr4
-    mov $0xc0000080, %ecx
-    rdmsr
-    or $((1 << 8) | (1 << 11)), %eax
-    wrmsr
-    mov %cr0, %eax
-    or $((1 << 31) | (1 << 16)), %eax
-    mov %eax, %cr0
-    ljmp $0x08, $(0x8000 + tramp_lm64 - tramp_start)
-
-    .code64
-tramp_lm64:
-    mov 0x8000 + (tramp_stack - tramp_start), %rsp
-    mov 0x8000 + (tramp_cpu - tramp_start), %rdi
-    mov 0x8000 + (tramp_entry - tramp_start), %rax
-    jmp *%rax
-
-    .balign 8
-tramp_gdt:
-    .quad 0
-    .quad 0x00af9a000000ffff
-    .quad 0x00cf92000000ffff
-    .quad 0x00cf9a000000ffff
-tramp_gdtr:
-    .word 31
-    .long 0x8000 + (tramp_gdt - tramp_start)
-    .balign 8
-    .globl tramp_cr3, tramp_stack, tramp_entry, tramp_cpu, tramp_end
-tramp_cr3:   .quad 0
-tramp_stack: .quad 0
-tramp_entry: .quad 0
-tramp_cpu:   .quad 0
-tramp_end:
-"#,
-    options(att_syntax)
-);
-
 // User programs: position-independent ring-3 code, copied into user pages.
 // System calls: rax = number, rdi/rsi/rdx = arguments. `user_hello` enters
 // with `syscall`, `user_bad` with `int 0x80`; the kernel sees the same frame.
@@ -157,12 +90,6 @@ unsafe extern "C" {
     static user_hello_end: u8;
     static user_bad: u8;
     static user_bad_end: u8;
-    static tramp_start: u8;
-    static tramp_cr3: u8;
-    static tramp_stack: u8;
-    static tramp_entry: u8;
-    static tramp_cpu: u8;
-    static tramp_end: u8;
     static boot_pml4: u8;
     fn ap_start64();
     static _kernel_start: u8;
@@ -177,7 +104,7 @@ fn sym(s: &u8) -> u64 {
 
 const COM1: u16 = 0x3f8;
 /// Physical address the AP trampoline is copied to (STARTUP vector 0x08).
-const TRAMPOLINE: u64 = 0x8000;
+const TRAMPOLINE: u64 = x86::smp::TRAMPOLINE;
 const IPI_VECTOR: u8 = 33;
 /// Vector for COM1's receive interrupt, routed through the I/O APIC.
 const COM1_VECTOR: u8 = 40;
@@ -439,29 +366,20 @@ extern "C" fn kmain(start_info: usize) -> ! {
     osmium::sched::set_remote_wake_hook(|cpu| {
         LAPIC.get().unwrap().send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, IPI_VECTOR)
     });
-    // Linker symbols delimiting the trampoline image and its slots.
-    let (start, end) = (&raw const tramp_start as u64, &raw const tramp_end as u64);
-    let slot = |s: *const u8| (TRAMPOLINE + (s as u64 - start)) as *mut u64;
     // SAFETY: the trampoline page is free low memory (reserved from the
-    // allocator) mapped writable above; the image fits in one page.
-    unsafe { core::ptr::copy_nonoverlapping(start as *const u8, TRAMPOLINE as *mut u8, (end - start) as usize) };
+    // allocator), mapped writable above; no AP is starting yet.
+    unsafe { x86::smp::install() };
     for (cpu, apic_id) in APIC_IDS.iter().enumerate().take(ncpus).skip(1) {
         let stack = alloc::vec![0u8; 64 * 1024].leak();
-        // SAFETY: slots inside the copied trampoline; the AP reads them
-        // after STARTUP, which happens after these writes.
-        unsafe {
-            slot(&raw const tramp_cr3).write_volatile(&raw const boot_pml4 as u64);
-            slot(&raw const tramp_stack).write_volatile((stack.as_ptr() as u64 + stack.len() as u64) & !15);
-            slot(&raw const tramp_entry).write_volatile(ap_start64 as *const () as u64);
-            slot(&raw const tramp_cpu).write_volatile(cpu as u64);
-        }
-        let id = apic_id.load(Ordering::Relaxed) as u8;
-        apic.send_init(id);
-        pit.wait_ns(10_000_000);
-        for _ in 0..2 {
-            apic.send_startup(id, (TRAMPOLINE >> 12) as u8);
-            pit.wait_ns(200_000);
-        }
+        let boot = x86::smp::ApBoot {
+            cr3: &raw const boot_pml4 as u64,
+            stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
+            entry: ap_start64 as *const () as u64,
+            cpu,
+        };
+        // SAFETY: the trampoline is installed and the previous AP has
+        // checked in (below); the boot tables identity-map it and the kernel.
+        unsafe { apic.start_ap(apic_id.load(Ordering::Relaxed) as u8, &boot, |ns| pit.wait_ns(ns)) };
         // One AP at a time: they share the trampoline's slots.
         while ONLINE.load(Ordering::Acquire) <= cpu {
             core::hint::spin_loop();
