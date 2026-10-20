@@ -45,19 +45,27 @@
 //! - A process is freed when its task has exited and its CPU has switched
 //!   away; until then its address space may still be active.
 //!
-//! Each process runs a single task; there is no `fork`, `clone` or `execve`
-//! yet.
+//! - [`set_platform`] enables `fork` and `execve`: it tells them how to make
+//!   and activate address spaces, how to resume a forked child in user mode
+//!   (`resume_user` in `osmium_arch::riscv64` / `aarch64`), and where a new
+//!   program's stack and `mmap` area go.
+//!
+//! Each process runs a single task: `clone` makes processes (`fork`,
+//! `vfork`), not threads. Forked memory is copied eagerly, not copy-on-write,
+//! and `execve` loads static, non-PIE ELF executables only.
 #![no_std]
 
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod exec;
 pub mod fd;
 mod memory;
 mod process;
 pub mod syscall;
 
+pub use exec::{ARG_MAX, Platform, UserEntry, set_platform};
 pub use fd::{FdTable, OpenFile, set_console};
 pub use memory::{AddressSpace, UserMemory};
 pub use process::{ExitStatus, Pid, Process, current, exit, root_for};

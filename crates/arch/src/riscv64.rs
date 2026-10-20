@@ -190,3 +190,29 @@ pub unsafe fn enter_user(entry: usize, user_sp: usize) -> ! {
         )
     }
 }
+
+/// Returns to user mode with every register taken from `frame`, as if
+/// returning from the trap that saved it: how a forked child resumes where
+/// its parent made the system call. The frame's `status` must select U-mode
+/// (SPP clear), as in any frame saved on a trap from U-mode. Does not return.
+///
+/// # Safety
+/// As for [`enter_user`]; `frame.epc` and `frame.x[2]` must be valid user
+/// addresses in the active address space.
+#[cfg(all(bare, not(feature = "riscv-m-mode")))]
+pub unsafe fn resume_user(frame: &crate::trap::TrapFrame) -> ! {
+    debug_assert!(frame.from_user(), "resume_user needs a U-mode frame");
+    // SAFETY: the caller upholds the contract. The return path only reads
+    // the frame and leaves on the user stack, so the frame may sit on this
+    // stack, which nothing uses again: the next trap from U-mode starts at
+    // the top of the task's kernel stack (TrapCpu).
+    unsafe {
+        asm!(
+            "csrci sstatus, 0x2",
+            "mv sp, {frame}",
+            "j osmium_trap_return",
+            frame = in(reg) frame,
+            options(noreturn),
+        )
+    }
+}

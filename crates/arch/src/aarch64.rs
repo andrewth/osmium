@@ -108,6 +108,44 @@ pub unsafe fn enter_user(entry: u64, user_sp: u64, kernel_sp: u64) -> ! {
     }
 }
 
+/// Returns to EL0 with every register taken from `frame`, as if returning
+/// from the exception that saved it: how a forked child resumes where its
+/// parent made the system call. `frame.spsr` must select EL0t, as in any
+/// frame saved on an exception from EL0. Exceptions from EL0 then arrive on
+/// `kernel_sp`, as with [`enter_user`]. Does not return.
+///
+/// # Safety
+/// As for [`enter_user`]. `frame` must lie below `kernel_sp` on that stack,
+/// or off it: the frame is copied to the stack's top.
+#[cfg(all(bare, not(feature = "aarch64-el2")))]
+pub unsafe fn resume_user(frame: &crate::trap::TrapFrame, kernel_sp: u64) -> ! {
+    const SIZE: usize = core::mem::size_of::<crate::trap::TrapFrame>();
+    debug_assert!(frame.spsr & 0xf == 0, "resume_user needs an EL0t frame");
+    debug_assert!(kernel_sp.is_multiple_of(16));
+    // SAFETY: the caller upholds the contract. With IRQs masked, the frame
+    // is copied to the top of the kernel stack highest pair first: a source
+    // lower on the same stack is never overwritten before it is read. The
+    // return path then pops it, leaving SP_EL1 at `kernel_sp`.
+    unsafe {
+        asm!(
+            "msr daifset, #0xf",
+            "add x9, x9, #{size}",
+            "sub x11, x10, #{size}",
+            "2:",
+            "ldp x12, x13, [x9, #-16]!",
+            "stp x12, x13, [x10, #-16]!",
+            "cmp x10, x11",
+            "b.ne 2b",
+            "mov sp, x10",
+            "b osmium_trap_return",
+            in("x9") frame as *const crate::trap::TrapFrame,
+            in("x10") kernel_sp,
+            size = const SIZE,
+            options(noreturn),
+        )
+    }
+}
+
 /// Power State Coordination Interface: CPU power control through firmware
 /// or the hypervisor.
 pub mod psci {

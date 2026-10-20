@@ -96,6 +96,10 @@ osmium_trap_entry:
 5:
     mv a0, sp
     call osmium_trap_dispatch
+    // The return path, also entered by `riscv64::resume_user` with sp at a
+    // frame and interrupts masked.
+.globl osmium_trap_return
+osmium_trap_return:
     ld t0, 256(sp)
     csrw sepc, t0
     ld t0, 264(sp)

@@ -146,7 +146,12 @@ fn console() -> &'static Arc<Console> {
         let c = Arc::new(Console::default());
         set_console(c.clone());
         let etc: Arc<dyn File> = Arc::new(Dir(alloc::vec![("motd", Arc::new(Text("welcome\n", 3)) as Arc<dyn File>)]));
-        let root = Dir(alloc::vec![("hello.txt", Arc::new(Text("hello, file\n", 2)) as Arc<dyn File>), ("etc", etc)]);
+        let bin: Arc<dyn File> = Arc::new(Dir(alloc::vec![("prog", Arc::new(Bytes(program(), 5)) as Arc<dyn File>)]));
+        let root = Dir(alloc::vec![
+            ("hello.txt", Arc::new(Text("hello, file\n", 2)) as Arc<dyn File>),
+            ("etc", etc),
+            ("bin", bin),
+        ]);
         set_vfs(Box::leak(Box::new(Vfs::new(Arc::new(root)))));
         c
     })
@@ -169,7 +174,7 @@ fn call(p: &Process, sys: Sys, args: &[u64]) -> i64 {
     a[..args.len()].copy_from_slice(args);
     match dispatch(p, sys.number(), a) {
         Outcome::Return(v) => v,
-        Outcome::Exit(s) => panic!("unexpected exit {s:?}"),
+        o => panic!("unexpected {o:?}"),
     }
 }
 
@@ -265,7 +270,7 @@ fn files_through_the_vfs() {
     assert_eq!(call(&p, Sys::Openat, &[-100i64 as u64, DATA, 0, 0]), -(Errno::ENOENT.0 as i64));
     assert_eq!(call(&p, Sys::Getcwd, &[DATA, 3]), -(Errno::ERANGE.0 as i64));
 
-    // getdents64 on "/": ".", "..", "hello.txt", "etc".
+    // getdents64 on "/": ".", "..", "hello.txt", "etc", "bin".
     put(&p, DATA, b"/\0");
     let dir = call(&p, Sys::Openat, &[-100i64 as u64, DATA, 0, 0]) as u64;
     let n = call(&p, Sys::Getdents64, &[dir, DATA + 0x1000, 0x1000]) as usize;
@@ -278,7 +283,7 @@ fn files_through_the_vfs() {
         names.push(String::from_utf8(name[..name.iter().position(|&b| b == 0).unwrap()].to_vec()).unwrap());
         off += reclen;
     }
-    assert_eq!(names, [".", "..", "hello.txt", "etc"]);
+    assert_eq!(names, [".", "..", "hello.txt", "etc", "bin"]);
     assert_eq!(call(&p, Sys::Getdents64, &[dir, DATA + 0x1000, 0x1000]), 0, "exhausted");
 }
 
@@ -292,4 +297,228 @@ fn processes_are_found_by_pid_until_dropped() {
     assert_eq!(ExitStatus::Signal(11).wait_status(), 11);
     drop(p);
     assert!(Process::find(pid).is_none());
+}
+
+/// An executable file.
+struct Bytes(&'static [u8], u64);
+
+impl File for Bytes {
+    fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+        let rest = self.0.get(off as usize..).unwrap_or(&[]);
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        Ok(n)
+    }
+    fn stat(&self) -> Stat {
+        Stat { ino: self.1, size: self.0.len() as u64, mode: 0o755, nlink: 1, ..Stat::default() }
+    }
+}
+
+const ENTRY: u64 = 0x40_0180;
+
+/// A static x86_64 ELF executable: an RX segment loading the first 0x200
+/// bytes of the file (headers included) at 0x40_0000, and an RW segment
+/// with 2 bytes of data and .bss at 0x40_2000.
+fn program() -> &'static [u8] {
+    let mut f = alloc::vec![0u8; 0x300];
+    f[..4].copy_from_slice(b"\x7fELF");
+    f[4] = 2;
+    f[5] = 1;
+    f[6] = 1;
+    f[16..18].copy_from_slice(&2u16.to_le_bytes());
+    f[18..20].copy_from_slice(&62u16.to_le_bytes());
+    f[24..32].copy_from_slice(&ENTRY.to_le_bytes());
+    f[32..40].copy_from_slice(&64u64.to_le_bytes());
+    f[52..54].copy_from_slice(&64u16.to_le_bytes());
+    f[54..56].copy_from_slice(&56u16.to_le_bytes());
+    f[56..58].copy_from_slice(&2u16.to_le_bytes());
+    let ph = |f: &mut Vec<u8>, at: usize, flags: u32, off: u64, va: u64, filesz: u64, memsz: u64| {
+        f[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+        f[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+        f[at + 8..at + 16].copy_from_slice(&off.to_le_bytes());
+        f[at + 16..at + 24].copy_from_slice(&va.to_le_bytes());
+        f[at + 32..at + 40].copy_from_slice(&filesz.to_le_bytes());
+        f[at + 40..at + 48].copy_from_slice(&memsz.to_le_bytes());
+        f[at + 48..at + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    };
+    ph(&mut f, 64, 5, 0, 0x40_0000, 0x200, 0x200);
+    ph(&mut f, 120, 6, 0x200, 0x40_2000, 2, 0x100);
+    f[0x180..0x184].copy_from_slice(&[0x90, 0x90, 0x0f, 0x05]);
+    f[0x200..0x202].copy_from_slice(&[0xaa, 0xbb]);
+    f.leak()
+}
+
+/// Frames for address spaces `execve` creates.
+fn exec_frames() -> &'static HeapFrames {
+    static F: OnceLock<&'static HeapFrames> = OnceLock::new();
+    F.get_or_init(leaked_frames)
+}
+
+static ACTIVATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const STACK_TOP: u64 = 0x7000_0000;
+
+fn platform() {
+    static P: OnceLock<()> = OnceLock::new();
+    P.get_or_init(|| {
+        set_platform(Platform {
+            new_memory: || Ok(Box::new(space(exec_frames()))),
+            activate: |root| ACTIVATED.store(root.0, std::sync::atomic::Ordering::SeqCst),
+            resume: |_| unreachable!("host tests never resume user mode"),
+            stack_top: STACK_TOP,
+            stack_size: 0x4000,
+            mmap_area: 0x200_0000..0x210_0000,
+        })
+    });
+}
+
+#[test]
+fn fork_copies_memory_and_shares_open_files() {
+    platform();
+    let (p, frames) = process("parent");
+    put(&p, DATA, b"before");
+    put(&p, DATA + 0x100, b"/hello.txt\0");
+    let fd = call(&p, Sys::Openat, &[-100i64 as u64, DATA + 0x100, 0, 0]) as u64;
+    assert_eq!(call(&p, Sys::Read, &[fd, DATA + 0x200, 3]), 3);
+    let brk = call(&p, Sys::Brk, &[0x40_2000]) as u64;
+    put(&p, 0x40_1000, b"heap");
+
+    let live = frames.live();
+    let Outcome::Fork { child, stack: 0 } = dispatch(&p, Sys::Fork.number(), [0; 6]) else { panic!("no fork") };
+    let c = Process::find(child).unwrap();
+    assert_eq!(frames.live(), live + 4 + 2 + 4, "4 data and 2 heap pages; a root, an L1 and two L0 tables");
+    assert_eq!((c.parent(), p.children()), (Some(p.pid()), alloc::vec![child]));
+    assert_eq!(call(&c, Sys::Getppid, &[]), p.pid().0 as i64);
+    assert_eq!(c.name(), "parent");
+
+    // Same contents, separate pages.
+    assert_eq!(get(&c, DATA, 6), b"before");
+    assert_eq!(get(&c, 0x40_1000, 4), b"heap");
+    put(&c, DATA, b"child!");
+    assert_eq!(get(&p, DATA, 6), b"before");
+    assert_eq!(call(&c, Sys::Brk, &[0]) as u64, brk);
+
+    // The descriptor shares its offset.
+    assert_eq!(call(&c, Sys::Read, &[fd, DATA + 0x200, 3]), 3);
+    assert_eq!(call(&p, Sys::Read, &[fd, DATA + 0x200, 100]), 6);
+    assert_eq!(get(&p, DATA + 0x200, 6), b" file\n");
+
+    // Threads are not supported; vfork's flags are.
+    assert_eq!(call(&p, Sys::Clone, &[0x100 | 17]), -(Errno::EINVAL.0 as i64), "CLONE_VM alone is a thread");
+    let Outcome::Fork { child: v, .. } = dispatch(&p, Sys::Clone.number(), [0x4100 | 17, 0, 0, 0, 0, 0]) else {
+        panic!("no vfork")
+    };
+
+    // Reaping: the children are gone once waited for.
+    let wnohang = call(&p, Sys::Wait4, &[-1i64 as u64, DATA + 0x300, 1, 0]);
+    assert_eq!(wnohang, 0, "nobody has exited");
+    c.set_exited(ExitStatus::Code(7));
+    drop(c);
+    assert_eq!(call(&p, Sys::Wait4, &[-1i64 as u64, DATA + 0x300, 0, DATA + 0x400]), child.0 as i64);
+    assert_eq!(get(&p, DATA + 0x300, 4), 0x700i32.to_ne_bytes());
+    assert!(Process::find(child).is_none(), "reaped and freed");
+    assert_eq!(frames.live(), live + 6 + 4, "only the vfork child's copy is left");
+    assert_eq!(call(&p, Sys::Wait4, &[child.0 as u64, 0, 1, 0]), -(Errno::ECHILD.0 as i64), "already reaped");
+    Process::find(v).unwrap().set_exited(ExitStatus::Signal(11));
+    assert_eq!(call(&p, Sys::Wait4, &[v.0 as u64, DATA + 0x300, 0, 0]), v.0 as i64);
+    assert_eq!(get(&p, DATA + 0x300, 4), 11i32.to_ne_bytes());
+    assert_eq!(call(&p, Sys::Wait4, &[-1i64 as u64, 0, 0, 0]), -(Errno::ECHILD.0 as i64));
+    assert_eq!(frames.live(), live);
+}
+
+/// The NUL-terminated string at `va`.
+fn cstr(p: &Process, va: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let b = get(p, va + out.len() as u64, 1)[0];
+        if b == 0 {
+            return out;
+        }
+        out.push(b);
+    }
+}
+
+fn word(p: &Process, va: u64) -> u64 {
+    u64::from_ne_bytes(get(p, va, 8).try_into().unwrap())
+}
+
+#[test]
+fn execve_loads_a_program_with_its_arguments() {
+    platform();
+    let (p, frames) = process("old");
+    // A pointer array: argv = ["prog", "-x"], envp = ["HOME=/"].
+    put(&p, DATA, b"/bin/prog\0prog\0-x\0HOME=/\0");
+    let argv: Vec<u8> = [DATA + 10, DATA + 15, 0].iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let envp: Vec<u8> = [DATA + 18, 0].iter().flat_map(|v| v.to_ne_bytes()).collect();
+    put(&p, DATA + 0x100, &argv);
+    put(&p, DATA + 0x200, &envp);
+    put(&p, DATA + 0x300, b"/hello.txt\0");
+    let kept = call(&p, Sys::Openat, &[-100i64 as u64, DATA + 0x300, 0, 0]) as u64;
+    let closed = call(&p, Sys::Openat, &[-100i64 as u64, DATA + 0x300, 0o2000000, 0]) as u64;
+    assert_eq!(call(&p, Sys::Fcntl, &[closed, 1, 0]), 1, "FD_CLOEXEC");
+
+    // Failures leave the process as it was.
+    put(&p, DATA + 0x400, b"/hello.txt\0/missing\0");
+    assert_eq!(call(&p, Sys::Execve, &[DATA + 0x400, 0, 0]), -(Errno::EACCES.0 as i64), "not executable");
+    assert_eq!(call(&p, Sys::Execve, &[DATA + 0x40b, 0, 0]), -(Errno::ENOENT.0 as i64));
+    assert_eq!(get(&p, DATA + 10, 4), b"prog");
+
+    let Outcome::Exec { pc, sp } = dispatch(&p, Sys::Execve.number(), [DATA, DATA + 0x100, DATA + 0x200, 0, 0, 0])
+    else {
+        panic!("no exec")
+    };
+    assert_eq!(pc, ENTRY);
+    assert_eq!(ACTIVATED.load(std::sync::atomic::Ordering::SeqCst), p.root().0);
+    assert_eq!(frames.live(), 1, "the old space is freed; its kernel root was leaked");
+    assert_eq!(p.name(), "prog");
+    assert_eq!(get(&p, ENTRY, 4), [0x90, 0x90, 0x0f, 0x05]);
+    assert_eq!(get(&p, 0x40_2000, 3), [0xaa, 0xbb, 0], "data, then .bss");
+    assert_eq!(call(&p, Sys::Brk, &[0]), 0x40_3000);
+    assert!(p.memory().read(DATA, &mut [0]).is_err(), "the old program's memory is gone");
+
+    // The initial stack.
+    assert!(sp.is_multiple_of(16) && sp < STACK_TOP);
+    assert_eq!(word(&p, sp), 2, "argc");
+    assert_eq!(cstr(&p, word(&p, sp + 8)), b"prog");
+    assert_eq!(cstr(&p, word(&p, sp + 16)), b"-x");
+    assert_eq!(word(&p, sp + 24), 0);
+    assert_eq!(cstr(&p, word(&p, sp + 32)), b"HOME=/");
+    assert_eq!(word(&p, sp + 40), 0);
+    let mut aux = std::collections::BTreeMap::new();
+    let mut at = sp + 48;
+    loop {
+        let (k, v) = (word(&p, at), word(&p, at + 8));
+        if k == 0 {
+            break;
+        }
+        aux.insert(k, v);
+        at += 16;
+    }
+    assert_eq!((aux[&3], aux[&4], aux[&5], aux[&6], aux[&9]), (0x40_0040, 56, 2, 4096, ENTRY));
+    assert_eq!(get(&p, aux[&3], 4), 1u32.to_le_bytes(), "AT_PHDR points at the first program header");
+    get(&p, aux[&25], 16);
+
+    // Descriptors survive unless close-on-exec.
+    assert_eq!(call(&p, Sys::Read, &[kept, sp, 0]), 0);
+    assert_eq!(call(&p, Sys::Read, &[closed, sp, 0]), -(Errno::EBADF.0 as i64));
+    assert_eq!(call(&p, Sys::Mmap, &[0, 0x1000, 3, 0x22, u64::MAX, 0]), 0x200_0000, "the platform's mmap area");
+}
+
+#[test]
+fn dup_and_fcntl() {
+    let (p, _) = process("dup");
+    assert_eq!(call(&p, Sys::Dup, &[1]), 3);
+    assert_eq!(call(&p, Sys::Dup2, &[1, 9]), 9);
+    assert_eq!(call(&p, Sys::Dup2, &[9, 9]), 9);
+    assert_eq!(call(&p, Sys::Dup3, &[9, 9, 0]), -(Errno::EINVAL.0 as i64));
+    assert_eq!(call(&p, Sys::Dup3, &[1, 5, 0o2000000]), 5);
+    assert_eq!(call(&p, Sys::Fcntl, &[5, 1, 0]), 1);
+    assert_eq!(call(&p, Sys::Fcntl, &[5, 2, 0]), 0);
+    assert_eq!(call(&p, Sys::Fcntl, &[5, 1, 0]), 0);
+    assert_eq!(call(&p, Sys::Fcntl, &[1, 0, 7]), 7, "F_DUPFD from 7");
+    assert_eq!(call(&p, Sys::Fcntl, &[1, 1030, 0]), 4, "F_DUPFD_CLOEXEC");
+    assert_eq!(call(&p, Sys::Fcntl, &[4, 1, 0]), 1);
+    assert_eq!(call(&p, Sys::Fcntl, &[1, 3, 0]), 2, "O_RDWR");
+    assert_eq!(call(&p, Sys::Dup, &[42]), -(Errno::EBADF.0 as i64));
+    assert_eq!(p.files().lock().len(), 3 + 5);
 }

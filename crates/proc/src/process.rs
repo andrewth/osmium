@@ -2,9 +2,10 @@
 //! the task that runs them.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use osmium_mm::addr::{PAGE_SIZE, PhysAddr};
@@ -45,6 +46,7 @@ impl ExitStatus {
 }
 
 /// The program break: `brk` grows the heap from `start` up to `limit`.
+#[derive(Clone, Copy)]
 struct Brk {
     start: u64,
     end: u64,
@@ -53,15 +55,19 @@ struct Brk {
 
 /// A process: one user address space and one task running in it.
 ///
-/// Build it with [`Process::new`], then [`Process::spawn`] its task. The task
-/// holds the only long-lived reference, so the address space is freed once
-/// the task has exited and its CPU has switched away from it, unless a
-/// waiter still holds the process.
+/// Build it with [`Process::new`], then [`Process::spawn`] its task, or
+/// [`Process::fork`] an existing one. The task holds a reference, and so
+/// does the parent of a forked process until it reaps the child with
+/// [`Process::wait_child`]. The address space is freed once both are gone:
+/// the task has exited and its CPU has switched away from it, and (for a
+/// forked process) the parent has reaped it or ended itself. Until then an
+/// exited child, a zombie, keeps its whole address space.
 pub struct Process {
     pid: Pid,
     parent: Option<Pid>,
-    name: &'static str,
-    memory: Box<dyn UserMemory>,
+    name: IrqSpinLock<&'static str>,
+    /// Replaced by `execve`, which is why it is shared and locked.
+    memory: IrqSpinLock<Arc<dyn UserMemory>>,
     brk: IrqSpinLock<Brk>,
     /// Next address `mmap` hands out (growing upwards), and its end.
     mmap: IrqSpinLock<(u64, u64)>,
@@ -70,6 +76,16 @@ pub struct Process {
     umask: u32,
     status: Once<ExitStatus>,
     exited: WaitQueue,
+    /// Forked children not yet reaped.
+    children: IrqSpinLock<Vec<Arc<Process>>>,
+    /// Woken whenever one of `children` exits.
+    child_exited: WaitQueue,
+}
+
+impl core::fmt::Debug for Process {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Process").field("pid", &self.pid).field("name", &self.name()).finish_non_exhaustive()
+    }
 }
 
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
@@ -84,22 +100,95 @@ impl Process {
     /// [`crate::AddressSpace::load_elf`]). Its descriptors 0, 1 and 2 are
     /// the console set with [`crate::set_console`], if any.
     pub fn new(name: &'static str, memory: impl UserMemory + 'static, brk_start: u64) -> Arc<Self> {
-        let pid = Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed));
-        let p = Arc::new(Self {
-            pid,
-            parent: None,
-            name,
-            memory: Box::new(memory),
-            brk: IrqSpinLock::new(Brk { start: brk_start, end: brk_start, limit: brk_start.saturating_add(BRK_MAX) }),
-            mmap: IrqSpinLock::new((0, 0)),
-            files: Mutex::new(FdTable::with_console()),
-            cwd: IrqSpinLock::new(String::from("/")),
+        Self::new_boxed(name, Box::new(memory), brk_start)
+    }
+
+    /// [`Process::new`] for memory that is already boxed, such as an empty
+    /// space from [`crate::Platform::new_memory`] that [`Process::exec`]
+    /// will fill.
+    pub fn new_boxed(name: &'static str, memory: Box<dyn UserMemory>, brk_start: u64) -> Arc<Self> {
+        let brk = Brk { start: brk_start, end: brk_start, limit: brk_start.saturating_add(BRK_MAX) };
+        Self::register(Self::with(None, name, memory.into(), brk, (0, 0), FdTable::with_console(), String::from("/")))
+    }
+
+    fn with(
+        parent: Option<Pid>,
+        name: &'static str,
+        memory: Arc<dyn UserMemory>,
+        brk: Brk,
+        mmap: (u64, u64),
+        files: FdTable,
+        cwd: String,
+    ) -> Self {
+        Self {
+            pid: Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed)),
+            parent,
+            name: IrqSpinLock::new(name),
+            memory: IrqSpinLock::new(memory),
+            brk: IrqSpinLock::new(brk),
+            mmap: IrqSpinLock::new(mmap),
+            files: Mutex::new(files),
+            cwd: IrqSpinLock::new(cwd),
             umask: 0o022,
             status: Once::new(),
             exited: WaitQueue::new(),
-        });
-        TABLE.lock().insert(pid, Arc::downgrade(&p));
+            children: IrqSpinLock::new(Vec::new()),
+            child_exited: WaitQueue::new(),
+        }
+    }
+
+    fn register(p: Self) -> Arc<Self> {
+        let p = Arc::new(p);
+        TABLE.lock().insert(p.pid, Arc::downgrade(&p));
         p
+    }
+
+    /// `fork`: a new process with a copy of this one's memory, sharing its
+    /// open files (and their offsets), with the same working directory,
+    /// break and `mmap` area, and this one as its parent. The child has no
+    /// task yet: spawn one that resumes user mode where the parent called
+    /// `fork`, with a return value of 0 (see [`crate::syscall::handle`]).
+    pub fn fork(&self) -> Result<Arc<Process>, Errno> {
+        let memory: Arc<dyn UserMemory> = self.memory().fork()?.into();
+        let files = self.files.lock().clone();
+        let child = Self::register(Self::with(
+            Some(self.pid),
+            self.name(),
+            memory,
+            *self.brk.lock(),
+            *self.mmap.lock(),
+            files,
+            self.cwd(),
+        ));
+        self.children.lock().push(child.clone());
+        Ok(child)
+    }
+
+    /// `wait4`: reaps an exited child, `pid` or any if `None`, and returns
+    /// its id and status. Blocks until one exits, unless `nohang`, when it
+    /// returns `Ok(None)` instead. Fails with `ECHILD` if there is no such
+    /// child.
+    pub fn wait_child(&self, pid: Option<Pid>, nohang: bool) -> Result<Option<(Pid, ExitStatus)>, Errno> {
+        let matches = |c: &Arc<Process>| pid.is_none_or(|pid| c.pid == pid);
+        let reaped = self.child_exited.wait_until(|| {
+            let mut children = self.children.lock();
+            if !children.iter().any(matches) {
+                return Some(Err(Errno::ECHILD));
+            }
+            match children.iter().position(|c| matches(c) && c.exit_status().is_some()) {
+                // Hand the child out: dropping it may free its memory, which
+                // must not happen here, under the queue's lock.
+                Some(i) => Some(Ok(Some(children.swap_remove(i)))),
+                None if nohang => Some(Ok(None)),
+                None => None,
+            }
+        })?;
+        Ok(reaped.map(|c| (c.pid, c.exit_status().expect("reaped children have exited"))))
+    }
+
+    /// Forked children that have not been reaped, exited or not.
+    pub fn children(&self) -> Vec<Pid> {
+        self.children.lock().iter().map(|c| c.pid).collect()
     }
 
     /// Lets `mmap` place anonymous mappings in `range` (page-aligned).
@@ -131,19 +220,37 @@ impl Process {
         self.parent
     }
 
-    /// The name given to [`Process::new`].
+    /// The name given to [`Process::new`], or after [`Process::exec`] the
+    /// program's file name.
     pub fn name(&self) -> &'static str {
-        self.name
+        *self.name.lock()
     }
 
     /// The process's memory.
-    pub fn memory(&self) -> &dyn UserMemory {
-        &*self.memory
+    pub fn memory(&self) -> Arc<dyn UserMemory> {
+        self.memory.lock().clone()
     }
 
     /// The root page table to activate when switching to this process.
     pub fn root(&self) -> PhysAddr {
-        self.memory.root()
+        self.memory.lock().root()
+    }
+
+    /// Replaces the program: the memory, its break and `mmap` area, and the
+    /// name, closing descriptors marked close-on-exec. Returns the old
+    /// memory, which must stay alive until its table is no longer active.
+    pub(crate) fn replace_image(
+        &self,
+        name: &str,
+        memory: Arc<dyn UserMemory>,
+        brk_start: u64,
+        mmap: core::ops::Range<u64>,
+    ) -> Arc<dyn UserMemory> {
+        *self.brk.lock() = Brk { start: brk_start, end: brk_start, limit: brk_start.saturating_add(BRK_MAX) };
+        *self.mmap.lock() = (mmap.start, mmap.end);
+        *self.name.lock() = intern(name);
+        self.files.lock().close_on_exec();
+        core::mem::replace(&mut *self.memory.lock(), memory)
     }
 
     /// The open-file table.
@@ -177,11 +284,14 @@ impl Process {
         self.exited.wait_until(|| self.exit_status())
     }
 
-    /// Records the exit status (the first one wins) and wakes waiters. Does
-    /// not stop the task; see [`exit`].
+    /// Records the exit status (the first one wins) and wakes waiters,
+    /// including a parent in `wait4`. Does not stop the task; see [`exit`].
     pub fn set_exited(&self, status: ExitStatus) {
         let _ = self.status.set(status);
         self.exited.wake_all();
+        if let Some(parent) = self.parent.and_then(Process::find) {
+            parent.child_exited.wake_all();
+        }
     }
 
     /// `brk(addr)`: moves the program break to `addr` if it is within
@@ -193,13 +303,14 @@ impl Process {
             return brk.end;
         }
         let (old, new) = (brk.end.next_multiple_of(PAGE), addr.next_multiple_of(PAGE));
+        let memory = self.memory();
         if new > old {
-            if self.memory.map_anon(old, new - old, MapFlags::RW).is_err() {
-                self.memory.unmap(old, new - old);
+            if memory.map_anon(old, new - old, MapFlags::RW).is_err() {
+                memory.unmap(old, new - old);
                 return brk.end;
             }
         } else if new < old {
-            self.memory.unmap(new, old - new);
+            memory.unmap(new, old - new);
         }
         brk.end = addr;
         brk.end
@@ -214,7 +325,7 @@ impl Process {
         if va.checked_add(len).is_none_or(|end| end > area.1) {
             return Err(Errno::ENOMEM);
         }
-        self.memory.map_anon(va, len, flags)?;
+        self.memory().map_anon(va, len, flags)?;
         area.0 += len;
         Ok(va)
     }
@@ -224,6 +335,20 @@ impl Drop for Process {
     fn drop(&mut self) {
         TABLE.lock().remove(&self.pid);
     }
+}
+
+/// A `'static` copy of `name`, shared by every process with that name: one
+/// small leak per distinct program name, so [`Process::name`] can stay
+/// `&'static str`.
+fn intern(name: &str) -> &'static str {
+    static NAMES: IrqSpinLock<BTreeSet<&'static str>> = IrqSpinLock::new(BTreeSet::new());
+    let mut names = NAMES.lock();
+    if let Some(&n) = names.get(name) {
+        return n;
+    }
+    let n: &'static str = String::from(name).leak();
+    names.insert(n);
+    n
 }
 
 /// The process the running task belongs to, if it is a user task.

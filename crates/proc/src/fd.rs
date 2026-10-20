@@ -97,9 +97,18 @@ impl OpenFile {
     }
 }
 
-/// A process's descriptor table.
+/// A process's descriptor table. Cloning it (for `fork`) shares every open
+/// file description, offsets included, as POSIX requires.
+#[derive(Clone)]
 pub struct FdTable {
-    slots: Vec<Option<Arc<OpenFile>>>,
+    slots: Vec<Option<Slot>>,
+}
+
+/// One descriptor: an open file and its close-on-exec flag.
+#[derive(Clone)]
+struct Slot {
+    file: Arc<OpenFile>,
+    cloexec: bool,
 }
 
 static CONSOLE: Once<Arc<dyn File>> = Once::new();
@@ -122,28 +131,72 @@ impl FdTable {
         let mut t = Self::new();
         if let Some(c) = CONSOLE.get() {
             let open = OpenFile::new(c.clone(), Access::RW);
-            t.slots = alloc::vec![Some(open.clone()), Some(open.clone()), Some(open)];
+            let slot = Slot { file: open, cloexec: false };
+            t.slots = alloc::vec![Some(slot.clone()), Some(slot.clone()), Some(slot)];
         }
         t
     }
 
     /// The open file behind `fd`.
     pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
-        usize::try_from(fd).ok().and_then(|i| self.slots.get(i)?.clone()).ok_or(Errno::EBADF)
+        self.slot(fd).map(|s| s.file.clone())
+    }
+
+    fn slot(&self, fd: i32) -> Result<&Slot, Errno> {
+        usize::try_from(fd).ok().and_then(|i| self.slots.get(i)?.as_ref()).ok_or(Errno::EBADF)
     }
 
     /// Installs `file` at the lowest free descriptor and returns it.
     pub fn insert(&mut self, file: Arc<OpenFile>) -> Result<i32, Errno> {
-        let fd = match self.slots.iter().position(Option::is_none) {
-            Some(i) => i,
-            None if self.slots.len() < MAX_FDS => {
-                self.slots.push(None);
-                self.slots.len() - 1
+        self.insert_from(0, file, false)
+    }
+
+    /// Installs `file` at the lowest free descriptor not below `min`, closed
+    /// by `execve` if `cloexec`, and returns it.
+    pub fn insert_from(&mut self, min: usize, file: Arc<OpenFile>, cloexec: bool) -> Result<i32, Errno> {
+        let fd = match self.slots.iter().skip(min).position(Option::is_none) {
+            Some(i) => min + i,
+            None if self.slots.len().max(min) < MAX_FDS => {
+                let fd = self.slots.len().max(min);
+                self.slots.resize(fd + 1, None);
+                fd
             }
-            None => return Err(Errno::EMFILE),
+            None => return Err(if min >= MAX_FDS { Errno::EINVAL } else { Errno::EMFILE }),
         };
-        self.slots[fd] = Some(file);
+        self.slots[fd] = Some(Slot { file, cloexec });
         Ok(fd as i32)
+    }
+
+    /// Makes `new` refer to `file` (closing whatever it referred to), as
+    /// `dup2` and `dup3` do.
+    pub fn insert_at(&mut self, new: i32, file: Arc<OpenFile>, cloexec: bool) -> Result<(), Errno> {
+        let i = usize::try_from(new).ok().filter(|&i| i < MAX_FDS).ok_or(Errno::EBADF)?;
+        if i >= self.slots.len() {
+            self.slots.resize(i + 1, None);
+        }
+        self.slots[i] = Some(Slot { file, cloexec });
+        Ok(())
+    }
+
+    /// Whether `execve` closes `fd`.
+    pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
+        self.slot(fd).map(|s| s.cloexec)
+    }
+
+    /// Sets whether `execve` closes `fd`.
+    pub fn set_cloexec(&mut self, fd: i32, on: bool) -> Result<(), Errno> {
+        let slot = usize::try_from(fd).ok().and_then(|i| self.slots.get_mut(i)?.as_mut()).ok_or(Errno::EBADF)?;
+        slot.cloexec = on;
+        Ok(())
+    }
+
+    /// Closes every descriptor marked close-on-exec.
+    pub fn close_on_exec(&mut self) {
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|s| s.cloexec) {
+                *slot = None;
+            }
+        }
     }
 
     /// Closes `fd`.

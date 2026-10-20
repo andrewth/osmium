@@ -201,6 +201,10 @@ osmium_trap_common_sp_saved:
     str x0, [sp, #288]
     mov x0, sp
     bl osmium_trap_dispatch
+    // The return path, also entered by `aarch64::resume_user` with sp at a
+    // frame and interrupts masked.
+.globl osmium_trap_return
+osmium_trap_return:
     ldr x1, [sp, #256]
     msr elr_el1, x1
     ldr x1, [sp, #264]

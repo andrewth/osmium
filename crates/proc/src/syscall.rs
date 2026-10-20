@@ -10,7 +10,7 @@ use osmium_fs::{Errno, FileKind, OpenFlags, PATH_MAX, Stat};
 use osmium_mm::paging::MapFlags;
 
 use crate::fd::{Access, OpenFile};
-use crate::process::{ExitStatus, Process};
+use crate::process::{ExitStatus, Pid, Process};
 
 /// The calls this layer implements, independent of their numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +41,15 @@ pub enum Sys {
     Munmap,
     SchedYield,
     Uname,
+    Clone,
+    Fork,
+    Vfork,
+    Execve,
+    Wait4,
+    Dup,
+    Dup2,
+    Dup3,
+    Fcntl,
 }
 
 /// Linux system-call numbers for x86_64.
@@ -48,6 +57,15 @@ pub enum Sys {
 const NUMBERS: &[(u64, Sys)] = &[
     (0, Sys::Read),
     (1, Sys::Write),
+    (32, Sys::Dup),
+    (33, Sys::Dup2),
+    (56, Sys::Clone),
+    (57, Sys::Fork),
+    (58, Sys::Vfork),
+    (59, Sys::Execve),
+    (61, Sys::Wait4),
+    (72, Sys::Fcntl),
+    (292, Sys::Dup3),
     (3, Sys::Close),
     (5, Sys::Fstat),
     (8, Sys::Lseek),
@@ -77,6 +95,12 @@ const NUMBERS: &[(u64, Sys)] = &[
 #[cfg(not(target_arch = "x86_64"))]
 const NUMBERS: &[(u64, Sys)] = &[
     (17, Sys::Getcwd),
+    (23, Sys::Dup),
+    (24, Sys::Dup3),
+    (25, Sys::Fcntl),
+    (220, Sys::Clone),
+    (221, Sys::Execve),
+    (260, Sys::Wait4),
     (29, Sys::Ioctl),
     (34, Sys::Mkdirat),
     (35, Sys::Unlinkat),
@@ -125,6 +149,7 @@ mod oflag {
     pub const EXCL: u64 = 0o200;
     pub const TRUNC: u64 = 0o1000;
     pub const APPEND: u64 = 0o2000;
+    pub const CLOEXEC: u64 = 0o2000000;
     #[cfg(target_arch = "aarch64")]
     pub const DIRECTORY: u64 = 0o40000;
     #[cfg(not(target_arch = "aarch64"))]
@@ -147,6 +172,24 @@ pub enum Outcome {
     Return(i64),
     /// The process asked to exit: end it with [`crate::exit`].
     Exit(ExitStatus),
+    /// The process forked `child` (see [`Process::fork`]). Return the
+    /// child's pid to the parent, and spawn the child's task resuming from a
+    /// copy of the parent's registers with a return value of 0 and, if
+    /// `stack` is not 0, that stack pointer.
+    Fork {
+        /// The new process, held by its parent until reaped.
+        child: Pid,
+        /// The child's stack pointer, or 0 to keep the parent's.
+        stack: u64,
+    },
+    /// The process replaced its program: resume user mode at `pc` with
+    /// stack `sp` and every other register cleared.
+    Exec {
+        /// The new program's entry point.
+        pc: u64,
+        /// Its initial stack pointer.
+        sp: u64,
+    },
 }
 
 type SysResult = Result<u64, Errno>;
@@ -187,6 +230,19 @@ pub fn dispatch(p: &Process, nr: u64, a: [u64; 6]) -> Outcome {
             Ok(0)
         }
         Sys::Uname => uname(p, a[0]),
+        Sys::Fork | Sys::Vfork => return outcome(fork(p, SIGCHLD, [0; 4])),
+        // asm-generic: (flags, stack, parent_tid, tls, child_tid);
+        // x86_64: (flags, stack, parent_tid, child_tid, tls).
+        #[cfg(target_arch = "x86_64")]
+        Sys::Clone => return outcome(fork(p, a[0], [a[1], a[2], a[3], a[4]])),
+        #[cfg(not(target_arch = "x86_64"))]
+        Sys::Clone => return outcome(fork(p, a[0], [a[1], a[2], a[4], a[3]])),
+        Sys::Execve => return outcome(execve(p, a[0], a[1], a[2])),
+        Sys::Wait4 => wait4(p, a[0] as i32, a[1], a[2], a[3]),
+        Sys::Dup => dup(p, fd),
+        Sys::Dup2 => dup3(p, fd, a[1] as i32, 0, true),
+        Sys::Dup3 => dup3(p, fd, a[1] as i32, a[2], false),
+        Sys::Fcntl => fcntl(p, fd, a[1], a[2]),
     };
     Outcome::Return(match r {
         Ok(v) => v as i64,
@@ -289,6 +345,12 @@ fn get_u64(p: &Process, va: u64) -> Result<u64, Errno> {
 
 /// Reads a NUL-terminated path from user memory.
 fn get_path(p: &Process, va: u64) -> Result<String, Errno> {
+    String::from_utf8(get_cstr(p, va, PATH_MAX, Errno::ENAMETOOLONG)?).map_err(|_| Errno::EINVAL)
+}
+
+/// Reads a NUL-terminated string from user memory, failing with `too_long`
+/// once it reaches `max` bytes.
+fn get_cstr(p: &Process, va: u64, max: usize, too_long: Errno) -> Result<alloc::vec::Vec<u8>, Errno> {
     let mut bytes = alloc::vec::Vec::new();
     let mut addr = va;
     loop {
@@ -301,12 +363,12 @@ fn get_path(p: &Process, va: u64) -> Result<String, Errno> {
             break;
         }
         bytes.extend_from_slice(&chunk[..n]);
-        if bytes.len() >= PATH_MAX {
-            return Err(Errno::ENAMETOOLONG);
+        if bytes.len() >= max {
+            return Err(too_long);
         }
         addr += n as u64;
     }
-    String::from_utf8(bytes).map_err(|_| Errno::EINVAL)
+    Ok(bytes)
 }
 
 fn vfs() -> Result<&'static osmium_fs::Vfs, Errno> {
@@ -367,7 +429,7 @@ fn openat(p: &Process, dirfd: i32, path: u64, flags: u64, mode: u32) -> SysResul
         return Err(Errno::EISDIR);
     }
     let open = OpenFile::with_path(file, access, path);
-    p.files().lock().insert(open).map(|fd| fd as u64)
+    p.files().lock().insert_from(0, open, flags & oflag::CLOEXEC != 0).map(|fd| fd as u64)
 }
 
 fn lseek(p: &Process, fd: i32, off: i64, whence: u64) -> SysResult {
@@ -522,6 +584,148 @@ fn munmap(p: &Process, addr: u64, len: u64) -> SysResult {
     Ok(0)
 }
 
+fn outcome(r: Result<Outcome, Errno>) -> Outcome {
+    r.unwrap_or_else(|e| Outcome::Return(-(e.0 as i64)))
+}
+
+const SIGCHLD: u64 = 17;
+
+mod clone_flag {
+    /// The signal sent to the parent when the child exits (ignored).
+    pub const EXIT_SIGNAL: u64 = 0xff;
+    pub const VM: u64 = 0x100;
+    pub const VFORK: u64 = 0x4000;
+    pub const PARENT_SETTID: u64 = 0x10_0000;
+    pub const CHILD_CLEARTID: u64 = 0x20_0000;
+    pub const CHILD_SETTID: u64 = 0x100_0000;
+}
+
+/// `fork`, `vfork`, and `clone` as C libraries use it to fork: a new
+/// process, never a thread. `vfork` (`CLONE_VM | CLONE_VFORK`) gets a copy
+/// too, which programs that follow vfork's rules cannot tell apart, except
+/// that the parent does not wait. `CLONE_CHILD_CLEARTID` is accepted and
+/// ignored: it matters only to other threads, and there are none.
+/// `tids` is (stack, parent_tid, child_tid, tls).
+fn fork(p: &Process, flags: u64, [stack, ptid, ctid, _tls]: [u64; 4]) -> Result<Outcome, Errno> {
+    use clone_flag::*;
+    crate::exec::platform()?;
+    let flags = flags & !EXIT_SIGNAL;
+    let vfork = flags & (VM | VFORK) == VM | VFORK;
+    if flags & !(VM | VFORK | PARENT_SETTID | CHILD_CLEARTID | CHILD_SETTID) != 0 || (flags & VM != 0 && !vfork) {
+        return Err(Errno::EINVAL);
+    }
+    let child = p.fork()?;
+    let tid = child.pid().0.to_ne_bytes();
+    if flags & PARENT_SETTID != 0 {
+        p.memory().write(ptid, &tid)?;
+    }
+    if flags & CHILD_SETTID != 0 {
+        child.memory().write(ctid, &tid)?;
+    }
+    Ok(Outcome::Fork { child: child.pid(), stack })
+}
+
+/// The NULL-terminated array of string pointers at `va` (NULL itself is an
+/// empty array), at most [`crate::exec::ARG_MAX`] bytes in all.
+fn get_strings(p: &Process, va: u64, total: &mut usize) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, Errno> {
+    let mut out = alloc::vec::Vec::new();
+    if va == 0 {
+        return Ok(out);
+    }
+    loop {
+        let ptr = get_u64(p, va + out.len() as u64 * 8)?;
+        if ptr == 0 {
+            return Ok(out);
+        }
+        let s = get_cstr(p, ptr, crate::exec::ARG_MAX, Errno::E2BIG)?;
+        *total += s.len() + 1 + 8;
+        if *total > crate::exec::ARG_MAX {
+            return Err(Errno::E2BIG);
+        }
+        out.push(s);
+    }
+}
+
+fn execve(p: &Process, path: u64, argv: u64, envp: u64) -> Result<Outcome, Errno> {
+    crate::exec::platform()?;
+    let path = path_at(p, AT_FDCWD, path)?;
+    let mut total = 0;
+    let argv = get_strings(p, argv, &mut total)?;
+    let envp = get_strings(p, envp, &mut total)?;
+    let argv: alloc::vec::Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+    let envp: alloc::vec::Vec<&[u8]> = envp.iter().map(|e| e.as_slice()).collect();
+    let entry = p.exec(&path, &argv, &envp)?;
+    Ok(Outcome::Exec { pc: entry.pc, sp: entry.sp })
+}
+
+/// `wait4(pid, wstatus, options, rusage)`. Without process groups, `pid` 0
+/// and below -1 mean any child, like -1. Resource usage reads as zero.
+fn wait4(p: &Process, pid: i32, wstatus: u64, options: u64, rusage: u64) -> SysResult {
+    const WNOHANG: u64 = 1;
+    let which = (pid > 0).then_some(Pid(pid as u32));
+    let Some((pid, status)) = p.wait_child(which, options & WNOHANG != 0)? else { return Ok(0) };
+    if wstatus != 0 {
+        p.memory().write(wstatus, &status.wait_status().to_ne_bytes())?;
+    }
+    if rusage != 0 {
+        p.memory().write(rusage, &[0; 144])?;
+    }
+    Ok(pid.0 as u64)
+}
+
+fn dup(p: &Process, fd: i32) -> SysResult {
+    let mut files = p.files().lock();
+    let f = files.get(fd)?;
+    files.insert(f).map(|fd| fd as u64)
+}
+
+/// `dup3`, or `dup2` when `dup2`: the same, except that `old == new` is
+/// allowed and there are no flags.
+fn dup3(p: &Process, old: i32, new: i32, flags: u64, dup2: bool) -> SysResult {
+    let mut files = p.files().lock();
+    let f = files.get(old)?;
+    if old == new {
+        return if dup2 { Ok(new as u64) } else { Err(Errno::EINVAL) };
+    }
+    if flags & !oflag::CLOEXEC != 0 {
+        return Err(Errno::EINVAL);
+    }
+    files.insert_at(new, f, flags & oflag::CLOEXEC != 0)?;
+    Ok(new as u64)
+}
+
+fn fcntl(p: &Process, fd: i32, cmd: u64, arg: u64) -> SysResult {
+    const F_DUPFD: u64 = 0;
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_GETFL: u64 = 3;
+    const F_SETFL: u64 = 4;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
+    const FD_CLOEXEC: u64 = 1;
+    let mut files = p.files().lock();
+    let f = files.get(fd)?;
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let min = usize::try_from(arg).map_err(|_| Errno::EINVAL)?;
+            files.insert_from(min, f, cmd == F_DUPFD_CLOEXEC).map(|fd| fd as u64)
+        }
+        F_GETFD => Ok(if files.cloexec(fd)? { FD_CLOEXEC } else { 0 }),
+        F_SETFD => files.set_cloexec(fd, arg & FD_CLOEXEC != 0).map(|()| 0),
+        F_GETFL => {
+            let a = f.access();
+            let mode = match (a.read, a.write) {
+                (true, true) => oflag::RDWR,
+                (false, true) => oflag::WRONLY,
+                _ => 0,
+            };
+            Ok(mode | if a.append { oflag::APPEND } else { 0 })
+        }
+        // No status flag (O_NONBLOCK, O_APPEND) can be changed yet.
+        F_SETFL => Ok(0),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 fn uname(p: &Process, buf: u64) -> SysResult {
     let machine = if cfg!(target_arch = "x86_64") {
         "x86_64"
@@ -555,12 +759,71 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
         return None;
     };
     match dispatch(&p, nr, args) {
-        Outcome::Return(v) => {
-            frame.set_return(v as u64);
-            None
+        Outcome::Return(v) => frame.set_return(v as u64),
+        Outcome::Exit(status) => return Some(status),
+        Outcome::Fork { child, stack } => {
+            let mut regs = frame.clone();
+            regs.set_return(0);
+            if stack != 0 {
+                set_sp(&mut regs, stack);
+            }
+            // `fork` checked both: the parent holds the child, and the
+            // platform is set.
+            let child = Process::find(child).expect("the parent holds its child");
+            let resume = crate::exec::platform().expect("fork needs a platform").resume;
+            child.spawn(osmium_sched::TaskBuilder::new(child.name()), move || resume(regs));
+            frame.set_return(child.pid().0 as u64);
         }
-        Outcome::Exit(status) => Some(status),
+        Outcome::Exec { pc, sp } => start(frame, pc, sp),
     }
+    None
+}
+
+/// Points `frame` at a new program's entry and stack, other registers clear.
+#[cfg(target_arch = "riscv64")]
+fn start(frame: &mut TrapFrame, pc: u64, sp: u64) {
+    frame.x = [0; 32];
+    frame.x[2] = sp;
+    frame.epc = pc;
+}
+
+#[cfg(target_arch = "riscv64")]
+fn set_sp(frame: &mut TrapFrame, sp: u64) {
+    frame.x[2] = sp;
+}
+
+#[cfg(target_arch = "aarch64")]
+fn start(frame: &mut TrapFrame, pc: u64, sp: u64) {
+    frame.x = [0; 31];
+    frame.sp = sp;
+    frame.elr = pc;
+    // EL0t, interrupts unmasked; no user thread pointer.
+    frame.spsr = 0;
+    frame.tpidrro = 0;
+}
+
+#[cfg(target_arch = "aarch64")]
+fn set_sp(frame: &mut TrapFrame, sp: u64) {
+    frame.sp = sp;
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn start(frame: &mut TrapFrame, pc: u64, sp: u64) {
+    let f = frame;
+    for r in [
+        &mut f.rax, &mut f.rbx, &mut f.rcx, &mut f.rdx, &mut f.rsi, &mut f.rdi, &mut f.rbp, &mut f.r8, &mut f.r9,
+        &mut f.r10, &mut f.r11, &mut f.r12, &mut f.r13, &mut f.r14, &mut f.r15,
+    ] {
+        *r = 0;
+    }
+    f.rip = pc;
+    f.rsp = sp;
+    f.rflags = 0x202;
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn set_sp(frame: &mut TrapFrame, sp: u64) {
+    frame.rsp = sp;
 }
 
 /// The call number and six arguments, and on RISC-V steps the PC past the

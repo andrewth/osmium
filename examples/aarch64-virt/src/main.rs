@@ -564,7 +564,60 @@ fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> (Arc<Task>, Weak<P
     (task, Arc::downgrade(&process))
 }
 
+/// The Rust program that forks and execs, from `examples/user/init.rs`.
+static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
+
+/// What `fork` and `execve` need: spaces like `new_space`'s, a stack below
+/// 0xff_0000_0000 and an `mmap` area above it, as for `spawn_elf`.
+/// osmium-proc makes loaded and copied code visible to instruction fetch.
+fn platform() -> osmium::proc::Platform {
+    osmium::proc::Platform {
+        new_memory: || {
+            // SAFETY: the kernel table lives for the whole run.
+            let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().unwrap(), 0..1) };
+            Ok(alloc::boxed::Box::new(space.map_err(|_| osmium::fs::Errno::ENOMEM)?))
+        },
+        activate: |root| {
+            // SAFETY: the table shares the kernel's root entry 0.
+            unsafe { aarch64::write_ttbr0_el1(root.0) };
+            osmium::arch::mmu::flush_all();
+        },
+        resume: |frame| {
+            let kernel_top = osmium::sched::current().kernel_stack_range().unwrap().end as u64;
+            // SAFETY: the child's task is running with its table active (the
+            // switch hook); the frame, its parent's from an svc, is on this
+            // task's stack.
+            unsafe { aarch64::resume_user(&frame, kernel_top) }
+        },
+        stack_top: 0xff_0000_0000,
+        stack_size: 64 * 1024,
+        mmap_area: 0xa0_0000_0000..0xa1_0000_0000,
+    }
+}
+
+/// Runs `/bin/init`, which forks, execs and waits, on `cpu`; its children
+/// go wherever the scheduler puts them.
+fn fork_exec_demo(cpu: usize) {
+    demos::user::install("init", INIT_ELF);
+    let process = Process::new_boxed("init", (platform().new_memory)().unwrap(), 0);
+    let init = Arc::downgrade(&process);
+    let task = process.spawn(TaskBuilder::new("init").cpu(cpu), || {
+        let entry = osmium::proc::current().unwrap().exec("/bin/init", &[b"init"], &[]).expect("exec /bin/init");
+        let kernel_top = osmium::sched::current().kernel_stack_range().unwrap().end as u64;
+        // SAFETY: exec activated the new table; vectors are installed and
+        // `kernel_top` is this task's own kernel stack.
+        unsafe { aarch64::enter_user(entry.pc, entry.sp, kernel_top) }
+    });
+    drop(process);
+    task.join();
+    // The task holds the process: let it go too.
+    drop(task);
+    let freed = demos::user::freed(&[init]);
+    println!("[user]  init and its children reaped; {freed} of 1 init address space torn down");
+}
+
 fn user_demo(ncpus: usize) {
+    osmium::proc::set_platform(platform());
     // SAFETY: linker symbols delimiting the user programs.
     let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
     let cpu = 1 % ncpus;
@@ -585,6 +638,7 @@ fn user_demo(ncpus: usize) {
     // switched away from them.
     let freed = demos::user::freed(&processes);
     println!("[user]  {freed} of 4 address spaces torn down with their tasks");
+    fork_exec_demo(cpu);
 }
 
 /// Handles `svc #0` from EL0. ELR already points past the `svc`.

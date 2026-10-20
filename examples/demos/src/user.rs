@@ -33,6 +33,7 @@ impl File for LogConsole {
 /// `/tmp`, and `/dev` holding `console`, `null` and `zero`.
 pub fn boot_vfs() {
     let vfs: &'static Vfs = Box::leak(Box::new(Vfs::new(RamFs::new(1).root())));
+    assert!(VFS.set(vfs).is_ok(), "boot_vfs called twice");
     vfs.mkdir("/etc", 0o755).unwrap();
     let motd = vfs.open("/etc/motd", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
     motd.write(0, b"welcome to osmium\n").unwrap();
@@ -46,6 +47,20 @@ pub fn boot_vfs() {
     vfs.mount("/dev", Arc::new(dev)).unwrap();
     osmium::proc::set_vfs(vfs);
     osmium::proc::set_console(console);
+}
+
+static VFS: osmium::sync::Once<&'static Vfs> = osmium::sync::Once::new();
+
+/// Writes `image` to `/bin/<name>` with mode 0755 (making `/bin` if
+/// needed), for `execve`. Call after [`boot_vfs`].
+pub fn install(name: &str, image: &[u8]) {
+    let vfs = VFS.get().expect("boot_vfs first");
+    if vfs.stat("/bin", true).is_err() {
+        vfs.mkdir("/bin", 0o755).unwrap();
+    }
+    let path = alloc::format!("/bin/{name}");
+    let file = vfs.open(&path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNC, 0o755).unwrap();
+    assert_eq!(file.write(0, image), Ok(image.len()));
 }
 
 /// Waits, briefly, until `processes` have been freed, and returns how many
