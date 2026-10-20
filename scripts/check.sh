@@ -146,6 +146,7 @@ if command -v qemu-system-x86_64 >/dev/null; then
         'guest exit Shutdown: 1 hypercall, LSR 0x60 (port) 0x60 (MMIO)' \
         "\\[guest\\] 64-bit, paging on, MMIO through the guest's page tables" \
         '\[guest\] 3 local APIC timer interrupts through a 64-bit IDT' \
+        '\[guest\] COM1 IRQ 4 through the I/O APIC, received: z' \
         '64-bit guest exit Shutdown, LSR 0x60 in r12' \
         '\[smp-guest\] cpu 1: up in real mode at 0x8000 after INIT/STARTUP' \
         '\[smp-guest\] cpu 0: IPI 0x41 from cpu 1 through the local APICs' \

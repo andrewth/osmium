@@ -38,7 +38,8 @@ use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryM
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
 use osmium::virt::devices::{
-    IpiKind, IpiTarget, LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualLapic, VirtualPic, VirtualPit, decode_icr,
+    IOAPIC_WINDOW, IpiKind, IpiTarget, LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualIoApic, VirtualLapic,
+    VirtualPic, VirtualPit, decode_icr,
 };
 use osmium::virt::smp::GuestCpus;
 use osmium::virt::x86::{self as svm, SvmPages, SvmVcpu};
@@ -204,7 +205,8 @@ x86_guest_end:
 // tables, unmapped in the nested ones), so every access is a nested page
 // fault whose instruction is fetched through the guest's tables. Then it
 // programs its emulated local APIC's timer (periodic, vector 0x40) and
-// takes three interrupts through a 64-bit IDT.
+// takes three interrupts through a 64-bit IDT, then routes COM1's IRQ 4
+// through the emulated I/O APIC and takes a received byte.
 core::arch::global_asm!(
     r#"
     .section .rodata.guest, "a"
@@ -241,9 +243,43 @@ lm_guest:
     jz 8f
     mov %al, (%rbx)
     jmp 7b
-8:  mov $1, %eax
+    // I/O APIC: COM1 (GSI 4) to vector 0x44 on APIC 0, edge, unmasked.
+8:  mov $0xfec00000, %r8
+    movl $0x18, (%r8)               // IOREGSEL: redirection entry 4, low
+    movl $0x44, 0x10(%r8)           // IOWIN
+    movl $0x19, (%r8)               // high: destination APIC 0
+    movl $0, 0x10(%r8)
+    mov $0x3f9, %dx                 // 16550 IER: receive interrupt
+    mov $1, %al
+    out %al, %dx
+9:  sti
+    hlt
+    cli
+    cmpb $0, lm_rx(%rip)
+    je 9b
+    lea 10f(%rip), %rsi
+11: lodsb
+    test %al, %al
+    jz 12f
+    mov %al, (%rbx)
+    jmp 11b
+12: movb lm_rx(%rip), %al
+    mov %al, (%rbx)
+    movb $0x0a, (%rbx)
+    mov $1, %eax
     vmmcall
 4:  jmp 4b
+
+lm_com1:                            // COM1 via the I/O APIC: read, EOI
+    push %rax
+    push %rdx
+    mov $0x3f8, %dx
+    in %dx, %al
+    movb %al, lm_rx(%rip)
+    movl $0, 0xb0(%rdi)             // local APIC EOI
+    pop %rdx
+    pop %rax
+    iretq
 
 lm_timer:                           // APIC timer: count, EOI, return
     incl lm_ticks(%rip)
@@ -252,6 +288,9 @@ lm_timer:                           // APIC timer: count, EOI, return
 
 3:  .asciz "[guest] 64-bit, paging on, MMIO through the guest's page tables\n"
 6:  .asciz "[guest] 3 local APIC timer interrupts through a 64-bit IDT\n"
+10: .asciz "[guest] COM1 IRQ 4 through the I/O APIC, received: "
+lm_rx:
+    .byte 0
     .balign 4
 lm_ticks:
     .long 0
@@ -270,6 +309,13 @@ lm_idt:
     .word 0x08
     .word 0x8e00                    // present, 64-bit interrupt gate
     .word (GBASE + lm_timer - lm_guest) >> 16
+    .long 0
+    .long 0
+    .space 3 * 16
+    .word (GBASE + lm_com1 - lm_guest) & 0xffff
+    .word 0x08
+    .word 0x8e00
+    .word (GBASE + lm_com1 - lm_guest) >> 16
     .long 0
     .long 0
 lm_idt_end:
@@ -510,6 +556,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
 const GUEST_ENTRY: u64 = 0x10_0000;
 const GUEST_MMIO_UART: u64 = 0xfed0_0000;
 const GUEST_LAPIC: u64 = 0xfee0_0000;
+const GUEST_IOAPIC: u64 = 0xfec0_0000;
 /// The emulated local APIC timer's input clock.
 const LAPIC_TIMER_HZ: u64 = 100_000_000;
 
@@ -742,9 +789,30 @@ fn long_mode_demo() {
     mmio.insert(GUEST_MMIO_UART, 8, Arc::new(uart)).unwrap();
     let intr = Arc::new(AtomicBool::new(false));
     let i = intr.clone();
-    let apic = Arc::new(VirtualLapic::new(0, LAPIC_TIMER_HZ, clock(), move |level| i.store(level, Ordering::Release)));
+    // COM1 -> I/O APIC input 4 -> local APIC. The I/O APIC holds the APIC
+    // weakly: the APIC's EOI hook holds the I/O APIC.
+    let ioapic: Arc<Once<Arc<VirtualIoApic>>> = Arc::new(Once::new());
+    let io = ioapic.clone();
+    let apic = Arc::new(
+        VirtualLapic::new(0, LAPIC_TIMER_HZ, clock(), move |level| i.store(level, Ordering::Release))
+            .with_eoi(move |v| io.get().unwrap().eoi(v)),
+    );
+    let a = Arc::downgrade(&apic);
+    let ioapic = ioapic
+        .call_once(|| {
+            Arc::new(VirtualIoApic::new(0, move |m| {
+                if let Some(a) = a.upgrade() {
+                    a.deliver(m.vector)
+                }
+            }))
+        })
+        .clone();
     mmio.insert(GUEST_LAPIC, LAPIC_WINDOW, apic.clone()).unwrap();
+    mmio.insert(GUEST_IOAPIC, IOAPIC_WINDOW, ioapic.clone()).unwrap();
+    let io = ioapic.clone();
+    let com1 = Arc::new(Uart16550Model::new(|_| {}).with_irq(move |level| io.set_level(4, level)));
     let pio = Bus::new();
+    pio.insert(0x3f8, 8, com1.clone()).unwrap();
 
     let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
@@ -756,9 +824,15 @@ fn long_mode_demo() {
     let a = apic.clone();
     vcpu.connect_intr(move || a.acknowledge());
     let now = clock();
+    let mut typed = false;
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { nr: 1, .. } => ControlFlow::Break(VmExit::Shutdown),
         VmExit::Halt => loop {
+            // Once the timer is stopped the guest waits for COM1: type a key.
+            if apic.next_deadline().is_none() && !typed {
+                typed = true;
+                com1.push_input(b'z');
+            }
             apic.poll();
             if v.interrupt_pending() {
                 break ControlFlow::Continue(());
