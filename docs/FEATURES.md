@@ -205,6 +205,13 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ AArch64 EL2 `Vcpu` (`aarch64-el2`, non-VHE): world switch through guest-exit hooks in the lower-EL vectors, EL1 system-register switching, stage 2 via `VTTBR_EL2`, MMIO emulation from data-abort syndromes, trapped `wfi`, IRQ exits, a virtual-IRQ line (`HCR_EL2.VI`), and PSCI for guests
 - 🗺 VMX `Vcpu` backend, SVM VMLOAD/VMSAVE state and MMIO under guest paging, virtual interrupt controllers (APLIC/IMSIC, vGIC), guest FP state, multi-vCPU guests
 
+### `osmium-proc`: processes and system calls
+- ✅ `Process`: a user address space, a descriptor table of `osmium_fs::File`s, working directory, program break, `mmap` area and exit status, attached to its task through `TaskBuilder::data`; `current`, `root_for` (the switch hook's table), `exit`, `wait`, lookup by `Pid`
+- ✅ `AddressSpace<F, A>`: shares the kernel's root entries, loads ELF or flat images, maps and unmaps anonymous memory, and frees its pages with the process; user copies walk the process's own table (user-accessible, writable for stores) and go through the physical mapping, so no SUM/PAN/SMAP handling is needed
+- ✅ One portable dispatcher with each architecture's Linux numbers, open flags and `struct stat`: `read`, `write`, `readv`, `writev`, `openat`, `close`, `lseek`, `fstat`, `newfstatat`, `getdents64`, `ioctl`, `getcwd`, `chdir`, `mkdirat`, `unlinkat`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `brk`, `mmap` (anonymous), `munmap`, `sched_yield`, `uname`; `syscall::handle` decodes the trap frame on RISC-V, AArch64 and x86_64
+- ✅ All three examples run their user programs as processes; the Rust user program exercises `getpid`, `uname`, `brk`, `mmap` and `writev`
+- 🗺 `fork`/`clone`, `execve`, `wait4`, signals, multi-threaded processes, file-backed `mmap`
+
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name
 

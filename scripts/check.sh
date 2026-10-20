@@ -60,17 +60,17 @@ boot() {
 # guest runs in VS-mode under the H extension.
 stick=$(mktemp)
 truncate -s 1M "$stick"
-EXPECT='ARP: 10.0.2.2 is at;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01;wrote and read back block 2047;keyboard transfer still pending after disk I/O;\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;\[guest\] hello over MMIO;\[guest\] hello over SBI;guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0;\[vguest\] timer interrupt after;\[vguest\] PLIC claim 10: received "ping";\[vguest\] PLIC claim 1: ARP reply, 10.0.2.2 is at 52:55:0a:00:02:02;driver guest exit Shutdown' \
+EXPECT='ARP: 10.0.2.2 is at;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01;wrote and read back block 2047;keyboard transfer still pending after disk I/O;\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/riscv64: brk ok, mmap ok, writev ok;\[guest\] hello over MMIO;\[guest\] hello over SBI;guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0;\[vguest\] timer interrupt after;\[vguest\] PLIC claim 10: received "ping";\[vguest\] PLIC claim 1: ARP reply, 10.0.2.2 is at 52:55:0a:00:02:02;driver guest exit Shutdown' \
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi \
     -netdev user,id=n0 -device virtio-net-device,netdev=n0 \
     -device qemu-xhci -device usb-kbd \
     -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,drive=stick
 rm -f "$stick"
-EXPECT='\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200' \
+EXPECT='\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/aarch64: brk ok, mmap ok, writev ok' \
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
-EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);user-2 exited with status 0;\[uart\]  COM1 IRQ 4;hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200' \
+EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);user-2 exited with status 0;\[uart\]  COM1 IRQ 4;hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/x86_64: brk ok, mmap ok, writev ok' \
 boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
     -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot
 

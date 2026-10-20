@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -35,7 +36,8 @@ use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryM
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use core::ptr::NonNull;
 
-use osmium::sched::{FifoScheduler, StackAllocator, TaskBuilder};
+use osmium::proc::{AddressSpace, ExitStatus, Process, UserMemory};
+use osmium::sched::{FifoScheduler, StackAllocator, Task, TaskBuilder};
 use osmium::sched::timer::TimerQueue;
 use osmium::sync::{IrqSpinLock, Once};
 
@@ -332,7 +334,7 @@ static CPU_TABLES: [core::sync::atomic::AtomicPtr<x86::CpuTables>; MAX_CPUS] =
 /// will put the trap frame when that task traps out of ring 3.
 fn on_switch(next: &osmium::sched::Task) {
     // Each process runs on its own page table; kernel tasks on the kernel's.
-    let root = next.data::<Process>().map_or(CR3.load(Ordering::Relaxed), |p| p.root.0);
+    let root = osmium::proc::root_for(next).map_or(CR3.load(Ordering::Relaxed), |r| r.0);
     if x86::read_cr3() & !0xfff != root {
         // SAFETY: both kinds of table map the kernel (shared root entry 0).
         unsafe { x86::write_cr3(root) };
@@ -583,6 +585,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     }
     fault_demo();
     overflow_demo();
+    osmium::proc::set_console(Arc::new(demos::user::LogConsole));
     user_demo();
     serial_demo();
 
@@ -710,61 +713,38 @@ fn serial_demo() {
 /// root entry 1 (512 GiB), outside the kernel's root entry 0.
 const USER_BASE: u64 = 0x80_0000_0000;
 
-/// A user process: its own page table (sharing the kernel's root entry 0)
-/// and the frames it owns. Attached to its task; freed when the task is.
-struct Process {
-    root: PhysAddr,
-    pt: IrqSpinLock<PageTable<X86_64, &'static Frames>>,
-    frames: Vec<PhysAddr>,
-}
+/// A process's memory: a table sharing the kernel's root entry 0, with
+/// table and user pages from `FRAMES`.
+type Space = AddressSpace<X86_64, &'static Frames>;
 
-static PROCESSES_FREED: AtomicUsize = AtomicUsize::new(0);
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        PROCESSES_FREED.fetch_add(1, Ordering::Relaxed);
-        let mut frames = FRAMES.lock();
-        for &f in &self.frames {
-            // SAFETY: the process's own frames; its page table, the only
-            // one mapping them, is dropped with it and no longer loaded.
-            unsafe { frames.dealloc(f, 0) };
-        }
-    }
+fn new_space() -> Space {
+    // SAFETY: the kernel table lives for the whole run.
+    unsafe { Space::new(&FRAMES, PT.lock().as_ref().unwrap(), 0..1) }.expect("out of memory for a page table")
 }
 
 /// Copies a user program into fresh pages, maps it user-accessible (code
 /// read/execute, stack read/write) at slot `n`, and spawns a task that drops
 /// to ring 3 there.
-fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> alloc::sync::Arc<osmium::sched::Task> {
+fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> (Arc<Task>, Weak<Process>) {
     let (start, end) = (code.0 as *const u8, code.1 as *const u8);
-    let len = end as usize - start as usize;
-    assert!(len <= PAGE_SIZE);
-    let mut frames = FRAMES.lock();
-    let (code_pa, stack_pa) = (frames.alloc_frame().unwrap(), frames.alloc_frame().unwrap());
-    drop(frames);
-    // SAFETY: fresh frames, identity-mapped; the program fits in one page.
-    unsafe {
-        core::ptr::write_bytes(code_pa.0 as *mut u8, 0, PAGE_SIZE);
-        core::ptr::copy_nonoverlapping(start, code_pa.0 as *mut u8, len);
-    }
+    // SAFETY: the linker symbols delimit the program's bytes.
+    let mut code = unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }.to_vec();
+    assert!(code.len() <= PAGE_SIZE);
     // Tell this copy which process it is (the '?' in its message).
-    // SAFETY: the frame holds the program just copied.
-    let code = unsafe { core::slice::from_raw_parts_mut(code_pa.0 as *mut u8, len) };
     if let Some(q) = code.iter().position(|&b| b == b'?') {
         code[q] = b'0' + n as u8;
     }
     let (code_va, stack_va) = (USER_BASE, USER_BASE + 0x8000);
-    let mut pt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).unwrap();
-    // SAFETY: the kernel table lives for the whole run.
-    unsafe { pt.share_root_entries(PT.lock().as_ref().unwrap(), 0..1) };
-    pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().ignore();
-    pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
-    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames: alloc::vec![code_pa, stack_pa] };
-    TaskBuilder::new(name).cpu(cpu).data(process).spawn(move || {
+    let space = new_space();
+    space.load_flat(code_va, &code, MapFlags::RX).unwrap();
+    space.map_anon(stack_va, PAGE_SIZE as u64, MapFlags::RW).unwrap();
+    let process = Process::new(name, space, USER_BASE + 0x10000);
+    let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
         // SAFETY: CpuTables are loaded, the switch hook keeps rsp[0] on this
         // task's kernel stack, and both pages are mapped user-accessible.
         unsafe { x86::enter_user(code_va, stack_va + PAGE_SIZE as u64) }
-    })
+    });
+    (task, Arc::downgrade(&process))
 }
 
 /// The Rust user program, built by `build.rs`.
@@ -772,33 +752,24 @@ static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"))
 
 /// Loads an ELF executable into a new address space and spawns a task on
 /// `cpu` that runs it in ring 3.
-fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> alloc::sync::Arc<osmium::sched::Task> {
+fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> (Arc<Task>, Weak<Process>) {
     use osmium::boot::elf::{Elf, Machine};
     let elf = Elf::new(image).expect("bad user ELF");
     assert_eq!(elf.machine(), Machine::X86_64);
-    let mut pt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).unwrap();
-    // SAFETY: the kernel table lives for the whole run.
-    unsafe { pt.share_root_entries(PT.lock().as_ref().unwrap(), 0..1) };
-    let mut frames = Vec::new();
-    elf.load_into(&mut pt, MapFlags::USER, || {
-        let pa = FRAMES.lock().alloc_frame()?;
-        frames.push(pa);
-        Some(pa)
-    })
-    .expect("loading the user ELF failed");
-    let page = PAGE_SIZE as u64;
+    let space = new_space();
+    let brk = space.load_elf(&elf).expect("loading the user ELF failed");
     // A one-page stack just below 1 TiB, clear of the image.
     let stack_top = 0xff_0000_0000u64;
-    let stack = FRAMES.lock().alloc_frame().unwrap();
-    pt.map(VirtAddr::new(stack_top - page), stack, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
-    frames.push(stack);
+    space.map_anon(stack_top - PAGE_SIZE as u64, PAGE_SIZE as u64, MapFlags::RW).unwrap();
     let entry = elf.entry();
-    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames };
-    TaskBuilder::new(name).cpu(cpu).data(process).spawn(move || {
+    let process = Process::new(name, space, brk);
+    process.set_mmap_area(0xa0_0000_0000..0xa1_0000_0000);
+    let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
         // SAFETY: as for the hand-written programs: CpuTables are loaded, the
         // switch hook installs this process's table, and its pages are mapped.
         unsafe { x86::enter_user(entry, stack_top) }
-    })
+    });
+    (task, Arc::downgrade(&process))
 }
 
 fn user_demo() {
@@ -808,50 +779,34 @@ fn user_demo() {
     // CPU's GS base, which CPU 0 alone would not test.
     let cpu = 1 % ONLINE.load(Ordering::Acquire);
     println!("[user]  running 3 ring-3 programs on CPU {cpu}");
-    let tasks = [
+    let spawned = [
         spawn_user("user-1", 1, hello, cpu),
         spawn_user("user-2", 2, hello, cpu),
         spawn_user("user-bad", 3, bad, cpu),
         spawn_elf("user-elf", HELLO_ELF, cpu),
     ];
     println!("[user]  each program has its own page table; all run at {USER_BASE:#x}");
-    for t in tasks {
-        t.join();
+    let mut processes = Vec::new();
+    for (task, process) in spawned {
+        task.join();
+        processes.push(process);
     }
     // Exited tasks (and their address spaces) are freed after the next switch.
     osmium::sched::yield_now();
-    println!("[user]  {} of 4 address spaces torn down with their tasks", PROCESSES_FREED.load(Ordering::Relaxed));
+    let freed = processes.iter().filter(|p| p.strong_count() == 0).count();
+    println!("[user]  {freed} of 4 address spaces torn down with their tasks");
 }
 
-/// Handles `int 0x80` from ring 3.
+/// Handles `syscall` and `int 0x80` from ring 3.
 fn syscall(frame: &mut TrapFrame) {
-    let [nr, a0, a1, a2, ..] = frame.syscall_args();
-    let task = osmium::sched::current();
-    match nr {
-        // write(fd, buf, len): only stdout, only from user-accessible memory.
-        1 if a0 == 1 && a2 <= 256 && user_readable(a1, a2) => {
-            // SAFETY: every page of the buffer is mapped user-readable.
-            let bytes = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
-            println!("[user]  {}: {}", task.name(), core::str::from_utf8(bytes).unwrap_or("<not utf-8>"));
-            frame.set_return(a2);
+    if let Some(status) = osmium::proc::syscall::handle(frame) {
+        let task = osmium::sched::current();
+        if let ExitStatus::Code(code) = status {
+            println!("[user]  {} exited with status {code} (kernel sees CPU {})", task.name(), cpu::current_id());
         }
-        60 => {
-            println!("[user]  {} exited with status {a0} (kernel sees CPU {})", task.name(), cpu::current_id());
-            drop(task);
-            osmium::sched::exit();
-        }
-        _ => frame.set_return(-38i64 as u64), // ENOSYS
+        drop(task);
+        osmium::proc::exit(status);
     }
-}
-
-fn user_readable(addr: u64, len: u64) -> bool {
-    let Some(end) = addr.checked_add(len) else { return false };
-    let task = osmium::sched::current();
-    let Some(process) = task.data::<Process>() else { return false };
-    let pt = process.pt.lock();
-    (addr & !(PAGE_SIZE as u64 - 1)..end)
-        .step_by(PAGE_SIZE)
-        .all(|p| pt.translate(VirtAddr::new(p)).is_some_and(|t| t.flags.contains(MapFlags::USER)))
 }
 
 fn on_trap(frame: &mut TrapFrame) {
@@ -860,7 +815,7 @@ fn on_trap(frame: &mut TrapFrame) {
         let task = osmium::sched::current();
         println!("[user]  {} killed: {:?} at rip {:#x}", task.name(), frame.cause(), frame.pc());
         drop(task);
-        osmium::sched::exit();
+        osmium::proc::exit(ExitStatus::Signal(11));
     }
     match (frame.vector(), frame.cause()) {
         (_, Trap::Syscall) if frame.from_user() => syscall(frame),
