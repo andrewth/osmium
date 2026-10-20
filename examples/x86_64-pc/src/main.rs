@@ -585,7 +585,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     }
     fault_demo();
     overflow_demo();
-    osmium::proc::set_console(Arc::new(demos::user::LogConsole));
+    demos::user::boot_vfs();
     user_demo();
     serial_demo();
 
