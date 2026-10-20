@@ -325,14 +325,23 @@ extern "C" fn kmain(x0: usize) -> ! {
     let k = |f| f | MapFlags::GLOBAL;
     let va = |a: u64| VirtAddr::new(a);
     let pa = |a: u64| PhysAddr::new(a);
-    pt.map_range(va(ram.0), pa(ram.0), kstart - ram.0, k(MapFlags::RW)).unwrap();
+    // Read/write RAM uses 4 KiB pages from the start: unmapping a task
+    // stack's guard page must not split a live block, which on AArch64
+    // needs break-before-make and would briefly unmap 2 MiB under other
+    // CPUs.
+    let map_4k = |pt: &mut PageTable<Aarch64, &'static Frames>, start: u64, len: u64| {
+        for p in (start..start + len).step_by(PAGE_SIZE) {
+            pt.map(va(p), pa(p), PageSize::Size4K, k(MapFlags::RW)).unwrap().ignore();
+        }
+    };
+    map_4k(&mut pt, ram.0, kstart - ram.0);
     pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).unwrap();
     pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).unwrap();
-    pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).unwrap();
+    map_4k(&mut pt, erodata, ram_end - erodata);
     for (base, len) in fdt.memory().filter(|&m| m != ram) {
         let (start, end) = (base.next_multiple_of(PAGE_SIZE as u64), (base + len) & !(PAGE_SIZE as u64 - 1));
         if start < end {
-            pt.map_range(va(start), pa(start), end - start, k(MapFlags::RW)).unwrap();
+            map_4k(&mut pt, start, end - start);
         }
     }
     for (base, len) in [(EARLY_UART as u64, PAGE_SIZE as u64), (gicd, gicd_len), (gicc, gicc_len)] {
