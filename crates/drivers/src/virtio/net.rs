@@ -11,7 +11,9 @@ use osmium_hal::net::{MacAddress, NetDevice, NetError};
 use osmium_hal::virtio::net;
 
 use super::queue::{Segment, VirtQueue};
-use super::{DeviceType, Transport, VirtioError, driver_ok, feature, negotiate};
+use core::mem::ManuallyDrop;
+
+use super::{DeviceType, Transport, VirtioError, driver_ok, feature, negotiate, reset};
 
 const RX: u16 = net::RX_QUEUE;
 const TX: u16 = net::TX_QUEUE;
@@ -28,10 +30,11 @@ const MAX_FRAME: usize = 1514;
 /// A virtio network card. Dropping it resets the device and frees its memory.
 pub struct VirtioNet<'d, T: Transport, D: DmaAllocator + ?Sized> {
     transport: T,
-    rx: VirtQueue<'d, D>,
-    tx: VirtQueue<'d, D>,
-    rx_slots: OwnedDma<'d, D>,
-    tx_slots: OwnedDma<'d, D>,
+    // Freed in `drop` only once the device has acknowledged its reset.
+    rx: ManuallyDrop<VirtQueue<'d, D>>,
+    tx: ManuallyDrop<VirtQueue<'d, D>>,
+    rx_slots: ManuallyDrop<OwnedDma<'d, D>>,
+    tx_slots: ManuallyDrop<OwnedDma<'d, D>>,
     mac: MacAddress,
     header_len: usize,
     has_status: bool,
@@ -54,7 +57,8 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioNet<'d, T, D> {
 
         let size = |q| match transport.max_queue_size(q).min(MAX_QUEUE_SIZE) {
             0 => Err(VirtioError::BadQueue),
-            n => Ok(n),
+            // Split queues come in powers of two.
+            n => Ok(1 << n.ilog2()),
         };
         let (rx_size, tx_size) = (size(RX)?, size(TX)?);
         let slots = |n: u16| OwnedDma::new(dma, n as usize * SLOT_LEN).ok_or(VirtioError::NoMemory);
@@ -64,11 +68,14 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioNet<'d, T, D> {
         } else {
             MacAddress([0x02, 0, 0, 0, 0, 1])
         };
+        // Plain values until all succeed, so a failure frees the others.
+        let (rx, tx) = (VirtQueue::new(dma, RX, rx_size)?, VirtQueue::new(dma, TX, tx_size)?);
+        let (rx_slots, tx_slots) = (slots(rx_size)?, slots(tx_size)?);
         let mut net = Self {
-            rx: VirtQueue::new(dma, RX, rx_size)?,
-            tx: VirtQueue::new(dma, TX, tx_size)?,
-            rx_slots: slots(rx_size)?,
-            tx_slots: slots(tx_size)?,
+            rx: ManuallyDrop::new(rx),
+            tx: ManuallyDrop::new(tx),
+            rx_slots: ManuallyDrop::new(rx_slots),
+            tx_slots: ManuallyDrop::new(tx_slots),
             mac,
             header_len: net::header_len(features & feature::VERSION_1 != 0, false),
             has_status: features & net::F_STATUS != 0,
@@ -185,9 +192,17 @@ impl<T: Transport, D: DmaAllocator + ?Sized> NetDevice for VirtioNet<'_, T, D> {
 
 impl<T: Transport, D: DmaAllocator + ?Sized> Drop for VirtioNet<'_, T, D> {
     fn drop(&mut self) {
-        // Stop the device before the queue and buffer fields free memory it
-        // may still be writing.
-        self.transport.set_status(0);
+        // Stop the device before freeing memory it may still be writing; if
+        // it never stops, leak the memory instead.
+        if reset(&self.transport) {
+            // SAFETY: dropped once, here; the device is reset.
+            unsafe {
+                ManuallyDrop::drop(&mut self.rx);
+                ManuallyDrop::drop(&mut self.tx);
+                ManuallyDrop::drop(&mut self.rx_slots);
+                ManuallyDrop::drop(&mut self.tx_slots);
+            }
+        }
     }
 }
 

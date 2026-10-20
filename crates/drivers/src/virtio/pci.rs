@@ -86,7 +86,14 @@ impl PciTransport {
             return Err(VirtioError::NotPresent);
         }
         func.enable_memory_and_dma();
-        Ok(Self { device_type, common, notify, notify_multiplier, isr, device })
+        let t = Self { device_type, common, notify, notify_multiplier, isr, device };
+        // Every queue's doorbell must lie in the notification window.
+        for q in 0..t.num_queues() {
+            if t.notify_offset(q).is_none() {
+                return Err(VirtioError::BadQueue);
+            }
+        }
+        Ok(t)
     }
 
     fn r16(&self, off: usize) -> u16 {
@@ -113,6 +120,14 @@ impl PciTransport {
     fn w64(&self, off: usize, v: u64) {
         self.w32(off, v as u32);
         self.w32(off + 4, (v >> 32) as u32);
+    }
+
+    /// Offset of queue `q`'s doorbell in the notification window, if it is
+    /// inside it and aligned.
+    fn notify_offset(&self, q: u16) -> Option<usize> {
+        self.w16(QUEUE_SELECT, q);
+        let off = (self.r16(QUEUE_NOTIFY_OFF) as usize).checked_mul(self.notify_multiplier as usize)?;
+        (off.is_multiple_of(2) && off.checked_add(2)? <= self.notify.len()).then_some(off)
     }
 
     /// Number of virtqueues the device has.
@@ -170,9 +185,11 @@ impl Transport for PciTransport {
     }
 
     fn notify(&self, index: u16) {
-        self.w16(QUEUE_SELECT, index);
-        let off = self.r16(QUEUE_NOTIFY_OFF) as usize * self.notify_multiplier as usize;
-        self.notify.write(off, index).expect("virtio-pci notify address outside window");
+        // `new` checked every queue's offset; a device that changes it
+        // later gets no doorbell, and its driver times out.
+        if let Some(off) = self.notify_offset(index) {
+            let _ = self.notify.write(off, index);
+        }
     }
 
     fn ack_interrupt(&self) -> u32 {
@@ -181,7 +198,7 @@ impl Transport for PciTransport {
     }
 
     fn config_read8(&self, offset: usize) -> u8 {
-        self.device.as_ref().and_then(|d| d.read(offset).ok()).expect("virtio config read outside window")
+        self.device.as_ref().and_then(|d| d.read(offset).ok()).unwrap_or(0)
     }
 }
 
@@ -303,6 +320,25 @@ mod tests {
         assert_eq!(t.status(), 7);
         drop(t);
         assert_eq!(regs(DEVICE_STATUS / 4) & 0xff, 7);
+    }
+
+    #[test]
+    fn notify_offset_outside_window() {
+        let cfg = Config::new(0x1050);
+        let func = Function::new(&cfg, Address::new(0, 1, 0)).unwrap();
+        let mut bar = vec![0u32; BAR_SIZE as usize / 4];
+        // One queue whose doorbell would be at 0x400 * 4, past the 4 KiB window.
+        bar[NUM_QUEUES / 4] = 1 << 16;
+        bar[QUEUE_NOTIFY_OFF / 4] = 0x400 << 16;
+        let base = bar.as_mut_ptr();
+        // SAFETY: the window covers a local array.
+        let t = PciTransport::new(&func, |_| Some(unsafe { IoMem::new(base.cast(), BAR_SIZE as usize) }));
+        assert_eq!(t.err(), Some(VirtioError::BadQueue));
+        // And no panic reading configuration past the device's window.
+        bar[QUEUE_NOTIFY_OFF / 4] = 0;
+        // SAFETY: as above.
+        let t = PciTransport::new(&func, |_| Some(unsafe { IoMem::new(base.cast(), BAR_SIZE as usize) })).unwrap();
+        assert_eq!(t.config_read8(0x100), 0);
     }
 
     #[test]

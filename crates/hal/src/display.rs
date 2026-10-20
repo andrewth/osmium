@@ -68,6 +68,11 @@ impl Channel {
         ((1u32 << self.bits) - 1) << self.shift
     }
 
+    /// True if 1–8 bits wide and inside a `bpp`-bit pixel.
+    const fn fits(&self, bpp: u8) -> bool {
+        self.bits >= 1 && self.bits <= 8 && self.shift as u32 + self.bits as u32 <= bpp as u32
+    }
+
     fn encode(&self, v: u8) -> u32 {
         (v as u32 >> (8 - self.bits)) << self.shift
     }
@@ -131,6 +136,16 @@ impl PixelFormat {
             return None;
         }
         Some(Self { bpp, red, green, blue })
+    }
+
+    /// True if `bpp` is 16, 24 or 32 and every channel is 1–8 bits wide and
+    /// inside the pixel. Formats from [`PixelFormat::from_masks`] and the
+    /// constants always are; [`Framebuffer::new`] rejects others.
+    pub const fn is_valid(&self) -> bool {
+        matches!(self.bpp, 16 | 24 | 32)
+            && self.red.fits(self.bpp)
+            && self.green.fits(self.bpp)
+            && self.blue.fits(self.bpp)
     }
 
     /// Bytes per pixel.
@@ -200,9 +215,10 @@ pub struct FramebufferInfo {
 }
 
 impl FramebufferInfo {
-    /// A tightly packed framebuffer (`stride` is exactly one row).
+    /// A tightly packed framebuffer (`stride` is exactly one row; it
+    /// saturates, which [`Framebuffer::new`] then rejects).
     pub const fn packed(width: u32, height: u32, format: PixelFormat) -> Self {
-        Self { width, height, stride: width * format.bytes_per_pixel() as u32, format }
+        Self { width, height, stride: width.saturating_mul(format.bytes_per_pixel() as u32), format }
     }
 
     /// Bytes the framebuffer covers.
@@ -247,10 +263,18 @@ pub struct Framebuffer {
 
 impl Framebuffer {
     /// The framebuffer described by `info` in `mem`, which must be at least
-    /// [`FramebufferInfo::size`] bytes, with rows that hold `width` pixels.
+    /// [`FramebufferInfo::size`] bytes, with rows that hold `width` pixels,
+    /// a valid format and a base and stride aligned for its pixels.
     pub fn new(mem: IoMem, info: FramebufferInfo) -> Result<Self, DisplayError> {
-        let row = info.width as usize * info.format.bytes_per_pixel();
-        if !matches!(info.format.bpp, 16 | 24 | 32) || row > info.stride as usize || mem.len() < info.size() {
+        let bpp = info.format.bytes_per_pixel();
+        let row = info.width as usize * bpp;
+        let align = if bpp == 3 { 1 } else { bpp };
+        if !info.format.is_valid()
+            || row > info.stride as usize
+            || mem.len() < info.size()
+            || !(mem.base() as usize).is_multiple_of(align)
+            || !(info.stride as usize).is_multiple_of(align)
+        {
             return Err(DisplayError::BadGeometry);
         }
         Ok(Self { mem: mem.slice(0, info.size())?, info })
@@ -504,6 +528,14 @@ mod tests {
         let fmt = PixelFormat::XRGB8888;
         assert!(Framebuffer::new(io.clone(), FramebufferInfo::packed(2, 3, fmt)).is_err(), "too small");
         assert!(Framebuffer::new(io.clone(), FramebufferInfo { width: 2, height: 1, stride: 4, format: fmt }).is_err());
-        assert!(Framebuffer::new(io, FramebufferInfo::packed(2, 2, fmt)).is_ok());
+        assert!(Framebuffer::new(io.clone(), FramebufferInfo::packed(2, 2, fmt)).is_ok());
+        assert!(Framebuffer::new(io.slice(2, 8).unwrap(), FramebufferInfo::packed(1, 1, fmt)).is_err(), "misaligned");
+        let mut bad = fmt;
+        bad.red.bits = 0;
+        assert!(!bad.is_valid());
+        assert!(Framebuffer::new(io.clone(), FramebufferInfo::packed(1, 1, bad)).is_err(), "empty channel");
+        bad.red = Channel { shift: 30, bits: 8 };
+        assert!(Framebuffer::new(io, FramebufferInfo::packed(1, 1, bad)).is_err(), "channel outside the pixel");
+        assert_eq!(FramebufferInfo::packed(u32::MAX, 1, fmt).stride, u32::MAX);
     }
 }

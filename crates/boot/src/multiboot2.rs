@@ -191,7 +191,10 @@ impl<'a> BootInfo<'a> {
             // Direct RGB colour info: position and size of red, green and
             // blue, a byte each.
             format: p.get(24..30).filter(|_| p[21] == 1).and_then(|c| {
-                let mask = |pos: u8, size: u8| if size == 0 || size > 8 { 0 } else { ((1u32 << size) - 1) << pos };
+                let mask = |pos: u8, size: u8| {
+                    // An empty, wide or out-of-range field makes the format unusable.
+                    if !(1..=8).contains(&size) || pos as u32 + size as u32 > 32 { 0 } else { ((1u32 << size) - 1) << pos }
+                };
                 PixelFormat::from_masks(p[20], mask(c[0], c[1]), mask(c[2], c[3]), mask(c[4], c[5]))
             }),
         })

@@ -119,7 +119,8 @@ pub trait Transport {
     /// updated, bit 1: the configuration changed).
     fn ack_interrupt(&self) -> u32;
 
-    /// Reads a byte of device-specific configuration.
+    /// Reads a byte of device-specific configuration; 0 beyond what the
+    /// device provides.
     fn config_read8(&self, offset: usize) -> u8;
 
     /// Reads a little-endian word of device-specific configuration.
@@ -146,6 +147,11 @@ pub fn negotiate<T: Transport + ?Sized>(t: &T, required: u64, optional: u64) -> 
     let features = offered & (required | optional | feature::VERSION_1);
     t.set_driver_features(features);
     if !t.is_legacy() {
+        // A modern interface must offer VERSION_1 (§6.1).
+        if features & feature::VERSION_1 == 0 {
+            t.set_status(status::FAILED);
+            return Err(VirtioError::Unsupported);
+        }
         t.set_status(status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK);
         if t.status() & status::FEATURES_OK == 0 {
             t.set_status(status::FAILED);
@@ -153,6 +159,23 @@ pub fn negotiate<T: Transport + ?Sized>(t: &T, required: u64, optional: u64) -> 
         }
     }
     Ok(features)
+}
+
+/// How many times [`reset`] polls the status, and drivers poll a queue for
+/// a synchronous request's completion, before giving up on the device.
+pub const POLL_LIMIT: u32 = 50_000_000;
+
+/// Resets the device and waits until it reads back status 0, as the driver
+/// must before freeing memory the device may use (§4.1.4.3.2). Returns
+/// false if it never did: the device may still be using the queues, which
+/// must then be leaked rather than freed.
+pub fn reset<T: Transport + ?Sized>(t: &T) -> bool {
+    t.set_status(0);
+    (0..POLL_LIMIT).any(|_| {
+        let done = t.status() == 0;
+        core::hint::spin_loop();
+        done
+    })
 }
 
 /// Marks the device live after its queues are set up.
@@ -269,7 +292,7 @@ pub(crate) mod testing {
             1
         }
         fn config_read8(&self, offset: usize) -> u8 {
-            self.config[offset]
+            self.config.get(offset).copied().unwrap_or(0)
         }
     }
 
@@ -283,6 +306,11 @@ pub(crate) mod testing {
 
         assert_eq!(negotiate(&t, 0b100, 0), Err(VirtioError::Unsupported));
         assert_eq!(t.status(), status::FAILED);
+
+        let mut no_v1 = FakeTransport::new(DeviceType::Net, 0b1, &[]);
+        no_v1.legacy = false;
+        assert_eq!(negotiate(&no_v1, 0, 0), Err(VirtioError::Unsupported), "modern without VERSION_1");
+        assert!(reset(&no_v1));
 
         let mut picky = FakeTransport::new(DeviceType::Net, feature::VERSION_1, &[]);
         picky.reject_features = true;

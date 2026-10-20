@@ -20,13 +20,18 @@ use osmium_hal::mmio::IoMem;
 use osmium_hal::virtio::gpu::*;
 
 use super::queue::{Segment, VirtQueue};
-use super::{DeviceType, Transport, VirtioError, driver_ok, negotiate};
+use core::mem::ManuallyDrop;
+
+use super::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
 
 /// Entries used in the control queue, at most (a command needs two).
 pub const MAX_QUEUE_SIZE: u16 = 4;
 
 /// Bytes of the request and response buffers.
 const CMD_LEN: usize = 4096;
+
+/// Largest framebuffer side the driver asks for.
+pub const MAX_SIDE: u32 = 16384;
 
 /// The format of every framebuffer: bytes B, G, R, X.
 pub const FORMAT: PixelFormat = PixelFormat::XRGB8888;
@@ -61,13 +66,14 @@ impl DisplayInfo {
 pub struct VirtioGpu<'d, T: Transport, D: DmaAllocator + ?Sized> {
     transport: T,
     dma: &'d D,
-    queue: VirtQueue<'d, D>,
-    req: OwnedDma<'d, D>,
-    resp: OwnedDma<'d, D>,
+    // Freed in `drop` only once the device has acknowledged its reset.
+    queue: ManuallyDrop<VirtQueue<'d, D>>,
+    req: ManuallyDrop<OwnedDma<'d, D>>,
+    resp: ManuallyDrop<OwnedDma<'d, D>>,
     num_scanouts: u32,
     // The current mode: its memory, resource ID and scanout.
     fb: Framebuffer,
-    backing: Option<OwnedDma<'d, D>>,
+    backing: ManuallyDrop<Option<OwnedDma<'d, D>>>,
     resource: u32,
     scanout: u32,
 }
@@ -110,23 +116,28 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         }
         negotiate(&transport, 0, 0)?;
         let size = match transport.max_queue_size(CONTROL_QUEUE).min(MAX_QUEUE_SIZE) {
-            n if n >= 2 => n,
+            // Split queues come in powers of two.
+            n if n >= 2 => 1 << n.ilog2(),
             _ => return Err(VirtioError::BadQueue),
         };
         let num_scanouts =
             u32::from_le_bytes(core::array::from_fn(|i| transport.config_read8(CONFIG_NUM_SCANOUTS + i)));
+        // Plain values until all succeed, so a failure frees the others.
+        let queue = VirtQueue::new(dma, CONTROL_QUEUE, size)?;
+        let req = OwnedDma::new(dma, CMD_LEN).ok_or(VirtioError::NoMemory)?;
+        let resp = OwnedDma::new(dma, CMD_LEN).ok_or(VirtioError::NoMemory)?;
         let gpu = Self {
-            queue: VirtQueue::new(dma, CONTROL_QUEUE, size)?,
-            req: OwnedDma::new(dma, CMD_LEN).ok_or(VirtioError::NoMemory)?,
-            resp: OwnedDma::new(dma, CMD_LEN).ok_or(VirtioError::NoMemory)?,
+            queue: ManuallyDrop::new(queue),
+            req: ManuallyDrop::new(req),
+            resp: ManuallyDrop::new(resp),
             num_scanouts: num_scanouts.min(MAX_SCANOUTS as u32),
             // SAFETY: an empty window touches no memory.
             fb: Framebuffer::new(
-                unsafe { IoMem::new(core::ptr::NonNull::dangling().as_ptr(), 0) },
+                unsafe { IoMem::new(core::ptr::NonNull::<u32>::dangling().as_ptr().cast(), 0) },
                 FramebufferInfo::packed(0, 0, FORMAT),
             )
             .expect("empty framebuffer"),
-            backing: None,
+            backing: ManuallyDrop::new(None),
             resource: 0,
             scanout: 0,
             dma,
@@ -150,8 +161,9 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
     }
 
     /// Sends the request built in `cmd` (with `extra` bytes appended) and
-    /// waits for a response of `resp_len` bytes; returns its type.
-    fn command(&mut self, cmd: Cmd, extra: &[u8], resp_len: usize) -> Result<u32, DisplayError> {
+    /// waits for a response of up to `resp_len` bytes; returns its type and
+    /// how many bytes the device says it wrote.
+    fn command(&mut self, cmd: Cmd, extra: &[u8], resp_len: usize) -> Result<(u32, usize), DisplayError> {
         self.req.write(0, &cmd.buf[..cmd.len]);
         self.req.write(cmd.len, extra);
         self.resp.write(0, &[0; HDR_LEN]);
@@ -163,20 +175,20 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         if self.queue.needs_notify() {
             self.transport.notify(CONTROL_QUEUE);
         }
-        // Nothing else is in flight, so the first completion is ours.
-        let done = loop {
-            if let Some(done) = self.queue.pop_used() {
-                break done;
+        // Nothing else is in flight, so the first completion is ours. A
+        // device that never answers (or breaks the queue) fails the
+        // command, and the queue then stays unusable.
+        match self.queue.wait_used(POLL_LIMIT) {
+            Some((done, len)) if done == head && len as usize >= HDR_LEN => {
+                Ok((self.resp.load::<u32>(0), (len as usize).min(resp_len)))
             }
-            core::hint::spin_loop();
-        };
-        debug_assert_eq!(done.0, head);
-        Ok(self.resp.load::<u32>(0))
+            _ => Err(DisplayError::Device),
+        }
     }
 
     /// Sends a command whose only answer is `OK_NODATA`.
     fn command_nodata(&mut self, cmd: Cmd, extra: &[u8]) -> Result<(), DisplayError> {
-        match self.command(cmd, extra, HDR_LEN)? {
+        match self.command(cmd, extra, HDR_LEN)?.0 {
             RESP_OK_NODATA => Ok(()),
             RESP_ERR_INVALID_SCANOUT_ID | RESP_ERR_INVALID_PARAMETER => Err(DisplayError::Unsupported),
             RESP_ERR_OUT_OF_MEMORY => Err(DisplayError::NoMemory),
@@ -186,7 +198,9 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
 
     /// Asks the device for each scanout's preferred mode.
     pub fn display_info(&mut self) -> Result<DisplayInfo, DisplayError> {
-        if self.command(Cmd::new(CMD_GET_DISPLAY_INFO), &[], RESP_DISPLAY_INFO_LEN)? != RESP_OK_DISPLAY_INFO {
+        if self.command(Cmd::new(CMD_GET_DISPLAY_INFO), &[], RESP_DISPLAY_INFO_LEN)?
+            != (RESP_OK_DISPLAY_INFO, RESP_DISPLAY_INFO_LEN)
+        {
             return Err(DisplayError::Device);
         }
         let mut info = DisplayInfo { scanouts: [Scanout::default(); MAX_SCANOUTS], count: self.num_scanouts as usize };
@@ -204,7 +218,8 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         if scanout >= self.num_scanouts || width == 0 || height == 0 {
             return Err(DisplayError::Unsupported);
         }
-        let info = FramebufferInfo::packed(width.min(16384), height.min(16384), FORMAT);
+        let (width, height) = (width.min(MAX_SIDE), height.min(MAX_SIDE));
+        let info = FramebufferInfo::packed(width, height, FORMAT);
         let backing = OwnedDma::new(self.dma, info.size()).ok_or(DisplayError::NoMemory)?;
         // SAFETY: DMA memory owned by `backing`, which outlives the window:
         // both are replaced together below, and the device only reads it.
@@ -224,20 +239,31 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
             .command_nodata(Cmd::new(CMD_RESOURCE_ATTACH_BACKING).u32(id).u32(1), &entry)
             .and_then(|()| self.command_nodata(Cmd::new(CMD_SET_SCANOUT).rect(full).u32(scanout).u32(id), &[]));
         if let Err(e) = attached {
-            let _ = self.command_nodata(Cmd::new(CMD_RESOURCE_UNREF).u32(id).u32(0), &[]);
+            // Unreferencing detaches the backing; if even that fails, the
+            // host may still hold it, so it is leaked rather than freed.
+            if self.command_nodata(Cmd::new(CMD_RESOURCE_UNREF).u32(id).u32(0), &[]).is_err() {
+                core::mem::forget(backing);
+            }
             return Err(e);
         }
         let old = self.resource;
         self.fb = fb;
         let old_backing = self.backing.replace(backing);
         (self.resource, self.scanout) = (id, scanout);
-        self.flush_all()?;
-        if old != 0 {
-            // The old resource is no longer scanned out. Unreferencing it
-            // detaches its backing, which is freed only after that.
-            self.command_nodata(Cmd::new(CMD_RESOURCE_UNREF).u32(old).u32(0), &[])?;
+        // The old resource is no longer scanned out. Unreferencing it
+        // detaches its backing, which is freed only after that succeeds.
+        let unref = |gpu: &mut Self| match old {
+            0 => Ok(()),
+            old => gpu.command_nodata(Cmd::new(CMD_RESOURCE_UNREF).u32(old).u32(0), &[]),
+        };
+        match unref(self) {
+            Ok(()) => drop(old_backing),
+            Err(e) => {
+                core::mem::forget(old_backing);
+                return Err(e);
+            }
         }
-        drop(old_backing);
+        self.flush_all()?;
         Ok(info)
     }
 
@@ -271,8 +297,17 @@ impl<T: Transport, D: DmaAllocator + ?Sized> Display for VirtioGpu<'_, T, D> {
 
 impl<T: Transport, D: DmaAllocator + ?Sized> Drop for VirtioGpu<'_, T, D> {
     fn drop(&mut self) {
-        // Stop the device before the fields free memory it may still read.
-        self.transport.set_status(0);
+        // Stop the device before freeing memory it may still read; if it
+        // never stops, leak the memory instead.
+        if reset(&self.transport) {
+            // SAFETY: dropped once, here; the device is reset.
+            unsafe {
+                ManuallyDrop::drop(&mut self.queue);
+                ManuallyDrop::drop(&mut self.req);
+                ManuallyDrop::drop(&mut self.resp);
+                ManuallyDrop::drop(&mut self.backing);
+            }
+        }
     }
 }
 
@@ -496,6 +531,15 @@ mod tests {
         let px = &host.resources[&1].pixels;
         let green: Vec<_> = (0..256).filter(|&i| px[i] == 0xff00).map(|i| (i % 16, i / 16)).collect();
         assert_eq!(green, [(4, 4), (5, 4), (4, 5), (5, 5)]);
+    }
+
+    #[test]
+    fn silent_device_fails_instead_of_hanging() {
+        let dma = HostDma::default();
+        let mut gpu = VirtioGpu::new(device(), &dma).unwrap();
+        assert_eq!(gpu.display_info(), Err(DisplayError::Device));
+        drop(gpu);
+        assert_eq!(dma.live.get(), 0, "reset acknowledged, so everything freed");
     }
 
     #[test]

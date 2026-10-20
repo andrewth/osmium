@@ -11,7 +11,9 @@ use osmium_hal::dma::{DmaAllocator, OwnedDma};
 use osmium_hal::virtio::blk;
 
 use super::queue::{Segment, VirtQueue};
-use super::{DeviceType, Transport, VirtioError, driver_ok, negotiate};
+use core::mem::ManuallyDrop;
+
+use super::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
 
 /// Bytes of DMA bounce buffer, and so the most one request transfers.
 pub const DATA_LEN: usize = 64 * 1024;
@@ -24,10 +26,11 @@ const STATUS_OFFSET: usize = blk::HEADER_LEN;
 /// A virtio block device. Dropping it resets the device and frees its memory.
 pub struct VirtioBlk<'d, T: Transport, D: DmaAllocator + ?Sized> {
     transport: T,
-    queue: VirtQueue<'d, D>,
+    // Freed in `drop` only once the device has acknowledged its reset.
+    queue: ManuallyDrop<VirtQueue<'d, D>>,
     /// Request header and status byte.
-    req: OwnedDma<'d, D>,
-    data: OwnedDma<'d, D>,
+    req: ManuallyDrop<OwnedDma<'d, D>>,
+    data: ManuallyDrop<OwnedDma<'d, D>>,
     sectors: u64,
     read_only: bool,
     has_flush: bool,
@@ -42,14 +45,19 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioBlk<'d, T, D> {
         }
         let features = negotiate(&transport, 0, blk::F_RO | blk::F_FLUSH)?;
         let size = match transport.max_queue_size(blk::REQUEST_QUEUE).min(MAX_QUEUE_SIZE) {
-            n if n >= 3 => n,
+            // Split queues come in powers of two; a request needs three.
+            n if n >= 4 => 1 << n.ilog2(),
             _ => return Err(VirtioError::BadQueue),
         };
         let sectors = u64::from_le_bytes(core::array::from_fn(|i| transport.config_read8(blk::CONFIG_CAPACITY + i)));
+        // Plain values until all succeed, so a failure frees the others.
+        let queue = VirtQueue::new(dma, blk::REQUEST_QUEUE, size)?;
+        let req = OwnedDma::new(dma, 64).ok_or(VirtioError::NoMemory)?;
+        let data = OwnedDma::new(dma, DATA_LEN).ok_or(VirtioError::NoMemory)?;
         let blk = Self {
-            queue: VirtQueue::new(dma, blk::REQUEST_QUEUE, size)?,
-            req: OwnedDma::new(dma, 64).ok_or(VirtioError::NoMemory)?,
-            data: OwnedDma::new(dma, DATA_LEN).ok_or(VirtioError::NoMemory)?,
+            queue: ManuallyDrop::new(queue),
+            req: ManuallyDrop::new(req),
+            data: ManuallyDrop::new(data),
             sectors,
             read_only: features & blk::F_RO != 0,
             has_flush: features & blk::F_FLUSH != 0,
@@ -83,7 +91,7 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioBlk<'d, T, D> {
         // Anything but a status the device wrote reads as an error.
         self.req.write(STATUS_OFFSET, &[0xff]);
 
-        let seg = |buf: &OwnedDma<'d, D>, offset: usize, len: usize, device_writes: bool| Segment {
+        let seg = |buf: &ManuallyDrop<OwnedDma<'d, D>>, offset: usize, len: usize, device_writes: bool| Segment {
             addr: buf.device_addr() + offset as u64,
             len: len as u32,
             device_writes,
@@ -97,14 +105,13 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioBlk<'d, T, D> {
         if self.queue.needs_notify() {
             self.transport.notify(blk::REQUEST_QUEUE);
         }
-        // Nothing else is in flight, so the first completion is ours.
-        let done = loop {
-            if let Some(done) = self.queue.pop_used() {
-                break done;
-            }
-            core::hint::spin_loop();
-        };
-        debug_assert_eq!(done.0, head);
+        // Nothing else is in flight, so the first completion is ours. A
+        // device that never answers (or breaks the queue) fails the request;
+        // the queue then stays unusable.
+        match self.queue.wait_used(POLL_LIMIT) {
+            Some((done, _)) if done == head => {}
+            _ => return Err(BlockError::Io),
+        }
 
         let mut status = [0xff];
         self.req.read(STATUS_OFFSET, &mut status);
@@ -159,9 +166,16 @@ impl<T: Transport, D: DmaAllocator + ?Sized> BlockDevice for VirtioBlk<'_, T, D>
 
 impl<T: Transport, D: DmaAllocator + ?Sized> Drop for VirtioBlk<'_, T, D> {
     fn drop(&mut self) {
-        // Stop the device before the queue and buffer fields free memory it
-        // may still be writing.
-        self.transport.set_status(0);
+        // Stop the device before freeing memory it may still be writing; if
+        // it never stops, leak the memory instead.
+        if reset(&self.transport) {
+            // SAFETY: dropped once, here; the device is reset.
+            unsafe {
+                ManuallyDrop::drop(&mut self.queue);
+                ManuallyDrop::drop(&mut self.req);
+                ManuallyDrop::drop(&mut self.data);
+            }
+        }
     }
 }
 

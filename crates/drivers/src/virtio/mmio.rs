@@ -119,7 +119,7 @@ impl Transport for MmioTransport {
     }
 
     fn config_read8(&self, offset: usize) -> u8 {
-        self.io.read(CONFIG + offset).expect("virtio config read outside window")
+        self.io.read(CONFIG + offset).unwrap_or(0)
     }
 }
 

@@ -221,6 +221,9 @@ impl ModeInfo {
     /// The framebuffer geometry, if the mode has a framebuffer.
     pub fn framebuffer_info(&self) -> Option<FramebufferInfo> {
         let format = self.format()?;
+        if self.width > self.pixels_per_scan_line {
+            return None;
+        }
         let stride = self.pixels_per_scan_line.checked_mul(format.bytes_per_pixel() as u32)?;
         Some(FramebufferInfo { width: self.width, height: self.height, stride, format })
     }

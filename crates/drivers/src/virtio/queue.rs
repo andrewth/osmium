@@ -9,6 +9,13 @@
 //! Linux; the device never writes the descriptor table, so the chain is safe
 //! there. The head index returned by [`VirtQueue::add`] identifies the
 //! request when it comes back from [`VirtQueue::pop_used`].
+//!
+//! The device is not trusted: a used entry naming a descriptor that is not
+//! the head of an outstanding request, a used index that runs ahead of what
+//! was made available, or a chain longer than the queue marks the queue
+//! broken (see [`VirtQueue::is_broken`]) instead of corrupting the free list
+//! or panicking. Outstanding heads are tracked in a bitmap after the used
+//! ring, in the same allocation (the device has no reason to touch it).
 
 use osmium_arch::barrier;
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
@@ -39,6 +46,9 @@ pub struct VirtQueue<'d, D: DmaAllocator + ?Sized> {
     // Our copy of avail.idx, and how far we have consumed used.idx.
     avail_idx: u16,
     last_used: u16,
+    /// Requests made available and not yet returned.
+    in_flight: u16,
+    broken: bool,
 }
 
 impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
@@ -55,20 +65,38 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
         legacy_used_offset(size)
     }
 
+    /// Offset of the outstanding-heads bitmap, after the rings.
+    const fn bitmap_offset(size: u16) -> usize {
+        Self::mem_size(size).next_multiple_of(8)
+    }
+
+    fn outstanding(&self, head: u16) -> bool {
+        let at = Self::bitmap_offset(self.size) + head as usize / 8;
+        self.read::<u8>(at) & (1 << (head % 8)) != 0
+    }
+
+    fn set_outstanding(&self, head: u16, on: bool) {
+        let at = Self::bitmap_offset(self.size) + head as usize / 8;
+        let bits = self.read::<u8>(at);
+        self.write(at, if on { bits | 1 << (head % 8) } else { bits & !(1 << (head % 8)) });
+    }
+
     /// Allocates queue `index` with `size` entries (1–32768).
     pub fn new(dma: &'d D, index: u16, size: u16) -> Result<Self, VirtioError> {
         if size == 0 || size > 32768 {
             return Err(VirtioError::BadQueue);
         }
-        let mem = OwnedDma::new(dma, Self::mem_size(size)).ok_or(VirtioError::NoMemory)?;
+        let len = Self::bitmap_offset(size) + (size as usize).div_ceil(8);
+        let mem = OwnedDma::new(dma, len).ok_or(VirtioError::NoMemory)?;
         if !mem.device_addr().is_aligned(LEGACY_ALIGN as u64)
             || !(mem.cpu_ptr().as_ptr() as usize).is_multiple_of(LEGACY_ALIGN)
         {
             return Err(VirtioError::NoMemory);
         }
-        let q = Self { mem, index, size, free_head: 0, num_free: size, avail_idx: 0, last_used: 0 };
+        let q = Self { mem, index, size, free_head: 0, num_free: size, avail_idx: 0, last_used: 0, in_flight: 0, broken: false };
         for i in 0..size {
             q.write_desc(i, PhysAddr::new(0), 0, 0, i.wrapping_add(1));
+            q.set_outstanding(i, false);
         }
         Ok(q)
     }
@@ -138,6 +166,9 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
     ///
     /// [`Transport::notify`]: super::Transport::notify
     pub fn add(&mut self, segments: &[Segment]) -> Result<u16, VirtioError> {
+        if self.broken {
+            return Err(VirtioError::BadQueue);
+        }
         let n = segments.len();
         if n == 0 || n > self.num_free as usize {
             return Err(VirtioError::QueueFull);
@@ -159,6 +190,8 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
             }
         }
         self.num_free -= n as u16;
+        self.in_flight += 1;
+        self.set_outstanding(head, true);
 
         let avail = Self::avail_offset(self.size);
         self.write(avail + avail_entry(self.avail_idx % self.size), head.to_le());
@@ -188,36 +221,83 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
     /// True if the device has returned requests not yet popped.
     pub fn has_used(&self) -> bool {
         let used = Self::used_offset(self.size);
-        u16::from_le(self.read::<u16>(used + 2)) != self.last_used
+        !self.broken && u16::from_le(self.read::<u16>(used + 2)) != self.last_used
+    }
+
+    /// True once the device has broken the queue's protocol. A broken queue
+    /// accepts no requests and returns no completions; reset the device.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Requests made available and not yet returned.
+    pub fn in_flight(&self) -> u16 {
+        self.in_flight
+    }
+
+    fn fail(&mut self) -> Option<(u16, u32)> {
+        self.broken = true;
+        None
     }
 
     /// Takes the next completed request: its head index and the number of
     /// bytes the device wrote. Its descriptors return to the free list.
+    /// Returns `None` if there is none, or if the device broke the protocol
+    /// (then [`is_broken`](Self::is_broken) says so).
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         if !self.has_used() {
             return None;
         }
+        let used = Self::used_offset(self.size);
+        // More completions than requests outstanding: a lying device.
+        if u16::from_le(self.read::<u16>(used + 2)).wrapping_sub(self.last_used) > self.in_flight {
+            return self.fail();
+        }
         // Read the entry only after seeing the index that covers it.
         barrier::dma_rmb();
-        let used = Self::used_offset(self.size);
         let entry = used + used_entry(self.last_used % self.size);
-        let head = u32::from_le(self.read::<u32>(entry)) as u16;
+        let id = u32::from_le(self.read::<u32>(entry));
         let len = u32::from_le(self.read::<u32>(entry + 4));
-        self.last_used = self.last_used.wrapping_add(1);
-        assert!(head < self.size, "virtio device returned descriptor {head}");
+        if id >= self.size as u32 || !self.outstanding(id as u16) {
+            return self.fail();
+        }
+        let head = id as u16;
 
+        // The device never writes the descriptor table, but bound the walk
+        // anyway: a chain is at most the queue long.
         let mut tail = head;
         let mut count = 1;
         while self.desc_flags(tail) & DESC_F_NEXT != 0 {
             tail = self.desc_next(tail);
             count += 1;
+            if count > self.size || tail >= self.size {
+                return self.fail();
+            }
         }
+        self.last_used = self.last_used.wrapping_add(1);
+        self.in_flight -= 1;
+        self.set_outstanding(head, false);
         let d = DESC_SIZE * tail as usize;
         self.write(d + 12, 0u16);
         self.write(d + 14, self.free_head.to_le());
         self.free_head = head;
         self.num_free += count;
         Some((head, len))
+    }
+
+    /// Waits for the next completed request, polling at most `spins` times.
+    /// `None` means the device is too slow or broke the protocol.
+    pub fn wait_used(&mut self, spins: u32) -> Option<(u16, u32)> {
+        for _ in 0..spins {
+            if let Some(done) = self.pop_used() {
+                return Some(done);
+            }
+            if self.broken {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+        None
     }
 }
 
@@ -336,5 +416,43 @@ pub(crate) mod tests {
         assert!(q.needs_notify());
         dev.set_no_notify(true);
         assert!(!q.needs_notify());
+    }
+
+    /// Writes used entry `slot` and the used index directly, as a faulty
+    /// device would.
+    fn forge_used(q: &VirtQueue<'_, HostDma>, slot: u16, id: u32, idx: u16) {
+        let used = q.addrs().used.as_u64() as *mut u8;
+        // SAFETY: test DMA memory is identity-mapped (HostDma).
+        unsafe {
+            used.add(4 + 8 * slot as usize).cast::<u32>().write_volatile(id);
+            used.add(2).cast::<u16>().write_volatile(idx);
+        }
+    }
+
+    #[test]
+    fn untrusted_device() {
+        let dma = HostDma::default();
+        let seg = Segment { addr: PhysAddr::new(0x1000), len: 1, device_writes: true };
+        for (id, idx, why) in [(4u32, 1u16, "id out of range"), (0x1_0000, 1, "id truncates to a valid head"), (2, 1, "not outstanding"), (0, 2, "index ahead")] {
+            let mut q = VirtQueue::new(&dma, 0, 4).unwrap();
+            let h = q.add(&[seg]).unwrap();
+            assert_eq!(h, 0);
+            forge_used(&q, 0, id, idx);
+            assert_eq!(q.pop_used(), None, "{why}");
+            assert!(q.is_broken(), "{why}");
+            assert_eq!(q.add(&[seg]), Err(VirtioError::BadQueue));
+            assert_eq!(q.wait_used(10), None);
+        }
+
+        // A completion returned twice: the second is rejected.
+        let mut q = VirtQueue::new(&dma, 0, 4).unwrap();
+        let h = q.add(&[seg]).unwrap();
+        q.add(&[seg]).unwrap();
+        forge_used(&q, 0, h as u32, 1);
+        assert_eq!(q.pop_used(), Some((h, 0)));
+        forge_used(&q, 1, h as u32, 2);
+        assert_eq!(q.pop_used(), None);
+        assert!(q.is_broken());
+        assert_eq!(dma.live.get(), 1);
     }
 }

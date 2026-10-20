@@ -171,7 +171,10 @@ impl ModeInfo {
     /// Parses a 256-byte mode information block.
     pub fn parse(mode: u16, b: &[u8]) -> Self {
         let w = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
-        let mask = |size: u8, pos: u8| if size == 0 || size > 8 { 0 } else { ((1u32 << size) - 1) << pos };
+        let mask = |size: u8, pos: u8| {
+            // An empty, wide or out-of-range field makes the format unusable.
+            if !(1..=8).contains(&size) || pos as u32 + size as u32 > 32 { 0 } else { ((1u32 << size) - 1) << pos }
+        };
         let (bpp, model) = (b[25], b[27]);
         // VBE 3.0 has a separate linear pitch; 2.0 uses the banked one.
         let pitch = match w(50) {
