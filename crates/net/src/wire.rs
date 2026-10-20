@@ -201,7 +201,8 @@ impl Fragment {
 
 impl Ipv4Header {
     /// Splits a packet into its header and payload, verifying the version,
-    /// lengths and header checksum. Options are skipped. Fragments are
+    /// lengths, header checksum and options (see [`ipopt`](crate::ipopt)); a
+    /// packet with malformed or source-route options is rejected. Fragments are
     /// rejected; [`parse_fragment`](Self::parse_fragment) accepts them.
     pub fn parse(b: &[u8]) -> Option<(Self, &[u8])> {
         let (header, fragment, payload) = Self::parse_fragment(b)?;
@@ -219,7 +220,7 @@ impl Ipv4Header {
         if header_len < IPV4_HEADER_LEN || total_len < header_len || total_len > b.len() {
             return None;
         }
-        if checksum::of(&b[..header_len]) != 0 {
+        if checksum::of(&b[..header_len]) != 0 || crate::ipopt::parse(&b[IPV4_HEADER_LEN..header_len]).is_none() {
             return None;
         }
         let fragment = Fragment { more: b[6] & 0x20 != 0, offset: usize::from(be16(b, 6) & 0x1fff) * 8 };

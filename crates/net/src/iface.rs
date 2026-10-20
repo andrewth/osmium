@@ -11,6 +11,10 @@ use osmium_hal::net::{MacAddress, NetDevice, NetError};
 
 use crate::Instant;
 use crate::arp::ArpCache;
+use crate::igmp::{
+    ALL_HOSTS, IGMP_QUERY, IGMP_REPORT_V1, IGMP_REPORT_V2, Igmp, IgmpPacket, Outgoing, PROTO_IGMP, multicast_mac,
+};
+use crate::ipopt;
 use crate::rng::Rng;
 use crate::socket::icmp::EchoReply;
 use crate::socket::tcp::reset_for;
@@ -28,6 +32,9 @@ const ARP_GIVE_UP: Duration = Duration::from_secs(3);
 /// transmission.
 const RX_BURST: usize = 64;
 const TTL: u8 = 64;
+/// Pieces one datagram may arrive in; more condemn it, so that a stream of
+/// tiny fragments cannot make the bookkeeping outgrow the datagram.
+const MAX_PIECES: usize = 512;
 /// How long the pieces of a fragmented datagram are kept (RFC 791 suggests
 /// 15 s).
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -104,6 +111,9 @@ impl Reassembly {
         if self.total.is_some_and(|t| end > t) {
             return false;
         }
+        if self.pieces.len() >= MAX_PIECES {
+            return false;
+        }
         let at = self.pieces.partition_point(|(o, _)| *o < offset);
         if let Some((o, d)) = at.checked_sub(1).map(|i| &self.pieces[i])
             && o + d.len() > offset
@@ -155,6 +165,8 @@ pub struct Interface {
     rng: Rng,
     rx_buf: Vec<u8>,
     reassembling: Vec<Reassembly>,
+    igmp: Igmp,
+    multicast_ttl: u8,
 }
 
 impl Interface {
@@ -177,6 +189,8 @@ impl Interface {
             rng: Rng::new(seed),
             rx_buf: vec![0; frame],
             reassembling: Vec::new(),
+            igmp: Igmp::new(),
+            multicast_ttl: 1,
         }
     }
 
@@ -224,6 +238,54 @@ impl Interface {
             self.requests.clear();
         }
         self.config = config;
+    }
+
+    /// Joins the multicast `group` (such as 239.1.2.3): the interface then
+    /// accepts packets for it, which [`UdpSocket`](crate::UdpSocket)s bound
+    /// to its port receive, and reports the membership with IGMP so that
+    /// routers and snooping switches forward it. A group joined twice must
+    /// be left twice. The 224.0.0.1 all-hosts group is always joined.
+    ///
+    /// Fails with [`Error::InvalidAddress`](crate::Error::InvalidAddress) if
+    /// `group` is not a multicast address and
+    /// [`Error::WouldBlock`](crate::Error::WouldBlock) if the interface is in
+    /// [`MAX_GROUPS`](crate::igmp::MAX_GROUPS) groups already.
+    pub fn join_multicast_group(&mut self, now: Instant, group: Ipv4Addr) -> Result<(), crate::Error> {
+        self.igmp.join(group, now)
+    }
+
+    /// Leaves a group joined with
+    /// [`join_multicast_group`](Self::join_multicast_group), telling the
+    /// routers if this host was the last to report it. Fails with
+    /// [`Error::InvalidState`](crate::Error::InvalidState) if the group was
+    /// not joined.
+    pub fn leave_multicast_group(&mut self, now: Instant, group: Ipv4Addr) -> Result<(), crate::Error> {
+        if let Some(Outgoing { dst, message }) = self.igmp.leave(group, now)?
+            && let Some(c) = self.config
+        {
+            self.send_igmp(now, c.address, dst, message);
+        }
+        Ok(())
+    }
+
+    /// Returns true if the interface accepts packets for `group`.
+    pub fn is_multicast_member(&self, group: Ipv4Addr) -> bool {
+        self.igmp.is_member(group)
+    }
+
+    /// The groups joined, in the order they were.
+    pub fn multicast_groups(&self) -> impl Iterator<Item = Ipv4Addr> + '_ {
+        self.igmp.groups()
+    }
+
+    /// Sets the time to live of multicast datagrams sent; the default 1 keeps
+    /// them on the link. (IGMP messages always use 1.)
+    pub fn set_multicast_ttl(&mut self, ttl: u8) {
+        self.multicast_ttl = ttl;
+    }
+
+    fn send_igmp(&mut self, now: Instant, src: Ipv4Addr, dst: Ipv4Addr, message: IgmpPacket) {
+        self.send_ip(now, Packet { src, dst, protocol: PROTO_IGMP, payload: message.emit() });
     }
 
     pub(crate) fn random_u64(&mut self) -> u64 {
@@ -282,6 +344,11 @@ impl Interface {
             }
         }
 
+        if let Some(c) = self.config {
+            for Outgoing { dst, message } in self.igmp.poll(now) {
+                self.send_igmp(now, c.address, dst, message);
+            }
+        }
         self.retry_arp(now);
         self.reassembling.retain(|r| now - r.first < REASSEMBLY_TIMEOUT);
         active | self.flush(dev)
@@ -294,6 +361,10 @@ impl Interface {
             return Some(Instant::ZERO);
         }
         let arp = self.requests.iter().map(|r| r.last + ARP_RETRY).min();
+        let arp = match (arp, self.config.and(self.igmp.poll_at())) {
+            (Some(a), Some(g)) => Some(a.min(g)),
+            (a, g) => a.or(g),
+        };
         match (arp, sockets.poll_at()) {
             (Some(a), Some(s)) => Some(a.min(s)),
             (a, s) => a.or(s),
@@ -338,26 +409,33 @@ impl Interface {
         self.ident = self.ident.wrapping_add(1);
         let step = (self.mtu - IPV4_HEADER_LEN) / 8 * 8;
         let whole = IPV4_HEADER_LEN + p.payload.len() <= self.mtu;
+        // IGMP carries the router alert option (RFC 2236); it is never
+        // fragmented.
+        let alert = p.protocol == PROTO_IGMP && whole;
+        let hlen = if alert { ipopt::HEADER_LEN_ROUTER_ALERT } else { IPV4_HEADER_LEN };
+        let ttl = if p.protocol == PROTO_IGMP {
+            1
+        } else if p.dst.is_multicast() {
+            self.multicast_ttl
+        } else {
+            TTL
+        };
         let mut frames = Vec::with_capacity(if whole { 1 } else { p.payload.len().div_ceil(step) });
         let mut offset = 0;
         while offset < p.payload.len() || (whole && frames.is_empty()) {
             let len = if whole { p.payload.len() } else { step.min(p.payload.len() - offset) };
-            let mut frame = self.ethernet_frame(dst_mac, ETHERTYPE_IPV4, IPV4_HEADER_LEN + len);
-            let header = Ipv4Header {
-                src: p.src,
-                dst: p.dst,
-                protocol: p.protocol,
-                ttl: TTL,
-                ident: self.ident,
-                payload_len: len,
-            };
-            if whole {
+            let mut frame = self.ethernet_frame(dst_mac, ETHERTYPE_IPV4, hlen + len);
+            let header =
+                Ipv4Header { src: p.src, dst: p.dst, protocol: p.protocol, ttl, ident: self.ident, payload_len: len };
+            if alert {
+                ipopt::emit_with_router_alert(&header, &mut frame[ETH_HEADER_LEN..]);
+            } else if whole {
                 header.emit(&mut frame[ETH_HEADER_LEN..]);
             } else {
                 let fragment = Fragment { more: offset + len < p.payload.len(), offset };
                 header.emit_fragment(&mut frame[ETH_HEADER_LEN..], fragment);
             }
-            frame[ETH_HEADER_LEN + IPV4_HEADER_LEN..].copy_from_slice(&p.payload[offset..offset + len]);
+            frame[ETH_HEADER_LEN + hlen..].copy_from_slice(&p.payload[offset..offset + len]);
             frames.push(frame);
             offset += len;
         }
@@ -377,6 +455,13 @@ impl Interface {
         // is fragmented.
         let too_big = IPV4_HEADER_LEN + p.payload.len() > self.mtu;
         if (too_big && p.protocol == PROTO_TCP) || p.payload.len() > MAX_DATAGRAM || self.mtu < IPV4_HEADER_LEN + 8 {
+            return;
+        }
+        if p.dst.is_multicast() {
+            // Multicast has no next hop to resolve: the group names the MAC.
+            if self.config.is_some() {
+                self.queue_ip(multicast_mac(p.dst), &p);
+            }
             return;
         }
         let next_hop = match self.config {
@@ -552,12 +637,14 @@ impl Interface {
         }
         let ours = self.config.map(|c| c.address);
         let to_us = Some(ip.dst) == ours;
+        // Multicast is taken for the groups joined, and only once configured.
+        let to_group = ours.is_some() && ip.dst.is_multicast() && self.igmp.is_member(ip.dst);
         let broadcast = ip.dst.is_broadcast() || self.config.is_some_and(|c| ip.dst == c.broadcast());
         // Before it has an address the interface takes UDP to anyone, which
         // is how a DHCP server's unicast OFFER arrives; it goes to the DHCP
         // client alone.
         let unconfigured_udp = ours.is_none() && ip.protocol == PROTO_UDP;
-        if !(to_us || broadcast || unconfigured_udp) {
+        if !(to_us || broadcast || unconfigured_udp || to_group) {
             return;
         }
         if !fragment.is_whole() {
@@ -625,6 +712,20 @@ impl Interface {
                     reply = Some(Packet { src: ip.dst, dst: ip.src, protocol: PROTO_ICMP, payload: icmp });
                 }
             }
+            PROTO_IGMP if to_group => {
+                let Some(msg) = IgmpPacket::parse(payload) else { return };
+                // Queries and reports are link-local (TTL 1, RFC 2236 / 3376).
+                if ip.ttl != 1 {
+                    return;
+                }
+                match msg.ty {
+                    IGMP_QUERY if ip.dst == ALL_HOSTS && msg.group.is_unspecified() || ip.dst == msg.group => {
+                        self.igmp.on_query(msg, now, cx.rng);
+                    }
+                    IGMP_REPORT_V1 | IGMP_REPORT_V2 if ip.dst == msg.group => self.igmp.on_report(msg.group),
+                    _ => {}
+                }
+            }
             PROTO_TCP if to_us => {
                 let Some((tcp, data)) = TcpHeader::parse(payload, ip.src, ip.dst) else { return };
                 let dst = SocketAddrV4::new(ip.dst, tcp.dst_port);
@@ -669,6 +770,7 @@ impl Interface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::igmp::{ALL_ROUTERS, IGMP_LEAVE};
     use crate::testing::{A_IP, B_IP, pair, run};
     use crate::{IcmpSocket, UdpSocket};
 
@@ -1014,5 +1116,186 @@ mod tests {
         assert_eq!(iface.rx_buf.len(), MAX_FRAME);
         iface.poll(Instant::ZERO, &mut Liar, &mut SocketSet::new());
         assert_eq!(iface.mss(), 1460);
+    }
+
+    const GROUP: Ipv4Addr = Ipv4Addr::new(239, 1, 2, 3);
+
+    /// An IGMP message from A to `dst`, in a frame to `dst`'s multicast MAC.
+    fn igmp_frame(dst: Ipv4Addr, ttl: u8, msg: IgmpPacket) -> Vec<u8> {
+        let payload = msg.emit();
+        let mut f = vec![0; ETH_HEADER_LEN + ipopt::HEADER_LEN_ROUTER_ALERT + payload.len()];
+        EthernetHeader { dst: multicast_mac(dst), src: MacAddress([2, 0, 0, 0, 0, 1]), ethertype: ETHERTYPE_IPV4 }
+            .emit(&mut f);
+        let h = Ipv4Header { src: A_IP, dst, protocol: PROTO_IGMP, ttl, ident: 0, payload_len: payload.len() };
+        ipopt::emit_with_router_alert(&h, &mut f[ETH_HEADER_LEN..]);
+        f[ETH_HEADER_LEN + ipopt::HEADER_LEN_ROUTER_ALERT..].copy_from_slice(&payload);
+        f
+    }
+
+    /// The IGMP messages in the frames `sent`, with their IP headers and
+    /// destination MACs.
+    fn igmp_sent(sent: &[Vec<u8>]) -> Vec<(MacAddress, Ipv4Header, IgmpPacket)> {
+        sent.iter()
+            .filter_map(|f| {
+                let (eth, ip) = EthernetHeader::parse(f)?;
+                let (h, payload) = Ipv4Header::parse(ip)?;
+                if h.protocol != PROTO_IGMP {
+                    return None;
+                }
+                assert!(ipopt::of_packet(ip)?.router_alert, "IGMP carries router alert");
+                Some((eth.dst, h, IgmpPacket::parse(payload).unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multicast_udp_reaches_members_only() {
+        let (mut a, mut b) = pair();
+        let sent = record(&mut a);
+        let hb = b.sockets.add(UdpSocket::new(8, 8));
+        b.sockets.get_mut::<UdpSocket>(hb).bind(5000).unwrap();
+        let ha = a.sockets.add(UdpSocket::new(8, 8));
+        a.sockets.get_mut::<UdpSocket>(ha).bind(6000).unwrap();
+        let mut now = Instant::ZERO;
+        let dst = SocketAddrV4::new(GROUP, 5000);
+
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(b"before", dst).unwrap();
+        run(&mut a, &mut b, &mut now, 20, |_, _| false);
+        assert!(!b.sockets.get::<UdpSocket>(hb).can_recv(), "B has not joined");
+
+        assert!(!b.iface.is_multicast_member(GROUP));
+        b.iface.join_multicast_group(now, GROUP).unwrap();
+        assert!(b.iface.is_multicast_member(GROUP) && b.iface.multicast_groups().eq([GROUP]));
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(b"after", dst).unwrap();
+        run(&mut a, &mut b, &mut now, 20, |_, _| false);
+        let mut buf = [0u8; 16];
+        let (n, from) = b.sockets.get_mut::<UdpSocket>(hb).recv_from(&mut buf).unwrap();
+        assert_eq!((&buf[..n], from), (&b"after"[..], SocketAddrV4::new(A_IP, 6000)));
+        assert!(!b.sockets.get::<UdpSocket>(hb).can_recv());
+
+        // It went to the group's MAC with TTL 1, and needed no ARP.
+        {
+            let sent = sent.borrow();
+            assert!(sent.iter().all(|f| EthernetHeader::parse(f).unwrap().0.ethertype == ETHERTYPE_IPV4));
+            let (eth, ip) = EthernetHeader::parse(&sent[0]).unwrap();
+            assert_eq!((eth.dst, Ipv4Header::parse(ip).unwrap().0.ttl), (multicast_mac(GROUP), 1));
+        }
+
+        b.iface.leave_multicast_group(now, GROUP).unwrap();
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(b"gone", dst).unwrap();
+        run(&mut a, &mut b, &mut now, 20, |_, _| false);
+        assert!(!b.sockets.get::<UdpSocket>(hb).can_recv());
+    }
+
+    #[test]
+    fn joins_report_queries_are_answered_and_leaves_announced() {
+        let (mut a, mut b) = pair();
+        let sent = record(&mut b);
+        let mut now = Instant::ZERO;
+        assert_eq!(b.iface.join_multicast_group(now, A_IP), Err(crate::Error::InvalidAddress));
+        assert_eq!(b.iface.leave_multicast_group(now, GROUP), Err(crate::Error::InvalidState));
+        b.iface.join_multicast_group(now, GROUP).unwrap();
+        assert_eq!(b.iface.poll_at(&b.sockets), Some(now));
+        run(&mut a, &mut b, &mut now, 1, |_, _| false);
+        {
+            let msgs = igmp_sent(&sent.borrow());
+            let (mac, ip, msg) = &msgs[0];
+            assert_eq!((*mac, ip.dst, ip.ttl, ip.src), (multicast_mac(GROUP), GROUP, 1, B_IP));
+            assert_eq!((msg.ty, msg.group), (IGMP_REPORT_V2, GROUP));
+        }
+        // The second unsolicited report.
+        run(&mut a, &mut b, &mut now, 10_000, |_, _| false);
+        assert_eq!(igmp_sent(&sent.borrow()).len(), 2);
+
+        // A general query with a one second response time.
+        let query = IgmpPacket { ty: IGMP_QUERY, max_response: 10, group: Ipv4Addr::UNSPECIFIED };
+        sent.borrow_mut().clear();
+        a.dev.tx.borrow_mut().push_back(igmp_frame(ALL_HOSTS, 64, query));
+        run(&mut a, &mut b, &mut now, 1100, |_, _| false);
+        assert!(igmp_sent(&sent.borrow()).is_empty(), "a query with a bad TTL is ignored");
+        a.dev.tx.borrow_mut().push_back(igmp_frame(ALL_HOSTS, 1, query));
+        assert!(run(&mut a, &mut b, &mut now, 1100, |_, _| !igmp_sent(&sent.borrow()).is_empty()));
+        assert_eq!(igmp_sent(&sent.borrow())[0].2.group, GROUP);
+
+        // Another member's report cancels ours.
+        sent.borrow_mut().clear();
+        a.dev.tx.borrow_mut().push_back(igmp_frame(ALL_HOSTS, 1, query));
+        run(&mut a, &mut b, &mut now, 1, |_, _| false);
+        let report = IgmpPacket { ty: IGMP_REPORT_V2, max_response: 0, group: GROUP };
+        a.dev.tx.borrow_mut().push_back(igmp_frame(GROUP, 1, report));
+        run(&mut a, &mut b, &mut now, 1500, |_, _| false);
+        assert!(igmp_sent(&sent.borrow()).is_empty(), "suppressed by another member's report");
+
+        // We were not the last to report, so leaving is silent; join again
+        // and leave: now it is announced.
+        b.iface.leave_multicast_group(now, GROUP).unwrap();
+        b.iface.join_multicast_group(now, GROUP).unwrap();
+        run(&mut a, &mut b, &mut now, 1, |_, _| false);
+        sent.borrow_mut().clear();
+        b.iface.leave_multicast_group(now, GROUP).unwrap();
+        run(&mut a, &mut b, &mut now, 1, |_, _| false);
+        let msgs = igmp_sent(&sent.borrow());
+        assert_eq!(msgs.len(), 1);
+        let (mac, ip, msg) = &msgs[0];
+        assert_eq!((*mac, ip.dst, msg.ty, msg.group), (multicast_mac(ALL_ROUTERS), ALL_ROUTERS, IGMP_LEAVE, GROUP));
+    }
+
+    /// A UDP datagram from A to B carrying the IP `options` (a multiple of
+    /// four bytes).
+    fn udp_with_options(options: &[u8]) -> Vec<u8> {
+        let udp = UdpHeader { src_port: 9, dst_port: 2000 }.emit(A_IP, B_IP, b"x");
+        let hlen = IPV4_HEADER_LEN + options.len();
+        let mut f = vec![0; ETH_HEADER_LEN + hlen + udp.len()];
+        let src = MacAddress([2, 0, 0, 0, 0, 1]);
+        EthernetHeader { dst: MacAddress([2, 0, 0, 0, 0, 2]), src, ethertype: ETHERTYPE_IPV4 }.emit(&mut f);
+        let ip = &mut f[ETH_HEADER_LEN..];
+        Ipv4Header { src: A_IP, dst: B_IP, protocol: PROTO_UDP, ttl: 64, ident: 0, payload_len: udp.len() }.emit(ip);
+        ip[0] = 0x40 | (hlen / 4) as u8;
+        ip[2..4].copy_from_slice(&((hlen + udp.len()) as u16).to_be_bytes());
+        ip[20..hlen].copy_from_slice(options);
+        ip[hlen..].copy_from_slice(&udp);
+        ip[10..12].fill(0);
+        let sum = checksum::of(&ip[..hlen]);
+        ip[10..12].copy_from_slice(&sum.to_be_bytes());
+        f
+    }
+
+    #[test]
+    fn ip_options_are_skipped_or_rejected() {
+        let (a, mut b) = pair();
+        let hb = b.sockets.add(UdpSocket::new(8, 8));
+        b.sockets.get_mut::<UdpSocket>(hb).bind(2000).unwrap();
+        let sent = record(&mut b);
+        let good: [&[u8]; 3] = [&[1, 1, 1, 0], &[148, 4, 0, 0], &[0x88, 4, 1, 2]];
+        let bad: [&[u8]; 5] = [
+            &[0x88, 9, 0, 0],            // runs past the header
+            &[0x88, 1, 0, 0],            // length below 2
+            &[131, 7, 4, 1, 2, 3, 4, 0], // loose source route
+            &[137, 7, 4, 1, 2, 3, 4, 0], // strict source route
+            &[148, 3, 0, 1],             // bad router alert
+        ];
+        for opts in bad {
+            a.dev.tx.borrow_mut().push_back(udp_with_options(opts));
+            b.poll(Instant::ZERO);
+            assert!(!b.sockets.get::<UdpSocket>(hb).can_recv(), "{opts:?}");
+        }
+        for opts in good {
+            a.dev.tx.borrow_mut().push_back(udp_with_options(opts));
+            b.poll(Instant::ZERO);
+            assert!(b.sockets.get_mut::<UdpSocket>(hb).recv_from(&mut [0; 4]).is_ok(), "{opts:?}");
+        }
+        assert!(sent.borrow().is_empty(), "no ICMP for dropped packets");
+    }
+
+    #[test]
+    fn a_stream_of_tiny_fragments_is_condemned() {
+        let (a, mut b) = pair();
+        for n in 0..MAX_PIECES + 1 {
+            a.dev.tx.borrow_mut().push_back(fragment(1, n * 8, true, &[0; 8]));
+        }
+        for _ in 0..(MAX_PIECES + 1).div_ceil(RX_BURST) {
+            b.poll(Instant::ZERO);
+        }
+        assert!(b.iface.reassembling.is_empty());
     }
 }

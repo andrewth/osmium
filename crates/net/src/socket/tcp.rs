@@ -2078,5 +2078,4 @@ mod tests {
         assert_eq!(got, data);
         assert!(tcp(&mut a, ca).srtt.is_some());
     }
-
 }

@@ -33,6 +33,8 @@ extern crate std;
 mod arp;
 mod error;
 mod iface;
+pub mod igmp;
+pub mod ipopt;
 mod rng;
 mod socket;
 mod time;
