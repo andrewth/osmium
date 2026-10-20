@@ -261,7 +261,10 @@ pub fn iscsi(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
         return;
     }
     let net = Stack { iface: &mut iface, dev, sockets: &mut sockets, now_ns };
-    let opts = Options::new("iqn.2026-10.org.osmium:riscv-virt", "iqn.2026-10.org.osmium:disk0");
+    let mut opts = Options::new("iqn.2026-10.org.osmium:riscv-virt", "iqn.2026-10.org.osmium:disk0");
+    // The target is local and answers in milliseconds; where nothing forwards
+    // the port (a guest of riscv-hyp), give up quickly.
+    opts.timeout = core::time::Duration::from_secs(3);
     let mut disk = match IscsiDisk::connect(net, PORTAL, &opts) {
         Ok(disk) => disk,
         Err(e) => {
