@@ -1,6 +1,6 @@
 [package]
 name = "osmium-fs"
-description = "Osmium: a virtual file system with mounts, a RAM file system, initramfs loading and ext2"
+description = "Osmium: a virtual file system with mounts, a RAM file system, initramfs loading and ext2/3/4"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
