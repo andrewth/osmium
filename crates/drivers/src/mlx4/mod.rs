@@ -56,7 +56,7 @@ use osmium_hal::pci::{MsiError, MsiMessage, MsixTable};
 use osmium_hal::timer::Clock;
 
 use cmd::{Ctx, Hcr, Input, MTTS_PER_WRITE, op};
-pub use eth::{EthPort, Offloads, RxChecksum, Tso, TxError, TxOffload};
+pub use eth::{EthPort, Offloads, RxChecksum, TSO_MAX_HEADER, Tso, TxError, TxOffload};
 
 /// Mellanox's PCI vendor ID.
 pub const VENDOR_ID: u16 = 0x15b3;
