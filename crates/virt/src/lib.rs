@@ -10,6 +10,7 @@
 //! - [`vcpu`]: a normalized [`VmExit`], the [`Vcpu`] trait that hardware
 //!   backends implement, and [`run_vcpu`], a loop that services device exits.
 //! - [`devices`]: emulated devices.
+//! - [`virtio`]: virtio device models behind the virtio-mmio transport.
 //!
 //! Hardware backends (VMX, SVM, Arm EL2, RISC-V H) implement [`Vcpu`]; they
 //! are on the roadmap.
@@ -24,6 +25,7 @@ pub mod devices;
 pub mod memory;
 pub mod stage2;
 pub mod vcpu;
+pub mod virtio;
 
 pub use bus::{Bus, BusDevice, BusError};
 pub use memory::{GuestMemory, GuestPhysAddr, Pod};
