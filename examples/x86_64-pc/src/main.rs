@@ -715,7 +715,7 @@ const USER_BASE: u64 = 0x80_0000_0000;
 struct Process {
     root: PhysAddr,
     pt: IrqSpinLock<PageTable<X86_64, &'static Frames>>,
-    frames: [PhysAddr; 2],
+    frames: Vec<PhysAddr>,
 }
 
 static PROCESSES_FREED: AtomicUsize = AtomicUsize::new(0);
@@ -724,7 +724,7 @@ impl Drop for Process {
     fn drop(&mut self) {
         PROCESSES_FREED.fetch_add(1, Ordering::Relaxed);
         let mut frames = FRAMES.lock();
-        for f in self.frames {
+        for &f in &self.frames {
             // SAFETY: the process's own frames; its page table, the only
             // one mapping them, is dropped with it and no longer loaded.
             unsafe { frames.dealloc(f, 0) };
@@ -759,11 +759,45 @@ fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> alloc
     unsafe { pt.share_root_entries(PT.lock().as_ref().unwrap(), 0..1) };
     pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().ignore();
     pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
-    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames: [code_pa, stack_pa] };
+    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames: alloc::vec![code_pa, stack_pa] };
     TaskBuilder::new(name).cpu(cpu).data(process).spawn(move || {
         // SAFETY: CpuTables are loaded, the switch hook keeps rsp[0] on this
         // task's kernel stack, and both pages are mapped user-accessible.
         unsafe { x86::enter_user(code_va, stack_va + PAGE_SIZE as u64) }
+    })
+}
+
+/// The Rust user program, built by `build.rs`.
+static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
+
+/// Loads an ELF executable into a new address space and spawns a task on
+/// `cpu` that runs it in ring 3.
+fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> alloc::sync::Arc<osmium::sched::Task> {
+    use osmium::boot::elf::{Elf, Machine};
+    let elf = Elf::new(image).expect("bad user ELF");
+    assert_eq!(elf.machine(), Machine::X86_64);
+    let mut pt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).unwrap();
+    // SAFETY: the kernel table lives for the whole run.
+    unsafe { pt.share_root_entries(PT.lock().as_ref().unwrap(), 0..1) };
+    let mut frames = Vec::new();
+    elf.load_into(&mut pt, MapFlags::USER, || {
+        let pa = FRAMES.lock().alloc_frame()?;
+        frames.push(pa);
+        Some(pa)
+    })
+    .expect("loading the user ELF failed");
+    let page = PAGE_SIZE as u64;
+    // A one-page stack just below 1 TiB, clear of the image.
+    let stack_top = 0xff_0000_0000u64;
+    let stack = FRAMES.lock().alloc_frame().unwrap();
+    pt.map(VirtAddr::new(stack_top - page), stack, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().ignore();
+    frames.push(stack);
+    let entry = elf.entry();
+    let process = Process { root: pt.root(), pt: IrqSpinLock::new(pt), frames };
+    TaskBuilder::new(name).cpu(cpu).data(process).spawn(move || {
+        // SAFETY: as for the hand-written programs: CpuTables are loaded, the
+        // switch hook installs this process's table, and its pages are mapped.
+        unsafe { x86::enter_user(entry, stack_top) }
     })
 }
 
@@ -774,14 +808,19 @@ fn user_demo() {
     // CPU's GS base, which CPU 0 alone would not test.
     let cpu = 1 % ONLINE.load(Ordering::Acquire);
     println!("[user]  running 3 ring-3 programs on CPU {cpu}");
-    let tasks = [spawn_user("user-1", 1, hello, cpu), spawn_user("user-2", 2, hello, cpu), spawn_user("user-bad", 3, bad, cpu)];
+    let tasks = [
+        spawn_user("user-1", 1, hello, cpu),
+        spawn_user("user-2", 2, hello, cpu),
+        spawn_user("user-bad", 3, bad, cpu),
+        spawn_elf("user-elf", HELLO_ELF, cpu),
+    ];
     println!("[user]  each program has its own page table; all run at {USER_BASE:#x}");
     for t in tasks {
         t.join();
     }
     // Exited tasks (and their address spaces) are freed after the next switch.
     osmium::sched::yield_now();
-    println!("[user]  {} of 3 address spaces torn down with their tasks", PROCESSES_FREED.load(Ordering::Relaxed));
+    println!("[user]  {} of 4 address spaces torn down with their tasks", PROCESSES_FREED.load(Ordering::Relaxed));
 }
 
 /// Handles `int 0x80` from ring 3.

@@ -21,7 +21,7 @@ principles and the full feature list with status.
 | `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA), `IrqTable`, global console with `println!` | no |
 | `osmium-drivers` | NS16550A, PL011, RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, i8254 PIT, RAM disk, Mellanox ConnectX-3 (mlx4) Ethernet | no |
-| `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG reader | writer only |
+| `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG reader, ELF64 loader | writer only |
 | `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
 | `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550 | yes |
 | `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
@@ -96,8 +96,9 @@ features.
 
 - User mode works on all three architectures: the examples run the same
   user programs, each in its own address space (sharing the kernel's root
-  page-table entries), with system calls. There is no ELF loader, file
-  system or process API yet; the examples hand-roll those parts. Kernel stack overflows are caught on all three
+  page-table entries), with system calls; the x86_64 example also loads a
+  Rust user program from an ELF file. There is no file system or process
+  API yet; the examples hand-roll those parts. Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. The scheduler does no load balancing; tasks move only

@@ -65,7 +65,7 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
 EXPECT='\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;3 of 3 address spaces torn down' \
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
-EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);user-2 exited with status 0;\[uart\]  COM1 IRQ 4;hello from process 2;3 of 3 address spaces torn down' \
+EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);user-2 exited with status 0;\[uart\]  COM1 IRQ 4;hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200' \
 boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
     -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot
 

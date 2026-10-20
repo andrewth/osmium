@@ -4,6 +4,7 @@
 //!   plus an [`fdt::FdtWriter`] (feature `alloc`) for building trees, which a
 //!   hypervisor needs to describe its guests.
 //! - [`multiboot2`]: the Multiboot2 boot information structure (GRUB).
+//! - [`elf`]: ELF64 executables (kernels, guests, user programs).
 //! - [`acpi`]: RSDP/RSDT/XSDT, MADT (CPUs, I/O APICs) and MCFG (PCI ECAM).
 //! - [`pvh`]: the PVH start-info structure (QEMU, Firecracker, Cloud
 //!   Hypervisor), plus a macro for the ELF note that advertises a PVH entry.
@@ -18,6 +19,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod acpi;
+pub mod elf;
 pub mod fdt;
 pub mod multiboot2;
 pub mod pvh;
