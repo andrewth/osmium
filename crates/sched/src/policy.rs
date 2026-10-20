@@ -1,8 +1,8 @@
 //! Ready-made scheduling policies.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use osmium_arch::MAX_CPUS;
 use osmium_sync::{IrqSpinLock, PerCpu};
@@ -201,6 +201,155 @@ impl Scheduler for PriorityScheduler {
     }
 }
 
+/// Run queue ordered by absolute deadline, then arrival.
+struct EdfQueue {
+    seq: u64,
+    tasks: BTreeMap<(u64, u64), Arc<Task>>,
+}
+
+/// Earliest-deadline-first scheduling.
+///
+/// Time is counted in ticks. A task with a relative deadline
+/// ([`Task::set_deadline`]) gets the absolute deadline `release + deadline`
+/// when it is spawned or woken; the release time is the wake-up time, except
+/// that a periodic task ([`Task::set_period`]) released again before its next
+/// period starts is released at the start of that period. The task with the
+/// earliest absolute deadline runs first, and a tick preempts the running task
+/// as soon as a queued one has an earlier deadline. Tasks without a deadline
+/// run after all that have one, round-robin in slices of `slice_ticks`; ties
+/// are served in arrival order. A task keeps its deadline across yields and
+/// preemptions.
+///
+/// The tick count is advanced by the first CPU that calls [`Scheduler::tick`]
+/// (override with [`EdfScheduler::with_clock`]). With
+/// [`EdfScheduler::with_stealing`], an idle CPU takes the earliest-deadline
+/// task it may run from another CPU's queue.
+pub struct EdfScheduler {
+    queues: PerCpu<IrqSpinLock<EdfQueue>>,
+    slice: u32,
+    steal: bool,
+    steals: AtomicUsize,
+    ticks: AtomicU64,
+    /// CPU id + 1 of the CPU that advances `ticks`; 0 until the first tick.
+    keeper: AtomicUsize,
+    clock: Option<fn() -> u64>,
+}
+
+impl EdfScheduler {
+    /// Creates the policy; tasks without a deadline share the CPU in slices
+    /// of `slice_ticks` ticks.
+    pub const fn new(slice_ticks: u32) -> Self {
+        Self {
+            queues: PerCpu::new([const { IrqSpinLock::new(EdfQueue { seq: 0, tasks: BTreeMap::new() }) }; MAX_CPUS]),
+            slice: slice_ticks,
+            steal: false,
+            steals: AtomicUsize::new(0),
+            ticks: AtomicU64::new(0),
+            keeper: AtomicUsize::new(0),
+            clock: None,
+        }
+    }
+
+    /// Enables work stealing between CPUs.
+    pub const fn with_stealing(mut self) -> Self {
+        self.steal = true;
+        self
+    }
+
+    /// Takes the current time from `clock` instead of counting ticks.
+    pub const fn with_clock(mut self, clock: fn() -> u64) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Tasks moved between CPUs by stealing so far.
+    pub fn steals(&self) -> usize {
+        self.steals.load(Ordering::Relaxed)
+    }
+
+    /// Number of tasks waiting on `cpu`.
+    pub fn queued(&self, cpu: usize) -> usize {
+        self.queues.get_for(cpu).lock().tasks.len()
+    }
+
+    fn now(&self) -> u64 {
+        match self.clock {
+            Some(c) => c(),
+            None => self.ticks.load(Ordering::Relaxed),
+        }
+    }
+
+    fn release(&self, task: &Task) {
+        let now = self.now();
+        let rel = task.deadline();
+        let period = task.period();
+        let mut release = now;
+        let last = task.release.load(Ordering::Relaxed);
+        if period != 0 && last != u64::MAX {
+            let next = last.saturating_add(period);
+            if next > now {
+                release = next;
+            }
+        }
+        task.release.store(release, Ordering::Relaxed);
+        let abs = if rel == 0 { u64::MAX } else { release.saturating_add(rel) };
+        task.abs_deadline.store(abs, Ordering::Relaxed);
+    }
+
+    fn steal_for(&self, cpu: usize) -> Option<Arc<Task>> {
+        for off in 1..MAX_CPUS {
+            let victim = (cpu + off) % MAX_CPUS;
+            let mut q = self.queues.get_for(victim).lock();
+            if let Some(key) = q.tasks.iter().find(|(_, t)| t.stealable_by(cpu)).map(|(k, _)| *k) {
+                self.steals.fetch_add(1, Ordering::Relaxed);
+                return q.tasks.remove(&key);
+            }
+        }
+        None
+    }
+}
+
+impl Scheduler for EdfScheduler {
+    fn enqueue(&self, task: Arc<Task>, reason: EnqueueReason) {
+        if matches!(reason, EnqueueReason::Spawned | EnqueueReason::Woken) {
+            self.release(&task);
+        }
+        task.slice_left.store(self.slice, Ordering::Relaxed);
+        let abs = task.abs_deadline.load(Ordering::Relaxed);
+        let mut q = self.queues.get_for(task.cpu()).lock();
+        q.seq += 1;
+        let seq = q.seq;
+        q.tasks.insert((abs, seq), task);
+    }
+
+    fn pick_next(&self, cpu: usize) -> Option<Arc<Task>> {
+        let local = self.queues.get_for(cpu).lock().tasks.pop_first().map(|(_, t)| t);
+        if local.is_none() && self.steal { self.steal_for(cpu) } else { local }
+    }
+
+    fn tick(&self, cpu: usize, current: &Task) -> bool {
+        if self.clock.is_none() {
+            let me = cpu + 1;
+            let k = self.keeper.load(Ordering::Relaxed);
+            if k == me || (k == 0 && self.keeper.compare_exchange(0, me, Ordering::Relaxed, Ordering::Relaxed).is_ok())
+            {
+                self.ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let left = current.slice_left.load(Ordering::Relaxed).saturating_sub(1);
+        current.slice_left.store(left, Ordering::Relaxed);
+        let mine = current.abs_deadline.load(Ordering::Relaxed);
+        match self.queues.get_for(cpu).lock().tasks.first_key_value() {
+            Some((&(abs, _), _)) => abs < mine || (abs == mine && left == 0),
+            None => false,
+        }
+    }
+
+    fn balances(&self) -> bool {
+        self.steal
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +410,113 @@ mod tests {
         s.enqueue(b, EnqueueReason::Spawned);
         assert!(s.tick(41, &a), "slice spent and someone is waiting");
         assert_eq!(s.queued(41), 1);
+    }
+
+    #[test]
+    fn edf_order_and_preemption() {
+        let s = EdfScheduler::new(2);
+        let late = TaskBuilder::new("late").deadline(50).cpu(50).build(|| {});
+        let soon = TaskBuilder::new("soon").deadline(5).cpu(50).build(|| {});
+        let none = TaskBuilder::new("none").cpu(50).build(|| {});
+        s.enqueue(none.clone(), EnqueueReason::Spawned);
+        s.enqueue(late.clone(), EnqueueReason::Spawned);
+        assert!(s.tick(50, &none), "a deadline beats none");
+        assert_eq!(s.pick_next(50).unwrap().name(), "late");
+        assert!(!s.tick(50, &late), "only best-effort waits");
+        s.enqueue(soon.clone(), EnqueueReason::Woken);
+        assert!(s.tick(50, &late), "earlier deadline woken: preempt");
+        assert_eq!(s.pick_next(50).unwrap().name(), "soon");
+        s.enqueue(late.clone(), EnqueueReason::Preempted);
+        assert_eq!(s.pick_next(50).unwrap().name(), "late");
+        assert_eq!(s.pick_next(50).unwrap().name(), "none");
+        assert!(s.pick_next(50).is_none());
+    }
+
+    #[test]
+    fn edf_deadlines_follow_the_clock_and_period() {
+        let s = EdfScheduler::new(2);
+        let idle = TaskBuilder::new("cur").cpu(51).build(|| {});
+        let p = TaskBuilder::new("p").deadline(10).period(100).cpu(51).build(|| {});
+        s.enqueue(p.clone(), EnqueueReason::Spawned);
+        assert_eq!(p.abs_deadline.load(Ordering::Relaxed), 10);
+        let p = s.pick_next(51).unwrap();
+        for _ in 0..30 {
+            s.tick(51, &idle);
+        }
+        s.enqueue(p.clone(), EnqueueReason::Woken);
+        assert_eq!(p.abs_deadline.load(Ordering::Relaxed), 110, "released at the next period start");
+        let q = TaskBuilder::new("q").deadline(20).cpu(51).build(|| {});
+        s.enqueue(q, EnqueueReason::Spawned);
+        assert_eq!(s.pick_next(51).unwrap().name(), "q", "deadline 50 before 110");
+    }
+
+    #[test]
+    fn edf_equal_deadlines_are_fifo_and_sliced() {
+        let s = EdfScheduler::new(2);
+        let a = TaskBuilder::new("a").deadline(9).cpu(52).build(|| {});
+        let b = TaskBuilder::new("b").deadline(9).cpu(52).build(|| {});
+        s.enqueue(a.clone(), EnqueueReason::Spawned);
+        s.enqueue(b, EnqueueReason::Spawned);
+        let a = s.pick_next(52).unwrap();
+        assert_eq!(a.name(), "a");
+        assert!(!s.tick(52, &a));
+        assert!(s.tick(52, &a), "slice spent, equal deadline waiting");
+    }
+
+    #[test]
+    fn edf_stealing_respects_affinity() {
+        let s = EdfScheduler::new(2).with_stealing();
+        let pinned = TaskBuilder::new("pinned").deadline(1).cpu(53).build(|| {});
+        let far = TaskBuilder::new("far").deadline(90).affinity(1 << 53 | 1 << 54).build(|| {});
+        let near = TaskBuilder::new("near").deadline(20).affinity(1 << 53 | 1 << 54).build(|| {});
+        for t in [&pinned, &far, &near] {
+            t.set_cpu_unpinned(53);
+        }
+        s.enqueue(pinned, EnqueueReason::Spawned);
+        s.enqueue(far, EnqueueReason::Spawned);
+        s.enqueue(near, EnqueueReason::Spawned);
+        assert_eq!(s.pick_next(54).unwrap().name(), "near", "earliest movable deadline");
+        assert_eq!(s.pick_next(54).unwrap().name(), "far");
+        assert!(s.pick_next(54).is_none(), "pinned stays");
+        assert_eq!(s.steals(), 2);
+        assert_eq!(s.pick_next(53).unwrap().name(), "pinned");
+    }
+
+    #[test]
+    fn edf_smp_hammer() {
+        use std::sync::Arc as StdArc;
+        let s = StdArc::new(EdfScheduler::new(2).with_stealing());
+        let total = 400usize;
+        for i in 0..total {
+            let t = TaskBuilder::new("w")
+                .deadline(1 + (i as u64 * 7) % 50)
+                .affinity(1 << 56 | 1 << 57 | 1 << 58)
+                .build(|| {});
+            t.set_cpu_unpinned(56 + i % 3);
+            s.enqueue(t, EnqueueReason::Spawned);
+        }
+        let done = StdArc::new(AtomicUsize::new(0));
+        let hs: std::vec::Vec<_> = (0..3)
+            .map(|n| {
+                let (s, done) = (s.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let mut idle = 0;
+                    while idle < 1000 {
+                        match s.pick_next(56 + n) {
+                            Some(t) => {
+                                idle = 0;
+                                done.fetch_add(1, Ordering::Relaxed);
+                                drop(t);
+                            }
+                            None => idle += 1,
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(done.load(Ordering::Relaxed), total, "every task taken exactly once");
     }
 }

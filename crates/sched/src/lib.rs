@@ -3,8 +3,9 @@
 //! The crate provides the *mechanism*: [`Task`]s with their own stacks, the
 //! per-arch context switch, the current-task pointer, blocking and waking,
 //! exit and tick-driven preemption. The *policy* is any [`Scheduler`]
-//! implementation, injected once with [`inject_scheduler`]. Two policies are
-//! included: [`FifoScheduler`] (round-robin) and [`PriorityScheduler`].
+//! implementation, injected once with [`inject_scheduler`]. Three policies are
+//! included: [`FifoScheduler`] (round-robin), [`PriorityScheduler`] and
+//! [`EdfScheduler`] (earliest deadline first).
 //!
 //! ```ignore
 //! static SCHED: FifoScheduler = FifoScheduler::new(10);
@@ -54,6 +55,6 @@ pub use core_sched::{
     EnqueueReason, Scheduler, current, exit, init_cpu, inject_scheduler, preempt_if_needed, set_remote_wake_hook,
     set_switch_hook, spawn, tick, yield_now,
 };
-pub use policy::{FifoScheduler, PriorityScheduler};
+pub use policy::{EdfScheduler, FifoScheduler, PriorityScheduler};
 pub use sync::{Mutex, MutexGuard, Semaphore, WaitQueue};
 pub use task::{ALL_CPUS, StackAllocator, Task, TaskBuilder, TaskId, TaskState, set_stack_allocator};

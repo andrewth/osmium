@@ -133,6 +133,13 @@ pub struct Task {
     affinity: AtomicU64,
     /// Remaining ticks of the current time slice; policies use it.
     pub(crate) slice_left: AtomicU32,
+    /// Relative deadline in ticks (0 = none); see [`crate::EdfScheduler`].
+    rel_deadline: AtomicU64,
+    /// Period in ticks (0 = aperiodic).
+    period: AtomicU64,
+    /// Absolute deadline and release time, kept by [`crate::EdfScheduler`].
+    pub(crate) abs_deadline: AtomicU64,
+    pub(crate) release: AtomicU64,
     pub(crate) entry: UnsafeCell<Option<Entry>>,
     _stack: Option<Stack>,
     pub(crate) exit_waiters: WaitQueue,
@@ -174,6 +181,27 @@ impl Task {
     /// Changes the priority; takes effect the next time the task is queued.
     pub fn set_priority(&self, p: u8) {
         self.priority.store(p.min(63), Ordering::Relaxed);
+    }
+
+    /// Relative deadline in ticks, 0 if none; used by [`crate::EdfScheduler`].
+    pub fn deadline(&self) -> u64 {
+        self.rel_deadline.load(Ordering::Relaxed)
+    }
+
+    /// Sets the relative deadline in ticks (0 = none, scheduled after every
+    /// task that has one); takes effect the next time the task is released.
+    pub fn set_deadline(&self, ticks: u64) {
+        self.rel_deadline.store(ticks, Ordering::Relaxed);
+    }
+
+    /// Period in ticks, 0 if the task is not periodic.
+    pub fn period(&self) -> u64 {
+        self.period.load(Ordering::Relaxed)
+    }
+
+    /// Sets the period in ticks (0 = aperiodic); see [`crate::EdfScheduler`].
+    pub fn set_period(&self, ticks: u64) {
+        self.period.store(ticks, Ordering::Relaxed);
     }
 
     /// The CPU the task last ran on or is assigned to.
@@ -308,6 +336,10 @@ impl Task {
             cpu: AtomicUsize::new(cpu),
             affinity: AtomicU64::new(ALL_CPUS),
             slice_left: AtomicU32::new(0),
+            rel_deadline: AtomicU64::new(0),
+            period: AtomicU64::new(0),
+            abs_deadline: AtomicU64::new(u64::MAX),
+            release: AtomicU64::new(u64::MAX),
             entry: UnsafeCell::new(entry),
             _stack: stack,
             exit_waiters: WaitQueue::new(),
@@ -330,6 +362,8 @@ pub struct TaskBuilder {
     priority: u8,
     cpu: Option<usize>,
     affinity: u64,
+    deadline: u64,
+    period: u64,
     data: Option<Box<dyn Any + Send + Sync>>,
     fp: Option<FpState>,
 }
@@ -346,7 +380,17 @@ impl TaskBuilder {
 
     /// Starts building a task called `name`.
     pub fn new(name: &'static str) -> Self {
-        Self { name, stack_size: Self::DEFAULT_STACK, priority: 0, cpu: None, affinity: ALL_CPUS, data: None, fp: None }
+        Self {
+            name,
+            stack_size: Self::DEFAULT_STACK,
+            priority: 0,
+            cpu: None,
+            affinity: ALL_CPUS,
+            deadline: 0,
+            period: 0,
+            data: None,
+            fp: None,
+        }
     }
 
     /// Sets the stack size in bytes.
@@ -373,6 +417,18 @@ impl TaskBuilder {
     pub fn affinity(mut self, mask: u64) -> Self {
         assert!(mask != 0, "a task must be allowed on some CPU");
         self.affinity = mask;
+        self
+    }
+
+    /// Sets the relative deadline in ticks for [`crate::EdfScheduler`].
+    pub fn deadline(mut self, ticks: u64) -> Self {
+        self.deadline = ticks;
+        self
+    }
+
+    /// Sets the period in ticks for [`crate::EdfScheduler`].
+    pub fn period(mut self, ticks: u64) -> Self {
+        self.period = ticks;
         self
     }
 
@@ -403,6 +459,8 @@ impl TaskBuilder {
         t.fp = self.fp.map(|s| Box::new(UnsafeCell::new(s)));
         t.priority.store(self.priority, Ordering::Relaxed);
         t.affinity.store(self.affinity, Ordering::Relaxed);
+        t.rel_deadline.store(self.deadline, Ordering::Relaxed);
+        t.period.store(self.period, Ordering::Relaxed);
         if let Some(d) = self.data {
             t.data.call_once(|| d);
         }

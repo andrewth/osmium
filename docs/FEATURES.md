@@ -181,7 +181,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `WaitQueue` (no lost wake-ups), sleeping `Mutex`, `Semaphore`
 - ✅ `TimerQueue`: deadline-ordered callbacks driven by the timer IRQ
 - ✅ `osmium-exec`: heap-free async executor (fixed task slots, interrupt-safe wakers, idle-until-interrupt without lost wake-ups, `run_with` for stack-pinned `async fn`s), `Signal`, `AtomicWaker`, `StaticCell`
-- 🗺 EDF policy
+- ✅ `EdfScheduler`: earliest-deadline-first (per-task relative deadline and period via `TaskBuilder`/`Task` setters, preempts on an earlier-deadline wake at the next tick, FIFO ties, optional stealing that respects affinity)
 
 ### `osmium-boot`: boot protocols
 - ✅ Flattened Device Tree (DTB) parser: zero-copy nodes and properties, `reg` decoding with `#address-cells`/`#size-cells`, `compatible` search
