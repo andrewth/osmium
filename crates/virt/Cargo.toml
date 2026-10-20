@@ -16,6 +16,7 @@ riscv64-hs = ["osmium-arch/riscv64-hs"]
 
 [dependencies]
 osmium-arch.workspace = true
+osmium-boot.workspace = true
 osmium-hal.workspace = true
 osmium-mm.workspace = true
 osmium-sync.workspace = true

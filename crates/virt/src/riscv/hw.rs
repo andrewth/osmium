@@ -214,6 +214,14 @@ pub fn init_cpu() {
     csr_write!("0x680", 0u64); // hgatp
 }
 
+/// The `time` CSR, the clock `vstimecmp` compares against.
+pub fn time() -> u64 {
+    let t: u64;
+    // SAFETY: reading the time counter has no side effects.
+    unsafe { asm!("rdtime {}", out(reg) t, options(nomem, nostack)) };
+    t
+}
+
 fn load_vs(c: &VsCsrs) {
     csr_write!("0x200", c.vsstatus);
     csr_write!("0x204", c.vsie);

@@ -18,13 +18,17 @@
 //! floating-point state is not switched, so `sstatus.FS` stays off while it
 //! runs and guest FP instructions trap to the guest.
 
+pub mod fdt;
 pub mod insn;
 pub mod sbi;
 
 #[cfg(all(target_arch = "riscv64", feature = "riscv64-hs"))]
 mod hw;
 #[cfg(all(target_arch = "riscv64", feature = "riscv64-hs"))]
-pub use hw::init_cpu;
+pub use hw::{init_cpu, time};
+
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::memory::GuestPhysAddr;
 use crate::vcpu::{Vcpu, VmExit};
@@ -120,6 +124,7 @@ pub struct RiscvVcpu {
     pub csrs: VsCsrs,
     hgatp: u64,
     pending: Option<MemOp>,
+    external: Arc<AtomicBool>,
 }
 
 /// SBI virtual-interrupt bits in `hvip`.
@@ -152,7 +157,34 @@ impl RiscvVcpu {
             htinst: 0,
             host: [0; 17],
         };
-        Self { state, csrs: VsCsrs::default(), hgatp, pending: None }
+        Self { state, csrs: VsCsrs::default(), hgatp, pending: None, external: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// The vCPU's supervisor external-interrupt line, for an interrupt
+    /// controller (a [`VirtualPlic`](crate::devices::VirtualPlic) context
+    /// output) to drive. Its level becomes `hvip.VSEIP` at the next entry.
+    pub fn external_irq(&self) -> Arc<AtomicBool> {
+        self.external.clone()
+    }
+
+    /// Copies the interrupt lines into `hvip` before entering the guest.
+    #[cfg_attr(not(all(target_arch = "riscv64", feature = "riscv64-hs")), allow(dead_code))]
+    fn sync_lines(&mut self) {
+        if self.external.load(Ordering::Acquire) {
+            self.csrs.hvip |= hvip::VSEIP;
+        } else {
+            self.csrs.hvip &= !hvip::VSEIP;
+        }
+    }
+
+    /// Whether an interrupt the guest has enabled is pending at time `now`
+    /// (the `time` CSR), i.e. whether a vCPU halted in `wfi` should run again.
+    pub fn interrupt_pending(&self, now: u64) -> bool {
+        // vsie uses the S-level bit positions: SSIE 1, STIE 5, SEIE 9.
+        let vsie = self.csrs.vsie;
+        (vsie & (1 << 9) != 0 && self.external.load(Ordering::Acquire))
+            || (vsie & (1 << 5) != 0 && now >= self.csrs.vstimecmp)
+            || (vsie & (1 << 1) != 0 && self.csrs.hvip & hvip::VSSIP != 0)
     }
 
     /// The `hgatp` value this vCPU runs with.
@@ -220,6 +252,7 @@ impl RiscvVcpu {
 impl Vcpu for RiscvVcpu {
     #[cfg(all(target_arch = "riscv64", feature = "riscv64-hs"))]
     fn run(&mut self) -> VmExit {
+        self.sync_lines();
         hw::run(self);
         self.classify(|pc| hw::fetch(pc))
     }
@@ -295,5 +328,25 @@ mod tests {
         assert_eq!(v.state.pc, 0x8000_0008);
         assert_eq!(exit(&mut v, 22, 0x1234_5073, 0, 0), VmExit::Unhandled { reason: 22 });
         assert_eq!(exit(&mut v, INTERRUPT | 5, 0, 0, 0), VmExit::ExternalInterrupt);
+    }
+
+    #[test]
+    fn interrupt_lines() {
+        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), 0, 0, 0);
+        let line = v.external_irq();
+        line.store(true, Ordering::SeqCst);
+        v.sync_lines();
+        assert_eq!(v.csrs.hvip, hvip::VSEIP);
+        assert!(!v.interrupt_pending(0), "SEIE clear");
+        v.csrs.vsie = 1 << 9;
+        assert!(v.interrupt_pending(0));
+        line.store(false, Ordering::SeqCst);
+        v.sync_lines();
+        assert_eq!(v.csrs.hvip, 0);
+        assert!(!v.interrupt_pending(0));
+        v.csrs.vsie |= 1 << 5;
+        v.csrs.vstimecmp = 100;
+        assert!(!v.interrupt_pending(99));
+        assert!(v.interrupt_pending(100));
     }
 }

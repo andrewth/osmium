@@ -12,11 +12,14 @@ const LCR_DLAB: u8 = 0x80;
 
 /// An emulated NS16550A UART: enough for guest consoles (Linux `8250`,
 /// firmware, `osmium-drivers`' own driver). Transmitted bytes go to a
-/// callback; received bytes are queued with [`Uart16550::push_input`].
+/// callback; received bytes are queued with [`Uart16550::push_input`]. With
+/// [`with_irq`](Uart16550::with_irq) the receive interrupt drives a line,
+/// such as a [`VirtualPlic`](super::VirtualPlic) source.
 /// Register spacing is one byte.
 pub struct Uart16550 {
     state: IrqSpinLock<State>,
     output: Box<dyn Fn(u8) + Send + Sync>,
+    irq: Option<Box<dyn Fn(bool) + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -28,17 +31,36 @@ struct State {
     dll: u8,
     dlm: u8,
     input: VecDeque<u8>,
+    irq_level: bool,
 }
 
 impl Uart16550 {
     /// Creates the device; `output` receives every byte the guest sends.
     pub fn new(output: impl Fn(u8) + Send + Sync + 'static) -> Self {
-        Self { state: IrqSpinLock::new(State::default()), output: Box::new(output) }
+        Self { state: IrqSpinLock::new(State::default()), output: Box::new(output), irq: None }
+    }
+
+    /// Reports the receive interrupt's level to `irq` whenever it changes.
+    pub fn with_irq(mut self, irq: impl Fn(bool) + Send + Sync + 'static) -> Self {
+        self.irq = Some(Box::new(irq));
+        self
+    }
+
+    fn update_irq(&self, s: &mut State) {
+        let level = s.ier & 1 != 0 && !s.input.is_empty();
+        if level != s.irq_level {
+            s.irq_level = level;
+            if let Some(irq) = &self.irq {
+                irq(level);
+            }
+        }
     }
 
     /// Queues a byte for the guest to read.
     pub fn push_input(&self, byte: u8) {
-        self.state.lock().input.push_back(byte);
+        let mut s = self.state.lock();
+        s.input.push_back(byte);
+        self.update_irq(&mut s);
     }
 
     /// Returns true if the guest enabled the receive interrupt and data is
@@ -69,6 +91,7 @@ impl BusDevice for Uart16550 {
         };
         data.fill(0);
         data[0] = v;
+        self.update_irq(&mut s);
     }
 
     fn write(&self, offset: u64, data: &[u8]) {
@@ -82,10 +105,14 @@ impl BusDevice for Uart16550 {
                 (self.output)(v);
             }
             1 if dlab => s.dlm = v,
-            1 => s.ier = v & 0x0f,
+            1 => {
+                s.ier = v & 0x0f;
+                self.update_irq(&mut s);
+            }
             2 => {
                 if v & 0x02 != 0 {
                     s.input.clear();
+                    self.update_irq(&mut s);
                 }
             }
             3 => s.lcr = v,
