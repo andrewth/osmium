@@ -148,7 +148,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ RAM disk `BlockDevice`
 - ✅ virtio-mmio transport (legacy and 1.x), split virtqueue, virtio-net `NetDevice`
 - ✅ xHCI USB host controller (`UsbHost`): polled command and event rings, root-port reset, control, bulk and interrupt transfers
-- 🗺 virtio-pci transport; virtio blk, console; xHCI interrupts, hubs and isochronous transfers; USB class drivers (HID, mass storage, CDC-ECM); GICv3; IO-APIC; HPET; NVMe
+- 🗺 virtio-pci transport; virtio blk, console; xHCI interrupts, hubs and isochronous transfers; USB class drivers (HID, mass storage, CDC-ECM); GICv3; HPET; NVMe
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)
