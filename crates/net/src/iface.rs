@@ -28,6 +28,14 @@ const ARP_GIVE_UP: Duration = Duration::from_secs(3);
 /// transmission.
 const RX_BURST: usize = 64;
 const TTL: u8 = 64;
+/// How long the pieces of a fragmented datagram are kept (RFC 791 suggests
+/// 15 s).
+const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Datagrams being reassembled at once; the oldest is dropped for a new one.
+const REASSEMBLIES: usize = 8;
+/// The most payload a datagram can have (the 16-bit total length less a
+/// header).
+const MAX_DATAGRAM: usize = 65535 - IPV4_HEADER_LEN;
 /// The largest receive buffer allocated, whatever the device claims: room
 /// for an IP packet of 65535 bytes and its Ethernet header.
 const MAX_FRAME: usize = 65550;
@@ -68,6 +76,66 @@ struct Pending {
     packet: Packet,
 }
 
+/// A fragmented datagram being put back together.
+struct Reassembly {
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    protocol: u8,
+    ident: u16,
+    first: Instant,
+    /// The datagram's payload length, known once its last fragment arrives.
+    total: Option<usize>,
+    header: Ipv4Header,
+    /// `(offset, bytes)`, sorted, disjoint.
+    pieces: Vec<(usize, Vec<u8>)>,
+}
+
+impl Reassembly {
+    /// Adds a fragment. Returns false if it overlaps what is held, which
+    /// condemns the whole datagram.
+    fn add(&mut self, offset: usize, more: bool, data: &[u8]) -> bool {
+        let end = offset + data.len();
+        if !more {
+            if self.total.is_some_and(|t| t != end) {
+                return false;
+            }
+            self.total = Some(end);
+        }
+        if self.total.is_some_and(|t| end > t) {
+            return false;
+        }
+        let at = self.pieces.partition_point(|(o, _)| *o < offset);
+        if let Some((o, d)) = at.checked_sub(1).map(|i| &self.pieces[i])
+            && o + d.len() > offset
+        {
+            return false;
+        }
+        if let Some((o, d)) = self.pieces.get(at) {
+            if *o == offset && d.len() == data.len() {
+                return true; // a duplicate
+            }
+            if *o < end {
+                return false;
+            }
+        }
+        self.pieces.insert(at, (offset, data.to_vec()));
+        true
+    }
+
+    /// The whole payload, if every piece is here.
+    fn complete(&self) -> Option<Vec<u8>> {
+        let total = self.total?;
+        let mut next = 0;
+        for (o, d) in &self.pieces {
+            if *o != next {
+                return None;
+            }
+            next += d.len();
+        }
+        (next == total).then(|| self.pieces.iter().flat_map(|(_, d)| d.iter().copied()).collect())
+    }
+}
+
 struct ArpRequest {
     ip: Ipv4Addr,
     first: Instant,
@@ -86,13 +154,15 @@ pub struct Interface {
     ident: u16,
     rng: Rng,
     rx_buf: Vec<u8>,
+    reassembling: Vec<Reassembly>,
 }
 
 impl Interface {
     /// An unconfigured interface for `dev`, which it takes the MAC address
-    /// and MTU from. `seed` seeds TCP initial sequence numbers, DHCP
-    /// transaction ids and ephemeral ports; use a hardware random number or
-    /// at least a clock reading.
+    /// and MTU from. `seed` keys the generator of TCP initial sequence
+    /// numbers, DHCP and DNS transaction ids and ephemeral ports; use a
+    /// hardware random number, or [`new_with_entropy`](Self::new_with_entropy)
+    /// for more than 64 bits.
     pub fn new<D: NetDevice + ?Sized>(dev: &D, seed: u64) -> Self {
         let frame = dev.max_frame_len().min(MAX_FRAME);
         Self {
@@ -106,7 +176,26 @@ impl Interface {
             ident: 0,
             rng: Rng::new(seed),
             rx_buf: vec![0; frame],
+            reassembling: Vec::new(),
         }
+    }
+
+    /// Like [`new`](Self::new), with the random number generator keyed from
+    /// `entropy`, bytes from a hardware source (such as a TRNG or the
+    /// firmware's random seed). TCP initial sequence numbers, DHCP and DNS
+    /// transaction ids and ephemeral ports are unpredictable to a peer only
+    /// as far as this is.
+    pub fn new_with_entropy<D: NetDevice + ?Sized>(dev: &D, seed: u64, entropy: &[u8]) -> Self {
+        let mut iface = Self::new(dev, seed);
+        iface.add_entropy(entropy);
+        iface
+    }
+
+    /// Mixes `entropy` into the generator that picks TCP initial sequence
+    /// numbers, transaction ids and ephemeral ports. Call it whenever fresh
+    /// randomness is at hand, such as at each timer interrupt.
+    pub fn add_entropy(&mut self, entropy: &[u8]) {
+        self.rng.mix(entropy);
     }
 
     /// The interface's MAC address.
@@ -190,6 +279,7 @@ impl Interface {
         }
 
         self.retry_arp(now);
+        self.reassembling.retain(|r| now - r.first < REASSEMBLY_TIMEOUT);
         active | self.flush(dev)
     }
 
@@ -238,26 +328,51 @@ impl Interface {
         frame
     }
 
-    fn ip_frame(&mut self, dst_mac: MacAddress, p: &Packet) -> Vec<u8> {
-        let mut frame = self.ethernet_frame(dst_mac, ETHERTYPE_IPV4, IPV4_HEADER_LEN + p.payload.len());
+    /// The frames that carry `p` to `dst_mac`: one, or fragments if it
+    /// exceeds the MTU.
+    fn ip_frames(&mut self, dst_mac: MacAddress, p: &Packet) -> Vec<Vec<u8>> {
         self.ident = self.ident.wrapping_add(1);
-        let header = Ipv4Header {
-            src: p.src,
-            dst: p.dst,
-            protocol: p.protocol,
-            ttl: TTL,
-            ident: self.ident,
-            payload_len: p.payload.len(),
-        };
-        header.emit(&mut frame[ETH_HEADER_LEN..]);
-        frame[ETH_HEADER_LEN + IPV4_HEADER_LEN..].copy_from_slice(&p.payload);
-        frame
+        let step = (self.mtu - IPV4_HEADER_LEN) / 8 * 8;
+        let whole = IPV4_HEADER_LEN + p.payload.len() <= self.mtu;
+        let mut frames = Vec::new();
+        let mut offset = 0;
+        while offset < p.payload.len() || (whole && frames.is_empty()) {
+            let len = if whole { p.payload.len() } else { step.min(p.payload.len() - offset) };
+            let mut frame = self.ethernet_frame(dst_mac, ETHERTYPE_IPV4, IPV4_HEADER_LEN + len);
+            let header = Ipv4Header {
+                src: p.src,
+                dst: p.dst,
+                protocol: p.protocol,
+                ttl: TTL,
+                ident: self.ident,
+                payload_len: len,
+            };
+            if whole {
+                header.emit(&mut frame[ETH_HEADER_LEN..]);
+            } else {
+                let fragment = Fragment { more: offset + len < p.payload.len(), offset };
+                header.emit_fragment(&mut frame[ETH_HEADER_LEN..], fragment);
+            }
+            frame[ETH_HEADER_LEN + IPV4_HEADER_LEN..].copy_from_slice(&p.payload[offset..offset + len]);
+            frames.push(frame);
+            offset += len;
+        }
+        frames
+    }
+
+    fn queue_ip(&mut self, dst_mac: MacAddress, p: &Packet) {
+        for frame in self.ip_frames(dst_mac, p) {
+            self.queue_frame(frame);
+        }
     }
 
     /// Routes `p` to its next hop, resolving the hop's MAC address first if
     /// it is not cached.
     fn send_ip(&mut self, now: Instant, p: Packet) {
-        if IPV4_HEADER_LEN + p.payload.len() > self.mtu {
+        // TCP sizes its segments to the MTU and relies on DF; everything else
+        // is fragmented.
+        let too_big = IPV4_HEADER_LEN + p.payload.len() > self.mtu;
+        if (too_big && p.protocol == PROTO_TCP) || p.payload.len() > MAX_DATAGRAM || self.mtu < IPV4_HEADER_LEN + 8 {
             return;
         }
         let next_hop = match self.config {
@@ -268,12 +383,10 @@ impl Interface {
             _ => return,
         };
         let Some(hop) = next_hop else {
-            let frame = self.ip_frame(MacAddress::BROADCAST, &p);
-            return self.queue_frame(frame);
+            return self.queue_ip(MacAddress::BROADCAST, &p);
         };
         if let Some(mac) = self.arp.lookup(hop, now) {
-            let frame = self.ip_frame(mac, &p);
-            return self.queue_frame(frame);
+            return self.queue_ip(mac, &p);
         }
         if self.pending.len() >= PENDING {
             return;
@@ -325,8 +438,7 @@ impl Interface {
         while i < self.pending.len() {
             if self.pending[i].next_hop == ip {
                 let p = self.pending.remove(i).unwrap();
-                let frame = self.ip_frame(mac, &p.packet);
-                self.queue_frame(frame);
+                self.queue_ip(mac, &p.packet);
             } else {
                 i += 1;
             }
@@ -377,10 +489,53 @@ impl Interface {
         }
     }
 
+    /// Takes a fragment of a datagram; returns the datagram, as a whole
+    /// packet, once its last piece arrives.
+    fn reassemble(&mut self, now: Instant, ip: &Ipv4Header, fragment: Fragment, payload: &[u8]) -> Option<Vec<u8>> {
+        // Every piece but the last is a whole number of 8-byte units, and
+        // none is empty.
+        if payload.is_empty() || (fragment.more && payload.len() % 8 != 0) || fragment.offset + payload.len() > MAX_DATAGRAM
+        {
+            return None;
+        }
+        let key = |r: &Reassembly| (r.src, r.dst, r.protocol, r.ident) == (ip.src, ip.dst, ip.protocol, ip.ident);
+        let i = match self.reassembling.iter().position(key) {
+            Some(i) => i,
+            None => {
+                if self.reassembling.len() >= REASSEMBLIES {
+                    self.reassembling.remove(0);
+                }
+                self.reassembling.push(Reassembly {
+                    src: ip.src,
+                    dst: ip.dst,
+                    protocol: ip.protocol,
+                    ident: ip.ident,
+                    first: now,
+                    total: None,
+                    header: *ip,
+                    pieces: Vec::new(),
+                });
+                self.reassembling.len() - 1
+            }
+        };
+        let r = &mut self.reassembling[i];
+        if !r.add(fragment.offset, fragment.more, payload) {
+            self.reassembling.remove(i);
+            return None;
+        }
+        let data = r.complete()?;
+        let header = Ipv4Header { payload_len: data.len(), ..r.header };
+        self.reassembling.remove(i);
+        let mut packet = vec![0; IPV4_HEADER_LEN + data.len()];
+        header.emit(&mut packet);
+        packet[IPV4_HEADER_LEN..].copy_from_slice(&data);
+        Some(packet)
+    }
+
     /// Handles an IPv4 packet that arrived in a link-layer broadcast or
     /// multicast frame if `link_multicast`.
     fn process_ipv4(&mut self, now: Instant, bytes: &[u8], link_multicast: bool, sockets: &mut SocketSet) {
-        let Some((ip, payload)) = Ipv4Header::parse(bytes) else { return };
+        let Some((ip, fragment, payload)) = Ipv4Header::parse_fragment(bytes) else { return };
         // A source that is no one host's, or is ours, is forged.
         let src = ip.src;
         if src.is_unspecified() || src.is_broadcast() || src.is_multicast() || src.is_loopback() {
@@ -397,6 +552,12 @@ impl Interface {
         // client alone.
         let unconfigured_udp = ours.is_none() && ip.protocol == PROTO_UDP;
         if !(to_us || broadcast || unconfigured_udp) {
+            return;
+        }
+        if !fragment.is_whole() {
+            if let Some(whole) = self.reassemble(now, &ip, fragment, payload) {
+                self.process_ipv4(now, &whole, link_multicast, sockets);
+            }
             return;
         }
         let mut cx = Cx { now, addr: ours, mac: self.mac, mss: self.mss(), rng: &mut self.rng };
@@ -666,6 +827,143 @@ mod tests {
             assert!(!b.iface.arp.contains(ip), "{ip}");
         }
         assert!(sent.borrow().is_empty(), "no replies");
+    }
+
+    fn udp_pair(a: &mut crate::testing::Host, b: &mut crate::testing::Host) -> (crate::SocketHandle, crate::SocketHandle) {
+        let ha = a.sockets.add(UdpSocket::new(4, 4));
+        let hb = b.sockets.add(UdpSocket::new(4, 4));
+        a.sockets.get_mut::<UdpSocket>(ha).bind(1000).unwrap();
+        b.sockets.get_mut::<UdpSocket>(hb).bind(2000).unwrap();
+        (ha, hb)
+    }
+
+    fn big(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 13 + i / 7) as u8).collect()
+    }
+
+    #[test]
+    fn fragments_are_sent_and_reassembled_despite_reordering_and_duplication() {
+        use crate::testing::Fate;
+        let (mut a, mut b) = pair();
+        let (ha, hb) = udp_pair(&mut a, &mut b);
+        // Some fragments arrive late and some twice.
+        a.set_shaper(|n, f| match (f.len() > 100, n % 3) {
+            (false, _) => Fate::Deliver,
+            (true, 0) => Fate::Duplicate,
+            (true, 1) if n < 6 => Fate::Delay(2),
+            _ => Fate::Deliver,
+        });
+        let data = big(8000);
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(&data, SocketAddrV4::new(B_IP, 2000)).unwrap();
+        let mut now = Instant::ZERO;
+        assert!(run(&mut a, &mut b, &mut now, 200, |_, b| b.sockets.get::<UdpSocket>(hb).can_recv()));
+        let mut buf = vec![0u8; 9000];
+        let (n, from) = b.sockets.get_mut::<UdpSocket>(hb).recv_from(&mut buf).unwrap();
+        assert_eq!((&buf[..n], from), (&data[..], SocketAddrV4::new(A_IP, 1000)));
+        run(&mut a, &mut b, &mut now, 100, |_, _| false);
+        assert!(!b.sockets.get::<UdpSocket>(hb).can_recv(), "delivered once");
+        assert!(b.iface.reassembling.is_empty());
+    }
+
+    #[test]
+    fn fragments_are_sent_to_the_mtu() {
+        let (mut a, mut b) = pair();
+        let (ha, _) = udp_pair(&mut a, &mut b);
+        let sent = record(&mut a);
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(&big(4000), SocketAddrV4::new(B_IP, 2000)).unwrap();
+        let mut now = Instant::ZERO;
+        run(&mut a, &mut b, &mut now, 50, |_, _| false);
+        let sent = sent.borrow();
+        let frags: Vec<_> = sent
+            .iter()
+            .filter_map(|f| Ipv4Header::parse_fragment(EthernetHeader::parse(f)?.1))
+            .filter(|(h, _, _)| h.protocol == PROTO_UDP)
+            .collect();
+        assert_eq!(frags.len(), 3);
+        assert!(frags.iter().all(|(h, ..)| h.ident == frags[0].0.ident));
+        let offsets: Vec<_> = frags.iter().map(|(_, f, p)| (f.offset, f.more, p.len())).collect();
+        assert_eq!(offsets, [(0, true, 1480), (1480, true, 1480), (2960, false, 1048)]);
+    }
+
+    #[test]
+    fn a_lost_fragment_loses_the_datagram_and_its_buffers_expire() {
+        let (mut a, mut b) = pair();
+        let (ha, hb) = udp_pair(&mut a, &mut b);
+        let mut count = 0;
+        a.set_filter(move |_, f| {
+            if f.len() > 100 {
+                count += 1;
+                return count != 2;
+            }
+            true
+        });
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(&big(4000), SocketAddrV4::new(B_IP, 2000)).unwrap();
+        let mut now = Instant::ZERO;
+        run(&mut a, &mut b, &mut now, 1000, |_, _| false);
+        assert!(!b.sockets.get::<UdpSocket>(hb).can_recv());
+        assert_eq!(b.iface.reassembling.len(), 1);
+        run(&mut a, &mut b, &mut now, 15_000, |_, _| false);
+        assert!(b.iface.reassembling.is_empty(), "gave up after the timeout");
+    }
+
+    /// A fragment of datagram `ident` from A to B.
+    fn fragment(ident: u16, offset: usize, more: bool, data: &[u8]) -> Vec<u8> {
+        let mut f = vec![0; ETH_HEADER_LEN + IPV4_HEADER_LEN + data.len()];
+        EthernetHeader { dst: MacAddress([2, 0, 0, 0, 0, 2]), src: MacAddress([2, 0, 0, 0, 0, 9]), ethertype: ETHERTYPE_IPV4 }
+            .emit(&mut f);
+        let h = Ipv4Header { src: A_IP, dst: B_IP, protocol: PROTO_UDP, ttl: 64, ident, payload_len: data.len() };
+        h.emit_fragment(&mut f[ETH_HEADER_LEN..], Fragment { more, offset });
+        f[ETH_HEADER_LEN + IPV4_HEADER_LEN..].copy_from_slice(data);
+        f
+    }
+
+    #[test]
+    fn overlapping_and_malformed_fragments_are_dropped() {
+        let (a, mut b) = pair();
+        let hb = b.sockets.add(UdpSocket::new(4, 4));
+        b.sockets.get_mut::<UdpSocket>(hb).bind(2000).unwrap();
+        let udp = UdpHeader { src_port: 9, dst_port: 2000 }.emit(A_IP, B_IP, &big(40));
+        let push = |f: Vec<u8>| a.dev.tx.borrow_mut().push_back(f);
+        // The first 24 bytes, then a fragment that overlaps them.
+        push(fragment(1, 0, true, &udp[..24]));
+        push(fragment(1, 16, false, &udp[16..]));
+        b.poll(Instant::ZERO);
+        assert!(!b.sockets.get::<UdpSocket>(hb).can_recv() && b.iface.reassembling.is_empty(), "overlap condemns it");
+        // A middle fragment that is not a multiple of 8 bytes.
+        push(fragment(2, 0, true, &udp[..13]));
+        // A fragment past the end of a datagram's last.
+        push(fragment(3, 24, false, &udp[24..]));
+        push(fragment(3, 48, true, &udp[..8]));
+        // Tiling exactly works.
+        push(fragment(4, 0, true, &udp[..24]));
+        push(fragment(4, 24, false, &udp[24..]));
+        b.poll(Instant::ZERO);
+        assert!(b.sockets.get::<UdpSocket>(hb).can_recv());
+        assert!(b.iface.reassembling.len() <= 1);
+    }
+
+    #[test]
+    fn partial_datagrams_are_bounded() {
+        let (a, mut b) = pair();
+        for ident in 0..100 {
+            a.dev.tx.borrow_mut().push_back(fragment(ident, 0, true, &[0; 64]));
+        }
+        b.poll(Instant::ZERO);
+        assert_eq!(b.iface.reassembling.len(), REASSEMBLIES);
+    }
+
+    #[test]
+    fn large_ping_is_fragmented_both_ways() {
+        let (mut a, mut b) = pair();
+        let h = a.sockets.add(IcmpSocket::new(0x77, 4));
+        a.sockets.get_mut::<IcmpSocket>(h).send_echo(B_IP, 1, &big(5000)).unwrap();
+        let mut now = Instant::ZERO;
+        let mut reply = None;
+        assert!(run(&mut a, &mut b, &mut now, 100, |a, _| {
+            reply = a.sockets.get_mut::<IcmpSocket>(h).recv();
+            reply.is_some()
+        }));
+        assert_eq!(reply.unwrap().data, big(5000));
     }
 
     /// Claims more than it could have copied, and a huge frame size.

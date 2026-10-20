@@ -10,7 +10,7 @@ use crate::wire::{ICMP_ECHO_REQUEST, IcmpHeader, PROTO_ICMP};
 use crate::{Error, Instant};
 
 /// Largest echo payload accepted, as for UDP.
-const MAX_PAYLOAD: usize = 1500 - 20 - 8;
+const MAX_PAYLOAD: usize = 65535 - 20 - 8;
 
 /// An echo reply.
 #[derive(Clone, Debug, PartialEq, Eq)]

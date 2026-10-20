@@ -8,9 +8,9 @@ use super::{Cx, Packet, binds};
 use crate::wire::{PROTO_UDP, UdpHeader};
 use crate::{Error, Instant};
 
-/// Largest payload [`UdpSocket::send_to`] accepts: what fits in one
-/// unfragmented packet on a 1500-byte Ethernet MTU.
-pub const MAX_PAYLOAD: usize = 1500 - 20 - 8;
+/// Largest payload [`UdpSocket::send_to`] accepts: what a datagram of 65535
+/// bytes holds. The interface fragments what does not fit its MTU.
+pub const MAX_PAYLOAD: usize = 65535 - 20 - 8;
 
 /// A UDP socket with bounded queues of datagrams in each direction.
 pub struct UdpSocket {
