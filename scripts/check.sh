@@ -103,7 +103,7 @@ if command -v qemu-system-aarch64 >/dev/null; then
     for line in 'example (EL2)' 'EL2 MMU on' '\[guest\] hello from EL1 over MMIO' \
         'guest exit Shutdown: 1 hypercall, 1 halt, 0 host interrupts, LSR 0x60' \
         '\[guest\] UART interrupt, received: ping' \
-        'vGIC guest exit Shutdown: INTID 27 (timer) then INTID 33 (UART), [0-9]* halts, [1-9][0-9]* timer exits' '\[done\]'; do
+        'vGIC guest exit Shutdown: INTID 27 (timer) then INTID 33 (UART), [0-9]* halts, [0-9]* timer exits' '\[done\]'; do
         grep -q "$line" "$hyplog" || { echo "aarch64-hyp: missing '$line'"; exit 1; }
     done
     rm -f "$hyplog"

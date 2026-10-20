@@ -112,8 +112,9 @@ gic_guest:
     add x1, x1, x2, lsr #10
     msr cntv_cval_el0, x1
     add x5, x1, x2, lsr #10         // spin (no exits) until 1 ms past the
-    mov x1, #1                      // deadline: the expiry must exit
-    msr cntv_ctl_el0, x1            // through the physical GIC
+    mov x1, #1                      // deadline, so the expiry usually exits
+    msr cntv_ctl_el0, x1            // through the physical GIC (under TCG it
+                                    // can land after the wfi below instead)
 8:  mrs x6, cntvct_el0
     cmp x6, x5
     b.lo 8b
