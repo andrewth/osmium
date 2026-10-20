@@ -221,7 +221,8 @@ pub fn demo_irq() {
     gstage.map_range(VirtAddr::new(etext), PhysAddr::new(etext), erodata - etext, MapFlags::READ).unwrap();
     let hgatp = hgatp_sv39x4(gstage.root(), 2);
 
-    let mut vcpu = RiscvVcpu::new(GuestPhysAddr(guest_main as *const () as u64), 0, GUEST2_RAM.0, hgatp);
+    let mut vcpu =
+        RiscvVcpu::new(GuestPhysAddr(guest_main as *const () as u64), 0, GUEST2_RAM.0, hgatp).with_memory(mem.clone());
     vcpu.state.x[2] = GUEST2_RAM.0 + len; // sp
     let gp: u64;
     // SAFETY: reads gp.
@@ -653,7 +654,8 @@ pub fn demo_smp(ncpus: usize) {
                         osmium::sched::yield_now();
                         continue;
                     };
-                    let mut vcpu = RiscvVcpu::new(GuestPhysAddr(entry), h as u64, opaque, hgatp);
+                    let mut vcpu =
+                        RiscvVcpu::new(GuestPhysAddr(entry), h as u64, opaque, hgatp).with_memory(mem.clone());
                     harts.attach(h, &mut vcpu);
                     let mut stopped = false;
                     let exit = run_vcpu(&mut vcpu, &buses.0, &buses.1, |v, exit| match exit {

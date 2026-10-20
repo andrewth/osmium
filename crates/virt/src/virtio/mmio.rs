@@ -27,9 +27,18 @@ pub struct DeviceCtx<'a> {
     queues: &'a mut [SplitQueue],
     mem: &'a GuestMemory,
     interrupt: bool,
+    /// Chains [`pop`](Self::pop) may still return: one queue's worth per
+    /// queue for each notify, so a guest that keeps posting cannot hold the
+    /// host in a device. What it posts after that waits for its next notify.
+    budget: usize,
 }
 
-impl DeviceCtx<'_> {
+impl<'a> DeviceCtx<'a> {
+    fn new(queues: &'a mut [SplitQueue], mem: &'a GuestMemory) -> Self {
+        let budget = queues.iter().map(|q| q.size as usize).sum();
+        Self { queues, mem, interrupt: false, budget }
+    }
+
     /// Guest memory.
     pub fn mem(&self) -> &GuestMemory {
         self.mem
@@ -37,7 +46,12 @@ impl DeviceCtx<'_> {
 
     /// Pops the next chain from queue `q`, if the queue is ready and has one.
     pub fn pop(&mut self, q: usize) -> Option<Result<DescChain, QueueError>> {
-        self.queues.get_mut(q)?.pop(self.mem)
+        if self.budget == 0 {
+            return None;
+        }
+        let r = self.queues.get_mut(q)?.pop(self.mem)?;
+        self.budget -= 1;
+        Some(r)
     }
 
     /// Returns chain `head` on queue `q` with `len` bytes written, and
@@ -102,7 +116,7 @@ impl<D: VirtioDevice> VirtioMmio<D> {
     pub fn with_device<R>(&self, f: impl FnOnce(&mut D, &mut DeviceCtx<'_>) -> R) -> R {
         let mut s = self.inner.lock();
         let s = &mut *s;
-        let mut ctx = DeviceCtx { queues: &mut s.queues, mem: &self.mem, interrupt: false };
+        let mut ctx = DeviceCtx::new(&mut s.queues, &self.mem);
         let r = f(&mut s.device, &mut ctx);
         if ctx.interrupt {
             self.raise(s, USED_BUFFER);
@@ -196,7 +210,7 @@ impl<D: VirtioDevice> VirtioMmio<D> {
             (QUEUE_DEVICE_LOW, Some(q)) if !q.ready => set_lo(&mut q.used),
             (QUEUE_DEVICE_HIGH, Some(q)) if !q.ready => set_hi(&mut q.used),
             (QUEUE_NOTIFY, _) if s.status & u32::from(status::DRIVER_OK) != 0 => {
-                let mut ctx = DeviceCtx { queues: &mut s.queues, mem: &self.mem, interrupt: false };
+                let mut ctx = DeviceCtx::new(&mut s.queues, &self.mem);
                 s.device.notify(v as usize, &mut ctx);
                 if ctx.interrupt {
                     self.raise(s, USED_BUFFER);
@@ -280,7 +294,13 @@ pub(crate) mod tests {
             w(QUEUE_DEVICE_LOW, (base + USED) as u32);
             w(QUEUE_READY, 1);
         }
-        w(STATUS, u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER) | u32::from(status::FEATURES_OK) | u32::from(status::DRIVER_OK));
+        w(
+            STATUS,
+            u32::from(status::ACKNOWLEDGE)
+                | u32::from(status::DRIVER)
+                | u32::from(status::FEATURES_OK)
+                | u32::from(status::DRIVER_OK),
+        );
     }
 
     pub(crate) fn rd<D: VirtioDevice>(dev: &VirtioMmio<D>, off: usize) -> u32 {
@@ -330,7 +350,11 @@ pub(crate) mod tests {
 
         // A driver that does not accept VERSION_1 fails negotiation.
         dev.write(STATUS as u64, &(u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER)).to_le_bytes());
-        dev.write(STATUS as u64, &(u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER) | u32::from(status::FEATURES_OK)).to_le_bytes());
+        dev.write(
+            STATUS as u64,
+            &(u32::from(status::ACKNOWLEDGE) | u32::from(status::DRIVER) | u32::from(status::FEATURES_OK))
+                .to_le_bytes(),
+        );
         assert_eq!(rd(&dev, STATUS) & u32::from(status::FEATURES_OK), 0);
 
         bring_up(&dev, &[(0, 0)]);

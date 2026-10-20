@@ -332,8 +332,9 @@ fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
             core::hint::spin_loop();
             continue;
         };
-        let mut vcpu =
-            RiscvVcpu::new(GuestPhysAddr(entry), me as u64, opaque, vm.hgatp).with_external_irq(vm.lines[me].clone());
+        let mut vcpu = RiscvVcpu::new(GuestPhysAddr(entry), me as u64, opaque, vm.hgatp)
+            .with_external_irq(vm.lines[me].clone())
+            .with_memory(vm.mem.clone());
         vm.cpus.attach(me, &mut vcpu);
         let mut stopped = false;
         // Hart 0 polls the host NIC on a host timer, so frames reach a

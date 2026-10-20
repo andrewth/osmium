@@ -59,14 +59,28 @@ const APIC_BASE_ENABLE: u64 = 1 << 11;
 /// its own local APIC ID (leaf 1 EBX bits 31:24, leaf 0xB EDX), the
 /// hypervisor-present bit (leaf 1 ECX bit 31), and neither x2APIC (only the
 /// xAPIC is emulated) nor SVM (no nested virtualization).
-pub fn patch_cpuid(leaf: u32, [a, mut b, mut c, mut d]: [u32; 4], apic_id: u8) -> [u32; 4] {
+pub fn patch_cpuid(leaf: u32, [mut a, mut b, mut c, mut d]: [u32; 4], apic_id: u8) -> [u32; 4] {
     match leaf {
         1 => {
             b = (b & 0x00ff_ffff) | (apic_id as u32) << 24;
-            c = (c & !(1 << 21)) | 1 << 31;
+            // No x2APIC or TSC-deadline timer (the emulated APIC is xAPIC
+            // with one-shot and periodic modes), no XSAVE/OSXSAVE/AVX (XCR0
+            // and XSETBV are the host's); the hypervisor bit is set.
+            c = (c & !(1 << 21 | 1 << 24 | 1 << 26 | 1 << 27 | 1 << 28)) | 1 << 31;
         }
+        7 => {
+            // No AVX2/AVX-512, and none of the speculation-control MSRs
+            // (IBRS/IBPB, STIBP, ARCH_CAPABILITIES, SSBD), which are not
+            // emulated.
+            b &= !(1 << 5 | 1 << 16 | 1 << 17 | 1 << 21 | 1 << 26 | 1 << 27 | 1 << 28 | 1 << 30 | 1 << 31);
+            c &= !(1 << 1 | 1 << 6 | 1 << 11 | 1 << 12 | 1 << 14);
+            d &= !(1 << 2 | 1 << 3 | 1 << 26 | 1 << 27 | 1 << 29 | 1 << 31);
+        }
+        0xd => [a, b, c, d] = [0; 4],
         0xb => d = apic_id as u32,
         0x8000_0001 => c &= !(1 << 2),
+        // AMD's IBPB/IBRS/STIBP/SSBD bits.
+        0x8000_0008 => b &= !(1 << 12 | 1 << 14 | 1 << 15 | 1 << 24 | 1 << 25 | 1 << 26),
         _ => {}
     }
     [a, b, c, d]
@@ -74,6 +88,8 @@ pub fn patch_cpuid(leaf: u32, [a, mut b, mut c, mut d]: [u32; 4], apic_id: u8) -
 
 /// VMCB offsets (AMD64 APM vol. 2, appendix B).
 pub mod vmcb {
+    /// Intercepted debug-register reads (bits 15:0) and writes (31:16).
+    pub const INTERCEPT_DR: usize = 0x004;
     /// Intercepted exceptions (bit per vector).
     pub const INTERCEPT_EXCEPTIONS: usize = 0x008;
     /// Intercepts: INTR, NMI, ... SHUTDOWN (bit per event).
@@ -189,6 +205,10 @@ pub mod exit {
     pub const VMLOAD: u64 = 0x82;
     /// SKINIT, the last SVM instruction.
     pub const SKINIT: u64 = 0x86;
+    /// XSETBV.
+    pub const XSETBV: u64 = 0x8d;
+    /// MOV from DR0 (DRn: + n); MOV to DR0 is `DR_READ + 0x10`.
+    pub const DR_READ: u64 = 0x20;
     /// The guest can take a virtual interrupt (interrupt window).
     pub const VINTR: u64 = 0x64;
     /// CPUID.
@@ -338,7 +358,11 @@ impl SvmVcpu {
         // host's dirty cache lines.
         let misc1 = 1 << 0 | 1 << 1 | 1 << 18 | 1 << 22 | 1 << 24 | 1 << 26 | 1 << 27 | 1 << 28 | 1 << 31;
         v.write32(INTERCEPT_MISC1, misc1);
-        v.write32(INTERCEPT_MISC2, 0x7f);
+        // XSETBV too: the guest is not offered XSAVE (XCR0 is the host's).
+        v.write32(INTERCEPT_MISC2, 0x7f | 1 << 13);
+        // DR0-DR3 reads and writes (DR6/DR7 are in the VMCB): no breakpoint
+        // addresses pass between VMs or to the host.
+        v.write32(INTERCEPT_DR, 0x000f_000f);
         // #DB and #AC: a guest whose delivery of these faults loops would
         // otherwise hold the host CPU forever; they are reflected back.
         v.write32(INTERCEPT_EXCEPTIONS, 1 << 1 | 1 << 17);
@@ -688,6 +712,13 @@ impl SvmVcpu {
         };
         if write {
             let v = (self.read64(RAX) & 0xffff_ffff) | self.regs.rdx << 32;
+            // Values VMRUN would reject raise #GP in the guest instead.
+            const EFER_VALID: u64 = 1 | 1 << 8 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 15;
+            let pat_ok = |v: u64| v.to_le_bytes().iter().all(|&t| matches!(t, 0 | 1 | 4 | 5 | 6 | 7));
+            if (msr == 0xc000_0080 && v & !EFER_VALID != 0) || (msr == 0x277 && !pat_ok(v)) {
+                self.pending_exception = Some(13 | 3 << 8 | 1 << 11 | EVENT_VALID); // #GP(0)
+                return;
+            }
             match msr {
                 0xc000_0080 => self.write64(EFER, v | EFER_SVME),
                 0xc000_0103 => self.tsc_aux = v & 0xffff_ffff,
@@ -755,7 +786,25 @@ impl SvmVcpu {
         const UD: u64 = 6 | 3 << 8 | EVENT_VALID; // #UD, type 3 (exception)
         let cpl = self.read64(vmcb::CPL & !7) >> (8 * (vmcb::CPL & 7)) & 3;
         match code {
-            exit::VMRUN | exit::INVLPGA | exit::VMLOAD..=exit::SKINIT => self.pending_exception = Some(UD),
+            exit::VMRUN | exit::INVLPGA | exit::VMLOAD..=exit::SKINIT | exit::XSETBV => {
+                self.pending_exception = Some(UD)
+            }
+            // MOV to or from DR0-DR3: read as zero, writes ignored.
+            c if (exit::DR_READ..exit::DR_READ + 0x20).contains(&c) => {
+                let read = c < exit::DR_READ + 0x10;
+                let Some((b, n)) = self.insn_bytes() else { return false };
+                // [REX] 0F 21/23 modrm: the GPR is modrm.rm (+ REX.B).
+                let (rex, i) = if n > 0 && b[0] & 0xf0 == 0x40 { (b[0], 1) } else { (0, 0) };
+                if n < i + 3 || b[i] != 0x0f {
+                    return false;
+                }
+                if read {
+                    let r = (b[i + 2] & 7) | (rex & 1) << 3;
+                    self.set_reg(r, 0);
+                }
+                let rip = self.rip();
+                self.skip_to(rip.wrapping_add(i as u64 + 3));
+            }
             exit::VMMCALL if cpl != 0 => self.pending_exception = Some(UD),
             exit::INVD => {
                 let rip = self.rip();
@@ -957,6 +1006,38 @@ mod tests {
         v.pending_exception = Some(6 | 3 << 8 | EVENT_VALID);
         v.prepare_interrupts();
         assert_eq!(v.read64(vmcb::EVENTINJ), 6 | 3 << 8 | EVENT_VALID);
+    }
+
+    #[test]
+    fn bad_efer_pat_and_debug_registers() {
+        let mut v = vcpu();
+        let wrmsr = |v: &mut SvmVcpu, msr: u32, val: u64| {
+            v.regs.rcx = msr as u64;
+            v.write64(vmcb::RAX, val & 0xffff_ffff);
+            v.regs.rdx = val >> 32;
+            v.write64(vmcb::EXITINFO1, 1);
+            v.emulate_msr();
+        };
+        let (rip, efer) = (v.rip(), v.read64(vmcb::EFER));
+        wrmsr(&mut v, 0xc000_0080, 1 << 3); // reserved
+        assert_eq!(v.pending_exception.take(), Some(13 | 3 << 8 | 1 << 11 | EVENT_VALID), "#GP(0)");
+        assert_eq!((v.rip(), v.read64(vmcb::EFER)), (rip, efer), "faults on the WRMSR, EFER unchanged");
+        wrmsr(&mut v, 0x277, 0x0007_0406_0007_0402); // memory type 2 is reserved
+        assert!(v.pending_exception.take().is_some());
+        // mov rbx, dr0 (0F 21 C3), from the decode-assist bytes.
+        v.regs.rbx = 0x1234;
+        // SAFETY: the instruction bytes field of the owned VMCB.
+        unsafe {
+            v.at(vmcb::INSN_LEN).write_volatile(3);
+            for (k, b) in [0x0f, 0x21, 0xc3].into_iter().enumerate() {
+                v.at(vmcb::INSN_BYTES + k).write_volatile(b);
+            }
+        }
+        let rip = v.rip();
+        assert!(v.reflect(exit::DR_READ));
+        assert_eq!((v.regs.rbx, v.rip()), (0, rip + 3));
+        assert!(v.reflect(exit::XSETBV));
+        assert_eq!(v.pending_exception.take(), Some(6 | 3 << 8 | EVENT_VALID));
     }
 
     #[test]

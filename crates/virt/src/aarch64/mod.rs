@@ -34,6 +34,8 @@ mod ec {
     pub const HVC64: u64 = 0x16;
     pub const SMC64: u64 = 0x17;
     pub const DABT_LOWER: u64 = 0x24;
+    /// MSR/MRS/system instruction trapped (TIDCP, TACR, TPM, TDA, ...).
+    pub const SYSREG: u64 = 0x18;
 }
 
 /// Lower-EL vector offsets / 0x80 that the exit stub records.
@@ -81,6 +83,8 @@ struct Load {
     size: u8,
     sign: bool,
     wide: bool,
+    /// Instruction length (ESR.IL: 4, or 2 for a 16-bit T32 instruction).
+    len: u64,
 }
 
 /// The guest's EL1 (and EL0) system registers, switched on every entry
@@ -168,6 +172,9 @@ pub struct Aarch64Vcpu {
     timer: Option<Box<dyn Fn(bool) + Send + Sync>>,
     pending: Option<Load>,
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
+    /// See [`new_vcpu_id`](crate::vcpu::new_vcpu_id).
+    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    pub(crate) id: u64,
 }
 
 impl Aarch64Vcpu {
@@ -184,6 +191,7 @@ impl Aarch64Vcpu {
             el1: El1Regs::default(),
             fp: FpState::default(),
             vttbr,
+            id: crate::vcpu::new_vcpu_id(),
             irq: Arc::new(AtomicBool::new(false)),
             timer: None,
             pending: None,
@@ -237,6 +245,24 @@ impl Aarch64Vcpu {
         }
     }
 
+    /// Completes a trapped system-register access (IMPLEMENTATION DEFINED,
+    /// auxiliary control, PMU, debug and physical-timer registers, which
+    /// `HCR_EL2`, `MDCR_EL2` and `CNTHCTL_EL2` trap) as read-as-zero,
+    /// write-ignored, and steps past it. Returns whether the exit was one.
+    pub fn emulate_sysreg(&mut self) -> bool {
+        let s = &mut self.state;
+        if s.vector != vector::SYNC || s.esr >> 26 != ec::SYSREG {
+            return false;
+        }
+        // ISS: Direction (bit 0, 1 = read), Rt (bits 9:5).
+        let rt = ((s.esr >> 5) & 31) as usize;
+        if s.esr & 1 != 0 && rt != 31 {
+            s.x[rt] = 0;
+        }
+        s.pc = s.pc.wrapping_add(4);
+        true
+    }
+
     /// Turns the exception recorded in `state` into an exit.
     pub fn classify(&mut self) -> VmExit {
         let s = &mut self.state;
@@ -270,7 +296,8 @@ impl Aarch64Vcpu {
                     s.pc = s.pc.wrapping_add(insn_len);
                     VmExit::MmioWrite { addr, size, data }
                 } else {
-                    self.pending = Some(Load { reg, size, sign: esr & (1 << 21) != 0, wide: esr & (1 << 15) != 0 });
+                    self.pending =
+                        Some(Load { reg, size, sign: esr & (1 << 21) != 0, wide: esr & (1 << 15) != 0, len: insn_len });
                     VmExit::MmioRead { addr, size }
                 }
             }
@@ -285,12 +312,17 @@ impl Vcpu for Aarch64Vcpu {
         if let Some(r) = &self.running {
             r.store(osmium_arch::cpu::current_id(), Ordering::Release);
         }
-        self.sync_timer(hw::counter());
-        hw::run(self);
+        let exit = loop {
+            self.sync_timer(hw::counter());
+            hw::run(self);
+            if !self.emulate_sysreg() {
+                break self.classify();
+            }
+        };
         if let Some(r) = &self.running {
             r.store(crate::smp::NOT_RUNNING, Ordering::Release);
         }
-        self.classify()
+        exit
     }
 
     #[cfg(not(all(target_arch = "aarch64", feature = "aarch64-el2")))]
@@ -311,7 +343,7 @@ impl Vcpu for Aarch64Vcpu {
         if l.reg != 31 {
             self.state.x[l.reg as usize] = v;
         }
-        self.state.pc = self.state.pc.wrapping_add(4);
+        self.state.pc = self.state.pc.wrapping_add(l.len);
     }
 
     fn complete_hypercall(&mut self, ret: u64) {
@@ -333,6 +365,24 @@ mod tests {
 
     const IL: u64 = 1 << 25;
     const ISV: u64 = 1 << 24;
+
+    #[test]
+    fn trapped_sysregs_read_as_zero() {
+        let mut v = Aarch64Vcpu::new(GuestPhysAddr(0x4000_0000), 0, 0);
+        v.state.x[3] = 0xdead;
+        // MRS x3, PMCCNTR_EL0 trapped by MDCR_EL2.TPM: EC 0x18, read, Rt 3.
+        v.state.vector = vector::SYNC;
+        v.state.esr = ec::SYSREG << 26 | 1 << 25 | 3 << 5 | 1;
+        assert!(v.emulate_sysreg());
+        assert_eq!((v.state.x[3], v.state.pc), (0, 0x4000_0004));
+        // A write is ignored; other exits are not this.
+        v.state.esr = ec::SYSREG << 26 | 1 << 25 | 3 << 5;
+        v.state.x[3] = 7;
+        assert!(v.emulate_sysreg());
+        assert_eq!(v.state.x[3], 7);
+        v.state.esr = ec::HVC64 << 26;
+        assert!(!v.emulate_sysreg());
+    }
 
     #[test]
     fn mmio() {

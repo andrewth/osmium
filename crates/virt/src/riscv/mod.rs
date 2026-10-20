@@ -32,7 +32,7 @@ pub use hw::{init_cpu, time};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::memory::GuestPhysAddr;
+use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 use insn::MemOp;
 
@@ -141,6 +141,11 @@ pub struct RiscvVcpu {
     external: Arc<AtomicBool>,
     ipi: Option<Arc<AtomicBool>>,
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
+    /// Guest memory, for fetching faulting instructions in software.
+    mem: Option<Arc<GuestMemory>>,
+    /// See [`new_vcpu_id`](crate::vcpu::new_vcpu_id).
+    #[cfg_attr(not(all(target_arch = "riscv64", feature = "riscv64-hs")), allow(dead_code))]
+    pub(crate) id: u64,
     pub(crate) fence: Option<Arc<AtomicBool>>,
 }
 
@@ -184,6 +189,8 @@ impl RiscvVcpu {
             ipi: None,
             running: None,
             fence: None,
+            id: crate::vcpu::new_vcpu_id(),
+            mem: None,
         }
     }
 
@@ -192,6 +199,15 @@ impl RiscvVcpu {
     /// output) to drive. Its level becomes `hvip.VSEIP` at the next entry.
     pub fn external_irq(&self) -> Arc<AtomicBool> {
         self.external.clone()
+    }
+
+    /// Gives the vCPU its guest memory: an instruction the hardware does not
+    /// report (`htinst` = 0) is then fetched by walking the guest's VS-stage
+    /// tables in software, instead of with `hlvx` in HS-mode, which traps
+    /// into the host if another vCPU changes the mapping meanwhile.
+    pub fn with_memory(mut self, mem: Arc<GuestMemory>) -> Self {
+        self.mem = Some(mem);
+        self
     }
 
     /// Uses `line` as the external-interrupt line instead, for an
@@ -295,6 +311,47 @@ impl RiscvVcpu {
     }
 }
 
+/// Translates guest-virtual `va` through the VS-stage tables `vsatp` names
+/// (Bare, Sv39, Sv48 or Sv57), reading them from `mem`: the guest-physical
+/// address, if a valid leaf maps it.
+pub fn translate_vs(mem: &GuestMemory, vsatp: u64, va: u64) -> Option<u64> {
+    let levels = match vsatp >> 60 {
+        0 => return Some(va),
+        8 => 3,
+        9 => 4,
+        10 => 5,
+        _ => return None,
+    };
+    let mut table = (vsatp & ((1 << 44) - 1)) << 12;
+    for level in (0..levels).rev() {
+        let index = (va >> (12 + 9 * level)) & 0x1ff;
+        let pte: u64 = mem.read_obj(GuestPhysAddr(table.checked_add(index * 8)?)).ok()?;
+        if pte & 1 == 0 {
+            return None;
+        }
+        let ppn = (pte >> 10) & ((1 << 44) - 1);
+        if pte & 0b1010 != 0 {
+            // A leaf (R or X): the low VPNs of a superpage come from `va`.
+            let span = 12 + 9 * level;
+            return Some((ppn << 12) & !((1 << span) - 1) | va & ((1 << span) - 1));
+        }
+        table = ppn << 12;
+    }
+    None
+}
+
+/// Fetches the (possibly compressed) instruction at guest-virtual `pc` in
+/// software, as `hlvx.hu` would.
+#[cfg_attr(not(all(target_arch = "riscv64", feature = "riscv64-hs")), allow(dead_code))]
+fn fetch_soft(mem: &GuestMemory, vsatp: u64, pc: u64) -> Option<u32> {
+    let half = |va: u64| mem.read_obj::<u16>(GuestPhysAddr(translate_vs(mem, vsatp, va)?)).ok();
+    let lo = half(pc)? as u32;
+    if lo & 3 != 3 {
+        return Some(lo);
+    }
+    Some(lo | (half(pc.wrapping_add(2))? as u32) << 16)
+}
+
 impl Vcpu for RiscvVcpu {
     #[cfg(all(target_arch = "riscv64", feature = "riscv64-hs"))]
     fn run(&mut self) -> VmExit {
@@ -309,7 +366,13 @@ impl Vcpu for RiscvVcpu {
         if let Some(r) = &self.running {
             r.store(crate::smp::NOT_RUNNING, Ordering::Release);
         }
-        self.classify(|pc| hw::fetch(pc))
+        match self.mem.clone() {
+            Some(mem) => {
+                let vsatp = self.csrs.vsatp;
+                self.classify(|pc| fetch_soft(&mem, vsatp, pc))
+            }
+            None => self.classify(|pc| hw::fetch(pc)),
+        }
     }
 
     #[cfg(not(all(target_arch = "riscv64", feature = "riscv64-hs")))]
@@ -341,6 +404,30 @@ mod tests {
         v.state.htval = htval;
         v.state.htinst = htinst;
         v.classify(|_| None)
+    }
+
+    #[test]
+    fn walks_vs_stage_tables() {
+        let mut ram = alloc::vec![0u8; 0x10000];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives `mem`.
+        unsafe { mem.add_region(GuestPhysAddr(0), ram.as_mut_ptr(), 0x10000) };
+        let pte = |a: u64, ppn: u64, flags: u64| mem.write_obj(GuestPhysAddr(a), ppn << 10 | flags).unwrap();
+        // Sv39, root 0x1000: VPN2 2 -> table 0x2000; VPN1 0 -> table 0x3000;
+        // VPN0 1 -> page 0x5000 (R X). VPN1 1 -> a 2 MiB leaf at 0x20_0000.
+        pte(0x1000 + 2 * 8, 2, 1);
+        pte(0x2000, 3, 1);
+        pte(0x3000 + 8, 5, 0b1011);
+        pte(0x2000 + 8, 0x200, 0b1011);
+        let vsatp = 8 << 60 | 1;
+        assert_eq!(translate_vs(&mem, vsatp, 0x8000_1234), Some(0x5234));
+        assert_eq!(translate_vs(&mem, vsatp, 0x8020_1234), Some(0x20_1234), "superpage");
+        assert_eq!(translate_vs(&mem, vsatp, 0x8000_2000), None, "unmapped");
+        assert_eq!(translate_vs(&mem, 0, 0x1234), Some(0x1234), "Bare");
+        // A compressed and a full instruction.
+        mem.write(GuestPhysAddr(0x5000), &[0x82, 0x80, 0x13, 0x05, 0x10, 0x00]).unwrap();
+        assert_eq!(fetch_soft(&mem, vsatp, 0x8000_1000), Some(0x8082), "c.ret");
+        assert_eq!(fetch_soft(&mem, vsatp, 0x8000_1002), Some(0x0010_0513), "li a0, 1");
     }
 
     #[test]

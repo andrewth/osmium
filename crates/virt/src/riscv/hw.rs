@@ -343,6 +343,10 @@ fn save_fp(fp: &mut FpState) {
     }
 }
 
+/// The vCPU each hart last ran (by [`RiscvVcpu::id`](super::RiscvVcpu)).
+static LAST_VCPU: [core::sync::atomic::AtomicU64; osmium_arch::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; osmium_arch::MAX_CPUS];
+
 /// Enters the guest and returns at its next exit.
 pub(super) fn run(v: &mut RiscvVcpu) {
     // FP works in a guest only while the host's sstatus.FS is on too, so it
@@ -354,7 +358,10 @@ pub(super) fn run(v: &mut RiscvVcpu) {
     if csr_read!("0x603") != HIDELEG {
         init_cpu();
     }
-    if csr_read!("0x680") != v.hgatp {
+    // A different vCPU than this hart last ran (or a new VM that reuses an
+    // old one's VMID and root): install its hgatp and flush.
+    let cpu = osmium_arch::cpu::current_id();
+    if LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id || csr_read!("0x680") != v.hgatp {
         csr_write!("0x680", v.hgatp);
         // SAFETY: hfence.gvma and hfence.vvma (all addresses, all VMIDs)
         // only invalidate TLB entries.

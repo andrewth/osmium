@@ -139,8 +139,9 @@ macro_rules! msr {
 
 /// `HCR_EL2` while a guest runs: stage 2 on (VM), set/way invalidation
 /// upgraded (SWIO), physical IRQ/FIQ/SError to EL2 (IMO, FMO, AMO), WFI and
-/// SMC trapped (TWI, TSC), and an AArch64 EL1 (RW).
-pub const HCR_GUEST: u64 = 1 << 0 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 13 | 1 << 19 | 1 << 31;
+/// SMC trapped (TWI, TSC), IMPLEMENTATION DEFINED and auxiliary control
+/// registers trapped (TIDCP, TACR), and an AArch64 EL1 (RW).
+pub const HCR_GUEST: u64 = 1 << 0 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 13 | 1 << 19 | 1 << 20 | 1 << 21 | 1 << 31;
 /// `HCR_EL2.VI`: a virtual IRQ is pending for the guest.
 pub const HCR_VI: u64 = 1 << 7;
 
@@ -155,7 +156,14 @@ pub const VTCR_48: u64 = 16 | 2 << 6 | 1 << 8 | 1 << 10 | 3 << 12 | 5 << 16 | 1 
 /// is optional.
 pub fn init_cpu() {
     msr!("vtcr_el2", VTCR_48);
-    msr!("cnthctl_el2", 3u64); // EL1PCTEN | EL1PCEN
+    // EL1 may read the physical counter (EL1PCTEN) but not use the
+    // physical timer, which is the host's: guests get the virtual one.
+    msr!("cnthctl_el2", 1u64);
+    // PMU and debug registers trap (TPM, TPMCR, TDA, TDOSA, TDRA), so no
+    // counter or breakpoint state passes between VMs and the host; HPMN
+    // keeps every implemented counter for EL2.
+    let counters = (mrs!("pmcr_el0") >> 11) & 0x1f;
+    msr!("mdcr_el2", counters | 1 << 5 | 1 << 6 | 1 << 9 | 1 << 10 | 1 << 11);
     msr!("cntvoff_el2", 0u64);
     // FP/SIMD untrapped (TFP = 0) so guests can use it and the switch can
     // move it; SVE still traps (TZ). The other bits are RES1.
@@ -258,6 +266,10 @@ fn save_fp(fp: &mut FpState) {
 
 const _: () = assert!(offset_of!(FpState, fpcr) == 512 && offset_of!(FpState, fpsr) == 520);
 
+/// The vCPU each CPU last ran (by [`Aarch64Vcpu::id`](super::Aarch64Vcpu)).
+static LAST_VCPU: [core::sync::atomic::AtomicU64; osmium_arch::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; osmium_arch::MAX_CPUS];
+
 /// Enters the guest and returns at its next exit.
 pub(super) fn run(v: &mut Aarch64Vcpu) {
     let daif = mrs!("daif");
@@ -269,7 +281,10 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     }
     let hcr = HCR_GUEST | if v.irq.load(core::sync::atomic::Ordering::Acquire) { HCR_VI } else { 0 };
     msr!("hcr_el2", hcr);
-    if mrs!("vttbr_el2") != v.vttbr {
+    // A different vCPU than this CPU last ran (or a new VM that reuses an
+    // old one's VMID and root): install its VTTBR and flush.
+    let cpu = osmium_arch::cpu::current_id();
+    if LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id || mrs!("vttbr_el2") != v.vttbr {
         msr!("vttbr_el2", v.vttbr);
         // SAFETY: TLB maintenance for the new stage-2 tables (all VMIDs is
         // coarse but correct).

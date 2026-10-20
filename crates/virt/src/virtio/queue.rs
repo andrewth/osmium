@@ -160,11 +160,16 @@ impl SplitQueue {
         fence(Ordering::Acquire);
         let slot = self.last_avail % self.size;
         self.last_avail = self.last_avail.wrapping_add(1);
-        Some(
-            mem.read_obj::<u16>(GuestPhysAddr(self.avail.0.wrapping_add(avail_entry(slot) as u64)))
-                .map_err(QueueError::from)
-                .and_then(|head| self.chain(mem, head)),
-        )
+        let head = match mem.read_obj::<u16>(GuestPhysAddr(self.avail.0.wrapping_add(avail_entry(slot) as u64))) {
+            Ok(h) => h,
+            Err(e) => return Some(Err(e.into())),
+        };
+        let chain = self.chain(mem, head);
+        if chain.is_err() && head < self.size {
+            // Hand a malformed chain back unused, so the driver can reuse it.
+            let _ = self.add_used(mem, head, 0);
+        }
+        Some(chain)
     }
 
     fn chain(&self, mem: &GuestMemory, head: u16) -> Result<DescChain, QueueError> {

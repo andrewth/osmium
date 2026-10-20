@@ -62,6 +62,15 @@ pub enum VmExit {
     },
 }
 
+/// A fresh, never reused identity for a vCPU: a CPU that runs a vCPU with
+/// a different identity than last time flushes its stage-2 translations, so
+/// a new VM that happens to get an old one's VMID and table root never sees
+/// its stale TLB entries.
+pub(crate) fn new_vcpu_id() -> u64 {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// A virtual CPU that a hardware backend (VMX, SVM, EL2, H-extension)
 /// implements.
 pub trait Vcpu {

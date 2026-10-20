@@ -54,7 +54,10 @@ impl VirtioConsole {
             // In bounded pieces: the guest's lengths never size an allocation.
             let mut buf = [0u8; 256];
             let mut at = 0;
-            while let Ok(n @ 1..) = chain.read(ctx.mem(), at, &mut buf) {
+            // At most 64 KiB per buffer, however much the guest claims.
+            while at < 64 * 1024
+                && let Ok(n @ 1..) = chain.read(ctx.mem(), at, &mut buf)
+            {
                 (self.output)(&buf[..n]);
                 at += n;
             }
@@ -151,11 +154,11 @@ mod tests {
         assert_eq!(&got, b"typed");
         assert!(line.load(Ordering::SeqCst));
 
-        // A 4 GiB buffer claim is read in pieces until guest memory ends.
+        // A 4 GiB buffer claim is read in pieces, and only its first 64 KiB.
         out.lock().clear();
         rebase(&mem, &mut tx, TXQ, &[(TXQ + DATA, u32::MAX, false)]);
         notify(&con, 1);
-        assert_eq!(out.lock().len(), 0x20000 - (TXQ + DATA) as usize);
+        assert_eq!(out.lock().len(), 64 * 1024);
     }
 
     /// Posts on a queue whose rings sit at `base` rather than 0.
