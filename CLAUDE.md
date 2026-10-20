@@ -50,7 +50,8 @@ Each example's serial output is grepped against a list of expected lines in `scr
 
 - Release profiles do not enable `overflow-checks`, so arithmetic wraps silently in release kernels while debug builds panic. Use explicit checked operations on values that come from untrusted sources (hardware registers, disk images, network packets).
 - `missing_docs` is a warning and `undocumented_unsafe_blocks` is a clippy warning. `check.sh` promotes clippy warnings to errors, so both need to be clean.
-- Only QEMU has been used. Nothing has run on physical hardware. The Intel VMX backend has only run under nested KVM, because QEMU's TCG does not emulate VMX.
+- Only QEMU has been used. Nothing has run on physical hardware. The Intel VMX backend has only run under nested KVM, because QEMU's TCG does not emulate VMX. The mlx4 driver and the xHCI hub and isochronous code have only run against simulated devices.
+- Cargo refuses to build `examples/*` from a git worktree under this repository's `.claude/worktrees/`, because the parent workspace claims them. Copy the tree out (for example with `git archive HEAD | tar -x -C <dir>`) to run `check.sh`'s QEMU boots.
 
 
 # Rust Coding Guidelines

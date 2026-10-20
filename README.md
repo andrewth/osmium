@@ -118,7 +118,7 @@ features.
   Rust user program from an ELF file as an `osmium-proc` process, which
   opens, writes and lists files in an `osmium-fs` RAM file system. On
   all three an init program also forks, waits and execs; `fork` copies
-  memory eagerly (no copy-on-write), and a process can have several threads (`clone` with `CLONE_THREAD`, joined with `futex`). Kernel stack overflows are caught on all three
+  memory copy-on-write, and a process can have several threads (`clone` with `CLONE_THREAD`, joined with `futex`). Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. Load balancing (`with_stealing`) is opt-in; by default tasks
@@ -133,6 +133,11 @@ features.
   (`OffsetMapper` does).
 - USB: hubs and isochronous endpoints are implemented but have only been
   tested against a simulated xHCI controller, not QEMU or hardware.
+- mlx4: MSI-X interrupts and checksum and segmentation offload have only been
+  tested against a simulated HCA (QEMU has no mlx4 device); several register
+  details were written from the Linux driver, not a datasheet.
+- `osmium-net` sockets now take `SocketAddr`; a socket serves one address
+  family, and there is no IPv6 fragmentation or path-MTU discovery.
   Isochronous transfers are limited to 4 KiB per service interval, SuperSpeed
   burst sizes from companion descriptors are ignored, and a SuperSpeed hub
   port needing a warm reset is not recovered.

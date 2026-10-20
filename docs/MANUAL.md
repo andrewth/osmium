@@ -777,7 +777,7 @@ on `execve`. If you need your own register handling, call
 The supported calls are listed in the [appendix](#appendix-system-call-numbers).
 Unknown numbers return `-ENOSYS`. Some limits apply:
 
-- `fork` copies memory eagerly.
+- `fork` shares memory copy-on-write.
 - `clone` creates processes, or threads with `CLONE_THREAD` (which needs `CLONE_VM|FS|FILES|SIGHAND`); all threads of a process share one CPU. `futex` has wait, wake, requeue, `WAKE_OP`, bitsets, timeouts (once the kernel gives `osmium_proc::futex::set_clock` a clock and calls `futex::tick`) and robust lists, but no priority-inheritance operations (`ENOSYS`).
 - `execve` loads only static, non-PIE ELF files. It refuses an image whose
   segments reach kernel address ranges (`ENOEXEC`) or need more than 1 GiB
@@ -972,12 +972,11 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
 ### Current limitations
 
 - Only QEMU has been tested (TCG, up to 4 CPUs), never physical hardware.
-- All threads of a process run on one CPU, and `fork` has no
-  copy-on-write.
-- FP/SIMD registers are saved on a context switch only when the target
-  enables them (`neon`, `d`). Soft-float kernels don't save them, so the
-  x86_64 and AArch64 examples call `trap_fp()` on every CPU: a user program
-  that uses FP/SIMD faults instead of seeing another process's registers.
+- All threads of a process run on one CPU.
+- FP/SIMD registers are switched per task only when the kernel calls
+  `osmium_arch::fp::enable` on every CPU and gives user tasks an `FpState`
+  (`TaskBuilder::fp_state`). Kernels are soft-float and never touch them.
+  AVX stays off on x86_64, and SVE and SME are not enabled on AArch64.
 - The heap can return large blocks to the frame allocator only if the
   mapper implements `virt_to_phys` (`OffsetMapper` does).
 - The Intel VMX backend has only run under nested KVM, and x86 MMIO emulation does not
