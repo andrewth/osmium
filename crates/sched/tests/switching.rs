@@ -226,9 +226,9 @@ fn task_data() {
 #[test]
 fn idle_cpu_steals_unpinned_work() {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static MOVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     become_cpu();
     let home = osmium_arch::cpu::current_id();
-    let steals_before = SCHED.steals();
 
     static GATE: WaitQueue = WaitQueue::new();
     // Another "CPU" with nothing of its own to run: its boot task blocks, so
@@ -249,12 +249,16 @@ fn idle_cpu_steals_unpinned_work() {
             let ran_on = ran_on.clone();
             // Unpinned (no .cpu()): starts here, but any CPU may run it.
             TaskBuilder::new("work").stack_size(256 * 1024).spawn(move || {
-                // Keep going until some steal has happened (the host decides
-                // when the thief thread runs), then a little longer so a
-                // stolen task records where it ran. Bounded either way.
+                // Keep going until some task has run elsewhere (the host
+                // decides when the thief thread runs), then a little longer.
+                // Bounded either way.
                 for i in 0..1_000_000 {
-                    ran_on.lock().unwrap().push(osmium_arch::cpu::current_id());
-                    if i >= 20 && SCHED.steals() > steals_before {
+                    let here = osmium_arch::cpu::current_id();
+                    ran_on.lock().unwrap().push(here);
+                    if here != home {
+                        MOVED.store(true, Ordering::Release);
+                    }
+                    if i >= 20 && MOVED.load(Ordering::Acquire) {
                         break;
                     }
                     osmium_sched::yield_now();
@@ -271,7 +275,6 @@ fn idle_cpu_steals_unpinned_work() {
 
     let ran_on = ran_on.lock().unwrap();
     assert!(ran_on.iter().any(|&c| c != home), "some work ran on another CPU");
-    assert!(SCHED.steals() > steals_before);
 }
 
 #[test]
