@@ -219,6 +219,16 @@ macro_rules! csr_clear {
     };
 }
 
+/// Clears `$v` in a CSR and evaluates to the CSR's previous value.
+macro_rules! csr_clear_read {
+    ($csr:literal, $v:expr) => {{
+        let old: u64;
+        // SAFETY: as above.
+        unsafe { asm!(concat!("csrrc {}, ", $csr, ", {}"), out(reg) old, in(reg) $v, options(nomem, nostack)) };
+        old
+    }};
+}
+
 /// Prepares this hart to run guests: delegates the guest's own exceptions
 /// and VS-level interrupts to it, lets it read the counters, and enables
 /// `vstimecmp` (Sstc). Running a vCPU does this itself on a hart that has
@@ -292,6 +302,7 @@ pub(super) fn fence_guest(hgatp: u64) {
 }
 
 const SSTATUS_FS: u64 = 3 << 13;
+const SSTATUS_SIE: u64 = 1 << 1;
 
 /// Loads `fp` into the FP registers. `sstatus.FS` must be on.
 fn load_fp(fp: &FpState) {
@@ -349,6 +360,13 @@ static LAST_VCPU: [core::sync::atomic::AtomicU64; osmium_arch::MAX_CPUS] =
 
 /// Enters the guest and returns at its next exit.
 pub(super) fn run(v: &mut RiscvVcpu) {
+    // Supervisor interrupts stay masked from before the first guest CSR is
+    // loaded until the last one is saved: a host interrupt taken in between
+    // could switch to another vCPU on this hart and clobber (or save) a
+    // half-switched VS context. The guest still exits on interrupts (traps
+    // to HS from VS are taken whatever sstatus.SIE says), and the exit path
+    // restores this masked sstatus.
+    let prev = csr_clear_read!("sstatus", SSTATUS_SIE);
     // FP works in a guest only while the host's sstatus.FS is on too, so it
     // is on across every run. The vCPU's registers are always loaded (no
     // values leak from another vCPU) and saved if the guest had FP on.
@@ -361,7 +379,10 @@ pub(super) fn run(v: &mut RiscvVcpu) {
     // A different vCPU than this hart last ran (or a new VM that reuses an
     // old one's VMID and root): install its hgatp and flush.
     let cpu = osmium_arch::cpu::current_id();
-    if LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id || csr_read!("0x680") != v.hgatp.0 {
+    let switched = LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id;
+    // `flush_stage2` was called since the last entry: the G-stage tables changed.
+    let stale = core::mem::take(&mut v.flush);
+    if switched || stale || csr_read!("0x680") != v.hgatp.0 {
         csr_write!("0x680", v.hgatp.0);
         // SAFETY: hfence.gvma and hfence.vvma (all addresses, all VMIDs)
         // only invalidate TLB entries.
@@ -376,6 +397,10 @@ pub(super) fn run(v: &mut RiscvVcpu) {
         save_fp(&mut v.fp);
     }
     csr_clear!("sstatus", SSTATUS_FS);
+    // Unmask last; an interrupt that became pending meanwhile is taken here.
+    if prev & SSTATUS_SIE != 0 {
+        csr_set!("sstatus", SSTATUS_SIE);
+    }
 }
 
 /// Reads the guest instruction at guest-virtual `pc` with `hlvx.hu`, using

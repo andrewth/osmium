@@ -178,6 +178,10 @@ fn load_el1(r: &El1Regs) {
     msr!("ttbr1_el1", r.ttbr1);
     msr!("tcr_el1", r.tcr);
     msr!("mair_el1", r.mair);
+    msr!("amair_el1", r.amair);
+    msr!("afsr0_el1", r.afsr0);
+    msr!("afsr1_el1", r.afsr1);
+    msr!("csselr_el1", r.csselr);
     msr!("vbar_el1", r.vbar);
     msr!("contextidr_el1", r.contextidr);
     msr!("esr_el1", r.esr);
@@ -206,6 +210,10 @@ fn save_el1(r: &mut El1Regs) {
     r.ttbr1 = mrs!("ttbr1_el1");
     r.tcr = mrs!("tcr_el1");
     r.mair = mrs!("mair_el1");
+    r.amair = mrs!("amair_el1");
+    r.afsr0 = mrs!("afsr0_el1");
+    r.afsr1 = mrs!("afsr1_el1");
+    r.csselr = mrs!("csselr_el1");
     r.vbar = mrs!("vbar_el1");
     r.contextidr = mrs!("contextidr_el1");
     r.esr = mrs!("esr_el1");
@@ -284,11 +292,18 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     // A different vCPU than this CPU last ran (or a new VM that reuses an
     // old one's VMID and root): install its VTTBR and flush.
     let cpu = osmium_arch::cpu::current_id();
-    if LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id || mrs!("vttbr_el2") != v.vttbr {
+    let switched = LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id;
+    // `flush_stage2` was called since the last entry: the tables changed.
+    let stale = core::mem::take(&mut v.flush);
+    if switched || mrs!("vttbr_el2") != v.vttbr {
         msr!("vttbr_el2", v.vttbr);
         // SAFETY: TLB maintenance for the new stage-2 tables (all VMIDs is
         // coarse but correct).
         unsafe { asm!("isb", "tlbi alle1is", "dsb ish", "isb", options(nostack, preserves_flags)) };
+    } else if stale {
+        // SAFETY: invalidates this VMID's stage 1 and 2 entries (VTTBR_EL2
+        // is current), broadcast to the inner shareable domain.
+        unsafe { asm!("tlbi vmalls12e1is", "dsb ish", "isb", options(nostack, preserves_flags)) };
     }
     load_el1(&v.el1);
     load_fp(&v.fp);

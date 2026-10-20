@@ -563,15 +563,25 @@ impl SvmVcpu {
             }
             return Some((buf, n.min(15)));
         }
+        self.fetch_insn()
+    }
+
+    /// The instruction at CS.base + RIP, read from guest memory through the
+    /// guest's tables (never from the decode-assist bytes, which hardware
+    /// writes only for nested and ordinary page faults).
+    fn fetch_insn(&self) -> Option<([u8; 15], usize)> {
+        let mut buf = [0u8; 15];
         let mem = self.mem.as_ref()?;
-        // In 64-bit mode CS has no base.
-        let base = if self.code_bits() == 64 { 0 } else { self.read64(vmcb::CS + 8) };
-        let linear = base.wrapping_add(self.rip());
+        // In 64-bit mode CS has no base; otherwise addresses wrap at 4 GiB.
+        let (base, wrap) =
+            if self.code_bits() == 64 { (0, u64::MAX) } else { (self.read64(vmcb::CS + 8), u32::MAX as u64) };
+        // CS.base + RIP is guest-chosen: wrap rather than overflow.
+        let linear = base.wrapping_add(self.rip()) & wrap;
         // Byte by byte through the guest's tables (the instruction may cross
         // a page); stop at the first byte that cannot be read.
         let mut n = 0;
         while n < 15 {
-            let Some(gpa) = self.translate(linear + n as u64) else { break };
+            let Some(gpa) = self.translate(linear.wrapping_add(n as u64) & wrap) else { break };
             if mem.read(GuestPhysAddr(gpa), &mut buf[n..n + 1]).is_err() {
                 break;
             }
@@ -648,8 +658,11 @@ impl SvmVcpu {
                 window = true;
             }
         }
+        // A virtual interrupt is taken (and VINTR fires) only when V_INTR_PRIO
+        // exceeds V_TPR, so the window request uses the highest priority.
         let v = self.read64(vmcb::V_INTR) & !(1 << 8);
-        self.write64(vmcb::V_INTR, if window { v | 1 << 8 } else { v });
+        let v = if window { v & !(0xf << 16) | 1 << 8 | 0xf << 16 } else { v };
+        self.write64(vmcb::V_INTR, v);
         let i = self.intercepts() & !INTERCEPT_VINTR;
         self.write32(vmcb::INTERCEPT_MISC1, if window { i | INTERCEPT_VINTR } else { i });
     }
@@ -752,6 +765,14 @@ impl SvmVcpu {
         self.write64(vmcb::INT_STATE, 0);
     }
 
+    /// Requests a flush of the guest's TLB entries (`TLB_CONTROL`) on the
+    /// next `VMRUN`. Call it after editing the guest's nested page tables:
+    /// the CPU keeps nested translations across runs and only the first run
+    /// flushes.
+    pub fn flush_stage2(&mut self) {
+        self.flush = true;
+    }
+
     /// Physical address of the VMCB.
     pub fn vmcb_pa(&self) -> u64 {
         self.vmcb_pa
@@ -793,7 +814,9 @@ impl SvmVcpu {
             // MOV to or from DR0-DR3: read as zero, writes ignored.
             c if (exit::DR_READ..exit::DR_READ + 0x20).contains(&c) => {
                 let read = c < exit::DR_READ + 0x10;
-                let Some((b, n)) = self.insn_bytes() else { return false };
+                // Decode assists write INSN_BYTES only for #NPF and #PF, so
+                // for a DR intercept it is stale: fetch from guest memory.
+                let Some((b, n)) = self.fetch_insn() else { return false };
                 // [REX] 0F 21/23 modrm: the GPR is modrm.rm (+ REX.B).
                 let (rex, i) = if n > 0 && b[0] & 0xf0 == 0x40 { (b[0], 1) } else { (0, 0) };
                 if n < i + 3 || b[i] != 0x0f {
@@ -1025,12 +1048,20 @@ mod tests {
         assert_eq!((v.rip(), v.read64(vmcb::EFER)), (rip, efer), "faults on the WRMSR, EFER unchanged");
         wrmsr(&mut v, 0x277, 0x0007_0406_0007_0402); // memory type 2 is reserved
         assert!(v.pending_exception.take().is_some());
-        // mov rbx, dr0 (0F 21 C3), from the decode-assist bytes.
+        // mov rbx, dr0 (0F 21 C3). The decode-assist bytes are stale for a DR
+        // intercept (hardware fills them for #NPF/#PF only), so the
+        // instruction is read from guest memory instead.
+        let mut ram = alloc::vec![0u8; 0x1000];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives the vCPU's use of `mem` in this test.
+        unsafe { mem.add_region(GuestPhysAddr(0x10_0000), ram.as_mut_ptr(), 0x1000) };
+        mem.write(GuestPhysAddr(0x10_0000), &[0x0f, 0x21, 0xc3]).unwrap();
+        let mut v = v.with_memory(Arc::new(mem));
         v.regs.rbx = 0x1234;
         // SAFETY: the instruction bytes field of the owned VMCB.
         unsafe {
             v.at(vmcb::INSN_LEN).write_volatile(3);
-            for (k, b) in [0x0f, 0x21, 0xc3].into_iter().enumerate() {
+            for (k, b) in [0x90, 0x90, 0x90].into_iter().enumerate() {
                 v.at(vmcb::INSN_BYTES + k).write_volatile(b);
             }
         }
@@ -1213,5 +1244,45 @@ mod tests {
         v.prepare_interrupts();
         assert_eq!(v.read64(vmcb::EVENTINJ), 0x30 | EVENT_VALID);
         assert_eq!(v.read64(vmcb::EXITINTINFO), 0);
+    }
+
+    #[test]
+    fn instruction_fetch_wraps_instead_of_overflowing() {
+        let mut ram = alloc::vec![0u8; 0x1000];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives the vCPU's use of `mem` in this test.
+        unsafe { mem.add_region(GuestPhysAddr(0), ram.as_mut_ptr(), 0x1000) };
+        mem.write(GuestPhysAddr(0), &[0x90]).unwrap();
+        let mut v = vcpu().with_memory(Arc::new(mem));
+        // 32-bit code at the top of the address space wraps to 0.
+        v.write64(vmcb::RIP, 0xffff_ffff);
+        assert_eq!(v.fetch_insn().map(|(_, n)| n), None, "0xffffffff is unmapped");
+        v.write64(vmcb::RIP, 0xffff_fffe);
+        assert_eq!(v.fetch_insn().map(|(_, n)| n), None);
+        // 64-bit code at u64::MAX - 1: the linear address wraps past 2^64.
+        v.set_long_mode(0x1000);
+        v.write64(vmcb::RIP, u64::MAX);
+        assert_eq!(v.fetch_insn().map(|(_, n)| n), None, "no panic, and a clean failure");
+        drop(v);
+        drop(ram);
+    }
+
+    #[test]
+    fn interrupt_window_uses_a_priority_above_the_task_priority() {
+        let mut v = vcpu();
+        v.connect_intr(|| Some(0x24));
+        v.irq_line().store(true, Ordering::SeqCst);
+        v.prepare_interrupts();
+        let vi = v.read64(vmcb::V_INTR);
+        assert_ne!(vi & 1 << 8, 0, "V_IRQ");
+        assert_eq!(vi >> 16 & 0xf, 0xf, "V_INTR_PRIO");
+    }
+
+    #[test]
+    fn stage2_flush_is_requested() {
+        let mut v = vcpu();
+        v.flush = false;
+        v.flush_stage2();
+        assert!(v.flush);
     }
 }

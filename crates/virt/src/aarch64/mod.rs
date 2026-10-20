@@ -97,6 +97,10 @@ pub struct El1Regs {
     pub ttbr1: u64,
     pub tcr: u64,
     pub mair: u64,
+    pub amair: u64,
+    pub afsr0: u64,
+    pub afsr1: u64,
+    pub csselr: u64,
     pub vbar: u64,
     pub contextidr: u64,
     pub esr: u64,
@@ -125,6 +129,10 @@ impl Default for El1Regs {
             ttbr1: 0,
             tcr: 0,
             mair: 0,
+            amair: 0,
+            afsr0: 0,
+            afsr1: 0,
+            csselr: 0,
             vbar: 0,
             contextidr: 0,
             esr: 0,
@@ -175,9 +183,22 @@ pub struct Aarch64Vcpu {
     /// See [`new_vcpu_id`](crate::vcpu::new_vcpu_id).
     #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
     pub(crate) id: u64,
+    /// The stage-2 tables changed: invalidate the VMID before the next entry.
+    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    pub(crate) flush: bool,
 }
 
 impl Aarch64Vcpu {
+    /// Arranges for the guest's cached stage-2 translations to be
+    /// invalidated (`tlbi vmalls12e1is` for its VMID) before this vCPU next
+    /// enters the guest. Call it after the hypervisor edits the guest's
+    /// stage-2 tables (unmapping or changing permissions of a page): the CPU
+    /// caches translations across entries and only flushes when the vCPU or
+    /// its `VTTBR_EL2` changes.
+    pub fn flush_stage2(&mut self) {
+        self.flush = true;
+    }
+
     /// A vCPU that starts at EL1h at `entry` with `x0` = `arg` (the device
     /// tree, by the Linux boot convention), translating through the stage-2
     /// table encoded in `vttbr` (see [`vttbr`](crate::stage2::vttbr)).
@@ -196,6 +217,7 @@ impl Aarch64Vcpu {
             timer: None,
             pending: None,
             running: None,
+            flush: false,
         }
     }
 

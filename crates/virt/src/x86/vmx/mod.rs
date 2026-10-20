@@ -327,6 +327,7 @@ const EFER_LMA: u64 = 1 << 10;
 const CR0_PE: u64 = 1;
 const CR0_PG: u64 = 1 << 31;
 const CR4_PAE: u64 = 1 << 5;
+const CR4_DE: u64 = 1 << 3;
 const CR4_VMXE: u64 = 1 << 13;
 /// #UD, #GP(0) and #DB in the form of [`VmxVcpu::pending_exception`]: the
 /// interruption information in the low half and the error code in the high.
@@ -555,14 +556,26 @@ impl VmxVcpu {
         self.vmcs.write(vmcs::GUEST_CR4, v | self.caps.cr4_fixed0);
     }
 
-    /// The guest's view of CR0.
+    /// The guest's view of CR0: the read shadow for the bits the host owns
+    /// (the guest/host mask), the real register for the rest, which the
+    /// guest writes natively without an exit.
     pub fn cr0(&self) -> u64 {
-        self.vmcs.read(vmcs::CR0_SHADOW)
+        let mask = self.vmcs.read(vmcs::CR0_MASK);
+        (self.vmcs.read(vmcs::CR0_SHADOW) & mask) | (self.vmcs.read(vmcs::GUEST_CR0) & !mask)
     }
 
-    /// The guest's view of CR4.
+    /// The guest's view of CR4 (see [`cr0`](Self::cr0)).
     pub fn cr4(&self) -> u64 {
-        self.vmcs.read(vmcs::CR4_SHADOW)
+        let mask = self.vmcs.read(vmcs::CR4_MASK);
+        (self.vmcs.read(vmcs::CR4_SHADOW) & mask) | (self.vmcs.read(vmcs::GUEST_CR4) & !mask)
+    }
+
+    /// Requests a flush of the guest-physical translations the CPU caches
+    /// (`INVEPT` and `INVVPID`) before the next entry. Call it after
+    /// editing the guest's EPT tables: the CPU keeps EPT-derived
+    /// translations across entries and only the first entry flushes.
+    pub fn flush_stage2(&mut self) {
+        self.flush = true;
     }
 
     fn area_entry(&self, base: usize, i: usize) -> *mut u8 {
@@ -731,14 +744,16 @@ impl VmxVcpu {
     fn insn_bytes(&self) -> Option<([u8; 15], usize)> {
         let mut buf = [0u8; 15];
         let mem = self.mem.as_ref()?;
-        // In 64-bit mode CS has no base.
-        let base = if self.code_bits() == 64 { 0 } else { self.seg_base(Seg::Cs) };
-        let linear = base.wrapping_add(self.rip());
+        // In 64-bit mode CS has no base; otherwise addresses wrap at 4 GiB.
+        let (base, wrap) =
+            if self.code_bits() == 64 { (0, u64::MAX) } else { (self.seg_base(Seg::Cs), u32::MAX as u64) };
+        // CS.base + RIP is guest-chosen: wrap rather than overflow.
+        let linear = base.wrapping_add(self.rip()) & wrap;
         // Byte by byte through the guest's tables (the instruction may cross
         // a page); stop at the first byte that cannot be read.
         let mut n = 0;
         while n < 15 {
-            let Some(gpa) = self.translate(linear + n as u64) else { break };
+            let Some(gpa) = self.translate(linear.wrapping_add(n as u64) & wrap) else { break };
             if mem.read(GuestPhysAddr(gpa), &mut buf[n..n + 1]).is_err() {
                 break;
             }
@@ -979,11 +994,14 @@ impl VmxVcpu {
         let q = self.vmcs.read(vmcs::EXIT_QUAL);
         let (cr, ty, gpr) = (q & 0xf, q >> 4 & 3, (q >> 8 & 0xf) as u8);
         let cr0 = self.cr0();
+        // Outside 64-bit mode the operand is 32 bits wide: the upper half of
+        // the register is not part of the value.
+        let opmask = if self.code_bits() == 64 { u64::MAX } else { u32::MAX as u64 };
         match (ty, cr) {
-            (0, 0) => self.write_cr0(self.reg(gpr)),
-            (0, 4) => self.write_cr4(self.reg(gpr)),
+            (0, 0) => self.write_cr0(self.reg(gpr) & opmask),
+            (0, 4) => self.write_cr4(self.reg(gpr) & opmask),
             (0, 8) => {
-                let v = self.reg(gpr);
+                let v = self.reg(gpr) & opmask;
                 if v > 0xf {
                     self.inject_gp();
                     return true;
@@ -1017,6 +1035,11 @@ impl VmxVcpu {
         {
             return self.inject_gp();
         }
+        // 32-bit PAE paging: the CPU uses the four PDPTEs cached in the VMCS
+        // with EPT, so load them from the tables at CR3 (SDM vol. 3, 26.3.2.4).
+        if pg && self.cr4() & CR4_PAE != 0 && efer & EFER_LME == 0 && !self.load_pdptes() {
+            return self.inject_gp();
+        }
         if pg && old & CR0_PG == 0 && efer & EFER_LME != 0 {
             self.vmcs.write(GUEST_EFER, efer | EFER_LMA);
         } else if !pg && old & CR0_PG != 0 {
@@ -1031,7 +1054,36 @@ impl VmxVcpu {
         if v >> 32 != 0 || v & !self.caps.cr4_fixed1 != 0 || v & CR4_VMXE != 0 || (lma && v & CR4_PAE == 0) {
             return self.inject_gp();
         }
+        // Changing CR4.PAE under 32-bit PAE paging reloads the PDPTEs.
+        let pae_paging = v & CR4_PAE != 0 && self.cr0() & CR0_PG != 0 && !lma;
+        if pae_paging && !self.load_pdptes() {
+            return self.inject_gp();
+        }
         self.set_cr4(v);
+    }
+
+    /// Loads GUEST_PDPTE0..3 from the guest's PAE page-directory-pointer
+    /// table at CR3. Returns false (leaving the VMCS untouched) when an
+    /// entry has reserved bits set or the table cannot be read. Without
+    /// guest memory attached the cached entries are left as they are.
+    fn load_pdptes(&mut self) -> bool {
+        let Some(mem) = self.mem.clone() else { return true };
+        let base = self.vmcs.read(vmcs::GUEST_CR3) & 0x000f_ffff_ffff_ffe0;
+        let mut pdptes = [0u64; 4];
+        for (i, e) in pdptes.iter_mut().enumerate() {
+            let Some(a) = base.checked_add(8 * i as u64) else { return false };
+            let Ok(v) = mem.read_obj::<u64>(GuestPhysAddr(a)) else { return false };
+            // Present entries must keep bits 2:1 and 8:5 clear, and stay
+            // within the 52-bit physical address width.
+            if v & 1 != 0 && v & (0xfff0_0000_0000_0000 | 0x1e6) != 0 {
+                return false;
+            }
+            *e = v;
+        }
+        for (i, e) in pdptes.into_iter().enumerate() {
+            self.vmcs.write(vmcs::GUEST_PDPTE0 + 2 * i as u32, e);
+        }
+        true
     }
 
     /// Emulates the debug-register access that caused a `MOV DR` exit and
@@ -1040,6 +1092,14 @@ impl VmxVcpu {
     fn emulate_dr(&mut self) {
         let q = self.vmcs.read(vmcs::EXIT_QUAL);
         let (dr, read, gpr) = (q & 7, q & 0x10 != 0, (q >> 8 & 0xf) as u8);
+        // MOV DR is privileged; with CR4.DE, DR4 and DR5 do not exist.
+        if self.cpl() != 0 {
+            return self.inject_gp();
+        }
+        if matches!(dr, 4 | 5) && self.cr4() & CR4_DE != 0 {
+            self.pending_exception = Some(UD);
+            return;
+        }
         if read {
             let v = match dr {
                 6 | 4 => self.dr6,

@@ -378,3 +378,127 @@ fn cpuid_view() {
     assert_eq!(patch_cpuid(7, [0, 1 << 10 | 1 << 3, 0, 0], 0)[1], 1 << 3, "no INVPCID");
     assert_eq!(patch_cpuid(0xa, [1, 2, 3, 4], 0), [0; 4], "no performance counters");
 }
+
+#[test]
+fn guest_visible_cr0_and_cr4_follow_native_writes() {
+    let mut v = vcpu();
+    // The guest sets CR4.PAE and CR0.PG itself (neither is intercepted):
+    // only the real registers change, not the shadows.
+    let cr4 = v.read(vmcs::GUEST_CR4);
+    v.write(vmcs::GUEST_CR4, cr4 | CR4_PAE);
+    let cr0 = v.read(vmcs::GUEST_CR0);
+    v.write(vmcs::GUEST_CR0, cr0 | CR0_PG);
+    assert_ne!(v.cr4() & CR4_PAE, 0);
+    assert_ne!(v.cr0() & CR0_PG, 0);
+    // Bits the host owns still read as the shadow says.
+    let owned = v.cr0_owned();
+    assert_eq!(v.cr0() & owned, v.read(vmcs::CR0_SHADOW) & owned);
+}
+
+#[test]
+fn native_pae_then_emulated_paging_is_not_refused() {
+    let mut v = vcpu();
+    let cr4 = v.read(vmcs::GUEST_CR4);
+    v.write(vmcs::GUEST_CR4, cr4 | CR4_PAE); // a native write
+    v.write(vmcs::GUEST_EFER, EFER_LME);
+    let q = 1 << 8;
+    v.regs.rcx = 0x8001_0033;
+    exit_with(&mut v, exit::CR_ACCESS, q, 3);
+    assert!(v.emulate_cr());
+    assert_eq!(v.pending_exception.take(), None, "LME paging with PAE set natively is legal");
+    assert_eq!(v.read(vmcs::GUEST_EFER) & EFER_LMA, EFER_LMA);
+}
+
+#[test]
+fn pae_paging_loads_the_pdptes() {
+    let mut ram = alloc::vec![0u8; 0x2000];
+    let mut mem = GuestMemory::new();
+    // SAFETY: `ram` outlives the vCPU's use of `mem` in this test.
+    unsafe { mem.add_region(GuestPhysAddr(0), ram.as_mut_ptr(), 0x2000) };
+    for i in 0..4u64 {
+        mem.write_obj(GuestPhysAddr(0x1000 + 8 * i), (0x5000 + 0x1000 * i) | 1).unwrap();
+    }
+    mem.write_obj(GuestPhysAddr(0x1020), 0u64).unwrap();
+    let mem = Arc::new(mem);
+    let mut v = vcpu().with_memory(mem.clone());
+    v.write(vmcs::GUEST_CR3, 0x1000);
+    v.set_cr4(CR4_PAE);
+    let q = 1 << 8;
+    v.regs.rcx = 0x8001_0033;
+    exit_with(&mut v, exit::CR_ACCESS, q, 3);
+    assert!(v.emulate_cr());
+    assert_eq!(v.pending_exception.take(), None);
+    for i in 0..4u32 {
+        assert_eq!(v.read(vmcs::GUEST_PDPTE0 + 2 * i), (0x5000 + 0x1000 * i as u64) | 1);
+    }
+    // A present entry with a reserved bit is #GP(0) and changes nothing.
+    mem.write_obj(GuestPhysAddr(0x1008), 0x6000u64 | 1 | 1 << 1).unwrap();
+    v.set_cr0(0x11);
+    v.regs.rcx = 0x8001_0033;
+    exit_with(&mut v, exit::CR_ACCESS, q, 3);
+    assert!(v.emulate_cr());
+    assert_eq!(v.pending_exception.take(), Some(GP));
+    assert_eq!(v.cr0(), 0x11);
+    drop(v);
+    drop(mem);
+    drop(ram);
+}
+
+#[test]
+fn mov_dr_needs_ring_0() {
+    let mut v = vcpu();
+    v.regs.rcx = 0x455;
+    v.write(vmcs::GUEST_AR + 2 * Seg::Ss as u32, 0x93 | 3 << 5);
+    exit_with(&mut v, exit::DR_ACCESS, 7 | 1 << 8, 3);
+    let rip = v.rip();
+    assert!(v.reflect(exit::DR_ACCESS));
+    assert_eq!(v.pending_exception.take(), Some(GP));
+    assert_eq!((v.dr7, v.rip()), (0x400, rip), "nothing changed, not stepped over");
+    // With CR4.DE, DR4 and DR5 do not exist.
+    v.write(vmcs::GUEST_AR + 2 * Seg::Ss as u32, 0x93);
+    v.set_cr4(CR4_DE);
+    exit_with(&mut v, exit::DR_ACCESS, 4 | 1 << 8, 3);
+    assert!(v.reflect(exit::DR_ACCESS));
+    assert_eq!(v.pending_exception.take(), Some(UD));
+}
+
+#[test]
+fn control_register_moves_use_the_operand_size() {
+    let mut v = vcpu();
+    // 32-bit code: the upper half of the register is not part of the value.
+    v.regs.rcx = 0xdead_beef_0000_0033;
+    exit_with(&mut v, exit::CR_ACCESS, 1 << 8, 3);
+    assert!(v.emulate_cr());
+    assert_eq!(v.pending_exception.take(), None);
+    assert_eq!(v.cr0(), 0x33);
+    // In 64-bit mode the same value has reserved bits set.
+    v.set_long_mode(0x1000);
+    assert_eq!(v.code_bits(), 64);
+    exit_with(&mut v, exit::CR_ACCESS, 1 << 8, 3);
+    assert!(v.emulate_cr());
+    assert_eq!(v.pending_exception.take(), Some(GP));
+}
+
+#[test]
+fn instruction_fetch_wraps_instead_of_overflowing() {
+    let mut ram = alloc::vec![0u8; 0x1000];
+    let mut mem = GuestMemory::new();
+    // SAFETY: `ram` outlives the vCPU's use of `mem` in this test.
+    unsafe { mem.add_region(GuestPhysAddr(0), ram.as_mut_ptr(), 0x1000) };
+    let mut v = vcpu().with_memory(Arc::new(mem));
+    v.write(vmcs::GUEST_RIP, 0xffff_ffff);
+    assert!(v.insn_bytes().is_none());
+    v.set_long_mode(0x1000);
+    v.write(vmcs::GUEST_RIP, u64::MAX);
+    assert!(v.insn_bytes().is_none(), "no overflow panic");
+    drop(v);
+    drop(ram);
+}
+
+#[test]
+fn stage2_flush_is_requested() {
+    let mut v = vcpu();
+    v.flush = false;
+    v.flush_stage2();
+    assert!(v.flush);
+}

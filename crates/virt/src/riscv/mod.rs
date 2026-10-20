@@ -148,6 +148,9 @@ pub struct RiscvVcpu {
     #[cfg_attr(not(all(target_arch = "riscv64", feature = "riscv64-hs")), allow(dead_code))]
     pub(crate) id: u64,
     pub(crate) fence: Option<Arc<AtomicBool>>,
+    /// The G-stage tables changed: `hfence.gvma` before the next entry.
+    #[cfg_attr(not(all(target_arch = "riscv64", feature = "riscv64-hs")), allow(dead_code))]
+    pub(crate) flush: bool,
 }
 
 /// SBI virtual-interrupt bits in `hvip`.
@@ -165,6 +168,17 @@ pub mod hvip {
 pub struct HartId(pub u64);
 
 impl RiscvVcpu {
+    /// Arranges for the hart's cached G-stage translations (`hfence.gvma`)
+    /// to be flushed before this vCPU next enters the guest. Call it after
+    /// the hypervisor edits the guest's G-stage tables (unmapping or
+    /// changing permissions of a page): the hart caches translations across
+    /// entries and only flushes when the vCPU or its `hgatp` changes. The
+    /// flush is local to the hart that runs the vCPU, so call it on every
+    /// vCPU of the guest.
+    pub fn flush_stage2(&mut self) {
+        self.flush = true;
+    }
+
     /// A vCPU that starts in VS-mode at `entry` with `a0` = `hartid` and
     /// `a1` = `arg` (the device tree, by the Linux boot convention), using
     /// the G-stage table encoded in `hgatp` (see
@@ -194,6 +208,7 @@ impl RiscvVcpu {
             ipi: None,
             running: None,
             fence: None,
+            flush: false,
             id: crate::vcpu::new_vcpu_id(),
             mem: None,
         }
