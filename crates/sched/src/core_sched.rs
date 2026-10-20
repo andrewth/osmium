@@ -40,6 +40,15 @@ pub trait Scheduler: Sync {
 
 static SCHEDULER: Once<&'static dyn Scheduler> = Once::new();
 static REMOTE_WAKE: Once<fn(usize)> = Once::new();
+static SWITCH_HOOK: Once<fn(&Task)> = Once::new();
+
+/// Registers `hook`, called with the incoming task just before every
+/// context switch, with interrupts disabled. Kernels use it for per-task
+/// CPU state: the x86 TSS kernel stack ([`Task::kernel_stack_top`]), the
+/// address space, or FPU state. Panics if called twice.
+pub fn set_switch_hook(hook: fn(&Task)) {
+    assert!(SWITCH_HOOK.set(hook).is_ok(), "switch hook already set");
+}
 
 /// Installs the scheduling policy. Panics if called twice.
 pub fn inject_scheduler(scheduler: &'static dyn Scheduler) {
@@ -223,6 +232,9 @@ fn schedule(requeue: Option<EnqueueReason>) {
     next.set_cpu(cpu);
     next.state.store(TaskState::Running as u8, Ordering::Release);
     NEED_RESCHED.get_for(cpu).store(false, Ordering::Relaxed);
+    if let Some(hook) = SWITCH_HOOK.get() {
+        hook(&next);
+    }
 
     let from = cur.ctx.get();
     let to = next.ctx.get();

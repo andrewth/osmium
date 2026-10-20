@@ -166,6 +166,12 @@ impl Task {
         self.cpu.store(cpu, Ordering::Relaxed);
     }
 
+    /// One past the top of the task's kernel stack, if it owns one (the
+    /// per-CPU boot tasks run on stacks the kernel set up itself).
+    pub fn kernel_stack_top(&self) -> Option<usize> {
+        self._stack.as_ref().map(Stack::top)
+    }
+
     /// Returns true if this is a CPU's idle task.
     pub fn is_idle(&self) -> bool {
         self.is_idle

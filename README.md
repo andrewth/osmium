@@ -87,8 +87,9 @@ features.
 
 ## Current limitations
 
-- User mode is not supported on any architecture. x86_64 traps use the
-  current stack (no IST), so a kernel stack overflow triple-faults.
+- User mode works on x86_64 only (the example runs ring-3 programs with
+  system calls). RISC-V and AArch64 traps cannot yet switch stacks, so they
+  have no user mode and cannot survive a kernel stack overflow.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. The scheduler does no load balancing; tasks move only
   when `Task::set_cpu` asks.

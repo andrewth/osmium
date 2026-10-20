@@ -101,6 +101,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Trap entry (RISC-V S/M-mode, AArch64 EL1/EL2): full `TrapFrame`, registered handler, portable `Trap` cause decoding
 - ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
 - ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction), per-CPU GDT/TSS (`CpuTables`) with IST stacks (`trap::set_ist`)
+- ✅ x86_64 user mode: `enter_user` (ring 3 via `iretq`), `trap::allow_from_user` for `int 0x80` system calls, `TrapFrame::from_user`
 - 🗺 Separate exception stacks on RISC-V and AArch64 (needed to survive a kernel stack overflow there)
 - 🗺 FPU/SIMD state save and restore; user-mode entry/return
 
@@ -145,6 +146,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `Task`, built with `TaskBuilder` (name, priority, stack size, home CPU)
 - ✅ Injectable `Scheduler` trait (as in OSTD) and the core operations: `yield_now`, `block`/`wake`, `exit`, tick-driven preemption, and `on_cpu` hand-off so global run queues are safe on SMP
 - ✅ Pluggable `StackAllocator` (for example, stacks with guard pages; the x86_64 example kills a task that overflows into its guard page and keeps running)
+- ✅ Context-switch hook (`set_switch_hook`) and `Task::kernel_stack_top`, for per-task CPU state such as the x86 TSS stack, address space or FPU
 - ✅ Remote-wake hook so kernels can IPI a CPU when work is queued there; task migration with `Task::set_cpu`
 - ✅ Ready-made policies: `FifoScheduler` (round-robin with a time slice) and `PriorityScheduler` (O(1) bitmap, 64 levels)
 - ✅ `WaitQueue` (no lost wake-ups), sleeping `Mutex`, `Semaphore`

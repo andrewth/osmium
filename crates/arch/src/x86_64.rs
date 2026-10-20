@@ -286,3 +286,37 @@ impl Default for CpuTables {
         Self::new()
     }
 }
+
+/// Drops to user mode (ring 3) at `entry` with stack `stack_top` and
+/// interrupts enabled, using the segments of [`CpuTables`]. General-purpose
+/// registers are cleared so no kernel values leak. Does not return: the
+/// next kernel entry is a trap or interrupt, on the stack in the TSS's `rsp[0]`.
+///
+/// # Safety
+/// [`CpuTables`] must be loaded on this CPU with `tss.rsp[0]` set to a valid
+/// kernel stack, and `entry`/`stack_top` must be mapped user-accessible.
+pub unsafe fn enter_user(entry: u64, stack_top: u64) -> ! {
+    // SAFETY: the caller upholds the contract; iretq loads the user context.
+    unsafe {
+        asm!(
+            "mov ds, {ds:x}",
+            "mov es, {ds:x}",
+            "push {ss}",
+            "push {sp}",
+            "push 0x202",
+            "push {cs}",
+            "push {ip}",
+            "xor eax, eax", "xor ebx, ebx", "xor ecx, ecx", "xor edx, edx",
+            "xor esi, esi", "xor edi, edi", "xor ebp, ebp",
+            "xor r8d, r8d", "xor r9d, r9d", "xor r10d, r10d", "xor r11d, r11d",
+            "xor r12d, r12d", "xor r13d, r13d", "xor r14d, r14d", "xor r15d, r15d",
+            "iretq",
+            ds = in(reg) selectors::USER_DATA as u64,
+            ss = in(reg) selectors::USER_DATA as u64,
+            sp = in(reg) stack_top,
+            cs = in(reg) selectors::USER_CODE as u64,
+            ip = in(reg) entry,
+            options(noreturn),
+        )
+    }
+}

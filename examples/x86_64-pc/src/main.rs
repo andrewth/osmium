@@ -218,7 +218,52 @@ tramp_end:
     options(att_syntax)
 );
 
+// User programs: position-independent ring-3 code, copied into user pages.
+// System calls go through `int 0x80`: rax = number, rdi/rsi/rdx = arguments.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.user, "a"
+    .globl user_hello, user_hello_end, user_bad, user_bad_end
+user_hello:
+    mov $3, %ebx
+1:  lea 3f(%rip), %rsi
+    mov $(4f - 3f), %edx
+    mov $1, %edi
+    mov $1, %eax              // write(1, msg, len)
+    int $0x80
+    mov $20000000, %ecx       // busy-wait without yielding: only the timer
+2:  dec %ecx                  // can switch us out
+    jnz 2b
+    dec %ebx
+    jnz 1b
+    mov $60, %eax             // exit(0)
+    xor %edi, %edi
+    int $0x80
+    ud2
+3:  .ascii "hello from ring 3"
+4:
+user_hello_end:
+
+user_bad:
+    mov $1, %eax
+    lea 1f(%rip), %rsi
+    mov $(2f - 1f), %edx
+    mov $1, %edi
+    int $0x80
+    mov 0x200000, %rax        // read kernel text: not user-accessible
+    ud2
+1:  .ascii "about to read kernel memory"
+2:
+user_bad_end:
+"#,
+    options(att_syntax)
+);
+
 unsafe extern "C" {
+    static user_hello: u8;
+    static user_hello_end: u8;
+    static user_bad: u8;
+    static user_bad_end: u8;
     static tramp_start: u8;
     static tramp_cr3: u8;
     static tramp_stack: u8;
@@ -265,8 +310,23 @@ fn load_cpu_tables() {
     let tables = alloc::boxed::Box::leak(alloc::boxed::Box::new(x86::CpuTables::new()));
     let stack = alloc::vec![0u8; 16 * 1024].leak();
     tables.tss.ist[DOUBLE_FAULT_IST as usize - 1] = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
+    CPU_TABLES[cpu::current_id()].store(&raw mut *tables, Ordering::Relaxed);
     // SAFETY: called once per CPU, with interrupts disabled.
     irq::without(|| unsafe { tables.load() });
+}
+
+/// Each CPU's GDT and TSS, so the switch hook can update `rsp[0]`.
+static CPU_TABLES: [core::sync::atomic::AtomicPtr<x86::CpuTables>; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
+/// Points this CPU's TSS at the incoming task's kernel stack, where the CPU
+/// will put the trap frame when that task traps out of ring 3.
+fn on_switch(next: &osmium::sched::Task) {
+    let tables = CPU_TABLES[cpu::current_id()].load(Ordering::Relaxed);
+    if let (Some(top), false) = (next.kernel_stack_top(), tables.is_null()) {
+        // SAFETY: this CPU's own tables; interrupts are off during a switch.
+        unsafe { (*tables).tss.rsp[0] = top as u64 };
+    }
 }
 
 /// Task stacks with an unmapped guard page below them, so an overflow
@@ -420,6 +480,9 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // before enabling interrupts.
     unsafe { trap::set_ist(DOUBLE_FAULT, DOUBLE_FAULT_IST) };
     osmium::sched::set_stack_allocator(&GuardedStacks);
+    osmium::sched::set_switch_hook(on_switch);
+    // SAFETY: the syscall handler treats every argument as untrusted.
+    unsafe { trap::allow_from_user(trap::SYSCALL_VECTOR) };
     println!("[guard] task stacks get unmapped guard pages; double faults run on IST{DOUBLE_FAULT_IST}");
 
     // --- Timers: calibrate TSC and APIC timer against the PIT ---------------
@@ -489,6 +552,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     }
     fault_demo();
     overflow_demo();
+    user_demo();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     shutdown()
@@ -567,8 +631,87 @@ fn overflow_demo() {
     println!("[guard] the other tasks keep running: {}", alloc::format!("{} free frames", FRAMES.lock().free_frames()));
 }
 
+/// Where user programs are mapped; well above the identity-mapped RAM.
+const USER_BASE: u64 = 0x4000_0000;
+
+/// Copies a user program into fresh pages, maps it user-accessible (code
+/// read/execute, stack read/write) at slot `n`, and spawns a task that drops
+/// to ring 3 there.
+fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8)) -> alloc::sync::Arc<osmium::sched::Task> {
+    let (start, end) = (code.0 as *const u8, code.1 as *const u8);
+    let len = end as usize - start as usize;
+    assert!(len <= PAGE_SIZE);
+    let mut frames = FRAMES.lock();
+    let (code_pa, stack_pa) = (frames.alloc_frame().unwrap(), frames.alloc_frame().unwrap());
+    drop(frames);
+    // SAFETY: fresh frames, identity-mapped; the program fits in one page.
+    unsafe {
+        core::ptr::write_bytes(code_pa.0 as *mut u8, 0, PAGE_SIZE);
+        core::ptr::copy_nonoverlapping(start, code_pa.0 as *mut u8, len);
+    }
+    let (code_va, stack_va) = (USER_BASE + n * 0x10000, USER_BASE + n * 0x10000 + 0x8000);
+    {
+        let mut pt = PT.lock();
+        let pt = pt.as_mut().unwrap();
+        pt.map(VirtAddr::new(code_va), code_pa, PageSize::Size4K, MapFlags::RX | MapFlags::USER).unwrap().flush();
+        pt.map(VirtAddr::new(stack_va), stack_pa, PageSize::Size4K, MapFlags::RW | MapFlags::USER).unwrap().flush();
+    }
+    TaskBuilder::new(name).spawn(move || {
+        // SAFETY: CpuTables are loaded, the switch hook keeps rsp[0] on this
+        // task's kernel stack, and both pages are mapped user-accessible.
+        unsafe { x86::enter_user(code_va, stack_va + PAGE_SIZE as u64) }
+    })
+}
+
+fn user_demo() {
+    // SAFETY: linker symbols delimiting the user programs.
+    let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
+    let tasks = [spawn_user("user-1", 0, hello), spawn_user("user-2", 1, hello), spawn_user("user-bad", 2, bad)];
+    for t in tasks {
+        t.join();
+    }
+}
+
+/// Handles `int 0x80` from ring 3.
+fn syscall(frame: &mut TrapFrame) {
+    let [nr, a0, a1, a2, ..] = frame.syscall_args();
+    let task = osmium::sched::current();
+    match nr {
+        // write(fd, buf, len): only stdout, only from user-accessible memory.
+        1 if a0 == 1 && a2 <= 256 && user_readable(a1, a2) => {
+            // SAFETY: every page of the buffer is mapped user-readable.
+            let bytes = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
+            println!("[user]  {}: {}", task.name(), core::str::from_utf8(bytes).unwrap_or("<not utf-8>"));
+            frame.set_return(a2);
+        }
+        60 => {
+            println!("[user]  {} exited with status {a0}", task.name());
+            drop(task);
+            osmium::sched::exit();
+        }
+        _ => frame.set_return(-38i64 as u64), // ENOSYS
+    }
+}
+
+fn user_readable(addr: u64, len: u64) -> bool {
+    let Some(end) = addr.checked_add(len) else { return false };
+    let pt = PT.lock();
+    let pt = pt.as_ref().unwrap();
+    (addr & !(PAGE_SIZE as u64 - 1)..end)
+        .step_by(PAGE_SIZE)
+        .all(|p| pt.translate(VirtAddr::new(p)).is_some_and(|t| t.flags.contains(MapFlags::USER)))
+}
+
 fn on_trap(frame: &mut TrapFrame) {
+    if frame.from_user() && frame.vector() < 32 && frame.cause() != Trap::Syscall {
+        // A fault in user mode ends that task, not the kernel.
+        let task = osmium::sched::current();
+        println!("[user]  {} killed: {:?} at rip {:#x}", task.name(), frame.cause(), frame.pc());
+        drop(task);
+        osmium::sched::exit();
+    }
     match (frame.vector(), frame.cause()) {
+        (_, Trap::Syscall) if frame.from_user() => syscall(frame),
         (DOUBLE_FAULT, _) => {
             // Reached through IST1: the task's own stack is unusable. A
             // double fault cannot be resumed, so end only the faulting task.

@@ -62,6 +62,11 @@ impl TrapFrame {
         self.rsp as usize
     }
 
+    /// Returns true if the trap came from user mode (ring 3).
+    pub fn from_user(&self) -> bool {
+        self.cs & 3 == 3
+    }
+
     /// The interrupt vector.
     pub fn vector(&self) -> u8 {
         self.vector as u8
@@ -125,6 +130,19 @@ pub unsafe fn set_ist(vector: u8, ist: u8) {
     // SAFETY: the IDT is built (per the contract); the write is one aligned
     // u64, and gates are only consulted by the CPU on interrupt delivery.
     unsafe { gate.write_volatile(gate.read_volatile() & !(0b111 << 32) | (ist as u64) << 32) };
+}
+
+/// Lets user mode raise `vector` with `int` (gate DPL 3), for system calls
+/// such as [`SYSCALL_VECTOR`]. Other vectors stay kernel-only, so `int n`
+/// from user mode raises a general-protection fault instead.
+///
+/// # Safety
+/// [`install`] must have run, and the handler must treat the vector as
+/// untrusted input from user mode.
+pub unsafe fn allow_from_user(vector: u8) {
+    let gate = IDT.0.get().cast::<u64>().wrapping_add(2 * vector as usize);
+    // SAFETY: as in `set_ist`.
+    unsafe { gate.write_volatile(gate.read_volatile() | 3 << 45) };
 }
 
 #[repr(C, align(16))]
