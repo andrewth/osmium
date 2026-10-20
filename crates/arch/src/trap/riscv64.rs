@@ -2,8 +2,10 @@ use core::sync::atomic::Ordering;
 
 use super::{Access, Interrupt, Trap, TrapCpu};
 
-#[cfg(all(bare, not(feature = "riscv-m-mode")))]
-core::arch::global_asm!(include_str!("riscv64_s.S"));
+#[cfg(all(bare, not(feature = "riscv-m-mode"), not(feature = "riscv64-hs")))]
+core::arch::global_asm!(".set OSMIUM_RISCV_HS, 0", include_str!("riscv64_s.S"));
+#[cfg(all(bare, not(feature = "riscv-m-mode"), feature = "riscv64-hs"))]
+core::arch::global_asm!(".set OSMIUM_RISCV_HS, 1", include_str!("riscv64_s.S"));
 #[cfg(all(bare, feature = "riscv-m-mode"))]
 core::arch::global_asm!(include_str!("riscv64_m.S"));
 

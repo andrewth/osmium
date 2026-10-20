@@ -11,10 +11,11 @@
 //! - [`vcpu`]: a normalized [`VmExit`], the [`Vcpu`] trait that hardware
 //!   backends implement, and [`run_vcpu`], a loop that services device exits.
 //! - [`devices`]: emulated devices.
+//! - [`riscv`]: a RISC-V H-extension vCPU and a minimal SBI for guests.
 //! - [`virtio`]: virtio device models behind the virtio-mmio transport.
 //!
-//! Hardware backends (VMX, SVM, Arm EL2, RISC-V H) implement [`Vcpu`]; they
-//! are on the roadmap.
+//! Hardware backends implement [`Vcpu`]: RISC-V H ([`riscv::RiscvVcpu`])
+//! today; VMX, SVM and Arm EL2 are on the roadmap.
 #![no_std]
 
 extern crate alloc;
@@ -24,6 +25,7 @@ extern crate std;
 pub mod bus;
 pub mod devices;
 pub mod memory;
+pub mod riscv;
 pub mod stage2;
 pub mod vcpu;
 pub mod virtio;

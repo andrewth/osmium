@@ -8,6 +8,14 @@ osmium_trap_entry:
     sd t1, 0x30(sp)
     // HOOK: guest exits (riscv64-hs) branch away here, before the
     // stack decision; t0/t1 are saved in TrapCpu.
+.if OSMIUM_RISCV_HS
+    csrr t0, 0x600       // hstatus
+    andi t0, t0, 0x80    // SPV: the trap came from a guest
+    beqz t0, 9f
+    la t0, osmium_hs_exit
+    jr t0
+9:
+.endif
     // Pick the stack for the frame; t0 = frame base.
     csrr t1, sstatus
     andi t1, t1, 0x100   // SPP: 0 = from U-mode

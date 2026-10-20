@@ -10,6 +10,8 @@
 
 extern crate alloc;
 
+mod hyp;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -151,7 +153,7 @@ type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
 
 // SAFETY: the kernel runs identity-mapped (before and after enabling
 // paging), so physical address = virtual address for all RAM.
-static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
+pub(crate) static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
 
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
@@ -454,6 +456,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     fault_demo();
     overflow_demo();
     user_demo();
+    hyp::demo();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     sbi::shutdown()

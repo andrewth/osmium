@@ -55,8 +55,9 @@ boot() {
 
 # Multi-threaded TCG runs the four CPUs in parallel on host threads.
 # QEMU's user network answers the kernel's ARP request over virtio-net, and a
-# USB stick behind the xHCI controller answers a SCSI INQUIRY.
-EXPECT='ARP: 10.0.2.2 is at;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01;\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;3 of 3 address spaces torn down' \
+# USB stick behind the xHCI controller answers a SCSI INQUIRY. A guest runs in
+# VS-mode under the H extension.
+EXPECT='ARP: 10.0.2.2 is at;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01;\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;3 of 3 address spaces torn down;\[guest\] hello over MMIO;\[guest\] hello over SBI;guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0' \
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi \
     -netdev user,id=n0 -device virtio-net-device,netdev=n0 \

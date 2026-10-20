@@ -15,3 +15,8 @@ workspace = true
 riscv-m-mode = []
 ## Use EL2 system registers (`TPIDR_EL2`, `TLBI ALLE2`) on AArch64, for hypervisors.
 aarch64-el2 = []
+## RISC-V HS-mode hypervisor: the trap entry sends guest exits (`hstatus.SPV`)
+## to `osmium_hs_exit`, which `osmium-virt`'s RISC-V vCPU provides. Needs the
+## H extension: on a CPU without it every trap would fault in the entry stub.
+## Has no effect with `riscv-m-mode`, whose trap entry has no guest hook.
+riscv64-hs = []

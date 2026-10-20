@@ -7,7 +7,7 @@ publish = false
 license = "GPL-2.0-only"
 
 [dependencies]
-osmium = { path = "../../crates/osmium", features = ["full"] }
+osmium = { path = "../../crates/osmium", features = ["full", "riscv64-hs"] }
 demos = { path = "../demos" }
 
 [profile.dev]
