@@ -286,6 +286,10 @@ const COM1: u16 = 0x3f8;
 /// Physical address the AP trampoline is copied to (STARTUP vector 0x08).
 const TRAMPOLINE: u64 = 0x8000;
 const IPI_VECTOR: u8 = 33;
+/// Vector for COM1's receive interrupt, routed through the I/O APIC.
+const COM1_VECTOR: u8 = 40;
+/// COM1's ISA IRQ.
+const COM1_IRQ: u8 = 4;
 const DOUBLE_FAULT: u8 = 8;
 /// IST slot for the double-fault handler's stack.
 const DOUBLE_FAULT_IST: u8 = 1;
@@ -358,6 +362,13 @@ unsafe impl StackAllocator for GuardedStacks {
     }
 }
 
+/// Received bytes, from the COM1 interrupt handler to the reader task.
+static RX: osmium::sync::SpscRing<u8, 256> = osmium::sync::SpscRing::new();
+static RX_PRODUCER: IrqSpinLock<Option<osmium::sync::Producer<'static, u8, 256>>> = IrqSpinLock::new(None);
+static RX_READY: osmium::sched::WaitQueue = osmium::sched::WaitQueue::new();
+/// First I/O APIC (address, first GSI) and COM1's line, from the MADT.
+static IOAPIC_INFO: Once<(u64, u32, u32, osmium::drivers::ioapic::LineMode)> = Once::new();
+
 static UART: Once<SerialConsole<Uart16550<Pio>>> = Once::new();
 static LAPIC: Once<LocalApic> = Once::new();
 static SCHED: FifoScheduler = FifoScheduler::new(2);
@@ -423,6 +434,12 @@ extern "C" fn kmain(start_info: usize) -> ! {
         // ACPI tables live; they are only read here.
         let read = |pa: u64, len: usize| Some(unsafe { core::slice::from_raw_parts(pa as *const u8, len) });
         let madt = Acpi::new(rsdp.0, read).ok().and_then(|a| a.find(b"APIC")).and_then(Madt::parse);
+        if let Some(m) = &madt
+            && let Some(io) = m.io_apics().next()
+        {
+            let (gsi, active_low, level) = m.isa_irq(COM1_IRQ);
+            IOAPIC_INFO.call_once(|| (io.addr, io.gsi_base, gsi, osmium::drivers::ioapic::LineMode { active_low, level }));
+        }
         for c in madt.iter().flat_map(|m| m.local_apics()).filter(|c| c.enabled && c.apic_id != my_apic) {
             APIC_IDS[ncpus].store(c.apic_id, Ordering::Relaxed);
             ncpus += 1;
@@ -467,6 +484,9 @@ extern "C" fn kmain(start_info: usize) -> ! {
     pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).unwrap();
     pt.map_range(va(lapic::DEFAULT_BASE), pa(lapic::DEFAULT_BASE), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE))
         .unwrap();
+    if let Some(&(io, ..)) = IOAPIC_INFO.get() {
+        pt.map_range(va(io), pa(io), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
+    }
     // Writable so the boot CPU can install the AP trampoline there.
     pt.map_range(va(TRAMPOLINE), pa(TRAMPOLINE), PAGE_SIZE as u64, k(MapFlags::RW)).unwrap();
     // SAFETY: the new table maps the running code, its stack, the heap and the APIC.
@@ -553,6 +573,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     fault_demo();
     overflow_demo();
     user_demo();
+    serial_demo();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     shutdown()
@@ -629,6 +650,49 @@ fn overflow_demo() {
     });
     t.join();
     println!("[guard] the other tasks keep running: {}", alloc::format!("{} free frames", FRAMES.lock().free_frames()));
+}
+
+/// Routes COM1's receive interrupt through the I/O APIC to this CPU and
+/// waits up to 300 ms for a line of input. To feed it under QEMU:
+/// `-chardev file,id=s0,path=out.log,input-path=in.txt -serial chardev:s0`.
+/// Bytes that arrive before the UART is initialized are dropped when its
+/// receive FIFO is reset, so start the input with a newline.
+fn serial_demo() {
+    let Some(&(io_addr, gsi_base, gsi, mode)) = IOAPIC_INFO.get() else {
+        println!("[uart]  no I/O APIC in the MADT; skipping");
+        return;
+    };
+    // SAFETY: the MADT says the I/O APIC lives here; mapped uncached above.
+    let ioapic = osmium::drivers::ioapic::IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
+    let (producer, mut rx) = RX.split().unwrap();
+    *RX_PRODUCER.lock() = Some(producer);
+    ioapic.route(gsi, COM1_VECTOR, LAPIC.get().unwrap().id() as u8, mode);
+    UART.get().unwrap().port().enable_rx_interrupt();
+    println!("[uart]  COM1 IRQ {COM1_IRQ} -> GSI {gsi} -> vector {COM1_VECTOR} on {} I/O APIC lines", ioapic.lines());
+
+    let deadline = now_ns() + 300_000_000;
+    let timed_out = alloc::sync::Arc::new(AtomicBool::new(false));
+    let t = timed_out.clone();
+    TIMERS.add(deadline, move || {
+        t.store(true, Ordering::Release);
+        RX_READY.wake_all();
+    });
+    let mut line = String::new();
+    loop {
+        let got = RX_READY.wait_until(|| rx.pop().map(Some).or_else(|| timed_out.load(Ordering::Acquire).then_some(None)));
+        match got {
+            Some(b'\n' | b'\r') if !line.is_empty() => break,
+            Some(b) if b.is_ascii_graphic() || b == b' ' => line.push(b as char),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    ioapic.mask(gsi);
+    if line.is_empty() {
+        println!("[uart]  no input within 300 ms (feed COM1 to see interrupt-driven input)");
+    } else {
+        println!("[uart]  interrupt-driven input: {line:?}");
+    }
 }
 
 /// Where user programs are mapped; well above the identity-mapped RAM.
@@ -733,6 +797,18 @@ fn on_trap(frame: &mut TrapFrame) {
         }
         (IPI_VECTOR, _) => {
             LAPIC.get().unwrap().eoi();
+            osmium::sched::preempt_if_needed();
+        }
+        (COM1_VECTOR, _) => {
+            // Drain the UART's FIFO into the ring, then wake the reader.
+            if let Some(p) = RX_PRODUCER.lock().as_mut() {
+                let mut port = UART.get().unwrap().port();
+                while let Some(b) = osmium::hal::serial::SerialPort::read_byte(&mut *port) {
+                    let _ = p.push(b);
+                }
+            }
+            LAPIC.get().unwrap().eoi();
+            RX_READY.wake_all();
             osmium::sched::preempt_if_needed();
         }
         (SPURIOUS_VECTOR, _) => {}

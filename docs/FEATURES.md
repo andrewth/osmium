@@ -139,6 +139,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Arm GICv2 (distributor + CPU interface, SGIs with correct source-CPU EOI)
 - ✅ x86 local APIC (xAPIC MMIO, INIT/STARTUP IPIs)
 - ✅ Intel 8254 PIT (calibration delays)
+- ✅ x86 I/O APIC (GSI routing, polarity/trigger, masking); the x86_64 example routes COM1's receive interrupt through it into an `SpscRing`
 - ✅ RAM disk `BlockDevice`
 - 🗺 virtio (MMIO/PCI): blk, net, console; GICv3; IO-APIC; HPET; NVMe
 
