@@ -3,9 +3,10 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::IpAddr;
 
 use super::{Cx, Packet};
+use crate::ipv6::{ICMPV6_ECHO_REQUEST, Icmpv6Header, PROTO_ICMPV6, echo_body};
 use crate::wire::{ICMP_ECHO_REQUEST, IcmpHeader, PROTO_ICMP};
 use crate::{Error, Instant};
 
@@ -16,7 +17,7 @@ const MAX_PAYLOAD: usize = 65535 - 20 - 8;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EchoReply {
     /// Who answered.
-    pub from: Ipv4Addr,
+    pub from: IpAddr,
     /// The sequence number of the request it answers.
     pub seq: u16,
     /// The echoed data.
@@ -29,7 +30,7 @@ pub struct EchoReply {
 /// carry it.
 pub struct IcmpSocket {
     ident: u16,
-    tx: VecDeque<(Ipv4Addr, u16, Vec<u8>)>,
+    tx: VecDeque<(IpAddr, u16, Vec<u8>)>,
     rx: VecDeque<EchoReply>,
     limit: usize,
 }
@@ -46,8 +47,10 @@ impl IcmpSocket {
         self.ident
     }
 
-    /// Queues an echo request to `dst`.
-    pub fn send_echo(&mut self, dst: Ipv4Addr, seq: u16, data: &[u8]) -> Result<(), Error> {
+    /// Queues an echo request to `dst`, an IPv4 or IPv6 address (ICMPv6
+    /// for the latter).
+    pub fn send_echo(&mut self, dst: impl Into<IpAddr>, seq: u16, data: &[u8]) -> Result<(), Error> {
+        let dst = dst.into();
         if dst.is_unspecified() {
             return Err(Error::InvalidAddress);
         }
@@ -77,10 +80,17 @@ impl IcmpSocket {
     }
 
     pub(crate) fn dispatch(&mut self, cx: &mut Cx, out: &mut Vec<Packet>) {
-        let Some(src) = cx.addr else { return };
-        while let Some((dst, seq, data)) = self.tx.pop_front() {
-            let payload = IcmpHeader { ty: ICMP_ECHO_REQUEST, code: 0, ident: self.ident, seq }.emit(&data);
-            out.push(Packet { src, dst, protocol: PROTO_ICMP, payload });
+        while let Some((dst, _, _)) = self.tx.front() {
+            let Some(src) = cx.source_for(*dst) else { return };
+            let Some((dst, seq, data)) = self.tx.pop_front() else { return };
+            let (protocol, payload) = match (src, dst) {
+                (IpAddr::V6(s), IpAddr::V6(d)) => (
+                    PROTO_ICMPV6,
+                    Icmpv6Header { ty: ICMPV6_ECHO_REQUEST, code: 0 }.emit(s, d, &echo_body(self.ident, seq, &data)),
+                ),
+                _ => (PROTO_ICMP, IcmpHeader { ty: ICMP_ECHO_REQUEST, code: 0, ident: self.ident, seq }.emit(&data)),
+            };
+            out.push(Packet { src, dst, protocol, payload });
         }
     }
 }

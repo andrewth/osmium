@@ -8,7 +8,7 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use osmium_fs::{Errno, File, FileKind, Stat};
-use osmium_net::{Error, Socket, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket};
+use osmium_net::{Error, Socket, SocketAddr, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket};
 use osmium_sync::IrqSpinLock;
 
 use crate::fd::{Access, OpenFile};
@@ -16,6 +16,15 @@ use crate::net::{NetStack, stack};
 use crate::process::Process;
 
 type SysResult = Result<u64, Errno>;
+
+/// The IPv4 address of `a`. The socket layer is `AF_INET` only, so an IPv6
+/// address (which it never creates) reads as unspecified.
+fn v4(a: SocketAddr) -> SocketAddrV4 {
+    match a {
+        SocketAddr::V4(a) => a,
+        SocketAddr::V6(a) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, a.port()),
+    }
+}
 
 const AF_INET: u64 = 2;
 const SOCK_STREAM: u64 = 1;
@@ -235,7 +244,7 @@ impl SocketFile {
             let taken = self.net.op(|_, s| {
                 let i = ready(s)?;
                 let h = backlog[i];
-                let peer = s.get::<TcpSocket>(h).remote_endpoint();
+                let peer = v4(s.get::<TcpSocket>(h).remote_endpoint());
                 let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
                 t.listen(port).expect("a fresh socket can listen");
                 Some((i, h, peer, s.add(t)))
@@ -403,8 +412,8 @@ impl SocketFile {
         if let Some((h, peer)) = udp {
             loop {
                 match self.net.op(|_, s| s.get_mut::<UdpSocket>(h).recv_from(buf)) {
-                    Ok((_, from)) if peer.is_some_and(|p| p != from) => continue,
-                    Ok((n, from)) => return Ok((n.min(buf.len()), Some(from))),
+                    Ok((_, from)) if peer.is_some_and(|p| SocketAddr::V4(p) != from) => continue,
+                    Ok((n, from)) => return Ok((n.min(buf.len()), Some(v4(from)))),
                     Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_recv()) => {
                     }
                     Err(e) => return Err(net_errno(e)),
@@ -445,11 +454,11 @@ impl SocketFile {
         let a = match &*self.kind.lock() {
             Kind::Tcp(Tcp::Unconnected(b)) => b.unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             Kind::Tcp(Tcp::Listening { port, .. }) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, *port),
-            Kind::Tcp(Tcp::Connected(h)) => self.net.peek(|_, s| s.get::<TcpSocket>(*h).local_endpoint()),
+            Kind::Tcp(Tcp::Connected(h)) => self.net.peek(|_, s| v4(s.get::<TcpSocket>(*h).local_endpoint())),
             Kind::Udp { handle, .. } => self
                 .net
                 .peek(|_, s| s.get::<UdpSocket>(*handle).local_endpoint())
-                .unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                .map_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), v4),
         };
         self.fill(a)
     }
@@ -460,7 +469,7 @@ impl SocketFile {
             Kind::Tcp(Tcp::Connected(h)) => {
                 let (state, a) = self.net.peek(|_, s| {
                     let t = s.get::<TcpSocket>(*h);
-                    (t.state(), t.remote_endpoint())
+                    (t.state(), v4(t.remote_endpoint()))
                 });
                 if matches!(state, TcpState::SynSent | TcpState::Closed) { Err(Errno::ENOTCONN) } else { Ok(a) }
             }

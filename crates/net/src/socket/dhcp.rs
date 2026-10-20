@@ -329,7 +329,7 @@ impl DhcpClient {
         };
         self.attempts += 1;
         let payload = UdpHeader { src_port: CLIENT_PORT, dst_port: SERVER_PORT }.emit(src, dst, &m.emit());
-        out.push(Packet { src, dst, protocol: PROTO_UDP, payload });
+        out.push(Packet { src: src.into(), dst: dst.into(), protocol: PROTO_UDP, payload });
     }
 
     pub(crate) fn process(&mut self, cx: &mut Cx, data: &[u8]) {
@@ -544,7 +544,16 @@ mod tests {
     fn requesting(reply: impl FnOnce(&mut Message)) -> DhcpClient {
         let mut rng = crate::rng::Rng::new(1);
         let mac = MacAddress([2, 0, 0, 0, 0, 1]);
-        let mut cx = Cx { now: Instant::ZERO, addr: None, mac, mss: 1460, rng: &mut rng };
+        let mut cx = Cx {
+            now: Instant::ZERO,
+            addr: None,
+            mac,
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng: &mut rng,
+        };
         let mut c = DhcpClient::new();
         c.dispatch(&mut cx, &mut Vec::new());
         let mut m = Message {

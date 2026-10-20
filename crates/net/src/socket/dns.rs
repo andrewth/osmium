@@ -1,4 +1,4 @@
-//! A DNS stub resolver (RFC 1035) for IPv4 addresses.
+//! A DNS stub resolver (RFC 1035) for IPv4 and IPv6 addresses.
 //!
 //! [`DnsClient`] owns a [`UdpSocket`] in the [`SocketSet`] and is polled
 //! like the other clients: [`resolve`](DnsClient::resolve) starts a lookup,
@@ -7,7 +7,12 @@
 //! It asks the servers it was given, or else the one DHCP reported. Answers
 //! are cached for their TTL, failures for a short while.
 //!
-//! Only `A` records are asked for. A response is believed only if it comes
+//! [`resolve`](DnsClient::resolve) asks for `A` records and
+//! [`resolve6`](DnsClient::resolve6) for `AAAA` records (collect those with
+//! [`result_ip`](DnsClient::result_ip)); a caller that wants both starts both
+//! and prefers the family it can reach. Servers may be IPv4 or IPv6: the
+//! ones the interface learned from DHCP and from router advertisements are
+//! used unless some are set. A response is believed only if it comes
 //! from a configured server, echoes the query's random id and question, and
 //! its records belong to the name asked for (directly or through the
 //! `CNAME`s that lead from it).
@@ -22,7 +27,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
 use super::SocketHandle;
@@ -31,6 +36,7 @@ use crate::{Error, Instant, Interface, SocketSet, TcpSocket, TcpState, UdpSocket
 
 const SERVER_PORT: u16 = 53;
 const TYPE_A: u16 = 1;
+const TYPE_AAAA: u16 = 28;
 const TYPE_CNAME: u16 = 5;
 const CLASS_IN: u16 = 1;
 const HEADER_LEN: usize = 12;
@@ -77,7 +83,7 @@ pub enum DnsError {
     TooManyQueries,
     /// The name does not exist.
     NameNotFound,
-    /// The name exists but has no IPv4 address.
+    /// The name exists but has no address of the kind asked for.
     NoAddress,
     /// The server failed or refused.
     ServerFailure,
@@ -96,7 +102,7 @@ impl core::fmt::Display for DnsError {
             DnsError::NoServer => "no DNS server",
             DnsError::TooManyQueries => "too many lookups",
             DnsError::NameNotFound => "name not found",
-            DnsError::NoAddress => "no IPv4 address",
+            DnsError::NoAddress => "no address",
             DnsError::ServerFailure => "DNS server failure",
             DnsError::Truncated => "DNS response truncated",
             DnsError::Timeout => "DNS lookup timed out",
@@ -111,7 +117,7 @@ impl core::error::Error for DnsError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DnsQuery(u32);
 
-type Outcome = Result<Vec<Ipv4Addr>, DnsError>;
+type Outcome = Result<Vec<IpAddr>, DnsError>;
 
 /// Where a lookup stands on the TCP retry.
 enum Tcp {
@@ -119,7 +125,7 @@ enum Tcp {
     No,
     /// A server sent a truncated response: connect to it and ask again. The
     /// addresses it did give, and their TTL, are the fallback.
-    Wanted { server: Ipv4Addr, partial: Vec<Ipv4Addr>, ttl: u32 },
+    Wanted { server: IpAddr, partial: Vec<IpAddr>, ttl: u32 },
     /// A [`TcpJob`] is working on it; UDP retries are off.
     Active,
 }
@@ -131,7 +137,7 @@ struct TcpJob {
     started: Instant,
     /// Bytes received: a two-byte length and the message.
     buf: Vec<u8>,
-    partial: Vec<Ipv4Addr>,
+    partial: Vec<IpAddr>,
     ttl: u32,
 }
 
@@ -140,6 +146,8 @@ struct Query {
     tcp: Tcp,
     /// Lower case, without a trailing dot.
     name: String,
+    /// The record type asked for, `TYPE_A` or `TYPE_AAAA`.
+    qtype: u16,
     id: u16,
     started: Instant,
     attempts: u8,
@@ -149,6 +157,7 @@ struct Query {
 
 struct CacheEntry {
     name: String,
+    qtype: u16,
     outcome: Outcome,
     expires: Instant,
 }
@@ -156,7 +165,9 @@ struct CacheEntry {
 /// A DNS resolver; see the module documentation.
 pub struct DnsClient {
     socket: SocketHandle,
-    servers: Vec<Ipv4Addr>,
+    /// The socket for IPv6 servers, added when the first is used.
+    socket6: Option<SocketHandle>,
+    servers: Vec<IpAddr>,
     queries: Vec<Query>,
     cache: Vec<CacheEntry>,
     jobs: Vec<TcpJob>,
@@ -184,8 +195,8 @@ fn normalize(name: &str) -> Option<String> {
     Some(name.to_ascii_lowercase())
 }
 
-/// A query for the `A` record of `name`, which [`normalize`] accepted.
-fn encode_query(id: u16, name: &str) -> Vec<u8> {
+/// A query for the `qtype` record of `name`, which [`normalize`] accepted.
+fn encode_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut m = Vec::with_capacity(HEADER_LEN + name.len() + 6);
     m.extend_from_slice(&id.to_be_bytes());
     m.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]); // RD, one question
@@ -194,7 +205,7 @@ fn encode_query(id: u16, name: &str) -> Vec<u8> {
         m.extend_from_slice(label.as_bytes());
     }
     m.push(0);
-    m.extend_from_slice(&TYPE_A.to_be_bytes());
+    m.extend_from_slice(&qtype.to_be_bytes());
     m.extend_from_slice(&CLASS_IN.to_be_bytes());
     m
 }
@@ -244,12 +255,14 @@ struct Response {
     truncated: bool,
     /// The question's name.
     name: String,
-    addresses: Vec<Ipv4Addr>,
+    /// The question's type.
+    qtype: u16,
+    addresses: Vec<IpAddr>,
     /// The smallest TTL among the records used, in seconds.
     ttl: u32,
 }
 
-/// Parses a response to a query for the `A` record of one name.
+/// Parses a response to a query for the `A` or `AAAA` record of one name.
 fn parse_response(msg: &[u8]) -> Option<Response> {
     let flags = be16(msg, 2)?;
     // A response (QR), to a standard query (opcode 0).
@@ -258,7 +271,8 @@ fn parse_response(msg: &[u8]) -> Option<Response> {
     }
     let mut name = String::new();
     let mut pos = read_name(msg, HEADER_LEN, &mut name)?;
-    if (be16(msg, pos)?, be16(msg, pos + 2)?) != (TYPE_A, CLASS_IN) {
+    let qtype = be16(msg, pos)?;
+    if !matches!(qtype, TYPE_A | TYPE_AAAA) || be16(msg, pos + 2)? != CLASS_IN {
         return None;
     }
     pos += 4;
@@ -267,6 +281,7 @@ fn parse_response(msg: &[u8]) -> Option<Response> {
         rcode: (flags & 0xf) as u8,
         truncated: flags & 0x0200 != 0,
         name: name.clone(),
+        qtype,
         addresses: Vec::new(),
         ttl: u32::MAX,
     };
@@ -290,11 +305,19 @@ fn parse_response(msg: &[u8]) -> Option<Response> {
                 chain.push(target);
                 r.ttl = r.ttl.min(ttl);
             }
-            TYPE_A if len == 4 && r.addresses.len() < MAX_ADDRESSES => {
+            TYPE_A if qtype == TYPE_A && len == 4 && r.addresses.len() < MAX_ADDRESSES => {
                 let ip = Ipv4Addr::new(msg[data], msg[data + 1], msg[data + 2], msg[data + 3]);
                 // An answer is never a non-address.
                 if !(ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()) {
-                    r.addresses.push(ip);
+                    r.addresses.push(ip.into());
+                    r.ttl = r.ttl.min(ttl);
+                }
+            }
+            TYPE_AAAA if qtype == TYPE_AAAA && len == 16 && r.addresses.len() < MAX_ADDRESSES => {
+                let octets: [u8; 16] = msg[data..data + 16].try_into().ok()?;
+                let ip = Ipv6Addr::from(octets);
+                if !(ip.is_unspecified() || ip.is_multicast()) {
+                    r.addresses.push(ip.into());
                     r.ttl = r.ttl.min(ttl);
                 }
             }
@@ -314,6 +337,7 @@ impl DnsClient {
         socket.bind(iface.ephemeral_port()).expect("a fresh socket binds");
         Self {
             socket: sockets.add(socket),
+            socket6: None,
             servers: Vec::new(),
             queries: Vec::new(),
             cache: Vec::new(),
@@ -327,20 +351,46 @@ impl DnsClient {
     /// The servers to ask, in order of preference, instead of the one DHCP
     /// reported. An empty list goes back to that one.
     pub fn set_servers(&mut self, servers: &[Ipv4Addr]) {
+        self.servers = servers.iter().copied().map(IpAddr::V4).collect();
+    }
+
+    /// Like [`set_servers`](Self::set_servers), with IPv4 and IPv6 servers.
+    pub fn set_servers_ip(&mut self, servers: &[IpAddr]) {
         self.servers = servers.to_vec();
     }
 
-    /// The socket handle, so that a caller can remove the socket.
+    /// The socket handle, so that a caller can remove the socket. If IPv6
+    /// servers are used there is a second one, [`socket6`](Self::socket6).
     pub fn socket(&self) -> SocketHandle {
         self.socket
+    }
+
+    /// The handle of the socket that talks to IPv6 servers, once one has been
+    /// asked.
+    pub fn socket6(&self) -> Option<SocketHandle> {
+        self.socket6
     }
 
     /// Starts looking up the IPv4 addresses of `name`. A dotted-quad is
     /// answered as itself, and a cached name at once; collect the result with
     /// [`result`](Self::result) after polling.
     pub fn resolve(&mut self, name: &str, now: Instant) -> Result<DnsQuery, DnsError> {
-        let literal = name.parse::<Ipv4Addr>().ok();
-        let name = normalize(name).ok_or(DnsError::InvalidName)?;
+        self.start(name, TYPE_A, now)
+    }
+
+    /// Starts looking up the IPv6 addresses of `name` (`AAAA` records). An
+    /// IPv6 literal is answered as itself. Collect the result with
+    /// [`result_ip`](Self::result_ip).
+    pub fn resolve6(&mut self, name: &str, now: Instant) -> Result<DnsQuery, DnsError> {
+        self.start(name, TYPE_AAAA, now)
+    }
+
+    fn start(&mut self, name: &str, qtype: u16, now: Instant) -> Result<DnsQuery, DnsError> {
+        let literal = match qtype {
+            TYPE_A => name.parse::<Ipv4Addr>().ok().map(IpAddr::V4),
+            _ => name.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
+        };
+        let name = if literal.is_some() { String::new() } else { normalize(name).ok_or(DnsError::InvalidName)? };
         let handle = DnsQuery(self.next_handle);
         let mut query = Query {
             handle,
@@ -351,10 +401,11 @@ impl DnsClient {
             next_try: now,
             result: None,
             name: name.clone(),
+            qtype,
         };
         if let Some(ip) = literal {
             query.result = Some((Ok(alloc::vec![ip]), now));
-        } else if let Some(c) = self.cache.iter().find(|c| c.name == name && c.expires > now) {
+        } else if let Some(c) = self.cache.iter().find(|c| c.name == name && c.qtype == qtype && c.expires > now) {
             query.result = Some((c.outcome.clone(), now));
         } else {
             if self.queries.iter().filter(|q| q.result.is_none()).count() >= MAX_QUERIES {
@@ -376,6 +427,19 @@ impl DnsClient {
     /// the addresses (at least one) or the error. A query's outcome can be
     /// taken once.
     pub fn result(&mut self, query: DnsQuery) -> Option<Result<Vec<Ipv4Addr>, DnsError>> {
+        Some(self.result_ip(query)?.map(|v| {
+            v.into_iter()
+                .filter_map(|a| match a {
+                    IpAddr::V4(a) => Some(a),
+                    IpAddr::V6(_) => None,
+                })
+                .collect()
+        }))
+    }
+
+    /// Like [`result`](Self::result), with addresses of either family: the
+    /// outcome of a [`resolve6`](Self::resolve6) lookup is collected here.
+    pub fn result_ip(&mut self, query: DnsQuery) -> Option<Result<Vec<IpAddr>, DnsError>> {
         let i = self.queries.iter().position(|q| q.handle == query);
         let Some(i) = i else { return Some(Err(DnsError::Cancelled)) };
         self.queries[i].result.as_ref()?;
@@ -399,9 +463,10 @@ impl DnsClient {
         self.queries.iter().filter(|q| q.result.is_none()).map(|q| q.next_try).min()
     }
 
-    fn servers(&self, iface: &Interface) -> Vec<Ipv4Addr> {
+    fn servers(&self, iface: &Interface) -> Vec<IpAddr> {
         if self.servers.is_empty() {
-            iface.config().and_then(|c| c.dns).into_iter().collect()
+            let v4 = iface.config().and_then(|c| c.dns).into_iter().map(IpAddr::V4);
+            v4.chain(iface.ipv6_dns().iter().copied().map(IpAddr::V6)).collect()
         } else {
             self.servers.clone()
         }
@@ -411,17 +476,21 @@ impl DnsClient {
         let q = &mut self.queries[i];
         q.result = Some((outcome.clone(), now));
         let Some(ttl) = ttl else { return };
-        let entry = CacheEntry { name: q.name.clone(), outcome, expires: now + ttl };
-        self.cache.retain(|c| c.name != entry.name && c.expires > now);
+        let entry = CacheEntry { name: q.name.clone(), qtype: q.qtype, outcome, expires: now + ttl };
+        self.cache.retain(|c| !(c.name == entry.name && c.qtype == entry.qtype) && c.expires > now);
         if self.cache.len() >= CACHE_ENTRIES {
             self.cache.remove(0);
         }
         self.cache.push(entry);
     }
 
-    fn handle_response(&mut self, msg: &[u8], from: Ipv4Addr, now: Instant) {
+    fn handle_response(&mut self, msg: &[u8], from: IpAddr, now: Instant) {
         let Some(r) = parse_response(msg) else { return };
-        let Some(i) = self.queries.iter().position(|q| q.result.is_none() && q.id == r.id && q.name == r.name) else {
+        let Some(i) = self
+            .queries
+            .iter()
+            .position(|q| q.result.is_none() && q.id == r.id && q.name == r.name && q.qtype == r.qtype)
+        else {
             return;
         };
         if r.truncated && r.rcode == 0 {
@@ -485,11 +554,11 @@ impl DnsClient {
                 continue;
             };
             let q = &self.queries[i];
-            let mut message = encode_query(q.id, &q.name);
+            let mut message = encode_query(q.id, &q.name, q.qtype);
             message.splice(0..0, (message.len() as u16).to_be_bytes());
             let mut socket = TcpSocket::new(TCP_RX, TCP_TX);
             // The query waits in the send buffer until the handshake is done.
-            let started = socket.connect(SocketAddrV4::new(server, SERVER_PORT), 0).is_ok()
+            let started = socket.connect(SocketAddr::new(server, SERVER_PORT), 0).is_ok()
                 && socket.send(&message) == Ok(message.len());
             if !started {
                 self.tcp_failed(i, partial, ttl, now);
@@ -541,7 +610,9 @@ impl DnsClient {
                 // The connection is the server's: its answer need not be
                 // checked against a source address, only against the query.
                 let response =
-                    parse_response(msg).filter(|r| r.id == self.queries[i].id && r.name == self.queries[i].name);
+                    parse_response(msg).filter(|r| {
+                        r.id == self.queries[i].id && r.name == self.queries[i].name && r.qtype == self.queries[i].qtype
+                    });
                 let (partial, ttl) = (core::mem::take(&mut job.partial), job.ttl);
                 match response {
                     // Truncation over TCP is no matter: take what there is.
@@ -565,7 +636,7 @@ impl DnsClient {
 
     /// The TCP retry of query `i` did not work out: the addresses the
     /// truncated response carried will do, if it carried any.
-    fn tcp_failed(&mut self, i: usize, partial: Vec<Ipv4Addr>, ttl: u32, now: Instant) {
+    fn tcp_failed(&mut self, i: usize, partial: Vec<IpAddr>, ttl: u32, now: Instant) {
         if partial.is_empty() {
             self.finish(i, Err(DnsError::Truncated), None, now);
         } else {
@@ -579,9 +650,11 @@ impl DnsClient {
     pub fn poll(&mut self, now: Instant, iface: &Interface, sockets: &mut SocketSet) {
         let servers = self.servers(iface);
         let mut buf = [0u8; MAX_RESPONSE];
-        while let Ok((n, from)) = sockets.get_mut::<UdpSocket>(self.socket).recv_from(&mut buf) {
-            if n <= buf.len() && from.port() == SERVER_PORT && servers.contains(from.ip()) {
-                self.handle_response(&buf[..n], *from.ip(), now);
+        for socket in [Some(self.socket), self.socket6].into_iter().flatten() {
+            while let Ok((n, from)) = sockets.get_mut::<UdpSocket>(socket).recv_from(&mut buf) {
+                if n <= buf.len() && from.port() == SERVER_PORT && servers.contains(&from.ip()) {
+                    self.handle_response(&buf[..n], from.ip(), now);
+                }
             }
         }
         self.poll_tcp(now, sockets);
@@ -601,9 +674,19 @@ impl DnsClient {
                     self.finish(i, Err(DnsError::Timeout), None, now);
                     continue;
                 }
-                let server = SocketAddrV4::new(servers[usize::from(q.attempts) % servers.len()], SERVER_PORT);
-                let message = encode_query(q.id, &q.name);
-                match sockets.get_mut::<UdpSocket>(self.socket).send_to(&message, server) {
+                let server = SocketAddr::new(servers[usize::from(q.attempts) % servers.len()], SERVER_PORT);
+                let message = encode_query(q.id, &q.name, q.qtype);
+                let socket = if server.is_ipv6() {
+                    *self.socket6.get_or_insert_with(|| {
+                        let mut s = UdpSocket::new(8, 8);
+                        s.bind_addr(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), self.rng.ephemeral_port()))
+                            .expect("a fresh socket binds");
+                        sockets.add(s)
+                    })
+                } else {
+                    self.socket
+                };
+                match sockets.get_mut::<UdpSocket>(socket).send_to(&message, server) {
                     Ok(()) => {
                         let q = &mut self.queries[i];
                         q.next_try = now + FIRST_TIMEOUT * (1 << q.attempts);
@@ -622,6 +705,7 @@ impl DnsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::sa;
     use crate::testing::{A_IP, B_IP, Fate, Host, config, pair, run};
 
     /// A response to `query` with the given answer records appended, each
@@ -652,14 +736,14 @@ mod tests {
             assert_eq!(normalize(bad), None, "{bad:?}");
         }
         assert_eq!(
-            encode_query(0x1234, "a.bc"),
+            encode_query(0x1234, "a.bc", TYPE_A),
             [0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 2, b'b', b'c', 0, 0, 1, 0, 1]
         );
     }
 
     #[test]
     fn parses_cname_chains_and_ignores_unrelated_records() {
-        let q = encode_query(7, "www.example.com");
+        let q = encode_query(7, "www.example.com", TYPE_A);
         // www.example.com -> cdn.example.com, the target compressed against the question.
         let cname_data = [3, b'c', b'd', b'n', 0xc0, 16]; // "cdn" + pointer to "example.com" at offset 16
         let m = response(
@@ -674,13 +758,13 @@ mod tests {
         );
         let r = parse_response(&m).unwrap();
         assert_eq!((r.id, r.rcode, r.name.as_str()), (7, 0, "www.example.com"));
-        assert_eq!(r.addresses, [Ipv4Addr::from(IP1), Ipv4Addr::new(1, 2, 3, 4)]);
+        assert_eq!(r.addresses, [IpAddr::from(IP1), IpAddr::from([1, 2, 3, 4])]);
         assert_eq!(r.ttl, 60);
     }
 
     #[test]
     fn rejects_malformed_responses() {
-        let q = encode_query(7, "a.com");
+        let q = encode_query(7, "a.com", TYPE_A);
         let good = response(&q, 0, &[(Q, TYPE_A, 60, &IP1)]);
         assert!(parse_response(&good).is_some());
         for len in 0..good.len() {
@@ -721,8 +805,8 @@ mod tests {
     }
 
     /// The addresses the TCP server gives.
-    fn big_answer() -> Vec<Ipv4Addr> {
-        (1..=8).map(|n| Ipv4Addr::new(10, 0, 0, n)).collect()
+    fn big_answer() -> Vec<IpAddr> {
+        (1..=8).map(|n| IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))).collect()
     }
 
     impl Server {
@@ -774,7 +858,10 @@ mod tests {
             let query = query.to_vec();
             self.tcp_rx.clear();
             let noise = [7u8; 30];
-            let addrs: Vec<[u8; 4]> = big_answer().iter().map(|a| a.octets()).collect();
+            let addrs: Vec<[u8; 4]> = big_answer().iter().map(|a| match a {
+                IpAddr::V4(a) => a.octets(),
+                IpAddr::V6(_) => unreachable!("big_answer is IPv4"),
+            }).collect();
             let mut answers: Vec<(&[u8], u16, u32, &[u8])> = (0..30).map(|_| (Q, 16, 60, &noise[..])).collect();
             answers.extend(addrs.iter().map(|a| (Q, TYPE_A, 60, &a[..])));
             let r = response(&query, 0, &answers);
@@ -832,7 +919,7 @@ mod tests {
                 self.server.serve(&mut self.b);
                 self.b.poll(self.now);
                 self.dns.poll(self.now, &self.a.iface, &mut self.a.sockets);
-                if let Some(r) = self.dns.result(q) {
+                if let Some(r) = self.dns.result_ip(q) {
                     return Some(r);
                 }
                 self.now = Instant::from_millis(self.now.as_millis() + 1);
@@ -845,19 +932,19 @@ mod tests {
     fn resolves_and_caches() {
         let mut t = Setup::new();
         let q = t.dns.resolve("Example.Com", t.now).unwrap();
-        assert_eq!(t.wait(q, 1000), Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
+        assert_eq!(t.wait(q, 1000), Some(Ok(alloc::vec![IpAddr::from(IP1)])));
         assert_eq!(t.server.queries, 1);
         // Cached: answered by resolve itself, without a packet.
         let q = t.dns.resolve("example.com", t.now).unwrap();
-        assert_eq!(t.dns.result(q), Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
+        assert_eq!(t.dns.result_ip(q), Some(Ok(alloc::vec![IpAddr::from(IP1)])));
         assert_eq!(t.server.queries, 1);
         // After the TTL it asks again.
         t.now = t.now + Duration::from_secs(61);
         let q = t.dns.resolve("example.com", t.now).unwrap();
-        assert_eq!(t.dns.result(q), None);
+        assert_eq!(t.dns.result_ip(q), None);
         assert!(t.wait(q, 1000).unwrap().is_ok());
         assert_eq!(t.server.queries, 2);
-        assert_eq!(t.dns.result(q), Some(Err(DnsError::Cancelled)), "taken once");
+        assert_eq!(t.dns.result_ip(q), Some(Err(DnsError::Cancelled)), "taken once");
     }
 
     #[test]
@@ -870,7 +957,7 @@ mod tests {
         assert_eq!((t.server.queries, t.server.tcp_queries), (1, 1));
         // The answer is cached, and the connection's socket is gone.
         let q = t.dns.resolve("big.example", t.now).unwrap();
-        assert_eq!(t.dns.result(q), Some(Ok(big_answer())));
+        assert_eq!(t.dns.result_ip(q), Some(Ok(big_answer())));
         for _ in 0..200 {
             t.a.poll(t.now);
             t.b.poll(t.now);
@@ -888,7 +975,7 @@ mod tests {
         let mut t = Setup::new();
         t.server.truncate = true;
         let q = t.dns.resolve("part.example", t.now).unwrap();
-        assert_eq!(t.wait(q, 5000), Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
+        assert_eq!(t.wait(q, 5000), Some(Ok(alloc::vec![IpAddr::V4(Ipv4Addr::from(IP1))])));
         assert_eq!(t.server.queries, 1, "no UDP retry while TCP was tried");
 
         // A truncated response with no address at all.
@@ -898,10 +985,10 @@ mod tests {
         let q = t.dns.resolve("none.example", t.now).unwrap();
         // Make the UDP answer carry none by dropping its records: rcode 0
         // with TC and no answers.
-        let mut query = encode_query(t.dns.queries[0].id, "none.example");
+        let mut query = encode_query(t.dns.queries[0].id, "none.example", TYPE_A);
         query[2] = 0x83;
         query[3] = 0x80;
-        t.dns.handle_response(&query, B_IP, t.now);
+        t.dns.handle_response(&query, IpAddr::V4(B_IP), t.now);
         assert_eq!(t.wait(q, 5000), Some(Err(DnsError::Truncated)));
     }
 
@@ -915,7 +1002,7 @@ mod tests {
         t.b.set_shaper(|n, _| if n > 4 { Fate::Drop } else { Fate::Deliver });
         let q = t.dns.resolve("slow.example", t.now).unwrap();
         let start = t.now;
-        assert_eq!(t.wait(q, 20_000), Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
+        assert_eq!(t.wait(q, 20_000), Some(Ok(alloc::vec![IpAddr::V4(Ipv4Addr::from(IP1))])));
         assert!((TCP_TIMEOUT..TCP_TIMEOUT + Duration::from_secs(1)).contains(&(t.now - start)));
     }
 
@@ -923,7 +1010,7 @@ mod tests {
     fn literals_and_bad_names() {
         let mut t = Setup::new();
         let q = t.dns.resolve("10.1.2.3", t.now).unwrap();
-        assert_eq!(t.dns.result(q), Some(Ok(alloc::vec![Ipv4Addr::new(10, 1, 2, 3)])));
+        assert_eq!(t.dns.result_ip(q), Some(Ok(alloc::vec![IpAddr::from([10, 1, 2, 3])])));
         assert_eq!(t.dns.resolve("not a name", t.now), Err(DnsError::InvalidName));
         for _ in 0..MAX_QUERIES {
             t.dns.resolve("busy.example", t.now).unwrap();
@@ -968,15 +1055,15 @@ mod tests {
             t.server.serve(&mut t.b);
             t.b.poll(t.now);
             t.dns.poll(t.now, &t.a.iface, &mut t.a.sockets);
-            r1 = r1.or(t.dns.result(first));
-            r2 = r2.or(t.dns.result(second));
+            r1 = r1.or(t.dns.result_ip(first));
+            r2 = r2.or(t.dns.result_ip(second));
             t.now = Instant::from_millis(t.now.as_millis() + 1);
             if r1.is_some() && r2.is_some() {
                 break;
             }
         }
-        assert_eq!(r1, Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
-        assert_eq!(r2, Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
+        assert_eq!(r1, Some(Ok(alloc::vec![IpAddr::from(IP1)])));
+        assert_eq!(r2, Some(Ok(alloc::vec![IpAddr::from(IP1)])));
     }
 
     #[test]
@@ -986,7 +1073,7 @@ mod tests {
         let q = t.dns.resolve("nope.example", t.now).unwrap();
         assert_eq!(t.wait(q, 1000), Some(Err(DnsError::NameNotFound)));
         let q = t.dns.resolve("nope.example", t.now).unwrap();
-        assert_eq!(t.dns.result(q), Some(Err(DnsError::NameNotFound)));
+        assert_eq!(t.dns.result_ip(q), Some(Err(DnsError::NameNotFound)));
         assert_eq!(t.server.queries, 1);
         t.now = t.now + Duration::from_secs(31);
         t.server.rcode = 0;
@@ -1010,7 +1097,7 @@ mod tests {
         let query_id = t.dns.queries[0].id;
         let evil = [6, 6, 6, 6];
         let spoof = |id: u16, name: &str, from_port: u16| {
-            let mut m = response(&encode_query(id, name), 0, &[(Q, TYPE_A, 600, &evil)]);
+            let mut m = response(&encode_query(id, name, TYPE_A), 0, &[(Q, TYPE_A, 600, &evil)]);
             m[..2].copy_from_slice(&id.to_be_bytes());
             (m, from_port)
         };
@@ -1025,16 +1112,16 @@ mod tests {
             t.b.sockets.get_mut::<UdpSocket>(t.server.socket).close();
             let s = t.b.sockets.get_mut::<UdpSocket>(t.server.socket);
             s.bind(from_port).unwrap();
-            s.send_to(&m, SocketAddrV4::new(A_IP, port)).unwrap();
+            s.send_to(&m, sa(A_IP, port)).unwrap();
             run(&mut t.a, &mut t.b, &mut now, 5, |_, _| false);
             t.dns.poll(now, &t.a.iface, &mut t.a.sockets);
-            assert_eq!(t.dns.result(q), None);
+            assert_eq!(t.dns.result_ip(q), None);
         }
         // The real server's answer still gets through.
         t.b.sockets.get_mut::<UdpSocket>(t.server.socket).close();
         t.b.sockets.get_mut::<UdpSocket>(t.server.socket).bind(53).unwrap();
         t.now = now;
-        assert_eq!(t.wait(q, 3000), Some(Ok(alloc::vec![Ipv4Addr::from(IP1)])));
+        assert_eq!(t.wait(q, 3000), Some(Ok(alloc::vec![IpAddr::from(IP1)])));
     }
 
     #[test]
@@ -1055,5 +1142,72 @@ mod tests {
         t.dns.set_servers(&[B_IP]);
         let q = t.dns.resolve("now.example", t.now).unwrap();
         assert!(t.wait(q, 2000).unwrap().is_ok());
+    }
+
+    #[test]
+    fn parses_aaaa_answers_and_keeps_the_families_apart() {
+        let aaaa = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let q = encode_query(9, "v6.example", TYPE_AAAA);
+        let m = response(
+            &q,
+            0,
+            &[
+                (Q, TYPE_A, 60, &IP1), // an A record does not answer an AAAA question
+                (Q, TYPE_AAAA, 120, &aaaa.octets()),
+                (Q, TYPE_AAAA, 90, &Ipv6Addr::UNSPECIFIED.octets()),
+                (Q, TYPE_AAAA, 90, &[1, 2, 3]), // wrong length
+            ],
+        );
+        let r = parse_response(&m).unwrap();
+        assert_eq!((r.qtype, r.addresses, r.ttl), (TYPE_AAAA, alloc::vec![IpAddr::V6(aaaa)], 120));
+        let q = encode_query(9, "v4.example", TYPE_A);
+        let m = response(&q, 0, &[(Q, TYPE_AAAA, 120, &aaaa.octets())]);
+        assert!(parse_response(&m).unwrap().addresses.is_empty());
+    }
+
+    #[test]
+    fn resolves_aaaa_through_an_ipv6_server() {
+        let aaaa = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53);
+        let (mut a, mut b, mut now) = crate::testing::pair6();
+        let server_addr = b.iface.ipv6_link_local().unwrap();
+        let mut dns = DnsClient::new(&mut a.iface, &mut a.sockets);
+        dns.set_servers_ip(&[IpAddr::V6(server_addr)]);
+        let server = b.sockets.add(UdpSocket::new(8, 8));
+        b.sockets.get_mut::<UdpSocket>(server).bind_addr(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 53)).unwrap();
+
+        let q6 = dns.resolve6("Host.Example", now).unwrap();
+        let q4 = dns.resolve("Host.Example", now).unwrap();
+        assert_eq!(
+            dns.resolve6("::1", now).map(|q| dns.result_ip(q)),
+            Ok(Some(Ok(alloc::vec![Ipv6Addr::LOCALHOST.into()])))
+        );
+        let (mut r6, mut r4) = (None, None);
+        for _ in 0..2000 {
+            a.poll(now);
+            b.poll(now);
+            let mut buf = [0u8; 600];
+            while let Ok((n, from)) = b.sockets.get_mut::<UdpSocket>(server).recv_from(&mut buf) {
+                // AAAA gets an address; A gets an empty answer.
+                let is_aaaa = buf[n - 3] == TYPE_AAAA as u8;
+                let answers: &[(&[u8], u16, u32, &[u8])] =
+                    if is_aaaa { &[(Q, TYPE_AAAA, 60, &aaaa.octets())] } else { &[] };
+                let r = response(&buf[..n], 0, answers);
+                b.sockets.get_mut::<UdpSocket>(server).send_to(&r, from).unwrap();
+            }
+            b.poll(now);
+            dns.poll(now, &a.iface, &mut a.sockets);
+            r6 = r6.or(dns.result_ip(q6));
+            r4 = r4.or(dns.result(q4));
+            now = Instant::from_millis(now.as_millis() + 1);
+            if r6.is_some() && r4.is_some() {
+                break;
+            }
+        }
+        assert_eq!(r6, Some(Ok(alloc::vec![IpAddr::V6(aaaa)])));
+        assert_eq!(r4, Some(Err(DnsError::NoAddress)));
+        assert!(dns.socket6().is_some(), "queries to an IPv6 server used the IPv6 socket");
+        // The AAAA answer is cached apart from the A lookup.
+        let again = dns.resolve6("host.example", now).unwrap();
+        assert_eq!(dns.result_ip(again), Some(Ok(alloc::vec![IpAddr::V6(aaaa)])));
     }
 }

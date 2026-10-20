@@ -1,7 +1,7 @@
 //! Sockets and the set an interface serves.
 
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use osmium_hal::net::MacAddress;
 
@@ -25,17 +25,41 @@ pub(crate) struct Cx<'cx> {
     pub(crate) now: Instant,
     /// The interface's address, once configured.
     pub(crate) addr: Option<Ipv4Addr>,
+    /// The interface's usable global IPv6 address, if it has one.
+    pub(crate) addr6: Option<Ipv6Addr>,
+    /// The interface's usable link-local IPv6 address.
+    pub(crate) link_local6: Option<Ipv6Addr>,
     pub(crate) mac: MacAddress,
-    /// The TCP maximum segment size the interface's MTU allows.
+    /// The TCP maximum segment size the interface's MTU allows over IPv4.
     pub(crate) mss: u16,
+    /// The same over IPv6.
+    pub(crate) mss6: u16,
     pub(crate) rng: &'cx mut Rng,
 }
 
-/// An IPv4 packet a socket wants sent; the interface adds the IP and
-/// Ethernet headers.
+impl Cx<'_> {
+    /// The address of the interface a packet to `dst` leaves from. For IPv6
+    /// a link-local destination (or multicast) is answered from the
+    /// link-local address and anything else from the global one.
+    pub(crate) fn source_for(&self, dst: IpAddr) -> Option<IpAddr> {
+        match dst {
+            IpAddr::V4(_) => self.addr.map(IpAddr::V4),
+            IpAddr::V6(d) if crate::ipv6::is_link_local(d) || d.is_multicast() => self.link_local6.map(IpAddr::V6),
+            IpAddr::V6(_) => self.addr6.or(self.link_local6).map(IpAddr::V6),
+        }
+    }
+
+    /// The TCP maximum segment size for a connection to `remote`.
+    pub(crate) fn mss_for(&self, remote: &SocketAddr) -> u16 {
+        if remote.is_ipv6() { self.mss6 } else { self.mss }
+    }
+}
+
+/// An IP packet a socket wants sent; the interface adds the IP and
+/// Ethernet headers. The two addresses are of one family.
 pub(crate) struct Packet {
-    pub(crate) src: Ipv4Addr,
-    pub(crate) dst: Ipv4Addr,
+    pub(crate) src: IpAddr,
+    pub(crate) dst: IpAddr,
     pub(crate) protocol: u8,
     /// The transport header and payload, checksum included.
     pub(crate) payload: Vec<u8>,
@@ -194,7 +218,10 @@ impl SocketSet {
 }
 
 /// Returns true if a socket bound to `bound` takes traffic for `dst`: the
-/// ports match and the address is either unspecified or equal.
-pub(crate) fn binds(bound: SocketAddrV4, dst: SocketAddrV4) -> bool {
-    bound.port() == dst.port() && (bound.ip().is_unspecified() || bound.ip() == dst.ip())
+/// ports match, the address families match, and the address is either
+/// unspecified or equal.
+pub(crate) fn binds(bound: SocketAddr, dst: SocketAddr) -> bool {
+    bound.port() == dst.port()
+        && bound.is_ipv4() == dst.is_ipv4()
+        && (bound.ip().is_unspecified() || bound.ip() == dst.ip())
 }

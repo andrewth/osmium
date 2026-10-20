@@ -7,7 +7,7 @@ use std::vec::Vec;
 
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
 
-use crate::{Config, Instant, Interface, Ipv4Addr, SocketSet};
+use crate::{Config, Instant, Interface, IpAddr, Ipv4Addr, SocketAddr, SocketSet};
 
 type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
 
@@ -97,6 +97,11 @@ impl Host {
         self.iface.poll(now, &mut self.dev, &mut self.sockets)
     }
 
+    /// Delivers `frame` to this host as if it had arrived from the link.
+    pub(crate) fn inject(&mut self, frame: Vec<u8>) {
+        self.dev.rx.borrow_mut().push_back(frame);
+    }
+
     /// Sets a shaper that drops, duplicates or delays frames this host sends.
     pub(crate) fn set_shaper(&mut self, f: impl FnMut(u64, &[u8]) -> Fate + 'static) {
         self.dev.shaper = Some(Rc::new(RefCell::new(f)));
@@ -110,6 +115,11 @@ impl Host {
 
 pub(crate) const A_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
 pub(crate) const B_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 2);
+
+/// An IPv4 socket address.
+pub(crate) const fn sa(ip: Ipv4Addr, port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(ip), port)
+}
 
 pub(crate) fn config(address: Ipv4Addr) -> Config {
     Config { address, prefix_len: 24, gateway: None, dns: None }
@@ -160,4 +170,17 @@ pub(crate) fn run(
         *now = Instant::from_millis(now.as_millis() + 1);
     }
     false
+}
+
+/// Two unconfigured hosts on one link with IPv6 on, polled until both
+/// link-local addresses have passed duplicate address detection. Returns
+/// the time reached.
+pub(crate) fn pair6() -> (Host, Host, Instant) {
+    let (mut a, mut b) = link();
+    a.iface.enable_ipv6().unwrap();
+    b.iface.enable_ipv6().unwrap();
+    let mut now = Instant::ZERO;
+    assert!(run(&mut a, &mut b, &mut now, 2000, |a, b| a.iface.ipv6_link_local().is_some()
+        && b.iface.ipv6_link_local().is_some()));
+    (a, b, now)
 }

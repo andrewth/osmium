@@ -210,7 +210,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `fs-fat` | osmium-fs-fat | yes | FAT12/16/32 (enables `fs`) |
 | `fs-iso9660` | osmium-fs-iso9660 | yes | Read-only ISO 9660 with Rock Ridge and Joliet (enables `fs`) |
 | `proc` | osmium-proc | yes | Processes and the system-call dispatcher (enables `sched`, `fs`, `mm`, `boot`) |
-| `net` | osmium-net | yes | IPv4, ARP, ICMP, UDP, TCP, DHCP |
+| `net` | osmium-net | yes | IPv4, IPv6, ARP, ICMP, UDP, TCP, DHCP |
 | `iscsi` | osmium-iscsi | yes | iSCSI initiator: a remote disk over TCP as a `BlockDevice` (enables `net`) |
 | `virt` | osmium-virt | yes | Hypervisor building blocks |
 
@@ -787,7 +787,7 @@ Unknown numbers return `-ENOSYS`. Some limits apply:
 
 ## 11. Networking
 
-`osmium-net` is a polled IPv4 stack over any `NetDevice`. It has no globals
+`osmium-net` is a polled IPv4 and IPv6 stack over any `NetDevice`. It has no globals
 and never reads a clock: you pass in the time and decide when to poll.
 
 ```rust
@@ -825,8 +825,18 @@ loop {
   undoes a join.
 - A truncated DNS answer is retried over TCP by `DnsClient` itself; TCP
   connections negotiate timestamps (RFC 7323) when the peer offers them.
-- Not supported: IPv6, forwarding, IGMPv3 membership reports (IGMPv3 queries
-  are answered with v2 reports). Socket system calls are not wired into
+- IPv6: call `iface.enable_ipv6()`. The interface then derives a link-local
+  address, checks it for duplicates, and solicits a router for SLAAC
+  addresses; `add_ipv6_address` and `set_ipv6_gateway` configure it by hand,
+  and `ipv6_addresses()` lists what is in use. Sockets take `SocketAddr`: bind
+  a `UdpSocket` with `bind_addr` (or a `TcpSocket` with `listen_on`) to a
+  `[::]:port` address for IPv6, and `connect` or `send_to` an IPv6 remote.
+  A socket serves one family. `DnsClient::resolve6` looks up AAAA records
+  (collect with `result_ip`). IPv6 fragments are dropped, and datagrams over
+  the MTU are not fragmented on send.
+- Not supported: IPv6 fragmentation, privacy addresses, DHCPv6, forwarding,
+  IGMPv3 membership reports (IGMPv3 queries are answered with v2 reports).
+  Socket system calls are not wired into
   `osmium-proc` yet.
 
 ### iSCSI

@@ -1,7 +1,7 @@
 //! Random numbers for TCP initial sequence numbers, DHCP transaction ids,
 //! DNS query ids and ephemeral ports.
 
-use core::net::SocketAddrV4;
+use core::net::{IpAddr, SocketAddr};
 
 use crate::Instant;
 
@@ -92,12 +92,26 @@ impl Rng {
     /// An initial sequence number for the connection `local` to `remote`
     /// (RFC 6528): a keyed hash of the four-tuple plus a clock that ticks
     /// every 4 microseconds, here every 250 per millisecond.
-    pub(crate) fn isn(&self, local: SocketAddrV4, remote: SocketAddrV4, now: Instant) -> u32 {
-        let words = [
-            u64::from(u32::from(*local.ip())) << 32 | u64::from(u32::from(*remote.ip())),
-            u64::from(local.port()) << 16 | u64::from(remote.port()),
-        ];
-        let hash = siphash(self.k1, self.k0, &words) as u32;
+    pub(crate) fn isn(&self, local: SocketAddr, remote: SocketAddr, now: Instant) -> u32 {
+        // An IPv4 address is hashed as one word and an IPv6 address as two.
+        let mut words = [0; 6];
+        let mut n = 0;
+        for ip in [local.ip(), remote.ip()] {
+            match ip {
+                IpAddr::V4(a) => {
+                    words[n] = u64::from(u32::from(a));
+                    n += 1;
+                }
+                IpAddr::V6(a) => {
+                    let v = u128::from(a);
+                    words[n] = (v >> 64) as u64;
+                    words[n + 1] = v as u64;
+                    n += 2;
+                }
+            }
+        }
+        words[n] = u64::from(local.port()) << 16 | u64::from(remote.port());
+        let hash = siphash(self.k1, self.k0, &words[..=n]) as u32;
         hash.wrapping_add((now.as_millis() as u32).wrapping_mul(250))
     }
 }
@@ -113,7 +127,7 @@ mod tests {
         assert_ne!(a.next_u32(), c.next_u32());
         b.mix(b"entropy");
         assert_ne!(a.next_u64(), b.next_u64());
-        let (l, r) = (SocketAddrV4::new([10, 0, 0, 1].into(), 1000), SocketAddrV4::new([10, 0, 0, 2].into(), 80));
+        let (l, r) = (SocketAddr::new([10, 0, 0, 1].into(), 1000), SocketAddr::new([10, 0, 0, 2].into(), 80));
         let t = Instant::ZERO;
         assert_ne!(a.isn(l, r, t), a.isn(r, l, t), "tuple dependent");
         assert_ne!(a.isn(l, r, t), c.isn(l, r, t), "key dependent");

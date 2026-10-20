@@ -4,7 +4,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::time::Duration;
 
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
@@ -15,11 +15,15 @@ use crate::igmp::{
     ALL_HOSTS, IGMP_QUERY, IGMP_REPORT_V1, IGMP_REPORT_V2, Igmp, IgmpPacket, Outgoing, PROTO_IGMP, multicast_mac,
 };
 use crate::ipopt;
+use crate::ipv6::{ETHERTYPE_IPV6, IPV6_HEADER_LEN};
 use crate::rng::Rng;
 use crate::socket::icmp::EchoReply;
 use crate::socket::tcp::reset_for;
 use crate::socket::{Cx, Packet, Socket, SocketSet, dhcp};
 use crate::wire::*;
+
+mod v6;
+pub use v6::Ipv6Address;
 
 /// Frames waiting for the device; more are dropped.
 const TX_QUEUE: usize = 128;
@@ -167,6 +171,7 @@ pub struct Interface {
     reassembling: Vec<Reassembly>,
     igmp: Igmp,
     multicast_ttl: u8,
+    v6: v6::State,
 }
 
 impl Interface {
@@ -191,6 +196,7 @@ impl Interface {
             reassembling: Vec::new(),
             igmp: Igmp::new(),
             multicast_ttl: 1,
+            v6: v6::State::new(dev.mac_address()),
         }
     }
 
@@ -285,7 +291,7 @@ impl Interface {
     }
 
     fn send_igmp(&mut self, now: Instant, src: Ipv4Addr, dst: Ipv4Addr, message: IgmpPacket) {
-        self.send_ip(now, Packet { src, dst, protocol: PROTO_IGMP, payload: message.emit() });
+        self.send_ip(now, Packet { src: src.into(), dst: dst.into(), protocol: PROTO_IGMP, payload: message.emit() });
     }
 
     pub(crate) fn random_u64(&mut self) -> u64 {
@@ -299,6 +305,11 @@ impl Interface {
 
     fn mss(&self) -> u16 {
         self.mtu.saturating_sub(IPV4_HEADER_LEN + TCP_HEADER_LEN).max(1) as u16
+    }
+
+    /// The TCP maximum segment size over IPv6.
+    fn mss6(&self) -> u16 {
+        self.v6.mtu(self.mtu).saturating_sub(IPV6_HEADER_LEN + TCP_HEADER_LEN).max(1) as u16
     }
 
     /// Receives what `dev` has, lets the sockets process it, sends what the
@@ -331,13 +342,23 @@ impl Interface {
             }
         }
 
+        self.poll_v6(now);
+
         let mut out = Vec::new();
         for (_, s) in sockets.iter_mut() {
             if self.tx.len() >= TX_QUEUE / 2 {
                 break;
             }
-            let mut cx =
-                Cx { now, addr: self.config.map(|c| c.address), mac: self.mac, mss: self.mss(), rng: &mut self.rng };
+            let mut cx = Cx {
+                now,
+                addr: self.config.map(|c| c.address),
+                addr6: self.v6.global(),
+                link_local6: self.v6.link_local(),
+                mac: self.mac,
+                mss: self.mss(),
+                mss6: self.mss6(),
+                rng: &mut self.rng,
+            };
             s.dispatch(&mut cx, &mut out);
             for p in out.drain(..) {
                 self.send_ip(now, p);
@@ -364,6 +385,10 @@ impl Interface {
         let arp = match (arp, self.config.and(self.igmp.poll_at())) {
             (Some(a), Some(g)) => Some(a.min(g)),
             (a, g) => a.or(g),
+        };
+        let arp = match (arp, self.v6.poll_at()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         };
         match (arp, sockets.poll_at()) {
             (Some(a), Some(s)) => Some(a.min(s)),
@@ -406,6 +431,7 @@ impl Interface {
     /// The frames that carry `p` to `dst_mac`: one, or fragments if it
     /// exceeds the MTU.
     fn ip_frames(&mut self, dst_mac: MacAddress, p: &Packet) -> Vec<Vec<u8>> {
+        let (IpAddr::V4(p_src), IpAddr::V4(p_dst)) = (p.src, p.dst) else { return Vec::new() };
         self.ident = self.ident.wrapping_add(1);
         let step = (self.mtu - IPV4_HEADER_LEN) / 8 * 8;
         let whole = IPV4_HEADER_LEN + p.payload.len() <= self.mtu;
@@ -426,7 +452,7 @@ impl Interface {
             let len = if whole { p.payload.len() } else { step.min(p.payload.len() - offset) };
             let mut frame = self.ethernet_frame(dst_mac, ETHERTYPE_IPV4, hlen + len);
             let header =
-                Ipv4Header { src: p.src, dst: p.dst, protocol: p.protocol, ttl, ident: self.ident, payload_len: len };
+                Ipv4Header { src: p_src, dst: p_dst, protocol: p.protocol, ttl, ident: self.ident, payload_len: len };
             if alert {
                 ipopt::emit_with_router_alert(&header, &mut frame[ETH_HEADER_LEN..]);
             } else if whole {
@@ -451,6 +477,7 @@ impl Interface {
     /// Routes `p` to its next hop, resolving the hop's MAC address first if
     /// it is not cached.
     fn send_ip(&mut self, now: Instant, p: Packet) {
+        let (IpAddr::V4(_), IpAddr::V4(p_dst)) = (p.src, p.dst) else { return self.send_ip6(now, p) };
         // TCP sizes its segments to the MTU and relies on DF; everything else
         // is fragmented.
         let too_big = IPV4_HEADER_LEN + p.payload.len() > self.mtu;
@@ -460,14 +487,14 @@ impl Interface {
         if p.dst.is_multicast() {
             // Multicast has no next hop to resolve: the group names the MAC.
             if self.config.is_some() {
-                self.queue_ip(multicast_mac(p.dst), &p);
+                self.queue_ip(multicast_mac(p_dst), &p);
             }
             return;
         }
         let next_hop = match self.config {
-            _ if p.dst.is_broadcast() => None,
-            Some(c) if p.dst == c.broadcast() => None,
-            Some(c) if c.contains(p.dst) => Some(p.dst),
+            _ if p_dst.is_broadcast() => None,
+            Some(c) if p_dst == c.broadcast() => None,
+            Some(c) if c.contains(p_dst) => Some(p_dst),
             Some(Config { gateway: Some(gw), .. }) => Some(gw),
             _ => return,
         };
@@ -542,6 +569,7 @@ impl Interface {
         match eth.ethertype {
             ETHERTYPE_ARP => self.process_arp(now, payload),
             ETHERTYPE_IPV4 => self.process_ipv4(now, payload, eth.dst.is_multicast(), sockets),
+            ETHERTYPE_IPV6 => self.process_ipv6(now, payload, sockets),
             _ => {}
         }
     }
@@ -653,7 +681,16 @@ impl Interface {
             }
             return;
         }
-        let mut cx = Cx { now, addr: ours, mac: self.mac, mss: self.mss(), rng: &mut self.rng };
+        let mut cx = Cx {
+            now,
+            addr: ours,
+            addr6: self.v6.global(),
+            link_local6: self.v6.link_local(),
+            mac: self.mac,
+            mss: self.mss(),
+            mss6: self.mss6(),
+            rng: &mut self.rng,
+        };
         let mut reply = None;
         match ip.protocol {
             PROTO_ICMP => {
@@ -662,14 +699,24 @@ impl Interface {
                     ICMP_ECHO_REQUEST if to_us => {
                         let echo =
                             IcmpHeader { ty: ICMP_ECHO_REPLY, code: 0, ident: icmp.ident, seq: icmp.seq }.emit(data);
-                        reply = Some(Packet { src: ip.dst, dst: ip.src, protocol: PROTO_ICMP, payload: echo });
+                        reply = Some(Packet {
+                            src: ip.dst.into(),
+                            dst: ip.src.into(),
+                            protocol: PROTO_ICMP,
+                            payload: echo,
+                        });
                     }
                     ICMP_ECHO_REPLY if to_us => {
                         for (_, s) in sockets.iter_mut() {
                             if let Socket::Icmp(s) = s
                                 && s.ident() == icmp.ident
                             {
-                                s.process(EchoReply { from: ip.src, seq: icmp.seq, data: data.to_vec(), at: now });
+                                s.process(EchoReply {
+                                    from: ip.src.into(),
+                                    seq: icmp.seq,
+                                    data: data.to_vec(),
+                                    at: now,
+                                });
                                 break;
                             }
                         }
@@ -682,8 +729,8 @@ impl Interface {
                 if ours.is_none() && udp.dst_port != dhcp::CLIENT_PORT {
                     return;
                 }
-                let dst = SocketAddrV4::new(ip.dst, udp.dst_port);
-                let src = SocketAddrV4::new(ip.src, udp.src_port);
+                let dst = SocketAddr::new(ip.dst.into(), udp.dst_port);
+                let src = SocketAddr::new(ip.src.into(), udp.src_port);
                 let mut delivered = false;
                 for (_, s) in sockets.iter_mut() {
                     match s {
@@ -709,7 +756,8 @@ impl Interface {
                     let header =
                         IcmpHeader { ty: ICMP_DEST_UNREACHABLE, code: ICMP_PORT_UNREACHABLE, ident: 0, seq: 0 };
                     let icmp = header.emit(quoted);
-                    reply = Some(Packet { src: ip.dst, dst: ip.src, protocol: PROTO_ICMP, payload: icmp });
+                    reply =
+                        Some(Packet { src: ip.dst.into(), dst: ip.src.into(), protocol: PROTO_ICMP, payload: icmp });
                 }
             }
             PROTO_IGMP if to_group => {
@@ -728,8 +776,8 @@ impl Interface {
             }
             PROTO_TCP if to_us => {
                 let Some((tcp, data)) = TcpHeader::parse(payload, ip.src, ip.dst) else { return };
-                let dst = SocketAddrV4::new(ip.dst, tcp.dst_port);
-                let src = SocketAddrV4::new(ip.src, tcp.src_port);
+                let dst = SocketAddr::new(ip.dst.into(), tcp.dst_port);
+                let src = SocketAddr::new(ip.src.into(), tcp.src_port);
                 let socket = {
                     let mut exact = None;
                     let mut listen = None;
@@ -752,8 +800,8 @@ impl Interface {
                 };
                 if let Some(rst) = rst {
                     reply = Some(Packet {
-                        src: ip.dst,
-                        dst: ip.src,
+                        src: ip.dst.into(),
+                        dst: ip.src.into(),
                         protocol: PROTO_TCP,
                         payload: rst.emit(ip.dst, ip.src, &[]),
                     });
@@ -771,6 +819,7 @@ impl Interface {
 mod tests {
     use super::*;
     use crate::igmp::{ALL_ROUTERS, IGMP_LEAVE};
+    use crate::testing::sa;
     use crate::testing::{A_IP, B_IP, pair, run};
     use crate::{IcmpSocket, UdpSocket};
 
@@ -796,7 +845,7 @@ mod tests {
             reply.is_some()
         }));
         let reply = reply.unwrap();
-        assert_eq!((reply.from, reply.seq, &reply.data[..]), (B_IP, 7, &b"hello"[..]));
+        assert_eq!((reply.from, reply.seq, &reply.data[..]), (IpAddr::from(B_IP), 7, &b"hello"[..]));
         assert_eq!(b.iface.arp.lookup(A_IP, now), Some(a.iface.mac_address()), "B learned A from its request");
     }
 
@@ -807,15 +856,15 @@ mod tests {
         let hb = b.sockets.add(UdpSocket::new(4, 4));
         a.sockets.get_mut::<UdpSocket>(ha).bind(1000).unwrap();
         b.sockets.get_mut::<UdpSocket>(hb).bind(2000).unwrap();
-        a.sockets.get_mut::<UdpSocket>(ha).send_to(b"ping", SocketAddrV4::new(B_IP, 2000)).unwrap();
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(b"ping", sa(B_IP, 2000)).unwrap();
         let mut now = Instant::ZERO;
         let mut buf = [0u8; 16];
         assert!(run(&mut a, &mut b, &mut now, 100, |_, b| b.sockets.get::<UdpSocket>(hb).can_recv()));
         let (n, from) = b.sockets.get_mut::<UdpSocket>(hb).recv_from(&mut buf).unwrap();
-        assert_eq!((&buf[..n], from), (&b"ping"[..], SocketAddrV4::new(A_IP, 1000)));
+        assert_eq!((&buf[..n], from), (&b"ping"[..], sa(A_IP, 1000)));
 
         // Nothing on port 3000: B answers with an ICMP error, which A drops.
-        a.sockets.get_mut::<UdpSocket>(ha).send_to(b"x", SocketAddrV4::new(B_IP, 3000)).unwrap();
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(b"x", sa(B_IP, 3000)).unwrap();
         let mut errors = 0;
         b.set_filter(move |_, f| {
             if f.len() > 34 && f[23] == PROTO_ICMP && f[34] == ICMP_DEST_UNREACHABLE {
@@ -965,12 +1014,12 @@ mod tests {
             _ => Fate::Deliver,
         });
         let data = big(8000);
-        a.sockets.get_mut::<UdpSocket>(ha).send_to(&data, SocketAddrV4::new(B_IP, 2000)).unwrap();
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(&data, sa(B_IP, 2000)).unwrap();
         let mut now = Instant::ZERO;
         assert!(run(&mut a, &mut b, &mut now, 200, |_, b| b.sockets.get::<UdpSocket>(hb).can_recv()));
         let mut buf = vec![0u8; 9000];
         let (n, from) = b.sockets.get_mut::<UdpSocket>(hb).recv_from(&mut buf).unwrap();
-        assert_eq!((&buf[..n], from), (&data[..], SocketAddrV4::new(A_IP, 1000)));
+        assert_eq!((&buf[..n], from), (&data[..], sa(A_IP, 1000)));
         run(&mut a, &mut b, &mut now, 100, |_, _| false);
         assert!(!b.sockets.get::<UdpSocket>(hb).can_recv(), "delivered once");
         assert!(b.iface.reassembling.is_empty());
@@ -981,7 +1030,7 @@ mod tests {
         let (mut a, mut b) = pair();
         let (ha, _) = udp_pair(&mut a, &mut b);
         let sent = record(&mut a);
-        a.sockets.get_mut::<UdpSocket>(ha).send_to(&big(4000), SocketAddrV4::new(B_IP, 2000)).unwrap();
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(&big(4000), sa(B_IP, 2000)).unwrap();
         let mut now = Instant::ZERO;
         run(&mut a, &mut b, &mut now, 50, |_, _| false);
         let sent = sent.borrow();
@@ -1008,7 +1057,7 @@ mod tests {
             }
             true
         });
-        a.sockets.get_mut::<UdpSocket>(ha).send_to(&big(4000), SocketAddrV4::new(B_IP, 2000)).unwrap();
+        a.sockets.get_mut::<UdpSocket>(ha).send_to(&big(4000), sa(B_IP, 2000)).unwrap();
         let mut now = Instant::ZERO;
         run(&mut a, &mut b, &mut now, 1000, |_, _| false);
         assert!(!b.sockets.get::<UdpSocket>(hb).can_recv());
@@ -1157,7 +1206,7 @@ mod tests {
         let ha = a.sockets.add(UdpSocket::new(8, 8));
         a.sockets.get_mut::<UdpSocket>(ha).bind(6000).unwrap();
         let mut now = Instant::ZERO;
-        let dst = SocketAddrV4::new(GROUP, 5000);
+        let dst = sa(GROUP, 5000);
 
         a.sockets.get_mut::<UdpSocket>(ha).send_to(b"before", dst).unwrap();
         run(&mut a, &mut b, &mut now, 20, |_, _| false);
@@ -1170,7 +1219,7 @@ mod tests {
         run(&mut a, &mut b, &mut now, 20, |_, _| false);
         let mut buf = [0u8; 16];
         let (n, from) = b.sockets.get_mut::<UdpSocket>(hb).recv_from(&mut buf).unwrap();
-        assert_eq!((&buf[..n], from), (&b"after"[..], SocketAddrV4::new(A_IP, 6000)));
+        assert_eq!((&buf[..n], from), (&b"after"[..], sa(A_IP, 6000)));
         assert!(!b.sockets.get::<UdpSocket>(hb).can_recv());
 
         // It went to the group's MAC with TTL 1, and needed no ARP.

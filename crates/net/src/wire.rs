@@ -1,11 +1,12 @@
-//! Packet formats: Ethernet II, ARP, IPv4, ICMP echo, UDP and TCP headers,
+//! Packet formats: Ethernet II, ARP, IPv4, ICMP echo, UDP and TCP headers
+//! (the last two over IPv4 or IPv6; see [`ipv6`](crate::ipv6) for the rest of IPv6),
 //! parsed from and written into byte slices, and the Internet checksum.
 //!
 //! Parsers check lengths and checksums and return `None` for anything
 //! malformed, so their callers can drop a packet with one `let ... else`.
 
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{IpAddr, Ipv4Addr};
 
 use osmium_hal::net::MacAddress;
 
@@ -52,7 +53,7 @@ fn mac(b: &[u8], at: usize) -> MacAddress {
 
 /// The Internet checksum (RFC 1071).
 pub mod checksum {
-    use core::net::Ipv4Addr;
+    use core::net::IpAddr;
 
     /// Adds `data` to a running one's-complement sum, as big-endian 16-bit
     /// words, padding an odd final byte with zero.
@@ -83,11 +84,24 @@ pub mod checksum {
         finish(add(0, data))
     }
 
-    /// The running sum of the IPv4 pseudo-header that UDP and TCP
-    /// checksums cover.
-    pub fn pseudo_header(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, len: usize) -> u32 {
-        let sum = add(add(0, &src.octets()), &dst.octets());
-        add(sum, &[0, protocol, (len >> 8) as u8, len as u8])
+    /// The running sum of the pseudo-header that UDP, TCP and ICMPv6
+    /// checksums cover: RFC 791's for IPv4 addresses, RFC 8200's for IPv6.
+    /// The two addresses are of one family; a mixed pair sums as IPv4.
+    pub fn pseudo_header(src: impl Into<IpAddr>, dst: impl Into<IpAddr>, protocol: u8, len: usize) -> u32 {
+        match (src.into(), dst.into()) {
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                let sum = add(add(0, &src.octets()), &dst.octets());
+                add(sum, &[(len >> 24) as u8, (len >> 16) as u8, (len >> 8) as u8, len as u8, 0, 0, 0, protocol])
+            }
+            (src, dst) => {
+                let octets = |a: IpAddr| match a {
+                    IpAddr::V4(a) => a.octets(),
+                    IpAddr::V6(_) => [0; 4],
+                };
+                let sum = add(add(0, &octets(src)), &octets(dst));
+                add(sum, &[0, protocol, (len >> 8) as u8, len as u8])
+            }
+        }
     }
 }
 
@@ -324,7 +338,8 @@ pub struct UdpHeader {
 impl UdpHeader {
     /// Splits a datagram carried from `src` to `dst` into its header and
     /// payload, verifying the length and, unless it is zero, the checksum.
-    pub fn parse(b: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Option<(Self, &[u8])> {
+    pub fn parse(b: &[u8], src: impl Into<IpAddr>, dst: impl Into<IpAddr>) -> Option<(Self, &[u8])> {
+        let (src, dst) = (src.into(), dst.into());
         if b.len() < UDP_HEADER_LEN {
             return None;
         }
@@ -333,8 +348,10 @@ impl UdpHeader {
             return None;
         }
         let b = &b[..len];
-        if be16(b, 6) != 0 && checksum::finish(checksum::add(checksum::pseudo_header(src, dst, PROTO_UDP, len), b)) != 0
-        {
+        // Over IPv4 a zero checksum means none was computed; IPv6 has no such
+        // escape (RFC 8200 section 8.1).
+        let unchecked = be16(b, 6) == 0 && src.is_ipv4();
+        if !unchecked && checksum::finish(checksum::add(checksum::pseudo_header(src, dst, PROTO_UDP, len), b)) != 0 {
             return None;
         }
         Some((Self { src_port: be16(b, 0), dst_port: be16(b, 2) }, &b[UDP_HEADER_LEN..]))
@@ -342,7 +359,8 @@ impl UdpHeader {
 
     /// Builds the datagram from `src` to `dst`: this header, `payload`, and
     /// the checksum.
-    pub fn emit(&self, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+    pub fn emit(&self, src: impl Into<IpAddr>, dst: impl Into<IpAddr>, payload: &[u8]) -> Vec<u8> {
+        let (src, dst) = (src.into(), dst.into());
         let len = UDP_HEADER_LEN + payload.len();
         let mut b = Vec::with_capacity(len);
         b.extend_from_slice(&self.src_port.to_be_bytes());
@@ -408,7 +426,7 @@ pub const MAX_SACK_BLOCKS: usize = 4;
 impl TcpHeader {
     /// Splits a segment carried from `src` to `dst` into its header and
     /// payload, verifying the data offset and checksum.
-    pub fn parse(b: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Option<(Self, &[u8])> {
+    pub fn parse(b: &[u8], src: impl Into<IpAddr>, dst: impl Into<IpAddr>) -> Option<(Self, &[u8])> {
         if b.len() < TCP_HEADER_LEN {
             return None;
         }
@@ -464,7 +482,7 @@ impl TcpHeader {
 
     /// Builds the segment from `src` to `dst`: this header (with its
     /// options), `payload`, and the checksum.
-    pub fn emit(&self, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+    pub fn emit(&self, src: impl Into<IpAddr>, dst: impl Into<IpAddr>, payload: &[u8]) -> Vec<u8> {
         // A TCP header carries at most 40 bytes of options.
         let mut opts = Vec::with_capacity(40);
         if let Some(mss) = self.mss {

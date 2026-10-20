@@ -18,7 +18,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
 use super::{Cx, Packet, binds};
@@ -107,8 +107,8 @@ pub struct TcpSocket {
     /// Our end. The address is unspecified on a listener and on a
     /// connection that has not sent its SYN yet; the port is 0 until an
     /// ephemeral one is chosen.
-    local: SocketAddrV4,
-    remote: SocketAddrV4,
+    local: SocketAddr,
+    remote: SocketAddr,
     /// The SYN is still to be built: [`connect`](Self::connect) was called
     /// but the interface has not assigned the address, port and ISS yet.
     fresh: bool,
@@ -216,8 +216,8 @@ impl TcpSocket {
     pub fn new(rx_cap: usize, tx_cap: usize) -> Self {
         Self {
             state: State::Closed,
-            local: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
-            remote: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+            local: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+            remote: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             fresh: false,
             passive: false,
             rx: VecDeque::new(),
@@ -285,8 +285,10 @@ impl TcpSocket {
     /// listening on its port.
     fn relisten(&mut self) {
         let port = self.local.port();
+        let v6 = self.local.is_ipv6();
         self.reset();
-        self.local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        let any = if v6 { Ipv6Addr::UNSPECIFIED.into() } else { Ipv4Addr::UNSPECIFIED.into() };
+        self.local = SocketAddr::new(any, port);
         self.state = State::Listen;
         self.passive = true;
     }
@@ -296,16 +298,25 @@ impl TcpSocket {
         usize::from(seg.mss.unwrap_or(DEFAULT_MSS as u16)).max(MIN_MSS).min(usize::from(ours))
     }
 
-    /// Waits for a connection to `port` on any address of the interface.
+    /// Waits for a connection to `port` on any IPv4 address of the
+    /// interface. [`listen_on`](Self::listen_on) with `[::]` waits on IPv6.
     pub fn listen(&mut self, port: u16) -> Result<(), Error> {
-        if port == 0 {
+        self.listen_on(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
+    }
+
+    /// Waits for a connection to `local`: an unspecified address means any
+    /// address of the interface of that family (IPv4 or IPv6), a specific
+    /// one only that address.
+    pub fn listen_on(&mut self, local: impl Into<SocketAddr>) -> Result<(), Error> {
+        let local = local.into();
+        if local.port() == 0 {
             return Err(Error::InvalidAddress);
         }
         if self.state != State::Closed {
             return Err(Error::InvalidState);
         }
         self.reset();
-        self.local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        self.local = local;
         self.state = State::Listen;
         self.passive = true;
         Ok(())
@@ -315,15 +326,21 @@ impl TcpSocket {
     /// ephemeral port if it is 0. The SYN goes out on the next poll;
     /// [`state`](Self::state) reaches [`State::Established`] when the peer
     /// accepts, and [`error`](Self::error) says why if it does not.
-    pub fn connect(&mut self, remote: SocketAddrV4, local_port: u16) -> Result<(), Error> {
-        if remote.port() == 0 || remote.ip().is_unspecified() || remote.ip().is_broadcast() {
+    pub fn connect(&mut self, remote: impl Into<SocketAddr>, local_port: u16) -> Result<(), Error> {
+        let remote = remote.into();
+        let unusable = match remote.ip() {
+            IpAddr::V4(a) => a.is_broadcast(),
+            IpAddr::V6(a) => a.is_multicast(),
+        };
+        if remote.port() == 0 || remote.ip().is_unspecified() || unusable {
             return Err(Error::InvalidAddress);
         }
         if self.state != State::Closed {
             return Err(Error::InvalidState);
         }
         self.reset();
-        self.local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_port);
+        let any = if remote.is_ipv6() { Ipv6Addr::UNSPECIFIED.into() } else { Ipv4Addr::UNSPECIFIED.into() };
+        self.local = SocketAddr::new(any, local_port);
         self.remote = remote;
         self.state = State::SynSent;
         self.fresh = true;
@@ -406,12 +423,12 @@ impl TcpSocket {
     }
 
     /// Our end of the connection.
-    pub fn local_endpoint(&self) -> SocketAddrV4 {
+    pub fn local_endpoint(&self) -> SocketAddr {
         self.local
     }
 
     /// The peer's end of the connection.
-    pub fn remote_endpoint(&self) -> SocketAddrV4 {
+    pub fn remote_endpoint(&self) -> SocketAddr {
         self.remote
     }
 
@@ -501,12 +518,12 @@ impl TcpSocket {
     }
 
     /// Returns true if an established connection carries `dst` <- `src`.
-    pub(crate) fn accepts_exact(&self, dst: SocketAddrV4, src: SocketAddrV4) -> bool {
+    pub(crate) fn accepts_exact(&self, dst: SocketAddr, src: SocketAddr) -> bool {
         !matches!(self.state, State::Closed | State::Listen) && self.local == dst && self.remote == src
     }
 
     /// Returns true if the socket listens for connections to `dst`.
-    pub(crate) fn accepts_listen(&self, dst: SocketAddrV4) -> bool {
+    pub(crate) fn accepts_listen(&self, dst: SocketAddr) -> bool {
         self.state == State::Listen && binds(self.local, dst)
     }
 
@@ -545,8 +562,8 @@ impl TcpSocket {
     pub(crate) fn process(
         &mut self,
         cx: &mut Cx,
-        dst: SocketAddrV4,
-        src: SocketAddrV4,
+        dst: SocketAddr,
+        src: SocketAddr,
         seg: &TcpHeader,
         payload: &[u8],
     ) -> Option<TcpHeader> {
@@ -563,7 +580,7 @@ impl TcpSocket {
                 }
                 // A SYN can only come from one host.
                 let ip = src.ip();
-                if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+                if ip.is_unspecified() || ip.is_multicast() || matches!(ip, IpAddr::V4(a) if a.is_broadcast()) {
                     return None;
                 }
                 self.local = dst;
@@ -573,7 +590,7 @@ impl TcpSocket {
                 self.ts_offset = cx.rng.next_u32();
                 self.snd_wnd = u32::from(seg.window);
                 self.snd_wl1 = seg.seq;
-                self.snd_mss = Self::peer_mss(seg, cx.mss);
+                self.snd_mss = Self::peer_mss(seg, cx.mss_for(&dst));
                 self.negotiate(seg);
                 self.state = State::SynReceived;
                 return None;
@@ -594,7 +611,7 @@ impl TcpSocket {
                     return None;
                 }
                 self.rcv_nxt = seg.seq.wrapping_add(1);
-                self.snd_mss = Self::peer_mss(seg, cx.mss);
+                self.snd_mss = Self::peer_mss(seg, cx.mss_for(&dst));
                 self.negotiate(seg);
                 self.snd_wnd = u32::from(seg.window);
                 self.snd_wl1 = seg.seq;
@@ -1165,8 +1182,8 @@ impl TcpSocket {
         if header.has(TCP_ACK) {
             self.last_ack_sent = header.ack;
         }
-        let segment = header.emit(*self.local.ip(), *self.remote.ip(), payload);
-        out.push(Packet { src: *self.local.ip(), dst: *self.remote.ip(), protocol: PROTO_TCP, payload: segment });
+        let segment = header.emit(self.local.ip(), self.remote.ip(), payload);
+        out.push(Packet { src: self.local.ip(), dst: self.remote.ip(), protocol: PROTO_TCP, payload: segment });
     }
 
     pub(crate) fn dispatch(&mut self, cx: &mut Cx, out: &mut Vec<Packet>) {
@@ -1175,10 +1192,10 @@ impl TcpSocket {
         match self.state {
             State::Closed => {
                 if let Some(rst) = self.rst_pending.take() {
-                    let segment = rst.emit(*self.local.ip(), *self.remote.ip(), &[]);
+                    let segment = rst.emit(self.local.ip(), self.remote.ip(), &[]);
                     out.push(Packet {
-                        src: *self.local.ip(),
-                        dst: *self.remote.ip(),
+                        src: self.local.ip(),
+                        dst: self.remote.ip(),
                         protocol: PROTO_TCP,
                         payload: segment,
                     });
@@ -1200,14 +1217,14 @@ impl TcpSocket {
         }
 
         if self.fresh {
-            let Some(addr) = cx.addr else { return };
+            let Some(addr) = cx.source_for(self.remote.ip()) else { return };
             self.local.set_ip(addr);
             if self.local.port() == 0 {
                 self.local.set_port(cx.rng.ephemeral_port());
             }
             self.set_iss(cx.rng.isn(self.local, self.remote, now));
             self.ts_offset = cx.rng.next_u32();
-            let mss = cx.mss as u32;
+            let mss = u32::from(cx.mss_for(&self.remote));
             self.cwnd = (10 * mss).min((2 * mss).max(14600));
             self.fresh = false;
         }
@@ -1244,7 +1261,7 @@ impl TcpSocket {
                 let mut syn = self.segment(flags);
                 // A SYN's window is never scaled.
                 syn.window = self.rx_window().min(65535) as u16;
-                syn.mss = Some(cx.mss);
+                syn.mss = Some(cx.mss_for(&self.remote));
                 if self.state == State::SynSent {
                     syn.wscale = Some(self.ws_offer);
                     syn.sack_permitted = self.sack_enabled;
@@ -1341,6 +1358,7 @@ impl TcpSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::sa;
     use crate::testing::{B_IP, Fate, Host, pair, run};
     use crate::{SocketHandle, wire};
 
@@ -1354,7 +1372,7 @@ mod tests {
         let ca = a.sockets.add(TcpSocket::new(rx, tx));
         let cb = b.sockets.add(TcpSocket::new(rx, tx));
         tcp(&mut b, cb).listen(80).unwrap();
-        tcp(&mut a, ca).connect(SocketAddrV4::new(B_IP, 80), 0).unwrap();
+        tcp(&mut a, ca).connect(sa(B_IP, 80), 0).unwrap();
         let mut now = Instant::ZERO;
         assert!(run(&mut a, &mut b, &mut now, 1000, |a, b| {
             tcp(a, ca).state() == State::Established && tcp(b, cb).state() == State::Established
@@ -1475,7 +1493,7 @@ mod tests {
     fn refused() {
         let (mut a, mut b) = pair();
         let ca = a.sockets.add(TcpSocket::new(64, 64));
-        tcp(&mut a, ca).connect(SocketAddrV4::new(B_IP, 81), 5000).unwrap();
+        tcp(&mut a, ca).connect(sa(B_IP, 81), 5000).unwrap();
         let mut now = Instant::ZERO;
         assert!(run(&mut a, &mut b, &mut now, 100, |a, _| !tcp(a, ca).is_open()));
         assert_eq!(tcp(&mut a, ca).error(), Some(Error::ConnectionRefused));
@@ -1508,9 +1526,18 @@ mod tests {
         let mut rng = crate::rng::Rng::new(1);
         let mut s = TcpSocket::new(64, 64);
         s.listen(80).unwrap();
-        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
-        let dst = SocketAddrV4::new(B_IP, 80);
-        let src = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 9), 4000);
+        let mut cx = Cx {
+            now: Instant::ZERO,
+            addr: Some(B_IP),
+            mac: Default::default(),
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng: &mut rng,
+        };
+        let dst = sa(B_IP, 80);
+        let src = sa(Ipv4Addr::new(192, 168, 1, 9), 4000);
         let ack =
             TcpHeader { src_port: 4000, dst_port: 80, seq: 1, ack: 99, flags: wire::TCP_ACK, ..Default::default() };
         let rst = s.process(&mut cx, dst, src, &ack, &[]).unwrap();
@@ -1518,7 +1545,7 @@ mod tests {
         assert_eq!(s.state(), State::Listen);
     }
 
-    const PEER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 9), 4000);
+    const PEER: SocketAddr = sa(Ipv4Addr::new(192, 168, 1, 9), 4000);
 
     fn syn(mss: Option<u16>) -> TcpHeader {
         TcpHeader { src_port: 4000, dst_port: 80, seq: 1000, flags: TCP_SYN, window: 1000, mss, ..Default::default() }
@@ -1528,8 +1555,17 @@ mod tests {
     fn half_open(rng: &mut crate::rng::Rng, syn: &TcpHeader) -> TcpSocket {
         let mut s = TcpSocket::new(64, 64);
         s.listen(80).unwrap();
-        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng };
-        assert!(s.process(&mut cx, SocketAddrV4::new(B_IP, 80), PEER, syn, &[]).is_none());
+        let mut cx = Cx {
+            now: Instant::ZERO,
+            addr: Some(B_IP),
+            mac: Default::default(),
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng,
+        };
+        assert!(s.process(&mut cx, sa(B_IP, 80), PEER, syn, &[]).is_none());
         s
     }
 
@@ -1538,10 +1574,19 @@ mod tests {
         let mut rng = crate::rng::Rng::new(1);
         let mut s = TcpSocket::new(64, 64);
         s.listen(80).unwrap();
-        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
-        let dst = SocketAddrV4::new(B_IP, 80);
+        let mut cx = Cx {
+            now: Instant::ZERO,
+            addr: Some(B_IP),
+            mac: Default::default(),
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng: &mut rng,
+        };
+        let dst = sa(B_IP, 80);
         for ip in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, Ipv4Addr::new(224, 0, 0, 1)] {
-            assert!(s.process(&mut cx, dst, SocketAddrV4::new(ip, 4000), &syn(None), &[]).is_none());
+            assert!(s.process(&mut cx, dst, sa(ip, 4000), &syn(None), &[]).is_none());
             assert_eq!(s.state(), State::Listen, "SYN from {ip}");
         }
     }
@@ -1554,7 +1599,16 @@ mod tests {
         let mut now = Instant::ZERO;
         let mut out = Vec::new();
         while s.state() == State::SynReceived && now.as_millis() < 600_000 {
-            let mut cx = Cx { now, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+            let mut cx = Cx {
+                now,
+                addr: Some(B_IP),
+                mac: Default::default(),
+                mss: 1460,
+                mss6: 1440,
+                addr6: None,
+                link_local6: None,
+                rng: &mut rng,
+            };
             s.dispatch(&mut cx, &mut out);
             now = Instant::from_millis(now.as_millis() + 100);
         }
@@ -1575,9 +1629,18 @@ mod tests {
         let mut s = half_open(&mut rng, &syn(None));
         s.state = State::TimeWait;
         s.timer = Some(Instant::from_millis(10_000));
-        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        let mut cx = Cx {
+            now: Instant::ZERO,
+            addr: Some(B_IP),
+            mac: Default::default(),
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng: &mut rng,
+        };
         let rst = TcpHeader { seq: s.rcv_nxt, flags: TCP_RST, ..syn(None) };
-        s.process(&mut cx, SocketAddrV4::new(B_IP, 80), PEER, &rst, &[]);
+        s.process(&mut cx, sa(B_IP, 80), PEER, &rst, &[]);
         assert_eq!(s.state(), State::TimeWait);
     }
 
@@ -1585,9 +1648,18 @@ mod tests {
     fn duplicate_acks_saturate() {
         let mut rng = crate::rng::Rng::new(1);
         let mut s = half_open(&mut rng, &syn(None));
-        let dst = SocketAddrV4::new(B_IP, 80);
+        let dst = sa(B_IP, 80);
         let mut out = Vec::new();
-        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        let mut cx = Cx {
+            now: Instant::ZERO,
+            addr: Some(B_IP),
+            mac: Default::default(),
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng: &mut rng,
+        };
         s.dispatch(&mut cx, &mut out);
         let ack = TcpHeader { seq: 1001, ack: s.iss.wrapping_add(1), flags: TCP_ACK, window: 1000, ..syn(None) };
         s.process(&mut cx, dst, PEER, &ack, &[]);
@@ -1635,7 +1707,7 @@ mod tests {
         let cb = b.sockets.add(TcpSocket::new(rx, 1024));
         setup(tcp(&mut a, ca), tcp(&mut b, cb));
         tcp(&mut b, cb).listen(80).unwrap();
-        tcp(&mut a, ca).connect(SocketAddrV4::new(B_IP, 80), 0).unwrap();
+        tcp(&mut a, ca).connect(sa(B_IP, 80), 0).unwrap();
         let mut now = Instant::ZERO;
         assert!(run(&mut a, &mut b, &mut now, 1000, |a, b| {
             tcp(a, ca).state() == State::Established && tcp(b, cb).state() == State::Established
@@ -1908,18 +1980,36 @@ mod tests {
         let mut s = half_open(&mut rng, &syn(None));
         assert_eq!((s.ws_active, s.snd_shift, s.rcv_shift, s.sack_ok), (false, 0, 0, false));
         let mut out = Vec::new();
-        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        let mut cx = Cx {
+            now: Instant::ZERO,
+            addr: Some(B_IP),
+            mac: Default::default(),
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng: &mut rng,
+        };
         s.dispatch(&mut cx, &mut out);
-        let (h, _) = TcpHeader::parse(&out[0].payload, B_IP, *PEER.ip()).unwrap();
+        let (h, _) = TcpHeader::parse(&out[0].payload, B_IP, PEER.ip()).unwrap();
         assert_eq!((h.wscale, h.sack_permitted), (None, false), "the SYN-ACK answers only what was offered");
 
         let offer = TcpHeader { wscale: Some(9), sack_permitted: true, ..syn(None) };
         let mut s = half_open(&mut rng, &offer);
         assert_eq!((s.ws_active, s.snd_shift, s.sack_ok), (true, 9, true));
         out.clear();
-        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        let mut cx = Cx {
+            now: Instant::ZERO,
+            addr: Some(B_IP),
+            mac: Default::default(),
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng: &mut rng,
+        };
         s.dispatch(&mut cx, &mut out);
-        let (h, _) = TcpHeader::parse(&out[0].payload, B_IP, *PEER.ip()).unwrap();
+        let (h, _) = TcpHeader::parse(&out[0].payload, B_IP, PEER.ip()).unwrap();
         assert_eq!((h.wscale, h.sack_permitted), (Some(0), true));
         let big = TcpHeader { wscale: Some(40), ..syn(None) };
         assert_eq!(half_open(&mut rng, &big).snd_shift, MAX_SHIFT, "shifts are capped");
@@ -2002,7 +2092,7 @@ mod tests {
         let cb = b.sockets.add(TcpSocket::new(1024, 1024));
         tcp(&mut a, ca).ts_enabled = false;
         tcp(&mut b, cb).listen(80).unwrap();
-        tcp(&mut a, ca).connect(SocketAddrV4::new(B_IP, 80), 0).unwrap();
+        tcp(&mut a, ca).connect(sa(B_IP, 80), 0).unwrap();
         let mut now = Instant::ZERO;
         assert!(run(&mut a, &mut b, &mut now, 1000, |a, b| {
             tcp(a, ca).state() == State::Established && tcp(b, cb).state() == State::Established
@@ -2036,7 +2126,20 @@ mod tests {
                 timestamps: ts,
                 ..TcpHeader::default()
             };
-            let mut cx = Cx { now, addr: Some(*local.ip()), mac: Default::default(), mss: 1460, rng: &mut rng };
+            let addr = match local.ip() {
+                IpAddr::V4(a) => Some(a),
+                IpAddr::V6(_) => None,
+            };
+            let mut cx = Cx {
+                now,
+                addr,
+                mac: Default::default(),
+                mss: 1460,
+                mss6: 1440,
+                addr6: None,
+                link_local6: None,
+                rng: &mut rng,
+            };
             sock.process(&mut cx, local, remote, &seg, data);
             sock.recv_queue()
         };

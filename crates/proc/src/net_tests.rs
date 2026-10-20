@@ -13,7 +13,7 @@ use osmium_fs::Errno;
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
 use osmium_mm::addr::PhysAddr;
 use osmium_mm::paging::MapFlags;
-use osmium_net::{Config, Instant, Interface, SocketAddrV4, SocketSet, TcpSocket, UdpSocket};
+use osmium_net::{Config, Instant, Interface, SocketAddr, SocketAddrV4, SocketSet, TcpSocket, UdpSocket};
 
 use crate::net::{NetStack, set_stack, stack};
 use crate::{Outcome, Process, Sys, UserMemory, dispatch};
@@ -265,7 +265,7 @@ fn sockets_over_a_simulated_link() {
     let conn = call(&p, Sys::Accept4, &[srv, ADDR, LEN, 0o4000]);
     assert!(conn >= 0, "accept: {conn}");
     let conn = conn as u64;
-    assert_eq!(parse(&get(&p, ADDR, 16)), peer.sockets.get::<TcpSocket>(c).local_endpoint());
+    assert_eq!(SocketAddr::V4(parse(&get(&p, ADDR, 16))), peer.sockets.get::<TcpSocket>(c).local_endpoint());
     assert_eq!(call(&p, Sys::Read, &[conn, BUF, 64]), 13);
     assert_eq!(get(&p, BUF, 13), b"to the server");
     put(&p, BUF, b"reply");
@@ -303,7 +303,7 @@ fn sockets_over_a_simulated_link() {
     assert_eq!(call(&p, Sys::Sendto, &[dup, BUF, 4, 0, ADDR, 16]), 4, "auto-binds an ephemeral port");
     pump(&net, &mut peer);
     let (n, from) = peer.sockets.get_mut::<UdpSocket>(s).recv_from(&mut b).unwrap();
-    assert_eq!((&b[..n], from), (&b"pong"[..], SocketAddrV4::new(US, 5000)));
+    assert_eq!((&b[..n], from), (&b"pong"[..], SocketAddr::V4(SocketAddrV4::new(US, 5000))));
     let (_, from) = peer.sockets.get_mut::<UdpSocket>(s).recv_from(&mut b).unwrap();
     assert_ne!(from.port(), 0);
     // A connected datagram socket reads and writes plainly.
