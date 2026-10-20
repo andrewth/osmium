@@ -48,6 +48,9 @@ const ROOT_INO: u64 = 1;
 /// Largest file FAT can hold.
 const MAX_SIZE: u64 = u32::MAX as u64;
 
+/// Largest directory FAT allows: 65536 entries (§6).
+const MAX_DIR: u64 = 65536 * ENTRY_SIZE as u64;
+
 fn io_error(e: BlockError) -> Errno {
     match e {
         BlockError::ReadOnly => Errno::EROFS,
@@ -107,11 +110,12 @@ impl<D: BlockDevice + Send + 'static> FatFs<D> {
     /// every node. Fails with `EINVAL` if the device does not hold FAT32.
     pub fn mount(mut dev: D, dev_id: u64) -> Result<Self, Errno> {
         let bs = dev.block_size();
-        if bs == 0 || bs > 4096 {
+        // A power of two, so it divides or is a multiple of every sector size.
+        if !bs.is_power_of_two() || bs > 4096 {
             return Err(Errno::EINVAL);
         }
         let mut boot = vec![0u8; 512.max(bs)];
-        dev.read_blocks(0, &mut boot[..bs.max(512).next_multiple_of(bs)]).map_err(io_error)?;
+        dev.read_blocks(0, &mut boot).map_err(io_error)?;
         let geo = Geometry::parse(&boot)?;
         if !(geo.sector_size as usize).is_multiple_of(bs) {
             return Err(Errno::EINVAL);
@@ -215,9 +219,9 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     // --- The FAT ---------------------------------------------------------
 
     fn fat_entry(&mut self, c: u32) -> Result<u32, Errno> {
-        let ss = self.geo.sector_size;
-        let sector = self.geo.fat_start + c * 4 / ss;
-        let at = (c * 4 % ss) as usize;
+        let ss = self.geo.sector_size as u64;
+        let sector = self.geo.fat_start + (c as u64 * 4 / ss) as u32;
+        let at = (c as u64 * 4 % ss) as usize;
         if self.fat_cache.as_ref().is_none_or(|(s, _)| *s != sector) {
             let mut buf = self.sector_buf();
             self.read_sector(sector, &mut buf)?;
@@ -230,8 +234,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     /// Sets cluster `c`'s FAT entry in every copy of the FAT.
     fn set_fat_entry(&mut self, c: u32, value: u32) -> Result<(), Errno> {
         self.fat_entry(c)?; // loads the sector into the cache
-        let ss = self.geo.sector_size;
-        let at = (c * 4 % ss) as usize;
+        let at = (c as u64 * 4 % self.geo.sector_size as u64) as usize;
         let (sector, mut buf) = self.fat_cache.take().unwrap();
         let old = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
         // The top four bits are reserved and must be preserved.
@@ -256,16 +259,14 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         }
     }
 
-    /// Allocates a zeroed cluster, linking it after `prev` if given.
+    /// Allocates a zeroed cluster, linking it after `prev` if given. The
+    /// FSInfo free count is only a hint, so even at 0 the FAT is searched.
     fn alloc_cluster(&mut self, prev: Option<u32>) -> Result<u32, Errno> {
-        if self.info.and_then(|i| i.free) == Some(0) {
-            return Err(Errno::ENOSPC);
-        }
         let count = self.geo.cluster_count;
         let start = self.info.map_or(2, |i| i.next_free);
         let mut found = None;
         for i in 0..count {
-            let c = 2 + (start - 2 + i) % count;
+            let c = 2 + ((start as u64 - 2 + i as u64) % count as u64) as u32;
             if self.fat_entry(c)? == FAT_FREE {
                 found = Some(c);
                 break;
@@ -282,7 +283,8 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
             self.set_fat_entry(p, c)?;
         }
         if let Some(info) = &mut self.info {
-            info.free = info.free.map(|f| f - 1);
+            // A count that was wrong becomes unknown.
+            info.free = info.free.and_then(|f| f.checked_sub(1));
             info.next_free = if c + 1 < count + 2 { c + 1 } else { 2 };
         }
         Ok(c)
@@ -299,7 +301,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
             }
             self.set_fat_entry(c, FAT_FREE)?;
             if let Some(info) = &mut self.info {
-                info.free = info.free.map(|f| f + 1);
+                info.free = info.free.map(|f| f + 1).filter(|&f| f <= self.geo.cluster_count);
             }
             c = next;
             steps += 1;
@@ -308,12 +310,16 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     }
 
     /// The `n`th cluster of the chain at `first`, if the chain is that long.
+    /// A chain longer than the volume (a cycle) is `EIO`.
     fn nth(&mut self, first: u32, n: u64) -> Result<Option<u32>, Errno> {
         if !self.geo.is_data_cluster(first) {
             return Ok(None);
         }
         let mut c = first;
-        for _ in 0..n {
+        for i in 0..n {
+            if i >= self.geo.cluster_count as u64 {
+                return Err(Errno::EIO);
+            }
             match self.next(c)? {
                 Some(next) => c = next,
                 None => return Ok(None),
@@ -322,14 +328,15 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         Ok(Some(c))
     }
 
-    /// Clusters in the chain at `first`.
-    fn chain_len(&mut self, first: u32) -> Result<u64, Errno> {
+    /// Clusters in the chain at `first`; `EIO` if there are more than `max`.
+    fn chain_len(&mut self, first: u32, max: u64) -> Result<u64, Errno> {
+        let max = max.min(self.geo.cluster_count as u64); // any more is a cycle
         let mut n = 0;
         let mut c = if self.geo.is_data_cluster(first) { Some(first) } else { None };
         while let Some(cur) = c {
             n += 1;
-            if n > self.geo.cluster_count as u64 {
-                return Err(Errno::EIO); // a cycle
+            if n > max {
+                return Err(Errno::EIO);
             }
             c = self.next(cur)?;
         }
@@ -344,6 +351,9 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         let cs = self.geo.cluster_size() as u64;
         let ss = self.geo.sector_size as u64;
         let want = (buf.len() as u64).min(limit.saturating_sub(off)) as usize;
+        if want == 0 {
+            return Ok(0); // without walking the chain to `off`
+        }
         let mut done = 0;
         let mut cluster = self.nth(first, off / cs)?;
         let mut sector = self.sector_buf();
@@ -381,7 +391,10 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
             *first = self.alloc_cluster(None)?;
         }
         let mut c = *first;
-        for _ in 0..off / cs {
+        for i in 0..off / cs {
+            if i >= self.geo.cluster_count as u64 {
+                return Err(Errno::EIO); // a cycle
+            }
             c = match self.next(c)? {
                 Some(n) => n,
                 None => self.alloc_cluster(Some(c))?,
@@ -420,7 +433,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     /// allocated).
     fn zero_range(&mut self, first: &mut u32, from: u64, to: u64) -> Result<(), Errno> {
         let cs = self.geo.cluster_size() as u64;
-        let allocated = self.chain_len(*first)? * cs;
+        let allocated = self.chain_len(*first, u64::MAX)? * cs;
         let end = to.min(allocated);
         let zeros = vec![0u8; cs as usize];
         let mut pos = from;
@@ -465,9 +478,10 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
 
     // --- Directories -------------------------------------------------------
 
-    /// A directory's whole contents.
+    /// A directory's whole contents; `EIO` if it is larger than FAT allows.
     fn dir_bytes(&mut self, first: u32) -> Result<Vec<u8>, Errno> {
-        let len = self.chain_len(first)? * self.geo.cluster_size() as u64;
+        let cs = self.geo.cluster_size() as u64;
+        let len = self.chain_len(first, MAX_DIR.div_ceil(cs))? * cs;
         let mut buf = vec![0u8; len as usize];
         let n = self.read_chain(first, 0, &mut buf, len)?;
         buf.truncate(n);
@@ -577,7 +591,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         let (ino, kind, first, read_only, size) = (s.ino, s.kind, s.first, s.read_only, s.size);
         let size = match kind {
             // A directory's size is the space its chain occupies.
-            FileKind::Directory => vol.chain_len(first).unwrap_or(0) * vol.geo.cluster_size() as u64,
+            FileKind::Directory => vol.chain_len(first, u64::MAX).unwrap_or(0) * vol.geo.cluster_size() as u64,
             _ => size as u64,
         };
         let mode = match (kind, read_only) {
@@ -668,6 +682,13 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             }
         };
 
+        // Where the entries go (with the short entry last); a directory may
+        // grow only so far.
+        let at = dir::find_free(&bytes, slots.len() + 1);
+        if (at + (slots.len() + 1) * ENTRY_SIZE) as u64 > MAX_DIR {
+            return Err(Errno::ENOSPC);
+        }
+
         // A directory gets its first cluster, with `.` and `..`, up front.
         let first = if kind == FileKind::Directory {
             let mut c = 0;
@@ -682,7 +703,6 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         };
         let attr_bits = if kind == FileKind::Directory { attr::DIRECTORY } else { attr::ARCHIVE };
         slots.push(dir::short_entry(&short, ntres, attr_bits, first, 0));
-        let at = dir::find_free(&bytes, slots.len());
         let flat: Vec<u8> = slots.iter().flatten().copied().collect();
         let mut dir_first_mut = dir_first;
         if let Err(e) = vol.write_chain(&mut dir_first_mut, at as u64, &flat) {

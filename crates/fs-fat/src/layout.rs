@@ -26,6 +26,10 @@ pub struct Geometry {
     pub fsinfo_sector: u32,
 }
 
+/// Most data clusters a FAT32 volume can have (§3.5): numbers from
+/// 0x0ffffff7 up mean bad cluster and end of chain.
+const MAX_CLUSTERS: u32 = 0x0fff_fff5;
+
 fn le16(b: &[u8], at: usize) -> u32 {
     u16::from_le_bytes([b[at], b[at + 1]]) as u32
 }
@@ -63,10 +67,13 @@ impl Geometry {
         if !valid {
             return Err(Errno::EINVAL);
         }
-        let data_start = reserved + fats * fat_sectors;
+        // The FATs lie between the reserved sectors and the data, all of it
+        // inside the volume.
+        let data_start = fats.checked_mul(fat_sectors).and_then(|f| f.checked_add(reserved)).ok_or(Errno::EINVAL)?;
         let cluster_count = total.checked_sub(data_start).ok_or(Errno::EINVAL)? / sectors_per_cluster;
-        // The FAT type is decided by the cluster count alone (§3.5).
-        if cluster_count < 65525 || root_entries != 0 || le16(b, 22) != 0 {
+        // The FAT type is decided by the cluster count alone (§3.5); above
+        // 0x0ffffff5 cluster numbers would collide with the reserved values.
+        if !(65525..=MAX_CLUSTERS).contains(&cluster_count) || root_entries != 0 || le16(b, 22) != 0 {
             return Err(Errno::EINVAL);
         }
         // The FAT must have an entry for every cluster.
@@ -187,6 +194,28 @@ mod tests {
         let mut odd = boot_sector();
         odd[13] = 3;
         assert_eq!(Geometry::parse(&odd), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn rejects_impossible_sizes() {
+        // FATs so big their sector count overflows.
+        let mut huge_fats = boot_sector();
+        huge_fats[16] = 255;
+        huge_fats[36..40].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+        assert_eq!(Geometry::parse(&huge_fats), Err(Errno::EINVAL));
+        // FATs that run past the end of the volume.
+        let mut past_end = boot_sector();
+        past_end[36..40].copy_from_slice(&70000u32.to_le_bytes());
+        assert_eq!(Geometry::parse(&past_end), Err(Errno::EINVAL));
+        // More clusters than FAT32 can number (and a FAT big enough for them).
+        let mut too_many = boot_sector();
+        too_many[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        too_many[36..40].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+        assert_eq!(Geometry::parse(&too_many), Err(Errno::EINVAL));
+        let mut most = too_many;
+        let total = 32 + 2 * 0x0200_0000 + MAX_CLUSTERS;
+        most[32..36].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(Geometry::parse(&most).map(|g| g.cluster_count), Ok(MAX_CLUSTERS));
     }
 
     #[test]

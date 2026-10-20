@@ -98,7 +98,7 @@ pub fn dot_entries(own: u32, parent: u32) -> [u8; 2 * ENTRY_SIZE] {
 /// Parses the entries in use in directory contents `bytes`, skipping `.`,
 /// `..`, volume labels and free slots. Long names whose checksum does not
 /// match the short entry that follows them are ignored, as the
-/// specification requires.
+/// specification requires, and so are long names no path could reach.
 pub fn parse(bytes: &[u8]) -> Vec<Entry> {
     let mut out = Vec::new();
     // Long-name parts collected so far: (expected next ordinal, checksum,
@@ -136,7 +136,7 @@ pub fn parse(bytes: &[u8]) -> Vec<Entry> {
             Some((0, sum, start, parts)) if sum == checksum(&short) => {
                 let units: Vec<u16> = parts.iter().rev().flatten().copied().collect();
                 match String::from_utf16(&units) {
-                    Ok(n) if !n.is_empty() => (n, start),
+                    Ok(n) if units.len() <= MAX_LONG && usable(&n) => (n, start),
                     _ => (short_to_string(&short, e[12]), offset),
                 }
             }
@@ -153,6 +153,14 @@ pub fn parse(bytes: &[u8]) -> Vec<Entry> {
         });
     }
     out
+}
+
+/// Most UTF-16 units in a long name (§7).
+const MAX_LONG: usize = 255;
+
+/// True if long name `n` can be a path component.
+fn usable(n: &str) -> bool {
+    !matches!(n, "" | "." | "..") && !n.contains(['/', '\0'])
 }
 
 /// Every short name in use in `bytes`, for picking a unique new one.
@@ -226,6 +234,19 @@ mod tests {
         let got = parse(&dir(&es));
         assert_eq!(got[0].name, "PLAIN.TXT", "checksum mismatch falls back to the short name");
         assert_eq!(got[0].slots(), 1);
+    }
+
+    #[test]
+    fn unusable_long_names_are_ignored() {
+        let long = "x".repeat(MAX_LONG + 5); // 20 parts: the ordinals allow 31
+        for name in ["", ".", "..", "a/b", &long] {
+            let short = *b"SAFE    TXT";
+            let mut es = lfn_entries(name, checksum(&short)).to_vec();
+            es.push(short_entry(&short, 0, 0, 0, 0));
+            let got = parse(&dir(&es));
+            assert_eq!((got[0].name.as_str(), got[0].slots()), ("SAFE.TXT", 1), "{name:?}");
+        }
+        assert!(usable("a.b") && !usable("a\0b"));
     }
 
     #[test]
