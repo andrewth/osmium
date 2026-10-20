@@ -205,4 +205,14 @@ unsafe impl<A: FrameAllocator, M: PhysMapper> crate::paging::TableAlloc for Lock
         // SAFETY: forwarded contract.
         unsafe { self.alloc.lock().dealloc(pa, 0) }
     }
+
+    fn alloc_root(&self, pages: usize) -> Option<PhysAddr> {
+        // Blocks of 2^order frames are aligned to their size.
+        pages.is_power_of_two().then(|| self.alloc.lock().alloc(pages.trailing_zeros()))?
+    }
+
+    unsafe fn free_root(&self, pa: PhysAddr, pages: usize) {
+        // SAFETY: forwarded contract; allocated above with this order.
+        unsafe { self.alloc.lock().dealloc(pa, pages.trailing_zeros()) }
+    }
 }

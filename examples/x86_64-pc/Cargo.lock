@@ -89,6 +89,7 @@ dependencies = [
 name = "osmium-virt"
 version = "0.1.0"
 dependencies = [
+ "osmium-hal",
  "osmium-mm",
  "osmium-sync",
 ]

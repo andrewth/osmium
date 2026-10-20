@@ -5,6 +5,7 @@
 //! | [`X86_64`] | x86_64 4-level paging | 4 | 48, sign-extended |
 //! | [`Aarch64`] | AArch64 stage 1, 4 KiB granule | 4 | 48, sign-extended |
 //! | [`Sv39`] / [`Sv48`] | RISC-V supervisor paging | 3 / 4 | 39 / 48, sign-extended |
+//! | [`Sv39x4`] / [`Sv48x4`] | RISC-V G-stage (guest physical), 16 KiB root | 3 / 4 | 41 / 50 |
 //! | [`Ept`] | Intel extended page tables (guest physical) | 4 | 48 |
 //! | [`Aarch64Stage2`] | AArch64 stage 2 (guest IPA), starting level 0 | 4 | 48 |
 
@@ -276,6 +277,51 @@ impl<const LEVELS: usize, const VA_BITS: u32> PageTableFormat for Riscv<LEVELS, 
             }
         }
         f
+    }
+}
+
+/// RISC-V G-stage translation (the hypervisor extension's guest-physical
+/// stage). Entries use the Sv39/Sv48 encoding, with `U` always set because
+/// G-stage checks every guest access as a user access; `USER` and `GLOBAL`
+/// are ignored. The root has 2048 entries over four pages, giving two extra
+/// address bits.
+pub struct RiscvGStage<const LEVELS: usize, const VA_BITS: u32>;
+
+/// RISC-V Sv39x4 (`hgatp.MODE` 8).
+pub type Sv39x4 = RiscvGStage<3, 41>;
+/// RISC-V Sv48x4 (`hgatp.MODE` 9).
+pub type Sv48x4 = RiscvGStage<4, 50>;
+
+impl<const LEVELS: usize, const VA_BITS: u32> PageTableFormat for RiscvGStage<LEVELS, VA_BITS> {
+    const LEVELS: usize = LEVELS;
+    const VA_BITS: u32 = VA_BITS;
+    const SIGN_EXTEND: bool = false;
+    const MAX_LEAF_LEVEL: usize = 2;
+    const ROOT_PAGES: usize = 4;
+
+    fn table(pa: PhysAddr) -> u64 {
+        Sv39::table(pa)
+    }
+
+    fn leaf(pa: PhysAddr, f: MapFlags, level: usize) -> u64 {
+        let f = f.difference(MapFlags::USER | MapFlags::GLOBAL);
+        Sv39::leaf(pa, f, level) | rv::U
+    }
+
+    fn is_valid(pte: u64) -> bool {
+        Sv39::is_valid(pte)
+    }
+
+    fn is_leaf(pte: u64, level: usize) -> bool {
+        Sv39::is_leaf(pte, level)
+    }
+
+    fn addr(pte: u64, level: usize) -> PhysAddr {
+        Sv39::addr(pte, level)
+    }
+
+    fn flags(pte: u64, level: usize) -> MapFlags {
+        Sv39::flags(pte & !(rv::U | rv::G), level)
     }
 }
 

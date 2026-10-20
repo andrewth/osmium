@@ -3,8 +3,9 @@
 //! - [`memory`]: [`GuestMemory`], the map from guest-physical addresses to
 //!   host memory, with bounds-checked access and a [`Pod`] marker for typed
 //!   reads and writes (in the spirit of rust-vmm's `vm-memory`).
-//! - [`stage2`]: second-stage page tables (Intel EPT, Arm stage 2) built on
-//!   `osmium_mm::PageTable`, and helpers to encode EPTP and VTTBR.
+//! - [`stage2`]: second-stage page tables (Intel EPT, Arm stage 2, RISC-V
+//!   G-stage) built on
+//!   `osmium_mm::PageTable`, and helpers to encode EPTP, VTTBR and hgatp.
 //! - [`bus`]: MMIO and port-I/O buses that route guest accesses to emulated
 //!   devices (as in rust-vmm's `vm-device`).
 //! - [`vcpu`]: a normalized [`VmExit`], the [`Vcpu`] trait that hardware

@@ -109,6 +109,17 @@ fn sv48() {
 }
 
 #[test]
+fn sv39x4() {
+    // The top of the 41-bit space lands in the fourth root page.
+    exercise::<Sv39x4>(0x0000_01ff_ffff_f000);
+}
+
+#[test]
+fn sv48x4() {
+    exercise::<Sv48x4>(0x0003_ffff_ffff_f000);
+}
+
+#[test]
 fn ept() {
     exercise::<Ept>(0x0000_ffff_ffff_f000);
 }
@@ -121,6 +132,8 @@ fn aarch64_stage2() {
 #[test]
 fn encodings() {
     // Values checked against the architecture manuals.
+    assert_eq!(Sv39x4::leaf(pa(0x5000), MapFlags::RW | MapFlags::GLOBAL, 0), 0x14d7, "V|R|W|U|A|D, no G");
+    assert_eq!(Sv39x4::flags(0x14d7, 0), MapFlags::RW | MapFlags::READ);
     assert_eq!(X86_64::leaf(pa(0x5000), MapFlags::RW, 0), 0x8000_0000_0000_5063);
     assert_eq!(X86_64::leaf(pa(0x20_0000), MapFlags::RX | MapFlags::GLOBAL, 1), 0x20_01a1);
     assert_eq!(Sv39::leaf(pa(0x8020_0000), MapFlags::RW, 0), 0x2008_00c7);

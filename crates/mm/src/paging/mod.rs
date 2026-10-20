@@ -138,6 +138,10 @@ pub trait PageTableFormat {
     const SIGN_EXTEND: bool;
     /// Highest level at which a leaf (huge page) is allowed.
     const MAX_LEAF_LEVEL: usize;
+    /// Number of contiguous pages in the root table, a power of two. Each
+    /// extra page widens the root index by one bit (RISC-V G-stage roots
+    /// are 4 pages, 16 KiB aligned).
+    const ROOT_PAGES: usize = 1;
 
     /// Encodes an entry pointing at the next-level table at `pa`.
     fn table(pa: PhysAddr) -> u64;
@@ -167,6 +171,24 @@ pub unsafe trait TableAlloc: PhysMapper {
     /// # Safety
     /// The frame must no longer be referenced by any table.
     unsafe fn free_table(&self, pa: PhysAddr);
+
+    /// Allocates a root table of `pages` contiguous frames, aligned to its
+    /// size. It need not be zeroed. The default supports only one page.
+    fn alloc_root(&self, pages: usize) -> Option<PhysAddr> {
+        if pages == 1 { self.alloc_table() } else { None }
+    }
+
+    /// Frees a root from `alloc_root`. The default frees each page with
+    /// `free_table`; allocators that override `alloc_root` may override this.
+    ///
+    /// # Safety
+    /// As for `free_table`.
+    unsafe fn free_root(&self, pa: PhysAddr, pages: usize) {
+        for i in 0..pages as u64 {
+            // SAFETY: forwarded contract.
+            unsafe { self.free_table(pa + i * PAGE_SIZE as u64) }
+        }
+    }
 }
 
 // SAFETY: forwards to `A`.
@@ -177,6 +199,13 @@ unsafe impl<A: TableAlloc + ?Sized> TableAlloc for &A {
     unsafe fn free_table(&self, pa: PhysAddr) {
         // SAFETY: forwarded contract.
         unsafe { (**self).free_table(pa) }
+    }
+    fn alloc_root(&self, pages: usize) -> Option<PhysAddr> {
+        (**self).alloc_root(pages)
+    }
+    unsafe fn free_root(&self, pa: PhysAddr, pages: usize) {
+        // SAFETY: forwarded contract.
+        unsafe { (**self).free_root(pa, pages) }
     }
 }
 
@@ -253,7 +282,9 @@ pub struct PageTable<F: PageTableFormat, A: TableAlloc> {
 impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     /// Allocates an empty root table.
     pub fn new(alloc: A) -> Result<Self, MapError> {
-        let root = Self::new_table(&alloc)?;
+        let root = alloc.alloc_root(F::ROOT_PAGES).ok_or(MapError::OutOfMemory)?;
+        // SAFETY: a fresh, exclusively owned block of `ROOT_PAGES` frames.
+        unsafe { alloc.phys_to_virt(root).write_bytes(0, PAGE_SIZE * F::ROOT_PAGES) };
         Ok(Self { root, alloc, shared: [0; ENTRIES / 64], _format: PhantomData })
     }
 
@@ -280,6 +311,7 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     /// # Safety
     /// `kernel` (its subtables, at least) must outlive this table.
     pub unsafe fn share_root_entries<B: TableAlloc>(&mut self, kernel: &PageTable<F, B>, indices: core::ops::Range<usize>) {
+        assert!(F::ROOT_PAGES == 1, "multi-page roots (G-stage) cannot share entries");
         assert!(indices.end <= ENTRIES, "root index out of range");
         let top = F::LEVELS - 1;
         for i in indices {
@@ -452,12 +484,17 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     }
 
     fn entry(&self, table: PhysAddr, va: VirtAddr, level: usize) -> &AtomicU64 {
-        let index = (va.0 >> (12 + 9 * level)) as usize % ENTRIES;
+        let index = (va.0 >> (12 + 9 * level)) as usize % Self::entries(level);
         let base = self.alloc.phys_to_virt(table).cast::<AtomicU64>();
         // SAFETY: `table` is a table frame of this tree, mapped by the
         // allocator's contract; the index is in bounds. Entries are accessed
         // atomically because the hardware walker reads them concurrently.
         unsafe { &*base.add(index) }
+    }
+
+    /// Entries in a table at `level`: the root may span several pages.
+    fn entries(level: usize) -> usize {
+        if level == F::LEVELS - 1 { ENTRIES * F::ROOT_PAGES } else { ENTRIES }
     }
 
     fn new_table(alloc: &A) -> Result<PhysAddr, MapError> {
@@ -469,7 +506,7 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
 
     fn free_subtree(&self, table: PhysAddr, level: usize) {
         if level > 0 {
-            for i in 0..ENTRIES {
+            for i in 0..Self::entries(level) {
                 let va = VirtAddr::new((i as u64) << (12 + 9 * level));
                 if level == F::LEVELS - 1 && self.is_shared(va) {
                     continue;
@@ -482,7 +519,13 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         }
         // SAFETY: called once per table, during drop, when nothing else
         // references the tree.
-        unsafe { self.alloc.free_table(table) };
+        unsafe {
+            if level == F::LEVELS - 1 {
+                self.alloc.free_root(table, F::ROOT_PAGES);
+            } else {
+                self.alloc.free_table(table);
+            }
+        }
     }
 }
 
