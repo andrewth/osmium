@@ -3,8 +3,9 @@
 // (TrapCpu.guest != 0): they branch to osmium_el2_guest_exit (osmium-virt)
 // with x0 = TrapCpu.guest, x1 = the vector number and the guest's x0/x1
 // pushed on the stack. Otherwise they fall through to the normal stub.
-// The symbol is weak so builds without osmium-virt still link; the branch
-// is only taken once a vCPU has set TrapCpu.guest.
+// The weak default below keeps builds without osmium-virt linking; the
+// branch is only taken once a vCPU has set TrapCpu.guest, and osmium-virt's
+// strong definition replaces the default.
 .weak osmium_el2_guest_exit
 .macro osmium_guest_vector kind
     stp x0, x1, [sp, #-16]!
@@ -22,6 +23,11 @@
     mov x0, #\kind
     b osmium_trap_common
 .endm
+
+// Unreachable without osmium-virt (nothing else sets TrapCpu.guest).
+osmium_el2_guest_exit:
+    brk #0xe2
+    b osmium_el2_guest_exit
 
 .macro osmium_kernel_vector kind
     // Current EL with SP_ELx: check sp before the first store, in case the
