@@ -578,7 +578,7 @@ For their timeouts they take an `osmium::hal::timer::Clock` (anything with
 | Driver | Finds | Use |
 |---|---|---|
 | `ahci::Ahci` | class 01/06/01, registers in BAR 5 | `Ahci::new(io, &dma, Some(&clock))` brings the ports up; with `None`, its timeouts count polls instead of time. `disks()` lists the SATA disk ports, and `take_disk(port)` returns an `AhciDisk`, a `BlockDevice` with `model()` and `serial()` that outlives the HBA. No ATAPI or NCQ. |
-| `nvme::Nvme` | class 01/08/02, BAR 0 (64-bit) | `Nvme::new(io, &dma, &clock)` is a `BlockDevice` on the first active namespace. Use `select_namespace(nsid)` to pick another. It has `model()`, `serial()` and `firmware()`, uses one I/O queue pair, and shuts the controller down on drop. |
+| `nvme::Nvme` | class 01/08/02, BAR 0 (64-bit) | `Nvme::new(io, &dma, &clock)` is a `BlockDevice` on the first active namespace. Use `select_namespace(nsid)` to pick another. It has `model()`, `serial()` and `firmware()`, uses one I/O queue pair with up to four commands in flight for transfers that split, and shuts the controller down on drop. `Nvme::with_interrupts(io, &dma, &clock, Interrupts { vector, signal, idle })` creates the I/O completion queue on an MSI-X table entry you have set up; your handler calls `IrqSignal::notify()` and the driver sleeps in `idle` between completions (admin commands are still polled). |
 
 ### Displays
 

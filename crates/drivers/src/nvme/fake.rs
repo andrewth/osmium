@@ -21,7 +21,7 @@ use std::vec::Vec;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::timer::Clock;
 
-use super::{ACQ, AQA, ASQ, CAP, CC, CSTS, DOORBELLS, PAGE, VS, op};
+use super::{ACQ, AQA, ASQ, CAP, CC, CSTS, DOORBELLS, IrqSignal, PAGE, VS, op};
 
 /// Bytes of register window.
 pub const REGS_LEN: usize = 0x2000;
@@ -85,6 +85,8 @@ pub struct Config {
     /// Sets More in every completion's status, and Do Not Retry in failed
     /// ones.
     pub status_flags: bool,
+    /// Posts the completions found in one doorbell scan in reverse order.
+    pub reorder: bool,
     pub namespaces: Vec<Ns>,
 }
 
@@ -109,6 +111,7 @@ impl Default for Config {
             fatal_io: false,
             io_delay_ns: 0,
             status_flags: false,
+            reorder: false,
             namespaces: vec![Ns::new(1, 9, 1024)],
         }
     }
@@ -148,6 +151,8 @@ struct Cq {
     size: u16,
     tail: u16,
     phase: bool,
+    /// Raises the fake's MSI-X signal for each completion.
+    ien: bool,
 }
 
 pub struct Fake {
@@ -165,6 +170,12 @@ pub struct Fake {
     /// Clock readings so far, so a slow command can wait for the driver to
     /// see the time it took.
     readings: AtomicU64,
+    /// Raised for each completion posted to a queue with interrupts on.
+    pub signal: IrqSignal,
+    /// The most commands the controller found waiting at once on an I/O queue.
+    pub max_inflight: AtomicU32,
+    /// Dword 11 of the last Create I/O Completion Queue.
+    pub cq_flags: AtomicU32,
 }
 
 // The driver's buffers are identity-mapped host memory.
@@ -243,6 +254,9 @@ impl Fake {
             start: Instant::now(),
             skipped: AtomicU64::new(0),
             readings: AtomicU64::new(0),
+            signal: IrqSignal::new(),
+            max_inflight: AtomicU32::new(0),
+            cq_flags: AtomicU32::new(0),
         }
     }
 
@@ -331,7 +345,8 @@ impl Fake {
                     let (asq, acq) = (asq | (self.reg(ASQ + 4) as u64) << 32, acq | (self.reg(ACQ + 4) as u64) << 32);
                     assert_eq!((asq % PAGE as u64, acq % PAGE as u64), (0, 0));
                     sqs[0] = Some(Sq { base: asq, size: (aqa & 0xfff) as u16 + 1, head: 0, cqid: 0 });
-                    cqs[0] = Some(Cq { base: acq, size: (aqa >> 16 & 0xfff) as u16 + 1, tail: 0, phase: true });
+                    cqs[0] =
+                        Some(Cq { base: acq, size: (aqa >> 16 & 0xfff) as u16 + 1, tail: 0, phase: true, ien: false });
                     enabled = true;
                     self.set_reg(CSTS, 1);
                 }
@@ -345,6 +360,11 @@ impl Fake {
                 let Some(mut sq) = sqs[qid as usize] else { continue };
                 let tail = self.doorbell(qid, false);
                 assert!(tail < sq.size, "SQ {qid} tail {tail} within {}", sq.size);
+                if qid == 1 {
+                    let waiting = (tail + sq.size - sq.head) % sq.size;
+                    self.max_inflight.fetch_max(waiting as u32, Ordering::Relaxed);
+                }
+                let mut deferred = Vec::new();
                 while sq.head != tail {
                     busy = true;
                     let sqe: [u32; 16] = core::array::from_fn(|i| rd32(sq.base + sq.head as u64 * 64 + 4 * i as u64));
@@ -371,7 +391,15 @@ impl Fake {
                     if qid == 1 && self.cfg.stray {
                         self.post(cq, sq.cqid, cid ^ 0x8000, qid, sq.head, 0, 0);
                     }
+                    if qid == 1 && self.cfg.reorder {
+                        deferred.push((sq.cqid, cid, sq.head, result, status));
+                        continue;
+                    }
                     self.post(cq, sq.cqid, cid, qid, sq.head, result, status);
+                }
+                for (cqid, cid, head, result, status) in deferred.into_iter().rev() {
+                    let cq = cqs[cqid as usize].as_mut().expect("completion queue exists");
+                    self.post(cq, cqid, cid, qid, head, result, status);
                 }
             }
             if !busy {
@@ -401,6 +429,9 @@ impl Fake {
         wr32(at + 8, sqhd as u32 | (sqid as u32) << 16);
         core::sync::atomic::fence(Ordering::Release);
         wr32(at + 12, cid as u32 | (cq.phase as u32) << 16 | (status as u32) << 17);
+        if cq.ien {
+            self.signal.notify();
+        }
         cq.tail += 1;
         if cq.tail == cq.size {
             cq.tail = 0;
@@ -485,10 +516,12 @@ impl Fake {
                 (0, 0)
             }
             op::CREATE_CQ => {
-                assert_eq!((qid, sqe[11]), (1, 1), "qid 1, contiguous, no interrupts");
+                assert_eq!(qid, 1);
+                assert!(sqe[11] & 0xffff == 1 || sqe[11] & 0xffff == 3, "contiguous, interrupts on or off");
+                self.cq_flags.store(sqe[11], Ordering::Relaxed);
                 assert!(size >= 2 && size <= self.cfg.mqes + 1, "CQ size {size}");
                 assert_eq!(prp1 % PAGE as u64, 0);
-                cqs[1] = Some(Cq { base: prp1, size, tail: 0, phase: true });
+                cqs[1] = Some(Cq { base: prp1, size, tail: 0, phase: true, ien: sqe[11] & 2 != 0 });
                 (0, 0)
             }
             op::CREATE_SQ => {

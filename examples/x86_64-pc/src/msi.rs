@@ -1,18 +1,24 @@
 //! MSI-X under QEMU: an NVMe controller's admin completions arrive as
 //! message-signalled interrupts at [`VECTOR`] on this CPU's local APIC.
 //!
-//! The NVMe driver itself polls; it does not know about the interrupts.
+//! The first driver instance polls; it does not know about the interrupts.
 //! Every admin queue completion raises MSI-X table entry 0 (the admin
 //! completion queue always uses interrupt vector 0), so bringing the
 //! controller up is enough to see interrupts arrive. A further admin command
 //! with the entry masked must leave its interrupt pending in the PBA, to be
 //! sent when the entry is unmasked.
+//!
+//! A second instance is then created with [`Nvme::with_interrupts`] on table
+//! entry 1 (same vector): its I/O completion queue raises MSI-X, the handler
+//! calls [`IrqSignal::notify`], and a transfer split into several commands
+//! is kept in flight and reaped by interrupt.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use osmium::boot::acpi::EcamWindow;
 use osmium::drivers::lapic;
-use osmium::drivers::nvme::{self, Nvme, NvmeError};
+use osmium::drivers::nvme::{self, Interrupts, IrqSignal, Nvme, NvmeError};
+use osmium::hal::block::BlockDevice;
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci::{self, Function, MsiError};
 use osmium::hal::println;
@@ -25,9 +31,13 @@ pub const VECTOR: u8 = 0x50;
 /// Interrupts received at [`VECTOR`].
 static DELIVERED: AtomicU32 = AtomicU32::new(0);
 
+/// Raised on every interrupt at [`VECTOR`], for the NVMe driver to wait on.
+static SIGNAL: IrqSignal = IrqSignal::new();
+
 /// Handles [`VECTOR`].
 pub fn on_interrupt() {
     DELIVERED.fetch_add(1, Ordering::Relaxed);
+    SIGNAL.notify();
     crate::LAPIC.get().expect("LAPIC initialised").eoi();
 }
 
@@ -158,6 +168,31 @@ fn run(func: &Function<'_, pci::Ecam>) -> Result<(), Error> {
     }
 
     drop(disk);
+
+    // Interrupt-driven completions: table entry 1, to the same vector.
+    table.set_message(1, lapic::msi_message(apic, VECTOR))?;
+    table.set_masked(1, false)?;
+    let idle = || core::hint::spin_loop();
+    let irq = Interrupts { vector: 1, signal: &SIGNAL, idle: &idle };
+    let mut disk = Nvme::with_interrupts(map(regs.address, regs.size), &crate::FRAMES, &Uptime, irq)?;
+    let before = SIGNAL.count();
+    // Eight commands' worth, kept in flight several at a time.
+    let mut buf = alloc::vec![0xa5u8; 8 * nvme::DATA_LEN];
+    let ok = disk.read_blocks(0, &mut buf).is_ok() && buf.iter().all(|&b| b == 0);
+    let n = SIGNAL.count().wrapping_sub(before);
+    if ok && n > 0 {
+        println!(
+            "[msi]   nvme completions by interrupt: {} KiB read in commands of up to {} KiB, up to {} in flight, {n} \
+             interrupts on MSI-X entry 1",
+            buf.len() / 1024,
+            disk.max_transfer() / 1024,
+            disk.queue_depth()
+        );
+    } else {
+        println!("[msi]   nvme completions by interrupt: read ok {ok}, interrupts {n}");
+    }
+    drop(disk);
+    table.set_masked(1, true)?;
     table.set_masked(0, true)?;
     msix.disable(func);
     Ok(())

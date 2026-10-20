@@ -162,12 +162,12 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ USB Ethernet (CDC-ECM) as a `NetDevice` on any `UsbHost`: functional-descriptor probing, MAC from the string descriptor, alternate-setting selection, notification-driven link state; boots under QEMU `usb-net` (its second configuration) and resolves ARP
 - ✅ Mellanox ConnectX-2/-3 (mlx4) Ethernet: reset, firmware start, ICM, polled raw Ethernet queue pair per port as a `NetDevice`; tested against a simulated HCA
 - ✅ AHCI (SATA): HBA handoff and port bring-up, IDENTIFY, READ/WRITE DMA EXT and FLUSH CACHE EXT; each disk is its own `BlockDevice` that outlives the HBA; error recovery with CLO or COMRESET; boots against QEMU `ich9-ahci` + `ide-hd`
-- ✅ NVMe: admin and one I/O queue pair (phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting, normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
+- ✅ NVMe: admin and one I/O queue pair (phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting with up to four commands in flight (out-of-order completions), optional MSI-X completion interrupts (`Nvme::with_interrupts`; polling remains the default), normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
 - ✅ virtio-pci transport (modern, capability-located registers); tested against a fake function and on QEMU `virtio-gpu-pci`/`virtio-vga`
 - ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
 - ✅ Bochs DISPI display (`BochsVbe`): QEMU std VGA, `bochs-display` and `virtio-vga` modes over MMIO on any architecture or ports on x86
 - ✅ VESA BIOS Extensions: controller and mode information, mode search and LFB mode setting through a `VideoBios` (x86's real-mode thunk, or a fake in tests)
-- 🗺 virtio console; virtio-gpu cursor, EDID and interrupts; a framebuffer text console; xHCI hubs and isochronous transfers; HID report descriptors; GICv3; HPET; AHCI/NVMe interrupts, NCQ and multiple queues; ATAPI
+- 🗺 virtio console; virtio-gpu cursor, EDID and interrupts; a framebuffer text console; xHCI hubs and isochronous transfers; HID report descriptors; GICv3; HPET; AHCI interrupts and NCQ, NVMe multiple I/O queues; ATAPI
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)

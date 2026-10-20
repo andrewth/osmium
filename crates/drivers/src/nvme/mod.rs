@@ -3,12 +3,20 @@
 //! [`Nvme`] brings a controller up from its registers (PCI BAR 0, class
 //! 01/08/02): disable, one admin queue pair, enable, IDENTIFY, one I/O
 //! queue pair, and the first active namespace, which it then serves as a
-//! [`BlockDevice`]. Like virtio-blk, requests are synchronous: one command
-//! is in flight at a time and the driver polls its completion queue, so no
-//! interrupt line is needed (they stay masked). Data is bounced through a
-//! DMA buffer of [`DATA_LEN`] bytes, described to the controller with PRP
-//! entries; larger transfers, and those over the controller's maximum
-//! (MDTS), are split.
+//! [`BlockDevice`]. Requests are synchronous, but a transfer larger than one
+//! command carries (over [`DATA_LEN`], or the controller's maximum, MDTS) is
+//! split and the pieces are kept in flight together, up to [`SLOTS`] at a
+//! time (fewer if the controller's queues are shorter), each with its own
+//! bounce buffer of [`DATA_LEN`] bytes described by PRP entries; completions
+//! may arrive in any order.
+//!
+//! By default the driver polls its completion queue ([`Nvme::new`]). With
+//! [`Nvme::with_interrupts`] the I/O completion queue is created with an
+//! MSI-X vector instead, and the driver sleeps through an [`Interrupts::idle`]
+//! hook between completions; the caller programs the MSI-X table and the
+//! interrupt handler, which calls [`IrqSignal::notify`]. Admin commands are
+//! always polled. The interrupt mask registers (INTMS) stay masked, as they
+//! must with MSI-X.
 //!
 //! Every wait is bounded by a [`Clock`]: CAP.TO for the controller to
 //! change state, [`COMMAND_TIMEOUT_NS`] for a command ([`FLUSH_TIMEOUT_NS`]
@@ -22,8 +30,9 @@
 //! allocators do. Namespaces with metadata, or with blocks larger than
 //! 4 KiB, are not supported.
 //!
-//! Not yet supported: interrupts (MSI-X), several commands in flight,
-//! several I/O queues, and controllers whose smallest page exceeds 4 KiB.
+//! Not yet supported: several I/O queues (one per CPU), pin-based or
+//! single-vector MSI interrupts, and controllers whose smallest page
+//! exceeds 4 KiB.
 
 mod queue;
 
@@ -31,6 +40,8 @@ mod queue;
 mod fake;
 
 use core::mem::ManuallyDrop;
+use core::ops::Range;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use osmium_arch::barrier;
 use osmium_hal::block::{BlockDevice, BlockError};
@@ -43,8 +54,11 @@ use queue::{Queue, Sqe};
 /// The BAR holding the controller's registers (64-bit memory).
 pub const BAR: u8 = 0;
 
-/// Bytes of DMA bounce buffer, and so the most one command transfers.
+/// Bytes of DMA bounce buffer per slot, and so the most one command transfers.
 pub const DATA_LEN: usize = 64 * 1024;
+
+/// Bounce buffers, and so the most I/O commands in flight at once.
+pub const SLOTS: usize = 4;
 
 /// Entries in the admin queues.
 pub const ADMIN_DEPTH: u16 = 16;
@@ -54,6 +68,9 @@ pub const IO_DEPTH: u16 = 16;
 
 /// The memory page size the driver programs (CC.MPS = 0).
 const PAGE: usize = 4096;
+
+/// Create I/O completion queue: interrupts enabled.
+const QUEUE_IEN: u32 = 1 << 1;
 
 // The PRP list is one page, never chained.
 const _: () = assert!(DATA_LEN / PAGE <= PAGE / 8);
@@ -226,11 +243,67 @@ impl Regs {
     }
 }
 
+/// A count of completion interrupts, shared between the interrupt handler
+/// and the driver (a `static` will do).
+pub struct IrqSignal(AtomicU32);
+
+impl IrqSignal {
+    /// A signal nothing has raised.
+    pub const fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+
+    /// Records an interrupt; call it from the MSI-X handler.
+    pub fn notify(&self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
+
+    /// Interrupts recorded so far (wrapping).
+    pub fn count(&self) -> u32 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Default for IrqSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How an interrupt-driven [`Nvme`] is signalled and waits.
+#[derive(Clone, Copy)]
+pub struct Interrupts<'d> {
+    /// The MSI-X table entry the I/O completion queue raises. The caller
+    /// has programmed and unmasked it, and enabled MSI-X.
+    pub vector: u16,
+    /// Raised by the handler of that vector.
+    pub signal: &'d IrqSignal,
+    /// Called to sleep until an interrupt may have arrived (for example
+    /// `sti; hlt`). It may return early or spuriously, and must return
+    /// eventually (a timer tick suffices), since the driver enforces its
+    /// command timeouts between calls.
+    pub idle: &'d dyn Fn(),
+}
+
+/// Sleeps in `irq`'s idle hook if no interrupt has arrived since `seen`
+/// (read before the completion queue was checked), else just spins once.
+fn idle(irq: Option<Interrupts<'_>>, seen: u32) {
+    match irq {
+        Some(i) if i.signal.count() == seen => (i.idle)(),
+        _ => osmium_arch::cpu::spin_hint(),
+    }
+}
+
+/// Copies a range of a request to or from the bounce buffer at a DMA offset.
+type Copier<'d, 'f, D> = dyn FnMut(&OwnedDma<'d, D>, usize, Range<usize>) + 'f;
+
 /// Everything the controller may access by DMA.
 struct Memory<'d, D: DmaAllocator + ?Sized> {
     admin: Queue<'d, D>,
     io: Queue<'d, D>,
+    /// [`SLOTS`] bounce buffers of [`DATA_LEN`] bytes.
     data: OwnedDma<'d, D>,
+    /// [`SLOTS`] pages of PRP list, one per bounce buffer.
     prp_list: OwnedDma<'d, D>,
 }
 
@@ -244,6 +317,7 @@ pub struct Nvme<'d, D: DmaAllocator + ?Sized> {
     /// CAP.TO: how long the controller may take to enable or disable.
     ready_timeout_ns: u64,
     next_cid: u16,
+    irq: Option<Interrupts<'d>>,
     /// Why a command was lost (it timed out, or the controller failed);
     /// the controller may still write its buffer.
     broken: Option<Failure>,
@@ -264,7 +338,27 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
     /// starts it with DMA memory from `dma`, serving its first active
     /// namespace; `clock` times its waits. The PCI function must already
     /// decode memory and be allowed to master the bus.
+    ///
+    /// Completions are polled; see [`with_interrupts`](Self::with_interrupts).
     pub fn new(io: IoMem, dma: &'d D, clock: &'d dyn Clock) -> Result<Self, NvmeError> {
+        Self::start(io, dma, clock, None)
+    }
+
+    /// Like [`new`](Self::new), but the I/O completion queue raises MSI-X
+    /// vector `irq.vector` and the driver waits with `irq.idle` instead of
+    /// spinning. The caller must have set up the vector (and enabled MSI-X
+    /// on the PCI function) before this call; if it cannot, use
+    /// [`new`](Self::new), which works without any interrupts.
+    pub fn with_interrupts(
+        io: IoMem,
+        dma: &'d D,
+        clock: &'d dyn Clock,
+        irq: Interrupts<'d>,
+    ) -> Result<Self, NvmeError> {
+        Self::start(io, dma, clock, Some(irq))
+    }
+
+    fn start(io: IoMem, dma: &'d D, clock: &'d dyn Clock, irq: Option<Interrupts<'d>>) -> Result<Self, NvmeError> {
         let r = |off: usize| io.read::<u32>(off).map_err(|_| NvmeError::BadRegisters);
         let cap = r(CAP)? as u64 | (r(CAP + 4)? as u64) << 32;
         let version = r(VS)?;
@@ -283,8 +377,8 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         let mem = Memory {
             admin: Queue::new(dma, 0, ADMIN_DEPTH)?,
             io: Queue::new(dma, IO_QID, (mqes.saturating_add(1)).min(IO_DEPTH))?,
-            data: alloc(dma, DATA_LEN)?,
-            prp_list: alloc(dma, PAGE)?,
+            data: alloc(dma, SLOTS * DATA_LEN)?,
+            prp_list: alloc(dma, SLOTS * PAGE)?,
         };
         // From here on, dropping `nvme` on an error disables the controller
         // before the memory goes.
@@ -294,6 +388,7 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
             clock,
             ready_timeout_ns: timeout * TIMEOUT_UNIT_NS,
             next_cid: 0,
+            irq,
             broken: None,
             io_queues: false,
             version,
@@ -345,6 +440,17 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
     /// controller says so.
     pub fn max_transfer(&self) -> usize {
         self.max_transfer
+    }
+
+    /// The most I/O commands this driver keeps in flight: [`SLOTS`], or
+    /// fewer if the controller's I/O queue is shorter.
+    pub fn queue_depth(&self) -> usize {
+        SLOTS.min(self.mem.io.depth() as usize - 1)
+    }
+
+    /// True if completions arrive by interrupt rather than polling.
+    pub fn interrupt_driven(&self) -> bool {
+        self.irq.is_some()
     }
 
     /// True if the controller has a volatile write cache, which
@@ -476,8 +582,12 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         }
         let (sq, cq) = self.mem.io.addrs();
         let size = (self.mem.io.depth() as u32 - 1) << 16 | IO_QID as u32;
-        // Interrupts stay off (IEN = 0).
-        let mut create_cq = command(op::CREATE_CQ, 0, size, QUEUE_PC, 0);
+        // Interrupts stay off (IEN = 0) unless the caller set up a vector.
+        let flags = match self.irq {
+            Some(i) => QUEUE_PC | QUEUE_IEN | (i.vector as u32) << 16,
+            None => QUEUE_PC,
+        };
+        let mut create_cq = command(op::CREATE_CQ, 0, size, flags, 0);
         set_prps(&mut create_cq, cq, 0);
         self.admin(create_cq, 0)?;
         self.io_queues = true;
@@ -508,11 +618,95 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         })
     }
 
-    /// Runs one read or write of `len` bytes of the buffer at `lba`.
-    fn transfer(&mut self, opcode: u8, lba: u64, len: usize) -> Result<(), BlockError> {
-        let blocks = (len >> self.block_shift) as u32;
-        let sqe = command(opcode, self.nsid, lba as u32, (lba >> 32) as u32, blocks - 1);
-        self.execute(true, sqe, len).map(|_| ()).map_err(|_| BlockError::Io)
+    /// Reads or writes `len` bytes at `lba` as commands of at most
+    /// `max_transfer` bytes, keeping up to [`queue_depth`](Self::queue_depth)
+    /// of them in flight. `fill` copies a piece's bytes (a range of the
+    /// request) into its bounce buffer before it is submitted, and `drain`
+    /// copies them out once it completes; both get the buffer's offset in
+    /// the DMA region. If a piece fails, no more are submitted, those in
+    /// flight are waited for, and the request fails.
+    fn pipeline(
+        &mut self,
+        opcode: u8,
+        lba: u64,
+        len: usize,
+        fill: &mut Copier<'d, '_, D>,
+        drain: &mut Copier<'d, '_, D>,
+    ) -> Result<(), BlockError> {
+        if self.broken.is_some() {
+            return Err(BlockError::Io);
+        }
+        let chunk = self.max_transfer;
+        let pieces = len.div_ceil(chunk);
+        let window = self.queue_depth();
+        let irq = self.irq;
+        let qid = self.mem.io.qid();
+        // The command identifier and piece index in each slot.
+        let mut slots: [Option<(u16, usize)>; SLOTS] = [None; SLOTS];
+        let (mut submitted, mut failed) = (0, false);
+        let mut deadline = self.clock.now_ns().saturating_add(COMMAND_TIMEOUT_NS);
+        loop {
+            let mut tail = None;
+            while !failed && submitted < pieces {
+                let Some(slot) = slots[..window].iter().position(Option::is_none) else { break };
+                let start = submitted * chunk;
+                let range = start..len.min(start + chunk);
+                fill(&self.mem.data, slot * DATA_LEN, range.clone());
+                let cid = self.next_cid;
+                self.next_cid = if cid == MAX_CID { 0 } else { cid + 1 };
+                let at = lba + (start >> self.block_shift) as u64;
+                let blocks = (range.len() >> self.block_shift) as u32;
+                let mut sqe = command(opcode, self.nsid, at as u32, (at >> 32) as u32, blocks - 1);
+                sqe[0] |= (cid as u32) << 16;
+                self.data_prps(&mut sqe, slot, range.len());
+                tail = Some(self.mem.io.push(&sqe));
+                slots[slot] = Some((cid, submitted));
+                submitted += 1;
+            }
+            if let Some(tail) = tail {
+                // The entries (and PRP lists) before the doorbell.
+                barrier::mb();
+                self.regs.doorbell(qid, false, tail);
+                deadline = self.clock.now_ns().saturating_add(COMMAND_TIMEOUT_NS);
+            }
+            if slots.iter().all(Option::is_none) {
+                return if failed { Err(BlockError::Io) } else { Ok(()) };
+            }
+            // Wait for one completion, whichever it is.
+            let lost = loop {
+                let seen = irq.map_or(0, |i| i.signal.count());
+                let Some(done) = self.mem.io.pop() else {
+                    if self.regs.read(CSTS) & CSTS_CFS != 0 {
+                        break Some(Failure::Fatal);
+                    }
+                    if self.clock.now_ns() > deadline {
+                        break Some(Failure::Timeout);
+                    }
+                    idle(irq, seen);
+                    continue;
+                };
+                self.regs.doorbell(qid, true, self.mem.io.head());
+                let found = slots.iter().position(|s| matches!(s, Some((cid, _)) if *cid == done.cid));
+                // Anything else is stray.
+                let Some(slot) = found.filter(|_| done.sqid == qid) else { continue };
+                let (_, index) = slots[slot].take().expect("slot was just matched");
+                match done.status {
+                    0 if opcode == op::READ => {
+                        let start = index * chunk;
+                        drain(&self.mem.data, slot * DATA_LEN, start..len.min(start + chunk));
+                    }
+                    0 => {}
+                    _ => failed = true,
+                }
+                deadline = self.clock.now_ns().saturating_add(COMMAND_TIMEOUT_NS);
+                break None;
+            };
+            // Only a lost command gets here without a completion.
+            if let Some(why) = lost {
+                self.broken = Some(why);
+                return Err(BlockError::Io);
+            }
+        }
     }
 
     /// Submits `sqe` on the admin or I/O queue, pointing its PRPs at the
@@ -526,8 +720,9 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         self.next_cid = if cid == MAX_CID { 0 } else { cid + 1 };
         sqe[0] |= (cid as u32) << 16;
         if len > 0 {
-            self.data_prps(&mut sqe, len);
+            self.data_prps(&mut sqe, 0, len);
         }
+        let irq = self.irq.filter(|_| io_queue);
 
         let mem = &mut *self.mem;
         let queue = if io_queue { &mut mem.io } else { &mut mem.admin };
@@ -541,6 +736,7 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         barrier::mb();
         self.regs.doorbell(queue.qid(), false, tail);
         let why = loop {
+            let seen = irq.map_or(0, |i| i.signal.count());
             let Some(done) = queue.pop() else {
                 // A failed controller completes nothing more.
                 if self.regs.read(CSTS) & CSTS_CFS != 0 {
@@ -549,7 +745,7 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
                 if self.clock.now_ns() > deadline {
                     break Failure::Timeout;
                 }
-                osmium_arch::cpu::spin_hint();
+                idle(irq, seen);
                 continue;
             };
             self.regs.doorbell(queue.qid(), true, queue.head());
@@ -565,19 +761,20 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         Err(why)
     }
 
-    /// Describes the first `len` bytes of the (page-aligned) bounce buffer:
-    /// PRP1 is its first page; PRP2 is the second page or, beyond two, a
-    /// list of the rest.
-    fn data_prps(&self, sqe: &mut Sqe, len: usize) {
-        let base = self.mem.data.device_addr().as_u64();
+    /// Describes the first `len` bytes of bounce buffer `slot`: PRP1 is its
+    /// first page; PRP2 is the second page or, beyond two, a list of the
+    /// rest (in the slot's own page of list).
+    fn data_prps(&self, sqe: &mut Sqe, slot: usize, len: usize) {
+        let base = self.mem.data.device_addr().as_u64() + (slot * DATA_LEN) as u64;
+        let list = slot * PAGE;
         let prp2 = match len.div_ceil(PAGE) {
             1 => 0,
             2 => base + PAGE as u64,
             pages => {
                 for i in 1..pages {
-                    self.mem.prp_list.store((i - 1) * 8, (base + (i * PAGE) as u64).to_le());
+                    self.mem.prp_list.store(list + (i - 1) * 8, (base + (i * PAGE) as u64).to_le());
                 }
-                self.mem.prp_list.device_addr().as_u64()
+                self.mem.prp_list.device_addr().as_u64() + list as u64
             }
         };
         set_prps(sqe, base, prp2);
@@ -607,22 +804,15 @@ impl<D: DmaAllocator + ?Sized> BlockDevice for Nvme<'_, D> {
 
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         self.check_range(lba, buf.len())?;
-        let chunk = self.max_transfer;
-        for (i, part) in buf.chunks_mut(chunk).enumerate() {
-            self.transfer(op::READ, lba + ((i * chunk) >> self.block_shift) as u64, part.len())?;
-            self.mem.data.read(0, part);
-        }
-        Ok(())
+        let len = buf.len();
+        let drain = &mut |dma: &OwnedDma<'_, D>, off, range: Range<usize>| dma.read(off, &mut buf[range]);
+        self.pipeline(op::READ, lba, len, &mut |_, _, _| {}, drain)
     }
 
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         self.check_range(lba, buf.len())?;
-        let chunk = self.max_transfer;
-        for (i, part) in buf.chunks(chunk).enumerate() {
-            self.mem.data.write(0, part);
-            self.transfer(op::WRITE, lba + ((i * chunk) >> self.block_shift) as u64, part.len())?;
-        }
-        Ok(())
+        let fill = &mut |dma: &OwnedDma<'_, D>, off, range: Range<usize>| dma.write(off, &buf[range]);
+        self.pipeline(op::WRITE, lba, buf.len(), fill, &mut |_, _, _| {})
     }
 
     /// Writes back the controller's volatile cache; a no-op for controllers
@@ -853,6 +1043,102 @@ mod tests {
             }
             assert_eq!(log, expected);
         }
+    }
+
+    /// Writes and reads back 40 blocks of 4 KiB in 8 KiB commands, 20 pieces
+    /// each way, and checks the controller saw them several at a time.
+    fn pipelined_roundtrip(fake: &Fake, nv: &mut Nvme<'_, HostDma>) -> Vec<u8> {
+        let data = pattern(40 * 4096, 11);
+        nv.write_blocks(0, &data).unwrap();
+        let mut back = vec![0u8; data.len()];
+        nv.read_blocks(0, &mut back).unwrap();
+        assert!(back == data, "every piece landed in its own place");
+        assert!(disk(fake, 0)[..data.len()] == data[..]);
+        data
+    }
+
+    #[test]
+    fn several_commands_in_flight() {
+        for (mqes, stray, reorder) in [(2047, false, false), (2047, true, true), (3, false, true), (1, true, true)] {
+            let ns = vec![Ns::new(1, 12, 64)];
+            let fake = Fake::new(Config { mdts: 1, mqes, stray, reorder, namespaces: ns, ..Config::default() });
+            let dma = HostDma::default();
+            run(&fake, || {
+                let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
+                assert!(!nv.interrupt_driven());
+                let window = nv.queue_depth();
+                // IO_DEPTH 16 entries, or mqes + 1; one entry stays empty.
+                assert_eq!(window, SLOTS.min((mqes as usize + 1).min(IO_DEPTH as usize) - 1));
+                pipelined_roundtrip(&fake, &mut nv);
+                assert_eq!(fake.max_inflight.load(Relaxed) as usize, window, "mqes {mqes}");
+                assert_eq!(fake.cq_flags.load(Relaxed), 1, "no interrupts");
+                assert_eq!(fake.signal.count(), 0);
+            });
+            assert_eq!(fake.io_commands().len(), 40);
+            assert_eq!(dma.live.get(), 0);
+        }
+    }
+
+    #[test]
+    fn completions_by_interrupt() {
+        for reorder in [false, true] {
+            let ns = vec![Ns::new(1, 12, 64)];
+            let fake = Fake::new(Config { mdts: 1, reorder, namespaces: ns, ..Config::default() });
+            let dma = HostDma::default();
+            let idles = AtomicU32::new(0);
+            let idle = || {
+                idles.fetch_add(1, Relaxed);
+                std::thread::yield_now();
+            };
+            let irq = Interrupts { vector: 5, signal: &fake.signal, idle: &idle };
+            run(&fake, || {
+                let mut nv = Nvme::with_interrupts(fake.io(), &dma, &fake, irq).unwrap();
+                assert!(nv.interrupt_driven());
+                assert_eq!(fake.cq_flags.load(Relaxed), QUEUE_PC | QUEUE_IEN | 5 << 16, "IEN and vector 5");
+                assert_eq!(fake.reg(INTMS), u32::MAX, "INTMS is for pin interrupts; MSI-X leaves it alone");
+                assert_eq!(fake.signal.count(), 0, "admin completions raise nothing here");
+                pipelined_roundtrip(&fake, &mut nv);
+                assert_eq!(fake.max_inflight.load(Relaxed) as usize, SLOTS);
+                nv.flush().unwrap();
+            });
+            assert_eq!(fake.signal.count() as usize, fake.io_commands().len(), "one interrupt per completion");
+            assert_eq!(dma.live.get(), 0);
+        }
+    }
+
+    #[test]
+    fn a_failed_piece_drains_the_rest() {
+        let fake =
+            Fake::new(Config { mdts: 1, bad_from: 6, namespaces: vec![Ns::new(1, 12, 64)], ..Config::default() });
+        let dma = HostDma::default();
+        run(&fake, || {
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
+            let mut buf = vec![0u8; 20 * 4096];
+            assert_eq!(nv.read_blocks(0, &mut buf), Err(BlockError::Io));
+            // Nothing is left in flight: the next request starts clean.
+            let mut small = vec![0u8; 4 * 4096];
+            nv.read_blocks(0, &mut small).unwrap();
+            assert!(small[..] == disk(&fake, 0)[..4 * 4096]);
+            assert_eq!(nv.write_blocks(0, &buf), Err(BlockError::Io));
+        });
+        let sent = fake.io_commands().len();
+        assert!(sent < 3 * 10 + 2, "submission stopped after the failure: {sent} commands");
+        assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
+    fn a_lost_piece_stops_the_driver() {
+        let fake = Fake::new(Config { mdts: 1, ignore_io: true, ..Config::default() });
+        let dma = HostDma::default();
+        run(&fake, || {
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
+            let mut buf = vec![0u8; 8 * 8192];
+            assert_eq!(nv.read_blocks(0, &mut buf), Err(BlockError::Io));
+            assert_eq!(nv.read_blocks(0, &mut buf), Err(BlockError::Io));
+        });
+        assert_eq!(fake.io_commands().len(), SLOTS, "a full window went out, and nothing after");
+        assert_eq!(fake.reg(CC) & CC_EN, 0);
+        assert_eq!(dma.live.get(), 0);
     }
 
     #[test]
