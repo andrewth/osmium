@@ -13,6 +13,7 @@
 //!
 //! [`psci`] answers the PSCI calls a single-vCPU guest makes.
 
+pub mod fdt;
 pub mod psci;
 
 use alloc::boxed::Box;
