@@ -377,7 +377,10 @@ impl Fake {
                             self.record(1, &sqe, 0);
                             match self.cfg.fatal_io {
                                 true => self.set_reg(CSTS, self.reg(CSTS) | 2),
-                                false => self.skip(3_600_000_000_000),
+                                // Once is enough to time the driver out. Later jumps would race with its
+                                // shutdown and push that past its own deadline.
+                                false if self.skipped.load(Ordering::Acquire) == 0 => self.skip(3_600_000_000_000),
+                                false => {}
                             }
                             continue;
                         }
