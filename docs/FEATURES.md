@@ -184,7 +184,9 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Stage-2 page tables: `osmium_mm` `PageTable` with the `Ept`, `Aarch64Stage2` and `Sv39x4`/`Sv48x4` formats; EPTP, VTTBR and hgatp encoders
 - ✅ `MmioBus` / `PioBus` device dispatch (as in rust-vmm `vm-device`)
 - ✅ Normalized `VmExit` enum, `Vcpu` trait, and a generic `run_vcpu` loop that services MMIO and PIO exits
-- ✅ An emulated 16550 UART device
+- ✅ An emulated 16550 UART device, with an optional receive-interrupt line
+- ✅ An emulated PLIC (`VirtualPlic`, QEMU `virt` register layout) whose S-mode context outputs drive vCPU external-interrupt lines (`hvip.VSEIP`)
+- ✅ RISC-V guest device trees (`riscv::fdt::GuestMachine`): harts, memory, PLIC, 16550s and virtio-mmio, in the layout Linux expects
 - ✅ virtio device models: split virtqueue over `GuestMemory`, the virtio-mmio (v2) transport as a bus device, virtio-console and virtio-blk (over any `BlockDevice`), sharing `osmium_hal::virtio` definitions with the drivers
 - ✅ RISC-V H-extension `Vcpu` (`riscv64-hs`): world switch through the trap entry's guest-exit hook, VS CSR switching, MMIO emulation from guest-page faults (`htinst` or `hlvx`-fetched instruction, compressed forms included), `wfi` halts, host-interrupt exits, and a minimal SBI (BASE, TIME, SRST, DBCN, legacy)
 - 🗺 VMX/SVM and Arm EL2 `Vcpu` backends, virtual interrupt controllers (APLIC/IMSIC, vGIC), virtio-net device, guest FP state, multi-vCPU guests
@@ -195,7 +197,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 ### Tooling and examples
 - ✅ Host unit and integration tests for every crate
 - ✅ Builds for `x86_64-unknown-none`, `aarch64-unknown-none-softfloat` and `riscv64imac-unknown-none-elf`
-- ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps; it also runs a small guest in VS-mode under the H extension
+- ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps; it also runs two guests in VS-mode under the H extension, the second built from osmium's own UART and PLIC drivers and taking timer and PLIC interrupts
 - ✅ `examples/aarch64-virt`: the same on QEMU AArch64 `virt` (GICv2, PL011, generic timer, stage-1 paging, PSCI)
 - ✅ `examples/x86_64-pc`: the same on QEMU q35 (PVH boot, COM1, local APIC timer, 4-level paging, ACPI MADT, INIT/SIPI trampoline)
 - ✅ `examples/riscv-firmware`: M-mode firmware with `-bios none`, no heap and no scheduler: async tasks on `osmium-exec` await CLINT timer and PLIC/UART interrupts, then power off

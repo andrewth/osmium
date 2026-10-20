@@ -457,6 +457,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     overflow_demo();
     user_demo();
     hyp::demo();
+    hyp::demo_irq();
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     sbi::shutdown()
