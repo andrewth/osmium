@@ -13,7 +13,15 @@ osmium_trap_entry:
     andi t1, t1, 0x100   // SPP: 0 = from U-mode
     beqz t1, 2f
     csrr t0, sscratch
+    // Already on the exception stack (a trap inside the overflow handler)?
+    // Then nest there, below the live frame.
+    ld t1, 0x38(sp)
+    bltu t0, t1, 4f
+    ld t1, 0x10(sp)
+    bgtu t0, t1, 4f
     addi t0, t0, -288
+    j 3f
+4:  addi t0, t0, -288
     ld t1, 0x18(sp)
     bgeu t0, t1, 3f
     // Interrupted sp is below the current stack's limit: overflow.

@@ -114,6 +114,9 @@ pub mod offsets {
     pub const RESERVED: usize = 0x28;
     /// A second GPR save slot for the stub (`t1`).
     pub const SCRATCH2: usize = 0x30;
+    /// Lowest address of the exception stack, so traps taken while already
+    /// on it nest there instead of being mistaken for another overflow.
+    pub const EXCEPTION_LO: usize = 0x38;
 }
 
 /// Per-CPU state the trap entry finds through `sscratch` (`mscratch`), which
@@ -133,6 +136,7 @@ pub struct TrapCpu {
     guest: AtomicU64,
     reserved: AtomicU64,
     scratch2: AtomicU64,
+    exception_lo: AtomicU64,
 }
 
 const _: () = {
@@ -142,6 +146,7 @@ const _: () = {
     assert!(core::mem::offset_of!(TrapCpu, guest) == offsets::GUEST);
     assert!(core::mem::offset_of!(TrapCpu, reserved) == offsets::RESERVED);
     assert!(core::mem::offset_of!(TrapCpu, scratch2) == offsets::SCRATCH2);
+    assert!(core::mem::offset_of!(TrapCpu, exception_lo) == offsets::EXCEPTION_LO);
 };
 
 static TRAP_CPUS: [TrapCpu; MAX_CPUS] = [const {
@@ -153,6 +158,7 @@ static TRAP_CPUS: [TrapCpu; MAX_CPUS] = [const {
         guest: AtomicU64::new(0),
         reserved: AtomicU64::new(0),
         scratch2: AtomicU64::new(0),
+        exception_lo: AtomicU64::new(0),
     }
 }; MAX_CPUS];
 
@@ -168,14 +174,20 @@ impl TrapCpu {
         self.kernel_sp.store(top as u64, Ordering::Relaxed);
     }
 
-    /// Sets the emergency stack (top address) used when the interrupted
-    /// kernel stack has overflowed.
-    pub fn set_exception_stack(&self, top: usize) {
-        self.exception_sp.store(top as u64, Ordering::Relaxed);
+    /// Sets the emergency stack used when the interrupted kernel stack has
+    /// overflowed: `stack` runs from its lowest address to one past its top.
+    /// Traps taken while already on it nest on it.
+    pub fn set_exception_stack(&self, stack: core::ops::Range<usize>) {
+        self.exception_lo.store(stack.start as u64, Ordering::Relaxed);
+        self.exception_sp.store((stack.end & !15) as u64, Ordering::Relaxed);
     }
 
-    /// Sets the lowest valid address of the kernel stack about to run
-    /// (0 disables the check). Update it on every context switch.
+    /// Sets the lowest valid address of the kernel stack about to run.
+    /// Update it on every context switch.
+    ///
+    /// 0 disables the check. Without it, an overflow into an unmapped guard
+    /// page faults again while saving the frame, before `sscratch` is
+    /// restored, and the CPU loops in the entry stub instead of reporting it.
     pub fn set_stack_limit(&self, lo: usize) {
         self.stack_lo.store(lo as u64, Ordering::Relaxed);
     }
@@ -184,7 +196,13 @@ impl TrapCpu {
     /// it was saved on the exception stack.
     pub fn overflowed(&self, frame: &TrapFrame) -> bool {
         let lo = self.stack_lo.load(Ordering::Relaxed);
-        frame.status & SPP_OR_MPP != 0 && lo != 0 && (frame.x[2].wrapping_sub(size_of::<TrapFrame>() as u64)) < lo
+        let sp = frame.x[2];
+        let on_exception_stack =
+            (self.exception_lo.load(Ordering::Relaxed)..=self.exception_sp.load(Ordering::Relaxed)).contains(&sp);
+        frame.status & SPP_OR_MPP != 0
+            && !on_exception_stack
+            && lo != 0
+            && sp.wrapping_sub(size_of::<TrapFrame>() as u64) < lo
     }
 
     /// Address of this structure, as kept in `sscratch`.

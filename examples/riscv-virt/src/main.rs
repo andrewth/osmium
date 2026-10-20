@@ -146,7 +146,8 @@ fn on_switch(next: &osmium::sched::Task) {
 /// Gives this hart an emergency stack for traps from an overflowed stack.
 fn set_exception_stack() {
     let stack = alloc::vec![0u8; 16 * 1024].leak();
-    TrapCpu::current().set_exception_stack((stack.as_ptr() as usize + stack.len()) & !15);
+    let lo = stack.as_ptr() as usize;
+    TrapCpu::current().set_exception_stack(lo..lo + stack.len());
 }
 
 static UART: Once<SerialConsole<Uart16550<Mmio>>> = Once::new();
@@ -369,6 +370,13 @@ fn on_trap(frame: &mut TrapFrame) {
         // exhausted, so it cannot continue. End only that task.
         let task = osmium::sched::current();
         println!("[guard] task {:?} overflowed its stack ({:?} at sp {:#x}); killed", task.name(), frame.cause(), frame.sp());
+        // A trap taken while on the exception stack must nest there, not be
+        // mistaken for another overflow.
+        RECOVER.store(true, Ordering::SeqCst);
+        // SAFETY: the breakpoint arm below steps over it.
+        unsafe { core::arch::asm!("ebreak") };
+        RECOVER.store(false, Ordering::SeqCst);
+        println!("[guard] nested {:?} on the exception stack handled", RECOVERED.lock().take().unwrap());
         drop(task);
         osmium::sched::exit();
     }
