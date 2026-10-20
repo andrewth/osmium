@@ -13,6 +13,7 @@
 //! - [`devices`]: emulated devices.
 //! - [`riscv`]: a RISC-V H-extension vCPU and a minimal SBI for guests.
 //! - [`aarch64`]: AArch64 EL2 exit decoding and PSCI for guests.
+//! - [`x86`]: an AMD SVM vCPU with nested paging.
 //! - [`virtio`]: virtio device models behind the virtio-mmio transport.
 //!
 //! Hardware backends implement [`Vcpu`]: RISC-V H ([`riscv::RiscvVcpu`])
@@ -31,6 +32,7 @@ pub mod riscv;
 pub mod stage2;
 pub mod vcpu;
 pub mod virtio;
+pub mod x86;
 
 pub use bus::{Bus, BusDevice, BusError};
 pub use memory::{GuestMemory, GuestPhysAddr, Pod};

@@ -109,4 +109,20 @@ if command -v qemu-system-aarch64 >/dev/null; then
     rm -f "$hyplog"
 fi
 
+# AMD SVM hypervisor (QEMU's TCG implements SVM with nested paging).
+if command -v qemu-system-x86_64 >/dev/null; then
+    echo "== boot examples/x86_64-hyp under QEMU"
+    svmlog=$(mktemp)
+    (cd examples/x86_64-hyp && cargo build -q --release)
+    timeout 60 qemu-system-x86_64 -machine q35 -cpu max -smp 1 -m 128M -nographic -no-reboot -display none \
+        -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp \
+        -serial "file:$svmlog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$svmlog"
+    for line in 'SVM on, nested paging' '\[guest\] hello from SVM over port I/O' \
+        'guest exit Shutdown: 1 hypercall, 1 halt, LSR 0x60' '\[done\]'; do
+        grep -q "$line" "$svmlog" || { echo "x86_64-hyp: missing '$line'"; exit 1; }
+    done
+    rm -f "$svmlog"
+fi
+
 echo "all checks passed"

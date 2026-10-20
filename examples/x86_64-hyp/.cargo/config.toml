@@ -1,0 +1,8 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# The kernel runs where it is linked, with no loader to apply relocations.
+rustflags = ["-C", "relocation-model=static"]
+# TCG implements AMD SVM with nested paging; `max` exposes it.
+runner = "qemu-system-x86_64 -machine q35 -cpu max -nographic -m 128M -no-reboot -kernel"

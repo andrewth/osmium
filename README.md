@@ -32,7 +32,7 @@ colors and type.
 | `osmium-drivers` | NS16550A, PL011, RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, i8254 PIT, RAM disk, Mellanox ConnectX-3 (mlx4) Ethernet | no |
 | `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG reader, ELF64 loader | writer only |
 | `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
-| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension and AArch64 EL2 vCPUs with a minimal SBI and PSCI, virtual PLIC, virtio-net | yes |
+| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension, AArch64 EL2 and AMD SVM vCPUs with a minimal SBI and PSCI, virtual PLIC, virtio-net | yes |
 | `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
 | `osmium-fs` | `File` trait and `Vfs` namespace (mounts, `..` across mounts, symlinks), Linux `Errno`, RAM file system, `/dev` nodes, cpio initramfs unpacking, ext2 (read and write) over any `BlockDevice` | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
