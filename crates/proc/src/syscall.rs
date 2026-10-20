@@ -67,12 +67,15 @@ pub enum Sys {
     Sendmsg,
     Recvmsg,
     Socketpair,
+    Pipe2,
     Ppoll,
     Pselect6,
     EpollCreate1,
     EpollCtl,
     EpollPwait,
     /// x86_64 only (the generic table has only the `p` variants).
+    #[cfg(target_arch = "x86_64")]
+    Pipe,
     #[cfg(target_arch = "x86_64")]
     Poll,
     #[cfg(target_arch = "x86_64")]
@@ -150,6 +153,8 @@ const NUMBERS: &[(u64, Sys)] = &[
     (46, Sys::Sendmsg),
     (47, Sys::Recvmsg),
     (53, Sys::Socketpair),
+    (22, Sys::Pipe),
+    (293, Sys::Pipe2),
     (7, Sys::Poll),
     (23, Sys::Select),
     (270, Sys::Pselect6),
@@ -223,6 +228,7 @@ const NUMBERS: &[(u64, Sys)] = &[
     (211, Sys::Sendmsg),
     (212, Sys::Recvmsg),
     (199, Sys::Socketpair),
+    (59, Sys::Pipe2),
     (72, Sys::Pselect6),
     (73, Sys::Ppoll),
     (20, Sys::EpollCreate1),
@@ -395,6 +401,9 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Sendmsg => crate::socket::sendmsg(p, fd, a[1], a[2]),
         Sys::Recvmsg => crate::socket::recvmsg(p, fd, a[1], a[2]),
         Sys::Socketpair => crate::socket::socketpair(p, a[0], a[1], a[2], a[3]),
+        Sys::Pipe2 => crate::pipe::pipe2(p, a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
+        Sys::Pipe => crate::pipe::pipe2(p, a[0], 0),
         Sys::Ppoll => crate::poll::ppoll(p, a[0], a[1], a[2], a[3], a[4]),
         Sys::Pselect6 => crate::poll::pselect6(p, a[0], a[1], a[2], a[3], a[4], a[5]),
         Sys::EpollCreate1 => crate::epoll::create1(p, a[0]),
@@ -459,13 +468,20 @@ fn write(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
     while done < len {
         let want = ((len - done) as usize).min(CHUNK);
         p.memory().read(buf + done, &mut kbuf[..want])?;
-        let n = f.write(&kbuf[..want])?;
+        let n = f.write(&kbuf[..want]).inspect_err(|&e| sigpipe(p, &f, e))?;
         done += n as u64;
         if n < want {
             break;
         }
     }
     Ok(done)
+}
+
+/// Raises `SIGPIPE` when a write to a pipe found no reader.
+fn sigpipe(p: &Process, f: &OpenFile, e: Errno) {
+    if e == Errno::EPIPE && crate::pipe::is_writer(f.file()) {
+        let _ = crate::signal::send(p, crate::signal::sig::SIGPIPE, p.pid());
+    }
 }
 
 /// The `struct iovec { base, len }` array at `iov`.
@@ -496,7 +512,7 @@ fn writev(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
     let mut pending = alloc::vec::Vec::new();
     let mut total = 0;
     let mut flush = |pending: &mut alloc::vec::Vec<u8>| -> Result<bool, Errno> {
-        let n = if pending.is_empty() { 0 } else { f.write(pending)? };
+        let n = if pending.is_empty() { 0 } else { f.write(pending).inspect_err(|&e| sigpipe(p, &f, e))? };
         total += n as u64;
         let complete = n == pending.len();
         pending.clear();
@@ -916,11 +932,12 @@ fn fcntl(p: &Process, fd: i32, cmd: u64, arg: u64) -> SysResult {
                 (false, true) => oflag::WRONLY,
                 _ => 0,
             };
-            Ok(mode | if a.append { oflag::APPEND } else { 0 } | crate::socket::status_flags(f.file()))
+            Ok(mode | if a.append { oflag::APPEND } else { 0 } | crate::socket::status_flags(f.file()) | crate::pipe::status_flags(f.file()))
         }
-        // Only a socket's O_NONBLOCK can be changed so far.
+        // Only a socket's or pipe's O_NONBLOCK can be changed so far.
         F_SETFL => {
             crate::socket::set_status_flags(f.file(), arg);
+            crate::pipe::set_status_flags(f.file(), arg);
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
