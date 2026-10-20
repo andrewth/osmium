@@ -207,7 +207,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `exec` | osmium-exec | no | A heap-free async executor |
 | `sched` | osmium-sched | yes | Tasks, context switch, scheduler, `Mutex`, `WaitQueue`, timers |
 | `fs` | osmium-fs | yes | VFS, RamFs, `/dev`, cpio, ext2/ext3/ext4 |
-| `fs-fat` | osmium-fs-fat | yes | FAT32 (enables `fs`) |
+| `fs-fat` | osmium-fs-fat | yes | FAT12/16/32 (enables `fs`) |
 | `fs-iso9660` | osmium-fs-iso9660 | yes | Read-only ISO 9660 with Rock Ridge and Joliet (enables `fs`) |
 | `proc` | osmium-proc | yes | Processes and the system-call dispatcher (enables `sched`, `fs`, `mm`, `boot`) |
 | `net` | osmium-net | yes | IPv4, ARP, ICMP, UDP, TCP, DHCP |
@@ -662,7 +662,7 @@ anywhere:
 let ext = Ext2::mount(disk, 3)?;           // ext2, ext3 or ext4; EINVAL if not ext*, ENOSYS if unsupported
 vfs.mount("/mnt", ext.root())?;
 
-let fat = osmium::fs_fat::FatFs::mount(stick, 4)?;   // FAT32 only
+let fat = osmium::fs_fat::FatFs::mount(stick, 4)?;   // FAT12, FAT16 or FAT32
 vfs.mount("/usb", fat.root())?;
 
 let iso = osmium::fs_iso9660::IsoFs::mount(cdrom, 5)?;
@@ -670,12 +670,12 @@ println!("disc {:?}, names from {:?}", iso.volume_id(), iso.names());
 vfs.mount("/cdrom", iso.root())?;
 ```
 
-| | ext2/3/4 (`osmium::fs::Ext2`) | FAT32 (`osmium::fs_fat::FatFs`) | ISO 9660 (`osmium::fs_iso9660::IsoFs`) |
+| | ext2/3/4 (`osmium::fs::Ext2`) | FAT12/16/32 (`osmium::fs_fat::FatFs`) | ISO 9660 (`osmium::fs_iso9660::IsoFs`) |
 |---|---|---|---|
 | Read/write | yes, or read-only if the volume has an unknown read-only feature (`quota`, `bigalloc`, …) | yes | read-only |
 | Names | ext directories; hashed indexes are scanned linearly and dropped on change | VFAT long names, generated 8.3 aliases | Rock Ridge if present, else Joliet, else lower-cased ISO names (`names()` says which) |
 | Extras | extents, `64bit`, `flex_bg`, `metadata_csum` (verified and kept); `set_clock` for timestamps; `into_device` to unmount | `free_bytes` from FSInfo | Symlinks and device nodes via Rock Ridge; files over 4 GiB; any device block size |
-| Not supported | journal replay (a clean journal is left alone; a dirty one fails with `ENOSYS`), `inline_data`, encryption, casefolding, rename, hard links | FAT12/16, timestamps, rename; device block sizes that are not a power of two up to 4 KiB; directories over 65536 entries | timestamps, multi-session beyond the first, UDF |
+| Not supported | journal replay (a clean journal is left alone; a dirty one fails with `ENOSYS`), `inline_data`, encryption, casefolding, rename, hard links | exFAT, timestamps, rename; a FAT12/16 root directory cannot grow (`ENOSPC` when full); device block sizes that are not a power of two up to 4 KiB; directories over 65536 entries | timestamps, multi-session beyond the first, UDF |
 
 The ext driver writes changes in place and journals nothing, and there is
 no block cache. Call `sync()` before removing the device. A corrupt layout

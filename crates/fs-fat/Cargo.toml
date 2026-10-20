@@ -1,6 +1,6 @@
 [package]
 name = "osmium-fs-fat"
-description = "Osmium: a FAT32 file system on any block device, for the osmium-fs VFS"
+description = "Osmium: a FAT12/16/32 file system on any block device, for the osmium-fs VFS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

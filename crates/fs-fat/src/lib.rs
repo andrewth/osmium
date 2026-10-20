@@ -1,4 +1,4 @@
-//! A FAT32 file system on any [`BlockDevice`], for the `osmium-fs` VFS.
+//! A FAT12, FAT16 or FAT32 file system on any [`BlockDevice`], for the `osmium-fs` VFS.
 //!
 //! [`FatFs::mount`] reads the volume and [`FatFs::root`] hands out its root
 //! directory as an [`osmium_fs::File`], ready for `Vfs::mount`. Long (VFAT)
@@ -11,7 +11,12 @@
 //! node, so a file removed while open keeps its clusters until the last
 //! reference goes.
 //!
-//! Not supported: FAT12/16, timestamps (new entries get a fixed date),
+//! The variant is told from the boot sector by its cluster count, as the
+//! Microsoft specification requires. FAT12 and FAT16 keep their root
+//! directory in a fixed region before the data, so it cannot grow: creating
+//! an entry in a full one fails with `ENOSPC`.
+//!
+//! Not supported: exFAT, timestamps (new entries get a fixed date),
 //! rename, and permissions beyond the read-only attribute. The volume's
 //! sector size must be a multiple of the device's block size.
 #![no_std]
@@ -34,13 +39,10 @@ use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_sync::SpinLock;
 
 use dir::{ENTRY_SIZE, Entry, attr};
-use layout::{FsInfo, Geometry};
+use layout::{FatKind, FsInfo, Geometry, ROOT_FIXED};
 
-/// FAT entry values.
-const FAT_MASK: u32 = 0x0fff_ffff;
+/// A free cluster's FAT entry.
 const FAT_FREE: u32 = 0;
-const FAT_BAD: u32 = 0x0fff_fff7;
-const FAT_EOC: u32 = 0x0fff_ffff;
 
 /// Inode number of the root directory, which has no directory entry.
 const ROOT_INO: u64 = 1;
@@ -94,7 +96,7 @@ struct Shared<D: BlockDevice + Send + 'static> {
     dev_id: u64,
 }
 
-/// A mounted FAT32 volume.
+/// A mounted FAT12, FAT16 or FAT32 volume.
 pub struct FatFs<D: BlockDevice + Send + 'static> {
     shared: Arc<Shared<D>>,
 }
@@ -106,8 +108,9 @@ pub struct Node<D: BlockDevice + Send + 'static> {
 }
 
 impl<D: BlockDevice + Send + 'static> FatFs<D> {
-    /// Mounts the FAT32 volume on `dev`. `dev_id` becomes `Stat::dev` of
-    /// every node. Fails with `EINVAL` if the device does not hold FAT32.
+    /// Mounts the FAT volume on `dev`. `dev_id` becomes `Stat::dev` of
+    /// every node. Fails with `EINVAL` if the device does not hold FAT12,
+    /// FAT16 or FAT32.
     pub fn mount(mut dev: D, dev_id: u64) -> Result<Self, Errno> {
         let bs = dev.block_size();
         // A power of two, so it divides or is a multiple of every sector size.
@@ -138,6 +141,15 @@ impl<D: BlockDevice + Send + 'static> FatFs<D> {
             let mut s = vol.sector_buf();
             vol.read_sector(geo.fsinfo_sector, &mut s)?;
             vol.info = FsInfo::parse(&s, &geo);
+        } else if geo.kind != FatKind::Fat32 {
+            // No FSInfo: count the free clusters once, for allocation hints.
+            let mut free = 0;
+            for c in 2..geo.cluster_count + 2 {
+                if vol.fat_entry(c)? == FAT_FREE {
+                    free += 1;
+                }
+            }
+            vol.info = Some(FsInfo { free: Some(free), next_free: 2 });
         }
         Ok(Self { shared: Arc::new(Shared { vol: SpinLock::new(vol), dev_id }) })
     }
@@ -218,42 +230,113 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
 
     // --- The FAT ---------------------------------------------------------
 
-    fn fat_entry(&mut self, c: u32) -> Result<u32, Errno> {
-        let ss = self.geo.sector_size as u64;
-        let sector = self.geo.fat_start + (c as u64 * 4 / ss) as u32;
-        let at = (c as u64 * 4 % ss) as usize;
+    /// Loads FAT sector `sector` (relative to the first FAT) into the cache.
+    fn load_fat(&mut self, sector: u32) -> Result<(), Errno> {
         if self.fat_cache.as_ref().is_none_or(|(s, _)| *s != sector) {
             let mut buf = self.sector_buf();
-            self.read_sector(sector, &mut buf)?;
+            let at = self.geo.fat_start.checked_add(sector).ok_or(Errno::EIO)?;
+            self.read_sector(at, &mut buf)?;
             self.fat_cache = Some((sector, buf));
         }
-        let (_, buf) = self.fat_cache.as_ref().unwrap();
-        Ok(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) & FAT_MASK)
+        Ok(())
+    }
+
+    /// Reads `N` bytes of the first FAT at byte offset `off`; they may
+    /// straddle a sector boundary.
+    fn fat_bytes<const N: usize>(&mut self, off: u64) -> Result<[u8; N], Errno> {
+        let ss = self.geo.sector_size as u64;
+        if off + N as u64 > self.geo.fat_sectors as u64 * ss {
+            return Err(Errno::EIO);
+        }
+        let mut out = [0u8; N];
+        let mut done = 0;
+        while done < N {
+            let pos = off + done as u64;
+            let (sector, within) = ((pos / ss) as u32, (pos % ss) as usize);
+            self.load_fat(sector)?;
+            let (_, buf) = self.fat_cache.as_ref().expect("sector just loaded");
+            let n = (ss as usize - within).min(N - done);
+            out[done..done + n].copy_from_slice(&buf[within..within + n]);
+            done += n;
+        }
+        Ok(out)
+    }
+
+    /// Writes `data` at byte offset `off` of every copy of the FAT.
+    fn put_fat_bytes(&mut self, off: u64, data: &[u8]) -> Result<(), Errno> {
+        let ss = self.geo.sector_size as u64;
+        let mut done = 0;
+        while done < data.len() {
+            let pos = off + done as u64;
+            let (sector, within) = ((pos / ss) as u32, (pos % ss) as usize);
+            self.load_fat(sector)?;
+            let n = (ss as usize - within).min(data.len() - done);
+            let (_, mut buf) = self.fat_cache.take().expect("sector just loaded");
+            buf[within..within + n].copy_from_slice(&data[done..done + n]);
+            let mut result = Ok(());
+            for copy in 0..self.geo.fats {
+                if result.is_ok() {
+                    let at = self.geo.fat_start + sector + copy * self.geo.fat_sectors;
+                    result = self.write_sector(at, &buf);
+                }
+            }
+            self.fat_cache = Some((sector, buf));
+            result?;
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Byte offset of cluster `c`'s entry in the FAT.
+    fn fat_offset(&self, c: u32) -> Result<u64, Errno> {
+        if c >= self.geo.cluster_count + 2 {
+            return Err(Errno::EIO);
+        }
+        Ok(match self.geo.kind {
+            FatKind::Fat12 => c as u64 + c as u64 / 2,
+            FatKind::Fat16 => c as u64 * 2,
+            FatKind::Fat32 => c as u64 * 4,
+        })
+    }
+
+    fn fat_entry(&mut self, c: u32) -> Result<u32, Errno> {
+        let off = self.fat_offset(c)?;
+        Ok(match self.geo.kind {
+            FatKind::Fat12 => {
+                let v = u16::from_le_bytes(self.fat_bytes::<2>(off)?) as u32;
+                if c & 1 == 1 { v >> 4 } else { v & 0x0fff }
+            }
+            FatKind::Fat16 => u16::from_le_bytes(self.fat_bytes::<2>(off)?) as u32,
+            FatKind::Fat32 => u32::from_le_bytes(self.fat_bytes::<4>(off)?) & FatKind::Fat32.mask(),
+        })
     }
 
     /// Sets cluster `c`'s FAT entry in every copy of the FAT.
     fn set_fat_entry(&mut self, c: u32, value: u32) -> Result<(), Errno> {
-        self.fat_entry(c)?; // loads the sector into the cache
-        let at = (c as u64 * 4 % self.geo.sector_size as u64) as usize;
-        let (sector, mut buf) = self.fat_cache.take().unwrap();
-        let old = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
-        // The top four bits are reserved and must be preserved.
-        buf[at..at + 4].copy_from_slice(&((old & !FAT_MASK) | (value & FAT_MASK)).to_le_bytes());
-        let mut result = Ok(());
-        for copy in 0..self.geo.fats {
-            if result.is_ok() {
-                result = self.write_sector(sector + copy * self.geo.fat_sectors, &buf);
+        let off = self.fat_offset(c)?;
+        let mask = self.geo.kind.mask();
+        match self.geo.kind {
+            FatKind::Fat12 => {
+                // Two entries share three bytes: keep the neighbour's nibble.
+                let old = u16::from_le_bytes(self.fat_bytes::<2>(off)?);
+                let v = (value & mask) as u16;
+                let new = if c & 1 == 1 { (old & 0x000f) | v << 4 } else { (old & 0xf000) | v };
+                self.put_fat_bytes(off, &new.to_le_bytes())
+            }
+            FatKind::Fat16 => self.put_fat_bytes(off, &(value as u16).to_le_bytes()),
+            FatKind::Fat32 => {
+                let old = u32::from_le_bytes(self.fat_bytes::<4>(off)?);
+                // The top four bits are reserved and must be preserved.
+                self.put_fat_bytes(off, &((old & !mask) | (value & mask)).to_le_bytes())
             }
         }
-        self.fat_cache = Some((sector, buf));
-        result
     }
 
     /// The cluster after `c`, or `None` at the end of the chain. A chain
     /// that points outside the volume is reported as `EIO`.
     fn next(&mut self, c: u32) -> Result<Option<u32>, Errno> {
         match self.fat_entry(c)? {
-            v if v >= 0x0fff_fff8 => Ok(None),
+            v if v > self.geo.kind.bad() => Ok(None),
             v if self.geo.is_data_cluster(v) => Ok(Some(v)),
             _ => Err(Errno::EIO),
         }
@@ -278,7 +361,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         for s in 0..self.geo.sectors_per_cluster {
             self.write_sector(first + s, &zero)?;
         }
-        self.set_fat_entry(c, FAT_EOC)?;
+        self.set_fat_entry(c, self.geo.kind.eoc())?;
         if let Some(p) = prev {
             self.set_fat_entry(p, c)?;
         }
@@ -296,7 +379,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         let mut steps = 0;
         while self.geo.is_data_cluster(c) && steps <= self.geo.cluster_count {
             let next = self.fat_entry(c)?;
-            if next == FAT_FREE || next == FAT_BAD {
+            if next == FAT_FREE || next == self.geo.kind.bad() {
                 break; // already free: a damaged chain, stop here
             }
             self.set_fat_entry(c, FAT_FREE)?;
@@ -348,6 +431,9 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     /// Reads up to `buf.len()` bytes at `off` of the chain at `first`,
     /// stopping at `limit` bytes or the chain's end; returns the count.
     fn read_chain(&mut self, first: u32, off: u64, buf: &mut [u8], limit: u64) -> Result<usize, Errno> {
+        if first == ROOT_FIXED {
+            return self.read_root(off, buf, limit);
+        }
         let cs = self.geo.cluster_size() as u64;
         let ss = self.geo.sector_size as u64;
         let want = (buf.len() as u64).min(limit.saturating_sub(off)) as usize;
@@ -378,11 +464,54 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         Ok(done)
     }
 
+    /// Like `read_chain`, for the fixed root directory of FAT12/16.
+    fn read_root(&mut self, off: u64, buf: &mut [u8], limit: u64) -> Result<usize, Errno> {
+        let ss = self.geo.sector_size as u64;
+        let limit = limit.min(self.geo.root_bytes());
+        let want = (buf.len() as u64).min(limit.saturating_sub(off)) as usize;
+        let mut done = 0;
+        let mut sector = self.sector_buf();
+        while done < want {
+            let pos = off + done as u64;
+            let s = self.geo.root_start + (pos / ss) as u32;
+            let in_sector = (pos % ss) as usize;
+            let n = (ss as usize - in_sector).min(want - done);
+            self.read_sector(s, &mut sector)?;
+            buf[done..done + n].copy_from_slice(&sector[in_sector..in_sector + n]);
+            done += n;
+        }
+        Ok(done)
+    }
+
+    /// Like `write_chain`, for the fixed root directory, which cannot grow.
+    fn write_root(&mut self, off: u64, data: &[u8]) -> Result<(), Errno> {
+        let ss = self.geo.sector_size as u64;
+        if off.checked_add(data.len() as u64).is_none_or(|end| end > self.geo.root_bytes()) {
+            return Err(Errno::ENOSPC);
+        }
+        let mut done = 0;
+        let mut sector = self.sector_buf();
+        while done < data.len() {
+            let pos = off + done as u64;
+            let s = self.geo.root_start + (pos / ss) as u32;
+            let in_sector = (pos % ss) as usize;
+            let n = (ss as usize - in_sector).min(data.len() - done);
+            self.read_sector(s, &mut sector)?;
+            sector[in_sector..in_sector + n].copy_from_slice(&data[done..done + n]);
+            self.write_sector(s, &sector)?;
+            done += n;
+        }
+        Ok(())
+    }
+
     /// Writes `data` at `off` of the chain at `*first`, allocating clusters
     /// (zeroed) as needed; `*first` changes if the chain was empty.
     fn write_chain(&mut self, first: &mut u32, off: u64, data: &[u8]) -> Result<(), Errno> {
         if data.is_empty() {
             return Ok(());
+        }
+        if *first == ROOT_FIXED {
+            return self.write_root(off, data);
         }
         let cs = self.geo.cluster_size() as u64;
         let ss = self.geo.sector_size as u64;
@@ -470,7 +599,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         if let Some(last) = self.nth(*first, keep - 1)?
             && let Some(rest) = self.next(last)?
         {
-            self.set_fat_entry(last, FAT_EOC)?;
+            self.set_fat_entry(last, self.geo.kind.eoc())?;
             self.free_chain(rest)?;
         }
         Ok(())
@@ -480,6 +609,12 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
 
     /// A directory's whole contents; `EIO` if it is larger than FAT allows.
     fn dir_bytes(&mut self, first: u32) -> Result<Vec<u8>, Errno> {
+        if first == ROOT_FIXED {
+            let mut buf = vec![0u8; self.geo.root_bytes() as usize];
+            let n = self.read_root(0, &mut buf, u64::MAX)?;
+            buf.truncate(n);
+            return Ok(buf);
+        }
         let cs = self.geo.cluster_size() as u64;
         let len = self.chain_len(first, MAX_DIR.div_ceil(cs))? * cs;
         let mut buf = vec![0u8; len as usize];
@@ -491,6 +626,12 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     /// The disk position of byte `off` of directory `first`: the inode
     /// number of the entry there.
     fn entry_ino(&mut self, first: u32, off: usize) -> Result<u64, Errno> {
+        if first == ROOT_FIXED {
+            if off as u64 >= self.geo.root_bytes() {
+                return Err(Errno::EIO);
+            }
+            return Ok(self.geo.root_start as u64 * self.geo.sector_size as u64 + off as u64);
+        }
         let cs = self.geo.cluster_size() as u64;
         let c = self.nth(first, off as u64 / cs)?.ok_or(Errno::EIO)?;
         Ok(self.geo.cluster_sector(c) as u64 * self.geo.sector_size as u64 + off as u64 % cs)
@@ -516,7 +657,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
 
     /// Writes the FSInfo hints and flushes the device.
     fn sync(&mut self) -> Result<(), Errno> {
-        if let Some(info) = self.info {
+        if let Some(info) = self.info.filter(|_| self.geo.fsinfo_sector != 0) {
             let mut s = self.sector_buf();
             self.read_sector(self.geo.fsinfo_sector, &mut s)?;
             info.store(&mut s);
@@ -542,7 +683,14 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
 
     fn find(vol: &mut Volume<D>, dir: u32, name: &str) -> Result<Option<Entry>, Errno> {
         let bytes = vol.dir_bytes(dir)?;
-        Ok(dir::parse(&bytes).into_iter().find(|e| name::same(&e.name, name)))
+        let mut found = dir::parse(&bytes).into_iter().find(|e| name::same(&e.name, name));
+        if vol.geo.kind != FatKind::Fat32 {
+            // The high word of the cluster is not part of the entry here.
+            if let Some(e) = &mut found {
+                e.first &= 0xffff;
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -591,6 +739,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         let (ino, kind, first, read_only, size) = (s.ino, s.kind, s.first, s.read_only, s.size);
         let size = match kind {
             // A directory's size is the space its chain occupies.
+            FileKind::Directory if first == ROOT_FIXED => vol.geo.root_bytes(),
             FileKind::Directory => vol.chain_len(first, u64::MAX).unwrap_or(0) * vol.geo.cluster_size() as u64,
             _ => size as u64,
         };
