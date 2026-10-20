@@ -1136,7 +1136,9 @@ mod tests {
             assert_eq!(nv.read_blocks(0, &mut buf), Err(BlockError::Io));
             assert_eq!(nv.read_blocks(0, &mut buf), Err(BlockError::Io));
         });
-        assert_eq!(fake.io_commands().len(), SLOTS, "a full window went out, and nothing after");
+        // A full window went out at once, but the driver may give up (the clock jumps an hour at the first
+        // command) before the controller has looked at all of it. Nothing is submitted after.
+        assert!((1..=SLOTS).contains(&fake.io_commands().len()));
         assert_eq!(fake.reg(CC) & CC_EN, 0);
         assert_eq!(dma.live.get(), 0);
     }
