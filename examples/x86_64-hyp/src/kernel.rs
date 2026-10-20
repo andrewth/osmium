@@ -132,6 +132,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
         let mut v = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, vm.ncr3, entry as u32, 0) }
             .with_memory(vm.mem.clone())
             .with_irq_line(vm.lines[me].clone());
+        v.set_apic_id(me as u8); // CPUID agrees with the vCPU's APIC
         if me == 0 {
             v.regs.rbx = info; // PVH: ebx = hvm_start_info
         } else {

@@ -41,6 +41,23 @@ use decode::{Access, Operand};
 const APIC_BASE_BSP: u64 = 1 << 8;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
 
+/// What a guest sees of the host's CPUID `leaf` (`[eax, ebx, ecx, edx]`):
+/// its own local APIC ID (leaf 1 EBX bits 31:24, leaf 0xB EDX), the
+/// hypervisor-present bit (leaf 1 ECX bit 31), and neither x2APIC (only the
+/// xAPIC is emulated) nor SVM (no nested virtualization).
+pub fn patch_cpuid(leaf: u32, [a, mut b, mut c, mut d]: [u32; 4], apic_id: u8) -> [u32; 4] {
+    match leaf {
+        1 => {
+            b = (b & 0x00ff_ffff) | (apic_id as u32) << 24;
+            c = (c & !(1 << 21)) | 1 << 31;
+        }
+        0xb => d = apic_id as u32,
+        0x8000_0001 => c &= !(1 << 2),
+        _ => {}
+    }
+    [a, b, c, d]
+}
+
 /// VMCB offsets (AMD64 APM vol. 2, appendix B).
 pub mod vmcb {
     /// Intercepts: INTR, NMI, ... SHUTDOWN (bit per event).
@@ -229,6 +246,8 @@ pub struct SvmVcpu {
     pub(crate) tsc_aux: u64,
     /// The guest's `IA32_APIC_BASE`.
     apic_base: u64,
+    /// The local APIC ID CPUID reports.
+    apic_id: u8,
     /// The host CPU running this vCPU's guest code, for kicks.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
@@ -268,10 +287,11 @@ impl SvmVcpu {
             running: None,
             tsc_aux: 0,
             apic_base: 0xfee0_0000 | APIC_BASE_ENABLE | APIC_BASE_BSP,
+            apic_id: 0,
         };
         use vmcb::*;
-        // INTR, NMI, HLT, IOIO, MSR, SHUTDOWN; VMRUN (required), VMMCALL.
-        v.write32(INTERCEPT_MISC1, 1 << 0 | 1 << 1 | 1 << 24 | 1 << 27 | 1 << 28 | 1 << 31);
+        // INTR, NMI, CPUID, HLT, IOIO, MSR, SHUTDOWN; VMRUN (required), VMMCALL.
+        v.write32(INTERCEPT_MISC1, 1 << 0 | 1 << 1 | 1 << 18 | 1 << 24 | 1 << 27 | 1 << 28 | 1 << 31);
         v.write32(INTERCEPT_MISC2, 1 << 0 | 1 << 1);
         v.write64(IOPM_BASE_PA, pages.iopm.1);
         v.write64(MSRPM_BASE_PA, pages.msrpm.1);
@@ -561,6 +581,27 @@ impl SvmVcpu {
         self.apic_base &= !APIC_BASE_BSP;
     }
 
+    /// Sets the local APIC ID CPUID reports to the guest (leaf 1 EBX bits 31:24
+    /// and leaf 0xB EDX); it should match the vCPU's emulated APIC.
+    pub fn set_apic_id(&mut self, id: u8) {
+        self.apic_id = id;
+    }
+
+    /// Answers the CPUID that caused a `CPUID` exit from the host's, as
+    /// [`patch_cpuid`] adjusts it, and steps past it.
+    #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+    fn emulate_cpuid(&mut self) {
+        let (leaf, sub) = (self.read64(vmcb::RAX) as u32, self.regs.rcx as u32);
+        let r = osmium_arch::x86_64::cpuid(leaf, sub);
+        let [a, b, c, d] = patch_cpuid(leaf, [r.eax, r.ebx, r.ecx, r.edx], self.apic_id);
+        self.write64(vmcb::RAX, a as u64);
+        self.regs.rbx = b as u64;
+        self.regs.rcx = c as u64;
+        self.regs.rdx = d as u64;
+        let rip = self.rip();
+        self.skip_to(rip + 2); // 0F A2
+    }
+
     /// Emulates the RDMSR or WRMSR that caused an `MSR` exit and steps
     /// past it. The syscall MSRs, FS/GS bases and PAT live in the VMCB;
     /// EFER keeps SVME set (VMRUN requires it); TSC_AUX is per vCPU;
@@ -706,6 +747,7 @@ impl Vcpu for SvmVcpu {
                 // An interrupt window opened: deliver on the next entry.
                 exit::VINTR => {}
                 exit::MSR => self.emulate_msr(),
+                exit::CPUID => self.emulate_cpuid(),
                 _ => break self.classify(),
             }
         };
@@ -792,6 +834,18 @@ mod tests {
         unsafe {
             SvmVcpu::new(SvmPages { vmcb: p(1), iopm: p(3), msrpm: p(2), host: p(1) }, 0x1000, 0x10_0000, 0x20_0000)
         }
+    }
+
+    #[test]
+    fn cpuid_view() {
+        let host = [0x000a_0f10, 0x0102_0800, 0x80a0_2201 | 1 << 21, 0x0789_3fff];
+        let [_, b, c, _] = patch_cpuid(1, host, 3);
+        assert_eq!(b, 0x0302_0800, "the vCPU's APIC ID");
+        assert_eq!(c & (1 << 21), 0, "no x2APIC");
+        assert_ne!(c & (1 << 31), 0, "hypervisor present");
+        assert_eq!(patch_cpuid(0xb, [0, 0, 0, 7], 3)[3], 3);
+        assert_eq!(patch_cpuid(0x8000_0001, [0, 0, 0b111, 0], 3)[2], 0b011, "no SVM");
+        assert_eq!(patch_cpuid(0, host, 3), host);
     }
 
     #[test]

@@ -925,6 +925,7 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, vm.ncr3, entry as u32, vm.ram_len as u32) }
                 .with_memory(vm.mem.clone())
                 .with_irq_line(vm.lines[me].clone());
+        v.set_apic_id(me as u8);
         if me > 0 {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
         }

@@ -97,24 +97,53 @@ CPU loop), take start requests with `take_start`, and connect the vCPU
   callback when a CPU's line rises, and acknowledge the SGI on the
   `ExternalInterrupt` exit.
 
+- x86: guests start their APs the PC way, with INIT and STARTUP through
+  `VirtualLapic` (decode the hook's ICR with `decode_icr`); start the AP's
+  vCPU with `SvmVcpu::set_real_mode` and `set_application_processor`, and
+  give each vCPU its APIC ID with `set_apic_id` so CPUID agrees. Kick as on
+  the other architectures: `GuestCpus::with_kick` sends the host CPU a
+  physical IPI, which exits the guest (the host runs with interrupts on, so
+  `VMRUN` honours them), and `attach_svm` records where it runs.
+
 ## Describing the machine
 
 `riscv::fdt::GuestMachine` writes a device tree for a RISC-V guest (harts,
 memory, PLIC, UARTs, virtio-mmio slots) in the layout Linux expects from
-QEMU `virt`; pass its address in `a1`. For other guests,
-`osmium_boot::fdt::FdtWriter` builds any tree, and `osmium_boot::elf`
-loads a kernel image.
+QEMU `virt`; pass its address in `a1`. `aarch64::fdt::ArmMachine` does the
+same for an AArch64 guest (PSCI over `hvc`, GICv2, timer, PL011s,
+virtio-mmio); pass it in `x0`. On x86, `x86::pc::PcBoot` writes what a PVH
+kernel boots from: the `hvm_start_info` (pass it in `ebx`), its memory map
+and ACPI tables with a MADT; `x86::pc::pvh_entry` finds the kernel's
+32-bit entry. `osmium_boot::fdt::FdtWriter` builds any other tree.
+
+## Booting a whole kernel
+
+The three `*-hyp` examples boot Osmium's own kernels as guests, and the
+recipe is the same on each:
+
+1. Allocate guest RAM, add it to a `GuestMemory`, and copy in each ELF
+   segment (`osmium_boot::elf`) at its address, zeroing the rest of its
+   memory size.
+2. Write the machine description into guest RAM where the kernel expects
+   it, and map the RAM in the second-stage table.
+3. Put the devices on the buses at the addresses the description gives,
+   wired to the interrupt controller, and the controller to each vCPU.
+4. Start vCPU 0 at the entry with the boot register set (`a1`, `x0` or
+   `ebx`), and the others when the guest asks (`GuestCpus`), one host CPU
+   each.
+5. Answer hypercalls (SBI, PSCI) and power-off, wait in `Halt` until
+   `interrupt_pending`, and make a guest that never exits do so
+   periodically (a host timer, or the timer PPI) so its timers and device
+   interrupts arrive.
 
 ## Current limits
 
-- x86 multi-vCPU guests start their APs the PC way (INIT and STARTUP through
-  `VirtualLapic`, decoded by `decode_icr`; the AP starts with
-  `SvmVcpu::set_real_mode`). Run each vCPU on its own host CPU and kick
-  it as on the other architectures: `GuestCpus::with_kick` sends the host
-  CPU a physical IPI, which exits the guest (the host runs with interrupts
-  on, so `VMRUN` honours them), and `attach_svm` records where it runs. x86 MMIO emulation without
-  decode assists walks 4-level (long-mode) guest page tables, or none; 32-bit
-  paging is not walked.
+- x86 MMIO emulation decodes moves, `MOVZX` and `TEST`; without decode
+  assists it walks 4-level (long-mode) guest page tables, or none; 32-bit
+  paging is not walked. MSRs other than the syscall ones, EFER, PAT,
+  `TSC_AUX` and `APIC_BASE` read as zero.
+- The x86 host does not switch FPU/SSE state: one vCPU per host CPU, on a
+  soft-float host, keeps it intact.
 - No VMX backend (QEMU's TCG does not emulate VMX).
 - FP/SIMD state is switched on RISC-V and AArch64 on the assumption that the
   host kernel itself never uses those registers (soft-float targets); SVE is
