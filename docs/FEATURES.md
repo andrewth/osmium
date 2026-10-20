@@ -100,7 +100,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Host simulation backend
 - ✅ Trap entry (RISC-V S/M-mode, AArch64 EL1/EL2): full `TrapFrame`, registered handler, portable `Trap` cause decoding
 - ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
-- 🗺 x86_64 IDT/trap entry
+- ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction); 🗺 IST stacks and a TSS
 - 🗺 FPU/SIMD state save and restore; user-mode entry/return
 
 ### `osmium-sync`: synchronization
@@ -134,7 +134,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Arm PL011 UART
 - ✅ RISC-V PLIC
 - ✅ Arm GICv2 (distributor + CPU interface, SGIs with correct source-CPU EOI)
-- ✅ x86 local APIC (xAPIC MMIO)
+- ✅ x86 local APIC (xAPIC MMIO, INIT/STARTUP IPIs)
+- ✅ Intel 8254 PIT (calibration delays)
 - ✅ RAM disk `BlockDevice`
 - 🗺 virtio (MMIO/PCI): blk, net, console; GICv3; IO-APIC; HPET; NVMe
 
@@ -153,7 +154,9 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ FDT writer (`alloc`), for hypervisors that generate guest device trees
 - ✅ Multiboot2 parser: memory map, command line, modules
 - ✅ Conversion of firmware memory maps into `osmium_mm::MemoryMap`
-- 🗺 UEFI boot services wrapper, Limine protocol, ACPI RSDP discovery
+- ✅ PVH start-info parser and the `pvh_entry_note!` ELF-note macro
+- ✅ ACPI: RSDP/RSDT/XSDT with checksums, MADT (local APICs, x2APICs, I/O APICs), MCFG (PCI ECAM windows)
+- 🗺 UEFI boot services wrapper, Limine protocol, AML
 
 ### `osmium-virt`: hypervisor building blocks
 - ✅ `GuestPhysAddr`, and `GuestMemory`: a GPA-to-host region map with bounds-checked `read`/`write`/`read_obj`/`write_obj` and a `Pod` marker
@@ -171,5 +174,6 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Builds for `x86_64-unknown-none`, `aarch64-unknown-none-softfloat` and `riscv64imac-unknown-none-elf`
 - ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps
 - ✅ `examples/aarch64-virt`: the same on QEMU AArch64 `virt` (GICv2, PL011, generic timer, stage-1 paging, PSCI)
-- ✅ Both examples bring up 4 CPUs and run shared SMP demos (cross-CPU mutex wake-ups by IPI, task migration)
+- ✅ `examples/x86_64-pc`: the same on QEMU q35 (PVH boot, COM1, local APIC timer, 4-level paging, ACPI MADT, INIT/SIPI trampoline)
+- ✅ All three examples bring up 4 CPUs and run shared SMP demos (cross-CPU mutex wake-ups by IPI, task migration)
 - ✅ `scripts/check.sh`: tests, clippy, rustdoc, all targets, and the QEMU boot test

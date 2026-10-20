@@ -52,5 +52,7 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
+boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
+    -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot
 
 echo "all checks passed"

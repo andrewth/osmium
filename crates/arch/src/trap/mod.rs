@@ -10,8 +10,9 @@
 //! (for example `osmium_sched::preempt_if_needed`): the frame stays on the
 //! preempted task's stack until it resumes. User mode is not supported yet.
 //!
-//! Supported: RISC-V 64 (S-mode, or M-mode with `riscv-m-mode`) and AArch64
-//! (EL1, or EL2 with `aarch64-el2`). On hosted targets a simulation lets
+//! Supported: RISC-V 64 (S-mode, or M-mode with `riscv-m-mode`), AArch64
+//! (EL1, or EL2 with `aarch64-el2`) and x86_64 (an IDT of interrupt gates,
+//! no IST yet). On hosted targets a simulation lets
 //! tests drive handlers with [`simulate`].
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -79,8 +80,6 @@ pub fn set_handler(handler: Handler) {
     HANDLER.store(handler as usize, Ordering::Release);
 }
 
-// Unused on bare-metal x86_64 until it has a trap backend.
-#[cfg_attr(all(bare, target_arch = "x86_64"), allow(dead_code))]
 fn dispatch(frame: &mut TrapFrame) {
     match HANDLER.load(Ordering::Acquire) {
         0 => panic!("unhandled trap {:?} at pc {:#x} (no handler registered)", frame.cause(), frame.pc()),
@@ -98,6 +97,38 @@ extern "C" fn osmium_trap_dispatch(frame: &mut TrapFrame) {
     dispatch(frame);
 }
 
+#[cfg(all(bare, target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+extern "C" fn osmium_trap_dispatch(frame: &mut TrapFrame) {
+    frame.on_entry();
+    dispatch(frame);
+}
+
+/// A minimal once-flag usable from `osmium-arch`, which sits below
+/// `osmium-sync`.
+#[allow(dead_code)]
+pub(crate) struct OnceFlag(core::sync::atomic::AtomicU8);
+
+#[allow(dead_code)]
+impl OnceFlag {
+    pub(crate) const fn new() -> Self {
+        Self(core::sync::atomic::AtomicU8::new(0))
+    }
+
+    /// Runs `f` exactly once; concurrent callers wait until it finishes.
+    pub(crate) fn call_once(&self, f: impl FnOnce()) {
+        use core::sync::atomic::Ordering;
+        if self.0.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+            f();
+            self.0.store(2, Ordering::Release);
+        } else {
+            while self.0.load(Ordering::Acquire) != 2 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
 #[cfg(target_arch = "riscv64")]
@@ -108,9 +139,14 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{TrapFrame, VectorKind, install};
 
-#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+#[cfg(all(bare, target_arch = "x86_64"))]
+mod x86_64;
+#[cfg(all(bare, target_arch = "x86_64"))]
+pub use x86_64::{SYSCALL_VECTOR, TrapFrame, install};
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64", all(bare, target_arch = "x86_64"))))]
 mod host;
-#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64")))]
+#[cfg(not(any(target_arch = "riscv64", target_arch = "aarch64", all(bare, target_arch = "x86_64"))))]
 pub use host::{TrapFrame, install};
 
 /// Runs the registered handler on a synthetic frame carrying `trap`, as if

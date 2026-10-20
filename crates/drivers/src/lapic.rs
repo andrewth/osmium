@@ -13,6 +13,9 @@ const TIMER_CURRENT: usize = 0x390;
 const TIMER_DIVIDE: usize = 0x3e0;
 
 const ICR_PENDING: u32 = 1 << 12;
+const ICR_INIT: u32 = 0b101 << 8;
+const ICR_STARTUP: u32 = 0b110 << 8;
+const ICR_LEVEL_ASSERT: u32 = 1 << 14;
 const LVT_MASKED: u32 = 1 << 16;
 const LVT_PERIODIC: u32 = 1 << 17;
 
@@ -58,8 +61,24 @@ impl LocalApic {
 
     /// Sends fixed-delivery interrupt `vector` to the CPU with APIC id `dest`.
     pub fn send_ipi(&self, dest: u8, vector: u8) {
+        self.send_icr(dest, vector as u32);
+    }
+
+    /// Sends an INIT IPI to the CPU with APIC id `dest`: the first step of
+    /// starting an application processor.
+    pub fn send_init(&self, dest: u8) {
+        self.send_icr(dest, ICR_INIT | ICR_LEVEL_ASSERT);
+    }
+
+    /// Sends a STARTUP IPI: CPU `dest` starts in real mode at physical
+    /// address `page << 12` (so the entry must be page aligned and below 1 MiB).
+    pub fn send_startup(&self, dest: u8, page: u8) {
+        self.send_icr(dest, ICR_STARTUP | page as u32);
+    }
+
+    fn send_icr(&self, dest: u8, low: u32) {
         self.write(ICR_HIGH, (dest as u32) << 24);
-        self.write(ICR_LOW, vector as u32);
+        self.write(ICR_LOW, low);
         while self.read(ICR_LOW) & ICR_PENDING != 0 {
             core::hint::spin_loop();
         }
@@ -109,5 +128,21 @@ mod tests {
         assert_eq!(regs[ICR_LOW / 4], 0x40);
         assert_eq!(regs[LVT_TIMER / 4], 0x20 | LVT_PERIODIC);
         assert_eq!(regs[TIMER_INITIAL / 4], 1000);
+    }
+
+    #[test]
+    fn init_and_startup() {
+        let mut regs = [0u32; 0x1000 / 4];
+        // SAFETY: the window covers a local array.
+        let apic = LocalApic::new(unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) });
+        apic.send_init(3);
+        assert_eq!(read_icr(&apic), (3 << 24, 0x4500));
+        apic.send_startup(3, 0x08);
+        drop(apic);
+        assert_eq!((regs[ICR_HIGH / 4], regs[ICR_LOW / 4]), (3 << 24, 0x0608));
+    }
+
+    fn read_icr(apic: &LocalApic) -> (u32, u32) {
+        (apic.read(ICR_HIGH), apic.read(ICR_LOW))
     }
 }

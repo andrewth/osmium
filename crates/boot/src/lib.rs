@@ -3,7 +3,10 @@
 //! - [`fdt`]: Flattened Device Tree (DTB) parsing, zero-copy and heap-free,
 //!   plus an [`fdt::FdtWriter`] (feature `alloc`) for building trees, which a
 //!   hypervisor needs to describe its guests.
-//! - [`multiboot2`]: the Multiboot2 boot information structure (GRUB, QEMU).
+//! - [`multiboot2`]: the Multiboot2 boot information structure (GRUB).
+//! - [`acpi`]: RSDP/RSDT/XSDT, MADT (CPUs, I/O APICs) and MCFG (PCI ECAM).
+//! - [`pvh`]: the PVH start-info structure (QEMU, Firecracker, Cloud
+//!   Hypervisor), plus a macro for the ELF note that advertises a PVH entry.
 //!
 //! Both can populate an [`osmium_mm::MemoryMap`], the starting point for
 //! the frame allocator.
@@ -14,8 +17,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod acpi;
 pub mod fdt;
 pub mod multiboot2;
+pub mod pvh;
 
 /// Reads a big-endian `u32` at `off`.
 pub(crate) fn be32(data: &[u8], off: usize) -> Option<u32> {

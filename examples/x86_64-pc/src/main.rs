@@ -1,0 +1,530 @@
+//! A small kernel for QEMU's x86_64 PC (q35), built entirely from Osmium
+//! components. QEMU loads the ELF directly through the PVH boot protocol and
+//! enters `pvh_start` in 32-bit protected mode with `ebx` pointing at the
+//! start-info structure.
+//!
+//! The same steps as the RISC-V and AArch64 examples, on PC hardware: COM1
+//! 16550 UART, local APIC timer calibrated against the PIT, x86_64 4-level
+//! paging, and the IDT from `osmium_arch::trap`.
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use osmium::arch::trap::{self, Trap, TrapFrame};
+use osmium::arch::x86_64 as x86;
+use osmium::arch::{MAX_CPUS, cpu, irq};
+use osmium::boot::acpi::{Acpi, Madt};
+use osmium::boot::pvh::StartInfo;
+use osmium::drivers::lapic::{self, LocalApic};
+use osmium::drivers::pit::{self, Pit};
+use osmium::drivers::uart16550::{Pio, Uart16550};
+use osmium::hal::console::{SerialConsole, set_console};
+use osmium::hal::mmio::IoMem;
+use osmium::hal::println;
+use osmium::hal::timer::TickRate;
+use osmium::mm::heap::LockedHeap;
+use osmium::mm::paging::formats::X86_64;
+use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
+use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
+use osmium::sched::FifoScheduler;
+use osmium::sched::timer::TimerQueue;
+use osmium::sync::{IrqSpinLock, Once};
+
+osmium::boot::pvh_entry_note!("pvh_start");
+
+// 32-bit PVH entry: zero .bss, identity-map the first 4 GiB with 2 MiB
+// pages, enter long mode with NX enabled, and call `kmain(start_info)`.
+core::arch::global_asm!(
+    r#"
+    .section .text.entry, "ax"
+    .code32
+    .globl pvh_start
+pvh_start:
+    cli
+    cld
+    mov %ebx, %esi
+
+    mov $_bss_start, %edi
+    mov $_bss_end, %ecx
+    sub %edi, %ecx
+    shr $2, %ecx
+    xor %eax, %eax
+    rep stosl
+
+    // PML4[0] -> PDPT; PDPT[0..4] -> PD[0..4]; PD entries map 2 MiB each.
+    mov $boot_pdpt, %eax
+    or $0x3, %eax
+    mov %eax, boot_pml4
+    mov $boot_pd, %eax
+    or $0x3, %eax
+    mov $boot_pdpt, %edi
+    mov $4, %ecx
+1:  mov %eax, (%edi)
+    add $0x1000, %eax
+    add $8, %edi
+    loop 1b
+    mov $boot_pd, %edi
+    mov $0x83, %eax
+    mov $2048, %ecx
+2:  mov %eax, (%edi)
+    add $0x200000, %eax
+    add $8, %edi
+    loop 2b
+
+    mov $boot_pml4, %eax
+    mov %eax, %cr3
+    mov %cr4, %eax
+    or $(1 << 5), %eax
+    mov %eax, %cr4
+    mov $0xc0000080, %ecx
+    rdmsr
+    or $((1 << 8) | (1 << 11)), %eax
+    wrmsr
+    mov %cr0, %eax
+    or $((1 << 31) | (1 << 16) | 1), %eax
+    mov %eax, %cr0
+
+    lgdt boot_gdtr
+    ljmp $0x08, $long_entry
+
+    .code64
+long_entry:
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    xor %ax, %ax
+    mov %ax, %fs
+    mov %ax, %gs
+    mov $boot_stack_top, %rsp
+    mov %esi, %edi
+    call kmain
+3:  hlt
+    jmp 3b
+
+    // Application processors arrive here from the trampoline, still on the
+    // boot page tables, with rdi = CPU index and rsp = their stack.
+    .globl ap_start64
+ap_start64:
+    lgdt boot_gdtr
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    xor %ax, %ax
+    mov %ax, %fs
+    mov %ax, %gs
+    pushq $0x08
+    lea 4f(%rip), %rax
+    push %rax
+    lretq
+4:  call ap_main
+    jmp 3b
+
+    .section .rodata
+    .balign 8
+boot_gdt:
+    .quad 0
+    .quad 0x00af9a000000ffff
+    .quad 0x00cf92000000ffff
+boot_gdtr:
+    .word boot_gdtr - boot_gdt - 1
+    .quad boot_gdt
+
+    .section .bss.boot, "aw", @nobits
+    .balign 4096
+boot_pml4: .space 4096
+boot_pdpt: .space 4096
+boot_pd:   .space 4096 * 4
+    .space 65536
+boot_stack_top:
+"#,
+    options(att_syntax)
+);
+
+// Real-mode AP trampoline. It is assembled here but runs as a copy at
+// `TRAMPOLINE` (0x8000), so every absolute address is computed relative to
+// that copy. Real mode -> protected mode -> long mode on the boot page tables,
+// then a jump to `tramp_entry`.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.trampoline, "a"
+    .code16
+    .globl tramp_start
+tramp_start:
+    cli
+    cld
+    mov %cs, %ax
+    mov %ax, %ds
+    lgdtl tramp_gdtr - tramp_start
+    mov %cr0, %eax
+    or $1, %eax
+    mov %eax, %cr0
+    ljmpl $0x18, $(0x8000 + tramp_pm32 - tramp_start)
+
+    .code32
+tramp_pm32:
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    mov 0x8000 + (tramp_cr3 - tramp_start), %eax
+    mov %eax, %cr3
+    mov %cr4, %eax
+    or $(1 << 5), %eax
+    mov %eax, %cr4
+    mov $0xc0000080, %ecx
+    rdmsr
+    or $((1 << 8) | (1 << 11)), %eax
+    wrmsr
+    mov %cr0, %eax
+    or $((1 << 31) | (1 << 16)), %eax
+    mov %eax, %cr0
+    ljmp $0x08, $(0x8000 + tramp_lm64 - tramp_start)
+
+    .code64
+tramp_lm64:
+    mov 0x8000 + (tramp_stack - tramp_start), %rsp
+    mov 0x8000 + (tramp_cpu - tramp_start), %rdi
+    mov 0x8000 + (tramp_entry - tramp_start), %rax
+    jmp *%rax
+
+    .balign 8
+tramp_gdt:
+    .quad 0
+    .quad 0x00af9a000000ffff
+    .quad 0x00cf92000000ffff
+    .quad 0x00cf9a000000ffff
+tramp_gdtr:
+    .word 31
+    .long 0x8000 + (tramp_gdt - tramp_start)
+    .balign 8
+    .globl tramp_cr3, tramp_stack, tramp_entry, tramp_cpu, tramp_end
+tramp_cr3:   .quad 0
+tramp_stack: .quad 0
+tramp_entry: .quad 0
+tramp_cpu:   .quad 0
+tramp_end:
+"#,
+    options(att_syntax)
+);
+
+unsafe extern "C" {
+    static tramp_start: u8;
+    static tramp_cr3: u8;
+    static tramp_stack: u8;
+    static tramp_entry: u8;
+    static tramp_cpu: u8;
+    static tramp_end: u8;
+    static boot_pml4: u8;
+    fn ap_start64();
+    static _kernel_start: u8;
+    static _etext: u8;
+    static _erodata: u8;
+    static _kernel_end: u8;
+}
+
+fn sym(s: &u8) -> u64 {
+    s as *const u8 as u64
+}
+
+const COM1: u16 = 0x3f8;
+/// Physical address the AP trampoline is copied to (STARTUP vector 0x08).
+const TRAMPOLINE: u64 = 0x8000;
+const IPI_VECTOR: u8 = 33;
+const TIMER_VECTOR: u8 = 32;
+const SPURIOUS_VECTOR: u8 = 0xff;
+/// Timer interrupt period.
+const TICK_NS: u64 = 10_000_000;
+
+type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
+
+// SAFETY: the kernel runs identity-mapped, before and after switching tables.
+static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
+
+#[global_allocator]
+static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
+
+static UART: Once<SerialConsole<Uart16550<Pio>>> = Once::new();
+static LAPIC: Once<LocalApic> = Once::new();
+static SCHED: FifoScheduler = FifoScheduler::new(2);
+static TIMERS: TimerQueue = TimerQueue::new();
+static TSC_RATE: Once<TickRate> = Once::new();
+static TICKS: AtomicU64 = AtomicU64::new(0);
+/// APIC id of each logical CPU.
+static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static ONLINE: AtomicUsize = AtomicUsize::new(1);
+static CR3: AtomicU64 = AtomicU64::new(0);
+/// APIC timer initial count for one tick.
+static APIC_TICK_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn now_ns() -> u64 {
+    TSC_RATE.get().unwrap().ticks_to_ns(cpu::ticks())
+}
+
+/// Powers QEMU off: ACPI PM1a control (q35/i440fx), then isa-debug-exit.
+fn shutdown() -> ! {
+    // SAFETY: QEMU's ACPI PM1a control register; SLP_TYP=0, SLP_EN.
+    unsafe {
+        x86::outw(0x604, 0x2000);
+        x86::outb(0xf4, 0);
+    }
+    cpu::halt_forever()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn kmain(start_info: usize) -> ! {
+    trap::set_handler(on_trap);
+    // SAFETY: we run on the boot stack from here on.
+    unsafe { trap::install() };
+
+    // SAFETY: COM1 belongs to this kernel.
+    let mut uart = Uart16550::new(unsafe { Pio::new(COM1) });
+    uart.init(Some(1));
+    set_console(UART.call_once(|| SerialConsole::new(uart)));
+    let mut brand = [0u8; 48];
+    println!("\nosmium x86_64-pc example on {}", cpu_brand(&mut brand));
+    // SAFETY: the only CPU; requires RDTSCP, which `-cpu max` provides.
+    unsafe { cpu::set_current_id(0) };
+
+    // --- PVH start info -----------------------------------------------------
+    // SAFETY: QEMU passes a valid start-info structure, identity-mapped by
+    // the boot page tables. Everything needed from it is copied out before
+    // those tables are replaced.
+    let info = unsafe { StartInfo::from_ptr(start_info as *const u8) }.expect("bad PVH start info");
+    let mut map = MemoryMap::<32>::new();
+    info.fill_memory_map(&mut map).unwrap();
+    println!(
+        "[pvh]   start info v{} at {start_info:#x}, {} memory-map entries, RSDP {:?}",
+        info.version(),
+        info.memory_map().count(),
+        info.rsdp()
+    );
+
+    // --- CPUs from the ACPI MADT (read while the boot tables map it) ---------
+    let my_apic = x86::cpuid(1, 0).ebx >> 24;
+    APIC_IDS[0].store(my_apic, Ordering::Relaxed);
+    let mut ncpus = 1;
+    if let Some(rsdp) = info.rsdp() {
+        // SAFETY: the boot tables identity-map the first 4 GiB, where QEMU's
+        // ACPI tables live; they are only read here.
+        let read = |pa: u64, len: usize| Some(unsafe { core::slice::from_raw_parts(pa as *const u8, len) });
+        let madt = Acpi::new(rsdp.0, read).ok().and_then(|a| a.find(b"APIC")).and_then(Madt::parse);
+        for c in madt.iter().flat_map(|m| m.local_apics()).filter(|c| c.enabled && c.apic_id != my_apic) {
+            APIC_IDS[ncpus].store(c.apic_id, Ordering::Relaxed);
+            ncpus += 1;
+        }
+    }
+    println!("[acpi]  MADT lists {ncpus} enabled CPUs; this one is APIC id {my_apic}");
+
+    // --- Physical memory ---------------------------------------------------
+    // SAFETY: linker-provided symbols.
+    let (kstart, etext, erodata, kend) =
+        unsafe { (sym(&_kernel_start), sym(&_etext), sym(&_erodata), sym(&_kernel_end)) };
+    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
+    map.page_align_usable();
+    for r in map.regions() {
+        println!("[mem]   {:#011x}..{:#011x} {:?}", r.start.0, r.end.0, r.kind);
+    }
+    let ram_end = map.usable().map(|r| r.end.0).max().unwrap();
+    {
+        let mut buddy = FRAMES.lock();
+        for r in map.usable() {
+            // SAFETY: the memory map says the range is free RAM, identity-mapped.
+            unsafe { buddy.add_region(r.start, r.end) };
+        }
+        println!("[frame] buddy allocator: {} free frames ({} MiB)", buddy.free_frames(), (buddy.free_frames() * PAGE_SIZE) >> 20);
+    }
+
+    // --- Heap ------------------------------------------------------------
+    HEAP.init(&FRAMES);
+    let squares: Vec<u64> = (0..1000).map(|i| i * i).collect();
+    let s: String = ["heap", "works"].join(" ");
+    println!("[heap]  {s} (sum of squares {})", squares.iter().sum::<u64>());
+
+    // --- Paging (4-level, W^X, NX) -----------------------------------------
+    let mut pt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).unwrap();
+    let k = |f| f | MapFlags::GLOBAL;
+    let va = |a: u64| VirtAddr::new(a);
+    let pa = |a: u64| PhysAddr::new(a);
+    // The first 1 MiB stays unmapped, so null-ish pointers fault.
+    pt.map_range(va(0x10_0000), pa(0x10_0000), kstart - 0x10_0000, k(MapFlags::RW)).unwrap();
+    pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).unwrap();
+    pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).unwrap();
+    pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).unwrap();
+    pt.map_range(va(lapic::DEFAULT_BASE), pa(lapic::DEFAULT_BASE), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE))
+        .unwrap();
+    // Writable so the boot CPU can install the AP trampoline there.
+    pt.map_range(va(TRAMPOLINE), pa(TRAMPOLINE), PAGE_SIZE as u64, k(MapFlags::RW)).unwrap();
+    // SAFETY: the new table maps the running code, its stack, the heap and the APIC.
+    unsafe { x86::write_cr3(pt.root().0) };
+    CR3.store(pt.root().0, Ordering::Release);
+    let t = pt.translate(va(kmain as *const () as u64)).unwrap();
+    println!("[mmu]   CR3 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
+    // The table must outlive the kernel.
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(pt));
+
+    // --- Timers: calibrate TSC and APIC timer against the PIT ---------------
+    // SAFETY: the PIT and port 0x61 belong to this kernel.
+    let pit = Pit::new(unsafe { pit::Pio::new() });
+    let tsc_hz = pit.calibrate(10_000_000, cpu::ticks);
+    TSC_RATE.call_once(|| TickRate::new(tsc_hz));
+    // Mask the legacy 8259 PICs; the local APIC delivers everything.
+    // SAFETY: the PIC data ports.
+    unsafe {
+        x86::outb(0x21, 0xff);
+        x86::outb(0xa1, 0xff);
+    }
+    // SAFETY: the local APIC's default address, mapped uncached above.
+    let apic = LAPIC.call_once(|| LocalApic::new(unsafe { IoMem::new(lapic::DEFAULT_BASE as *mut u8, PAGE_SIZE) }));
+    apic.enable(SPURIOUS_VECTOR);
+    apic.start_timer(TIMER_VECTOR, u32::MAX, false);
+    let apic_hz = pit.calibrate(10_000_000, || u32::MAX as u64 - apic.timer_remaining() as u64);
+    apic.stop_timer();
+    println!("[timer] TSC {} MHz, APIC timer {} MHz (divided by 16), measured with the PIT", tsc_hz / 1_000_000, apic_hz / 1_000_000);
+
+    // --- Scheduler ---------------------------------------------------------
+    osmium::sched::inject_scheduler(&SCHED);
+    osmium::sched::init_cpu();
+    APIC_TICK_COUNT.store((apic_hz * TICK_NS / 1_000_000_000) as u32, Ordering::Relaxed);
+    apic.start_timer(TIMER_VECTOR, APIC_TICK_COUNT.load(Ordering::Relaxed), true);
+    irq::enable();
+    println!("[sched] FIFO scheduler, {} ms tick, APIC id {}", TICK_NS / 1_000_000, apic.id());
+
+    // --- Application processors (INIT, STARTUP, STARTUP) ---------------------
+    osmium::sched::set_remote_wake_hook(|cpu| {
+        LAPIC.get().unwrap().send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, IPI_VECTOR)
+    });
+    // Linker symbols delimiting the trampoline image and its slots.
+    let (start, end) = (&raw const tramp_start as u64, &raw const tramp_end as u64);
+    let slot = |s: *const u8| (TRAMPOLINE + (s as u64 - start)) as *mut u64;
+    // SAFETY: the trampoline page is free low memory (reserved from the
+    // allocator) mapped writable above; the image fits in one page.
+    unsafe { core::ptr::copy_nonoverlapping(start as *const u8, TRAMPOLINE as *mut u8, (end - start) as usize) };
+    for (cpu, apic_id) in APIC_IDS.iter().enumerate().take(ncpus).skip(1) {
+        let stack = alloc::vec![0u8; 64 * 1024].leak();
+        // SAFETY: slots inside the copied trampoline; the AP reads them
+        // after STARTUP, which happens after these writes.
+        unsafe {
+            slot(&raw const tramp_cr3).write_volatile(&raw const boot_pml4 as u64);
+            slot(&raw const tramp_stack).write_volatile((stack.as_ptr() as u64 + stack.len() as u64) & !15);
+            slot(&raw const tramp_entry).write_volatile(ap_start64 as *const () as u64);
+            slot(&raw const tramp_cpu).write_volatile(cpu as u64);
+        }
+        let id = apic_id.load(Ordering::Relaxed) as u8;
+        apic.send_init(id);
+        pit.wait_ns(10_000_000);
+        for _ in 0..2 {
+            apic.send_startup(id, (TRAMPOLINE >> 12) as u8);
+            pit.wait_ns(200_000);
+        }
+        // One AP at a time: they share the trampoline's slots.
+        while ONLINE.load(Ordering::Acquire) <= cpu {
+            core::hint::spin_loop();
+        }
+    }
+    println!("[smp]   {ncpus} CPUs online");
+
+    demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });
+    if ncpus > 1 {
+        demos::smp(ncpus);
+    }
+    fault_demo();
+
+    println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
+    shutdown()
+}
+
+/// The CPUID brand string (no heap needed: called before the heap exists).
+fn cpu_brand(buf: &mut [u8; 48]) -> &str {
+    for (i, leaf) in (0x8000_0002..=0x8000_0004).enumerate() {
+        let r = x86::cpuid(leaf, 0);
+        for (j, w) in [r.eax, r.ebx, r.ecx, r.edx].into_iter().enumerate() {
+            buf[i * 16 + j * 4..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(48);
+    core::str::from_utf8(&buf[..end]).unwrap_or("?").trim()
+}
+
+/// Rust entry of application processors, on their own stack.
+#[unsafe(no_mangle)]
+extern "C" fn ap_main(cpu: usize) -> ! {
+    // SAFETY: the boot CPU's table maps everything this CPU touches.
+    unsafe { x86::write_cr3(CR3.load(Ordering::Acquire)) };
+    // SAFETY: the boot CPU hands out distinct indices.
+    unsafe { cpu::set_current_id(cpu) };
+    // SAFETY: we are on the stack the boot CPU allocated for us.
+    unsafe { trap::install() };
+    let apic = LAPIC.get().unwrap();
+    apic.enable(SPURIOUS_VECTOR);
+    osmium::sched::init_cpu();
+    apic.start_timer(TIMER_VECTOR, APIC_TICK_COUNT.load(Ordering::Relaxed), true);
+    irq::enable();
+    println!("[smp]   APIC id {} online as CPU {cpu}", apic.id());
+    ONLINE.fetch_add(1, Ordering::Release);
+    // Hand the CPU to the scheduler for good.
+    osmium::sched::exit()
+}
+
+fn on_timer() {
+    if cpu::current_id() == 0 {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    TIMERS.process(now_ns());
+    osmium::sched::tick();
+}
+
+/// The last exception that `on_trap` recovered from.
+static RECOVERED: IrqSpinLock<Option<Trap>> = IrqSpinLock::new(None);
+static RECOVER: AtomicBool = AtomicBool::new(false);
+
+fn fault_demo() {
+    RECOVER.store(true, Ordering::SeqCst);
+    // SAFETY: the handler steps over the breakpoint.
+    unsafe { core::arch::asm!("int3") };
+    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().unwrap());
+    // The first 1 MiB is unmapped: a page fault.
+    // SAFETY: the read faults and the handler skips it; the value is never used.
+    let v: u64;
+    unsafe { core::arch::asm!("mov {}, qword ptr [0x1000]", out(reg) v) };
+    let _ = v;
+    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().unwrap());
+    RECOVER.store(false, Ordering::SeqCst);
+}
+
+fn on_trap(frame: &mut TrapFrame) {
+    match (frame.vector(), frame.cause()) {
+        (TIMER_VECTOR, _) => {
+            // Acknowledge before a possible task switch, or no further
+            // timer interrupts would be delivered.
+            LAPIC.get().unwrap().eoi();
+            on_timer();
+            osmium::sched::preempt_if_needed();
+        }
+        (IPI_VECTOR, _) => {
+            LAPIC.get().unwrap().eoi();
+            osmium::sched::preempt_if_needed();
+        }
+        (SPURIOUS_VECTOR, _) => {}
+        (_, cause @ (Trap::Breakpoint | Trap::PageFault { .. })) if RECOVER.load(Ordering::SeqCst) => {
+            *RECOVERED.lock() = Some(cause);
+            // `int3` is 1 byte; the faulting `mov rax, [0x1000]` is 8.
+            let len = if cause == Trap::Breakpoint { 1 } else { 8 };
+            frame.set_pc(frame.pc() + len);
+        }
+        (v, cause) => panic!("unhandled trap {cause:?} (vector {v}) at rip {:#x}, error {:#x}", frame.pc(), frame.error_code),
+    }
+}
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    irq::disable();
+    println!("\n[panic] {info}");
+    shutdown()
+}

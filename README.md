@@ -20,8 +20,8 @@ principles and the full feature list with status.
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
 | `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA), `IrqTable`, global console with `println!` | no |
-| `osmium-drivers` | NS16550A, PL011, RISC-V PLIC, GICv2, x86 local APIC, RAM disk | no |
-| `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 parser; both fill a `MemoryMap` | writer only |
+| `osmium-drivers` | NS16550A, PL011, RISC-V PLIC, GICv2, x86 local APIC (with INIT/SIPI), i8254 PIT, RAM disk | no |
+| `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG reader | writer only |
 | `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
 | `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550 | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
@@ -29,11 +29,13 @@ principles and the full feature list with status.
 The library never defines an entry point, panic handler or global allocator;
 your OS assembles those from the parts it uses.
 
-## Examples: the same kernel on two architectures
+## Examples: the same kernel on three architectures
 
 [`examples/riscv-virt`](examples/riscv-virt) and
 [`examples/aarch64-virt`](examples/aarch64-virt) boot on QEMU's `virt`
-machines with four CPUs. Each discovers hardware from the device tree, builds
+machines with four CPUs, and [`examples/x86_64-pc`](examples/x86_64-pc) on
+QEMU's q35 PC (PVH boot, ACPI MADT, local APIC timer calibrated with the
+PIT, INIT/SIPI bring-up through a real-mode trampoline). Each discovers hardware from the device tree, builds
 a memory map, feeds the buddy allocator, turns on the heap, enables W^X
 paging (Sv39 or AArch64 stage 1), moves the console to the UART driver
 (16550 or PL011), brings up the other CPUs (SBI HSM or PSCI), and runs the
@@ -85,9 +87,8 @@ features.
 
 ## Current limitations
 
-- Traps are supported on RISC-V and AArch64 only; x86_64 has no IDT setup
-  yet and no bootable example. User mode is not supported on any
-  architecture.
+- User mode is not supported on any architecture. x86_64 traps use the
+  current stack (no IST), so a kernel stack overflow triple-faults.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. The scheduler does no load balancing; tasks move only
   when `Task::set_cpu` asks.

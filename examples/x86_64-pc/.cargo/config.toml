@@ -1,0 +1,7 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# The kernel runs where it is linked, with no loader to apply relocations.
+rustflags = ["-C", "relocation-model=static"]
+runner = "qemu-system-x86_64 -machine q35 -cpu max -nographic -m 128M -smp 4 -kernel"
