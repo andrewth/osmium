@@ -23,6 +23,7 @@ osmium-fs = { path = "crates/fs", version = "0.1.0" }
 osmium-proc = { path = "crates/proc", version = "0.1.0" }
 osmium-fs-fat = { path = "crates/fs-fat", version = "0.1.0" }
 osmium-net = { path = "crates/net", version = "0.1.0" }
+osmium-fs-ext4 = { path = "crates/fs-ext4", version = "0.1.0" }
 osmium-fs-iso9660 = { path = "crates/fs-iso9660", version = "0.1.0" }
 osmium-iscsi = { path = "crates/iscsi", version = "0.1.0" }
 

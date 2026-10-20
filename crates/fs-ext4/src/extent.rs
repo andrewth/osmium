@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use osmium_hal::block::BlockDevice;
 
 use super::{Csum, Fs, Inode, get16, get32, ino, put16, put32};
-use crate::Errno;
+use osmium_fs::Errno;
 
 const MAGIC: u16 = 0xf30a;
 const HEADER: usize = 12;

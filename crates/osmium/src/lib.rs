@@ -17,6 +17,7 @@
 //! | `exec` | `osmium-exec` | heap-free async executor for firmware |
 //! | `fs` | `osmium-fs` | virtual file system, mounts, RAM file system, initramfs |
 //! | `fs_fat` | `osmium-fs-fat` | FAT32 with long names on any block device |
+//! | `fs_ext4` | `osmium-fs-ext4` | ext2, ext3 and ext4, read and write, on any block device |
 //! | `fs_iso9660` | `osmium-fs-iso9660` | read-only ISO 9660 with Rock Ridge and Joliet on any block device |
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
 //! | `net` | `osmium-net` | IPv4 stack: ARP, ICMP echo, UDP, TCP, DHCP client |
@@ -41,6 +42,8 @@ pub use osmium_proc as proc;
 pub use osmium_fs_fat as fs_fat;
 #[cfg(feature = "net")]
 pub use osmium_net as net;
+#[cfg(feature = "fs-ext4")]
+pub use osmium_fs_ext4 as fs_ext4;
 #[cfg(feature = "fs-iso9660")]
 pub use osmium_fs_iso9660 as fs_iso9660;
 #[cfg(feature = "iscsi")]

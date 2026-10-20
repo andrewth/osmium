@@ -1,0 +1,15 @@
+[package]
+name = "osmium-fs-ext4"
+description = "Osmium: the ext2, ext3 and ext4 file systems, read and write, on any block device, for the osmium-fs VFS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-fs.workspace = true
+osmium-hal.workspace = true
+osmium-sync.workspace = true

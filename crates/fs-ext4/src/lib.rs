@@ -23,6 +23,11 @@
 //! All state lives behind one spin lock held across device I/O, and there is
 //! no block cache: simple and correct, not fast. Nothing is journaled; call
 //! [`File::sync`] to flush the device.
+#![no_std]
+
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod csum;
 mod extent;
@@ -36,8 +41,8 @@ use alloc::vec::Vec;
 use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_sync::SpinLock;
 
-use crate::dev::makedev;
-use crate::{DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat};
+use osmium_fs::dev::makedev;
+use osmium_fs::{DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat};
 use csum::{crc16, crc32c};
 
 const MAGIC: u16 = 0xef53;
@@ -520,7 +525,7 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
         self.shared.fs.lock().read_only
     }
 
-    /// The root directory, to pass to [`Vfs::mount`](crate::Vfs::mount).
+    /// The root directory, to pass to [`Vfs::mount`](osmium_fs::Vfs::mount).
     pub fn root(&self) -> Arc<dyn File> {
         let mut fs = self.shared.fs.lock();
         fs.node(&self.shared, ROOT_INO)
@@ -1913,7 +1918,7 @@ impl<D: BlockDevice + Send + 'static> Drop for Node<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OpenFlags, Vfs};
+    use osmium_fs::{OpenFlags, RamFs, Vfs};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::{format, fs, string::ToString};
@@ -2074,7 +2079,7 @@ mod tests {
                 assert_eq!(root.read(0, &mut [0; 4]).err(), Some(Errno::EISDIR));
 
                 // Through the VFS, following the fast link.
-                let vfs = Vfs::new(crate::RamFs::new(1).root());
+                let vfs = Vfs::new(RamFs::new(1).root());
                 vfs.mkdir("/mnt", 0o755).unwrap();
                 vfs.mount("/mnt", root).unwrap();
                 let big = vfs.open("/mnt/fast", OpenFlags::READ, 0).unwrap();
