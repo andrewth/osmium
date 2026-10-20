@@ -13,6 +13,8 @@ workspace = true
 ## The RISC-V H-extension vCPU's world switch (riscv64 targets). Enables the
 ## matching guest-exit hook in `osmium-arch`.
 riscv64-hs = ["osmium-arch/riscv64-hs"]
+## The AArch64 EL2 vCPU's world switch (aarch64 targets, host at EL2).
+aarch64-el2 = ["osmium-arch/aarch64-el2"]
 
 [dependencies]
 osmium-arch.workspace = true

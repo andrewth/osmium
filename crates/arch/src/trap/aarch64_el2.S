@@ -1,4 +1,28 @@
 .section .text.osmium_trap, "ax", @progbits
+// Lower-EL vectors 8-11 are guest exits while a vCPU runs on this CPU
+// (TrapCpu.guest != 0): they branch to osmium_el2_guest_exit (osmium-virt)
+// with x0 = TrapCpu.guest, x1 = the vector number and the guest's x0/x1
+// pushed on the stack. Otherwise they fall through to the normal stub.
+// The symbol is weak so builds without osmium-virt still link; the branch
+// is only taken once a vCPU has set TrapCpu.guest.
+.weak osmium_el2_guest_exit
+.macro osmium_guest_vector kind
+    stp x0, x1, [sp, #-16]!
+    mrs x0, tpidr_el2
+    adrp x1, OSMIUM_TRAP_CPUS
+    add x1, x1, :lo12:OSMIUM_TRAP_CPUS
+    add x0, x1, x0, lsl #6
+    ldr x0, [x0, #0x20]             // TrapCpu.guest
+    cbz x0, 1f
+    mov x1, #\kind
+    b osmium_el2_guest_exit
+1:  ldp x0, x1, [sp], #16
+    sub sp, sp, #304
+    stp x0, x1, [sp, #0]
+    mov x0, #\kind
+    b osmium_trap_common
+.endm
+
 .macro osmium_kernel_vector kind
     // Current EL with SP_ELx: check sp before the first store, in case the
     // kernel stack has overflowed. Exactly 32 instructions (the slot size).
@@ -85,28 +109,16 @@ osmium_vec_7:
     osmium_kernel_vector 7
 .org osmium_trap_vectors + 0x400
 osmium_vec_8:
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #8
-    b osmium_trap_common
+    osmium_guest_vector 8
 .org osmium_trap_vectors + 0x480
 osmium_vec_9:
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #9
-    b osmium_trap_common
+    osmium_guest_vector 9
 .org osmium_trap_vectors + 0x500
 osmium_vec_10:
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #10
-    b osmium_trap_common
+    osmium_guest_vector 10
 .org osmium_trap_vectors + 0x580
 osmium_vec_11:
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #11
-    b osmium_trap_common
+    osmium_guest_vector 11
 .org osmium_trap_vectors + 0x600
 osmium_vec_12:
     sub sp, sp, #304

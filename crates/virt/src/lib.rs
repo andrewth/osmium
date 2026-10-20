@@ -12,6 +12,7 @@
 //!   backends implement, and [`run_vcpu`], a loop that services device exits.
 //! - [`devices`]: emulated devices.
 //! - [`riscv`]: a RISC-V H-extension vCPU and a minimal SBI for guests.
+//! - [`aarch64`]: AArch64 EL2 exit decoding and PSCI for guests.
 //! - [`virtio`]: virtio device models behind the virtio-mmio transport.
 //!
 //! Hardware backends implement [`Vcpu`]: RISC-V H ([`riscv::RiscvVcpu`])
@@ -22,6 +23,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod aarch64;
 pub mod bus;
 pub mod devices;
 pub mod memory;

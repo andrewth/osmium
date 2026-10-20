@@ -90,4 +90,21 @@ if command -v qemu-system-riscv64 >/dev/null; then
     rm -f "$fwlog"
 fi
 
+# EL2 hypervisor (QEMU starts it at EL2 with virtualization=on): checked for
+# its own lines, since it runs none of the scheduler demos.
+if command -v qemu-system-aarch64 >/dev/null; then
+    echo "== boot examples/aarch64-hyp under QEMU"
+    hyplog=$(mktemp)
+    (cd examples/aarch64-hyp && cargo build -q --release)
+    timeout 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=2 -cpu max -smp 1 -m 128M -nographic \
+        -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp \
+        -serial "file:$hyplog" -monitor none </dev/null >/dev/null
+    sed -n '/^osmium/,$p' "$hyplog"
+    for line in 'example (EL2)' 'EL2 MMU on' '\[guest\] hello from EL1 over MMIO' \
+        'guest exit Shutdown: 1 hypercall, 1 halt, 0 host interrupts, LSR 0x60' '\[done\]'; do
+        grep -q "$line" "$hyplog" || { echo "aarch64-hyp: missing '$line'"; exit 1; }
+    done
+    rm -f "$hyplog"
+fi
+
 echo "all checks passed"

@@ -27,12 +27,12 @@ colors and type.
 |---|---|---|
 | `osmium-arch` | IRQ flag control, CPU id, trap entry with a portable `Trap` cause, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
-| `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2, RISC-V G-stage), slab heap as `#[global_allocator]` | no |
+| `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA), `IrqTable`, global console with `println!` | no |
 | `osmium-drivers` | NS16550A, PL011, RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, i8254 PIT, RAM disk, Mellanox ConnectX-3 (mlx4) Ethernet | no |
 | `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG reader, ELF64 loader | writer only |
 | `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
-| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension vCPU with a minimal SBI | yes |
+| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension and AArch64 EL2 vCPUs with a minimal SBI and PSCI, virtual PLIC, virtio-net | yes |
 | `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
 

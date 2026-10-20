@@ -29,7 +29,7 @@ exec = ["dep:osmium-exec"]
 ## RISC-V machine-mode CSRs.
 riscv-m-mode = ["osmium-arch/riscv-m-mode"]
 ## AArch64 EL2 registers.
-aarch64-el2 = ["osmium-arch/aarch64-el2"]
+aarch64-el2 = ["osmium-arch/aarch64-el2", "osmium-virt?/aarch64-el2"]
 ## RISC-V HS-mode hypervisor: guest-exit hook and the H-extension vCPU.
 riscv64-hs = ["osmium-arch/riscv64-hs", "osmium-virt?/riscv64-hs"]
 

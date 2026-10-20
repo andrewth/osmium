@@ -1,0 +1,16 @@
+[package]
+name = "aarch64-hyp"
+description = "A hypervisor for QEMU's AArch64 virt machine at EL2, assembled from Osmium components"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-2.0-only"
+
+[dependencies]
+osmium = { path = "../../crates/osmium", features = ["full", "aarch64-el2"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
