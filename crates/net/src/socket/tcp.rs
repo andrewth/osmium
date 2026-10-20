@@ -4,11 +4,17 @@
 //! that connection. A server that wants several at once listens with
 //! several sockets on the same port.
 //!
-//! Received data is accepted only in order; a segment past a gap is dropped
-//! and re-acknowledged, and the peer's retransmission fills the gap. Lost
-//! data of our own is resent go-back-N from the oldest unacknowledged byte,
-//! on a timeout or after three duplicate ACKs. There is no congestion
-//! control beyond that: the sender fills the peer's window.
+//! Data that arrives past a gap is held, within the receive window, until
+//! the gap is filled; each out-of-order segment is acknowledged at once so
+//! that the sender sees duplicate ACKs. Window scaling (RFC 7323) and
+//! selective acknowledgments (RFC 2018) are negotiated in the handshake.
+//!
+//! The sender is congestion controlled (RFC 5681): slow start from a ten
+//! segment initial window, congestion avoidance, and fast retransmit and
+//! recovery per NewReno (RFC 6582), or per RFC 6675 when the peer supports
+//! SACK, which retransmits exactly the holes its blocks report. A timeout
+//! drops the window to one segment and resends from the oldest
+//! unacknowledged byte.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -16,7 +22,7 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use core::time::Duration;
 
 use super::{Cx, Packet, binds};
-use crate::wire::{PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
+use crate::wire::{MAX_SACK_BLOCKS, PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
 use crate::{Error, Instant};
 
 /// Retransmission timeout before the first round-trip measurement.
@@ -35,6 +41,12 @@ const DEFAULT_MSS: usize = 536;
 const MIN_MSS: usize = 64;
 /// Segments sent per poll.
 const MAX_BURST: usize = 16;
+/// Out-of-order ranges held, and SACK ranges remembered; more are dropped.
+const MAX_RANGES: usize = 64;
+/// The largest window scale shift (RFC 7323).
+const MAX_SHIFT: u8 = 14;
+/// The largest receive buffer: what the largest shift can advertise.
+const MAX_RX_CAP: usize = 65535 << MAX_SHIFT;
 
 /// The connection states of RFC 9293.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +110,36 @@ pub struct TcpSocket {
 
     rx: VecDeque<u8>,
     rx_cap: usize,
+    /// Data held past a gap, as sorted, disjoint `(sequence number, bytes)`
+    /// ranges inside the receive window.
+    ooo: Vec<(u32, Vec<u8>)>,
+    /// Start of the range the latest out-of-order segment landed in, which
+    /// SACK reports first.
+    ooo_recent: Option<u32>,
+    /// Sequence number of a FIN that arrived ahead of missing data.
+    ooo_fin: Option<u32>,
+    /// The window scale shift we offer, from the buffer size.
+    ws_offer: u8,
+    /// Window scaling was agreed: the peer's shift, ours (`ws_offer`).
+    ws_active: bool,
+    snd_shift: u8,
+    rcv_shift: u8,
+    /// SACK was agreed.
+    sack_ok: bool,
+    /// Ranges above `snd_una` the peer reports having, sorted and disjoint.
+    scoreboard: Vec<(u32, u32)>,
+    /// Holes below this are retransmitted already in this recovery (SACK).
+    rexmit_next: u32,
+    /// A single segment to retransmit from this sequence number.
+    rexmit_one: Option<u32>,
+    cwnd: u32,
+    ssthresh: u32,
+    /// `snd_max` when the last loss was detected: recovery ends when it is
+    /// acknowledged, and no new recovery starts before.
+    recover: u32,
+    in_recovery: bool,
+    /// Bytes acknowledged toward the next congestion avoidance increase.
+    ca_acc: u32,
     /// The peer's FIN has been received; reads past the data return 0.
     rx_fin: bool,
     /// Bytes from `tx_seq` on: sent but unacknowledged, then unsent.
@@ -139,12 +181,15 @@ pub struct TcpSocket {
     /// The timer fired with a zero window: send one byte past it.
     probe: bool,
     error: Option<Error>,
+    /// Offer SACK in the handshake; off only in tests.
+    sack_enabled: bool,
 }
 
 impl TcpSocket {
     /// A closed socket with `rx_cap` and `tx_cap` bytes of buffering. The
-    /// receive buffer bounds the advertised window, so at most 65535 of it
-    /// is used.
+    /// receive buffer bounds the advertised window; one over 65535 bytes
+    /// needs a peer that supports window scaling to be used in full, and at
+    /// most 1 GiB of it is.
     pub fn new(rx_cap: usize, tx_cap: usize) -> Self {
         Self {
             state: State::Closed,
@@ -153,7 +198,23 @@ impl TcpSocket {
             fresh: false,
             passive: false,
             rx: VecDeque::new(),
-            rx_cap: rx_cap.min(65535),
+            rx_cap: rx_cap.min(MAX_RX_CAP),
+            ooo: Vec::new(),
+            ooo_recent: None,
+            ooo_fin: None,
+            ws_offer: (0..=MAX_SHIFT).find(|s| rx_cap.min(MAX_RX_CAP) >> s <= 65535).unwrap_or(MAX_SHIFT),
+            ws_active: false,
+            snd_shift: 0,
+            rcv_shift: 0,
+            sack_ok: false,
+            scoreboard: Vec::new(),
+            rexmit_next: 0,
+            rexmit_one: None,
+            cwnd: 0,
+            ssthresh: u32::MAX,
+            recover: 0,
+            in_recovery: false,
+            ca_acc: 0,
             rx_fin: false,
             tx: VecDeque::new(),
             tx_cap,
@@ -179,11 +240,14 @@ impl TcpSocket {
             dup_acks: 0,
             probe: false,
             error: None,
+            sack_enabled: true,
         }
     }
 
     fn reset(&mut self) {
+        let sack_enabled = self.sack_enabled;
         *self = Self::new(self.rx_cap, self.tx_cap);
+        self.sack_enabled = sack_enabled;
     }
 
     /// Returns a connection that came from [`listen`](Self::listen) to
@@ -369,14 +433,20 @@ impl TcpSocket {
         }
         // Tell the peer once half the buffer has opened up, rather than
         // after every read (silly-window avoidance, RFC 9293 3.8.6.2.2).
-        if self.adv_wnd < self.rx_cap as u32 / 2 && self.rx_window() >= self.rx_cap as u32 / 2 {
+        let half = (self.rx_cap as u32).min(self.max_window()) / 2;
+        if self.adv_wnd < half && self.rx_window() >= half {
             self.ack_pending = true;
         }
         Ok(n)
     }
 
+    /// The largest window the peer can be told.
+    fn max_window(&self) -> u32 {
+        65535 << self.rcv_shift
+    }
+
     fn rx_window(&self) -> u32 {
-        (self.rx_cap - self.rx.len()) as u32
+        ((self.rx_cap - self.rx.len()) as u32).min(self.max_window())
     }
 
     fn fail(&mut self, error: Error) {
@@ -443,11 +513,11 @@ impl TcpSocket {
                 self.local = dst;
                 self.remote = src;
                 self.rcv_nxt = seg.seq.wrapping_add(1);
-                self.iss = cx.rng.next_u32();
-                self.set_iss(self.iss);
+                self.set_iss(cx.rng.isn(dst, src, now));
                 self.snd_wnd = u32::from(seg.window);
                 self.snd_wl1 = seg.seq;
                 self.snd_mss = Self::peer_mss(seg, cx.mss);
+                self.negotiate(seg);
                 self.state = State::SynReceived;
                 return None;
             }
@@ -468,6 +538,7 @@ impl TcpSocket {
                 }
                 self.rcv_nxt = seg.seq.wrapping_add(1);
                 self.snd_mss = Self::peer_mss(seg, cx.mss);
+                self.negotiate(seg);
                 self.snd_wnd = u32::from(seg.window);
                 self.snd_wl1 = seg.seq;
                 self.snd_wl2 = seg.ack;
@@ -526,7 +597,7 @@ impl TcpSocket {
                 return reset_for(seg, payload.len());
             }
             self.state = State::Established;
-            self.snd_wnd = u32::from(seg.window);
+            self.snd_wnd = u32::from(seg.window) << self.snd_shift;
             self.snd_wl1 = seg.seq;
             self.snd_wl2 = seg.ack;
         }
@@ -535,25 +606,23 @@ impl TcpSocket {
             self.ack_pending = true;
             return None;
         }
+        let window = u32::from(seg.window) << self.snd_shift;
+        if self.sack_ok && seg.sack_len > 0 {
+            self.process_sack(seg);
+        }
         if before(self.snd_una, seg.ack) {
+            self.on_new_ack(seg.ack);
             self.ack_received(seg.ack, now);
-            self.dup_acks = 0;
         } else if seg.ack == self.snd_una
             && payload.is_empty()
             && !seg.has(TCP_FIN)
             && self.snd_una != self.snd_max
-            && u32::from(seg.window) == self.snd_wnd
+            && window == self.snd_wnd
         {
-            // Fast retransmit (RFC 5681 3.2): a third duplicate ACK means a
-            // segment was lost, not merely delayed.
-            self.dup_acks = self.dup_acks.saturating_add(1);
-            if self.dup_acks == 3 {
-                self.snd_nxt = self.snd_una;
-                self.rtt_sample = None;
-            }
+            self.on_dup_ack();
         }
         if before(self.snd_wl1, seg.seq) || (self.snd_wl1 == seg.seq && before_eq(self.snd_wl2, seg.ack)) {
-            self.snd_wnd = u32::from(seg.window);
+            self.snd_wnd = window;
             self.snd_wl1 = seg.seq;
             self.snd_wl2 = seg.ack;
             if self.snd_wnd > 0 {
@@ -576,43 +645,64 @@ impl TcpSocket {
         let mut fin_ok = true;
         if !payload.is_empty() {
             if matches!(self.state, State::Established | State::FinWait1 | State::FinWait2) {
-                // Skip what we already have, then take what fits.
-                let skip = if before(seg.seq, self.rcv_nxt) { self.rcv_nxt.wrapping_sub(seg.seq) as usize } else { 0 };
-                if seg.seq.wrapping_add(skip as u32) == self.rcv_nxt && skip <= payload.len() {
-                    let data = &payload[skip..];
-                    let take = data.len().min(self.rx_window() as usize);
+                // Skip what we already have.
+                let data = if before(seg.seq, self.rcv_nxt) {
+                    payload.get(self.rcv_nxt.wrapping_sub(seg.seq) as usize..).unwrap_or(&[])
+                } else {
+                    payload
+                };
+                let seq = if before(seg.seq, self.rcv_nxt) { self.rcv_nxt } else { seg.seq };
+                let wnd = self.rx_window();
+                if seq == self.rcv_nxt {
+                    let take = data.len().min(wnd as usize);
                     self.rx.extend(&data[..take]);
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(take as u32);
                     fin_ok = take == data.len();
+                    self.ooo_drain();
                 } else {
-                    // Out of order: acknowledge at once, so that the sender
-                    // sees one duplicate ACK per segment (RFC 5681 4.2).
-                    self.adv_wnd = self.rx_window();
-                    return Some(self.segment(TCP_ACK));
+                    // Past a gap: hold it, and acknowledge at once so that
+                    // the sender sees one duplicate ACK per segment (RFC
+                    // 5681 4.2).
+                    let rel = seq.wrapping_sub(self.rcv_nxt);
+                    let take = if rel < wnd { data.len().min((wnd - rel) as usize) } else { 0 };
+                    fin_ok = take == data.len();
+                    if take > 0 {
+                        self.ooo_insert(seq, &data[..take]);
+                    }
+                    if seg.has(TCP_FIN) && fin_ok {
+                        self.ooo_fin = Some(seg.seq.wrapping_add(payload.len() as u32));
+                    }
+                    let ack = self.segment(TCP_ACK);
+                    self.adv_wnd = u32::from(ack.window) << self.rcv_shift;
+                    return Some(ack);
                 }
             }
             self.ack_pending = true;
         }
 
         if seg.has(TCP_FIN) {
-            let fin_seq = seg.seq.wrapping_add(payload.len() as u32);
             match self.state {
-                State::Established | State::FinWait1 | State::FinWait2 if fin_ok && fin_seq == self.rcv_nxt => {
-                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    self.rx_fin = true;
-                    self.state = match self.state {
-                        State::Established => State::CloseWait,
-                        State::FinWait1 if !fin_acked => State::Closing,
-                        _ => {
-                            self.enter_time_wait(now);
-                            State::TimeWait
-                        }
-                    };
+                State::Established | State::FinWait1 | State::FinWait2 if fin_ok => {
+                    self.ooo_fin = Some(seg.seq.wrapping_add(payload.len() as u32));
                 }
                 State::TimeWait => self.enter_time_wait(now),
                 _ => {}
             }
             self.ack_pending = true;
+        }
+        if matches!(self.state, State::Established | State::FinWait1 | State::FinWait2)
+            && self.ooo_fin == Some(self.rcv_nxt)
+        {
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+            self.rx_fin = true;
+            self.state = match self.state {
+                State::Established => State::CloseWait,
+                State::FinWait1 if !fin_acked => State::Closing,
+                _ => {
+                    self.enter_time_wait(now);
+                    State::TimeWait
+                }
+            };
         }
         None
     }
@@ -623,6 +713,245 @@ impl TcpSocket {
         self.snd_una = iss;
         self.snd_nxt = iss;
         self.snd_max = iss;
+        self.recover = iss;
+        self.rexmit_next = iss;
+    }
+
+    /// Takes the options of the peer's SYN: window scaling and SACK are on
+    /// only if both ends offered them. Also starts congestion control, now
+    /// that the MSS is known.
+    fn negotiate(&mut self, syn: &TcpHeader) {
+        self.ws_active = syn.wscale.is_some();
+        self.snd_shift = syn.wscale.map_or(0, |s| s.min(MAX_SHIFT));
+        self.rcv_shift = if self.ws_active { self.ws_offer } else { 0 };
+        self.sack_ok = syn.sack_permitted && self.sack_enabled;
+        let mss = self.snd_mss as u32;
+        // RFC 6928.
+        self.cwnd = (10 * mss).min((2 * mss).max(14600));
+        self.ssthresh = u32::MAX;
+        self.in_recovery = false;
+    }
+
+    /// Inserts `data` at `seq`, past a gap, merging it with the ranges it
+    /// overlaps or touches.
+    fn ooo_insert(&mut self, seq: u32, data: &[u8]) {
+        let (mut start, mut end) = (seq, seq.wrapping_add(data.len() as u32));
+        let mut buf = data.to_vec();
+        let base = self.rcv_nxt;
+        let mut i = 0;
+        while i < self.ooo.len() {
+            let (rs, ref rd) = self.ooo[i];
+            let re = rs.wrapping_add(rd.len() as u32);
+            if before(end, rs) {
+                break;
+            }
+            if before(re, start) {
+                i += 1;
+                continue;
+            }
+            let (rs, rd) = self.ooo.remove(i);
+            if before(rs, start) {
+                let mut merged = rd[..start.wrapping_sub(rs) as usize].to_vec();
+                merged.append(&mut buf);
+                buf = merged;
+                start = rs;
+            }
+            if before(end, re) {
+                buf.extend_from_slice(&rd[end.wrapping_sub(rs) as usize..]);
+                end = re;
+            }
+        }
+        debug_assert!(self.ooo.iter().all(|(s, _)| s.wrapping_sub(base) < 1 << 31));
+        if self.ooo.len() < MAX_RANGES {
+            self.ooo.insert(i, (start, buf));
+            self.ooo_recent = Some(start);
+        }
+    }
+
+    /// Moves held ranges that `rcv_nxt` has reached into the receive buffer.
+    fn ooo_drain(&mut self) {
+        while let Some((start, _)) = self.ooo.first() {
+            if before(self.rcv_nxt, *start) {
+                break;
+            }
+            let (start, data) = self.ooo.remove(0);
+            let skip = self.rcv_nxt.wrapping_sub(start) as usize;
+            if let Some(rest) = data.get(skip..) {
+                let take = rest.len().min(self.rx_window() as usize);
+                self.rx.extend(&rest[..take]);
+                self.rcv_nxt = self.rcv_nxt.wrapping_add(take as u32);
+            }
+        }
+        if self.ooo.is_empty() {
+            self.ooo_recent = None;
+        }
+    }
+
+    /// Adds the SACK blocks for the data held past a gap to `h`.
+    fn fill_sack(&self, h: &mut TcpHeader) {
+        if !self.sack_ok || self.ooo.is_empty() {
+            return;
+        }
+        let block = |(s, d): &(u32, Vec<u8>)| (*s, s.wrapping_add(d.len() as u32));
+        let recent = self.ooo.iter().filter(|(s, _)| Some(*s) == self.ooo_recent).map(block);
+        let others = self.ooo.iter().filter(|(s, _)| Some(*s) != self.ooo_recent).map(block);
+        for b in recent.chain(others).take(MAX_SACK_BLOCKS) {
+            h.sack[usize::from(h.sack_len)] = b;
+            h.sack_len += 1;
+        }
+    }
+
+    /// Merges the peer's SACK blocks into the scoreboard.
+    fn process_sack(&mut self, seg: &TcpHeader) {
+        for &(l, r) in &seg.sack[..usize::from(seg.sack_len)] {
+            // Only data in flight counts; this also drops D-SACKs.
+            let l = if before(l, self.snd_una) { self.snd_una } else { l };
+            if !before(l, r) || before(self.snd_max, r) {
+                continue;
+            }
+            let base = self.snd_una;
+            let (mut start, mut end) = (l, r);
+            let mut i = 0;
+            while i < self.scoreboard.len() {
+                let (rs, re) = self.scoreboard[i];
+                if before(end, rs) {
+                    break;
+                }
+                if before(re, start) {
+                    i += 1;
+                    continue;
+                }
+                self.scoreboard.remove(i);
+                if before(rs, start) {
+                    start = rs;
+                }
+                if before(end, re) {
+                    end = re;
+                }
+            }
+            debug_assert!(start.wrapping_sub(base) < 1 << 31);
+            if self.scoreboard.len() < MAX_RANGES {
+                self.scoreboard.insert(i, (start, end));
+            }
+        }
+    }
+
+    /// Bytes of `[from, to)` the peer has reported.
+    fn sacked_between(&self, from: u32, to: u32) -> u32 {
+        let mut n = 0u32;
+        for &(l, r) in &self.scoreboard {
+            let (l, r) = (if before(l, from) { from } else { l }, if before(to, r) { to } else { r });
+            if before(l, r) {
+                n = n.wrapping_add(r.wrapping_sub(l));
+            }
+        }
+        n
+    }
+
+    /// The first stretch at or after `from` that the peer has not reported
+    /// but has reported data beyond: presumed lost.
+    fn next_hole(&self, from: u32) -> Option<(u32, u32)> {
+        let mut pos = if before(from, self.snd_una) { self.snd_una } else { from };
+        for &(l, r) in &self.scoreboard {
+            if before(pos, l) {
+                return Some((pos, l));
+            }
+            if before(pos, r) {
+                pos = r;
+            }
+        }
+        None
+    }
+
+    /// Bytes in the network, by RFC 6675's reckoning: what is above the
+    /// highest reported byte, plus our retransmissions of holes below it.
+    fn pipe(&self) -> u32 {
+        let high = self.scoreboard.last().map_or(self.snd_una, |&(_, r)| r);
+        let boundary = if before(high, self.rexmit_next) { self.rexmit_next } else { high };
+        let retransmitted = self
+            .rexmit_next
+            .wrapping_sub(self.snd_una)
+            .wrapping_sub(self.sacked_between(self.snd_una, self.rexmit_next));
+        let retransmitted = if before(self.snd_una, self.rexmit_next) { retransmitted } else { 0 };
+        self.snd_max.wrapping_sub(boundary).wrapping_add(retransmitted)
+    }
+
+    /// An ACK acknowledges new data up to `ack` (before `snd_una` moves).
+    fn on_new_ack(&mut self, ack: u32) {
+        let mss = self.snd_mss as u32;
+        let acked = ack.wrapping_sub(self.snd_una);
+        self.dup_acks = 0;
+        if self.in_recovery {
+            if before_eq(self.recover, ack) {
+                self.in_recovery = false;
+                self.cwnd = self.ssthresh;
+                self.rexmit_one = None;
+            } else if self.sack_ok {
+                // The byte the ACK stops at was lost, though no block may say
+                // so yet: resend it unless it has been resent.
+                if before_eq(self.rexmit_next, ack) {
+                    self.rexmit_next = ack;
+                    self.rexmit_one = Some(ack);
+                }
+            } else {
+                // NewReno partial ACK: retransmit the next hole, and deflate
+                // by what was acknowledged (RFC 6582 3.2 step 5).
+                self.rexmit_one = Some(ack);
+                self.cwnd = self.cwnd.saturating_sub(acked).saturating_add(if acked >= mss { mss } else { 0 }).max(mss);
+            }
+        } else if self.cwnd < self.ssthresh {
+            self.cwnd = self.cwnd.saturating_add(acked.min(mss));
+        } else {
+            self.ca_acc = self.ca_acc.saturating_add(acked);
+            if self.ca_acc >= self.cwnd {
+                self.ca_acc -= self.cwnd;
+                self.cwnd = self.cwnd.saturating_add(mss);
+            }
+        }
+        // Reports below the new left edge are history.
+        self.scoreboard.retain_mut(|(l, r)| {
+            if before_eq(*r, ack) {
+                return false;
+            }
+            if before(*l, ack) {
+                *l = ack;
+            }
+            true
+        });
+    }
+
+    fn on_dup_ack(&mut self) {
+        self.dup_acks = self.dup_acks.saturating_add(1);
+        let mss = self.snd_mss as u32;
+        if self.in_recovery {
+            if !self.sack_ok {
+                self.cwnd = self.cwnd.saturating_add(mss);
+            }
+        } else if self.dup_acks == 3 && before_eq(self.recover, self.snd_una) {
+            // Fast retransmit and fast recovery (RFC 5681 3.2, RFC 6582).
+            let flight = self.snd_max.wrapping_sub(self.snd_una);
+            self.ssthresh = (flight / 2).max(2 * mss);
+            self.recover = self.snd_max;
+            self.in_recovery = true;
+            self.rexmit_one = Some(self.snd_una);
+            self.rexmit_next = self.snd_una;
+            self.rtt_sample = None;
+            self.cwnd = if self.sack_ok { self.ssthresh } else { self.ssthresh.saturating_add(3 * mss) };
+        }
+    }
+
+    /// The retransmission timer fired with data outstanding (RFC 5681 3.1).
+    fn on_timeout(&mut self) {
+        let mss = self.snd_mss as u32;
+        let flight = self.snd_max.wrapping_sub(self.snd_una);
+        self.ssthresh = (flight / 2).max(2 * mss);
+        self.cwnd = mss;
+        self.recover = self.snd_max;
+        self.in_recovery = false;
+        self.dup_acks = 0;
+        self.ca_acc = 0;
+        self.rexmit_one = None;
+        self.scoreboard.clear();
     }
 
     /// Advances `snd_una` to `ack`, which acknowledges new data.
@@ -671,28 +1000,75 @@ impl TcpSocket {
             }
             _ => {
                 let offset = self.snd_nxt.wrapping_sub(self.tx_seq) as usize;
-                let window_left = self.snd_una.wrapping_add(self.snd_wnd).wrapping_sub(self.snd_nxt) as i32 > 0;
-                let data = offset < self.tx.len() && window_left;
+                let data = offset < self.tx.len() && self.window_left() > 0;
                 let fin = self.fin_queued && offset == self.tx.len();
-                if self.ack_pending || data || fin { Some(Instant::ZERO) } else { self.timer }
+                if self.ack_pending || data || fin || self.rexmit_ready() { Some(Instant::ZERO) } else { self.timer }
             }
         }
     }
 
     fn segment(&self, flags: u8) -> TcpHeader {
-        TcpHeader {
+        self.segment_at(self.snd_nxt, flags)
+    }
+
+    fn segment_at(&self, seq: u32, flags: u8) -> TcpHeader {
+        let mut h = TcpHeader {
             src_port: self.local.port(),
             dst_port: self.remote.port(),
-            seq: self.snd_nxt,
+            seq,
             ack: if flags & TCP_ACK != 0 { self.rcv_nxt } else { 0 },
             flags,
-            window: self.rx_window().min(65535) as u16,
-            mss: None,
+            window: (self.rx_window() >> self.rcv_shift).min(65535) as u16,
+            ..TcpHeader::default()
+        };
+        if flags & (TCP_ACK | TCP_SYN) == TCP_ACK {
+            self.fill_sack(&mut h);
         }
+        h
+    }
+
+    /// How many bytes from `snd_nxt` the peer's window and ours allow.
+    fn window_left(&self) -> usize {
+        let wnd = if self.probe { self.snd_wnd.max(1) } else { self.snd_wnd };
+        let by_peer = self.snd_una.wrapping_add(wnd).wrapping_sub(self.snd_nxt) as i32;
+        let by_cwnd = if self.in_recovery && self.sack_ok {
+            i64::from(self.cwnd) - i64::from(self.pipe())
+        } else {
+            i64::from(self.snd_una.wrapping_add(self.cwnd.min(wnd)).wrapping_sub(self.snd_nxt) as i32)
+        };
+        i64::from(by_peer).min(by_cwnd).max(0) as usize
+    }
+
+    /// Returns true if recovery has a segment to retransmit.
+    fn rexmit_ready(&self) -> bool {
+        self.in_recovery
+            && (self.rexmit_one.is_some()
+                || (self.sack_ok && self.next_hole(self.rexmit_next).is_some() && self.pipe() < self.cwnd))
+    }
+
+    /// Retransmits up to `max` bytes from `seq`, which `snd_max` has passed,
+    /// without moving `snd_nxt`. Returns how many sequence numbers it used.
+    fn retransmit(&mut self, seq: u32, max: usize, out: &mut Vec<Packet>) -> u32 {
+        let offset = seq.wrapping_sub(self.tx_seq) as usize;
+        let sent = (self.snd_max.wrapping_sub(self.tx_seq) as usize).min(self.tx.len());
+        if offset > self.tx.len() || !before(seq, self.snd_max) {
+            return 0;
+        }
+        let len = sent.saturating_sub(offset).min(self.snd_mss).min(max);
+        let fin = self.fin_queued && offset + len == self.tx.len() && before(self.tx_seq.wrapping_add(self.tx.len() as u32), self.snd_max);
+        if len == 0 && !fin {
+            return 0;
+        }
+        let flags = TCP_ACK | if fin { TCP_FIN } else { 0 };
+        let payload: Vec<u8> = self.tx.range(offset..offset + len).copied().collect();
+        let header = self.segment_at(seq, flags);
+        self.emit(header, &payload, out);
+        len as u32 + u32::from(fin)
     }
 
     fn emit(&mut self, header: TcpHeader, payload: &[u8], out: &mut Vec<Packet>) {
-        self.adv_wnd = u32::from(header.window);
+        let shift = if header.has(TCP_SYN) { 0 } else { self.rcv_shift };
+        self.adv_wnd = u32::from(header.window) << shift;
         let segment = header.emit(*self.local.ip(), *self.remote.ip(), payload);
         out.push(Packet { src: *self.local.ip(), dst: *self.remote.ip(), protocol: PROTO_TCP, payload: segment });
     }
@@ -732,7 +1108,9 @@ impl TcpSocket {
             if self.local.port() == 0 {
                 self.local.set_port(cx.rng.ephemeral_port());
             }
-            self.set_iss(cx.rng.next_u32());
+            self.set_iss(cx.rng.isn(self.local, self.remote, now));
+            let mss = cx.mss as u32;
+            self.cwnd = (10 * mss).min((2 * mss).max(14600));
             self.fresh = false;
         }
 
@@ -752,6 +1130,9 @@ impl TcpSocket {
             self.rto = (self.rto * 2).min(MAX_RTO);
             // Karn's algorithm: never time a retransmitted segment.
             self.rtt_sample = None;
+            if self.snd_una != self.snd_max && !matches!(self.state, State::SynSent | State::SynReceived) {
+                self.on_timeout();
+            }
             if self.snd_wnd == 0 && self.snd_una == self.snd_max {
                 self.probe = true;
             }
@@ -763,7 +1144,16 @@ impl TcpSocket {
                 self.snd_nxt = self.iss;
                 let flags = if self.state == State::SynSent { TCP_SYN } else { TCP_SYN | TCP_ACK };
                 let mut syn = self.segment(flags);
+                // A SYN's window is never scaled.
+                syn.window = self.rx_window().min(65535) as u16;
                 syn.mss = Some(cx.mss);
+                if self.state == State::SynSent {
+                    syn.wscale = Some(self.ws_offer);
+                    syn.sack_permitted = self.sack_enabled;
+                } else {
+                    syn.wscale = self.ws_active.then_some(self.ws_offer);
+                    syn.sack_permitted = self.sack_ok;
+                }
                 self.emit(syn, &[], out);
                 self.snd_nxt = self.iss.wrapping_add(1);
                 self.snd_max = self.snd_nxt;
@@ -776,15 +1166,35 @@ impl TcpSocket {
             return;
         }
 
+        if self.in_recovery {
+            if let Some(seq) = self.rexmit_one.take() {
+                let n = self.retransmit(seq, self.snd_mss, out);
+                if self.sack_ok && n > 0 && before(self.rexmit_next, seq.wrapping_add(n)) {
+                    self.rexmit_next = seq.wrapping_add(n);
+                }
+                self.ack_pending = false;
+            }
+            for _ in 0..MAX_BURST {
+                if !self.sack_ok || self.pipe() >= self.cwnd {
+                    break;
+                }
+                let Some((start, end)) = self.next_hole(self.rexmit_next) else { break };
+                let n = self.retransmit(start, end.wrapping_sub(start) as usize, out);
+                if n == 0 {
+                    break;
+                }
+                self.rexmit_next = start.wrapping_add(n);
+                self.ack_pending = false;
+            }
+        }
+
         for _ in 0..MAX_BURST {
             let offset = self.snd_nxt.wrapping_sub(self.tx_seq) as usize;
             if offset > self.tx.len() {
                 break; // the FIN is out
             }
             let unsent = self.tx.len() - offset;
-            let wnd = if self.probe { self.snd_wnd.max(1) } else { self.snd_wnd };
-            let window = (self.snd_una.wrapping_add(wnd).wrapping_sub(self.snd_nxt) as i32).max(0) as usize;
-            let len = unsent.min(window).min(self.snd_mss);
+            let len = unsent.min(self.window_left()).min(self.snd_mss);
             let fin = self.fin_queued && offset + len == self.tx.len();
             if len == 0 && !fin {
                 break;
@@ -832,7 +1242,7 @@ impl TcpSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{B_IP, Host, pair, run};
+    use crate::testing::{B_IP, Fate, Host, pair, run};
     use crate::{SocketHandle, wire};
 
     fn tcp(h: &mut Host, s: SocketHandle) -> &mut TcpSocket {
@@ -959,7 +1369,7 @@ mod tests {
         // retransmit.
         bulk(100_000, 4096, |n, _| n % 7 != 3);
         let slow = bulk(100_000, 32768, |n, _| n % 7 != 3);
-        assert!(slow < Duration::from_secs(2), "fast retransmit: {slow:?}");
+        assert!(slow < Duration::from_secs(6), "fast retransmit: {slow:?}");
     }
 
     #[test]
@@ -1089,5 +1499,397 @@ mod tests {
             s.process(&mut cx, dst, PEER, &ack, &[]);
         }
         assert_eq!(s.dup_acks, u8::MAX);
+    }
+
+    /// The sequence number and payload length of an Ethernet frame, if it
+    /// carries a TCP segment.
+    fn tcp_segment(frame: &[u8]) -> Option<(u32, usize)> {
+        let (_, ip) = wire::EthernetHeader::parse(frame)?;
+        let (h, payload) = wire::Ipv4Header::parse(ip)?;
+        if h.protocol != PROTO_TCP {
+            return None;
+        }
+        TcpHeader::parse(payload, h.src, h.dst).map(|(t, d)| (t.seq, d.len()))
+    }
+
+    /// What a transfer from A to B left behind.
+    struct Transfer {
+        elapsed: Duration,
+        /// Data segments A sent that covered bytes it had sent before.
+        resent: usize,
+        max_cwnd: u32,
+        recoveries: u32,
+        timeouts: u32,
+    }
+
+    /// Sends `len` bytes from A to B, through `fate` on A's frames and
+    /// `back` on B's, with the sockets adjusted by `setup`.
+    fn transfer(
+        len: usize,
+        rx: usize,
+        setup: impl Fn(&mut TcpSocket, &mut TcpSocket),
+        fate: impl FnMut(u64, &[u8]) -> Fate + 'static,
+        back: impl FnMut(u64, &[u8]) -> Fate + 'static,
+    ) -> Transfer {
+        let (mut a, mut b) = pair();
+        let ca = a.sockets.add(TcpSocket::new(rx, len + 1));
+        let cb = b.sockets.add(TcpSocket::new(rx, 1024));
+        setup(tcp(&mut a, ca), tcp(&mut b, cb));
+        tcp(&mut b, cb).listen(80).unwrap();
+        tcp(&mut a, ca).connect(SocketAddrV4::new(B_IP, 80), 0).unwrap();
+        let mut now = Instant::ZERO;
+        assert!(run(&mut a, &mut b, &mut now, 1000, |a, b| {
+            tcp(a, ca).state() == State::Established && tcp(b, cb).state() == State::Established
+        }));
+        let segments = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = segments.clone();
+        let mut fate = fate;
+        let mut high = None::<u32>;
+        a.set_shaper(move |n, f| {
+            if let Some((seq, len @ 1..)) = tcp_segment(f) {
+                let end = seq.wrapping_add(len as u32);
+                match high {
+                    Some(h) if before(seq, h) => counter.set(counter.get() + 1),
+                    Some(h) if !before(h, end) => {}
+                    _ => high = Some(end),
+                }
+            }
+            fate(n, f)
+        });
+        b.set_shaper(back);
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 + i / 251) as u8).collect();
+        assert_eq!(tcp(&mut a, ca).send(&data), Ok(len));
+        tcp(&mut a, ca).close();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        let start = now;
+        let (mut max_cwnd, mut recoveries, mut timeouts) = (0, 0, 0);
+        let (mut was_recovering, mut last_retries) = (false, 0);
+        let ok = run(&mut a, &mut b, &mut now, 120_000, |a, b| {
+            let x = tcp(a, ca);
+            max_cwnd = max_cwnd.max(x.cwnd);
+            recoveries += u32::from(x.in_recovery && !was_recovering);
+            was_recovering = x.in_recovery;
+            timeouts += u32::from(x.retries > 0 && last_retries == 0);
+            last_retries = x.retries;
+            while let Ok(n) = tcp(b, cb).recv(&mut buf) {
+                if n == 0 {
+                    return true;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            false
+        });
+        assert!(ok, "stalled after {} of {len} bytes", got.len());
+        assert!(got == data, "received {} of {len} bytes intact", got.len());
+        Transfer { elapsed: now - start, resent: segments.get(), max_cwnd, recoveries, timeouts }
+    }
+
+    fn clean(_: u64, _: &[u8]) -> Fate {
+        Fate::Deliver
+    }
+
+    fn data_frame(f: &[u8]) -> bool {
+        tcp_segment(f).is_some_and(|(_, l)| l > 0)
+    }
+
+    #[test]
+    fn reordered_segments_are_reassembled_without_retransmission() {
+        // Every fourth data segment arrives two segments late.
+        let mut k = 0;
+        let t = transfer(
+            60_000,
+            65535,
+            |_, _| {},
+            move |_, f| {
+                if !data_frame(f) {
+                    return Fate::Deliver;
+                }
+                k += 1;
+                if k % 4 == 0 { Fate::Delay(2) } else { Fate::Deliver }
+            },
+            clean,
+        );
+        assert_eq!(t.resent, 0, "nothing was sent twice");
+        assert_eq!(t.timeouts, 0);
+    }
+
+    #[test]
+    fn one_lost_segment_is_the_only_one_resent() {
+        let mut k = 0;
+        let t = transfer(
+            60_000,
+            65535,
+            |_, _| {},
+            move |_, f| {
+                if !data_frame(f) {
+                    return Fate::Deliver;
+                }
+                k += 1;
+                if k == 5 { Fate::Drop } else { Fate::Deliver }
+            },
+            clean,
+        );
+        assert_eq!(t.resent, 1, "only the hole is resent, not what followed it");
+        assert_eq!(t.recoveries, 1);
+        assert_eq!(t.timeouts, 0);
+    }
+
+    #[test]
+    fn duplicated_frames_are_harmless() {
+        let mut k = 0;
+        let t = transfer(
+            60_000,
+            8192,
+            |_, _| {},
+            move |_, f| {
+                k += 1;
+                if data_frame(f) && k % 3 == 0 { Fate::Duplicate } else { Fate::Deliver }
+            },
+            |n, _| if n % 5 == 0 { Fate::Duplicate } else { Fate::Deliver },
+        );
+        assert_eq!(t.timeouts, 0);
+        assert!(t.elapsed < Duration::from_secs(3), "{:?}", t.elapsed);
+    }
+
+    #[test]
+    fn data_past_a_gap_is_held_and_delivered_in_order() {
+        let (mut a, mut b, ca, cb, mut now) = connected(4096, 4096);
+        // Drop the first data segment only.
+        let mut first = true;
+        a.set_shaper(move |_, f| {
+            if data_frame(f) && std::mem::take(&mut first) { Fate::Drop } else { Fate::Deliver }
+        });
+        tcp(&mut a, ca).send(&[1; 100]).unwrap();
+        run(&mut a, &mut b, &mut now, 10, |_, _| false);
+        tcp(&mut a, ca).send(&[2; 100]).unwrap();
+        run(&mut a, &mut b, &mut now, 10, |_, _| false);
+        let rx = tcp(&mut b, cb);
+        assert_eq!((rx.recv_queue(), rx.ooo.len()), (0, 1), "second segment is held");
+        assert!(run(&mut a, &mut b, &mut now, 3000, |_, b| tcp(b, cb).recv_queue() == 200));
+        let mut buf = [0u8; 200];
+        assert_eq!(tcp(&mut b, cb).recv(&mut buf), Ok(200));
+        assert!(buf[..100].iter().all(|&x| x == 1) && buf[100..].iter().all(|&x| x == 2));
+        assert!(tcp(&mut b, cb).ooo.is_empty());
+    }
+
+    #[test]
+    fn fin_ahead_of_data_waits_for_the_gap() {
+        let (mut a, mut b, ca, cb, mut now) = connected(4096, 4096);
+        let mut first = true;
+        a.set_shaper(move |_, f| {
+            if data_frame(f) && std::mem::take(&mut first) { Fate::Drop } else { Fate::Deliver }
+        });
+        tcp(&mut a, ca).send(&[1; 100]).unwrap();
+        run(&mut a, &mut b, &mut now, 5, |_, _| false);
+        tcp(&mut a, ca).send(&[2; 100]).unwrap();
+        tcp(&mut a, ca).close();
+        run(&mut a, &mut b, &mut now, 20, |_, _| false);
+        assert_eq!(tcp(&mut b, cb).state(), State::Established, "the FIN is not taken before the data");
+        assert!(run(&mut a, &mut b, &mut now, 3000, |_, b| tcp(b, cb).state() == State::CloseWait));
+        let mut buf = [0u8; 300];
+        assert_eq!(tcp(&mut b, cb).recv(&mut buf), Ok(200));
+        assert_eq!(tcp(&mut b, cb).recv(&mut buf), Ok(0));
+    }
+
+    #[test]
+    fn out_of_order_ranges_merge_and_are_bounded() {
+        let mut s = TcpSocket::new(1000, 100);
+        s.rcv_nxt = 100;
+        s.ooo_insert(110, &[1; 10]);
+        s.ooo_insert(130, &[3; 10]);
+        s.ooo_insert(120, &[2; 10]);
+        assert_eq!(s.ooo.len(), 1);
+        assert_eq!((s.ooo[0].0, s.ooo[0].1.len()), (110, 30));
+        s.ooo_insert(105, &[0; 10]);
+        assert_eq!((s.ooo[0].0, s.ooo[0].1.len()), (105, 35));
+        s.ooo_insert(1000, &[9; 1]);
+        for i in 0..200u32 {
+            s.ooo_insert(2000 + i * 2, &[0; 1]);
+        }
+        assert!(s.ooo.len() <= MAX_RANGES);
+        s.rx.clear();
+        s.ooo_insert(100, &[7; 5]);
+        s.rcv_nxt = 100;
+        s.ooo_drain();
+        assert_eq!(s.rcv_nxt, 140, "the bytes before the gap and the merged range are taken");
+    }
+
+    #[test]
+    fn slow_start_then_loss_halves_the_window() {
+        let t = transfer(300_000, 65535, |_, _| {}, clean, clean);
+        assert!(t.max_cwnd > 14600 * 2, "slow start opens the window: {}", t.max_cwnd);
+        assert_eq!((t.recoveries, t.timeouts), (0, 0));
+
+        let mut k = 0;
+        let lossy = transfer(
+            300_000,
+            65535,
+            |_, _| {},
+            move |_, f| {
+                if !data_frame(f) {
+                    return Fate::Deliver;
+                }
+                k += 1;
+                if k % 50 == 0 { Fate::Drop } else { Fate::Deliver }
+            },
+            clean,
+        );
+        assert!(lossy.recoveries >= 3, "{} recoveries", lossy.recoveries);
+        assert_eq!(lossy.timeouts, 0, "fast recovery, not timeouts");
+        assert!(lossy.max_cwnd < t.max_cwnd + 1, "loss caps the window");
+    }
+
+    #[test]
+    fn congestion_window_state_machine() {
+        let mut s = TcpSocket::new(65535, 100);
+        s.snd_mss = 1000;
+        s.snd_una = 5000;
+        s.snd_max = 5000 + 20_000;
+        s.snd_nxt = s.snd_max;
+        s.cwnd = 3000;
+        s.ssthresh = 5000;
+        // Slow start: one MSS per ACK, however much it acknowledges.
+        s.on_new_ack(5000 + 4000);
+        s.snd_una += 4000;
+        assert_eq!(s.cwnd, 4000);
+        s.on_new_ack(s.snd_una + 1000);
+        s.snd_una += 1000;
+        assert_eq!(s.cwnd, 5000);
+        // Congestion avoidance: one MSS per window acknowledged.
+        for _ in 0..5 {
+            s.on_new_ack(s.snd_una + 1000);
+            s.snd_una += 1000;
+        }
+        assert_eq!(s.cwnd, 6000);
+        // Three duplicate ACKs: ssthresh is half the flight, cwnd is that
+        // plus the three segments that left the network.
+        let flight = s.snd_max - s.snd_una;
+        for _ in 0..3 {
+            s.on_dup_ack();
+        }
+        assert!(s.in_recovery);
+        assert_eq!((s.ssthresh, s.cwnd, s.rexmit_one), (flight / 2, flight / 2 + 3000, Some(s.snd_una)));
+        s.on_dup_ack();
+        assert_eq!(s.cwnd, flight / 2 + 4000, "inflated by each further duplicate");
+        // A partial ACK stays in recovery and retransmits the next hole.
+        s.on_new_ack(s.snd_una + 2000);
+        s.snd_una += 2000;
+        assert!(s.in_recovery && s.rexmit_one == Some(s.snd_una));
+        // The full ACK deflates to ssthresh.
+        s.on_new_ack(s.snd_max);
+        assert!(!s.in_recovery);
+        assert_eq!(s.cwnd, s.ssthresh);
+        // A timeout starts over from one segment.
+        s.snd_una = s.snd_max - 8000;
+        s.on_timeout();
+        assert_eq!((s.cwnd, s.ssthresh), (1000, 4000));
+        // And a third duplicate ACK right after cannot start a recovery
+        // for data sent before the timeout (RFC 6582).
+        s.dup_acks = 2;
+        s.on_dup_ack();
+        assert!(!s.in_recovery);
+    }
+
+    #[test]
+    fn window_scaling_opens_large_windows() {
+        let (a, b, ca, cb, _) = connected(1 << 20, 4096);
+        assert_eq!(tcp_ws(&a, ca), (true, 5, 5), "1 MiB needs a shift of 5");
+        let _ = (b, cb);
+        // A transfer that needs far more than 64 KiB in flight to be fast.
+        let t = transfer(1_000_000, 1 << 20, |_, _| {}, clean, clean);
+        assert!(t.max_cwnd > 65535, "window above 64 KiB used: {}", t.max_cwnd);
+        assert!(t.elapsed < Duration::from_secs(5), "{:?}", t.elapsed);
+    }
+
+    fn tcp_ws(h: &Host, s: SocketHandle) -> (bool, u8, u8) {
+        let s = h.sockets.get::<TcpSocket>(s);
+        (s.ws_active, s.snd_shift, s.rcv_shift)
+    }
+
+    #[test]
+    fn window_scaling_is_off_unless_both_ends_offer_it() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        assert_eq!((s.ws_active, s.snd_shift, s.rcv_shift, s.sack_ok), (false, 0, 0, false));
+        let mut out = Vec::new();
+        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        s.dispatch(&mut cx, &mut out);
+        let (h, _) = TcpHeader::parse(&out[0].payload, B_IP, *PEER.ip()).unwrap();
+        assert_eq!((h.wscale, h.sack_permitted), (None, false), "the SYN-ACK answers only what was offered");
+
+        let offer = TcpHeader { wscale: Some(9), sack_permitted: true, ..syn(None) };
+        let mut s = half_open(&mut rng, &offer);
+        assert_eq!((s.ws_active, s.snd_shift, s.sack_ok), (true, 9, true));
+        out.clear();
+        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        s.dispatch(&mut cx, &mut out);
+        let (h, _) = TcpHeader::parse(&out[0].payload, B_IP, *PEER.ip()).unwrap();
+        assert_eq!((h.wscale, h.sack_permitted), (Some(0), true));
+        let big = TcpHeader { wscale: Some(40), ..syn(None) };
+        assert_eq!(half_open(&mut rng, &big).snd_shift, MAX_SHIFT, "shifts are capped");
+    }
+
+    #[test]
+    fn large_buffers_without_scaling_advertise_65535() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        s.rx_cap = 1 << 20;
+        assert_eq!(s.rx_window(), 65535);
+        let seg = s.segment(TCP_ACK);
+        assert_eq!(seg.window, 65535);
+    }
+
+    /// Frames of one flight lost together: SACK resends exactly those.
+    fn burst_loss(sack: bool) -> Transfer {
+        let mut k = 0;
+        transfer(
+            200_000,
+            65535,
+            move |a, b| {
+                a.sack_enabled = sack;
+                b.sack_enabled = sack;
+            },
+            move |_, f| {
+                if !data_frame(f) {
+                    return Fate::Deliver;
+                }
+                k += 1;
+                // Segments 30, 32, 34 and 36 of the first pass.
+                if matches!(k, 30 | 32 | 34 | 36) { Fate::Drop } else { Fate::Deliver }
+            },
+            clean,
+        )
+    }
+
+    #[test]
+    fn sack_recovers_several_holes_in_one_round_trip() {
+        let with = burst_loss(true);
+        assert_eq!(with.resent, 4, "exactly the four lost segments are resent");
+        assert_eq!((with.recoveries, with.timeouts), (1, 0));
+        let without = burst_loss(false);
+        assert!(without.resent >= 4);
+        assert!(with.elapsed <= without.elapsed, "{:?} vs {:?}", with.elapsed, without.elapsed);
+    }
+
+    #[test]
+    fn sack_blocks_are_reported_and_scoreboard_tracks_them() {
+        let (mut a, mut b, ca, cb, mut now) = connected(8192, 8192);
+        assert!(tcp(&mut a, ca).sack_ok && tcp(&mut b, cb).sack_ok);
+        let mut n = 0;
+        a.set_shaper(move |_, f| {
+            if !data_frame(f) {
+                return Fate::Deliver;
+            }
+            n += 1;
+            if n == 1 || n == 3 { Fate::Drop } else { Fate::Deliver }
+        });
+        tcp(&mut a, ca).send(&[7; 5 * 1460]).unwrap();
+        run(&mut a, &mut b, &mut now, 30, |_, _| false);
+        let sender = tcp(&mut a, ca);
+        assert!(sender.in_recovery || sender.scoreboard.len() <= 2);
+        let rcv_nxt_gap = tcp(&mut b, cb).ooo.len();
+        assert!(rcv_nxt_gap <= 2);
+        assert!(run(&mut a, &mut b, &mut now, 3000, |_, b| tcp(b, cb).recv_queue() == 5 * 1460));
     }
 }

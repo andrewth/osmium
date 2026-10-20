@@ -183,11 +183,34 @@ pub struct Ipv4Header {
     pub payload_len: usize,
 }
 
+/// Where a packet's payload sits in the datagram it was fragmented from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Fragment {
+    /// More fragments follow this one.
+    pub more: bool,
+    /// Offset of the payload in the datagram, in bytes (a multiple of 8).
+    pub offset: usize,
+}
+
+impl Fragment {
+    /// Returns true if the packet is a whole datagram.
+    pub const fn is_whole(&self) -> bool {
+        !self.more && self.offset == 0
+    }
+}
+
 impl Ipv4Header {
     /// Splits a packet into its header and payload, verifying the version,
     /// lengths and header checksum. Options are skipped. Fragments are
-    /// rejected, since the stack does not reassemble them.
+    /// rejected; [`parse_fragment`](Self::parse_fragment) accepts them.
     pub fn parse(b: &[u8]) -> Option<(Self, &[u8])> {
+        let (header, fragment, payload) = Self::parse_fragment(b)?;
+        fragment.is_whole().then_some((header, payload))
+    }
+
+    /// Like [`parse`](Self::parse), but also returns where the payload sits
+    /// in its datagram, for packets that are fragments.
+    pub fn parse_fragment(b: &[u8]) -> Option<(Self, Fragment, &[u8])> {
         if b.len() < IPV4_HEADER_LEN || b[0] >> 4 != 4 {
             return None;
         }
@@ -199,11 +222,7 @@ impl Ipv4Header {
         if checksum::of(&b[..header_len]) != 0 {
             return None;
         }
-        let more_fragments = b[6] & 0x20 != 0;
-        let offset = be16(b, 6) & 0x1fff;
-        if more_fragments || offset != 0 {
-            return None;
-        }
+        let fragment = Fragment { more: b[6] & 0x20 != 0, offset: usize::from(be16(b, 6) & 0x1fff) * 8 };
         let header = Self {
             src: ip(b, 12),
             dst: ip(b, 16),
@@ -212,18 +231,29 @@ impl Ipv4Header {
             ident: be16(b, 4),
             payload_len: total_len - header_len,
         };
-        Some((header, &b[header_len..total_len]))
+        Some((header, fragment, &b[header_len..total_len]))
     }
 
     /// Writes the header, with DF set and its checksum, into the first
     /// [`IPV4_HEADER_LEN`] bytes of `buf`.
     pub fn emit(&self, buf: &mut [u8]) {
+        self.emit_inner(buf, 0x4000);
+    }
+
+    /// Writes the header of a fragment: DF clear, and the fragment fields of
+    /// `fragment` (whose offset must be a multiple of 8).
+    pub fn emit_fragment(&self, buf: &mut [u8], fragment: Fragment) {
+        let flags = u16::from(fragment.more) << 13 | (fragment.offset / 8) as u16 & 0x1fff;
+        self.emit_inner(buf, flags);
+    }
+
+    fn emit_inner(&self, buf: &mut [u8], flags_offset: u16) {
         let total = (IPV4_HEADER_LEN + self.payload_len) as u16;
         buf[0] = 0x45;
         buf[1] = 0;
         buf[2..4].copy_from_slice(&total.to_be_bytes());
         buf[4..6].copy_from_slice(&self.ident.to_be_bytes());
-        buf[6..8].copy_from_slice(&[0x40, 0]);
+        buf[6..8].copy_from_slice(&flags_offset.to_be_bytes());
         buf[8] = self.ttl;
         buf[9] = self.protocol;
         buf[10..12].fill(0);
@@ -340,7 +370,8 @@ pub const TCP_PSH: u8 = 0x08;
 /// TCP flag: ACK.
 pub const TCP_ACK: u8 = 0x10;
 
-/// A TCP header. Of the options, only the maximum segment size is kept.
+/// A TCP header. Of the options, the maximum segment size, window scale and
+/// SACK are kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct TcpHeader {
     /// Source port.
@@ -357,7 +388,19 @@ pub struct TcpHeader {
     pub window: u16,
     /// The maximum segment size option.
     pub mss: Option<u16>,
+    /// The window scale option's shift count (RFC 7323), in SYN segments.
+    pub wscale: Option<u8>,
+    /// The SACK-permitted option (RFC 2018), in SYN segments.
+    pub sack_permitted: bool,
+    /// The SACK option's blocks, as `(left edge, right edge)`; only the first
+    /// `sack_len` are meaningful.
+    pub sack: [(u32, u32); MAX_SACK_BLOCKS],
+    /// Number of blocks in `sack`.
+    pub sack_len: u8,
 }
+
+/// The most SACK blocks a segment carries: a TCP header has room for four.
+pub const MAX_SACK_BLOCKS: usize = 4;
 
 impl TcpHeader {
     /// Splits a segment carried from `src` to `dst` into its header and
@@ -380,7 +423,7 @@ impl TcpHeader {
             ack: be32(b, 8),
             flags: b[13] & 0x3f,
             window: be16(b, 14),
-            mss: None,
+            ..Self::default()
         };
         let mut opts = &b[TCP_HEADER_LEN..offset];
         while let [kind, rest @ ..] = opts {
@@ -393,8 +436,20 @@ impl TcpHeader {
                     if len < 2 || len > opts.len() {
                         break;
                     }
-                    if *kind == 2 && len == 4 {
-                        header.mss = Some(be16(opts, 2));
+                    match (*kind, len) {
+                        (2, 4) => header.mss = Some(be16(opts, 2)),
+                        (3, 3) => header.wscale = Some(opts[2]),
+                        (4, 2) => header.sack_permitted = true,
+                        (5, _) if len >= 10 && (len - 2) % 8 == 0 => {
+                            for block in opts[2..len].chunks_exact(8) {
+                                if usize::from(header.sack_len) == MAX_SACK_BLOCKS {
+                                    break;
+                                }
+                                header.sack[usize::from(header.sack_len)] = (be32(block, 0), be32(block, 4));
+                                header.sack_len += 1;
+                            }
+                        }
+                        _ => {}
                     }
                     opts = &opts[len..];
                 }
@@ -403,10 +458,32 @@ impl TcpHeader {
         Some((header, &b[offset..]))
     }
 
-    /// Builds the segment from `src` to `dst`: this header (with the MSS
-    /// option if set), `payload`, and the checksum.
+    /// Builds the segment from `src` to `dst`: this header (with its
+    /// options), `payload`, and the checksum.
     pub fn emit(&self, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
-        let header_len = TCP_HEADER_LEN + if self.mss.is_some() { 4 } else { 0 };
+        let mut opts = Vec::new();
+        if let Some(mss) = self.mss {
+            opts.extend_from_slice(&[2, 4]);
+            opts.extend_from_slice(&mss.to_be_bytes());
+        }
+        if self.sack_permitted {
+            opts.extend_from_slice(&[4, 2]);
+        }
+        if let Some(shift) = self.wscale {
+            opts.extend_from_slice(&[1, 3, 3, shift]);
+        }
+        let blocks = &self.sack[..usize::from(self.sack_len).min(MAX_SACK_BLOCKS)];
+        if !blocks.is_empty() {
+            opts.extend_from_slice(&[1, 1, 5, 2 + 8 * blocks.len() as u8]);
+            for (left, right) in blocks {
+                opts.extend_from_slice(&left.to_be_bytes());
+                opts.extend_from_slice(&right.to_be_bytes());
+            }
+        }
+        while opts.len() % 4 != 0 {
+            opts.push(1);
+        }
+        let header_len = TCP_HEADER_LEN + opts.len();
         let len = header_len + payload.len();
         let mut b = Vec::with_capacity(len);
         b.extend_from_slice(&self.src_port.to_be_bytes());
@@ -416,10 +493,7 @@ impl TcpHeader {
         b.extend_from_slice(&[(header_len as u8 / 4) << 4, self.flags]);
         b.extend_from_slice(&self.window.to_be_bytes());
         b.extend_from_slice(&[0, 0, 0, 0]);
-        if let Some(mss) = self.mss {
-            b.extend_from_slice(&[2, 4]);
-            b.extend_from_slice(&mss.to_be_bytes());
-        }
+        b.extend_from_slice(&opts);
         b.extend_from_slice(payload);
         let sum = checksum::finish(checksum::add(checksum::pseudo_header(src, dst, PROTO_TCP, len), &b));
         b[16..18].copy_from_slice(&sum.to_be_bytes());
@@ -481,6 +555,37 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_fragment_fields() {
+        let h = Ipv4Header {
+            src: Ipv4Addr::LOCALHOST,
+            dst: Ipv4Addr::LOCALHOST,
+            protocol: 17,
+            ttl: 1,
+            ident: 9,
+            payload_len: 8,
+        };
+        let mut b = [0u8; 28];
+        let frag = Fragment { more: true, offset: 1480 };
+        h.emit_fragment(&mut b, frag);
+        assert_eq!(Ipv4Header::parse(&b), None);
+        assert_eq!(Ipv4Header::parse_fragment(&b), Some((h, frag, &[0u8; 8][..])));
+        h.emit(&mut b);
+        assert_eq!(Ipv4Header::parse_fragment(&b).unwrap().1, Fragment::default());
+    }
+
+    #[test]
+    fn tcp_options_round_trip() {
+        let (src, dst) = (Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8));
+        let syn = TcpHeader { flags: TCP_SYN, mss: Some(1460), wscale: Some(7), sack_permitted: true, ..Default::default() };
+        let b = syn.emit(src, dst, &[]);
+        assert_eq!(TcpHeader::parse(&b, src, dst), Some((syn, &[][..])));
+        let mut ack = TcpHeader { flags: TCP_ACK, sack_len: 3, ..Default::default() };
+        ack.sack[..3].copy_from_slice(&[(10, 20), (30, 40), (50, 60)]);
+        let b = ack.emit(src, dst, b"x");
+        assert_eq!(TcpHeader::parse(&b, src, dst), Some((ack, &b"x"[..])));
+    }
+
+    #[test]
     fn tcp_round_trip_with_mss() {
         let (src, dst) = (Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8));
         let h = TcpHeader {
@@ -491,6 +596,7 @@ mod tests {
             flags: TCP_SYN | TCP_ACK,
             window: 5,
             mss: Some(1460),
+            ..Default::default()
         };
         let b = h.emit(src, dst, b"hi");
         assert_eq!(TcpHeader::parse(&b, src, dst), Some((h, &b"hi"[..])));
