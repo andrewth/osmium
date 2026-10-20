@@ -447,8 +447,9 @@ fn sbi_shutdown() -> ! {
 }
 
 // A two-hart guest: hart 0 starts hart 1 through SBI HSM, hart 1 sends hart
-// 0 an IPI and stops itself, hart 0 waits for the IPI (sip.SSIP) and for
-// hart 1 to report STOPPED, then powers off. Position independent.
+// 0 an IPI and stops itself, hart 0 spins on sip.SSIP until the IPI arrives
+// (the hypervisor kicks its host CPU to make it exit) and waits for hart 1
+// to report STOPPED, then powers off. Position independent.
 core::arch::global_asm!(
     r#"
     .section .rodata.guest, "a"
@@ -470,8 +471,8 @@ smp_guest:
     mv s2, a0
     li t0, 2
     csrs sie, t0                    // SSIE
-1:  wfi
-    csrr t1, sip
+1:  csrr t1, sip                    // busy-wait in the guest: the IPI can
+                                    // only arrive through an exit
     andi t1, t1, 2
     beqz t1, 1b
     csrc sip, t0
@@ -543,7 +544,14 @@ pub fn demo_smp(ncpus: usize) {
     map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
     let hgatp = hgatp_sv39x4(gstage.root(), 3);
 
-    let harts = GuestHarts::new(2);
+    // Kick a host CPU out of its guest with a host IPI; its handler only
+    // clears the interrupt, and the exit makes the vCPU look at its lines.
+    let kicks = Arc::new(AtomicU64::new(0));
+    let k = kicks.clone();
+    let harts = GuestHarts::with_kick(2, move |cpu| {
+        k.fetch_add(1, Ordering::Relaxed);
+        let _ = osmium::arch::riscv64::sbi::send_ipi(1, crate::HARTS[cpu].load(Ordering::Relaxed));
+    });
     harts.request_start(0, GUEST_RAM.0, 0).unwrap();
     let buses = Arc::new((Bus::new(), Bus::new()));
     let done = Arc::new(AtomicBool::new(false));
@@ -561,7 +569,7 @@ pub fn demo_smp(ncpus: usize) {
                         continue;
                     };
                     let mut vcpu = RiscvVcpu::new(GuestPhysAddr(entry), h as u64, opaque, hgatp);
-                    vcpu.connect_ipi(harts.ipi_line(h));
+                    harts.attach(h, &mut vcpu);
                     let mut stopped = false;
                     let exit = run_vcpu(&mut vcpu, &buses.0, &buses.1, |v, exit| match exit {
                         VmExit::Hypercall { .. } => {
@@ -605,9 +613,10 @@ pub fn demo_smp(ncpus: usize) {
     }
     let cpus = if ncpus > 2 { "host CPUs 1 and 2" } else { "host CPU 0" };
     println!(
-        "[hyp]   SMP guest: 2 vCPUs on {cpus}; hart_start returned {}, hart 1 got opaque {:#x}",
+        "[hyp]   SMP guest: 2 vCPUs on {cpus}; hart_start returned {}, hart 1 got opaque {:#x}; {} kick(s)",
         results[0].load(Ordering::Acquire) as i64,
-        results[1].load(Ordering::Acquire)
+        results[1].load(Ordering::Acquire),
+        kicks.load(Ordering::Relaxed)
     );
 
     drop(gstage);

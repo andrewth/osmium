@@ -1,8 +1,9 @@
 //! The harts of a multi-vCPU RISC-V guest: SBI HSM state and IPIs.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use osmium_sync::IrqSpinLock;
 
@@ -20,7 +21,14 @@ struct Slot {
     state: AtomicU64,
     start: IrqSpinLock<Option<(u64, u64)>>,
     ipi: Arc<AtomicBool>,
+    /// Host CPU the hart's vCPU is running guest code on, or `usize::MAX`.
+    running: Arc<AtomicUsize>,
 }
+
+/// Not in the guest.
+pub(super) const NOT_RUNNING: usize = usize::MAX;
+
+type Kick = Box<dyn Fn(usize) + Send + Sync>;
 
 /// Shared state for a guest's harts. Each vCPU's host task takes start
 /// requests with [`take_start`](Self::take_start), connects its IPI line
@@ -29,19 +37,40 @@ struct Slot {
 /// HSM and IPI on top of it.
 pub struct GuestHarts {
     slots: Vec<Slot>,
+    kick: Option<Kick>,
 }
 
 impl GuestHarts {
     /// `n` harts, all stopped.
     pub fn new(n: usize) -> Arc<Self> {
+        Arc::new(Self::build(n, None))
+    }
+
+    /// Like [`new`](Self::new), with a way to interrupt host CPU `cpu`
+    /// (usually a host IPI). An IPI to a hart whose vCPU is running guest
+    /// code on another host CPU then kicks that CPU, so the vCPU exits and
+    /// sees the interrupt at once instead of at its next exit.
+    pub fn with_kick(n: usize, kick: impl Fn(usize) + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self::build(n, Some(Box::new(kick))))
+    }
+
+    fn build(n: usize, kick: Option<Kick>) -> Self {
         let slots = (0..n)
             .map(|_| Slot {
                 state: AtomicU64::new(status::STOPPED),
                 start: IrqSpinLock::new(None),
                 ipi: Arc::new(AtomicBool::new(false)),
+                running: Arc::new(AtomicUsize::new(NOT_RUNNING)),
             })
             .collect();
-        Arc::new(Self { slots })
+        Self { slots, kick }
+    }
+
+    /// Connects `vcpu` as hart `hart`: its IPI line, and the record of
+    /// which host CPU it runs on (for kicks).
+    pub fn attach(&self, hart: usize, vcpu: &mut super::RiscvVcpu) {
+        vcpu.connect_ipi(self.slots[hart].ipi.clone());
+        vcpu.running = Some(self.slots[hart].running.clone());
     }
 
     /// Number of harts.
@@ -103,6 +132,13 @@ impl GuestHarts {
             };
             if hit {
                 s.ipi.store(true, Ordering::Release);
+                let cpu = s.running.load(Ordering::Acquire);
+                if let Some(kick) = &self.kick
+                    && cpu != NOT_RUNNING
+                    && cpu != osmium_arch::cpu::current_id()
+                {
+                    kick(cpu);
+                }
             }
         }
         Ok(())
@@ -133,5 +169,17 @@ mod tests {
         assert!(h.ipi_line(2).load(Ordering::SeqCst));
         h.send_ipi(0, u64::MAX).unwrap();
         assert!(h.ipi_line(0).load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn kicks_running_harts_only() {
+        let kicked = Arc::new(AtomicUsize::new(NOT_RUNNING));
+        let k = kicked.clone();
+        let h = GuestHarts::with_kick(2, move |cpu| k.store(cpu, Ordering::SeqCst));
+        h.send_ipi(0b10, 0).unwrap();
+        assert_eq!(kicked.load(Ordering::SeqCst), NOT_RUNNING, "hart 1 is not in the guest");
+        h.slots[1].running.store(3, Ordering::SeqCst);
+        h.send_ipi(0b10, 0).unwrap();
+        assert_eq!(kicked.load(Ordering::SeqCst), 3);
     }
 }
