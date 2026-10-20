@@ -162,6 +162,9 @@ pub struct Fake {
     start: Instant,
     /// Nanoseconds skipped ahead.
     skipped: AtomicU64,
+    /// Clock readings so far, so a slow command can wait for the driver to
+    /// see the time it took.
+    readings: AtomicU64,
 }
 
 // The driver's buffers are identity-mapped host memory.
@@ -239,12 +242,25 @@ impl Fake {
             disables: AtomicU32::new(0),
             start: Instant::now(),
             skipped: AtomicU64::new(0),
+            readings: AtomicU64::new(0),
         }
     }
 
     /// Moves the clock `ns` ahead.
     pub fn skip(&self, ns: u64) {
         self.skipped.fetch_add(ns, Ordering::AcqRel);
+    }
+
+    /// Moves the clock `ns` ahead and waits until the driver has read it
+    /// twice, so it decides on its deadline before the completion appears
+    /// (a real controller completes only after the time has passed).
+    fn take_time(&self, ns: u64) {
+        self.skip(ns);
+        let seen = self.readings.load(Ordering::Acquire);
+        let start = Instant::now();
+        while self.readings.load(Ordering::Acquire) < seen + 2 && start.elapsed().as_secs() < 5 {
+            std::thread::yield_now();
+        }
     }
 
     pub fn io(&self) -> IoMem {
@@ -345,7 +361,9 @@ impl Fake {
                             }
                             continue;
                         }
-                        self.skip(self.cfg.io_delay_ns);
+                        if self.cfg.io_delay_ns != 0 {
+                            self.take_time(self.cfg.io_delay_ns);
+                        }
                         self.nvm(&sqe)
                     };
                     let cid = (sqe[0] >> 16) as u16;
@@ -539,6 +557,7 @@ impl Fake {
 
 impl Clock for Fake {
     fn now_ns(&self) -> u64 {
+        self.readings.fetch_add(1, Ordering::AcqRel);
         self.start.elapsed().as_nanos() as u64 + self.skipped.load(Ordering::Acquire)
     }
 }
