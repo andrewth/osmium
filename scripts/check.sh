@@ -117,8 +117,10 @@ fi
 
 # RISC-V hypervisor booting a whole guest kernel: the riscv-virt kernel
 # built above runs in VS-mode under riscv-hyp (QEMU's loader places the ELF
-# raw in host RAM), with one vCPU on each of two host harts. Guest lines
-# carry a "| " prefix.
+# raw in host RAM), with one vCPU on each of two host harts, a virtio-blk
+# disk over a host RAM disk, and a virtio-net card bridged to the host's
+# QEMU user network (DHCP, ping and the TCP echo all from inside the guest).
+# Guest lines carry a "| " prefix.
 if command -v qemu-system-riscv64 >/dev/null; then
     echo "== boot examples/riscv-virt as a guest of examples/riscv-hyp under QEMU"
     nestlog=$(mktemp)
@@ -126,12 +128,17 @@ if command -v qemu-system-riscv64 >/dev/null; then
     timeout 120 qemu-system-riscv64 -machine virt -bios default -smp 2 -accel tcg,thread=multi -m 512M -nographic \
         -kernel examples/riscv-hyp/target/riscv64imac-unknown-none-elf/release/riscv-hyp \
         -device loader,file=examples/riscv-virt/target/riscv64imac-unknown-none-elf/release/riscv-virt,addr=0x98000000,force-raw=on \
+        -netdev user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat -device virtio-net-device,netdev=n0 \
         -serial "file:$nestlog" -monitor none </dev/null >/dev/null
     sed -n '/^osmium/,$p' "$nestlog"
     for line in 'guest kernel: [0-9]* KiB loaded, entry 0x80200000' '| osmium riscv-virt example (hart 0)' \
         '| \[mmu\]   Sv39 on' '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
         '| \[smp\]   2 CPUs online' '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' \
         '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
+        '| \[net\]   DHCP: 10.0.2.15/24 via 10.0.2.2' '| \[net\]   ping 10.0.2.2: seq 1 in' \
+        '| \[net\]   TCP echo from 10.0.2.100:7: "hello over TCP"' \
+        '| \[blk\]   virtio-blk (1.x) at 0x10001000: 8192 sectors; wrote and read back sector 4096' \
+        "the host RAM disk holds the guest's write to sector 4096" \
         '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' \
         '| \[hyp\]   no H extension in riscv,isa: skipping the guests' '| \[done\]' 'guest exit Shutdown'; do
         grep -q "$line" "$nestlog" || { echo "riscv-hyp: missing '$line'"; exit 1; }

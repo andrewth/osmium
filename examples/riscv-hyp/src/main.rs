@@ -26,9 +26,15 @@ use osmium::arch::riscv64::{self as rv, sbi as host_sbi};
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::boot::elf::Elf;
 use osmium::boot::fdt::Fdt;
+use osmium::drivers::ramdisk::RamDisk;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
+use osmium::drivers::virtio::mmio::MmioTransport;
+use osmium::drivers::virtio::net::VirtioNet;
+use osmium::drivers::virtio::{DeviceType, Transport as _};
+use osmium::hal::block::BlockDevice as _;
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::mmio::IoMem;
+use osmium::hal::net::NetDevice as _;
 use osmium::hal::println;
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MemoryMap, OffsetMapper, PageTable};
@@ -39,10 +45,8 @@ use osmium::virt::riscv::fdt::GuestMachine;
 use osmium::virt::riscv::{self, RiscvVcpu, sbi};
 use osmium::virt::smp::GuestCpus;
 use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
-use osmium::virt::virtio::{MMIO_SIZE, VirtioBlock, VirtioMmio};
+use osmium::virt::virtio::{MMIO_SIZE, VirtioBlock, VirtioMmio, VirtioNetDevice};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
-use osmium::drivers::ramdisk::RamDisk;
-use osmium::hal::block::BlockDevice as _;
 
 core::arch::global_asm!(
     r#"
@@ -112,6 +116,16 @@ const PLIC_BASE: u64 = 0x0c00_0000;
 const BLK_BASE: u64 = 0x1000_1000;
 const BLK_IRQ: u32 = 1;
 const DISK_ORDER: u32 = 10; // 4 MiB
+/// virtio-net bridged to the host's own virtio-net, in the second slot.
+const NET_BASE: u64 = 0x1000_2000;
+const NET_IRQ: u32 = 2;
+/// How often (in timer ticks) hart 0 moves frames from the host NIC to
+/// the guest while the guest runs: 1 ms.
+const NET_POLL_TICKS: u64 = 10_000;
+
+type HostNic = VirtioNet<'static, MmioTransport, Frames>;
+/// The host's virtio-net, which the guest's network card is bridged to.
+static HOST_NIC: Once<IrqSpinLock<HostNic>> = Once::new();
 /// The guest's device tree, at the top of its RAM.
 const GUEST_DTB_SIZE: u64 = 0x1_0000;
 
@@ -171,6 +185,22 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: only enables a source the host never takes in HS-mode.
     unsafe { rv::write_sie(rv::read_sie() | 1 << 1) };
 
+    // The host's virtio-net, if QEMU has one: the guest's card is bridged to it.
+    let nic = fdt
+        .all_nodes()
+        .filter(|n| n.compatible().any(|c| c == "virtio,mmio"))
+        .filter_map(|n| n.reg().next().map(|(a, s)| (a, s.unwrap_or(0x200))))
+        .find_map(|(base, len)| {
+            // SAFETY: the device tree puts a virtio-mmio slot here; nothing else uses it.
+            let t = MmioTransport::new(unsafe { IoMem::new(base as *mut u8, len as usize) }).ok()?;
+            (t.device_type() == DeviceType::Net).then_some(t)
+        });
+    if let Some(t) = nic {
+        let nic = VirtioNet::new(t, &FRAMES).expect("virtio-net init failed");
+        println!("[net]   host virtio-net {}: bridged to the guest", nic.mac_address());
+        HOST_NIC.call_once(|| IrqSpinLock::new(nic));
+    }
+
     // One vCPU per host hart: start the others.
     let cpus = fdt.find_node("/cpus").expect("no /cpus");
     let mut ncpus = 1;
@@ -228,6 +258,8 @@ struct Vm {
     mem: Arc<GuestMemory>,
     hgatp: u64,
     mmio: Bus,
+    /// The guest's network card, bridged to [`HOST_NIC`].
+    net: Option<Arc<VirtioMmio<VirtioNetDevice>>>,
     /// Per vCPU: its external-interrupt line (PLIC context 2n + 1).
     lines: Vec<Arc<AtomicBool>>,
     done: AtomicBool,
@@ -262,6 +294,23 @@ extern "C" fn secondary_main(_hartid: usize, boot: &SecondaryBoot) -> ! {
     }
 }
 
+/// Moves frames the host NIC has received into the guest's card.
+fn poll_net(vm: &Vm) {
+    let (Some(nic), Some(net)) = (HOST_NIC.get(), &vm.net) else { return };
+    let mut frames = Vec::new();
+    {
+        let mut nic = nic.lock();
+        let mut buf = [0u8; 1514];
+        while let Ok(n) = nic.receive(&mut buf) {
+            frames.push(buf[..n].to_vec());
+        }
+    }
+    // Outside the NIC's lock: the card's transmit path takes it.
+    for f in frames {
+        net.with_device(|d, ctx| d.receive(&f, ctx));
+    }
+}
+
 /// Runs vCPU `me` on this host hart each time the guest starts it, until
 /// the guest is done. Returns the exit that ended the guest, if it was this
 /// vCPU's.
@@ -277,6 +326,14 @@ fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
             RiscvVcpu::new(GuestPhysAddr(entry), me as u64, opaque, vm.hgatp).with_external_irq(vm.lines[me].clone());
         vm.cpus.attach(me, &mut vcpu);
         let mut stopped = false;
+        // Hart 0 polls the host NIC on a host timer, so frames reach a
+        // guest that busy-waits for them without exiting.
+        let mut next_poll = riscv::time() + NET_POLL_TICKS;
+        if me == 0 && vm.net.is_some() {
+            host_sbi::set_timer(next_poll);
+            // SAFETY: as with SSIE: the timer exits the guest; the host never takes it.
+            unsafe { rv::write_sie(rv::read_sie() | 1 << 5) };
+        }
         let exit = run_vcpu(&mut vcpu, &vm.mmio, &Bus::new(), |v, exit| match exit {
             VmExit::Hypercall { .. } => {
                 match sbi::handle_smp(
@@ -302,6 +359,9 @@ fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
                     if vm.done.load(Ordering::Acquire) {
                         return ControlFlow::Break(VmExit::Halt);
                     }
+                    if me == 0 {
+                        poll_net(vm);
+                    }
                     core::hint::spin_loop();
                 }
                 ControlFlow::Continue(())
@@ -311,6 +371,12 @@ fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
                 // whatever the guest now has pending.
                 // SAFETY: clears only this hart's software-interrupt bit.
                 unsafe { rv::write_sip(rv::read_sip() & !(1 << 1)) };
+                if me == 0 && riscv::time() >= next_poll {
+                    // The host timer: bring in received frames, re-arm.
+                    poll_net(vm);
+                    next_poll = riscv::time() + NET_POLL_TICKS;
+                    host_sbi::set_timer(next_poll);
+                }
                 if vm.done.load(Ordering::Acquire) {
                     return ControlFlow::Break(VmExit::Halt);
                 }
@@ -362,7 +428,11 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
         memory: &[(GUEST_RAM, len)],
         plic: Some((PLIC_BASE, 32)),
         uarts: &[(GUEST_UART, UART_IRQ)],
-        virtio: &[(BLK_BASE, BLK_IRQ)],
+        virtio: if HOST_NIC.get().is_some() {
+            &[(BLK_BASE, BLK_IRQ), (NET_BASE, NET_IRQ)]
+        } else {
+            &[(BLK_BASE, BLK_IRQ)]
+        },
         bootargs: "",
     }
     .to_dtb();
@@ -401,6 +471,21 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
         p.set_level(BLK_IRQ, level)
     }));
     mmio.insert(BLK_BASE, MMIO_SIZE, blk.clone()).unwrap();
+    // The network card: frames the guest sends go out on the host NIC;
+    // hart 0 brings received ones in (`poll_net`). Same MAC as the host
+    // NIC, which the host itself does not use.
+    let net = HOST_NIC.get().map(|nic| {
+        let mac = nic.lock().mac_address().0;
+        let backend = |frame: &[u8], _: &mut dyn FnMut(&[u8])| {
+            let _ = HOST_NIC.get().unwrap().lock().transmit(frame);
+        };
+        let p = plic_for_blk.clone();
+        let dev = Arc::new(VirtioMmio::new(VirtioNetDevice::new(mac, backend), mem.clone(), move |level| {
+            p.set_level(NET_IRQ, level)
+        }));
+        mmio.insert(NET_BASE, MMIO_SIZE, dev.clone()).unwrap();
+        dev
+    });
     // An IPI or fence for a vCPU running guest code on another hart kicks
     // that hart with a host IPI.
     let cpus = GuestCpus::with_kick(harts, |cpu| {
@@ -413,6 +498,7 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
         mem,
         hgatp: hgatp_sv39x4(gstage.root(), 1),
         mmio,
+        net,
         lines,
         done: AtomicBool::new(false),
         running: AtomicUsize::new(harts),

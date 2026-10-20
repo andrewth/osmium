@@ -6,8 +6,9 @@ they see, what happens when they halt. The three `*-hyp` examples
 (`examples/riscv-virt/src/hyp.rs`, `examples/aarch64-hyp`,
 `examples/x86_64-hyp`) put the pieces together; this page explains them.
 `examples/riscv-hyp` goes further and boots a whole kernel as its guest:
-Osmium's own `riscv-virt`, from ELF, with a generated device tree and one
-vCPU per host hart.
+Osmium's own `riscv-virt`, from ELF, with a generated device tree, one
+vCPU per host hart, a virtio-blk disk and a virtio-net card bridged to the
+host's network card.
 
 ## The pieces
 
