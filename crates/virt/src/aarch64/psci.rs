@@ -98,7 +98,8 @@ mod tests {
 
         // With CPUs: start CPU 1, query it, turn this one off.
         let cpus = GuestCpus::new(2);
-        let smp = |v: &mut Aarch64Vcpu, nr, a: [u64; 6]| handle_smp(v, VmExit::Hypercall { nr, args: a }, Some((&cpus, 0)));
+        let smp =
+            |v: &mut Aarch64Vcpu, nr, a: [u64; 6]| handle_smp(v, VmExit::Hypercall { nr, args: a }, Some((&cpus, 0)));
         smp(&mut v, CPU_ON, [1, 0x4000_0100, 7, 0, 0, 0]);
         assert_eq!(v.state.x[0], 0);
         smp(&mut v, CPU_ON, [1, 0, 0, 0, 0, 0]);

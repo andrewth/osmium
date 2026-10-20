@@ -51,9 +51,15 @@ where
     F: osmium_mm::paging::PageTableFormat,
     A: TableAlloc,
 {
+    // Whole pages only: rounding a region up would hand the guest the host
+    // memory that follows it.
+    let page = PAGE_SIZE as u64;
     for r in mem.regions() {
-        let len = r.len.next_multiple_of(PAGE_SIZE as u64);
-        table.map_range(VirtAddr::new(r.gpa.0), host_to_phys(r.host), len, MapFlags::RW | MapFlags::EXEC)?;
+        let pa = host_to_phys(r.host);
+        if !r.gpa.0.is_multiple_of(page) || !pa.0.is_multiple_of(page) || !r.len.is_multiple_of(page) {
+            return Err(MapError::Misaligned);
+        }
+        table.map_range(VirtAddr::new(r.gpa.0), pa, r.len, MapFlags::RW | MapFlags::EXEC)?;
     }
     Ok(())
 }
@@ -123,7 +129,9 @@ mod tests {
         map_guest_memory(&mut g, &mem, |p| PhysAddr::new(p as u64)).unwrap();
         assert_eq!(g.translate(VirtAddr::new(0x8012_3456)).unwrap().pa, PhysAddr::new(0x1_0012_3456));
         // Above the 39-bit range a plain Sv39 table would cover.
-        g.map(VirtAddr::new(0x180_0000_0000), PhysAddr::new(0x5000), osmium_mm::PageSize::Size4K, MapFlags::READ).unwrap().ignore();
+        g.map(VirtAddr::new(0x180_0000_0000), PhysAddr::new(0x5000), osmium_mm::PageSize::Size4K, MapFlags::READ)
+            .unwrap()
+            .ignore();
         assert_eq!(g.translate(VirtAddr::new(0x180_0000_0010)).unwrap().pa, PhysAddr::new(0x5010));
     }
 

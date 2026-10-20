@@ -127,8 +127,18 @@ pub fn enable(hsave_pa: u64) -> Result<(), SvmError> {
     Ok(())
 }
 
+/// The VMCB each CPU last ran. Every vCPU uses ASID 1, so a CPU that runs
+/// a different VMCB than last time (another vCPU, a vCPU that moved, or a
+/// new VM in a reused page) flushes the guest TLB first.
+static LAST_VMCB: [core::sync::atomic::AtomicU64; osmium_arch::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; osmium_arch::MAX_CPUS];
+
 /// Enters the guest and returns at its next `#VMEXIT`.
 pub(super) fn run(v: &mut SvmVcpu) {
+    let cpu = osmium_arch::cpu::current_id();
+    if LAST_VMCB[cpu].swap(v.vmcb_pa, core::sync::atomic::Ordering::Relaxed) != v.vmcb_pa {
+        v.write32(super::vmcb::TLB_CONTROL, 1);
+    }
     let flags: u64;
     // SAFETY: reads RFLAGS.
     unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };

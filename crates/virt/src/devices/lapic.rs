@@ -87,10 +87,16 @@ impl State {
         Some((now.saturating_sub(start) as u128 * hz as u128 / 1_000_000_000 / self.divisor() as u128) as u64)
     }
 
+    /// Timer ticks between periodic interrupts: the guest's count, but at
+    /// least 100 µs, so a guest cannot make the host deliver (and poll) an
+    /// interrupt storm.
+    fn interval(&self, hz: u64) -> u64 {
+        (self.initial as u64).max(hz / 10_000 / self.divisor()).max(1)
+    }
+
     fn expiries(&self, now: u64, hz: u64) -> u64 {
         let Some(t) = self.elapsed(now, hz) else { return 0 };
-        let n = self.initial as u64;
-        if self.periodic() { t / n } else { (t >= n) as u64 }
+        if self.periodic() { t / self.interval(hz) } else { (t >= self.initial as u64) as u64 }
     }
 
     fn current(&self, now: u64, hz: u64) -> u32 {
@@ -104,7 +110,8 @@ impl State {
         if !self.periodic() && self.fired > 0 {
             return None;
         }
-        let ticks = (self.fired + 1) * self.initial as u64 * self.divisor();
+        let n = if self.periodic() { self.interval(hz) } else { self.initial as u64 };
+        let ticks = (self.fired + 1) * n * self.divisor();
         Some(start + (ticks as u128 * 1_000_000_000).div_ceil(hz as u128) as u64)
     }
 
@@ -506,6 +513,17 @@ mod tests {
         // Initial count 0 stops it.
         r.w(TIMER_INITIAL, 0);
         assert_eq!(r.apic.next_deadline(), None);
+    }
+
+    #[test]
+    fn periodic_floor() {
+        // A 1-tick periodic timer interrupts no faster than every 100 us.
+        let r = rig();
+        r.w(SVR, 0x1ff);
+        r.w(TIMER_DIVIDE, 0xb);
+        r.w(LVT_TIMER, PERIODIC | 0x40);
+        r.w(TIMER_INITIAL, 1);
+        assert_eq!(r.apic.next_deadline(), Some(500 + 100_000));
     }
 
     #[test]

@@ -74,6 +74,8 @@ pub fn patch_cpuid(leaf: u32, [a, mut b, mut c, mut d]: [u32; 4], apic_id: u8) -
 
 /// VMCB offsets (AMD64 APM vol. 2, appendix B).
 pub mod vmcb {
+    /// Intercepted exceptions (bit per vector).
+    pub const INTERCEPT_EXCEPTIONS: usize = 0x008;
     /// Intercepts: INTR, NMI, ... SHUTDOWN (bit per event).
     pub const INTERCEPT_MISC1: usize = 0x00c;
     /// Intercepts: VMRUN, VMMCALL, ...
@@ -171,8 +173,22 @@ pub mod vmcb {
 
 /// `#VMEXIT` codes.
 pub mod exit {
+    /// Exception with vector `v`: `EXCEPTION + v`.
+    pub const EXCEPTION: u64 = 0x40;
     /// Physical interrupt.
     pub const INTR: u64 = 0x60;
+    /// Physical NMI.
+    pub const NMI: u64 = 0x61;
+    /// INVD.
+    pub const INVD: u64 = 0x76;
+    /// INVLPGA.
+    pub const INVLPGA: u64 = 0x7a;
+    /// VMRUN.
+    pub const VMRUN: u64 = 0x80;
+    /// VMLOAD, VMSAVE, STGI, CLGI, SKINIT.
+    pub const VMLOAD: u64 = 0x82;
+    /// SKINIT, the last SVM instruction.
+    pub const SKINIT: u64 = 0x86;
     /// The guest can take a virtual interrupt (interrupt window).
     pub const VINTR: u64 = 0x64;
     /// CPUID.
@@ -265,6 +281,8 @@ pub struct SvmVcpu {
     apic_base: u64,
     /// The local APIC ID CPUID reports.
     apic_id: u8,
+    /// An exception to raise in the guest at the next entry (EVENTINJ form).
+    pending_exception: Option<u64>,
     /// Whether `fpu` is switched around VMRUN.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     pub(crate) switch_fp: bool,
@@ -310,11 +328,20 @@ impl SvmVcpu {
             apic_base: 0xfee0_0000 | APIC_BASE_ENABLE | APIC_BASE_BSP,
             apic_id: 0,
             switch_fp: false,
+            pending_exception: None,
         };
         use vmcb::*;
-        // INTR, NMI, CPUID, HLT, IOIO, MSR, SHUTDOWN; VMRUN (required), VMMCALL.
-        v.write32(INTERCEPT_MISC1, 1 << 0 | 1 << 1 | 1 << 18 | 1 << 24 | 1 << 27 | 1 << 28 | 1 << 31);
-        v.write32(INTERCEPT_MISC2, 1 << 0 | 1 << 1);
+        // INTR, NMI, CPUID, INVD, HLT, INVLPGA, IOIO, MSR, SHUTDOWN; and every
+        // SVM instruction: VMRUN (required), VMMCALL, VMLOAD, VMSAVE, STGI,
+        // CLGI, SKINIT. Unintercepted, VMLOAD/VMSAVE would reach host
+        // memory, CLGI would take the host CPU, and INVD would discard the
+        // host's dirty cache lines.
+        let misc1 = 1 << 0 | 1 << 1 | 1 << 18 | 1 << 22 | 1 << 24 | 1 << 26 | 1 << 27 | 1 << 28 | 1 << 31;
+        v.write32(INTERCEPT_MISC1, misc1);
+        v.write32(INTERCEPT_MISC2, 0x7f);
+        // #DB and #AC: a guest whose delivery of these faults loops would
+        // otherwise hold the host CPU forever; they are reflected back.
+        v.write32(INTERCEPT_EXCEPTIONS, 1 << 1 | 1 << 17);
         v.write64(IOPM_BASE_PA, pages.iopm.1);
         v.write64(MSRPM_BASE_PA, pages.msrpm.1);
         v.write32(GUEST_ASID, 1);
@@ -512,7 +539,9 @@ impl SvmVcpu {
             return Some((buf, n.min(15)));
         }
         let mem = self.mem.as_ref()?;
-        let linear = (self.read64(vmcb::CS + 8)).wrapping_add(self.rip());
+        // In 64-bit mode CS has no base.
+        let base = if self.code_bits() == 64 { 0 } else { self.read64(vmcb::CS + 8) };
+        let linear = base.wrapping_add(self.rip());
         // Byte by byte through the guest's tables (the instruction may cross
         // a page); stop at the first byte that cannot be read.
         let mut n = 0;
@@ -573,8 +602,14 @@ impl SvmVcpu {
         self.write64(vmcb::EVENTINJ, 0);
         let pending = self.read64(vmcb::EXITINTINFO);
         self.write64(vmcb::EXITINTINFO, 0);
-        if pending & EVENT_VALID != 0 {
+        // A software interrupt (type 4) is not re-injected: RIP still points
+        // at its INTn, which runs again.
+        if pending & EVENT_VALID != 0 && (pending >> 8) & 7 != 4 {
             self.write64(vmcb::EVENTINJ, pending);
+            return;
+        }
+        if let Some(e) = self.pending_exception.take() {
+            self.write64(vmcb::EVENTINJ, e);
             return;
         }
         let mut window = false;
@@ -594,9 +629,6 @@ impl SvmVcpu {
         self.write32(vmcb::INTERCEPT_MISC1, if window { i | INTERCEPT_VINTR } else { i });
     }
 
-    /// Moves the guest past an instruction the hypervisor completed for it.
-    /// Like the CPU retiring it, this ends an STI or MOV SS interrupt shadow
-    /// (`sti; hlt` would otherwise never let an interrupt in).
     /// Marks this vCPU as an application processor: `IA32_APIC_BASE.BSP`
     /// reads as 0.
     pub fn set_application_processor(&mut self) {
@@ -630,7 +662,7 @@ impl SvmVcpu {
         self.regs.rcx = c as u64;
         self.regs.rdx = d as u64;
         let rip = self.rip();
-        self.skip_to(rip + 2); // 0F A2
+        self.skip_to(rip.wrapping_add(2)); // 0F A2
     }
 
     /// Emulates the RDMSR or WRMSR that caused an `MSR` exit and steps
@@ -677,9 +709,12 @@ impl SvmVcpu {
             self.regs.rdx = v >> 32;
         }
         let rip = self.rip();
-        self.skip_to(rip + 2); // RDMSR and WRMSR are 0F 32 and 0F 30
+        self.skip_to(rip.wrapping_add(2)); // RDMSR and WRMSR are 0F 32 and 0F 30
     }
 
+    /// Moves the guest past an instruction the hypervisor completed for it.
+    /// Like the CPU retiring it, this ends an STI or MOV SS interrupt shadow
+    /// (`sti; hlt` would otherwise never let an interrupt in).
     fn skip_to(&mut self, rip: u64) {
         self.write64(vmcb::RIP, rip);
         self.write64(vmcb::INT_STATE, 0);
@@ -711,6 +746,32 @@ impl SvmVcpu {
         self.write64(vmcb::V_INTR, v);
     }
 
+    /// Handles the exits the guest must never see the host for: SVM
+    /// instructions (and VMMCALL outside ring 0) raise #UD in the guest,
+    /// INVD retires as a no-op, and intercepted #DB/#AC are reflected
+    /// back. Returns whether it did.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    fn reflect(&mut self, code: u64) -> bool {
+        const UD: u64 = 6 | 3 << 8 | EVENT_VALID; // #UD, type 3 (exception)
+        let cpl = self.read64(vmcb::CPL & !7) >> (8 * (vmcb::CPL & 7)) & 3;
+        match code {
+            exit::VMRUN | exit::INVLPGA | exit::VMLOAD..=exit::SKINIT => self.pending_exception = Some(UD),
+            exit::VMMCALL if cpl != 0 => self.pending_exception = Some(UD),
+            exit::INVD => {
+                let rip = self.rip();
+                self.skip_to(rip.wrapping_add(2)); // 0F 08
+            }
+            c if c == exit::EXCEPTION + 1 => self.pending_exception = Some(1 | 3 << 8 | EVENT_VALID),
+            c if c == exit::EXCEPTION + 17 => {
+                // #AC has an error code (always 0).
+                let e = self.read64(vmcb::EXITINFO1) & 0xffff_ffff;
+                self.pending_exception = Some(17 | 3 << 8 | 1 << 11 | EVENT_VALID | e << 32);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// Turns the `#VMEXIT` recorded in the VMCB into an exit.
     pub fn classify(&mut self) -> VmExit {
         let code = self.read64(vmcb::EXITCODE);
@@ -732,11 +793,11 @@ impl SvmVcpu {
                 }
             }
             exit::HLT => {
-                self.skip_to(rip + 1);
+                self.skip_to(rip.wrapping_add(1));
                 VmExit::Halt
             }
             exit::VMMCALL => {
-                self.skip_to(rip + 3);
+                self.skip_to(rip.wrapping_add(3));
                 let r = &self.regs;
                 VmExit::Hypercall { nr: self.rax(), args: [r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.r8] }
             }
@@ -748,14 +809,14 @@ impl SvmVcpu {
                 };
                 if a.store {
                     let data = self.operand_value(&a) & (u64::MAX >> (64 - 8 * a.size as u32));
-                    self.skip_to(rip + a.len as u64);
+                    self.skip_to(rip.wrapping_add(a.len as u64));
                     VmExit::MmioWrite { addr, size: a.size, data }
                 } else {
                     self.pending_mmio = Some(a);
                     VmExit::MmioRead { addr, size: a.size }
                 }
             }
-            exit::INTR => VmExit::ExternalInterrupt,
+            exit::INTR | exit::NMI => VmExit::ExternalInterrupt,
             exit::SHUTDOWN => VmExit::Shutdown,
             _ => VmExit::Unhandled { reason: code },
         }
@@ -779,7 +840,10 @@ impl Vcpu for SvmVcpu {
                 exit::VINTR => {}
                 exit::MSR => self.emulate_msr(),
                 exit::CPUID => self.emulate_cpuid(),
-                _ => break self.classify(),
+                code => match self.reflect(code) {
+                    true => {}
+                    false => break self.classify(),
+                },
             }
         };
         if let Some(r) = &self.running {
@@ -813,7 +877,7 @@ impl Vcpu for SvmVcpu {
                 }
                 self.write64(vmcb::RFLAGS, f);
                 let rip = self.rip();
-                self.skip_to(rip + a.len as u64);
+                self.skip_to(rip.wrapping_add(a.len as u64));
                 return;
             }
             let Operand::Reg(r) = a.operand else { return };
@@ -829,7 +893,7 @@ impl Vcpu for SvmVcpu {
                 self.set_reg(r, (old & !mask) | value);
             }
             let rip = self.rip();
-            self.skip_to(rip + a.len as u64);
+            self.skip_to(rip.wrapping_add(a.len as u64));
             return;
         }
         if let Some(size) = self.pending_in.take() {
@@ -865,6 +929,34 @@ mod tests {
         unsafe {
             SvmVcpu::new(SvmPages { vmcb: p(1), iopm: p(3), msrpm: p(2), host: p(1) }, 0x1000, 0x10_0000, 0x20_0000)
         }
+    }
+
+    #[test]
+    fn svm_instructions_and_exceptions_are_reflected() {
+        let mut v = vcpu();
+        let set_cpl = |v: &mut SvmVcpu, cpl: u64| {
+            let w = v.read64(vmcb::CPL & !7) & !(0xff << 24);
+            v.write64(vmcb::CPL & !7, w | cpl << 24);
+        };
+        for code in [exit::VMRUN, exit::VMLOAD, exit::VMLOAD + 1, exit::VMLOAD + 3, exit::SKINIT, exit::INVLPGA] {
+            assert!(v.reflect(code));
+            assert_eq!(v.pending_exception.take(), Some(6 | 3 << 8 | EVENT_VALID), "#UD for {code:#x}");
+        }
+        set_cpl(&mut v, 0);
+        assert!(!v.reflect(exit::VMMCALL), "a hypercall from ring 0");
+        set_cpl(&mut v, 3);
+        assert!(v.reflect(exit::VMMCALL));
+        assert_eq!(v.pending_exception.take(), Some(6 | 3 << 8 | EVENT_VALID), "#UD from user mode");
+        let rip = v.rip();
+        assert!(v.reflect(exit::INVD));
+        assert_eq!(v.rip(), rip + 2, "INVD retires as a no-op");
+        assert!(v.reflect(exit::EXCEPTION + 17));
+        assert_eq!(v.pending_exception.take(), Some(17 | 3 << 8 | 1 << 11 | EVENT_VALID), "#AC with its error code");
+        assert!(!v.reflect(exit::HLT));
+        // A reflected exception is injected at the next entry.
+        v.pending_exception = Some(6 | 3 << 8 | EVENT_VALID);
+        v.prepare_interrupts();
+        assert_eq!(v.read64(vmcb::EVENTINJ), 6 | 3 << 8 | EVENT_VALID);
     }
 
     #[test]

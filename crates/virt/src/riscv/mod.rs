@@ -174,7 +174,17 @@ impl RiscvVcpu {
             htinst: 0,
             host: [0; 17],
         };
-        Self { state, csrs: VsCsrs::default(), fp: FpState::default(), hgatp, pending: None, external: Arc::new(AtomicBool::new(false)), ipi: None, running: None, fence: None }
+        Self {
+            state,
+            csrs: VsCsrs::default(),
+            fp: FpState::default(),
+            hgatp,
+            pending: None,
+            external: Arc::new(AtomicBool::new(false)),
+            ipi: None,
+            running: None,
+            fence: None,
+        }
     }
 
     /// The vCPU's supervisor external-interrupt line, for an interrupt
@@ -246,7 +256,7 @@ impl RiscvVcpu {
         match cause {
             // Environment call from VS-mode.
             10 => {
-                s.pc += 4;
+                s.pc = s.pc.wrapping_add(4);
                 VmExit::Hypercall {
                     nr: (s.x[17] & 0xffff_ffff) | s.x[16] << 32,
                     args: [s.x[10], s.x[11], s.x[12], s.x[13], s.x[14], s.x[15]],
@@ -260,7 +270,7 @@ impl RiscvVcpu {
                     Some(op) if op.store && cause == 23 => {
                         let data = if op.reg == 0 { 0 } else { s.x[op.reg as usize] };
                         let data = if op.size == 8 { data } else { data & ((1 << (8 * op.size)) - 1) };
-                        s.pc += op.len as u64;
+                        s.pc = s.pc.wrapping_add(op.len as u64);
                         VmExit::MmioWrite { addr, size: op.size, data }
                     }
                     Some(op) if !op.store && cause == 21 => {
@@ -274,7 +284,7 @@ impl RiscvVcpu {
             22 => {
                 let insn = if s.stval != 0 { Some(s.stval as u32) } else { fetch(s.pc) };
                 if insn == Some(WFI as u32) {
-                    s.pc += 4;
+                    s.pc = s.pc.wrapping_add(4);
                     VmExit::Halt
                 } else {
                     VmExit::Unhandled { reason: cause }
@@ -312,7 +322,7 @@ impl Vcpu for RiscvVcpu {
             if op.reg != 0 {
                 self.state.x[op.reg as usize] = op.extend(value);
             }
-            self.state.pc += op.len as u64;
+            self.state.pc = self.state.pc.wrapping_add(op.len as u64);
         }
     }
 

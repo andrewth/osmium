@@ -60,7 +60,12 @@ pub enum Outcome {
 /// Answers the SBI call in `exit` (a [`VmExit::Hypercall`] from `vcpu`).
 /// Console output goes to `console`. Unknown calls return
 /// `SBI_ERR_NOT_SUPPORTED` to the guest. Returns `None` for other exits.
-pub fn handle(vcpu: &mut RiscvVcpu, mem: &GuestMemory, exit: VmExit, console: &mut dyn FnMut(&[u8])) -> Option<Outcome> {
+pub fn handle(
+    vcpu: &mut RiscvVcpu,
+    mem: &GuestMemory,
+    exit: VmExit,
+    console: &mut dyn FnMut(&[u8]),
+) -> Option<Outcome> {
     handle_smp(vcpu, mem, exit, console, None)
 }
 
@@ -112,7 +117,8 @@ pub fn handle_smp(
         (eid::BASE, 4..=6) => (0, 0), // mvendorid, marchid, mimpid
         (eid::DBCN, 0) => {
             // write(num_bytes, base_lo, base_hi): a guest-physical buffer.
-            let gpa = GuestPhysAddr(args[1] | args[2] << 32);
+            // base_addr_hi is only meaningful on RV32; RV64 guests pass 0.
+            let gpa = GuestPhysAddr(args[1]);
             let mut buf = vec![0u8; args[0].min(4096) as usize];
             match mem.read(gpa, &mut buf) {
                 Ok(()) => {
@@ -160,7 +166,14 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
 
-    fn call(v: &mut RiscvVcpu, mem: &GuestMemory, eid: u64, fid: u64, args: [u64; 6], out: &mut Vec<u8>) -> Option<Outcome> {
+    fn call(
+        v: &mut RiscvVcpu,
+        mem: &GuestMemory,
+        eid: u64,
+        fid: u64,
+        args: [u64; 6],
+        out: &mut Vec<u8>,
+    ) -> Option<Outcome> {
         handle(v, mem, VmExit::Hypercall { nr: eid | fid << 32, args }, &mut |b| out.extend_from_slice(b))
     }
 

@@ -45,6 +45,13 @@ impl Channel {
         if self.reload == 0 { 0x1_0000 } else { self.reload as u64 }
     }
 
+    /// Ticks between periodic interrupts: the period, but at least 60
+    /// (about 50 µs), so a guest cannot make the host deliver an
+    /// interrupt storm.
+    fn interval(&self) -> u64 {
+        self.period().max(60)
+    }
+
     fn periodic(&self) -> bool {
         matches!(self.mode, 2 | 3)
     }
@@ -61,7 +68,7 @@ impl Channel {
             return 0;
         }
         let t = ticks(now.saturating_sub(start));
-        if self.periodic() { t / self.period() } else { (t >= self.period()) as u64 }
+        if self.periodic() { t / self.interval() } else { (t >= self.period()) as u64 }
     }
 
     /// The counting element at `now`.
@@ -99,7 +106,8 @@ impl Channel {
         if self.gated() || (!self.periodic() && self.fired > 0) {
             return None;
         }
-        Some(start + ns((self.fired + 1) * self.period()))
+        let n = if self.periodic() { self.interval() } else { self.period() };
+        Some(start + ns((self.fired + 1) * n))
     }
 
     fn control(&mut self, v: u8, now: u64) {
@@ -364,6 +372,16 @@ mod tests {
         assert_eq!(r.rising(), 2);
         assert!(!r.pit.poll());
         assert!(r.pit.next_deadline().unwrap() > r.now.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn periodic_floor() {
+        // A rate generator with count 2 interrupts no faster than every 60 ticks.
+        let r = Rig::new();
+        r.out(3, 0x34);
+        r.out(0, 2);
+        r.out(0, 0);
+        assert_eq!(r.pit.next_deadline(), Some(1_000 + ns(60)));
     }
 
     #[test]

@@ -136,6 +136,10 @@ osmium_hs_exit:
     sd t1, {sstatus}(t0)
     csrr t1, 0x600       // hstatus
     sd t1, {hstatus}(t0)
+    // Back in the host: clear SPV, so no later sret from a host path
+    // (returning to a user task, say) can enter V=1 with host registers.
+    li t1, 0x80
+    csrc 0x600, t1
     csrr t1, scause
     sd t1, {scause}(t0)
     csrr t1, stval
@@ -223,11 +227,21 @@ macro_rules! csr_clear {
 pub fn init_cpu() {
     // Misaligned/access/page faults, illegal instruction, breakpoint, and
     // ecall from VU-mode go straight to the guest kernel.
-    let hedeleg: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
-        | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15);
+    let hedeleg: u64 = (1 << 0)
+        | (1 << 1)
+        | (1 << 2)
+        | (1 << 3)
+        | (1 << 4)
+        | (1 << 5)
+        | (1 << 6)
+        | (1 << 7)
+        | (1 << 8)
+        | (1 << 12)
+        | (1 << 13)
+        | (1 << 15);
     csr_write!("0x602", hedeleg);
     csr_write!("0x603", HIDELEG);
-    csr_write!("0x606", 0xffff_ffffu64); // hcounteren
+    csr_write!("0x606", 0x7u64); // hcounteren: cycle, time, instret; no host HPM counters
     csr_write!("0x60a", 1u64 << 63); // henvcfg.STCE
     csr_write!("0x605", 0u64); // htimedelta
     csr_write!("0x645", 0u64); // hvip
@@ -344,9 +358,7 @@ pub(super) fn run(v: &mut RiscvVcpu) {
         csr_write!("0x680", v.hgatp);
         // SAFETY: hfence.gvma and hfence.vvma (all addresses, all VMIDs)
         // only invalidate TLB entries.
-        unsafe {
-            asm!(".insn r 0x73, 0, 0x31, x0, x0, x0", ".insn r 0x73, 0, 0x11, x0, x0, x0", options(nostack))
-        };
+        unsafe { asm!(".insn r 0x73, 0, 0x31, x0, x0, x0", ".insn r 0x73, 0, 0x11, x0, x0, x0", options(nostack)) };
     }
     load_vs(&v.csrs);
     // SAFETY: `state` stays valid and exclusively borrowed for the guest run;
@@ -373,5 +385,5 @@ pub(super) fn fetch(pc: u64) -> Option<u32> {
     if lo & 3 != 3 {
         return Some(lo as u32);
     }
-    Some((lo | hlvx(pc + 2) << 16) as u32)
+    Some((lo | hlvx(pc.wrapping_add(2)) << 16) as u32)
 }

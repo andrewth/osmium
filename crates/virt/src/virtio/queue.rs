@@ -198,6 +198,9 @@ impl SplitQueue {
     /// Returns chain `head` to the driver, recording that the device wrote
     /// `len` bytes into it. Returns true if the driver wants an interrupt.
     pub fn add_used(&mut self, mem: &GuestMemory, head: u16, len: u32) -> Result<bool, QueueError> {
+        if self.size == 0 {
+            return Err(QueueError::BadIndex(head));
+        }
         let slot = self.next_used % self.size;
         let elem = (head as u64) | (len as u64) << 32;
         mem.write_obj(GuestPhysAddr(self.used.0.wrapping_add(used_entry(slot) as u64)), elem.to_le())?;

@@ -179,7 +179,16 @@ impl Aarch64Vcpu {
         x[0] = arg;
         let state =
             GuestState { x, pc: entry.0, pstate: PSTATE_EL1H, esr: 0, far: 0, hpfar: 0, vector: 0, host: [0; 13] };
-        Self { state, el1: El1Regs::default(), fp: FpState::default(), vttbr, irq: Arc::new(AtomicBool::new(false)), timer: None, pending: None, running: None }
+        Self {
+            state,
+            el1: El1Regs::default(),
+            fp: FpState::default(),
+            vttbr,
+            irq: Arc::new(AtomicBool::new(false)),
+            timer: None,
+            pending: None,
+            running: None,
+        }
     }
 
     /// The vCPU's IRQ line, for an interrupt controller (a
@@ -240,13 +249,13 @@ impl Aarch64Vcpu {
         let insn_len = if esr & (1 << 25) != 0 { 4 } else { 2 };
         match esr >> 26 {
             ec::WFX if esr & 1 == 0 => {
-                s.pc += insn_len;
+                s.pc = s.pc.wrapping_add(insn_len);
                 VmExit::Halt
             }
             // HVC returns to the next instruction; a trapped SMC to itself.
             ec::HVC64 | ec::SMC64 => {
                 if esr >> 26 == ec::SMC64 {
-                    s.pc += 4;
+                    s.pc = s.pc.wrapping_add(4);
                 }
                 VmExit::Hypercall { nr: s.x[0], args: [s.x[1], s.x[2], s.x[3], s.x[4], s.x[5], s.x[6]] }
             }
@@ -258,7 +267,7 @@ impl Aarch64Vcpu {
                 if esr & (1 << 6) != 0 {
                     let data = if reg == 31 { 0 } else { s.x[reg as usize] };
                     let data = if size == 8 { data } else { data & ((1 << (8 * size)) - 1) };
-                    s.pc += insn_len;
+                    s.pc = s.pc.wrapping_add(insn_len);
                     VmExit::MmioWrite { addr, size, data }
                 } else {
                     self.pending = Some(Load { reg, size, sign: esr & (1 << 21) != 0, wide: esr & (1 << 15) != 0 });
@@ -302,7 +311,7 @@ impl Vcpu for Aarch64Vcpu {
         if l.reg != 31 {
             self.state.x[l.reg as usize] = v;
         }
-        self.state.pc += 4;
+        self.state.pc = self.state.pc.wrapping_add(4);
     }
 
     fn complete_hypercall(&mut self, ret: u64) {

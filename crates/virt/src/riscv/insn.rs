@@ -123,7 +123,10 @@ mod tests {
         // htinst for c.lw a0, 0(a1): lw a0, 0(x0) with bit 1 clear.
         assert_eq!(decode_transformed(0x2501), Some(MemOp { store: false, size: 4, reg: 10, signed: true, len: 2 }));
         // htinst for sw a5, 4(a0): rs1 and the offset cleared.
-        assert_eq!(decode_transformed(0x00f0_2023), Some(MemOp { store: true, size: 4, reg: 15, signed: false, len: 4 }));
+        assert_eq!(
+            decode_transformed(0x00f0_2023),
+            Some(MemOp { store: true, size: 4, reg: 15, signed: false, len: 4 })
+        );
         assert_eq!(decode_transformed(0), None);
         assert_eq!(decode_transformed(0x3000), None, "pseudo-instruction");
     }

@@ -160,7 +160,8 @@ pub fn decode(code: &[u8], bits: u8) -> Option<Access> {
         size,
         operand,
         dest_size: if movzx { full } else { size },
-        high_byte: size == 1 && rex == 0 && imm == 0,
+        // ah..bh only name the byte operand itself, never MOVZX's destination.
+        high_byte: size == 1 && rex == 0 && imm == 0 && !movzx,
         len: i as u8,
         test,
     })
@@ -182,6 +183,8 @@ mod tests {
         // movzx eax, byte [ebx + 5]
         let a = d(&[0x0f, 0xb6, 0x43, 0x05], 32);
         assert_eq!((a.store, a.size, a.dest_size, a.operand, a.len), (false, 1, 4, Operand::Reg(0), 4));
+        // movzx esi, byte [ebx]: esi, not dh
+        assert!(!d(&[0x0f, 0xb6, 0x33], 32).high_byte);
         // mov ecx, [eax + esi*4 + 0x1000]
         let a = d(&[0x8b, 0x8c, 0xb0, 0x00, 0x10, 0x00, 0x00], 32);
         assert_eq!((a.size, a.operand, a.len), (4, Operand::Reg(1), 7));

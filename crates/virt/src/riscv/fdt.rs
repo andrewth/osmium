@@ -93,8 +93,9 @@ impl GuestMachine<'_> {
             let size = crate::devices::VirtualPlic::mmio_size(2 * self.harts as usize);
             w.property_cells("reg", &reg(base, size));
             // Per hart: the M context (unconnected: cause -1), then the S context.
-            let ext: Vec<u32> =
-                (0..self.harts).flat_map(|h| [CPU_INTC_PHANDLE + h, u32::MAX, CPU_INTC_PHANDLE + h, IRQ_S_EXT]).collect();
+            let ext: Vec<u32> = (0..self.harts)
+                .flat_map(|h| [CPU_INTC_PHANDLE + h, u32::MAX, CPU_INTC_PHANDLE + h, IRQ_S_EXT])
+                .collect();
             w.property_cells("interrupts-extended", &ext);
             w.property_u32("riscv,ndev", sources - 1);
             w.property_u32("#interrupt-cells", 1);
