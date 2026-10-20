@@ -59,16 +59,19 @@ boot() {
 # background as $screen_pid (0 when QEMU is missing); `screen_wait NAME`
 # collects its verdict.
 screen() {
-    qmp=$(mktemp -u)
+    # A socket in a fresh private directory, not a guessable /tmp name.
+    qmp_dir=$(mktemp -d)
+    qmp=$qmp_dir/qmp.sock
     screen_pid=0
     command -v "$1" >/dev/null || return 0
     python3 -I scripts/screen.py "$qmp" "$2" "$3" 600 ${4:-} &
     screen_pid=$!
 }
 screen_wait() {
-    [ "$screen_pid" = 0 ] && return
-    wait "$screen_pid" || { echo "$1: screen check failed"; exit 1; }
-    rm -f "$qmp"
+    if [ "$screen_pid" != 0 ]; then
+        wait "$screen_pid" || { echo "$1: screen check failed"; exit 1; }
+    fi
+    rm -rf "$qmp_dir"
 }
 
 # Multi-threaded TCG runs the four CPUs in parallel on host threads.
