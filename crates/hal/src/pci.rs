@@ -10,8 +10,14 @@
 //! On machines whose firmware leaves BARs unassigned (QEMU `virt` booted
 //! with OpenSBI, for one), [`BarAllocator`] hands out addresses from the host
 //! bridge's memory window.
+//!
+//! [`Function::msi`] and [`Function::msix`] program message-signalled
+//! interrupts ([`MsiMessage`]).
 
 use crate::mmio::IoMem;
+
+mod msi;
+pub use msi::{Msi, MsiError, MsiMessage, Msix, MsixPba, MsixTable};
 
 /// Bus, device and function numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -496,14 +502,14 @@ mod tests {
     /// only the address bits above the BAR's size, and bits in `hardwired`
     /// read back as zero.
     #[derive(Default)]
-    struct FakeConfig {
+    pub(super) struct FakeConfig {
         space: RefCell<BTreeMap<(Address, u16), u32>>,
         bar_sizes: BTreeMap<(Address, u16), u64>,
         hardwired: BTreeMap<(Address, u16), u32>,
     }
 
     impl FakeConfig {
-        fn set(&self, a: Address, off: u16, v: u32) {
+        pub(super) fn set(&self, a: Address, off: u16, v: u32) {
             self.space.borrow_mut().insert((a, off), v);
         }
     }

@@ -1,6 +1,7 @@
 //! x86 local APIC in xAPIC (MMIO) mode.
 
 use osmium_hal::mmio::IoMem;
+use osmium_hal::pci::MsiMessage;
 
 const ID: usize = 0x020;
 const EOI: usize = 0x0b0;
@@ -126,6 +127,12 @@ impl LocalApic {
     }
 }
 
+/// The MSI or MSI-X message that raises fixed, edge-triggered interrupt
+/// `vector` on the CPU with xAPIC id `apic_id` (physical destination mode).
+pub const fn msi_message(apic_id: u8, vector: u8) -> MsiMessage {
+    MsiMessage { address: DEFAULT_BASE | (apic_id as u64) << 12, data: vector as u32 }
+}
+
 #[cfg(test)]
 // Tests drop drivers explicitly to end their use of the fake register memory
 // before inspecting it.
@@ -162,6 +169,11 @@ mod tests {
         apic.send_startup(3, 0x08);
         drop(apic);
         assert_eq!((regs[ICR_HIGH / 4], regs[ICR_LOW / 4]), (3 << 24, 0x0608));
+    }
+
+    #[test]
+    fn msi() {
+        assert_eq!(msi_message(3, 0x50), MsiMessage { address: 0xfee0_3000, data: 0x50 });
     }
 
     fn read_icr(apic: &LocalApic) -> (u32, u32) {

@@ -138,10 +138,11 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ DMA buffer descriptor (`DmaBuffer` with CPU and device addresses), self-freeing `OwnedDma`, and a `DmaAllocator` over any `LockedFrames`
 - ✅ `NetDevice` trait and `MacAddress`
 - ✅ PCI: `ConfigAccess` over ECAM or x86 port I/O, brute-force enumeration, BAR probing and assignment (`BarAllocator`), capability lists
+- ✅ PCI MSI and MSI-X: an architecture-neutral `MsiMessage`, MSI programming (32/64-bit, multiple vectors, per-vector masks), MSI-X tables and pending bits in a BAR window, entry and function masks, all bounds-checked against the device; x86 messages from `lapic::msi_message`
 - ✅ USB: setup packets, standard descriptor parsing, the `UsbHost` host-controller trait, and generic device enumeration
 - ✅ virtio constants and split-ring layout shared by drivers and device models (including virtio-pci capabilities and virtio-gpu commands)
 - ✅ Displays: `Framebuffer` over any `IoMem` (16/24/32 bpp, any channel layout from VBE, GOP or virtio-gpu; fill, per-pixel drawing, 1-bpp bitmaps for fonts, scrolling) and the `Display` trait, whose `flush` serves devices that copy from guest memory
-- 🗺 Async variants of device traits, PCI bridge walking, MSI/MSI-X
+- 🗺 Async variants of device traits, PCI bridge walking
 
 ### `osmium-drivers`: reference drivers
 - ✅ NS16550A UART (port I/O and MMIO backends)

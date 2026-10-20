@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+mod msi;
+
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -481,6 +483,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     demos::user::boot_vfs();
     user_demo();
     serial_demo();
+    msi::demo(ecam);
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     shutdown()
@@ -865,6 +868,7 @@ fn on_trap(frame: &mut TrapFrame) {
             RX_READY.wake_all();
             osmium::sched::preempt_if_needed();
         }
+        (msi::VECTOR, _) => msi::on_interrupt(),
         (SPURIOUS_VECTOR, _) => {}
         // A spurious IRQ from a masked PIC: no EOI (none was latched).
         (v, _) if PIC_VECTORS.contains(&v) => {}

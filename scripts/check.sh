@@ -129,12 +129,14 @@ EXPECT='\[guard\] task "deep" overflowed;nested Breakpoint on the exception stac
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
 # The VESA BIOS sets the mode through a real-mode thunk, then virtio-vga's
-# virtio-gpu side takes over the screen, which is checked.
+# virtio-gpu side takes over the screen, which is checked. An NVMe controller
+# (on a null block device) raises its admin completions as MSI-X interrupts.
 screen qemu-system-x86_64 640 400
-EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);user-2 exited with status 0;\[uart\]  COM1 IRQ 4;hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/x86_64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111;\[vesa\]  VBE 3.0, .* set mode 0x[0-9a-f]*: 800x600 32bpp at;\[vesa\]  DISPI 0xb0c5 reads back the BIOS.s mode;\[vesa\] 800x600 32bpp, stride 3200: colour bars drawn;\[virtio-vga\] DISPI 0xb0c5: firmware left 800x600 32bpp;\[virtio-vga\] 640x400 32bpp, stride 2560: colour bars drawn' \
+EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);user-2 exited with status 0;\[uart\]  COM1 IRQ 4;hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/x86_64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111;\[vesa\]  VBE 3.0, .* set mode 0x[0-9a-f]*: 800x600 32bpp at;\[vesa\]  DISPI 0xb0c5 reads back the BIOS.s mode;\[vesa\] 800x600 32bpp, stride 3200: colour bars drawn;\[virtio-vga\] DISPI 0xb0c5: firmware left 800x600 32bpp;\[virtio-vga\] 640x400 32bpp, stride 2560: colour bars drawn;\[msi\]   nvme MSI-X vector 0x50 delivered to APIC;\[msi\]   masked entry 0 held an IDENTIFY completion pending in the PBA; unmasking delivered it' \
 boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
     -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
-    -vga none -device virtio-vga -qmp "unix:$qmp,server=on,wait=off"
+    -vga none -device virtio-vga -qmp "unix:$qmp,server=on,wait=off" \
+    -blockdev driver=null-co,node-name=nv0,read-zeroes=on -device nvme,serial=osmium1,drive=nv0
 screen_wait x86_64-pc
 
 # Heap-free M-mode firmware (no OpenSBI): checked for its own lines, since it
