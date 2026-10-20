@@ -22,6 +22,10 @@ unsafe impl<T: Send, const N: usize> Sync for SpscRing<T, N> {}
 
 impl<T, const N: usize> SpscRing<T, N> {
     /// Creates an empty ring holding up to `N` items.
+    ///
+    /// # Panics
+    ///
+    /// If `N` is zero (at compile time in a `const` context).
     pub const fn new() -> Self {
         assert!(N > 0);
         Self {
@@ -69,13 +73,13 @@ impl<T, const N: usize> Drop for SpscRing<T, N> {
 }
 
 /// The sending half of an [`SpscRing`].
-pub struct Producer<'a, T, const N: usize> {
-    ring: &'a SpscRing<T, N>,
+pub struct Producer<'ring, T, const N: usize> {
+    ring: &'ring SpscRing<T, N>,
 }
 
 /// The receiving half of an [`SpscRing`].
-pub struct Consumer<'a, T, const N: usize> {
-    ring: &'a SpscRing<T, N>,
+pub struct Consumer<'ring, T, const N: usize> {
+    ring: &'ring SpscRing<T, N>,
 }
 
 impl<T, const N: usize> Producer<'_, T, N> {

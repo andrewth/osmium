@@ -216,8 +216,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     fn ext_path(&mut self, seed: u32, inode: &Inode, lblk: u32) -> Result<Path, Errno> {
         let data = inode.raw[ino::BLOCK..ino::BLOCK + 60].to_vec();
         check_root(&data)?;
+        let mut path = Vec::with_capacity(usize::from(depth(&data)) + 1);
         let mut node = Node { block: 0, data };
-        let mut path = Vec::new();
         loop {
             let n = entries(&node.data);
             let mut i = 0;
@@ -247,7 +247,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let lblk = lblk as u32;
         let seed = self.ext_seed(ino, inode);
         let path = self.ext_path(seed, inode, lblk)?;
-        let (leaf, i) = path.last().unwrap();
+        let (leaf, i) = path.last().expect("a path always has a leaf");
         let near = (entries(&leaf.data) > 0).then(|| Extent::get(&leaf.data, *i));
         let mut goal = self.group_start(self.group_of(ino));
         if let Some(e) = near
@@ -444,8 +444,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     fn ext_convert(&mut self, seed: u32, inode: &mut Inode, path: Path, lblk: u32) -> Result<(), Errno> {
         // Up to two entries go into this leaf. Without room for them, take
         // enough nodes for two splits to the root (and a level more) first.
-        let leaf = &path.last().unwrap().0;
-        let mut spare = Vec::new();
+        let leaf = &path.last().expect("a path always has a leaf").0;
+        let mut spare = Vec::with_capacity(2 * (path.len() + 1));
         if max(&leaf.data) - entries(&leaf.data) < 2 {
             for _ in 0..2 * (path.len() + 1) {
                 match self.alloc_block(self.group_start(0)) {
@@ -470,13 +470,14 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         lblk: u32,
         spare: &mut Vec<u64>,
     ) -> Result<(), Errno> {
-        let (leaf, i) = path.last_mut().unwrap();
+        let (leaf, i) = path.last_mut().expect("a path always has a leaf");
         let i = *i;
         let e = Extent::get(&leaf.data, i);
         let off = lblk - e.block;
         let one = Extent { block: lblk, len: 1, start: e.start + off as u64, uninit: false };
         let rest = Extent { block: lblk + 1, len: e.len - off - 1, start: one.start + 1, uninit: true };
-        let mut pending = Vec::new();
+        // `one` and `rest`, at most.
+        let mut pending = Vec::with_capacity(2);
         if off > 0 {
             Extent { len: off, ..e }.put(&mut leaf.data, i);
             pending.push(one);

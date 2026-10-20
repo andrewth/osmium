@@ -663,7 +663,7 @@ mod tests {
 
     /// Runs `body` while a controller thread serves `fake`.
     fn run<R>(fake: &Fake, body: impl FnOnce() -> R) -> R {
-        struct Stop<'a>(&'a Fake);
+        struct Stop<'dev>(&'dev Fake);
         impl Drop for Stop<'_> {
             fn drop(&mut self) {
                 self.0.stop();

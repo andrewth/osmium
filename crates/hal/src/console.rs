@@ -21,7 +21,7 @@ pub trait Console: Sync {
     /// lock for the whole message, so lines from different CPUs do not
     /// interleave.
     fn write_fmt(&self, args: fmt::Arguments<'_>) {
-        struct Adapter<'a, C: Console + ?Sized>(&'a C);
+        struct Adapter<'con, C: Console + ?Sized>(&'con C);
         impl<C: Console + ?Sized> Write for Adapter<'_, C> {
             fn write_str(&mut self, s: &str) -> fmt::Result {
                 self.0.write_str(s);

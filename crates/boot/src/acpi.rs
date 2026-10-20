@@ -26,9 +26,9 @@ pub enum AcpiError {
 
 /// A system description table, header included.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Table<'a> {
+pub struct Table<'src> {
     /// The whole table, `length` bytes.
-    pub data: &'a [u8],
+    pub data: &'src [u8],
 }
 
 const HEADER: usize = 36;
@@ -36,14 +36,14 @@ const HEADER: usize = 36;
 /// KiB (the DSDT is usually the biggest).
 const MAX_TABLE: usize = 1 << 20;
 
-impl<'a> Table<'a> {
+impl<'src> Table<'src> {
     /// The four-byte signature (`b"APIC"`, `b"MCFG"`, ...).
     pub fn signature(&self) -> [u8; 4] {
-        self.data[..4].try_into().unwrap()
+        self.data[..4].try_into().expect("fixed-width slice")
     }
 
     /// Table contents after the standard header.
-    pub fn body(&self) -> &'a [u8] {
+    pub fn body(&self) -> &'src [u8] {
         &self.data[HEADER..]
     }
 }
@@ -53,14 +53,14 @@ fn checksum_ok(bytes: &[u8]) -> bool {
 }
 
 /// The ACPI root: the RSDT or XSDT found through the RSDP.
-pub struct Acpi<'a, F> {
+pub struct Acpi<'src, F> {
     read: F,
-    root: Table<'a>,
+    root: Table<'src>,
     /// True for the XSDT (64-bit entries).
     wide: bool,
 }
 
-impl<'a, F: Fn(u64, usize) -> Option<&'a [u8]>> Acpi<'a, F> {
+impl<'src, F: Fn(u64, usize) -> Option<&'src [u8]>> Acpi<'src, F> {
     /// Validates the RSDP at physical address `rsdp` and its root table.
     ///
     /// `read(pa, len)` should return exactly `len` bytes; a slice of any
@@ -84,11 +84,11 @@ impl<'a, F: Fn(u64, usize) -> Option<&'a [u8]>> Acpi<'a, F> {
     }
 
     /// Calls `read`, rejecting slices of the wrong length.
-    fn read_exact(read: &F, pa: u64, len: usize) -> Option<&'a [u8]> {
+    fn read_exact(read: &F, pa: u64, len: usize) -> Option<&'src [u8]> {
         read(pa, len).filter(|d| d.len() == len)
     }
 
-    fn table_at(read: &F, pa: u64) -> Option<Table<'a>> {
+    fn table_at(read: &F, pa: u64) -> Option<Table<'src>> {
         let len = le32(Self::read_exact(read, pa, HEADER)?, 4)? as usize;
         // A length shorter than the header, or implausibly long (a corrupt
         // header could otherwise ask for gigabytes), is malformed.
@@ -100,7 +100,7 @@ impl<'a, F: Fn(u64, usize) -> Option<&'a [u8]>> Acpi<'a, F> {
     }
 
     /// Every table listed by the root whose checksum is valid.
-    pub fn tables(&self) -> impl Iterator<Item = Table<'a>> + '_ {
+    pub fn tables(&self) -> impl Iterator<Item = Table<'src>> + '_ {
         let step = if self.wide { 8 } else { 4 };
         self.root.body().chunks_exact(step).filter_map(move |e| {
             let pa = if self.wide { le64(e, 0)? } else { le32(e, 0)? as u64 };
@@ -109,7 +109,7 @@ impl<'a, F: Fn(u64, usize) -> Option<&'a [u8]>> Acpi<'a, F> {
     }
 
     /// The first table with signature `sig`.
-    pub fn find(&self, sig: &[u8; 4]) -> Option<Table<'a>> {
+    pub fn find(&self, sig: &[u8; 4]) -> Option<Table<'src>> {
         self.tables().find(|t| &t.signature() == sig)
     }
 }
@@ -152,14 +152,14 @@ pub struct InterruptOverride {
 
 /// The Multiple APIC Description Table (`APIC`).
 #[derive(Clone, Copy, Debug)]
-pub struct Madt<'a> {
+pub struct Madt<'src> {
     local_apic_addr: u64,
-    entries: &'a [u8],
+    entries: &'src [u8],
 }
 
-impl<'a> Madt<'a> {
+impl<'src> Madt<'src> {
     /// Parses an `APIC` table.
-    pub fn parse(t: Table<'a>) -> Option<Self> {
+    pub fn parse(t: Table<'src>) -> Option<Self> {
         if &t.signature() != b"APIC" {
             return None;
         }
@@ -180,7 +180,7 @@ impl<'a> Madt<'a> {
         self.local_apic_addr
     }
 
-    fn walk(entries: &'a [u8]) -> impl Iterator<Item = (u8, &'a [u8])> + 'a {
+    fn walk(entries: &'src [u8]) -> impl Iterator<Item = (u8, &'src [u8])> + 'src {
         let mut rest = entries;
         core::iter::from_fn(move || {
             let (&typ, &len) = (rest.first()?, rest.get(1)?);
@@ -194,16 +194,20 @@ impl<'a> Madt<'a> {
     }
 
     /// Local APICs and x2APICs.
-    pub fn local_apics(&self) -> impl Iterator<Item = LocalApic> + 'a {
+    pub fn local_apics(&self) -> impl Iterator<Item = LocalApic> + 'src {
         Self::walk(self.entries).filter_map(|(typ, e)| match typ {
-            0 => Some(LocalApic { processor_uid: *e.get(2)? as u32, apic_id: *e.get(3)? as u32, enabled: le32(e, 4)? & 1 != 0 }),
+            0 => Some(LocalApic {
+                processor_uid: *e.get(2)? as u32,
+                apic_id: *e.get(3)? as u32,
+                enabled: le32(e, 4)? & 1 != 0,
+            }),
             9 => Some(LocalApic { processor_uid: le32(e, 12)?, apic_id: le32(e, 4)?, enabled: le32(e, 8)? & 1 != 0 }),
             _ => None,
         })
     }
 
     /// Interrupt source overrides.
-    pub fn overrides(&self) -> impl Iterator<Item = InterruptOverride> + 'a {
+    pub fn overrides(&self) -> impl Iterator<Item = InterruptOverride> + 'src {
         Self::walk(self.entries).filter_map(|(typ, e)| {
             let flags = u16::from_le_bytes([*e.get(8)?, *e.get(9)?]);
             (typ == 2).then_some(InterruptOverride {
@@ -224,9 +228,11 @@ impl<'a> Madt<'a> {
     }
 
     /// I/O APICs.
-    pub fn io_apics(&self) -> impl Iterator<Item = IoApic> + 'a {
+    pub fn io_apics(&self) -> impl Iterator<Item = IoApic> + 'src {
         Self::walk(self.entries).filter_map(|(typ, e)| {
-            (typ == 1).then(|| Some(IoApic { id: *e.get(2)?, addr: le32(e, 4)? as u64, gsi_base: le32(e, 8)? })).flatten()
+            (typ == 1)
+                .then(|| Some(IoApic { id: *e.get(2)?, addr: le32(e, 4)? as u64, gsi_base: le32(e, 8)? }))
+                .flatten()
         })
     }
 }
@@ -246,20 +252,25 @@ pub struct EcamWindow {
 
 /// The PCI Express memory-mapped configuration table (`MCFG`).
 #[derive(Clone, Copy, Debug)]
-pub struct Mcfg<'a> {
-    entries: &'a [u8],
+pub struct Mcfg<'src> {
+    entries: &'src [u8],
 }
 
-impl<'a> Mcfg<'a> {
+impl<'src> Mcfg<'src> {
     /// Parses an `MCFG` table.
-    pub fn parse(t: Table<'a>) -> Option<Self> {
+    pub fn parse(t: Table<'src>) -> Option<Self> {
         (&t.signature() == b"MCFG").then(|| Some(Self { entries: t.body().get(8..)? })).flatten()
     }
 
     /// The ECAM windows.
-    pub fn entries(&self) -> impl Iterator<Item = EcamWindow> + 'a {
+    pub fn entries(&self) -> impl Iterator<Item = EcamWindow> + 'src {
         self.entries.as_chunks::<16>().0.iter().filter_map(|e| {
-            Some(EcamWindow { base: le64(e, 0)?, segment: u16::from_le_bytes([e[8], e[9]]), start_bus: e[10], end_bus: e[11] })
+            Some(EcamWindow {
+                base: le64(e, 0)?,
+                segment: u16::from_le_bytes([e[8], e[9]]),
+                start_bus: e[10],
+                end_bus: e[11],
+            })
         })
     }
 }

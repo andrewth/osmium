@@ -168,7 +168,7 @@ impl<H: UsbHost> BootKeyboard<H> {
         if got? < 8 {
             return Ok(None);
         }
-        Ok(Some(buf[..8].try_into().unwrap()))
+        Ok(Some(buf[..8].try_into().expect("fixed-width slice")))
     }
 
     /// The next key event, if any, without waiting.

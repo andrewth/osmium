@@ -129,6 +129,10 @@ impl TrapFrame {
 /// [`install`] must have run, and every CPU that can take `vector` must
 /// have loaded a TSS whose `ist[ist - 1]` points at a valid stack, for
 /// example with `osmium_arch::x86_64::CpuTables`.
+///
+/// # Panics
+///
+/// If `ist` is not in `1..=7`.
 pub unsafe fn set_ist(vector: u8, ist: u8) {
     assert!((1..=7).contains(&ist), "IST indices are 1-7");
     let gate = IDT.0.get().cast::<u64>().wrapping_add(2 * vector as usize);

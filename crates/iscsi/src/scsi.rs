@@ -133,12 +133,12 @@ pub fn write(lba: u64, blocks: u32) -> Cdb {
 pub fn rw_range(cdb: &[u8]) -> Option<(u64, u32)> {
     match cdb.first()? {
         0x28 | 0x2a if cdb.len() >= 10 => Some((
-            u32::from_be_bytes(cdb[2..6].try_into().unwrap()) as u64,
+            u32::from_be_bytes(cdb[2..6].try_into().expect("fixed-width slice")) as u64,
             u16::from_be_bytes([cdb[7], cdb[8]]) as u32,
         )),
         0x88 | 0x8a if cdb.len() >= 14 => Some((
-            u64::from_be_bytes(cdb[2..10].try_into().unwrap()),
-            u32::from_be_bytes(cdb[10..14].try_into().unwrap()),
+            u64::from_be_bytes(cdb[2..10].try_into().expect("fixed-width slice")),
+            u32::from_be_bytes(cdb[10..14].try_into().expect("fixed-width slice")),
         )),
         _ => None,
     }
@@ -212,9 +212,9 @@ impl Inquiry {
         Some(Self {
             peripheral: d[0],
             removable: d[1] & 0x80 != 0,
-            vendor: d[8..16].try_into().unwrap(),
-            product: d[16..32].try_into().unwrap(),
-            revision: d[32..36].try_into().unwrap(),
+            vendor: d[8..16].try_into().expect("fixed-width slice"),
+            product: d[16..32].try_into().expect("fixed-width slice"),
+            revision: d[32..36].try_into().expect("fixed-width slice"),
         })
     }
 
@@ -257,16 +257,16 @@ impl Capacity {
     /// medium is too large and READ CAPACITY(16) is needed.
     pub fn parse_10(d: &[u8]) -> Option<Self> {
         Some(Self {
-            last_lba: u32::from_be_bytes(d.get(0..4)?.try_into().unwrap()) as u64,
-            block_size: u32::from_be_bytes(d.get(4..8)?.try_into().unwrap()),
+            last_lba: u32::from_be_bytes(d.get(0..4)?.try_into().expect("fixed-width slice")) as u64,
+            block_size: u32::from_be_bytes(d.get(4..8)?.try_into().expect("fixed-width slice")),
         })
     }
 
     /// Parses READ CAPACITY(16) data.
     pub fn parse_16(d: &[u8]) -> Option<Self> {
         Some(Self {
-            last_lba: u64::from_be_bytes(d.get(0..8)?.try_into().unwrap()),
-            block_size: u32::from_be_bytes(d.get(8..12)?.try_into().unwrap()),
+            last_lba: u64::from_be_bytes(d.get(0..8)?.try_into().expect("fixed-width slice")),
+            block_size: u32::from_be_bytes(d.get(8..12)?.try_into().expect("fixed-width slice")),
         })
     }
 

@@ -523,19 +523,19 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: QEMU passes a valid start-info structure, identity-mapped.
     let info = unsafe { StartInfo::from_ptr(start_info as *const u8) }.expect("bad PVH start info");
     let mut map = MemoryMap::<32>::new();
-    info.fill_memory_map(&mut map).unwrap();
+    info.fill_memory_map(&mut map).expect("fill_memory_map failed");
     // SAFETY: linker-provided symbols.
     let (kstart, kend) = unsafe { (sym(&_kernel_start), sym(&_kernel_end)) };
-    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
+    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).expect("reserve failed");
     // The AP trampoline's page (and the rest of low memory) stays out of the allocator.
-    map.reserve(PhysAddr::new(0), PhysAddr::new(0x10_0000), RegionKind::Reserved).unwrap();
+    map.reserve(PhysAddr::new(0), PhysAddr::new(0x10_0000), RegionKind::Reserved).expect("reserve failed");
     // With enough RAM, so does the window for a guest kernel image (QEMU's
     // loader may have put one there).
     let top = map.regions().iter().map(|r| r.end.0).max().unwrap_or(0);
     let image_window = top >= kernel::IMAGE_BASE + kernel::IMAGE_WINDOW;
     if image_window {
         let (base, end) = (kernel::IMAGE_BASE, kernel::IMAGE_BASE + kernel::IMAGE_WINDOW);
-        map.reserve(PhysAddr::new(base), PhysAddr::new(end), RegionKind::Reserved).unwrap();
+        map.reserve(PhysAddr::new(base), PhysAddr::new(end), RegionKind::Reserved).expect("reserve failed");
     }
     // The boot CPU's APIC ID from its local APIC (CPUID's may be virtualized),
     // read through the boot tables' identity map of the default address.
@@ -644,7 +644,7 @@ fn start_host_cpu(cpu: usize) {
     let pit = Pit::new(unsafe { PitPio::new() });
     let id = HOST_APIC_IDS[cpu].load(Ordering::Relaxed);
     // SAFETY: the trampoline is installed and no other AP is in it.
-    unsafe { LAPIC.get().unwrap().start_ap(id, &boot, |ns| pit.wait_ns(ns)) };
+    unsafe { LAPIC.get().expect("LAPIC initialised").start_ap(id, &boot, |ns| pit.wait_ns(ns)) };
     while ONLINE.load(Ordering::Acquire) <= cpu {
         core::hint::spin_loop();
     }
@@ -658,7 +658,7 @@ extern "C" fn ap_main(cpu: usize) -> ! {
     unsafe { cpu::set_current_id(cpu) };
     // SAFETY: we are on the stack the boot CPU allocated for us.
     unsafe { trap::install() };
-    LAPIC.get().unwrap().enable(SPURIOUS_VECTOR);
+    LAPIC.get().expect("LAPIC initialised").enable(SPURIOUS_VECTOR);
     let hsave = FRAMES.lock().alloc(0).expect("host save area");
     svm::enable(hsave.0).expect("SVM on the second CPU");
     irq::enable();
@@ -700,7 +700,7 @@ const GUEST_RAM_ORDER: u32 = 9; // 2 MiB at guest-physical 0
 /// One block of `order` frames as (host pointer, physical address).
 fn block(order: u32) -> (NonNull<u8>, u64) {
     let pa = FRAMES.lock().alloc(order).expect("out of frames");
-    (NonNull::new(pa.0 as *mut u8).unwrap(), pa.0)
+    (NonNull::new(pa.0 as *mut u8).expect("new failed"), pa.0)
 }
 
 fn guest_demo() {
@@ -716,13 +716,13 @@ fn guest_demo() {
         let start = &raw const x86_guest;
         core::slice::from_raw_parts(start, (&raw const x86_guest_end).offset_from(start) as usize)
     };
-    mem.write(GuestPhysAddr(GUEST_ENTRY), image).unwrap();
+    mem.write(GuestPhysAddr(GUEST_ENTRY), image).expect("write failed");
 
     // Nested page table: guest-physical 0..2 MiB onto the block. NPT walks
     // are user accesses, so the leaves need USER.
     let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
     let flags = MapFlags::RW | MapFlags::EXEC | MapFlags::USER;
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, flags).unwrap();
+    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, flags).expect("map_range failed");
 
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let out = line.clone();
@@ -740,15 +740,15 @@ fn guest_demo() {
     let pic = Arc::new(VirtualPic::new(move |level| i.store(level, Ordering::Release)));
     let p = pic.clone();
     let com1 = Arc::new(Uart16550Model::new(console.clone()).with_irq(move |level| p.set_level(4, level)));
-    pio.insert(0x3f8, 8, com1.clone()).unwrap();
-    pio.insert(0x20, 2, pic.master()).unwrap();
-    pio.insert(0xa0, 2, pic.slave()).unwrap();
+    pio.insert(0x3f8, 8, com1.clone()).expect("insert failed");
+    pio.insert(0x20, 2, pic.master()).expect("insert failed");
+    pio.insert(0xa0, 2, pic.slave()).expect("insert failed");
     let clock = clock();
     let p = pic.clone();
     let pit = Arc::new(VirtualPit::new(clock, move |level| p.set_level(0, level)));
-    pio.insert(0x40, 4, pit.clone()).unwrap();
+    pio.insert(0x40, 4, pit.clone()).expect("insert failed");
     let mmio = Bus::new();
-    mmio.insert(GUEST_MMIO_UART, 8, Arc::new(Uart16550Model::new(console))).unwrap();
+    mmio.insert(GUEST_MMIO_UART, 8, Arc::new(Uart16550Model::new(console))).expect("insert failed");
 
     let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
@@ -820,10 +820,11 @@ fn fp_demo() {
     // and the guests until it is freed below.
     unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image.
-    mem.write(GuestPhysAddr(GUEST_ENTRY), unsafe { image(&fp_guest, &fp_guest_end) }).unwrap();
+    mem.write(GuestPhysAddr(GUEST_ENTRY), unsafe { image(&fp_guest, &fp_guest_end) }).expect("write failed");
     let mem = Arc::new(mem);
     let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER).unwrap();
+    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER)
+        .expect("map_range failed");
     let (mmio, pio) = (Bus::new(), Bus::new());
 
     let mut pages = Vec::new();
@@ -889,11 +890,11 @@ fn long_mode_demo() {
         let start = &raw const lm_guest;
         core::slice::from_raw_parts(start, (&raw const lm_guest_end).offset_from(start) as usize)
     };
-    mem.write(GuestPhysAddr(GUEST_ENTRY), image).unwrap();
+    mem.write(GuestPhysAddr(GUEST_ENTRY), image).expect("write failed");
     // Guest page tables: PML4 0x1000 -> PDPT 0x2000. PDPT[0] -> PD 0x3000
     // mapping 0..2 MiB (RAM); PDPT[3] -> PD 0x4000 mapping the 2 MiB page
     // holding the MMIO UART, uncached.
-    let pte = |gpa: u64, v: u64| mem.write_obj(GuestPhysAddr(gpa), v).unwrap();
+    let pte = |gpa: u64, v: u64| mem.write_obj(GuestPhysAddr(gpa), v).expect("write_obj failed");
     pte(0x1000, 0x2003);
     pte(0x2000, 0x3003);
     pte(0x2000 + 3 * 8, 0x4003);
@@ -904,7 +905,8 @@ fn long_mode_demo() {
     let mem = Arc::new(mem);
 
     let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER).unwrap();
+    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER)
+        .expect("map_range failed");
 
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let out = line.clone();
@@ -917,7 +919,7 @@ fn long_mode_demo() {
             l.clear();
         }
     });
-    mmio.insert(GUEST_MMIO_UART, 8, Arc::new(uart)).unwrap();
+    mmio.insert(GUEST_MMIO_UART, 8, Arc::new(uart)).expect("insert failed");
     let intr = Arc::new(AtomicBool::new(false));
     let i = intr.clone();
     // COM1 -> I/O APIC input 4 -> local APIC. The I/O APIC holds the APIC
@@ -926,7 +928,7 @@ fn long_mode_demo() {
     let io = ioapic.clone();
     let apic = Arc::new(
         VirtualLapic::new(0, LAPIC_TIMER_HZ, clock(), move |level| i.store(level, Ordering::Release))
-            .with_eoi(move |v| io.get().unwrap().eoi(v)),
+            .with_eoi(move |v| io.get().expect("get returned None").eoi(v)),
     );
     let a = Arc::downgrade(&apic);
     let ioapic = ioapic
@@ -938,12 +940,12 @@ fn long_mode_demo() {
             }))
         })
         .clone();
-    mmio.insert(GUEST_LAPIC, LAPIC_WINDOW, apic.clone()).unwrap();
-    mmio.insert(GUEST_IOAPIC, IOAPIC_WINDOW, ioapic.clone()).unwrap();
+    mmio.insert(GUEST_LAPIC, LAPIC_WINDOW, apic.clone()).expect("insert failed");
+    mmio.insert(GUEST_IOAPIC, IOAPIC_WINDOW, ioapic.clone()).expect("insert failed");
     let io = ioapic.clone();
     let com1 = Arc::new(Uart16550Model::new(|_| {}).with_irq(move |level| io.set_level(4, level)));
     let pio = Bus::new();
-    pio.insert(0x3f8, 8, com1.clone()).unwrap();
+    pio.insert(0x3f8, 8, com1.clone()).expect("insert failed");
 
     let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
@@ -1034,7 +1036,7 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
         if me > 0 {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
         }
-        let a = vm.apics[me].get().unwrap().clone();
+        let a = vm.apics[me].get().expect("get returned None").clone();
         v.connect_intr(move || a.acknowledge());
         vm.cpus.attach_svm(me, &mut v);
         let exit = run_vcpu(&mut v, &vm.buses[me], &vm.pio, |v, exit| match exit {
@@ -1093,10 +1095,11 @@ fn smp_demo() {
     unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the two images.
     let (bsp, ap) = unsafe { (image(&smp_bsp, &smp_bsp_end), image(&smp_ap, &smp_ap_end)) };
-    mem.write(GuestPhysAddr(GUEST_ENTRY), bsp).unwrap();
-    mem.write(GuestPhysAddr(0x8000), ap).unwrap();
+    mem.write(GuestPhysAddr(GUEST_ENTRY), bsp).expect("write failed");
+    mem.write(GuestPhysAddr(0x8000), ap).expect("write failed");
     let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER).unwrap();
+    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER)
+        .expect("map_range failed");
 
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let com1 = Arc::new(Uart16550Model::new(move |b| {
@@ -1108,7 +1111,7 @@ fn smp_demo() {
         }
     }));
     let pio = Bus::new();
-    pio.insert(0x3f8, 8, com1).unwrap();
+    pio.insert(0x3f8, 8, com1).expect("insert failed");
 
     // A vCPU's interrupt arriving while it runs guest code on another host
     // CPU kicks that CPU with a physical IPI, so the guest exits and the
@@ -1117,7 +1120,7 @@ fn smp_demo() {
     let k = kicks.clone();
     let cpus = GuestCpus::with_kick(N, move |host| {
         k.fetch_add(1, Ordering::Relaxed);
-        LAPIC.get().unwrap().send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
+        LAPIC.get().expect("LAPIC initialised").send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
     });
     // One local APIC per vCPU. An ICR write the sender cannot deliver
     // itself lands in the hook: STARTUP becomes a start request, a fixed
@@ -1143,11 +1146,11 @@ fn smp_demo() {
             });
         let apic = apics[i].call_once(|| Arc::new(apic)).clone();
         let mmio = Bus::new();
-        mmio.insert(GUEST_LAPIC, LAPIC_WINDOW, apic).unwrap();
+        mmio.insert(GUEST_LAPIC, LAPIC_WINDOW, apic).expect("insert failed");
         buses.push(mmio);
     }
 
-    cpus.request_start(0, GUEST_ENTRY, 0).unwrap();
+    cpus.request_start(0, GUEST_ENTRY, 0).expect("request_start failed");
     let vm = SmpVm {
         cpus,
         mem: Arc::new(mem),
@@ -1182,7 +1185,7 @@ fn on_trap(frame: &mut TrapFrame) {
     match frame.vector() {
         // A kick: taking it is all it is for (the guest has already exited).
         // A kick, or the host tick that makes a busy guest exit.
-        KICK_VECTOR | kernel::HOST_TICK_VECTOR => return LAPIC.get().unwrap().eoi(),
+        KICK_VECTOR | kernel::HOST_TICK_VECTOR => return LAPIC.get().expect("LAPIC initialised").eoi(),
         SPURIOUS_VECTOR => return,
         _ => {}
     }

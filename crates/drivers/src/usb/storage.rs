@@ -86,10 +86,10 @@ fn trimmed(b: &[u8]) -> &str {
     core::str::from_utf8(b).map(str::trim_end).unwrap_or("?")
 }
 
-enum Data<'a> {
+enum Data<'buf> {
     None,
-    In(&'a mut [u8]),
-    Out(&'a [u8]),
+    In(&'buf mut [u8]),
+    Out(&'buf [u8]),
 }
 
 /// A USB mass-storage device, as a [`BlockDevice`].
@@ -153,12 +153,11 @@ impl<H: UsbHost> UsbStorage<H> {
         if s.command(&[READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], Data::In(&mut cap))? < cap.len() {
             return Err(StorageError::Short);
         }
-        let last = u32::from_be_bytes(cap[0..4].try_into().unwrap());
-        s.block_size = u32::from_be_bytes(cap[4..8].try_into().unwrap()) as usize;
+        let last = u32::from_be_bytes(cap[0..4].try_into().expect("fixed-width slice"));
+        s.block_size = u32::from_be_bytes(cap[4..8].try_into().expect("fixed-width slice")) as usize;
         s.blocks = last as u64 + 1;
         // A last LBA of 0xffffffff means "too many to say here".
-        if last == u32::MAX || !s.block_size.is_power_of_two() || !(512..=MAX_COMMAND_BYTES).contains(&s.block_size)
-        {
+        if last == u32::MAX || !s.block_size.is_power_of_two() || !(512..=MAX_COMMAND_BYTES).contains(&s.block_size) {
             return Err(StorageError::Unsupported);
         }
         Ok(s)
@@ -176,8 +175,8 @@ impl<H: UsbHost> UsbStorage<H> {
         Ok(Inquiry {
             device_type: d[0] & 0x1f,
             removable: d[1] & 0x80 != 0,
-            vendor: d[8..16].try_into().unwrap(),
-            product: d[16..32].try_into().unwrap(),
+            vendor: d[8..16].try_into().expect("fixed-width slice"),
+            product: d[16..32].try_into().expect("fixed-width slice"),
         })
     }
 
@@ -285,7 +284,7 @@ impl<H: UsbHost> UsbStorage<H> {
             self.reset_recovery();
             return Err(StorageError::Phase);
         }
-        let residue = u32::from_le_bytes(csw[8..12].try_into().unwrap()) as usize;
+        let residue = u32::from_le_bytes(csw[8..12].try_into().expect("fixed-width slice")) as usize;
         Ok((csw[12], moved.min(len.saturating_sub(residue))))
     }
 

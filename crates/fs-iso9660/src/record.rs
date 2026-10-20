@@ -19,7 +19,7 @@ pub mod flag {
 const MIN_LEN: usize = 34;
 
 /// One directory record.
-pub struct Record<'a> {
+pub struct Record<'src> {
     /// First logical block of the data, after any extended attribute record.
     pub extent: u32,
     /// Bytes in this extent.
@@ -29,14 +29,14 @@ pub struct Record<'a> {
     /// Recorded in interleaved mode, which is not supported.
     pub interleaved: bool,
     /// The raw file identifier.
-    pub name: &'a [u8],
+    pub name: &'src [u8],
     /// The system use area (SUSP and Rock Ridge entries).
-    pub system_use: &'a [u8],
+    pub system_use: &'src [u8],
 }
 
-impl<'a> Record<'a> {
+impl<'src> Record<'src> {
     /// Parses a record of exactly `r.len()` bytes.
-    pub fn parse(r: &'a [u8]) -> Result<Self, Errno> {
+    pub fn parse(r: &'src [u8]) -> Result<Self, Errno> {
         if r.len() < MIN_LEN || r[0] as usize != r.len() {
             return Err(Errno::EIO);
         }
@@ -47,7 +47,7 @@ impl<'a> Record<'a> {
         }
         // A padding byte keeps the system use area at an even offset.
         let su = (name_end + (name_len + 1) % 2).min(r.len());
-        let le32 = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().unwrap());
+        let le32 = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().expect("fixed-width slice"));
         Ok(Record {
             extent: le32(2).wrapping_add(r[1] as u32),
             size: le32(10),
@@ -73,21 +73,21 @@ impl<'a> Record<'a> {
 ///
 /// Records never cross a logical block; a zero length byte means the rest
 /// of the block is padding.
-pub struct Records<'a> {
-    data: &'a [u8],
+pub struct Records<'src> {
+    data: &'src [u8],
     block: usize,
     pos: usize,
 }
 
-impl<'a> Records<'a> {
+impl<'src> Records<'src> {
     /// Walks `data`, a directory extent of `block`-byte logical blocks.
-    pub fn new(data: &'a [u8], block: usize) -> Self {
+    pub fn new(data: &'src [u8], block: usize) -> Self {
         Records { data, block, pos: 0 }
     }
 }
 
-impl<'a> Iterator for Records<'a> {
-    type Item = Result<(usize, Record<'a>), Errno>;
+impl<'src> Iterator for Records<'src> {
+    type Item = Result<(usize, Record<'src>), Errno>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {

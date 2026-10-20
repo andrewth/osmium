@@ -4,16 +4,16 @@ use osmium_hal::block::{BlockDevice, BlockError};
 
 /// A disk stored in a byte slice (an initrd, a test image, a RAM-backed
 /// scratch disk).
-pub struct RamDisk<'a> {
-    data: &'a mut [u8],
+pub struct RamDisk<'disk> {
+    data: &'disk mut [u8],
     block_size: usize,
     read_only: bool,
 }
 
-impl<'a> RamDisk<'a> {
+impl<'disk> RamDisk<'disk> {
     /// Uses `data` as the disk. Panics unless `data` is a whole number of
     /// `block_size` blocks.
-    pub fn new(data: &'a mut [u8], block_size: usize) -> Self {
+    pub fn new(data: &'disk mut [u8], block_size: usize) -> Self {
         assert!(block_size > 0 && data.len().is_multiple_of(block_size));
         Self { data, block_size, read_only: false }
     }

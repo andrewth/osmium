@@ -99,10 +99,10 @@ impl Message {
         }
         let mut m = Message {
             op: b[0],
-            xid: u32::from_be_bytes(b[4..8].try_into().unwrap()),
+            xid: u32::from_be_bytes(b[4..8].try_into().expect("fixed-width slice")),
             ciaddr: addr(&b[12..])?,
             yiaddr: addr(&b[16..])?,
-            chaddr: MacAddress(b[28..34].try_into().unwrap()),
+            chaddr: MacAddress(b[28..34].try_into().expect("fixed-width slice")),
             ..Message::default()
         };
         let mut opts = &b[FIXED_LEN..];

@@ -10,16 +10,16 @@ const TRAILER: &str = "TRAILER!!!";
 
 /// One member of a cpio archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Entry<'a> {
+pub struct Entry<'src> {
     /// Path inside the archive, without a leading `./` or `/`; empty for the
     /// archive's root (`.`).
-    pub name: &'a str,
+    pub name: &'src str,
     /// The member's kind.
     pub kind: FileKind,
     /// Permission bits (`0o7777`).
     pub mode: u32,
     /// The file's contents, or a symbolic link's target.
-    pub data: &'a [u8],
+    pub data: &'src [u8],
 }
 
 /// Iterates over the members of a `newc` (`070701`) or `newc` with
@@ -31,8 +31,8 @@ pub fn entries(archive: &[u8]) -> Entries<'_> {
 }
 
 /// The iterator returned by [`entries`].
-pub struct Entries<'a> {
-    rest: &'a [u8],
+pub struct Entries<'src> {
+    rest: &'src [u8],
     done: bool,
 }
 
@@ -47,8 +47,8 @@ fn align4(n: usize) -> usize {
     n.next_multiple_of(4)
 }
 
-impl<'a> Entries<'a> {
-    fn parse(&mut self) -> Result<Option<Entry<'a>>, Errno> {
+impl<'src> Entries<'src> {
+    fn parse(&mut self) -> Result<Option<Entry<'src>>, Errno> {
         // Several archives may be concatenated, with zero padding between.
         while self.rest.len() >= 4 && self.rest[..4] == [0; 4] {
             self.rest = &self.rest[4..];
@@ -94,8 +94,8 @@ impl<'a> Entries<'a> {
     }
 }
 
-impl<'a> Iterator for Entries<'a> {
-    type Item = Result<Entry<'a>, Errno>;
+impl<'src> Iterator for Entries<'src> {
+    type Item = Result<Entry<'src>, Errno>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {

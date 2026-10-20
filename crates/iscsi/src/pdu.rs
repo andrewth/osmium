@@ -106,7 +106,7 @@ impl Pdu {
 
     /// The big-endian word at byte `at` of the BHS.
     pub fn u32_at(&self, at: usize) -> u32 {
-        u32::from_be_bytes(self.bhs[at..at + 4].try_into().unwrap())
+        u32::from_be_bytes(self.bhs[at..at + 4].try_into().expect("fixed-width slice"))
     }
 
     /// Stores a big-endian word at byte `at` of the BHS.
@@ -123,7 +123,7 @@ impl Pdu {
     }
 
     fn lun(&self) -> [u8; 8] {
-        self.bhs[8..16].try_into().unwrap()
+        self.bhs[8..16].try_into().expect("fixed-width slice")
     }
 
     fn set_lun(&mut self, lun: [u8; 8]) {
@@ -229,7 +229,7 @@ impl PduReader {
                 return Err(PduError::Digest);
             }
         }
-        let mut pdu = Pdu { bhs: self.buf[..BHS_LEN].try_into().unwrap(), data: Vec::new() };
+        let mut pdu = Pdu { bhs: self.buf[..BHS_LEN].try_into().expect("fixed-width slice"), data: Vec::new() };
         pdu.data.extend_from_slice(&self.buf[data_at..data_at + len]);
         self.buf.drain(..total);
         Ok(Some(pdu))
@@ -551,7 +551,7 @@ impl Message {
                 expected_len: p.u32_at(20),
                 cmd_sn: sn24,
                 exp_stat_sn: sn28,
-                cdb: p.bhs[32..48].try_into().unwrap(),
+                cdb: p.bhs[32..48].try_into().expect("fixed-width slice"),
                 data: pdu.data,
             }),
             opcode::LOGIN_REQUEST => Message::LoginRequest(LoginRequest {
@@ -559,7 +559,7 @@ impl Message {
                 cont: flags & C != 0,
                 csg: flags >> 2 & 3,
                 nsg: flags & 3,
-                isid: p.bhs[8..14].try_into().unwrap(),
+                isid: p.bhs[8..14].try_into().expect("fixed-width slice"),
                 tsih: p.u16_at(14),
                 itt: p.u32_at(16),
                 cid: p.u16_at(20),
@@ -622,7 +622,7 @@ impl Message {
                 cont: flags & C != 0,
                 csg: flags >> 2 & 3,
                 nsg: flags & 3,
-                isid: p.bhs[8..14].try_into().unwrap(),
+                isid: p.bhs[8..14].try_into().expect("fixed-width slice"),
                 tsih: p.u16_at(14),
                 itt: p.u32_at(16),
                 stat_sn: sn24,

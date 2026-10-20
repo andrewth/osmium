@@ -1,10 +1,17 @@
 //! File descriptors.
+//!
+//! # Locking
+//!
+//! A process's [`FdTable`] sits behind a lock that is held only to look up
+//! or change a slot. Callers clone the [`OpenFile`] out of it and drop the
+//! lock before any file I/O, so I/O never runs under the table lock.
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use osmium_sync::{IrqSpinLock, Once};
+use osmium_sync::Once;
 
 use osmium_fs::{Errno, File};
 
@@ -32,7 +39,9 @@ impl Access {
 pub struct OpenFile {
     file: Arc<dyn File>,
     access: Access,
-    offset: IrqSpinLock<u64>,
+    /// Shared by every descriptor duplicated from this open (including across
+    /// `fork`), so it is only ever advanced with an atomic read-modify-write.
+    offset: AtomicU64,
     /// The absolute path it was opened by, for `*at` calls relative to it.
     path: Option<String>,
 }
@@ -40,12 +49,12 @@ pub struct OpenFile {
 impl OpenFile {
     /// Opens `file` at offset 0.
     pub fn new(file: Arc<dyn File>, access: Access) -> Arc<Self> {
-        Arc::new(Self { file, access, offset: IrqSpinLock::new(0), path: None })
+        Arc::new(Self { file, access, offset: AtomicU64::new(0), path: None })
     }
 
     /// Opens `file`, found at the absolute `path`, at offset 0.
     pub fn with_path(file: Arc<dyn File>, access: Access, path: String) -> Arc<Self> {
-        Arc::new(Self { file, access, offset: IrqSpinLock::new(0), path: Some(path) })
+        Arc::new(Self { file, access, offset: AtomicU64::new(0), path: Some(path) })
     }
 
     /// The path it was opened by, if any.
@@ -65,12 +74,24 @@ impl OpenFile {
 
     /// The current position.
     pub fn offset(&self) -> u64 {
-        *self.offset.lock()
+        self.offset.load(Ordering::Relaxed)
     }
 
     /// Moves the position.
     pub fn set_offset(&self, off: u64) {
-        *self.offset.lock() = off;
+        self.offset.store(off, Ordering::Relaxed);
+    }
+
+    /// Moves the position forward by `n` bytes.
+    fn advance(&self, n: usize) -> Result<(), Errno> {
+        let mut cur = self.offset.load(Ordering::Relaxed);
+        loop {
+            let next = cur.checked_add(n as u64).ok_or(Errno::EOVERFLOW)?;
+            match self.offset.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Ok(()),
+                Err(now) => cur = now,
+            }
+        }
     }
 
     /// Reads at the current position and advances it.
@@ -78,9 +99,8 @@ impl OpenFile {
         if !self.access.read {
             return Err(Errno::EBADF);
         }
-        let off = self.offset();
-        let n = self.file.read(off, buf)?;
-        self.set_offset(off + n as u64);
+        let n = self.file.read(self.offset(), buf)?;
+        self.advance(n)?;
         Ok(n)
     }
 
@@ -90,9 +110,15 @@ impl OpenFile {
         if !self.access.write {
             return Err(Errno::EBADF);
         }
-        let off = if self.access.append { self.file.stat().size } else { self.offset() };
-        let n = self.file.write(off, buf)?;
-        self.set_offset(off + n as u64);
+        if self.access.append {
+            // An append lands at the end and leaves the position just past it.
+            let off = self.file.stat().size;
+            let n = self.file.write(off, buf)?;
+            self.set_offset(off.checked_add(n as u64).ok_or(Errno::EOVERFLOW)?);
+            return Ok(n);
+        }
+        let n = self.file.write(self.offset(), buf)?;
+        self.advance(n)?;
         Ok(n)
     }
 }

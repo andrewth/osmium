@@ -32,6 +32,10 @@ pub struct Address {
 
 impl Address {
     /// Bus `bus`, device `device`, function `function`.
+    ///
+    /// # Panics
+    ///
+    /// If `device` is 32 or more, or `function` is 8 or more.
     pub const fn new(bus: u8, device: u8, function: u8) -> Self {
         assert!(device < 32 && function < 8);
         Self { bus, device, function }
@@ -235,14 +239,14 @@ pub struct Bar {
 }
 
 /// One PCI function, reached through `C`.
-pub struct Function<'a, C: ConfigAccess + ?Sized> {
-    cfg: &'a C,
+pub struct Function<'cfg, C: ConfigAccess + ?Sized> {
+    cfg: &'cfg C,
     addr: Address,
 }
 
-impl<'a, C: ConfigAccess + ?Sized> Function<'a, C> {
+impl<'cfg, C: ConfigAccess + ?Sized> Function<'cfg, C> {
     /// The function at `addr`, or `None` if nothing responds there.
-    pub fn new(cfg: &'a C, addr: Address) -> Option<Self> {
+    pub fn new(cfg: &'cfg C, addr: Address) -> Option<Self> {
         let f = Self { cfg, addr };
         (f.vendor_id() != 0xffff).then_some(f)
     }
@@ -368,6 +372,10 @@ impl<'a, C: ConfigAccess + ?Sized> Function<'a, C> {
 
     /// Programs `bar` to decode at `address`, which must be aligned to its
     /// size.
+    ///
+    /// # Panics
+    ///
+    /// If `address` is not aligned to the BAR's size.
     pub fn set_bar(&self, bar: &Bar, address: u64) {
         assert!(address.is_multiple_of(bar.size), "BAR address not aligned to its size");
         let off = reg::BAR0 + bar.index as u16 * 4;
@@ -381,7 +389,7 @@ impl<'a, C: ConfigAccess + ?Sized> Function<'a, C> {
     }
 
     /// Iterates over the capability list as `(id, offset)` pairs.
-    pub fn capabilities(&self) -> Capabilities<'_, 'a, C> {
+    pub fn capabilities(&self) -> Capabilities<'_, 'cfg, C> {
         let has_list = self.read16(reg::COMMAND_STATUS + 2) & (1 << 4) != 0;
         let next = if has_list { self.read8(reg::CAPABILITIES) & !3 } else { 0 };
         Capabilities { func: self, next, budget: 48 }
@@ -394,8 +402,8 @@ impl<'a, C: ConfigAccess + ?Sized> Function<'a, C> {
 }
 
 /// Iterator returned by [`Function::capabilities`].
-pub struct Capabilities<'f, 'a, C: ConfigAccess + ?Sized> {
-    func: &'f Function<'a, C>,
+pub struct Capabilities<'f, 'cfg, C: ConfigAccess + ?Sized> {
+    func: &'f Function<'cfg, C>,
     next: u8,
     // Bounds the walk on a malformed (cyclic) list.
     budget: u8,

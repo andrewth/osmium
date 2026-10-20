@@ -42,9 +42,9 @@ use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind};
 use osmium::sync::{IrqSpinLock, Once};
 use osmium::virt::devices::{Uart16550 as Uart16550Model, VirtualPlic};
 use osmium::virt::riscv::fdt::GuestMachine;
-use osmium::virt::riscv::{self, RiscvVcpu, sbi};
+use osmium::virt::riscv::{self, HartId, RiscvVcpu, sbi};
 use osmium::virt::smp::GuestCpus;
-use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
+use osmium::virt::stage2::{GStageTable, Hgatp, hgatp_sv39x4, map_guest_memory};
 use osmium::virt::virtio::{MMIO_SIZE, VirtioBlock, VirtioMmio, VirtioNetDevice};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
@@ -155,7 +155,8 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: OpenSBI passes a valid DTB, reserved below.
     let fdt = unsafe { Fdt::from_ptr(dtb as *const u8) }.expect("bad device tree");
     let uart_node = fdt.find_compatible(&["ns16550a"]).expect("no UART");
-    let (uart_base, uart_len) = uart_node.reg().next().map(|(a, s)| (a, s.unwrap_or(0x100))).unwrap();
+    let (uart_base, uart_len) =
+        uart_node.reg().next().map(|(a, s)| (a, s.unwrap_or(0x100))).expect("UART has a reg property");
     // SAFETY: the device tree says the UART's registers live here; nothing else uses them.
     let io = unsafe { IoMem::new(uart_base as *mut u8, uart_len as usize) };
     let mut uart = Uart16550::new(Mmio::new(io, 0));
@@ -164,16 +165,17 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!("\nosmium riscv-hyp example (hart {hartid})");
 
     let mut map = MemoryMap::<32>::new();
-    fdt.fill_memory_map(&mut map, Some(PhysAddr::new(dtb as u64))).unwrap();
+    fdt.fill_memory_map(&mut map, Some(PhysAddr::new(dtb as u64))).expect("fill_memory_map failed");
     // SAFETY: linker-provided symbols.
     let (kstart, kend) = unsafe { (sym(&_kernel_start), sym(&_kernel_end)) };
-    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
+    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).expect("reserve failed");
     // With enough RAM, keep the window for the guest kernel image (where
     // QEMU's loader puts it) out of the allocator.
     let top = map.regions().iter().map(|r| r.end.0).max().unwrap_or(0);
     let image_window = top >= IMAGE_BASE + IMAGE_WINDOW;
     if image_window {
-        map.reserve(PhysAddr::new(IMAGE_BASE), PhysAddr::new(IMAGE_BASE + IMAGE_WINDOW), RegionKind::Reserved).unwrap();
+        map.reserve(PhysAddr::new(IMAGE_BASE), PhysAddr::new(IMAGE_BASE + IMAGE_WINDOW), RegionKind::Reserved)
+            .expect("reserve failed");
     }
     map.page_align_usable();
     {
@@ -266,7 +268,7 @@ fn guest_console() -> impl Fn(u8) + Send + Sync + Clone + 'static {
 struct Vm {
     cpus: Arc<GuestCpus>,
     mem: Arc<GuestMemory>,
-    hgatp: u64,
+    hgatp: Hgatp,
     mmio: Bus,
     /// The guest's network card, bridged to [`HOST_NIC`].
     net: Option<Arc<VirtioMmio<VirtioNetDevice>>>,
@@ -332,7 +334,7 @@ fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
             core::hint::spin_loop();
             continue;
         };
-        let mut vcpu = RiscvVcpu::new(GuestPhysAddr(entry), me as u64, opaque, vm.hgatp)
+        let mut vcpu = RiscvVcpu::new(GuestPhysAddr(entry), HartId(me as u64), opaque, vm.hgatp)
             .with_external_irq(vm.lines[me].clone())
             .with_memory(vm.mem.clone());
         vm.cpus.attach(me, &mut vcpu);
@@ -452,11 +454,11 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     }
     .to_dtb();
     assert!(dtb.len() as u64 <= GUEST_DTB_SIZE);
-    mem.write(GuestPhysAddr(dtb_at), &dtb).unwrap();
+    mem.write(GuestPhysAddr(dtb_at), &dtb).expect("write failed");
     let mem = Arc::new(mem);
 
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
-    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
 
     // Hart n's S-mode context is 2n + 1 (2n is its unconnected M context).
     let lines: Vec<Arc<AtomicBool>> = (0..harts).map(|_| Arc::new(AtomicBool::new(false))).collect();
@@ -470,8 +472,8 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     let p = plic.clone();
     let uart = Arc::new(Uart16550Model::new(guest_console()).with_irq(move |level| p.set_level(UART_IRQ, level)));
     let mmio = Bus::new();
-    mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2 * harts), plic).unwrap();
-    mmio.insert(GUEST_UART, 8, uart).unwrap();
+    mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2 * harts), plic).expect("insert failed");
+    mmio.insert(GUEST_UART, 8, uart).expect("insert failed");
     // The disk: a host RAM disk the guest reaches through virtio-blk.
     let disk_pa = FRAMES.lock().alloc(DISK_ORDER).expect("no memory for the disk");
     let disk_len = PAGE_SIZE << DISK_ORDER;
@@ -485,20 +487,20 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     let blk = Arc::new(VirtioMmio::new(VirtioBlock::new(RamDisk::new(disk_buf, 512)), mem.clone(), move |level| {
         p.set_level(BLK_IRQ, level)
     }));
-    mmio.insert(BLK_BASE, MMIO_SIZE, blk.clone()).unwrap();
+    mmio.insert(BLK_BASE, MMIO_SIZE, blk.clone()).expect("insert failed");
     // The network card: frames the guest sends go out on the host NIC;
     // hart 0 brings received ones in (`poll_net`). Same MAC as the host
     // NIC, which the host itself does not use.
     let net = HOST_NIC.get().map(|nic| {
         let mac = nic.lock().mac_address().0;
         let backend = |frame: &[u8], _: &mut dyn FnMut(&[u8])| {
-            let _ = HOST_NIC.get().unwrap().lock().transmit(frame);
+            let _ = HOST_NIC.get().expect("HOST_NIC initialised").lock().transmit(frame);
         };
         let p = plic_for_blk.clone();
         let dev = Arc::new(VirtioMmio::new(VirtioNetDevice::new(mac, backend), mem.clone(), move |level| {
             p.set_level(NET_IRQ, level)
         }));
-        mmio.insert(NET_BASE, MMIO_SIZE, dev.clone()).unwrap();
+        mmio.insert(NET_BASE, MMIO_SIZE, dev.clone()).expect("insert failed");
         dev
     });
     // An IPI or fence for a vCPU running guest code on another hart kicks
@@ -506,7 +508,7 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     let cpus = GuestCpus::with_kick(harts, |cpu| {
         let _ = host_sbi::send_ipi(1, HARTS[cpu].load(Ordering::Relaxed));
     });
-    cpus.request_start(0, elf.entry(), dtb_at).unwrap();
+    cpus.request_start(0, elf.entry(), dtb_at).expect("request_start failed");
 
     let vm = Vm {
         cpus,
@@ -531,7 +533,7 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     // riscv-virt's block demo writes (i * 13 + 5) to the middle sector.
     let mut sector = [0u8; 512];
     let lba = (disk_len / 512 / 2) as u64;
-    blk.with_device(|b, _| b.disk().read_blocks(lba, &mut sector)).unwrap();
+    blk.with_device(|b, _| b.disk().read_blocks(lba, &mut sector)).expect("with_device failed");
     if sector.iter().enumerate().all(|(i, &b)| b == (i * 13 + 5) as u8) {
         println!("[hyp]   the host RAM disk holds the guest's write to sector {lba}");
     } else {

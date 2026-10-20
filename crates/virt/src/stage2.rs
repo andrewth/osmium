@@ -18,15 +18,19 @@ pub type GStageTable<A> = PageTable<Sv39x4, A>;
 /// RISC-V G-stage tables, Sv48x4 (50-bit guest-physical addresses).
 pub type GStage48Table<A> = PageTable<Sv48x4, A>;
 
+/// An encoded `hgatp` register: translation mode, VMID and G-stage root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hgatp(pub u64);
+
 /// Encodes `hgatp` for an Sv39x4 G-stage table rooted at `root` (16 KiB
 /// aligned) with `vmid` (up to 14 bits).
-pub const fn hgatp_sv39x4(root: PhysAddr, vmid: u16) -> u64 {
-    8 << 60 | ((vmid as u64) & 0x3fff) << 44 | root.0 >> 12
+pub const fn hgatp_sv39x4(root: PhysAddr, vmid: u16) -> Hgatp {
+    Hgatp(8 << 60 | ((vmid as u64) & 0x3fff) << 44 | root.0 >> 12)
 }
 
 /// Encodes `hgatp` for an Sv48x4 G-stage table.
-pub const fn hgatp_sv48x4(root: PhysAddr, vmid: u16) -> u64 {
-    9 << 60 | ((vmid as u64) & 0x3fff) << 44 | root.0 >> 12
+pub const fn hgatp_sv48x4(root: PhysAddr, vmid: u16) -> Hgatp {
+    Hgatp(9 << 60 | ((vmid as u64) & 0x3fff) << 44 | root.0 >> 12)
 }
 
 /// Encodes the VMCS EPT pointer for a 4-level, write-back EPT rooted at `root`.
@@ -116,7 +120,7 @@ mod tests {
         map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).unwrap();
         assert!(s2.translate(VirtAddr::new(0x4000_0000)).unwrap().flags.contains(MapFlags::RW | MapFlags::EXEC));
         assert_eq!(vttbr(PhysAddr::new(0x8000_0000), 5), 0x0005_0000_8000_0000);
-        assert_eq!(hgatp_sv39x4(PhysAddr::new(0x8020_4000), 3), 0x8000_3000_0008_0204);
+        assert_eq!(hgatp_sv39x4(PhysAddr::new(0x8020_4000), 3), Hgatp(0x8000_3000_0008_0204));
     }
 
     #[test]

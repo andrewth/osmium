@@ -63,6 +63,6 @@ impl Volume {
         let id = &d[40..72];
         let mut volume_id = if joliet { name::ucs2(id) } else { String::from_utf8_lossy(id).into_owned() };
         volume_id.truncate(volume_id.trim_end_matches([' ', '\0']).len());
-        Ok(Volume { block_size, volume_id, root: d[156..190].try_into().unwrap() })
+        Ok(Volume { block_size, volume_id, root: d[156..190].try_into().expect("fixed-width slice") })
     }
 }

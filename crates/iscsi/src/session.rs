@@ -91,13 +91,13 @@ impl Options {
 }
 
 /// The data stage of a SCSI command.
-pub enum Data<'a> {
+pub enum Data<'buf> {
     /// No data.
     None,
     /// The target sends data into this buffer.
-    In(&'a mut [u8]),
+    In(&'buf mut [u8]),
     /// The target receives this data.
-    Out(&'a [u8]),
+    Out(&'buf [u8]),
 }
 
 /// The U and O flags and residual count of a command's status.

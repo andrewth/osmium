@@ -456,7 +456,7 @@ mod tests {
         std::thread::scope(|s| {
             let server = s.spawn(|| serve(DeviceSide::new(size, addrs), &mut host, &stop));
             // Stop the device even if `body` panics, so the scope can end.
-            struct Stop<'a>(&'a AtomicBool);
+            struct Stop<'flag>(&'flag AtomicBool);
             impl Drop for Stop<'_> {
                 fn drop(&mut self) {
                     self.0.store(true, Ordering::Release);

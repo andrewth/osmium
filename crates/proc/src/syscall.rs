@@ -412,7 +412,7 @@ fn iovecs(p: &Process, iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64
     if count > 1024 {
         return Err(Errno::EINVAL);
     }
-    (0..count).map(|i| Ok((get_u64(p, iov + i * 16)?, get_u64(p, iov + i * 16 + 8)?))).collect()
+    (0..count).map(|i| Ok((user_u64(p, iov + i * 16)?, user_u64(p, iov + i * 16 + 8)?))).collect()
 }
 
 fn readv(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
@@ -458,20 +458,20 @@ fn writev(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
     Ok(total)
 }
 
-fn get_u64(p: &Process, va: u64) -> Result<u64, Errno> {
+fn user_u64(p: &Process, va: u64) -> Result<u64, Errno> {
     let mut b = [0; 8];
     p.memory().read(va, &mut b)?;
     Ok(u64::from_ne_bytes(b))
 }
 
 /// Reads a NUL-terminated path from user memory.
-fn get_path(p: &Process, va: u64) -> Result<String, Errno> {
-    String::from_utf8(get_cstr(p, va, PATH_MAX, Errno::ENAMETOOLONG)?).map_err(|_| Errno::EINVAL)
+fn user_path(p: &Process, va: u64) -> Result<String, Errno> {
+    String::from_utf8(user_cstr(p, va, PATH_MAX, Errno::ENAMETOOLONG)?).map_err(|_| Errno::EINVAL)
 }
 
 /// Reads a NUL-terminated string from user memory, failing with `too_long`
 /// once it reaches `max` bytes.
-fn get_cstr(p: &Process, va: u64, max: usize, too_long: Errno) -> Result<alloc::vec::Vec<u8>, Errno> {
+fn user_cstr(p: &Process, va: u64, max: usize, too_long: Errno) -> Result<alloc::vec::Vec<u8>, Errno> {
     let mut bytes = alloc::vec::Vec::new();
     let mut addr = va;
     loop {
@@ -498,7 +498,7 @@ fn vfs() -> Result<&'static osmium_fs::Vfs, Errno> {
 
 /// The absolute path for `path` relative to `dirfd`.
 fn path_at(p: &Process, dirfd: i32, path: u64) -> Result<String, Errno> {
-    let path = get_path(p, path)?;
+    let path = user_path(p, path)?;
     if path.is_empty() {
         return Err(Errno::ENOENT);
     }
@@ -571,7 +571,7 @@ fn lseek(p: &Process, fd: i32, off: i64, whence: u64) -> SysResult {
 }
 
 fn newfstatat(p: &Process, dirfd: i32, path: u64, buf: u64, flags: u64) -> SysResult {
-    let st = if flags & AT_EMPTY_PATH != 0 && get_path(p, path)?.is_empty() {
+    let st = if flags & AT_EMPTY_PATH != 0 && user_path(p, path)?.is_empty() {
         let f = if dirfd == AT_FDCWD { None } else { Some(p.files().lock().get(dirfd)?) };
         match f {
             Some(f) => f.file().stat(),
@@ -760,17 +760,17 @@ pub(crate) fn fork(p: &Process, flags: u64, [stack, ptid, ctid, _tls]: [u64; 4])
 
 /// The NULL-terminated array of string pointers at `va` (NULL itself is an
 /// empty array), at most [`crate::exec::ARG_MAX`] bytes in all.
-fn get_strings(p: &Process, va: u64, total: &mut usize) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, Errno> {
+fn user_strings(p: &Process, va: u64, total: &mut usize) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, Errno> {
     let mut out = alloc::vec::Vec::new();
     if va == 0 {
         return Ok(out);
     }
     loop {
-        let ptr = get_u64(p, va + out.len() as u64 * 8)?;
+        let ptr = user_u64(p, va + out.len() as u64 * 8)?;
         if ptr == 0 {
             return Ok(out);
         }
-        let s = get_cstr(p, ptr, crate::exec::ARG_MAX, Errno::E2BIG)?;
+        let s = user_cstr(p, ptr, crate::exec::ARG_MAX, Errno::E2BIG)?;
         *total += s.len() + 1 + 8;
         if *total > crate::exec::ARG_MAX {
             return Err(Errno::E2BIG);
@@ -783,8 +783,8 @@ fn execve(p: &Process, path: u64, argv: u64, envp: u64) -> Result<Outcome, Errno
     crate::exec::platform()?;
     let path = path_at(p, AT_FDCWD, path)?;
     let mut total = 0;
-    let argv = get_strings(p, argv, &mut total)?;
-    let envp = get_strings(p, envp, &mut total)?;
+    let argv = user_strings(p, argv, &mut total)?;
+    let envp = user_strings(p, envp, &mut total)?;
     let argv: alloc::vec::Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let envp: alloc::vec::Vec<&[u8]> = envp.iter().map(|e| e.as_slice()).collect();
     if p.group.live() > 1 {

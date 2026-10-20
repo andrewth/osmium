@@ -31,13 +31,13 @@ impl<T: Net> Net for &mut T {
 }
 
 /// An interface, its device and socket set, and a clock, as a [`Net`].
-pub struct Stack<'a, D: NetDevice + ?Sized> {
+pub struct Stack<'net, D: NetDevice + ?Sized> {
     /// The interface.
-    pub iface: &'a mut Interface,
+    pub iface: &'net mut Interface,
     /// The device it runs on.
-    pub dev: &'a mut D,
+    pub dev: &'net mut D,
     /// The sockets it serves, which the session adds its socket to.
-    pub sockets: &'a mut SocketSet,
+    pub sockets: &'net mut SocketSet,
     /// A monotonic clock in nanoseconds.
     pub now_ns: fn() -> u64,
 }

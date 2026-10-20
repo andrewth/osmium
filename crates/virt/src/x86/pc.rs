@@ -13,15 +13,15 @@ const PHYS32_ENTRY: u32 = 18;
 
 /// A PC guest's machine, as its PVH start information and ACPI tables
 /// describe it.
-pub struct PcBoot<'a> {
+pub struct PcBoot<'src> {
     /// Number of CPUs; their local APIC IDs are 0, 1, ...
     pub cpus: u32,
     /// RAM as (base, size).
-    pub memory: &'a [(u64, u64)],
+    pub memory: &'src [(u64, u64)],
     /// The I/O APIC as (ID, MMIO address); its GSIs start at 0.
     pub ioapic: Option<(u8, u32)>,
     /// Kernel command line.
-    pub cmdline: &'a str,
+    pub cmdline: &'src str,
 }
 
 /// The blob [`PcBoot::build`] writes, and where its parts are.
@@ -135,11 +135,11 @@ impl PcBoot<'_> {
 pub fn pvh_entry(image: &[u8]) -> Option<u32> {
     // namesz 4, descsz 4 (or 8), type 18, "Xen\0", then the entry.
     image.windows(16).enumerate().find_map(|(i, w)| {
-        let le = |o: usize| u32::from_le_bytes(w[o..o + 4].try_into().unwrap());
+        let le = |o: usize| u32::from_le_bytes(w[o..o + 4].try_into().expect("fixed-width slice"));
         (le(0) == 4 && matches!(le(4), 4 | 8) && le(8) == PHYS32_ENTRY && &w[12..16] == b"Xen\0")
             .then(|| image.get(i + 16..i + 20))
             .flatten()
-            .map(|e| u32::from_le_bytes(e.try_into().unwrap()))
+            .map(|e| u32::from_le_bytes(e.try_into().expect("fixed-width slice")))
     })
 }
 

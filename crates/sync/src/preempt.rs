@@ -7,6 +7,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use osmium_arch::{MAX_CPUS, cpu, irq};
 
+// Each counter is only touched by its own CPU, with IRQs masked, so there is
+// nothing to synchronise with and every access can be `Relaxed`; the atomic
+// is for interior mutability in a `static`.
 static COUNT: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 /// Disables preemption on this CPU. Calls nest.

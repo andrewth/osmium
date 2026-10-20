@@ -33,12 +33,7 @@ unsafe impl<T: ?Sized + Send, G: Guardian> Send for SpinLock<T, G> {}
 impl<T, G: Guardian> SpinLock<T, G> {
     /// Creates an unlocked lock.
     pub const fn new(data: T) -> Self {
-        Self {
-            next: AtomicU32::new(0),
-            serving: AtomicU32::new(0),
-            _guard: PhantomData,
-            data: UnsafeCell::new(data),
-        }
+        Self { next: AtomicU32::new(0), serving: AtomicU32::new(0), _guard: PhantomData, data: UnsafeCell::new(data) }
     }
 
     /// Consumes the lock and returns the data.
@@ -62,11 +57,7 @@ impl<T: ?Sized, G: Guardian> SpinLock<T, G> {
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T, G>> {
         let state = G::enter();
         let serving = self.serving.load(Ordering::Relaxed);
-        if self
-            .next
-            .compare_exchange(serving, serving.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
+        if self.next.compare_exchange(serving, serving.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed).is_ok() {
             Some(SpinLockGuard { lock: self, state: Some(state), _not_send: PhantomData })
         } else {
             G::exit(state);
@@ -112,8 +103,8 @@ impl<T: ?Sized + fmt::Debug, G: Guardian> fmt::Debug for SpinLock<T, G> {
 
 /// Grants access to the data of a held [`SpinLock`]; releases it on drop.
 #[must_use = "the lock is released immediately if the guard is not used"]
-pub struct SpinLockGuard<'a, T: ?Sized, G: Guardian = PreemptDisabled> {
-    lock: &'a SpinLock<T, G>,
+pub struct SpinLockGuard<'lock, T: ?Sized, G: Guardian = PreemptDisabled> {
+    lock: &'lock SpinLock<T, G>,
     state: Option<G::State>,
     // The guardian state (IRQ flag, preempt count) belongs to this CPU.
     _not_send: PhantomData<*const ()>,

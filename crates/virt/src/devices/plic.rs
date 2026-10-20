@@ -116,7 +116,8 @@ impl State {
                 (0..32).filter(|b| self.pending.get(base + b).copied().unwrap_or(false)).fold(0, |w, b| w | 1 << b)
             }
             o if o < CONTEXT => {
-                let (ctx, word) = (((o - ENABLE) / ENABLE_STRIDE) as usize, ((o - ENABLE) % ENABLE_STRIDE / 4) as usize);
+                let (ctx, word) =
+                    (((o - ENABLE) / ENABLE_STRIDE) as usize, ((o - ENABLE) % ENABLE_STRIDE / 4) as usize);
                 self.enable.get(ctx).and_then(|e| e.get(word)).copied().unwrap_or(0)
             }
             o if (o - CONTEXT) / CONTEXT_STRIDE < contexts => {
@@ -147,7 +148,8 @@ impl State {
             }
             o if o < ENABLE => {}
             o if o < CONTEXT => {
-                let (ctx, word) = (((o - ENABLE) / ENABLE_STRIDE) as usize, ((o - ENABLE) % ENABLE_STRIDE / 4) as usize);
+                let (ctx, word) =
+                    (((o - ENABLE) / ENABLE_STRIDE) as usize, ((o - ENABLE) % ENABLE_STRIDE / 4) as usize);
                 if let Some(w) = self.enable.get_mut(ctx).and_then(|e| e.get_mut(word)) {
                     // Source 0 does not exist.
                     *w = if word == 0 { v & !1 } else { v };
@@ -193,7 +195,7 @@ impl BusDevice for VirtualPlic {
             return;
         }
         let mut s = self.state.lock();
-        s.write(offset, u32::from_le_bytes(data.try_into().unwrap()));
+        s.write(offset, u32::from_le_bytes(data.try_into().expect("length checked above")));
         self.update(&mut s);
     }
 }

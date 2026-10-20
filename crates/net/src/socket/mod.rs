@@ -21,14 +21,14 @@ use udp::UdpSocket;
 
 /// What a socket sees of the interface while it is processed or asked for
 /// packets.
-pub(crate) struct Cx<'a> {
+pub(crate) struct Cx<'cx> {
     pub(crate) now: Instant,
     /// The interface's address, once configured.
     pub(crate) addr: Option<Ipv4Addr>,
     pub(crate) mac: MacAddress,
     /// The TCP maximum segment size the interface's MTU allows.
     pub(crate) mss: u16,
-    pub(crate) rng: &'a mut Rng,
+    pub(crate) rng: &'cx mut Rng,
 }
 
 /// An IPv4 packet a socket wants sent; the interface adds the IP and

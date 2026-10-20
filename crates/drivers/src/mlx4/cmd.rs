@@ -114,16 +114,16 @@ impl Ctx {
 }
 
 /// What a command takes as input.
-pub enum Input<'a> {
+pub enum Input<'ctx> {
     /// Nothing (the input parameter is zero).
     None,
     /// A 64-bit immediate parameter.
     Imm(u64),
     /// The first `len` bytes of a context, through the input mailbox.
-    Mailbox(&'a Ctx, usize),
+    Mailbox(&'ctx Ctx, usize),
     /// Mailbox contents written by a closure (for inputs larger than a
     /// [`Ctx`], such as WRITE_MTT).
-    Raw(&'a dyn Fn(&DmaBuffer)),
+    Raw(&'ctx dyn Fn(&DmaBuffer)),
 }
 
 /// The command interface: the HCR in BAR 0 and two mailboxes.

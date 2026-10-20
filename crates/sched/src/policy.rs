@@ -1,4 +1,11 @@
 //! Ready-made scheduling policies.
+//!
+//! # Lock order
+//!
+//! Every policy keeps one run queue per CPU behind its own lock, and never
+//! holds two of them at once: `pick_next` releases the local queue before
+//! `steal_for` locks a victim's, and `steal_for` locks one victim at a time.
+//! Run-queue locks are leaves, so no other lock is taken while one is held.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
@@ -49,7 +56,7 @@ impl FifoScheduler {
     fn steal_for(&self, cpu: usize) -> Option<Arc<Task>> {
         for off in 1..MAX_CPUS {
             let victim = (cpu + off) % MAX_CPUS;
-            let mut q = self.queues.get_for(victim).lock();
+            let mut q = self.queues.for_cpu(victim).lock();
             if let Some(i) = q.iter().rposition(|t| t.stealable_by(cpu)) {
                 let t = q.remove(i);
                 self.steals.fetch_add(1, Ordering::Relaxed);
@@ -61,25 +68,25 @@ impl FifoScheduler {
 
     /// Number of tasks waiting on `cpu`.
     pub fn queued(&self, cpu: usize) -> usize {
-        self.queues.get_for(cpu).lock().len()
+        self.queues.for_cpu(cpu).lock().len()
     }
 }
 
 impl Scheduler for FifoScheduler {
     fn enqueue(&self, task: Arc<Task>, _reason: EnqueueReason) {
         task.slice_left.store(self.slice, Ordering::Relaxed);
-        self.queues.get_for(task.cpu()).lock().push_back(task);
+        self.queues.for_cpu(task.cpu()).lock().push_back(task);
     }
 
     fn pick_next(&self, cpu: usize) -> Option<Arc<Task>> {
-        let local = self.queues.get_for(cpu).lock().pop_front();
+        let local = self.queues.for_cpu(cpu).lock().pop_front();
         if local.is_none() && self.steal { self.steal_for(cpu) } else { local }
     }
 
     fn tick(&self, cpu: usize, current: &Task) -> bool {
         let left = current.slice_left.load(Ordering::Relaxed).saturating_sub(1);
         current.slice_left.store(left, Ordering::Relaxed);
-        left == 0 && !self.queues.get_for(cpu).lock().is_empty()
+        left == 0 && !self.queues.for_cpu(cpu).lock().is_empty()
     }
 
     fn balances(&self) -> bool {
@@ -143,7 +150,7 @@ impl PriorityScheduler {
     fn steal_for(&self, cpu: usize) -> Option<Arc<Task>> {
         for off in 1..MAX_CPUS {
             let victim = (cpu + off) % MAX_CPUS;
-            let mut q = self.queues.get_for(victim).lock();
+            let mut q = self.queues.for_cpu(victim).lock();
             let mut bits = q.bitmap;
             while bits != 0 {
                 let p = 63 - bits.leading_zeros() as usize;
@@ -166,14 +173,14 @@ impl Scheduler for PriorityScheduler {
     fn enqueue(&self, task: Arc<Task>, _reason: EnqueueReason) {
         task.slice_left.store(self.slice, Ordering::Relaxed);
         let p = task.priority() as usize;
-        let mut q = self.queues.get_for(task.cpu()).lock();
+        let mut q = self.queues.for_cpu(task.cpu()).lock();
         q.levels[p].push_back(task);
         q.bitmap |= 1 << p;
     }
 
     fn pick_next(&self, cpu: usize) -> Option<Arc<Task>> {
         let local = {
-            let mut q = self.queues.get_for(cpu).lock();
+            let mut q = self.queues.for_cpu(cpu).lock();
             q.highest().and_then(|p| {
                 let p = p as usize;
                 let t = q.levels[p].pop_front();
@@ -189,7 +196,7 @@ impl Scheduler for PriorityScheduler {
     fn tick(&self, cpu: usize, current: &Task) -> bool {
         let left = current.slice_left.load(Ordering::Relaxed).saturating_sub(1);
         current.slice_left.store(left, Ordering::Relaxed);
-        match self.queues.get_for(cpu).lock().highest() {
+        match self.queues.for_cpu(cpu).lock().highest() {
             Some(p) if p > current.priority() => true,
             Some(p) => p == current.priority() && left == 0,
             None => false,
@@ -269,7 +276,7 @@ impl EdfScheduler {
 
     /// Number of tasks waiting on `cpu`.
     pub fn queued(&self, cpu: usize) -> usize {
-        self.queues.get_for(cpu).lock().tasks.len()
+        self.queues.for_cpu(cpu).lock().tasks.len()
     }
 
     fn now(&self) -> u64 {
@@ -299,7 +306,7 @@ impl EdfScheduler {
     fn steal_for(&self, cpu: usize) -> Option<Arc<Task>> {
         for off in 1..MAX_CPUS {
             let victim = (cpu + off) % MAX_CPUS;
-            let mut q = self.queues.get_for(victim).lock();
+            let mut q = self.queues.for_cpu(victim).lock();
             if let Some(key) = q.tasks.iter().find(|(_, t)| t.stealable_by(cpu)).map(|(k, _)| *k) {
                 self.steals.fetch_add(1, Ordering::Relaxed);
                 return q.tasks.remove(&key);
@@ -316,14 +323,14 @@ impl Scheduler for EdfScheduler {
         }
         task.slice_left.store(self.slice, Ordering::Relaxed);
         let abs = task.abs_deadline.load(Ordering::Relaxed);
-        let mut q = self.queues.get_for(task.cpu()).lock();
+        let mut q = self.queues.for_cpu(task.cpu()).lock();
         q.seq += 1;
         let seq = q.seq;
         q.tasks.insert((abs, seq), task);
     }
 
     fn pick_next(&self, cpu: usize) -> Option<Arc<Task>> {
-        let local = self.queues.get_for(cpu).lock().tasks.pop_first().map(|(_, t)| t);
+        let local = self.queues.for_cpu(cpu).lock().tasks.pop_first().map(|(_, t)| t);
         if local.is_none() && self.steal { self.steal_for(cpu) } else { local }
     }
 
@@ -339,7 +346,7 @@ impl Scheduler for EdfScheduler {
         let left = current.slice_left.load(Ordering::Relaxed).saturating_sub(1);
         current.slice_left.store(left, Ordering::Relaxed);
         let mine = current.abs_deadline.load(Ordering::Relaxed);
-        match self.queues.get_for(cpu).lock().tasks.first_key_value() {
+        match self.queues.for_cpu(cpu).lock().tasks.first_key_value() {
             Some((&(abs, _), _)) => abs < mine || (abs == mine && left == 0),
             None => false,
         }

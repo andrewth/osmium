@@ -178,7 +178,7 @@ pub fn arp_tagged(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u6
         let Ok(n) = dev.receive(&mut frame) else { continue };
         let Some(f) = frame.get(..n) else { continue };
         if n >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 2] && f[28..32] == GATEWAY {
-            let gw = osmium::hal::net::MacAddress(f[22..28].try_into().unwrap());
+            let gw = osmium::hal::net::MacAddress(f[22..28].try_into().expect("fixed-width slice"));
             println!("{tag}ARP: {}.{}.{}.{} is at {gw}", GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3]);
             return;
         }
@@ -303,7 +303,13 @@ pub fn iscsi(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
         }
     };
     let q = disk.inquiry();
-    println!("[iscsi] {PORTAL}: \"{}\" \"{}\", {} blocks of {}", q.vendor(), q.product(), disk.num_blocks(), disk.block_size());
+    println!(
+        "[iscsi] {PORTAL}: \"{}\" \"{}\", {} blocks of {}",
+        q.vendor(),
+        q.product(),
+        disk.num_blocks(),
+        disk.block_size()
+    );
     match block_roundtrip(&mut disk) {
         Ok(lba) => println!("[iscsi] wrote and read back block {lba}"),
         Err(e) => println!("[iscsi] round trip failed: {e:?}"),
@@ -352,14 +358,17 @@ where
             "[usb]   port {port}: {:04x}:{:04x} {:?}-speed, {} interface(s)",
             d.vendor_id,
             d.product_id,
-            status.speed.unwrap(),
+            status.speed.expect("an attached port reports a speed"),
             dev.config.num_interfaces
         );
         for desc in Descriptors::new(&config[..dev.config_len]).flatten() {
             if let Descriptor::Interface(i) = desc
                 && i.alternate == 0
             {
-                println!("[usb]     interface {}: class {:02x}/{:02x}/{:02x}", i.number, i.class, i.subclass, i.protocol);
+                println!(
+                    "[usb]     interface {}: class {:02x}/{:02x}/{:02x}",
+                    i.number, i.class, i.subclass, i.protocol
+                );
             }
         }
         config.truncate(dev.config_len);
@@ -426,7 +435,8 @@ where
         let lba = n - 1;
         let pattern: Vec<u8> = (0..bs).map(|i| (i * 7 + 3) as u8).collect();
         let mut back = alloc::vec![0u8; bs];
-        let ok = disk.write_blocks(lba, &pattern).and_then(|_| disk.flush()).and_then(|_| disk.read_blocks(lba, &mut back));
+        let ok =
+            disk.write_blocks(lba, &pattern).and_then(|_| disk.flush()).and_then(|_| disk.read_blocks(lba, &mut back));
         match ok {
             Ok(()) if back == pattern => println!("[usb]     disk: wrote and read back block {lba}"),
             Ok(()) => println!("[usb]     disk: block {lba} read back wrong"),
@@ -481,7 +491,9 @@ pub fn fat<D: osmium::hal::block::BlockDevice + Send + 'static>(disk: D) {
 
 /// Writes a pattern to the middle sector of `disk`, flushes, reads it back
 /// and returns the sector number if the data matched.
-pub fn block_roundtrip<D: osmium::hal::block::BlockDevice>(disk: &mut D) -> Result<u64, osmium::hal::block::BlockError> {
+pub fn block_roundtrip<D: osmium::hal::block::BlockDevice>(
+    disk: &mut D,
+) -> Result<u64, osmium::hal::block::BlockError> {
     let bs = disk.block_size();
     let lba = disk.num_blocks() / 2;
     let pattern: Vec<u8> = (0..bs).map(|i| (i * 13 + 5) as u8).collect();

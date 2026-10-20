@@ -22,6 +22,10 @@ pub struct TickRate {
 
 impl TickRate {
     /// A counter running at `hz` ticks per second.
+    ///
+    /// # Panics
+    ///
+    /// If `hz` is zero.
     pub const fn new(hz: u64) -> Self {
         assert!(hz > 0);
         Self { hz }

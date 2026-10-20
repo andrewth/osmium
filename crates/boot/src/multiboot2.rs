@@ -23,28 +23,28 @@ pub struct InvalidInfo;
 
 /// A parsed Multiboot2 information structure.
 #[derive(Clone, Copy, Debug)]
-pub struct BootInfo<'a> {
-    data: &'a [u8],
+pub struct BootInfo<'src> {
+    data: &'src [u8],
 }
 
 /// A raw tag.
 #[derive(Clone, Copy, Debug)]
-pub struct Tag<'a> {
+pub struct Tag<'src> {
     /// Tag type.
     pub typ: u32,
     /// Payload after the 8-byte tag header.
-    pub payload: &'a [u8],
+    pub payload: &'src [u8],
 }
 
 /// A boot module (initrd, configuration, ...).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Module<'a> {
+pub struct Module<'src> {
     /// First byte.
     pub start: PhysAddr,
     /// One past the last byte.
     pub end: PhysAddr,
     /// The module's command line.
-    pub cmdline: &'a str,
+    pub cmdline: &'src str,
 }
 
 /// Linear framebuffer description.
@@ -73,9 +73,9 @@ impl Framebuffer {
     }
 }
 
-impl<'a> BootInfo<'a> {
+impl<'src> BootInfo<'src> {
     /// Parses the structure in `data`.
-    pub fn new(data: &'a [u8]) -> Result<Self, InvalidInfo> {
+    pub fn new(data: &'src [u8]) -> Result<Self, InvalidInfo> {
         let total = le32(data, 0).ok_or(InvalidInfo)? as usize;
         if total < 16 || total > data.len() {
             return Err(InvalidInfo);
@@ -86,7 +86,7 @@ impl<'a> BootInfo<'a> {
     /// Parses the structure at physical address `addr`, as passed in EBX.
     ///
     /// # Safety
-    /// `ptr` must point at a valid structure that stays unmodified for `'a`.
+    /// `ptr` must point at a valid structure that stays unmodified for `'src`.
     pub unsafe fn from_ptr(ptr: *const u8) -> Result<Self, InvalidInfo> {
         // SAFETY: the caller guarantees the header is readable.
         let total = unsafe { (ptr as *const u32).read_unaligned() } as usize;
@@ -100,7 +100,7 @@ impl<'a> BootInfo<'a> {
     }
 
     /// All tags, up to the end tag.
-    pub fn tags(&self) -> impl Iterator<Item = Tag<'a>> + 'a + use<'a> {
+    pub fn tags(&self) -> impl Iterator<Item = Tag<'src>> + 'src + use<'src> {
         let data = self.data;
         let mut off = 8;
         core::iter::from_fn(move || {
@@ -117,22 +117,22 @@ impl<'a> BootInfo<'a> {
         })
     }
 
-    fn tag(&self, typ: u32) -> Option<&'a [u8]> {
+    fn tag(&self, typ: u32) -> Option<&'src [u8]> {
         self.tags().find(|t| t.typ == typ).map(|t| t.payload)
     }
 
     /// The kernel command line.
-    pub fn cmdline(&self) -> Option<&'a str> {
+    pub fn cmdline(&self) -> Option<&'src str> {
         cstr(self.tag(TAG_CMDLINE)?)
     }
 
     /// The boot loader's name.
-    pub fn loader_name(&self) -> Option<&'a str> {
+    pub fn loader_name(&self) -> Option<&'src str> {
         cstr(self.tag(TAG_LOADER_NAME)?)
     }
 
     /// Loaded modules.
-    pub fn modules(&self) -> impl Iterator<Item = Module<'a>> + 'a + use<'a> {
+    pub fn modules(&self) -> impl Iterator<Item = Module<'src>> + 'src + use<'src> {
         self.tags().filter(|t| t.typ == TAG_MODULE).filter_map(|t| {
             Some(Module {
                 start: PhysAddr::new(le32(t.payload, 0)? as u64),
@@ -143,10 +143,14 @@ impl<'a> BootInfo<'a> {
     }
 
     /// `(base, length, type)` of each memory-map entry. Type 1 is usable RAM.
-    pub fn memory_map(&self) -> impl Iterator<Item = (u64, u64, u32)> + 'a + use<'a> {
+    pub fn memory_map(&self) -> impl Iterator<Item = (u64, u64, u32)> + 'src + use<'src> {
         let payload = self.tag(TAG_MMAP).unwrap_or(&[]);
         let entry_size = le32(payload, 0).unwrap_or(24).max(1) as usize;
-        payload.get(8..).unwrap_or(&[]).chunks_exact(entry_size).filter_map(|e| Some((le64(e, 0)?, le64(e, 8)?, le32(e, 16)?)))
+        payload
+            .get(8..)
+            .unwrap_or(&[])
+            .chunks_exact(entry_size)
+            .filter_map(|e| Some((le64(e, 0)?, le64(e, 8)?, le32(e, 16)?)))
     }
 
     /// Adds the memory map, the info structure itself (if `info_at` is given)
@@ -186,7 +190,7 @@ impl<'a> BootInfo<'a> {
     }
 
     /// The ACPI RSDP copied by the loader (v2 preferred).
-    pub fn rsdp(&self) -> Option<&'a [u8]> {
+    pub fn rsdp(&self) -> Option<&'src [u8]> {
         self.tag(TAG_RSDP_V2).or_else(|| self.tag(TAG_RSDP_V1))
     }
 
@@ -205,7 +209,11 @@ impl<'a> BootInfo<'a> {
             format: p.get(24..30).filter(|_| p[21] == 1).and_then(|c| {
                 let mask = |pos: u8, size: u8| {
                     // An empty, wide or out-of-range field makes the format unusable.
-                    if !(1..=8).contains(&size) || pos as u32 + size as u32 > 32 { 0 } else { ((1u32 << size) - 1) << pos }
+                    if !(1..=8).contains(&size) || pos as u32 + size as u32 > 32 {
+                        0
+                    } else {
+                        ((1u32 << size) - 1) << pos
+                    }
                 };
                 PixelFormat::from_masks(p[20], mask(c[0], c[1]), mask(c[2], c[3]), mask(c[4], c[5]))
             }),

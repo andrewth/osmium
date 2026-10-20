@@ -9,19 +9,19 @@ use osmium_boot::fdt::FdtWriter;
 /// `osmium-boot` expect from QEMU `virt`: CPUs started with PSCI over `hvc`,
 /// a GICv2, the architected timer, PL011 UARTs and virtio-mmio devices.
 /// Interrupts are given as SPI numbers (INTID - 32).
-pub struct ArmMachine<'a> {
+pub struct ArmMachine<'src> {
     /// Number of CPUs (MPIDR affinity 0 = 0, 1, ...).
     pub cpus: u32,
     /// RAM as (base, size).
-    pub memory: &'a [(u64, u64)],
+    pub memory: &'src [(u64, u64)],
     /// GICv2 distributor and CPU interface bases.
     pub gic: (u64, u64),
     /// PL011 UARTs as (base, SPI); the first is the console.
-    pub uarts: &'a [(u64, u32)],
+    pub uarts: &'src [(u64, u32)],
     /// virtio-mmio devices as (base, SPI).
-    pub virtio: &'a [(u64, u32)],
+    pub virtio: &'src [(u64, u32)],
     /// Kernel command line.
-    pub bootargs: &'a str,
+    pub bootargs: &'src str,
 }
 
 const GIC_PHANDLE: u32 = 1;

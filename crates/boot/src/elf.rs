@@ -36,8 +36,8 @@ impl Machine {
 
 /// A parsed ELF64 file.
 #[derive(Clone, Copy, Debug)]
-pub struct Elf<'a> {
-    data: &'a [u8],
+pub struct Elf<'src> {
+    data: &'src [u8],
 }
 
 /// Segment permission flags (`p_flags`).
@@ -53,11 +53,11 @@ pub struct SegmentFlags {
 
 /// A loadable (`PT_LOAD`) segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Segment<'a> {
+pub struct Segment<'src> {
     /// Virtual address of the segment's first byte.
     pub vaddr: u64,
     /// Bytes to copy from the file.
-    pub data: &'a [u8],
+    pub data: &'src [u8],
     /// Size in memory; bytes past `data.len()` are zero (`.bss`).
     pub mem_size: u64,
     /// Permissions.
@@ -68,13 +68,14 @@ pub struct Segment<'a> {
 
 const PT_LOAD: u32 = 1;
 
-impl<'a> Elf<'a> {
+impl<'src> Elf<'src> {
     /// Validates `data` as a little-endian ELF64 executable.
-    pub fn new(data: &'a [u8]) -> Result<Self, ElfError> {
+    pub fn new(data: &'src [u8]) -> Result<Self, ElfError> {
         if data.get(..4) != Some(b"\x7fELF") || data.get(4) != Some(&2) || data.get(5) != Some(&1) {
             return Err(ElfError::NotElf64);
         }
-        let typ = u16::from_le_bytes([*data.get(16).ok_or(ElfError::Truncated)?, *data.get(17).ok_or(ElfError::Truncated)?]);
+        let typ =
+            u16::from_le_bytes([*data.get(16).ok_or(ElfError::Truncated)?, *data.get(17).ok_or(ElfError::Truncated)?]);
         if typ != 2 && typ != 3 {
             return Err(ElfError::NotExecutable);
         }
@@ -117,7 +118,7 @@ impl<'a> Elf<'a> {
         self.u16_at(16) == Some(3)
     }
 
-    fn raw_segments(&self) -> impl Iterator<Item = Result<Segment<'a>, ElfError>> + use<'a> {
+    fn raw_segments(&self) -> impl Iterator<Item = Result<Segment<'src>, ElfError>> + use<'src> {
         let data = self.data;
         let (off, size, n) = self.ph_table().unwrap_or((0, 0, 0));
         (0..n).filter_map(move |i| {
@@ -128,7 +129,8 @@ impl<'a> Elf<'a> {
             let seg = (|| {
                 let flags = le32(data, ph + 4)?;
                 let (offset, vaddr) = (le64(data, ph + 8)? as usize, le64(data, ph + 16)?);
-                let (filesz, memsz, align) = (le64(data, ph + 32)? as usize, le64(data, ph + 40)?, le64(data, ph + 48)?);
+                let (filesz, memsz, align) =
+                    (le64(data, ph + 32)? as usize, le64(data, ph + 40)?, le64(data, ph + 48)?);
                 if (filesz as u64) > memsz {
                     return None;
                 }
@@ -218,7 +220,7 @@ impl<'a> Elf<'a> {
     }
 
     /// The loadable segments, in file order.
-    pub fn segments(&self) -> impl Iterator<Item = Segment<'a>> + use<'a> {
+    pub fn segments(&self) -> impl Iterator<Item = Segment<'src>> + use<'src> {
         // `new` validated every segment.
         self.raw_segments().filter_map(Result::ok)
     }

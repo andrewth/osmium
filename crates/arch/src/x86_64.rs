@@ -116,7 +116,9 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
 #[inline]
 pub unsafe fn wrmsr(msr: u32, v: u64) {
     // SAFETY: the caller upholds the contract.
-    unsafe { asm!("wrmsr", in("ecx") msr, in("eax") v as u32, in("edx") (v >> 32) as u32, options(nostack, preserves_flags)) }
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") v as u32, in("edx") (v >> 32) as u32, options(nostack, preserves_flags))
+    }
 }
 
 /// Reads CR3 (the physical address of the root page table plus flags).
@@ -149,7 +151,9 @@ pub unsafe fn write_cr3(v: u64) {
 /// `x86_64-unknown-none` target does not).
 pub unsafe fn trap_fp() {
     // SAFETY: the caller upholds the contract; EM and TS only add faults.
-    unsafe { asm!("mov {t}, cr0", "or {t}, 0xc", "mov cr0, {t}", t = out(reg) _, options(nomem, nostack, preserves_flags)) }
+    unsafe {
+        asm!("mov {t}, cr0", "or {t}, 0xc", "mov cr0, {t}", t = out(reg) _, options(nomem, nostack, preserves_flags))
+    }
 }
 
 /// Reads CR2, the faulting address of the last page fault.
@@ -419,6 +423,10 @@ pub unsafe fn enter_user(entry: u64, stack_top: u64) -> ! {
 /// # Safety
 /// As for [`enter_user`]; `frame.rip` and `frame.rsp` must be valid user
 /// addresses in the active address space.
+///
+/// # Panics
+///
+/// If `frame` is not a ring-3 frame (its `cs` and `ss` must have RPL 3).
 #[cfg(bare)]
 pub unsafe fn resume_user(frame: &crate::trap::TrapFrame) -> ! {
     // Returning anything but ring 3 here would hand the user kernel mode.

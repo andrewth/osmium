@@ -63,7 +63,7 @@ Devices have an output line (`Uart16550::with_irq`, `VirtioMmio::new`'s
 and connect the controller's output to the vCPU:
 
 ```rust
-let vcpu = RiscvVcpu::new(entry, hartid, dtb, hgatp);
+let vcpu = RiscvVcpu::new(entry, HartId(hartid), dtb, hgatp);
 let eip = vcpu.external_irq();
 let plic = Arc::new(VirtualPlic::new(32, 2, move |ctx, level| {
     if ctx == 1 { eip.store(level, Ordering::Release) } // hart 0's S-mode context

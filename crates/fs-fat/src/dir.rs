@@ -127,7 +127,7 @@ pub fn parse(bytes: &[u8]) -> Vec<Entry> {
             };
             continue;
         }
-        let short: [u8; 11] = e[..11].try_into().unwrap();
+        let short: [u8; 11] = e[..11].try_into().expect("fixed-width slice");
         let pending = lfn.take();
         if e[11] & attr::VOLUME_ID != 0 || short[0] == b'.' {
             continue;
@@ -147,7 +147,7 @@ pub fn parse(bytes: &[u8]) -> Vec<Entry> {
             short,
             attr: e[11],
             first: first_cluster(e),
-            size: u32::from_le_bytes(e[28..32].try_into().unwrap()),
+            size: u32::from_le_bytes(e[28..32].try_into().expect("fixed-width slice")),
             offset,
             start,
         });
@@ -171,7 +171,7 @@ pub fn short_names(bytes: &[u8]) -> Vec<[u8; 11]> {
         .iter()
         .take_while(|e| e[0] != END)
         .filter(|e| e[0] != FREE && e[11] & 0x3f != attr::LONG_NAME)
-        .map(|e| e[..11].try_into().unwrap())
+        .map(|e| e[..11].try_into().expect("fixed-width slice"))
         .collect()
 }
 

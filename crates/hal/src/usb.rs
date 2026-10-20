@@ -408,7 +408,7 @@ impl EndpointDescriptor {
 
 /// One descriptor from a configuration descriptor set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Descriptor<'a> {
+pub enum Descriptor<'src> {
     /// The configuration header.
     Configuration(ConfigurationDescriptor),
     /// An interface.
@@ -417,7 +417,7 @@ pub enum Descriptor<'a> {
     Endpoint(EndpointDescriptor),
     /// Anything else (class-specific, companion, association), as raw bytes
     /// including the two-byte header.
-    Other(&'a [u8]),
+    Other(&'src [u8]),
 }
 
 /// Walks the descriptors in a configuration descriptor set (the bytes
@@ -426,19 +426,19 @@ pub enum Descriptor<'a> {
 /// Iteration stops at the end of the buffer or at a malformed descriptor
 /// (a length below 2 or past the end), which it yields as `Err` once.
 #[derive(Clone)]
-pub struct Descriptors<'a> {
-    rest: &'a [u8],
+pub struct Descriptors<'src> {
+    rest: &'src [u8],
 }
 
-impl<'a> Descriptors<'a> {
+impl<'src> Descriptors<'src> {
     /// Iterates over `bytes`.
-    pub fn new(bytes: &'a [u8]) -> Self {
+    pub fn new(bytes: &'src [u8]) -> Self {
         Self { rest: bytes }
     }
 }
 
-impl<'a> Iterator for Descriptors<'a> {
-    type Item = Result<Descriptor<'a>, BadDescriptor>;
+impl<'src> Iterator for Descriptors<'src> {
+    type Item = Result<Descriptor<'src>, BadDescriptor>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.rest.is_empty() {

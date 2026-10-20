@@ -63,7 +63,7 @@ impl VirtioNetDevice {
         while !self.rx_backlog.is_empty() && ctx.ready(RX) {
             let Some(chain) = ctx.pop(RX) else { break };
             let Ok(chain) = chain else { continue };
-            let frame = self.rx_backlog.pop_front().unwrap();
+            let frame = self.rx_backlog.pop_front().expect("loop checked the backlog");
             let mut hdr = [0u8; HEADER];
             hdr[10] = 1; // num_buffers
             let mem = ctx.mem();

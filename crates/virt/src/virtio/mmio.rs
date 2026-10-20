@@ -23,9 +23,9 @@ pub const MMIO_SIZE: u64 = 0x1000;
 
 /// What a device sees while it services a queue: the queues, guest memory,
 /// and a way to raise the used-buffer interrupt.
-pub struct DeviceCtx<'a> {
-    queues: &'a mut [SplitQueue],
-    mem: &'a GuestMemory,
+pub struct DeviceCtx<'ctx> {
+    queues: &'ctx mut [SplitQueue],
+    mem: &'ctx GuestMemory,
     interrupt: bool,
     /// Chains [`pop`](Self::pop) may still return: one queue's worth per
     /// queue for each notify, so a guest that keeps posting cannot hold the
@@ -33,8 +33,8 @@ pub struct DeviceCtx<'a> {
     budget: usize,
 }
 
-impl<'a> DeviceCtx<'a> {
-    fn new(queues: &'a mut [SplitQueue], mem: &'a GuestMemory) -> Self {
+impl<'ctx> DeviceCtx<'ctx> {
+    fn new(queues: &'ctx mut [SplitQueue], mem: &'ctx GuestMemory) -> Self {
         let budget = queues.iter().map(|q| q.size as usize).sum();
         Self { queues, mem, interrupt: false, budget }
     }
@@ -267,7 +267,7 @@ impl<D: VirtioDevice> BusDevice for VirtioMmio<D> {
         if offset & 3 != 0 || data.len() != 4 {
             return;
         }
-        let v = u32::from_le_bytes(data.try_into().unwrap());
+        let v = u32::from_le_bytes(data.try_into().expect("length checked above"));
         self.write_reg(&mut s, offset, v);
     }
 }

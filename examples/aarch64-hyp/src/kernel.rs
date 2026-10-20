@@ -93,7 +93,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
         vcpu.connect_timer(move |level| {
             gic.set_private_level(me, VTIMER_INTID, level);
             if masked.swap(level, Ordering::Relaxed) != level {
-                let g = PHYS_GIC.get().unwrap();
+                let g = PHYS_GIC.get().expect("PHYS_GIC initialised");
                 if level { g.disable(VTIMER_INTID) } else { g.enable(VTIMER_INTID) }
             }
         });
@@ -122,7 +122,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             VmExit::ExternalInterrupt => {
                 // The timer's PPI or a kick: acknowledge it; the next entry
                 // delivers what the guest now has pending.
-                let g = PHYS_GIC.get().unwrap();
+                let g = PHYS_GIC.get().expect("PHYS_GIC initialised");
                 if let Some(irq) = g.claim() {
                     g.complete(irq);
                 }
@@ -134,7 +134,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             other => ControlFlow::Break(other),
         });
         // Leave the physical timer PPI as the next guest expects it.
-        PHYS_GIC.get().unwrap().enable(VTIMER_INTID);
+        PHYS_GIC.get().expect("PHYS_GIC initialised").enable(VTIMER_INTID);
         if stopped {
             continue; // CPU_OFF: wait for CPU_ON
         }
@@ -185,17 +185,18 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
         println!("[hyp]   the guest kernel overlaps its device tree at {GUEST_RAM:#x}");
         return;
     }
-    mem.write(GuestPhysAddr(GUEST_RAM), &dtb).unwrap();
+    mem.write(GuestPhysAddr(GUEST_RAM), &dtb).expect("write failed");
 
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
-    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     let vttbr = vttbr(s2.root(), 4);
     core::mem::forget(s2); // in use until power-off
     core::mem::forget(mem);
 
     // A vCPU's interrupt arriving while it runs guest code on another host
     // CPU kicks that CPU with a physical SGI.
-    let cpus = GuestCpus::with_kick(ncpus, |host| PHYS_GIC.get().unwrap().send_sgi(1 << host, KICK_SGI));
+    let cpus =
+        GuestCpus::with_kick(ncpus, |host| PHYS_GIC.get().expect("PHYS_GIC initialised").send_sgi(1 << host, KICK_SGI));
     let lines: Vec<Arc<AtomicBool>> = (0..ncpus).map(|_| Arc::new(AtomicBool::new(false))).collect();
     let (l, c) = (lines.clone(), cpus.clone());
     let gic = Arc::new(VirtualGicV2::with_cpus(ncpus, 64, move |cpu, level| {
@@ -209,14 +210,14 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
     let buses = (0..ncpus)
         .map(|cpu| {
             let bus = Bus::new();
-            bus.insert(GICD, GIC_WINDOW, gic.distributor_for(cpu)).unwrap();
-            bus.insert(GICC, GIC_WINDOW, gic.cpu_interface_for(cpu)).unwrap();
-            bus.insert(UART, PL011_WINDOW, uart.clone()).unwrap();
+            bus.insert(GICD, GIC_WINDOW, gic.distributor_for(cpu)).expect("insert failed");
+            bus.insert(GICC, GIC_WINDOW, gic.cpu_interface_for(cpu)).expect("insert failed");
+            bus.insert(UART, PL011_WINDOW, uart.clone()).expect("insert failed");
             bus
         })
         .collect();
     // The boot CPU starts with x0 = the device tree.
-    cpus.request_start(0, elf.entry(), GUEST_RAM).unwrap();
+    cpus.request_start(0, elf.entry(), GUEST_RAM).expect("request_start failed");
 
     let vm =
         KernelVm { cpus, vttbr, buses, lines, gic, done: AtomicBool::new(false), running: AtomicUsize::new(ncpus) };

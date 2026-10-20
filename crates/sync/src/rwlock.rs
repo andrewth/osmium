@@ -78,16 +78,16 @@ impl<T: Default, G: Guardian> Default for RwSpinLock<T, G> {
 
 /// Shared access to a [`RwSpinLock`].
 #[must_use]
-pub struct RwSpinLockReadGuard<'a, T: ?Sized, G: Guardian = PreemptDisabled> {
-    lock: &'a RwSpinLock<T, G>,
+pub struct RwSpinLockReadGuard<'lock, T: ?Sized, G: Guardian = PreemptDisabled> {
+    lock: &'lock RwSpinLock<T, G>,
     state: Option<G::State>,
     _not_send: PhantomData<*const ()>,
 }
 
 /// Exclusive access to a [`RwSpinLock`].
 #[must_use]
-pub struct RwSpinLockWriteGuard<'a, T: ?Sized, G: Guardian = PreemptDisabled> {
-    lock: &'a RwSpinLock<T, G>,
+pub struct RwSpinLockWriteGuard<'lock, T: ?Sized, G: Guardian = PreemptDisabled> {
+    lock: &'lock RwSpinLock<T, G>,
     state: Option<G::State>,
     _not_send: PhantomData<*const ()>,
 }

@@ -2,7 +2,7 @@ use std::env;
 use std::process::Command;
 
 fn main() {
-    let dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     println!("cargo::rustc-link-arg=-T{dir}/link.x");
     println!("cargo::rerun-if-changed=link.x");
     build_user_program("aarch64-unknown-none-softfloat", "0x8000000000", &[]);
@@ -17,8 +17,8 @@ fn build_user_program(target: &str, base: &str, extra: &[&str]) {
 }
 
 fn build_one(name: &str, target: &str, base: &str, extra: &[&str]) {
-    let dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out = env::var("OUT_DIR").unwrap();
+    let dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
+    let out = env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     println!("cargo::rerun-if-changed=../user/{name}.rs");
     let status = Command::new(rustc)

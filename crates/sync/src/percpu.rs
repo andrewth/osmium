@@ -5,7 +5,7 @@ use osmium_arch::{MAX_CPUS, cpu, irq};
 /// One `T` per CPU, selected by `osmium_arch::cpu::current_id`.
 ///
 /// `T` must be `Sync` for the container to be shared, because other CPUs may
-/// read any slot with [`PerCpu::get_for`]. For mutable data that only its own
+/// read any slot with [`PerCpu::for_cpu`]. For mutable data that only its own
 /// CPU touches, use [`PerCpuCell`].
 ///
 /// ```
@@ -36,7 +36,7 @@ impl<T> PerCpu<T> {
 
     /// Returns the slot of `cpu`.
     #[inline]
-    pub fn get_for(&self, cpu: usize) -> &T {
+    pub fn for_cpu(&self, cpu: usize) -> &T {
         &self.slots[cpu]
     }
 
@@ -128,7 +128,7 @@ mod tests {
             COUNTS.get().fetch_add(5, Ordering::Relaxed);
         });
         t.join().unwrap();
-        assert_eq!(COUNTS.get_for(3).load(Ordering::Relaxed), 5);
+        assert_eq!(COUNTS.for_cpu(3).load(Ordering::Relaxed), 5);
     }
 
     #[test]

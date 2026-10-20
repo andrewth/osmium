@@ -51,7 +51,7 @@ impl TrapFrame {
 
     /// System-call argument registers `a0`..=`a7`.
     pub fn syscall_args(&self) -> [u64; 8] {
-        self.x[10..18].try_into().unwrap()
+        self.x[10..18].try_into().expect("fixed-width slice")
     }
 
     /// Sets the return value register `a0`.
@@ -116,7 +116,6 @@ impl TrapCpu {
             && lo != 0
             && sp.wrapping_sub(size_of::<TrapFrame>() as u64) < lo
     }
-
 }
 
 #[cfg(not(feature = "riscv-m-mode"))]

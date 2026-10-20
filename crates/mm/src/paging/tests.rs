@@ -3,7 +3,7 @@ use super::*;
 use crate::frame::testmem::SimRam;
 use crate::frame::{BuddyAllocator, FrameAllocator, LockedFrames};
 
-type Frames<'a> = LockedFrames<BuddyAllocator<&'a SimRam>, &'a SimRam>;
+type Frames<'ram> = LockedFrames<BuddyAllocator<&'ram SimRam>, &'ram SimRam>;
 
 fn frames(ram: &SimRam) -> Frames<'_> {
     let mut b = BuddyAllocator::new(ram);
@@ -63,10 +63,7 @@ fn exercise<F: PageTableFormat>(high_va: u64) {
             pt.map(va(0x20_1000), pa(0x1000), PageSize::Size4K, MapFlags::RW).err(),
             Some(MapError::HugePageConflict)
         );
-        assert_eq!(
-            pt.map(va(0x30_1000), pa(0x1000), PageSize::Size2M, MapFlags::RW).err(),
-            Some(MapError::Misaligned)
-        );
+        assert_eq!(pt.map(va(0x30_1000), pa(0x1000), PageSize::Size2M, MapFlags::RW).err(), Some(MapError::Misaligned));
 
         // Upper-half (or highest) addresses, and out-of-range ones.
         pt.map(va(high_va), pa(0x9000), PageSize::Size4K, MapFlags::READ | MapFlags::GLOBAL).unwrap().ignore();
@@ -89,7 +86,10 @@ fn exercise<F: PageTableFormat>(high_va: u64) {
         assert_eq!((t.pa, t.size), (pa(0x8123_4000), PageSize::Size4K));
         assert!(pt.translate(va(0x4123_4000)).is_none());
         let around = pt.translate(va(0x4123_5008)).unwrap();
-        assert_eq!((around.pa, around.size, around.flags), (pa(0x8123_5008), PageSize::Size4K, MapFlags::RW | MapFlags::READ));
+        assert_eq!(
+            (around.pa, around.size, around.flags),
+            (pa(0x8123_5008), PageSize::Size4K, MapFlags::RW | MapFlags::READ)
+        );
         assert_eq!(pt.translate(va(0x4000_0000)).unwrap().size, PageSize::Size2M, "the rest stays 2 MiB");
         assert_eq!(pt.translate(va(0x7fff_ffff)).unwrap().pa, pa(0xbfff_ffff));
         assert_eq!(pt.split(va(0x4123_5000)), Ok(PageSize::Size4K));
@@ -221,7 +221,10 @@ fn shared_kernel_entries() {
         kernel.map(va(0x30_0000), pa(0x30_0000), PageSize::Size4K, MapFlags::RW).unwrap().ignore();
         assert_eq!(proc_b.translate(va(0x30_0000)).unwrap().pa, pa(0x30_0000));
         // Kernel mappings cannot be changed through a process table.
-        assert_eq!(proc_a.map(va(0x40_0000), pa(0), PageSize::Size4K, MapFlags::RW).err(), Some(MapError::InvalidAddress));
+        assert_eq!(
+            proc_a.map(va(0x40_0000), pa(0), PageSize::Size4K, MapFlags::RW).err(),
+            Some(MapError::InvalidAddress)
+        );
         assert_eq!(proc_a.unmap(va(0x20_0000)).err(), Some(UnmapError::InvalidAddress));
     }
     // Dropping the processes freed only their own tables.

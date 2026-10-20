@@ -166,7 +166,7 @@ pub fn tick() {
         // SAFETY: IRQs are off; only this CPU uses its state.
         let cur = unsafe { &*current_ptr() };
         if !cur.is_idle && scheduler().tick(cpu, cur) {
-            NEED_RESCHED.get_for(cpu).store(true, Ordering::Relaxed);
+            NEED_RESCHED.for_cpu(cpu).store(true, Ordering::Relaxed);
         }
     });
 }
@@ -227,7 +227,7 @@ fn schedule(requeue: Option<EnqueueReason>) {
                 .is_ok()
             {
                 // SAFETY: as above.
-                let me = unsafe { (*st).current.clone() }.unwrap();
+                let me = unsafe { (*st).current.clone() }.expect("a running task is the current task");
                 enqueue(me, reason);
             }
         }
@@ -281,7 +281,7 @@ fn schedule(requeue: Option<EnqueueReason>) {
     next.on_cpu.store(true, Ordering::Relaxed);
     next.set_cpu(cpu);
     next.state.store(TaskState::Running as u8, Ordering::Release);
-    NEED_RESCHED.get_for(cpu).store(false, Ordering::Relaxed);
+    NEED_RESCHED.for_cpu(cpu).store(false, Ordering::Relaxed);
     // The kernel never uses FP, so the registers still hold `cur`'s user
     // values. `finish_switch` publishes the saved copy (`on_cpu`) before
     // another CPU may load it.

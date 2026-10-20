@@ -21,7 +21,7 @@ use osmium::sync::IrqSpinLock;
 use osmium::virt::devices::{Uart16550, VirtualPlic};
 use osmium::virt::riscv::fdt::GuestMachine;
 use osmium::virt::riscv::harts::GuestHarts;
-use osmium::virt::riscv::{self, RiscvVcpu, sbi};
+use osmium::virt::riscv::{self, HartId, RiscvVcpu, sbi};
 use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
 use osmium::virt::virtio::{MMIO_SIZE, VirtioBlock, VirtioMmio, VirtioNetDevice};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, Vcpu, VmExit, run_vcpu};
@@ -112,10 +112,10 @@ pub fn demo() {
         let start = &raw const guest_image;
         core::slice::from_raw_parts(start, (&raw const guest_image_end).offset_from(start) as usize)
     };
-    mem.write(GUEST_RAM, image).unwrap();
+    mem.write(GUEST_RAM, image).expect("write failed");
 
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
-    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     let hgatp = hgatp_sv39x4(gstage.root(), 1);
 
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
@@ -129,10 +129,10 @@ pub fn demo() {
             l.clear();
         }
     });
-    mmio.insert(GUEST_UART, 8, Arc::new(uart)).unwrap();
+    mmio.insert(GUEST_UART, 8, Arc::new(uart)).expect("insert failed");
     let pio = Bus::new();
 
-    let mut vcpu = RiscvVcpu::new(GUEST_RAM, 0, 0, hgatp);
+    let mut vcpu = RiscvVcpu::new(GUEST_RAM, HartId(0), 0, hgatp);
     let (mut hypercalls, mut halts, mut interrupts) = (0, 0, 0);
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { .. } => {
@@ -209,20 +209,22 @@ pub fn demo_irq() {
         bootargs: "",
     }
     .to_dtb();
-    mem.write(GUEST2_RAM, &dtb).unwrap();
+    mem.write(GUEST2_RAM, &dtb).expect("write failed");
 
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
-    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     // SAFETY: linker symbols.
     let (start, etext, erodata) =
         unsafe { (crate::sym(&crate::_kernel_start), crate::sym(&crate::_etext), crate::sym(&crate::_erodata)) };
     let rx = MapFlags::READ | MapFlags::EXEC;
-    gstage.map_range(VirtAddr::new(start), PhysAddr::new(start), etext - start, rx).unwrap();
-    gstage.map_range(VirtAddr::new(etext), PhysAddr::new(etext), erodata - etext, MapFlags::READ).unwrap();
+    gstage.map_range(VirtAddr::new(start), PhysAddr::new(start), etext - start, rx).expect("map_range failed");
+    gstage
+        .map_range(VirtAddr::new(etext), PhysAddr::new(etext), erodata - etext, MapFlags::READ)
+        .expect("map_range failed");
     let hgatp = hgatp_sv39x4(gstage.root(), 2);
 
-    let mut vcpu =
-        RiscvVcpu::new(GuestPhysAddr(guest_main as *const () as u64), 0, GUEST2_RAM.0, hgatp).with_memory(mem.clone());
+    let mut vcpu = RiscvVcpu::new(GuestPhysAddr(guest_main as *const () as u64), HartId(0), GUEST2_RAM.0, hgatp)
+        .with_memory(mem.clone());
     vcpu.state.x[2] = GUEST2_RAM.0 + len; // sp
     let gp: u64;
     // SAFETY: reads gp.
@@ -253,15 +255,15 @@ pub fn demo_irq() {
         .with_irq(move |level| p.set_level(UART_IRQ, level)),
     );
     let mmio = Bus::new();
-    mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2), plic.clone()).unwrap();
-    mmio.insert(GUEST_UART, 8, uart.clone()).unwrap();
+    mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2), plic.clone()).expect("insert failed");
+    mmio.insert(GUEST_UART, 8, uart.clone()).expect("insert failed");
     let p = plic.clone();
     let net = VirtioMmio::new(
         VirtioNetDevice::new([0x52, 0x54, 0, 0x12, 0x34, 0x56], arp_responder),
         mem.clone(),
         move |level| p.set_level(NET_IRQ, level),
     );
-    mmio.insert(NET_BASE, MMIO_SIZE, Arc::new(net)).unwrap();
+    mmio.insert(NET_BASE, MMIO_SIZE, Arc::new(net)).expect("insert failed");
     // A 32 KiB RAM disk behind virtio-blk. The device needs 'static data;
     // the buffer is reclaimed once the device is gone.
     let disk_buf: &'static mut [u8] = alloc::vec![0u8; 64 * 512].leak();
@@ -269,7 +271,7 @@ pub fn demo_irq() {
     let disk = RamDisk::new(disk_buf, 512);
     let p = plic.clone();
     let blk = Arc::new(VirtioMmio::new(VirtioBlock::new(disk), mem.clone(), move |level| p.set_level(BLK_IRQ, level)));
-    mmio.insert(BLK_BASE, MMIO_SIZE, blk.clone()).unwrap();
+    mmio.insert(BLK_BASE, MMIO_SIZE, blk.clone()).expect("insert failed");
     let pio = Bus::new();
 
     let mut halts = 0;
@@ -304,7 +306,7 @@ pub fn demo_irq() {
     });
     // The guest's block write must be on the host's RAM disk.
     let mut sector = [0u8; 512];
-    blk.with_device(|b, _| b.disk().read_blocks(BLK_SECTOR, &mut sector)).unwrap();
+    blk.with_device(|b, _| b.disk().read_blocks(BLK_SECTOR, &mut sector)).expect("with_device failed");
     if sector.starts_with(BLK_TEXT) {
         println!("[hyp]   the host RAM disk holds the sector the guest wrote ({BLK_SECTOR})");
     } else {
@@ -344,16 +346,19 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
 
     // SAFETY: the hypervisor put a device tree at `dtb`.
     let Ok(fdt) = (unsafe { Fdt::from_ptr(dtb as *const u8) }) else { sbi_shutdown() };
-    let node = fdt.find_compatible(&["ns16550a"]).unwrap();
-    let (base, size) = node.reg().next().unwrap();
-    let irq = node.interrupts().next().unwrap();
+    let node = fdt.find_compatible(&["ns16550a"]).expect("find_compatible returned None");
+    let (base, size) = node.reg().next().expect("next returned None");
+    let irq = node.interrupts().next().expect("next returned None");
     // SAFETY: the UART's register window from the device tree.
     let mut uart = UartDriver::new(Mmio::new(unsafe { IoMem::new(base as *mut u8, size.unwrap_or(8) as usize) }, 0));
     uart.init(None);
-    let pnode = fdt.find_compatible(&["riscv,plic0"]).unwrap();
-    let (pbase, psize) = pnode.reg().next().unwrap();
+    let pnode = fdt.find_compatible(&["riscv,plic0"]).expect("find_compatible returned None");
+    let (pbase, psize) = pnode.reg().next().expect("next returned None");
     // SAFETY: the PLIC's register window from the device tree.
-    let plic = Plic::new(unsafe { IoMem::new(pbase as *mut u8, psize.unwrap() as usize) }, Plic::supervisor_context);
+    let plic = Plic::new(
+        unsafe { IoMem::new(pbase as *mut u8, psize.expect("PLIC reg has a size") as usize) },
+        Plic::supervisor_context,
+    );
     let _ = writeln!(SerialWriter(&mut uart), "[vguest] osmium UART and PLIC drivers in VS-mode; UART irq {irq}");
 
     // Interrupts stay globally off (sstatus.SIE = 0): wfi still wakes for
@@ -396,13 +401,15 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     }
 
     // virtio-net with osmium's driver; DMA memory from the top half of RAM.
-    let vnode = fdt.all_nodes().find(|n| n.is_compatible("virtio,mmio")).unwrap();
-    let (vbase, vsize) = vnode.reg().next().unwrap();
-    let virq = vnode.interrupts().next().unwrap();
-    let (ram_base, ram_size) = fdt.memory().next().unwrap();
+    let vnode = fdt.all_nodes().find(|n| n.is_compatible("virtio,mmio")).expect("find failed");
+    let (vbase, vsize) = vnode.reg().next().expect("next returned None");
+    let virq = vnode.interrupts().next().expect("next returned None");
+    let (ram_base, ram_size) = fdt.memory().next().expect("next returned None");
     let dma = BumpDma { next: Cell::new(ram_base + ram_size / 2), end: ram_base + ram_size - 0x10000 };
     // SAFETY: the virtio-mmio window from the device tree.
-    let Ok(t) = MmioTransport::new(unsafe { IoMem::new(vbase as *mut u8, vsize.unwrap() as usize) }) else {
+    let Ok(t) = MmioTransport::new(unsafe {
+        IoMem::new(vbase as *mut u8, vsize.expect("virtio-mmio reg has a size") as usize)
+    }) else {
         sbi_shutdown()
     };
     let Ok(mut net) = VirtioNet::new(t, &dma) else { sbi_shutdown() };
@@ -438,7 +445,7 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
             && frame[12..14] == [0x08, 0x06]
             && frame[20..22] == [0, 2]
         {
-            let gw = MacAddress(frame[22..28].try_into().unwrap());
+            let gw = MacAddress(frame[22..28].try_into().expect("fixed-width slice"));
             let _ = writeln!(SerialWriter(&mut uart), "[vguest] PLIC claim {claimed}: ARP reply, 10.0.2.2 is at {gw}");
             break;
         }
@@ -623,10 +630,10 @@ pub fn demo_smp(ncpus: usize) {
         let start = &raw const smp_guest;
         core::slice::from_raw_parts(start, (&raw const smp_guest_end).offset_from(start) as usize)
     };
-    mem.write(GUEST_RAM, image).unwrap();
+    mem.write(GUEST_RAM, image).expect("write failed");
     let mem = Arc::new(mem);
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
-    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     let hgatp = hgatp_sv39x4(gstage.root(), 3);
 
     // Kick a host CPU out of its guest with a host IPI; its handler only
@@ -637,7 +644,7 @@ pub fn demo_smp(ncpus: usize) {
         k.fetch_add(1, Ordering::Relaxed);
         let _ = osmium::arch::riscv64::sbi::send_ipi(1, crate::HARTS[cpu].load(Ordering::Relaxed));
     });
-    harts.request_start(0, GUEST_RAM.0, 0).unwrap();
+    harts.request_start(0, GUEST_RAM.0, 0).expect("request_start failed");
     let buses = Arc::new((Bus::new(), Bus::new()));
     let done = Arc::new(AtomicBool::new(false));
     let results = Arc::new([AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)]);
@@ -655,7 +662,7 @@ pub fn demo_smp(ncpus: usize) {
                         continue;
                     };
                     let mut vcpu =
-                        RiscvVcpu::new(GuestPhysAddr(entry), h as u64, opaque, hgatp).with_memory(mem.clone());
+                        RiscvVcpu::new(GuestPhysAddr(entry), HartId(h as u64), opaque, hgatp).with_memory(mem.clone());
                     harts.attach(h, &mut vcpu);
                     let mut stopped = false;
                     let exit = run_vcpu(&mut vcpu, &buses.0, &buses.1, |v, exit| match exit {
@@ -769,9 +776,9 @@ pub fn demo_fp() {
         let start = &raw const fp_guest;
         core::slice::from_raw_parts(start, (&raw const fp_guest_end).offset_from(start) as usize)
     };
-    mem.write(GUEST_RAM, image).unwrap();
+    mem.write(GUEST_RAM, image).expect("write failed");
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
-    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     let hgatp = hgatp_sv39x4(gstage.root(), 4);
     let (mmio, pio) = (Bus::new(), Bus::new());
 
@@ -786,7 +793,7 @@ pub fn demo_fp() {
         v.complete_hypercall(0);
         (exit, a0)
     };
-    let mut vcpus = [RiscvVcpu::new(GUEST_RAM, 1, 0, hgatp), RiscvVcpu::new(GUEST_RAM, 2, 0, hgatp)];
+    let mut vcpus = [RiscvVcpu::new(GUEST_RAM, HartId(1), 0, hgatp), RiscvVcpu::new(GUEST_RAM, HartId(2), 0, hgatp)];
     let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
     let ok = |(e, _): &(VmExit, u64), nr| matches!(e, VmExit::Hypercall { nr: n, .. } if *n == nr);
     let (ra, rb) = (steps[2].1, steps[3].1);

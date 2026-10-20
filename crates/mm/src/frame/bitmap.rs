@@ -5,16 +5,16 @@ use crate::addr::{PAGE_SIZE, PhysAddr};
 ///
 /// Small and predictable, which suits firmware and early boot. Allocation is
 /// a linear scan from a rotating hint.
-pub struct BitmapAllocator<'a> {
+pub struct BitmapAllocator<'bits> {
     base: PhysAddr,
     frames: usize,
     /// Bit set = frame free.
-    bits: &'a mut [u64],
+    bits: &'bits mut [u64],
     free: usize,
     hint: usize,
 }
 
-impl<'a> BitmapAllocator<'a> {
+impl<'bits> BitmapAllocator<'bits> {
     /// Words of storage needed to track `frames` frames.
     pub const fn storage_words(frames: usize) -> usize {
         frames.div_ceil(64)
@@ -24,7 +24,7 @@ impl<'a> BitmapAllocator<'a> {
     /// frames initially in use. Free frames with [`BitmapAllocator::add_free`].
     ///
     /// Panics if `bits` is too small or `base` is not page aligned.
-    pub fn new(base: PhysAddr, frames: usize, bits: &'a mut [u64]) -> Self {
+    pub fn new(base: PhysAddr, frames: usize, bits: &'bits mut [u64]) -> Self {
         assert!(base.is_aligned(PAGE_SIZE as u64));
         assert!(bits.len() >= Self::storage_words(frames), "bitmap storage too small");
         bits.fill(0);

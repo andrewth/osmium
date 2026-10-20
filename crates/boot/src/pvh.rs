@@ -31,7 +31,9 @@ macro_rules! pvh_entry_note {
             ".long 18\n", // XEN_ELFNOTE_PHYS32_ENTRY
             ".asciz \"Xen\"\n",
             ".balign 4\n",
-            ".long ", $entry, "\n",
+            ".long ",
+            $entry,
+            "\n",
             ".balign 4\n",
             ".popsection\n",
         ));
@@ -213,11 +215,11 @@ pub struct Module {
 
 /// A parsed `hvm_start_info`.
 #[derive(Clone, Copy, Debug)]
-pub struct StartInfo<'a> {
-    header: &'a [u8],
-    memmap: &'a [u8],
-    modules: &'a [u8],
-    cmdline: Option<&'a str>,
+pub struct StartInfo<'src> {
+    header: &'src [u8],
+    memmap: &'src [u8],
+    modules: &'src [u8],
+    cmdline: Option<&'src str>,
     /// Bytes of the command line, NUL included.
     cmdline_len: usize,
     /// Physical address of the header, if known.
@@ -229,10 +231,15 @@ const HEADER_V1: usize = 56;
 const MODULE_SIZE: u64 = 32;
 const MEMMAP_ENTRY_SIZE: u64 = 24;
 
-impl<'a> StartInfo<'a> {
+impl<'src> StartInfo<'src> {
     /// Parses a start-info header plus the memory map, module list and
     /// command line it points to, given as byte slices.
-    pub fn parse(header: &'a [u8], memmap: &'a [u8], modules: &'a [u8], cmdline: Option<&'a [u8]>) -> Result<Self, InvalidStartInfo> {
+    pub fn parse(
+        header: &'src [u8],
+        memmap: &'src [u8],
+        modules: &'src [u8],
+        cmdline: Option<&'src [u8]>,
+    ) -> Result<Self, InvalidStartInfo> {
         if le32(header, 0) != Some(MAGIC) || header.len() < HEADER_V0 {
             return Err(InvalidStartInfo);
         }
@@ -246,7 +253,7 @@ impl<'a> StartInfo<'a> {
     /// # Safety
     /// `ptr` must point at a valid `hvm_start_info` whose memory map, module
     /// list and command line are readable at their physical addresses and
-    /// unmodified for `'a`.
+    /// unmodified for `'src`.
     pub unsafe fn from_ptr(ptr: *const u8) -> Result<Self, InvalidStartInfo> {
         // SAFETY: the caller guarantees the v0 header is readable.
         let v0 = unsafe { core::slice::from_raw_parts(ptr, HEADER_V0) };
@@ -257,7 +264,7 @@ impl<'a> StartInfo<'a> {
         let len = if version >= 1 { HEADER_V1 } else { HEADER_V0 };
         // SAFETY: the version says this much is present.
         let header = unsafe { core::slice::from_raw_parts(ptr, len) };
-        let slice = |pa: u64, n: usize| -> &'a [u8] {
+        let slice = |pa: u64, n: usize| -> &'src [u8] {
             if pa == 0 || n == 0 {
                 &[]
             } else {
@@ -308,7 +315,7 @@ impl<'a> StartInfo<'a> {
     }
 
     /// The kernel command line.
-    pub fn cmdline(&self) -> Option<&'a str> {
+    pub fn cmdline(&self) -> Option<&'src str> {
         self.cmdline
     }
 
@@ -318,7 +325,7 @@ impl<'a> StartInfo<'a> {
     }
 
     /// The memory map.
-    pub fn memory_map(&self) -> impl Iterator<Item = MemmapEntry> + 'a + use<'a> {
+    pub fn memory_map(&self) -> impl Iterator<Item = MemmapEntry> + 'src + use<'src> {
         self.memmap
             .as_chunks::<24>()
             .0
@@ -327,7 +334,7 @@ impl<'a> StartInfo<'a> {
     }
 
     /// Boot modules.
-    pub fn modules(&self) -> impl Iterator<Item = Module> + 'a + use<'a> {
+    pub fn modules(&self) -> impl Iterator<Item = Module> + 'src + use<'src> {
         self.modules
             .as_chunks::<32>()
             .0

@@ -240,7 +240,7 @@ fn mem(addr: u64, len: usize) -> &'static mut [u8] {
 }
 
 fn dword(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+    u32::from_le_bytes(b[off..off + 4].try_into().expect("fixed-width slice"))
 }
 
 impl FakeHba {

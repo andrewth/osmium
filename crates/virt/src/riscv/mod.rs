@@ -33,6 +33,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::memory::{GuestMemory, GuestPhysAddr};
+use crate::stage2::Hgatp;
 use crate::vcpu::{Vcpu, VmExit};
 use insn::MemOp;
 
@@ -136,7 +137,7 @@ pub struct RiscvVcpu {
     pub csrs: VsCsrs,
     /// Floating-point registers.
     pub fp: FpState,
-    hgatp: u64,
+    hgatp: Hgatp,
     pending: Option<MemOp>,
     external: Arc<AtomicBool>,
     ipi: Option<Arc<AtomicBool>>,
@@ -159,14 +160,18 @@ pub mod hvip {
     pub const VSEIP: u64 = 1 << 10;
 }
 
+/// A hart ID, as the guest sees it in `a0` at boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HartId(pub u64);
+
 impl RiscvVcpu {
     /// A vCPU that starts in VS-mode at `entry` with `a0` = `hartid` and
     /// `a1` = `arg` (the device tree, by the Linux boot convention), using
     /// the G-stage table encoded in `hgatp` (see
     /// [`hgatp_sv39x4`](crate::stage2::hgatp_sv39x4)).
-    pub fn new(entry: GuestPhysAddr, hartid: u64, arg: u64, hgatp: u64) -> Self {
+    pub fn new(entry: GuestPhysAddr, hartid: HartId, arg: u64, hgatp: Hgatp) -> Self {
         let mut x = [0; 32];
-        x[10] = hartid;
+        x[10] = hartid.0;
         x[11] = arg;
         let state = GuestState {
             x,
@@ -250,7 +255,7 @@ impl RiscvVcpu {
     }
 
     /// The `hgatp` value this vCPU runs with.
-    pub fn hgatp(&self) -> u64 {
+    pub fn hgatp(&self) -> Hgatp {
         self.hgatp
     }
 
@@ -360,7 +365,7 @@ impl Vcpu for RiscvVcpu {
         }
         self.sync_lines();
         if self.fence.as_ref().is_some_and(|f| f.swap(false, Ordering::AcqRel)) {
-            hw::fence_guest(self.hgatp);
+            hw::fence_guest(self.hgatp.0);
         }
         hw::run(self);
         if let Some(r) = &self.running {
@@ -432,7 +437,7 @@ mod tests {
 
     #[test]
     fn mmio_load_and_store() {
-        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), 0, 0, 0);
+        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), HartId(0), 0, Hgatp(0));
         // lbu t0, 5(a0) at 0x1000_0005, described by htinst.
         let e = exit(&mut v, 21, 0x1000_0005, 0x1000_0005 >> 2, 0x0000_4283);
         assert_eq!(e, VmExit::MmioRead { addr: GuestPhysAddr(0x1000_0005), size: 1 });
@@ -456,7 +461,7 @@ mod tests {
 
     #[test]
     fn ecall_wfi_interrupt() {
-        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), 0, 0, 0);
+        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), HartId(0), 0, Hgatp(0));
         v.state.x[17] = 0x4442_434e; // DBCN
         v.state.x[16] = 2;
         v.state.x[10] = b'x' as u64;
@@ -474,7 +479,7 @@ mod tests {
 
     #[test]
     fn interrupt_lines() {
-        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), 0, 0, 0);
+        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), HartId(0), 0, Hgatp(0));
         let line = v.external_irq();
         line.store(true, Ordering::SeqCst);
         v.sync_lines();

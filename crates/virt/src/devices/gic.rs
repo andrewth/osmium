@@ -108,7 +108,7 @@ impl State {
         let rp = self.running_priority(cpu);
         let mut best: Option<(u8, usize)> = None;
         for i in 0..self.lines() {
-            let irq = self.irq(cpu, i).unwrap();
+            let irq = self.irq(cpu, i).expect("i < lines()");
             // A uniprocessor GIC routes every SPI to its one CPU.
             let targeted = i < PRIVATE || self.cpus.len() == 1 || self.targets[i - PRIVATE] & (1 << cpu) != 0;
             let p = irq.priority;
@@ -162,7 +162,7 @@ impl State {
                 let i = byte_at(GICD_ITARGETSR);
                 (0..4).fold(0, |w, k| {
                     let t = match i + k {
-                        n if n < PRIVATE => 1 << cpu, // reads as the reading CPU
+                        n if n < PRIVATE => 1 << cpu,   // reads as the reading CPU
                         _ if self.cpus.len() == 1 => 0, // RAZ/WI on a uniprocessor
                         n => self.targets.get(n - PRIVATE).copied().unwrap_or(0),
                     };
@@ -257,7 +257,7 @@ impl State {
             GICC_BPR => self.cpus[cpu].bpr as u32,
             GICC_IAR => {
                 let Some(i) = self.best(cpu) else { return SPURIOUS };
-                let irq = self.irq_mut(cpu, i).unwrap();
+                let irq = self.irq_mut(cpu, i).expect("best() returns a valid line");
                 irq.active = true;
                 irq.latched = false;
                 let (prio, source) = (irq.priority, irq.source);
@@ -320,12 +320,23 @@ impl VirtualGicV2 {
 
     /// A GIC for `cpus` vCPUs (at most 8). `output(cpu, level)` reports
     /// changes of each CPU's IRQ line.
+    ///
+    /// # Panics
+    ///
+    /// If `cpus` is not in `1..=8`.
     pub fn with_cpus(cpus: usize, lines: usize, output: impl Fn(usize, bool) + Send + Sync + 'static) -> Self {
         assert!((1..=8).contains(&cpus), "GICv2 supports 1-8 CPUs");
         let lines = lines.max(64).next_multiple_of(32);
         let mut config = vec![0; lines];
         config[..16].fill(2); // SGIs: edge
-        let cpu = || Cpu { private: [Irq::default(); PRIVATE], enable: false, pmr: 0, bpr: 0, running: Vec::new(), asserted: false };
+        let cpu = || Cpu {
+            private: [Irq::default(); PRIVATE],
+            enable: false,
+            pmr: 0,
+            bpr: 0,
+            running: Vec::new(),
+            asserted: false,
+        };
         let state = State {
             dist_enable: false,
             cpus: (0..cpus).map(|_| cpu()).collect(),
@@ -413,7 +424,7 @@ impl BusDevice for Window {
         if !self.interface && data.len() == 1 && (GICD_IPRIORITYR..GICD_ICFGR).contains(&offset) {
             s.write_byte(self.cpu, offset, data[0]);
         } else if data.len() == 4 && offset & 3 == 0 {
-            let v = u32::from_le_bytes(data.try_into().unwrap());
+            let v = u32::from_le_bytes(data.try_into().expect("length checked above"));
             if self.interface { s.cpu_write(self.cpu, offset, v) } else { s.dist_write(self.cpu, offset, v) }
         }
         self.gic.update(&mut s);
@@ -489,7 +500,8 @@ mod tests {
         let lines = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
         let l = lines.clone();
         let gic = Arc::new(VirtualGicV2::with_cpus(2, 64, move |cpu, v| l[cpu].store(v, Ordering::SeqCst)));
-        let (d0, c0, d1, c1) = (gic.distributor_for(0), gic.cpu_interface_for(0), gic.distributor_for(1), gic.cpu_interface_for(1));
+        let (d0, c0, d1, c1) =
+            (gic.distributor_for(0), gic.cpu_interface_for(0), gic.distributor_for(1), gic.cpu_interface_for(1));
         assert_eq!(rd(&d0, GICD_TYPER) >> 5 & 7, 1, "two CPUs");
         wr(&d0, GICD_CTLR, 1);
         for (d, c) in [(&d0, &c0), (&d1, &c1)] {

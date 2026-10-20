@@ -47,7 +47,7 @@ fn ip(b: &[u8], at: usize) -> Ipv4Addr {
 }
 
 fn mac(b: &[u8], at: usize) -> MacAddress {
-    MacAddress(b[at..at + 6].try_into().unwrap())
+    MacAddress(b[at..at + 6].try_into().expect("fixed-width slice"))
 }
 
 /// The Internet checksum (RFC 1071).
@@ -461,7 +461,8 @@ impl TcpHeader {
     /// Builds the segment from `src` to `dst`: this header (with its
     /// options), `payload`, and the checksum.
     pub fn emit(&self, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
-        let mut opts = Vec::new();
+        // A TCP header carries at most 40 bytes of options.
+        let mut opts = Vec::with_capacity(40);
         if let Some(mss) = self.mss {
             opts.extend_from_slice(&[2, 4]);
             opts.extend_from_slice(&mss.to_be_bytes());

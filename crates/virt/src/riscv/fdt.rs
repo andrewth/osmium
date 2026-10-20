@@ -9,23 +9,23 @@ use osmium_boot::fdt::FdtWriter;
 /// `osmium-boot` expect from QEMU `virt`: one `riscv,cpu-intc` per hart, a
 /// PLIC with an M and an S context per hart (the M contexts are left
 /// unconnected), 16550 UARTs and virtio-mmio devices.
-pub struct GuestMachine<'a> {
+pub struct GuestMachine<'src> {
     /// Number of harts.
     pub harts: u32,
     /// `riscv,isa` string, e.g. `"rv64imac"`.
-    pub isa: &'a str,
+    pub isa: &'src str,
     /// Timer frequency in Hz (QEMU `virt`: 10 MHz).
     pub timebase: u32,
     /// RAM as (base, size).
-    pub memory: &'a [(u64, u64)],
+    pub memory: &'src [(u64, u64)],
     /// PLIC as (base, number of sources).
     pub plic: Option<(u64, u32)>,
     /// 16550 UARTs as (base, PLIC source); the first is the console.
-    pub uarts: &'a [(u64, u32)],
+    pub uarts: &'src [(u64, u32)],
     /// virtio-mmio devices as (base, PLIC source).
-    pub virtio: &'a [(u64, u32)],
+    pub virtio: &'src [(u64, u32)],
     /// Kernel command line.
-    pub bootargs: &'a str,
+    pub bootargs: &'src str,
 }
 
 const CPU_INTC_PHANDLE: u32 = 1;

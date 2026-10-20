@@ -35,7 +35,7 @@ fn le16(b: &[u8], at: usize) -> u32 {
 }
 
 fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    u32::from_le_bytes(b[at..at + 4].try_into().expect("fixed-width slice"))
 }
 
 impl Geometry {

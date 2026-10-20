@@ -50,6 +50,10 @@ impl FdtWriter {
     }
 
     /// Closes the innermost open node.
+    ///
+    /// # Panics
+    ///
+    /// If no node is open.
     pub fn end_node(&mut self) {
         assert!(self.depth > 0, "end_node without begin_node");
         self.u32(END_NODE);
@@ -57,6 +61,10 @@ impl FdtWriter {
     }
 
     /// Adds a property with a raw value.
+    ///
+    /// # Panics
+    ///
+    /// If called outside a node.
     pub fn property(&mut self, name: &str, value: &[u8]) {
         assert!(self.depth > 0, "property outside a node");
         let nameoff = self.string_offset(name);
@@ -95,7 +103,7 @@ impl FdtWriter {
 
     /// Adds a string-list property (`compatible`).
     pub fn property_string_list(&mut self, name: &str, list: &[&str]) {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(list.iter().map(|s| s.len() + 1).sum());
         for s in list {
             bytes.extend_from_slice(s.as_bytes());
             bytes.push(0);
@@ -104,6 +112,10 @@ impl FdtWriter {
     }
 
     /// Finishes the tree and returns the blob.
+    ///
+    /// # Panics
+    ///
+    /// If any node is still open.
     pub fn finish(mut self, boot_cpu: u32) -> Vec<u8> {
         assert_eq!(self.depth, 0, "unclosed nodes");
         self.u32(END);

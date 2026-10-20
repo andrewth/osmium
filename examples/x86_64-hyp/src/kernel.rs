@@ -117,7 +117,7 @@ fn guest_console() -> impl Fn(u8) + Send + Sync + 'static {
 pub fn start_host_tick() {
     let count = HOST_TICK_COUNT.load(Ordering::Relaxed);
     if count != 0 {
-        LAPIC.get().unwrap().start_timer(HOST_TICK_VECTOR, count, true);
+        LAPIC.get().expect("LAPIC initialised").start_timer(HOST_TICK_VECTOR, count, true);
     }
 }
 
@@ -143,7 +143,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
             v.set_application_processor();
         }
-        let apic = vm.apics[me].get().unwrap().clone();
+        let apic = vm.apics[me].get().expect("get returned None").clone();
         let a = apic.clone();
         v.connect_intr(move || a.acknowledge());
         vm.cpus.attach_svm(me, &mut v);
@@ -209,7 +209,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             last = Some(exit);
         }
     }
-    LAPIC.get().unwrap().stop_timer();
+    LAPIC.get().expect("LAPIC initialised").stop_timer();
     vm.running.fetch_sub(1, Ordering::AcqRel);
     last
 }
@@ -219,7 +219,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
 pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     let ncpus = ncpus.min(MAX_CPUS);
     // The host tick: calibrate this CPU's local APIC timer against the PIT.
-    let lapic = LAPIC.get().unwrap();
+    let lapic = LAPIC.get().expect("LAPIC initialised");
     lapic.start_timer(HOST_TICK_VECTOR, u32::MAX, false);
     // SAFETY: nothing else uses the host's PIT.
     let pit = osmium::drivers::pit::Pit::new(unsafe { osmium::drivers::pit::Pio::new() });
@@ -253,18 +253,18 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
         println!("[hyp]   the guest kernel overlaps its boot information at {BOOT_INFO:#x}");
         return;
     }
-    mem.write(GuestPhysAddr(BOOT_INFO), &blob.bytes).unwrap();
+    mem.write(GuestPhysAddr(BOOT_INFO), &blob.bytes).expect("write failed");
     let mem = Arc::new(mem);
 
     let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
     let flags = MapFlags::RW | MapFlags::EXEC | MapFlags::USER;
-    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, flags).unwrap();
+    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, flags).expect("map_range failed");
     let ncr3 = npt.root().0;
     core::mem::forget(npt); // in use until power-off
 
     let done = Arc::new(AtomicBool::new(false));
     let cpus = GuestCpus::with_kick(ncpus, |host| {
-        LAPIC.get().unwrap().send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
+        LAPIC.get().expect("LAPIC initialised").send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
     });
     // Interrupt routing: COM1 -> I/O APIC -> the destination's local APIC.
     let apics: Arc<[Once<Arc<VirtualLapic>>; MAX_CPUS]> = Arc::new([const { Once::new() }; MAX_CPUS]);
@@ -304,21 +304,21 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
             });
         let apic = apics[i].call_once(|| Arc::new(apic)).clone();
         let mmio = Bus::new();
-        mmio.insert(LAPIC_BASE, LAPIC_WINDOW, apic).unwrap();
-        mmio.insert(IOAPIC_BASE, IOAPIC_WINDOW, ioapic.clone()).unwrap();
+        mmio.insert(LAPIC_BASE, LAPIC_WINDOW, apic).expect("insert failed");
+        mmio.insert(IOAPIC_BASE, IOAPIC_WINDOW, ioapic.clone()).expect("insert failed");
         buses.push(mmio);
     }
     let pio = Bus::new();
     let io = ioapic.clone();
     let com1 = Arc::new(Uart16550Model::new(guest_console()).with_irq(move |level| io.set_level(COM1_GSI, level)));
-    pio.insert(0x3f8, 8, com1.clone()).unwrap();
+    pio.insert(0x3f8, 8, com1.clone()).expect("insert failed");
     let pit = Arc::new(VirtualPit::new(clock(), |_| {}));
-    pio.insert(0x40, 4, pit.clone()).unwrap();
-    pio.insert(0x61, 1, pit.port_b()).unwrap();
-    pio.insert(0x604, 2, Arc::new(PowerOff(done.clone()))).unwrap();
-    pio.insert(0xf4, 1, Arc::new(PowerOff(done.clone()))).unwrap();
+    pio.insert(0x40, 4, pit.clone()).expect("insert failed");
+    pio.insert(0x61, 1, pit.port_b()).expect("insert failed");
+    pio.insert(0x604, 2, Arc::new(PowerOff(done.clone()))).expect("insert failed");
+    pio.insert(0xf4, 1, Arc::new(PowerOff(done.clone()))).expect("insert failed");
 
-    cpus.request_start(0, entry as u64, blob.start_info).unwrap();
+    cpus.request_start(0, entry as u64, blob.start_info).expect("request_start failed");
     let vm = KernelVm { cpus, mem, ncr3, pio, buses, lines, apics, pit, com1, done, running: AtomicUsize::new(ncpus) };
     KERNEL_VM.store(&raw const vm as *mut KernelVm, Ordering::Release);
     let exit = vcpu_loop(&vm, 0);

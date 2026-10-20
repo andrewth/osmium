@@ -19,7 +19,7 @@ pub trait SerialPort {
 }
 
 /// Adapts a [`SerialPort`] to [`fmt::Write`], translating `\n` to `\r\n`.
-pub struct SerialWriter<'a, S: SerialPort + ?Sized>(pub &'a mut S);
+pub struct SerialWriter<'port, S: SerialPort + ?Sized>(pub &'port mut S);
 
 impl<S: SerialPort + ?Sized> fmt::Write for SerialWriter<'_, S> {
     fn write_str(&mut self, s: &str) -> fmt::Result {

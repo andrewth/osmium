@@ -924,7 +924,9 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             match slot.endpoint(i) {
                 Some(old) => *old = ep,
                 // Room was checked above.
-                None => *slot.endpoints.iter_mut().find(|e| e.is_none()).unwrap() = Some(ep),
+                None => {
+                    *slot.endpoints.iter_mut().find(|e| e.is_none()).expect("endpoint slot checked above") = Some(ep)
+                }
             }
         }
         Ok(())
@@ -1073,10 +1075,10 @@ mod tests {
     /// reset sequence) with one slot whose endpoint 3 has a `submit_in`
     /// transfer outstanding at TRB address 0x1000. Nothing answers commands
     /// or transfers.
-    fn fake<'a>(
-        dma: &'a crate::virtio::testing::HostDma,
+    fn fake<'dma>(
+        dma: &'dma crate::virtio::testing::HostDma,
         regs: &mut [u32],
-    ) -> Xhci<'a, crate::virtio::testing::HostDma> {
+    ) -> Xhci<'dma, crate::virtio::testing::HostDma> {
         // SAFETY: the window covers the caller's array, which outlives the controller.
         let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), regs.len() * 4) };
         let mut endpoints = [const { None }; MAX_ENDPOINTS];

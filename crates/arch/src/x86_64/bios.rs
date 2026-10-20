@@ -313,6 +313,10 @@ pub unsafe fn int(vector: u8, regs: &mut Regs) {
 ///
 /// # Safety
 /// As [`int`]; the call may write only the buffer.
+///
+/// # Panics
+///
+/// If `buf` is longer than [`BUFFER_LEN`].
 pub unsafe fn int_with_buffer(vector: u8, regs: &mut Regs, buf: &mut [u8]) {
     assert!(buf.len() <= BUFFER_LEN);
     regs.es = (BUFFER >> 4) as u16;

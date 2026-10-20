@@ -17,35 +17,35 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use core::ptr::NonNull;
 use osmium::arch::riscv64::{self, SatpMode, sbi};
 use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::{Fdt, Node};
-use osmium::drivers::uart16550::{Mmio, Uart16550};
-use osmium::drivers::virtio::mmio::MmioTransport;
-use osmium::drivers::virtio::blk::VirtioBlk;
-use osmium::drivers::virtio::net::VirtioNet;
-use osmium::drivers::virtio::{DeviceType, Transport};
-use osmium::drivers::plic::Plic;
 use osmium::drivers::ahci::{self, Ahci};
 use osmium::drivers::nvme::{self, Nvme};
+use osmium::drivers::plic::Plic;
+use osmium::drivers::uart16550::{Mmio, Uart16550};
+use osmium::drivers::virtio::blk::VirtioBlk;
+use osmium::drivers::virtio::mmio::MmioTransport;
+use osmium::drivers::virtio::net::VirtioNet;
+use osmium::drivers::virtio::{DeviceType, Transport};
 use osmium::drivers::xhci::Xhci;
 use osmium::hal::block::BlockDevice;
-use osmium::hal::irq::{InterruptController, IrqTable};
-use osmium::hal::pci;
-use osmium::hal::usb::UsbHost;
 use osmium::hal::console::{Console, SerialConsole, set_console};
+use osmium::hal::irq::{InterruptController, IrqTable};
 use osmium::hal::mmio::IoMem;
+use osmium::hal::pci;
 use osmium::hal::println;
 use osmium::hal::timer::{Clock, TickRate};
-use osmium::mm::heap::LockedHeap;
-use osmium::mm::paging::formats::Sv39;
+use osmium::hal::usb::UsbHost;
 use osmium::mm::frame::order_for;
+use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::PageSize;
+use osmium::mm::paging::formats::Sv39;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sched::timer::TimerQueue;
-use core::ptr::NonNull;
 
 use osmium::arch::trap::TrapCpu;
 use osmium::proc::{AddressSpace, ExitStatus, Process, UserMemory};
@@ -182,7 +182,8 @@ fn xhci_irq(_irq: u32) {
 
 // SAFETY: the kernel runs identity-mapped (before and after enabling
 // paging), so physical address = virtual address for all RAM.
-pub(crate) static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
+pub(crate) static FRAMES: Frames =
+    unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
 
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
@@ -208,9 +209,9 @@ unsafe impl StackAllocator for GuardedStacks {
         let guard = base.as_ptr() as u64 - PAGE_SIZE as u64;
         {
             let mut pt = PT.lock();
-            let pt = pt.as_mut().unwrap();
+            let pt = pt.as_mut().expect("as_mut returned None");
             let flags = MapFlags::RW | MapFlags::GLOBAL;
-            pt.map(VirtAddr::new(guard), PhysAddr::new(guard), PageSize::Size4K, flags).unwrap().flush();
+            pt.map(VirtAddr::new(guard), PhysAddr::new(guard), PageSize::Size4K, flags).expect("map failed").flush();
         }
         // SAFETY: the block came from `alloc` with the same order.
         unsafe { FRAMES.lock().dealloc(PhysAddr::new(guard), order_for(len + PAGE_SIZE)) };
@@ -300,7 +301,12 @@ fn pcie_host(fdt: &Fdt<'_>) -> Option<PcieHost> {
 
 /// Finds the first function of class `class`, assigns its BARs from `bars`
 /// and enables it; returns its address, BAR `bar` and interrupt pin.
-fn find_pci(host: &PcieHost, bars: &mut pci::BarAllocator, class: pci::Class, bar: u8) -> Option<(pci::Address, u64, u64, u8)> {
+fn find_pci(
+    host: &PcieHost,
+    bars: &mut pci::BarAllocator,
+    class: pci::Class,
+    bar: u8,
+) -> Option<(pci::Address, u64, u64, u8)> {
     // SAFETY: the device tree puts the ECAM window here, mapped as device
     // memory; only this function uses it.
     let ecam = pci::Ecam::new(unsafe { IoMem::new(host.ecam.0 as *mut u8, host.ecam.1 as usize) }, 0);
@@ -341,7 +347,9 @@ fn pci_intx_irq(fdt: &Fdt<'_>, addr: pci::Address, pin: u8) -> Option<u32> {
         if i + 5 + acells + icells > map.len() {
             return None;
         }
-        if (0..4).all(|k| map[i + k] & mask.get(k).copied().unwrap_or(!0) == unit[k] & mask.get(k).copied().unwrap_or(!0)) {
+        if (0..4)
+            .all(|k| map[i + k] & mask.get(k).copied().unwrap_or(!0) == unit[k] & mask.get(k).copied().unwrap_or(!0))
+        {
             return map.get(i + 5 + acells).copied();
         }
         i += 5 + acells + icells;
@@ -386,7 +394,7 @@ fn xhci_interrupts(
 }
 
 /// Base and size of every virtio-mmio slot in the device tree.
-fn virtio_slots<'a>(fdt: &Fdt<'a>) -> impl Iterator<Item = (u64, u64)> + 'a {
+fn virtio_slots<'src>(fdt: &Fdt<'src>) -> impl Iterator<Item = (u64, u64)> + 'src {
     fdt.all_nodes()
         .filter(|n| n.compatible().any(|c| c == "virtio,mmio"))
         .filter_map(|n| n.reg().next().map(|(a, s)| (a, s.unwrap_or(0x200))))
@@ -405,7 +413,7 @@ fn wait_online(n: usize) -> bool {
 }
 
 fn now_ns() -> u64 {
-    RATE.get().unwrap().ticks_to_ns(cpu::ticks())
+    RATE.get().expect("RATE initialised").ticks_to_ns(cpu::ticks())
 }
 
 /// [`now_ns`] for drivers that take a [`Clock`].
@@ -439,7 +447,8 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     // --- Console on the real UART -----------------------------------------
     let uart_node = fdt.find_compatible(&["ns16550a"]).expect("no UART");
-    let (uart_base, uart_len) = uart_node.reg().next().map(|(a, s)| (a, s.unwrap_or(0x100))).unwrap();
+    let (uart_base, uart_len) =
+        uart_node.reg().next().map(|(a, s)| (a, s.unwrap_or(0x100))).expect("UART has a reg property");
     let shift = uart_node.property("reg-shift").and_then(|p| p.as_u32()).unwrap_or(0) as u8;
     // SAFETY: the device tree says the UART's registers live here; nothing else uses them.
     let io = unsafe { IoMem::new(uart_base as *mut u8, uart_len as usize) };
@@ -450,11 +459,11 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     // --- Physical memory ---------------------------------------------------
     let mut map = MemoryMap::<32>::new();
-    fdt.fill_memory_map(&mut map, Some(PhysAddr::new(dtb as u64))).unwrap();
+    fdt.fill_memory_map(&mut map, Some(PhysAddr::new(dtb as u64))).expect("fill_memory_map failed");
     // SAFETY: linker-provided symbols.
     let (kstart, etext, erodata, kend) =
         unsafe { (sym(&_kernel_start), sym(&_etext), sym(&_erodata), sym(&_kernel_end)) };
-    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
+    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).expect("reserve failed");
     map.page_align_usable();
     for r in map.regions() {
         println!("[mem]   {:#011x}..{:#011x} {:?}", r.start.0, r.end.0, r.kind);
@@ -465,7 +474,11 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             // SAFETY: the memory map says the range is free RAM, identity-mapped.
             unsafe { buddy.add_region(r.start, r.end) };
         }
-        println!("[frame] buddy allocator: {} free frames ({} MiB)", buddy.free_frames(), (buddy.free_frames() * PAGE_SIZE) >> 20);
+        println!(
+            "[frame] buddy allocator: {} free frames ({} MiB)",
+            buddy.free_frames(),
+            (buddy.free_frames() * PAGE_SIZE) >> 20
+        );
     }
 
     // --- Heap ------------------------------------------------------------
@@ -481,22 +494,25 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // --- Paging (Sv39, W^X) ------------------------------------------------
     // The kernel's own memory node is mapped piecewise below (W^X); any
     // other node, all of which the frame allocator was given, as RW.
-    let ram = fdt.memory().find(|&(base, len)| (base..base + len).contains(&kstart)).expect("no memory node holds the kernel");
+    let ram = fdt
+        .memory()
+        .find(|&(base, len)| (base..base + len).contains(&kstart))
+        .expect("no memory node holds the kernel");
     let ram_end = ram.0 + ram.1;
-    let mut pt: PageTable<Sv39, &'static Frames> = PageTable::new(&FRAMES).unwrap();
+    let mut pt: PageTable<Sv39, &'static Frames> = PageTable::new(&FRAMES).expect("new failed");
     let k = |f| f | MapFlags::GLOBAL;
     let va = |a: u64| VirtAddr::new(a);
     let pa = |a: u64| PhysAddr::new(a);
     // RAM below the kernel holds firmware (PMP-protected, never touched) and
     // free frames the allocator hands out.
-    pt.map_range(va(ram.0), pa(ram.0), kstart - ram.0, k(MapFlags::RW)).unwrap();
-    pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).unwrap();
-    pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).unwrap();
-    pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).unwrap();
+    pt.map_range(va(ram.0), pa(ram.0), kstart - ram.0, k(MapFlags::RW)).expect("map_range failed");
+    pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).expect("map_range failed");
+    pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).expect("map_range failed");
+    pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).expect("map_range failed");
     for (base, len) in fdt.memory().filter(|&m| m != ram) {
         let (start, end) = (base.next_multiple_of(PAGE_SIZE as u64), (base + len) & !(PAGE_SIZE as u64 - 1));
         if start < end {
-            pt.map_range(va(start), pa(start), end - start, k(MapFlags::RW)).unwrap();
+            pt.map_range(va(start), pa(start), end - start, k(MapFlags::RW)).expect("map_range failed");
         }
     }
     // Device windows from the device tree: rounded out to whole pages, and
@@ -535,9 +551,9 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: the table identity-maps the running code, its stack, the heap and the UART.
     unsafe { riscv64::write_satp(SatpMode::Sv39, 0, pt.root().0) };
     SATP_ROOT.store(pt.root().0, Ordering::Release);
-    let t = pt.translate(va(kmain as *const () as u64)).unwrap();
+    let t = pt.translate(va(kmain as *const () as u64)).expect("translate failed");
     println!("[mmu]   Sv39 on, root {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
-    let t = pt.translate(va(ram_end - 1)).unwrap();
+    let t = pt.translate(va(ram_end - 1)).expect("translate failed");
     println!("[mmu]   top of RAM mapped {:?} via {:?} page", t.flags, t.size);
     *PT.lock() = Some(pt);
     set_exception_stack();
@@ -554,7 +570,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // --- Scheduler and timer interrupts -----------------------------------
     osmium::sched::inject_scheduler(&SCHED);
     osmium::sched::init_cpu();
-    sbi::set_timer(cpu::ticks() + RATE.get().unwrap().ns_to_ticks(TICK_NS));
+    sbi::set_timer(cpu::ticks() + RATE.get().expect("RATE initialised").ns_to_ticks(TICK_NS));
     // SAFETY: enabling timer and software interrupts; the trap vector is installed.
     unsafe { riscv64::write_sie(riscv64::SIE_STIE | riscv64::SIE_SSIE) };
     irq::enable();
@@ -627,7 +643,9 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             let mut disk = VirtioBlk::new(t, &FRAMES).expect("virtio-blk init failed");
             let n = disk.num_blocks();
             match demos::block_roundtrip(&mut disk) {
-                Ok(lba) => println!("[blk]   virtio-blk ({legacy}) at {base:#x}: {n} sectors; wrote and read back sector {lba}"),
+                Ok(lba) => println!(
+                    "[blk]   virtio-blk ({legacy}) at {base:#x}: {n} sectors; wrote and read back sector {lba}"
+                ),
                 Err(e) => println!("[blk]   virtio-blk ({legacy}) at {base:#x}: {n} sectors; round trip failed: {e:?}"),
             }
         }
@@ -650,7 +668,10 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
                             Ok(mut disk) => {
                                 let (n, bs) = (disk.num_blocks(), disk.block_size());
                                 let r = demos::block_roundtrip(&mut disk);
-                                println!("[ahci]  port {port} \"{}\": {n} sectors of {bs}; round trip {r:?}", disk.model());
+                                println!(
+                                    "[ahci]  port {port} \"{}\": {n} sectors of {bs}; round trip {r:?}",
+                                    disk.model()
+                                );
                             }
                             Err(e) => println!("[ahci]  port {port}: {e:?}"),
                         }
@@ -712,7 +733,13 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
             let mut hc = Xhci::new(io, &FRAMES).expect("xHCI init failed");
             hc.no_op().expect("xHCI command ring");
-            println!("[usb]   xHCI at {:02x}:{:02x}.{} BAR0 {base:#x}, {} ports", addr.bus, addr.device, addr.function, hc.num_ports());
+            println!(
+                "[usb]   xHCI at {:02x}:{:02x}.{} BAR0 {base:#x}, {} ports",
+                addr.bus,
+                addr.device,
+                addr.function,
+                hc.num_ports()
+            );
             // In a static, so drivers built on it (and a file system on the
             // USB stick) and the interrupt handler can live as long as the kernel.
             let xhci = XHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc));
@@ -744,7 +771,11 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         println!("[hyp]   no H extension in riscv,isa: skipping the guests (running as one?)");
     }
 
-    println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
+    println!(
+        "[done]  {} timer ticks, {} free frames; shutting down",
+        TICKS.load(Ordering::Relaxed),
+        FRAMES.lock().free_frames()
+    );
     sbi::shutdown()
 }
 
@@ -756,11 +787,11 @@ fn fault_demo() {
     RECOVER.store(true, Ordering::SeqCst);
     // SAFETY: the handler steps over the breakpoint.
     unsafe { core::arch::asm!("ebreak") };
-    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().unwrap());
+    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().expect("recovery recorded by the trap handler"));
     // Nothing is mapped at 0x1000: a load page fault.
     // SAFETY: the read faults and the handler skips it; the value is never used.
     let _ = unsafe { core::ptr::read_volatile(0x1000 as *const u64) };
-    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().unwrap());
+    println!("[trap]  recovered from {:?}", RECOVERED.lock().take().expect("recovery recorded by the trap handler"));
     RECOVER.store(false, Ordering::SeqCst);
 }
 
@@ -779,7 +810,7 @@ extern "C" fn secondary_main(hartid: usize, boot: &SecondaryBoot) -> ! {
         unsafe { osmium::arch::fp::enable() };
     }
     osmium::sched::init_cpu();
-    sbi::set_timer(cpu::ticks() + RATE.get().unwrap().ns_to_ticks(TICK_NS));
+    sbi::set_timer(cpu::ticks() + RATE.get().expect("RATE initialised").ns_to_ticks(TICK_NS));
     // SAFETY: as on the boot hart.
     unsafe { riscv64::write_sie(riscv64::SIE_STIE | riscv64::SIE_SSIE) };
     irq::enable();
@@ -815,7 +846,8 @@ type Space = AddressSpace<Sv39, &'static Frames>;
 
 fn new_space() -> Space {
     // SAFETY: the kernel table lives for the whole run.
-    unsafe { Space::new(&FRAMES, PT.lock().as_ref().unwrap(), 0..64) }.expect("out of memory for a page table")
+    unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..64) }
+        .expect("out of memory for a page table")
 }
 
 /// Copies a user program into fresh pages, maps it user-accessible (code
@@ -832,8 +864,8 @@ fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> (Arc<
     }
     let (code_va, stack_va) = (USER_BASE, USER_BASE + 0x8000);
     let space = new_space();
-    space.load_flat(code_va, &code, MapFlags::RX).unwrap();
-    space.map_anon(stack_va, PAGE_SIZE as u64, MapFlags::RW).unwrap();
+    space.load_flat(code_va, &code, MapFlags::RX).expect("load_flat failed");
+    space.map_anon(stack_va, PAGE_SIZE as u64, MapFlags::RW).expect("map_anon failed");
     let process = Process::new(name, space, USER_BASE + 0x10000);
     let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
         // The code was written through the identity map, possibly by another
@@ -857,7 +889,7 @@ fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> (Arc<Task>, Weak<P
     let space = new_space();
     let brk = space.load_elf(&elf).expect("loading the user ELF failed");
     let stack_top: u64 = 0x11_0000_0000;
-    space.map_anon(stack_top - PAGE_SIZE as u64, PAGE_SIZE as u64, MapFlags::RW).unwrap();
+    space.map_anon(stack_top - PAGE_SIZE as u64, PAGE_SIZE as u64, MapFlags::RW).expect("map_anon failed");
     let entry = elf.entry();
     let process = Process::new(name, space, brk);
     process.set_mmap_area(0x12_0000_0000..0x13_0000_0000);
@@ -881,7 +913,7 @@ fn platform() -> osmium::proc::Platform {
     osmium::proc::Platform {
         new_memory: || {
             // SAFETY: the kernel table lives for the whole run.
-            let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().unwrap(), 0..64) };
+            let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..64) };
             Ok(alloc::boxed::Box::new(space.map_err(|_| osmium::fs::Errno::ENOMEM)?))
         },
         activate: |root| {
@@ -905,10 +937,14 @@ fn platform() -> osmium::proc::Platform {
 /// go wherever the scheduler puts them.
 fn fork_exec_demo(cpu: usize) {
     demos::user::install("init", INIT_ELF);
-    let process = Process::new_boxed("init", (platform().new_memory)().unwrap(), 0);
+    let process =
+        Process::new_boxed("init", (platform().new_memory)().expect("out of memory for the init address space"), 0);
     let init = Arc::downgrade(&process);
     let task = process.spawn(TaskBuilder::new("init").cpu(cpu), || {
-        let entry = osmium::proc::current().unwrap().exec("/bin/init", &[b"init"], &[]).expect("exec /bin/init");
+        let entry = osmium::proc::current()
+            .expect("current returned None")
+            .exec("/bin/init", &[b"init"], &[])
+            .expect("exec /bin/init");
         // SAFETY: exec activated the new table; traps are installed and the
         // switch hook keeps TrapCpu's kernel stack on this task.
         unsafe { riscv64::enter_user(entry.pc as usize, entry.sp as usize) }
@@ -1059,14 +1095,22 @@ fn handle_trap(frame: &mut TrapFrame) {
         // This frame lives on the exception stack; the task's own stack is
         // exhausted, so it cannot continue. End only that task.
         let task = osmium::sched::current();
-        println!("[guard] task {:?} overflowed its stack ({:?} at sp {:#x}); killed", task.name(), frame.cause(), frame.sp());
+        println!(
+            "[guard] task {:?} overflowed its stack ({:?} at sp {:#x}); killed",
+            task.name(),
+            frame.cause(),
+            frame.sp()
+        );
         // A trap taken while on the exception stack must nest there, not be
         // mistaken for another overflow.
         RECOVER.store(true, Ordering::SeqCst);
         // SAFETY: the breakpoint arm below steps over it.
         unsafe { core::arch::asm!("ebreak") };
         RECOVER.store(false, Ordering::SeqCst);
-        println!("[guard] nested {:?} on the exception stack handled", RECOVERED.lock().take().unwrap());
+        println!(
+            "[guard] nested {:?} on the exception stack handled",
+            RECOVERED.lock().take().expect("recovery recorded by the trap handler")
+        );
         drop(task);
         osmium::sched::exit();
     }
@@ -1104,7 +1148,7 @@ fn on_timer() {
     if cpu::current_id() == 0 {
         TICKS.fetch_add(1, Ordering::Relaxed);
     }
-    let rate = RATE.get().unwrap();
+    let rate = RATE.get().expect("RATE initialised");
     sbi::set_timer(cpu::ticks() + rate.ns_to_ticks(TICK_NS));
     TIMERS.process(now_ns());
     osmium::sched::tick();

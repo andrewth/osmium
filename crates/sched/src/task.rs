@@ -211,6 +211,10 @@ impl Task {
 
     /// Moves the task to `cpu`'s run queue the next time it is queued. A
     /// task pinned to one CPU stays pinned, to the new one.
+    ///
+    /// # Panics
+    ///
+    /// If `cpu` is not below [`osmium_arch::MAX_CPUS`].
     pub fn set_cpu(&self, cpu: usize) {
         assert!(cpu < osmium_arch::MAX_CPUS);
         if self.affinity().count_ones() == 1 {
@@ -221,6 +225,10 @@ impl Task {
 
     /// Pins the task to `cpu`: it moves there the next time it is queued
     /// and no policy moves it elsewhere.
+    ///
+    /// # Panics
+    ///
+    /// If `cpu` is not below [`osmium_arch::MAX_CPUS`].
     pub fn pin(&self, cpu: usize) {
         assert!(cpu < osmium_arch::MAX_CPUS);
         self.affinity.store(1 << cpu, Ordering::Relaxed);
@@ -234,12 +242,20 @@ impl Task {
     }
 
     /// The CPUs the task may run on (bit `n` = CPU `n`).
+    ///
+    /// # Panics
+    ///
+    /// If `mask` is empty.
     pub fn affinity(&self) -> u64 {
         self.affinity.load(Ordering::Relaxed)
     }
 
     /// Restricts the task to the CPUs in `mask`. If its current CPU is not
     /// among them, it moves to the lowest one the next time it is queued.
+    ///
+    /// # Panics
+    ///
+    /// If `mask` is empty.
     pub fn set_affinity(&self, mask: u64) {
         assert!(mask != 0, "a task must be allowed on some CPU");
         self.affinity.store(mask, Ordering::Relaxed);
@@ -278,7 +294,7 @@ impl Task {
     /// one is already set.
     pub fn set_data<T: Any + Send + Sync>(&self, value: T) -> Result<(), T> {
         let mut value = Some(value);
-        self.data.call_once(|| Box::new(value.take().unwrap()));
+        self.data.call_once(|| Box::new(value.take().expect("call_once runs its closure at most once")));
         match value {
             None => Ok(()),
             Some(v) => Err(v),

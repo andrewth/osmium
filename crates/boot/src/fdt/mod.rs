@@ -39,8 +39,8 @@ pub enum FdtError {
 
 /// A parsed device tree blob.
 #[derive(Clone, Copy)]
-pub struct Fdt<'a> {
-    data: &'a [u8],
+pub struct Fdt<'src> {
+    data: &'src [u8],
     /// Struct block `[start, end)`.
     structs: Span,
     /// Strings block `[start, end)`.
@@ -49,9 +49,9 @@ pub struct Fdt<'a> {
     boot_cpu: u32,
 }
 
-impl<'a> Fdt<'a> {
+impl<'src> Fdt<'src> {
     /// Validates the header of `data`.
-    pub fn new(data: &'a [u8]) -> Result<Self, FdtError> {
+    pub fn new(data: &'src [u8]) -> Result<Self, FdtError> {
         let h = |i: usize| be32(data, i * 4).ok_or(FdtError::Truncated);
         if h(0)? != MAGIC {
             return Err(FdtError::BadMagic);
@@ -90,7 +90,7 @@ impl<'a> Fdt<'a> {
     ///
     /// # Safety
     /// `ptr` must point to a readable device tree that stays valid and
-    /// unmodified for `'a`.
+    /// unmodified for `'src`.
     pub unsafe fn from_ptr(ptr: *const u8) -> Result<Self, FdtError> {
         // SAFETY: the caller guarantees the header is readable.
         let header = unsafe { core::slice::from_raw_parts(ptr, 8) };
@@ -113,13 +113,13 @@ impl<'a> Fdt<'a> {
     }
 
     /// The root node.
-    pub fn root(&self) -> Node<'a> {
+    pub fn root(&self) -> Node<'src> {
         Node { fdt: *self, begin: self.structs.start + self.skip_nops(0), parent_cells: Cells::ROOT }
     }
 
     /// Finds a node by absolute path. A path component without a unit
     /// address (`memory`) matches a node with one (`memory@80000000`).
-    pub fn find_node(&self, path: &str) -> Option<Node<'a>> {
+    pub fn find_node(&self, path: &str) -> Option<Node<'src>> {
         let mut node = self.root();
         for part in path.split('/').filter(|p| !p.is_empty()) {
             node = node.children().find(|c| {
@@ -131,34 +131,34 @@ impl<'a> Fdt<'a> {
     }
 
     /// Every node, depth-first.
-    pub fn all_nodes(&self) -> AllNodes<'a> {
+    pub fn all_nodes(&self) -> AllNodes<'src> {
         AllNodes { fdt: *self, off: self.root().begin, stack: [Cells::ROOT; MAX_DEPTH], depth: 0 }
     }
 
     /// The first node compatible with any of `compatible`.
-    pub fn find_compatible(&self, compatible: &[&str]) -> Option<Node<'a>> {
+    pub fn find_compatible(&self, compatible: &[&str]) -> Option<Node<'src>> {
         self.all_nodes().find(|n| n.compatible().any(|c| compatible.contains(&c)))
     }
 
     /// The `/chosen` node.
-    pub fn chosen(&self) -> Option<Node<'a>> {
+    pub fn chosen(&self) -> Option<Node<'src>> {
         self.find_node("/chosen")
     }
 
     /// The `bootargs` property of `/chosen`.
-    pub fn bootargs(&self) -> Option<&'a str> {
+    pub fn bootargs(&self) -> Option<&'src str> {
         self.chosen()?.property("bootargs")?.as_str()
     }
 
     /// `(address, size)` of every RAM range in `device_type = "memory"` nodes.
-    pub fn memory(&self) -> impl Iterator<Item = (u64, u64)> + 'a + use<'a> {
+    pub fn memory(&self) -> impl Iterator<Item = (u64, u64)> + 'src + use<'src> {
         self.all_nodes()
             .filter(|n| n.property("device_type").and_then(|p| p.as_str()) == Some("memory"))
             .flat_map(|n| n.reg().map(|(a, s)| (a, s.unwrap_or(0))))
     }
 
     /// Entries of the memory reservation block.
-    pub fn reservations(&self) -> impl Iterator<Item = (u64, u64)> + 'a + use<'a> {
+    pub fn reservations(&self) -> impl Iterator<Item = (u64, u64)> + 'src + use<'src> {
         let data = self.data;
         let base = self.rsvmap;
         (0usize..)
@@ -238,12 +238,12 @@ impl<'a> Fdt<'a> {
         off - self.structs.start
     }
 
-    fn string(&self, nameoff: usize) -> Option<&'a str> {
+    fn string(&self, nameoff: usize) -> Option<&'src str> {
         cstr(self.data.get(self.strings.start + nameoff..self.strings.end)?)
     }
 
     /// Parses the property at `off`; returns it and the offset after it.
-    fn prop_at(&self, off: usize) -> Option<(Property<'a>, usize)> {
+    fn prop_at(&self, off: usize) -> Option<(Property<'src>, usize)> {
         let len = be32(self.data, off.checked_add(4)?)? as usize;
         let name = self.string(be32(self.data, off.checked_add(8)?)? as usize)?;
         let start = off.checked_add(12)?;
@@ -317,17 +317,17 @@ impl Cells {
 
 /// A node of the tree.
 #[derive(Clone, Copy)]
-pub struct Node<'a> {
-    fdt: Fdt<'a>,
+pub struct Node<'src> {
+    fdt: Fdt<'src>,
     /// Offset of the BEGIN_NODE token.
     begin: usize,
     parent_cells: Cells,
 }
 
-impl<'a> Node<'a> {
+impl<'src> Node<'src> {
     /// The node's name, including any unit address (`uart@10000000`). The
     /// root's name is empty.
-    pub fn name(&self) -> &'a str {
+    pub fn name(&self) -> &'src str {
         self.fdt.data.get(self.begin + 4..).and_then(cstr).unwrap_or("")
     }
 
@@ -336,7 +336,7 @@ impl<'a> Node<'a> {
     }
 
     /// The node's properties.
-    pub fn properties(&self) -> impl Iterator<Item = Property<'a>> + 'a + use<'a> {
+    pub fn properties(&self) -> impl Iterator<Item = Property<'src>> + 'src + use<'src> {
         let fdt = self.fdt;
         let mut off = self.props_start();
         core::iter::from_fn(move || {
@@ -355,7 +355,7 @@ impl<'a> Node<'a> {
     }
 
     /// The property called `name`.
-    pub fn property(&self, name: &str) -> Option<Property<'a>> {
+    pub fn property(&self, name: &str) -> Option<Property<'src>> {
         self.properties().find(|p| p.name == name)
     }
 
@@ -366,7 +366,7 @@ impl<'a> Node<'a> {
     }
 
     /// The node's direct children.
-    pub fn children(&self) -> impl Iterator<Item = Node<'a>> + 'a + use<'a> {
+    pub fn children(&self) -> impl Iterator<Item = Node<'src>> + 'src + use<'src> {
         let fdt = self.fdt;
         let cells = self.child_cells();
         // Skip past the properties to the first child.
@@ -397,7 +397,7 @@ impl<'a> Node<'a> {
     }
 
     /// The `compatible` strings.
-    pub fn compatible(&self) -> impl Iterator<Item = &'a str> + 'a + use<'a> {
+    pub fn compatible(&self) -> impl Iterator<Item = &'src str> + 'src + use<'src> {
         self.property("compatible").into_iter().flat_map(|p| p.as_str_list())
     }
 
@@ -408,7 +408,7 @@ impl<'a> Node<'a> {
 
     /// `(address, size)` pairs of the `reg` property, decoded with the
     /// parent's cell counts. `size` is `None` when `#size-cells` is 0.
-    pub fn reg(&self) -> impl Iterator<Item = (u64, Option<u64>)> + 'a + use<'a> {
+    pub fn reg(&self) -> impl Iterator<Item = (u64, Option<u64>)> + 'src + use<'src> {
         let Cells { address, size } = self.parent_cells;
         let value = self.property("reg").map_or(&[][..], |p| p.value);
         let stride = (address + size) as usize * 4;
@@ -423,7 +423,7 @@ impl<'a> Node<'a> {
 
     /// Interrupt specifiers of the `interrupts` property, one `u32` each
     /// (the common one-cell case, as on the RISC-V PLIC).
-    pub fn interrupts(&self) -> impl Iterator<Item = u32> + 'a + use<'a> {
+    pub fn interrupts(&self) -> impl Iterator<Item = u32> + 'src + use<'src> {
         self.property("interrupts").into_iter().flat_map(|p| p.as_u32_cells())
     }
 }
@@ -439,18 +439,18 @@ fn read_cells(bytes: &[u8]) -> u64 {
 }
 
 /// Depth-first iterator over all nodes.
-pub struct AllNodes<'a> {
-    fdt: Fdt<'a>,
+pub struct AllNodes<'src> {
+    fdt: Fdt<'src>,
     off: usize,
     /// Child cells of each open ancestor.
     stack: [Cells; MAX_DEPTH],
     depth: usize,
 }
 
-impl<'a> Iterator for AllNodes<'a> {
-    type Item = Node<'a>;
+impl<'src> Iterator for AllNodes<'src> {
+    type Item = Node<'src>;
 
-    fn next(&mut self) -> Option<Node<'a>> {
+    fn next(&mut self) -> Option<Node<'src>> {
         loop {
             match self.fdt.token(self.off)? {
                 BEGIN_NODE => {
@@ -479,14 +479,14 @@ impl<'a> Iterator for AllNodes<'a> {
 
 /// A property: a name and raw big-endian bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Property<'a> {
+pub struct Property<'src> {
     /// The property name.
-    pub name: &'a str,
+    pub name: &'src str,
     /// The raw value.
-    pub value: &'a [u8],
+    pub value: &'src [u8],
 }
 
-impl<'a> Property<'a> {
+impl<'src> Property<'src> {
     /// The value as one big-endian `u32`.
     pub fn as_u32(&self) -> Option<u32> {
         (self.value.len() == 4).then(|| be32(self.value, 0)).flatten()
@@ -502,17 +502,17 @@ impl<'a> Property<'a> {
     }
 
     /// The value as a NUL-terminated string.
-    pub fn as_str(&self) -> Option<&'a str> {
+    pub fn as_str(&self) -> Option<&'src str> {
         cstr(self.value)
     }
 
     /// The value as a list of NUL-terminated strings.
-    pub fn as_str_list(&self) -> impl Iterator<Item = &'a str> + 'a + use<'a> {
+    pub fn as_str_list(&self) -> impl Iterator<Item = &'src str> + 'src + use<'src> {
         self.value.split(|&b| b == 0).filter(|s| !s.is_empty()).filter_map(|s| core::str::from_utf8(s).ok())
     }
 
     /// The value as big-endian `u32` cells.
-    pub fn as_u32_cells(&self) -> impl Iterator<Item = u32> + 'a + use<'a> {
+    pub fn as_u32_cells(&self) -> impl Iterator<Item = u32> + 'src + use<'src> {
         self.value.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes(*c))
     }
 }

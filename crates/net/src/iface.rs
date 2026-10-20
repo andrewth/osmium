@@ -338,7 +338,7 @@ impl Interface {
         self.ident = self.ident.wrapping_add(1);
         let step = (self.mtu - IPV4_HEADER_LEN) / 8 * 8;
         let whole = IPV4_HEADER_LEN + p.payload.len() <= self.mtu;
-        let mut frames = Vec::new();
+        let mut frames = Vec::with_capacity(if whole { 1 } else { p.payload.len().div_ceil(step) });
         let mut offset = 0;
         while offset < p.payload.len() || (whole && frames.is_empty()) {
             let len = if whole { p.payload.len() } else { step.min(p.payload.len() - offset) };
@@ -441,7 +441,7 @@ impl Interface {
         let mut i = 0;
         while i < self.pending.len() {
             if self.pending[i].next_hop == ip {
-                let p = self.pending.remove(i).unwrap();
+                let p = self.pending.remove(i).expect("i < pending.len()");
                 self.queue_ip(mac, &p.packet);
             } else {
                 i += 1;

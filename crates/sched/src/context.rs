@@ -26,6 +26,10 @@ impl Context {
     ///
     /// # Safety
     /// The stack must be writable and large enough for `entry`.
+    ///
+    /// # Panics
+    ///
+    /// If `stack_top` is not 16-byte aligned.
     pub unsafe fn new(stack_top: usize, entry: extern "C" fn() -> !) -> Self {
         assert_eq!(stack_top % 16, 0);
         // `switch` ends in `ret`, which pops this slot. Afterwards rsp is
@@ -83,6 +87,10 @@ impl Context {
     ///
     /// # Safety
     /// The stack must be writable and large enough for `entry`.
+    ///
+    /// # Panics
+    ///
+    /// If `stack_top` is not 16-byte aligned.
     pub unsafe fn new(stack_top: usize, entry: extern "C" fn() -> !) -> Self {
         assert_eq!(stack_top % 16, 0);
         let mut c = Self::default();
@@ -170,6 +178,10 @@ impl Context {
     ///
     /// # Safety
     /// The stack must be writable and large enough for `entry`.
+    ///
+    /// # Panics
+    ///
+    /// If `stack_top` is not 16-byte aligned.
     pub unsafe fn new(stack_top: usize, entry: extern "C" fn() -> !) -> Self {
         assert_eq!(stack_top % 16, 0);
         Self { ra: entry as usize as u64, sp: stack_top as u64, ..Self::default() }
@@ -204,12 +216,30 @@ macro_rules! riscv_switch {
 pub unsafe extern "C" fn switch(from: *mut Context, to: *const Context) {
     #[cfg(target_feature = "d")]
     riscv_switch!(
-        "fsd fs0, 112(a0)", "fsd fs1, 120(a0)", "fsd fs2, 128(a0)", "fsd fs3, 136(a0)",
-        "fsd fs4, 144(a0)", "fsd fs5, 152(a0)", "fsd fs6, 160(a0)", "fsd fs7, 168(a0)",
-        "fsd fs8, 176(a0)", "fsd fs9, 184(a0)", "fsd fs10, 192(a0)", "fsd fs11, 200(a0)",
-        "fld fs0, 112(a1)", "fld fs1, 120(a1)", "fld fs2, 128(a1)", "fld fs3, 136(a1)",
-        "fld fs4, 144(a1)", "fld fs5, 152(a1)", "fld fs6, 160(a1)", "fld fs7, 168(a1)",
-        "fld fs8, 176(a1)", "fld fs9, 184(a1)", "fld fs10, 192(a1)", "fld fs11, 200(a1)"
+        "fsd fs0, 112(a0)",
+        "fsd fs1, 120(a0)",
+        "fsd fs2, 128(a0)",
+        "fsd fs3, 136(a0)",
+        "fsd fs4, 144(a0)",
+        "fsd fs5, 152(a0)",
+        "fsd fs6, 160(a0)",
+        "fsd fs7, 168(a0)",
+        "fsd fs8, 176(a0)",
+        "fsd fs9, 184(a0)",
+        "fsd fs10, 192(a0)",
+        "fsd fs11, 200(a0)",
+        "fld fs0, 112(a1)",
+        "fld fs1, 120(a1)",
+        "fld fs2, 128(a1)",
+        "fld fs3, 136(a1)",
+        "fld fs4, 144(a1)",
+        "fld fs5, 152(a1)",
+        "fld fs6, 160(a1)",
+        "fld fs7, 168(a1)",
+        "fld fs8, 176(a1)",
+        "fld fs9, 184(a1)",
+        "fld fs10, 192(a1)",
+        "fld fs11, 200(a1)"
     );
     #[cfg(not(target_feature = "d"))]
     riscv_switch!();

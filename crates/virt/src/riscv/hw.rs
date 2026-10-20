@@ -361,8 +361,8 @@ pub(super) fn run(v: &mut RiscvVcpu) {
     // A different vCPU than this hart last ran (or a new VM that reuses an
     // old one's VMID and root): install its hgatp and flush.
     let cpu = osmium_arch::cpu::current_id();
-    if LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id || csr_read!("0x680") != v.hgatp {
-        csr_write!("0x680", v.hgatp);
+    if LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id || csr_read!("0x680") != v.hgatp.0 {
+        csr_write!("0x680", v.hgatp.0);
         // SAFETY: hfence.gvma and hfence.vvma (all addresses, all VMIDs)
         // only invalidate TLB entries.
         unsafe { asm!(".insn r 0x73, 0, 0x31, x0, x0, x0", ".insn r 0x73, 0, 0x11, x0, x0, x0", options(nostack)) };

@@ -41,12 +41,12 @@ struct Resolved {
 }
 
 /// A path resolved to its parent directory and final component.
-struct Parent<'a> {
+struct Parent<'path> {
     dir: Arc<dyn File>,
     /// The directory's canonical path.
     path: String,
     /// The final component: `None` for `/`, otherwise possibly `.` or `..`.
-    name: Option<&'a str>,
+    name: Option<&'path str>,
     /// The path ended in `/`.
     trailing_slash: bool,
 }
@@ -253,7 +253,7 @@ impl Vfs {
         Ok(Resolved { node, path })
     }
 
-    fn parent<'a>(&self, path: &'a str) -> Result<Parent<'a>, Errno> {
+    fn parent<'path>(&self, path: &'path str) -> Result<Parent<'path>, Errno> {
         let (mut comps, trailing_slash) = split(path)?;
         let name = comps.pop();
         let mut walker = Walker::new(self.snapshot());

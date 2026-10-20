@@ -109,6 +109,8 @@ impl<T: ?Sized> Mutex<T> {
     /// Acquires the lock if it is free.
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         self.locked
+            // Acquire pairs with the Release store in the guard's drop; a failed
+            // attempt reads nothing else, so Relaxed is enough.
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
             .then(|| MutexGuard { mutex: self })
@@ -117,8 +119,8 @@ impl<T: ?Sized> Mutex<T> {
 
 /// Access to the data of a locked [`Mutex`].
 #[must_use]
-pub struct MutexGuard<'a, T: ?Sized> {
-    mutex: &'a Mutex<T>,
+pub struct MutexGuard<'lock, T: ?Sized> {
+    mutex: &'lock Mutex<T>,
 }
 
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
@@ -157,6 +159,8 @@ impl Semaphore {
 
     /// Takes a permit if one is available.
     pub fn try_acquire(&self) -> bool {
+        // The first load only seeds the CAS; taking a permit is what Acquires
+        // (against the Release in `release`).
         let mut c = self.count.load(Ordering::Relaxed);
         while c > 0 {
             match self.count.compare_exchange_weak(c, c - 1, Ordering::Acquire, Ordering::Relaxed) {
@@ -180,6 +184,7 @@ impl Semaphore {
 
     /// Permits currently available.
     pub fn available(&self) -> usize {
+        // A snapshot for display; it orders nothing.
         self.count.load(Ordering::Relaxed)
     }
 }

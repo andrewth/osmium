@@ -150,8 +150,8 @@ impl<T: NoPadding, G: Guardian> SeqLock<T, G> {
 }
 
 /// Ends a [`SeqLock`] write when dropped, including during unwinding.
-struct WriteRelease<'a, G: Guardian> {
-    seq: &'a AtomicUsize,
+struct WriteRelease<'seq, G: Guardian> {
+    seq: &'seq AtomicUsize,
     /// The even sequence number that marks the write as finished.
     next: usize,
     state: Option<G::State>,

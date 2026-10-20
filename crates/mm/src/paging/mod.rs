@@ -327,7 +327,15 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     ///
     /// # Safety
     /// `kernel` (its subtables, at least) must outlive this table.
-    pub unsafe fn share_root_entries<B: TableAlloc>(&mut self, kernel: &PageTable<F, B>, indices: core::ops::Range<usize>) {
+    ///
+    /// # Panics
+    ///
+    /// If the format has a multi-page root (G-stage tables), or `indices` runs past the root table.
+    pub unsafe fn share_root_entries<B: TableAlloc>(
+        &mut self,
+        kernel: &PageTable<F, B>,
+        indices: core::ops::Range<usize>,
+    ) {
         assert!(F::ROOT_PAGES == 1, "multi-page roots (G-stage) cannot share entries");
         assert!(indices.end <= ENTRIES, "root index out of range");
         let top = F::LEVELS - 1;
@@ -386,7 +394,8 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     /// building tables before activation. On error, already-made mappings
     /// remain.
     pub fn map_range(&mut self, va: VirtAddr, pa: PhysAddr, len: u64, flags: MapFlags) -> Result<(), MapError> {
-        if !va.is_aligned(PAGE_SIZE as u64) || !pa.is_aligned(PAGE_SIZE as u64) || !len.is_multiple_of(PAGE_SIZE as u64) {
+        if !va.is_aligned(PAGE_SIZE as u64) || !pa.is_aligned(PAGE_SIZE as u64) || !len.is_multiple_of(PAGE_SIZE as u64)
+        {
             return Err(MapError::Misaligned);
         }
         let mut done = 0;
@@ -469,7 +478,8 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         let child = PageSize::from_level(level - 1);
         for i in 0..ENTRIES as u64 {
             let cva = VirtAddr::new(i << (12 + 9 * (level - 1)));
-            self.entry(table, cva, level - 1).store(F::leaf(base + i * child.bytes(), flags, level - 1), Ordering::Relaxed);
+            self.entry(table, cva, level - 1)
+                .store(F::leaf(base + i * child.bytes(), flags, level - 1), Ordering::Relaxed);
         }
         // Re-find the entry: `entry` borrows `self`.
         let (e, _) = self.find_leaf(va).map_err(|_| MapError::InvalidAddress)?;

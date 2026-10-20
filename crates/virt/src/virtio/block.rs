@@ -50,8 +50,8 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
             // No status byte to report into, or no header: drop it.
             return 0;
         }
-        let ty = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-        let sector = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let ty = u32::from_le_bytes(hdr[0..4].try_into().expect("fixed-width slice"));
+        let sector = u64::from_le_bytes(hdr[8..16].try_into().expect("fixed-width slice"));
         let status_at = wlen - 1;
 
         let (status, data) = match ty {

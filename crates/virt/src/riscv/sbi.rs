@@ -163,7 +163,9 @@ pub fn handle_smp(
 
 #[cfg(test)]
 mod tests {
+    use super::super::HartId;
     use super::*;
+    use crate::stage2::Hgatp;
     use alloc::vec::Vec;
 
     fn call(
@@ -184,7 +186,7 @@ mod tests {
         // SAFETY: `ram` outlives `mem` and is only used through it.
         unsafe { mem.add_region(GuestPhysAddr(0x8000_0000), ram.as_mut_ptr(), 0x1000) };
         mem.write(GuestPhysAddr(0x8000_0100), b"hello").unwrap();
-        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), 0, 0, 0);
+        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), HartId(0), 0, Hgatp(0));
         let mut out = Vec::new();
 
         assert_eq!(call(&mut v, &mem, eid::DBCN, 0, [5, 0x8000_0100, 0, 0, 0, 0], &mut out), Some(Outcome::Continue));

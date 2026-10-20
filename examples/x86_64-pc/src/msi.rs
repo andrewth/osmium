@@ -28,7 +28,7 @@ static DELIVERED: AtomicU32 = AtomicU32::new(0);
 /// Handles [`VECTOR`].
 pub fn on_interrupt() {
     DELIVERED.fetch_add(1, Ordering::Relaxed);
-    crate::LAPIC.get().unwrap().eoi();
+    crate::LAPIC.get().expect("LAPIC initialised").eoi();
 }
 
 struct Uptime;
@@ -63,12 +63,12 @@ impl From<NvmeError> for Error {
 /// mapped yet) and returns a window onto it.
 fn map(addr: u64, size: u64) -> IoMem {
     let mut guard = crate::PT.lock();
-    let pt = guard.as_mut().unwrap();
+    let pt = guard.as_mut().expect("as_mut returned None");
     let end = (addr + size).next_multiple_of(PAGE_SIZE as u64);
     for page in (addr & !(PAGE_SIZE as u64 - 1)..end).step_by(PAGE_SIZE) {
         if pt.translate(VirtAddr::new(page)).is_none() {
             let flags = MapFlags::RW | MapFlags::DEVICE | MapFlags::GLOBAL;
-            pt.map_range(VirtAddr::new(page), PhysAddr::new(page), PAGE_SIZE as u64, flags).unwrap();
+            pt.map_range(VirtAddr::new(page), PhysAddr::new(page), PAGE_SIZE as u64, flags).expect("map_range failed");
         }
     }
     // SAFETY: just mapped as device memory; the demo owns the device.
@@ -120,7 +120,7 @@ fn run(func: &Function<'_, pci::Ecam>) -> Result<(), Error> {
     let pba = msix.pba(&map(pba_bar.address, pba_bar.size))?;
 
     // Everything masked but entry 0, which goes to this CPU.
-    let apic = crate::LAPIC.get().unwrap().id() as u8;
+    let apic = crate::LAPIC.get().expect("LAPIC initialised").id() as u8;
     for i in 0..table.len() {
         table.set_masked(i, true)?;
     }

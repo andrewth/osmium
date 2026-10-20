@@ -200,7 +200,7 @@ fn le16(b: &[u8], off: usize) -> u16 {
 /// Where the program headers appear in memory (`AT_PHDR`): inside whichever
 /// segment loads the bytes at their file offset, or 0 if none does.
 fn phdr_address(image: &[u8], elf: &Elf<'_>) -> u64 {
-    let phoff = image.get(32..40).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let phoff = image.get(32..40).map_or(0, |b| u64::from_le_bytes(b.try_into().expect("fixed-width slice")));
     elf.segments()
         .find_map(|s| {
             let off = s.data.as_ptr() as u64 - image.as_ptr() as u64;

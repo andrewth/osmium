@@ -332,7 +332,7 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     unsafe { trap::install() };
     enable_mmu(PhysAddr::new(TTBR0.load(Ordering::Acquire)));
     // This CPU's GIC interface, for kicks from the other CPU.
-    let gic = PHYS_GIC.get().unwrap();
+    let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
     gic.init_cpu();
     gic.enable(KICK_SGI);
     // A guest's timer expiring while it runs here exits it, as on CPU 0.
@@ -372,7 +372,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     unsafe { trap::install() };
 
     // SAFETY: QEMU virt's PL011 lives here and nothing else drives it.
-    let mut uart = Pl011::new(unsafe { IoMem::new(EARLY_UART as *mut u8, 0x1000) }).unwrap();
+    let mut uart = Pl011::new(unsafe { IoMem::new(EARLY_UART as *mut u8, 0x1000) }).expect("new failed");
     uart.init(None);
     set_console(UART.call_once(|| SerialConsole::new(uart)));
     println!("\nosmium aarch64-hyp example (EL{})", aarch64::current_el());
@@ -392,18 +392,18 @@ extern "C" fn kmain(x0: usize) -> ! {
 
     // --- Physical memory ---------------------------------------------------
     let mut map = MemoryMap::<32>::new();
-    fdt.fill_memory_map(&mut map, Some(PhysAddr::new(dtb as u64))).unwrap();
+    fdt.fill_memory_map(&mut map, Some(PhysAddr::new(dtb as u64))).expect("fill_memory_map failed");
     // SAFETY: linker-provided symbols.
     let (kstart, etext, erodata, kend) =
         unsafe { (sym(&_kernel_start), sym(&_etext), sym(&_erodata), sym(&_kernel_end)) };
-    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
+    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).expect("reserve failed");
     // With enough RAM, keep the window for a guest kernel image out of the
     // allocator (QEMU's loader may have put one there).
     let top = map.regions().iter().map(|r| r.end.0).max().unwrap_or(0);
     let image_window = top >= kernel::IMAGE_BASE + kernel::IMAGE_WINDOW;
     if image_window {
         let (base, end) = (kernel::IMAGE_BASE, kernel::IMAGE_BASE + kernel::IMAGE_WINDOW);
-        map.reserve(PhysAddr::new(base), PhysAddr::new(end), RegionKind::Reserved).unwrap();
+        map.reserve(PhysAddr::new(base), PhysAddr::new(end), RegionKind::Reserved).expect("reserve failed");
     }
     map.page_align_usable();
     let (ram_start, ram_end) = map.regions().iter().fold((u64::MAX, 0), |(s, e), r| (s.min(r.start.0), e.max(r.end.0)));
@@ -418,10 +418,10 @@ extern "C" fn kmain(x0: usize) -> ! {
     HEAP.init(&FRAMES);
 
     // --- EL2 stage-1 MMU -----------------------------------------------------
-    let mut pt: PageTable<Aarch64El2, &'static Frames> = PageTable::new(&FRAMES).unwrap();
+    let mut pt: PageTable<Aarch64El2, &'static Frames> = PageTable::new(&FRAMES).expect("new failed");
     let rw = MapFlags::RW | MapFlags::GLOBAL;
     let id = |pt: &mut PageTable<Aarch64El2, _>, a: u64, b: u64, f| {
-        pt.map_range(VirtAddr::new(a), PhysAddr::new(a), b - a, f).unwrap()
+        pt.map_range(VirtAddr::new(a), PhysAddr::new(a), b - a, f).expect("map_range failed")
     };
     id(&mut pt, ram_start, kstart, rw);
     id(&mut pt, kstart, etext, MapFlags::RX | MapFlags::GLOBAL);
@@ -430,8 +430,10 @@ extern "C" fn kmain(x0: usize) -> ! {
     id(&mut pt, EARLY_UART as u64, EARLY_UART as u64 + 0x1000, rw | MapFlags::DEVICE);
     let gic_node = fdt.find_compatible(&["arm,cortex-a15-gic", "arm,gic-400"]).expect("no GICv2");
     let mut regs = gic_node.reg();
-    let (gicd, gicd_len) = regs.next().map(|(a, s)| (a, s.unwrap())).unwrap();
-    let (gicc, gicc_len) = regs.next().map(|(a, s)| (a, s.unwrap())).unwrap();
+    let (gicd, gicd_len) =
+        regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
+    let (gicc, gicc_len) =
+        regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
     id(&mut pt, gicd, gicd + gicd_len, rw | MapFlags::DEVICE);
     id(&mut pt, gicc, gicc + gicc_len, rw | MapFlags::DEVICE);
     enable_mmu(pt.root());
@@ -539,10 +541,10 @@ fn guest_demo() {
         let start = &raw const guest_image;
         core::slice::from_raw_parts(start, (&raw const guest_image_end).offset_from(start) as usize)
     };
-    mem.write(GUEST_RAM, image).unwrap();
+    mem.write(GUEST_RAM, image).expect("write failed");
 
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
-    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
 
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let out = line.clone();
@@ -555,7 +557,7 @@ fn guest_demo() {
             l.clear();
         }
     });
-    mmio.insert(GUEST_UART, 8, Arc::new(uart)).unwrap();
+    mmio.insert(GUEST_UART, 8, Arc::new(uart)).expect("insert failed");
     let pio = Bus::new();
 
     let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1));
@@ -604,9 +606,9 @@ fn gic_guest_demo() {
         let start = &raw const gic_guest;
         core::slice::from_raw_parts(start, (&raw const gic_guest_end).offset_from(start) as usize)
     };
-    mem.write(GUEST_RAM, image).unwrap();
+    mem.write(GUEST_RAM, image).expect("write failed");
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
-    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
 
     let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 2));
     let irq = vcpu.irq_line();
@@ -619,7 +621,7 @@ fn gic_guest_demo() {
         // exiting the guest again; restore it once the guest has dealt
         // with the timer.
         if masked.swap(level, Ordering::Relaxed) != level {
-            let gic = PHYS_GIC.get().unwrap();
+            let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
             if level { gic.disable(VTIMER_INTID) } else { gic.enable(VTIMER_INTID) }
         }
     });
@@ -639,9 +641,9 @@ fn gic_guest_demo() {
         .with_irq(move |level| g.set_level(GUEST_UART_INTID, level)),
     );
     let mmio = Bus::new();
-    mmio.insert(GUEST_GICD, GIC_WINDOW, vgic.distributor()).unwrap();
-    mmio.insert(GUEST_GICC, GIC_WINDOW, vgic.cpu_interface()).unwrap();
-    mmio.insert(GUEST_UART, 8, uart.clone()).unwrap();
+    mmio.insert(GUEST_GICD, GIC_WINDOW, vgic.distributor()).expect("insert failed");
+    mmio.insert(GUEST_GICC, GIC_WINDOW, vgic.cpu_interface()).expect("insert failed");
+    mmio.insert(GUEST_UART, 8, uart.clone()).expect("insert failed");
     let pio = Bus::new();
 
     let (mut halts, mut interrupts, mut typed) = (0, 0, false);
@@ -704,9 +706,9 @@ fn fp_demo() {
         let start = &raw const fp_guest;
         core::slice::from_raw_parts(start, (&raw const fp_guest_end).offset_from(start) as usize)
     };
-    mem.write(GUEST_RAM, image).unwrap();
+    mem.write(GUEST_RAM, image).expect("write failed");
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
-    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     let (mmio, pio) = (Bus::new(), Bus::new());
     let vttbr = vttbr(s2.root(), 4);
     let step = |v: &mut Aarch64Vcpu| {
@@ -783,7 +785,7 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             VmExit::ExternalInterrupt => {
                 // A kick (or another physical interrupt): acknowledge it; the
                 // next entry delivers whatever the vGIC now has pending.
-                let gic = PHYS_GIC.get().unwrap();
+                let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
                 if let Some(irq) = gic.claim() {
                     if irq == KICK_SGI && me == 0 {
                         vm.kicks.fetch_add(1, Ordering::Relaxed);
@@ -826,16 +828,17 @@ fn smp_guest_demo() {
         let start = &raw const smp_guest;
         core::slice::from_raw_parts(start, (&raw const smp_guest_end).offset_from(start) as usize)
     };
-    mem.write(GUEST_RAM, image).unwrap();
+    mem.write(GUEST_RAM, image).expect("write failed");
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
-    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     let vttbr = vttbr(s2.root(), 3);
     core::mem::forget(s2); // in use by both CPUs until power-off
 
     // A vCPU's interrupt arriving while it runs guest code on another host
     // CPU kicks that CPU with a physical SGI, so the guest exits and the
     // next entry delivers it.
-    let cpus = GuestCpus::with_kick(2, |host| PHYS_GIC.get().unwrap().send_sgi(1 << host, KICK_SGI));
+    let cpus =
+        GuestCpus::with_kick(2, |host| PHYS_GIC.get().expect("PHYS_GIC initialised").send_sgi(1 << host, KICK_SGI));
     let lines: Vec<Arc<AtomicBool>> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
     let (l, c) = (lines.clone(), cpus.clone());
     let gic = Arc::new(VirtualGicV2::with_cpus(2, 64, move |cpu, level| {
@@ -856,13 +859,13 @@ fn smp_guest_demo() {
     let buses = (0..2)
         .map(|cpu| {
             let bus = Bus::new();
-            bus.insert(GUEST_GICD, GIC_WINDOW, gic.distributor_for(cpu)).unwrap();
-            bus.insert(GUEST_GICC, GIC_WINDOW, gic.cpu_interface_for(cpu)).unwrap();
-            bus.insert(GUEST_UART, 8, uart.clone()).unwrap();
+            bus.insert(GUEST_GICD, GIC_WINDOW, gic.distributor_for(cpu)).expect("insert failed");
+            bus.insert(GUEST_GICC, GIC_WINDOW, gic.cpu_interface_for(cpu)).expect("insert failed");
+            bus.insert(GUEST_UART, 8, uart.clone()).expect("insert failed");
             bus
         })
         .collect();
-    cpus.request_start(0, GUEST_RAM.0, 0).unwrap();
+    cpus.request_start(0, GUEST_RAM.0, 0).expect("request_start failed");
     let vm = SMP_VM.call_once(|| SmpVm {
         cpus,
         mem,

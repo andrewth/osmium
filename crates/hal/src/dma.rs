@@ -123,14 +123,14 @@ pub trait DmaAllocator {
 /// window ([`IoMem::new`](crate::mmio::IoMem::new), which is `unsafe`)
 /// vouched that accesses through it do not violate memory safety. Leaving a
 /// device pointed at a dropped buffer breaks that promise.
-pub struct OwnedDma<'a, A: DmaAllocator + ?Sized> {
+pub struct OwnedDma<'dma, A: DmaAllocator + ?Sized> {
     buf: ManuallyDrop<DmaBuffer>,
-    alloc: &'a A,
+    alloc: &'dma A,
 }
 
-impl<'a, A: DmaAllocator + ?Sized> OwnedDma<'a, A> {
+impl<'dma, A: DmaAllocator + ?Sized> OwnedDma<'dma, A> {
     /// Allocates a zeroed, coherent buffer of `len` bytes from `alloc`.
-    pub fn new(alloc: &'a A, len: usize) -> Option<Self> {
+    pub fn new(alloc: &'dma A, len: usize) -> Option<Self> {
         alloc.alloc_coherent(len).map(|buf| Self { buf: ManuallyDrop::new(buf), alloc })
     }
 }

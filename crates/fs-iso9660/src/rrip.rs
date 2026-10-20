@@ -36,7 +36,7 @@ pub struct Continuation {
 }
 
 fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    u32::from_le_bytes(b[at..at + 4].try_into().expect("fixed-width slice"))
 }
 
 /// The `SP` entry that starts the root's `.` record on a SUSP volume:

@@ -52,7 +52,7 @@ impl<T> Once<T> {
     /// Stores `value` if the cell is empty; otherwise hands it back.
     pub fn set(&self, value: T) -> Result<(), T> {
         let mut value = Some(value);
-        self.call_once(|| value.take().unwrap());
+        self.call_once(|| value.take().expect("call_once runs its closure at most once"));
         match value {
             None => Ok(()),
             Some(v) => Err(v),

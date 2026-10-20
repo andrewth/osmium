@@ -46,6 +46,10 @@ impl GicV2 {
 
     /// Sends software-generated interrupt `sgi` (0–15) to every CPU whose
     /// bit is set in `targets`.
+    ///
+    /// # Panics
+    ///
+    /// If `sgi` is 16 or more.
     pub fn send_sgi(&self, targets: u8, sgi: u32) {
         assert!(sgi < 16, "SGIs are 0-15");
         let _ = self.gicd.write(GICD_SGIR, (targets as u32) << 16 | sgi);
@@ -148,7 +152,8 @@ mod tests {
         d[GICD_TYPER / 4] = 2; // 96 lines
         c[GICC_IAR / 4] = 33;
         // SAFETY: the windows cover local arrays.
-        let gic = unsafe { GicV2::new(IoMem::new(d.as_mut_ptr().cast(), 0x1000), IoMem::new(c.as_mut_ptr().cast(), 0x100)) };
+        let gic =
+            unsafe { GicV2::new(IoMem::new(d.as_mut_ptr().cast(), 0x1000), IoMem::new(c.as_mut_ptr().cast(), 0x100)) };
         gic.init_distributor();
         gic.init_cpu();
         assert_eq!(gic.num_irqs(), 96);
@@ -171,7 +176,8 @@ mod tests {
         // SGI 1 from CPU 2.
         c[GICC_IAR / 4] = 2 << 10 | 1;
         // SAFETY: the windows cover local arrays.
-        let gic = unsafe { GicV2::new(IoMem::new(d.as_mut_ptr().cast(), 0x1000), IoMem::new(c.as_mut_ptr().cast(), 0x100)) };
+        let gic =
+            unsafe { GicV2::new(IoMem::new(d.as_mut_ptr().cast(), 0x1000), IoMem::new(c.as_mut_ptr().cast(), 0x100)) };
         gic.send_sgi(0b1010, 1);
         assert_eq!(gic.claim(), Some(1));
         gic.complete(1);
@@ -187,7 +193,8 @@ mod tests {
         d[GICD_TYPER / 4] = 2; // 96 lines
         c[GICC_IAR / 4] = 1022;
         // SAFETY: the windows cover local arrays.
-        let gic = unsafe { GicV2::new(IoMem::new(d.as_mut_ptr().cast(), 0x1000), IoMem::new(c.as_mut_ptr().cast(), 0x100)) };
+        let gic =
+            unsafe { GicV2::new(IoMem::new(d.as_mut_ptr().cast(), 0x1000), IoMem::new(c.as_mut_ptr().cast(), 0x100)) };
         // Line 1024 + 32 would be an ICENABLER write; 96 is past the end.
         gic.enable(1024 + 32);
         gic.enable(96);

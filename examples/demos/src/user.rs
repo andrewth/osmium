@@ -34,17 +34,17 @@ impl File for LogConsole {
 pub fn boot_vfs() {
     let vfs: &'static Vfs = Box::leak(Box::new(Vfs::new(RamFs::new(1).root())));
     assert!(VFS.set(vfs).is_ok(), "boot_vfs called twice");
-    vfs.mkdir("/etc", 0o755).unwrap();
-    let motd = vfs.open("/etc/motd", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
-    motd.write(0, b"welcome to osmium\n").unwrap();
-    vfs.mkdir("/tmp", 0o1777).unwrap();
-    vfs.mkdir("/dev", 0o755).unwrap();
+    vfs.mkdir("/etc", 0o755).expect("mkdir failed");
+    let motd = vfs.open("/etc/motd", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).expect("open failed");
+    motd.write(0, b"welcome to osmium\n").expect("write failed");
+    vfs.mkdir("/tmp", 0o1777).expect("mkdir failed");
+    vfs.mkdir("/dev", 0o755).expect("mkdir failed");
     let console: Arc<dyn File> = Arc::new(LogConsole);
     let dev = DevDir::new(2);
     dev.insert("console", console.clone());
     dev.insert("null", Arc::new(Null::new()));
     dev.insert("zero", Arc::new(Zero::new()));
-    vfs.mount("/dev", Arc::new(dev)).unwrap();
+    vfs.mount("/dev", Arc::new(dev)).expect("mount failed");
     osmium::proc::set_vfs(vfs);
     osmium::proc::set_console(console);
 }
@@ -56,10 +56,10 @@ static VFS: osmium::sync::Once<&'static Vfs> = osmium::sync::Once::new();
 pub fn install(name: &str, image: &[u8]) {
     let vfs = VFS.get().expect("boot_vfs first");
     if vfs.stat("/bin", true).is_err() {
-        vfs.mkdir("/bin", 0o755).unwrap();
+        vfs.mkdir("/bin", 0o755).expect("mkdir failed");
     }
     let path = alloc::format!("/bin/{name}");
-    let file = vfs.open(&path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNC, 0o755).unwrap();
+    let file = vfs.open(&path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNC, 0o755).expect("open failed");
     assert_eq!(file.write(0, image), Ok(image.len()));
 }
 

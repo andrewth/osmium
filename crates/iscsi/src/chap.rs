@@ -120,7 +120,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-fn value<'a>(keys: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+fn value<'src>(keys: &[(&'src str, &'src str)], key: &str) -> Option<&'src str> {
     keys.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
 

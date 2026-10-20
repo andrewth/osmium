@@ -96,11 +96,12 @@ extern "C" fn fw_main(hart: usize) -> ! {
 
     // SAFETY: QEMU virt's CLINT and PLIC; this firmware owns them.
     let clint = CLINT.call_once(|| Clint::new(unsafe { IoMem::new(CLINT_BASE as *mut u8, 0x1_0000) }));
-    let plic = PLIC.call_once(|| Plic::new(unsafe { IoMem::new(PLIC_BASE as *mut u8, 0x40_0000) }, Plic::machine_context));
+    let plic =
+        PLIC.call_once(|| Plic::new(unsafe { IoMem::new(PLIC_BASE as *mut u8, 0x40_0000) }, Plic::machine_context));
     plic.set_priority(UART_IRQ, 1);
     plic.enable(UART_IRQ);
     plic.set_threshold(0);
-    let (producer, consumer) = RX.split().unwrap();
+    let (producer, consumer) = RX.split().expect("split returned None");
     *RX_PRODUCER.lock() = Some(producer);
 
     clint.set_deadline(0, clint.mtime() + TICK);
@@ -108,7 +109,9 @@ extern "C" fn fw_main(hart: usize) -> ! {
     // vector is installed.
     unsafe { core::arch::asm!("csrs mie, {}", in(reg) MIE_MTIE | MIE_MEIE) };
     irq::enable();
-    println!("[fw]    CLINT timer every 10 ms, UART IRQ {UART_IRQ} through the PLIC; async tasks on a heap-free executor");
+    println!(
+        "[fw]    CLINT timer every 10 ms, UART IRQ {UART_IRQ} through the PLIC; async tasks on a heap-free executor"
+    );
 
     EXEC.run_to_completion(&mut [pin!(ticker()), pin!(console(consumer))]);
 
@@ -164,15 +167,15 @@ async fn console(mut rx: osmium::sync::Consumer<'static, u8, 64>) {
 fn on_trap(frame: &mut TrapFrame) {
     match frame.cause() {
         Trap::Interrupt(Interrupt::Timer) => {
-            let clint = CLINT.get().unwrap();
+            let clint = CLINT.get().expect("CLINT initialised");
             clint.set_deadline(0, clint.mtime() + TICK);
             TICKS.signal(TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1);
         }
         Trap::Interrupt(Interrupt::External) => {
-            let plic = PLIC.get().unwrap();
+            let plic = PLIC.get().expect("PLIC initialised");
             while let Some(irq) = plic.claim() {
                 if irq == UART_IRQ {
-                    let mut port = UART.get().unwrap().port();
+                    let mut port = UART.get().expect("UART initialised").port();
                     let mut producer = RX_PRODUCER.lock();
                     while let Some(b) = port.read_byte() {
                         if let Some(p) = producer.as_mut() {

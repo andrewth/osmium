@@ -5,7 +5,7 @@ use osmium_hal::mmio::IoMem;
 use osmium_sync::{IrqDisabled, IrqSpinLock, SpinLockGuard};
 
 // A held `IoApic::lock`, which owns the select/window pair.
-type Selected<'a> = SpinLockGuard<'a, (), IrqDisabled>;
+type Selected<'lock> = SpinLockGuard<'lock, (), IrqDisabled>;
 
 const IOREGSEL: usize = 0x00;
 const IOWIN: usize = 0x10;

@@ -87,8 +87,8 @@ impl DescChain {
 
     /// Calls `f(gpa, buf_offset, len)` for each piece of `[offset, offset + len)`
     /// across `descs`.
-    fn walk<'a>(
-        descs: impl Iterator<Item = &'a Desc>,
+    fn walk<'desc>(
+        descs: impl Iterator<Item = &'desc Desc>,
         mut offset: usize,
         len: usize,
         mut f: impl FnMut(GuestPhysAddr, usize, usize) -> Result<(), OutOfBounds>,
@@ -185,8 +185,8 @@ impl SplitQueue {
             let raw = mem.read_obj::<[u8; DESC_SIZE]>(GuestPhysAddr(
                 self.desc.0.wrapping_add((DESC_SIZE * i as usize) as u64),
             ))?;
-            let addr = u64::from_le_bytes(raw[0..8].try_into().unwrap());
-            let len = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+            let addr = u64::from_le_bytes(raw[0..8].try_into().expect("fixed-width slice"));
+            let len = u32::from_le_bytes(raw[8..12].try_into().expect("fixed-width slice"));
             let flags = u16::from_le_bytes([raw[12], raw[13]]);
             let next = u16::from_le_bytes([raw[14], raw[15]]);
             if flags & DESC_F_INDIRECT != 0 {
