@@ -96,7 +96,15 @@ osmium_trap_entry:
     csrw mstatus, t0
     ld x1, 8(sp)
     ld x3, 24(sp)
+    // tp: restore the frame's value only when returning to U-mode (the
+    // user's tp). In kernel mode tp is this hart's CPU id, and the task may
+    // have been preempted on one hart and resumed here on another.
+    ld t0, 264(sp)
+    li t1, 0x1800
+    and t0, t0, t1
+    bnez t0, 6f
     ld x4, 32(sp)
+6:
     ld x5, 40(sp)
     ld x6, 48(sp)
     ld x7, 56(sp)
