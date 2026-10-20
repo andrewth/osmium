@@ -111,8 +111,10 @@ features.
   user programs, each in its own address space (sharing the kernel's root
   page-table entries), with system calls, and all three load the same
   Rust user program from an ELF file as an `osmium-proc` process, which
-  opens, writes and lists files in an `osmium-fs` RAM file system. There
-  is no `fork`, `execve` or `wait4` yet, and a process has one thread. Kernel stack overflows are caught on all three
+  opens, writes and lists files in an `osmium-fs` RAM file system. On
+  RISC-V and AArch64 an init program also forks, waits and execs; `fork`
+  copies memory eagerly (no copy-on-write), x86_64-pc does not enable
+  `fork`/`execve` yet, and a process has one thread. Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. The scheduler does no load balancing; tasks move only

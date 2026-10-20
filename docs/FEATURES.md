@@ -214,7 +214,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `AddressSpace<F, A>`: shares the kernel's root entries, loads ELF or flat images, maps and unmaps anonymous memory, and frees its pages with the process; user copies walk the process's own table (user-accessible, writable for stores) and go through the physical mapping, so no SUM/PAN/SMAP handling is needed
 - ✅ One portable dispatcher with each architecture's Linux numbers, open flags and `struct stat`: `read`, `write`, `readv`, `writev`, `openat`, `close`, `lseek`, `fstat`, `newfstatat`, `getdents64`, `ioctl`, `getcwd`, `chdir`, `mkdirat`, `unlinkat`, `exit`, `exit_group`, `getpid`, `getppid`, `gettid`, `brk`, `mmap` (anonymous), `munmap`, `sched_yield`, `uname`; `syscall::handle` decodes the trap frame on RISC-V, AArch64 and x86_64
 - ✅ All three examples run their user programs as processes; the Rust user program exercises `getpid`, `uname`, `brk`, `mmap` and `writev`
-- 🗺 `fork`/`clone`, `execve`, `wait4`, signals, multi-threaded processes, file-backed `mmap`
+- ✅ `fork`, `vfork` and `clone` (processes only, `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`), with an eager copy of the address space and shared open file descriptions; `execve` of static ELF executables from the VFS, with argv, envp and auxv (`AT_PHDR`, `AT_ENTRY`, `AT_RANDOM`, ...) on a fresh stack; `wait4` (pid or any, `WNOHANG`); `dup`, `dup2`, `dup3`, `fcntl` and close-on-exec. The kernel supplies a `Platform` (address-space factory, table activation, child resume via `resume_user` in `osmium-arch`); riscv-virt and aarch64-virt run an init that forks, waits and execs itself
+- 🗺 Copy-on-write `fork`, `fork`/`execve` on x86_64-pc, threads, signals, PIE and dynamically linked executables, file-backed `mmap`
 
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name

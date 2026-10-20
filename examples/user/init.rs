@@ -178,15 +178,20 @@ unsafe extern "C" fn main(sp: *const u64) -> ! {
     if child == 0 {
         // SAFETY: single-threaded program.
         unsafe { MARK = 2 };
-        say!("fork child: pid {pid_now}, parent {parent}", pid_now = sys::call(sys::GETPID, [0; 5]),
-            parent = sys::call(sys::GETPPID, [0; 5]));
+        say!(
+            "fork child: pid {pid_now}, parent {parent}",
+            pid_now = sys::call(sys::GETPID, [0; 5]),
+            parent = sys::call(sys::GETPPID, [0; 5])
+        );
         exit(7);
     }
     let (reaped, code) = wait(child);
     // SAFETY: single-threaded program.
     let mark = unsafe { MARK };
-    say!("fork: pid {pid} reaped child {reaped} (status {code}); parent's memory unchanged: {}",
-        if reaped == child && mark == 1 { "ok" } else { "FAILED" });
+    say!(
+        "fork: pid {pid} reaped child {reaped} (status {code}); parent's memory unchanged: {}",
+        if reaped == child && mark == 1 { "ok" } else { "FAILED" }
+    );
 
     if sys::fork() == 0 {
         let path = b"/bin/init\0";

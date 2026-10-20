@@ -99,7 +99,7 @@ impl Process {
     /// returns where it starts. Descriptors marked close-on-exec are closed,
     /// and the break and `mmap` area start afresh. Call it on the process's
     /// own task (the new table is activated there), then enter user mode at
-    /// the returned entry; [`crate::syscall::handle`] does both for the
+    /// the returned entry; `syscall::handle` does both for the
     /// system call.
     ///
     /// On failure the process is unchanged.

@@ -147,7 +147,7 @@ impl Process {
     /// open files (and their offsets), with the same working directory,
     /// break and `mmap` area, and this one as its parent. The child has no
     /// task yet: spawn one that resumes user mode where the parent called
-    /// `fork`, with a return value of 0 (see [`crate::syscall::handle`]).
+    /// `fork`, with a return value of 0 (see `syscall::handle`).
     pub fn fork(&self) -> Result<Arc<Process>, Errno> {
         let memory: Arc<dyn UserMemory> = self.memory().fork()?.into();
         let files = self.files.lock().clone();
