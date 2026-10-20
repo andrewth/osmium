@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use osmium_arch::{MAX_CPUS, cpu, irq};
 use osmium_sync::{Once, PerCpu, PerCpuCell, preempt};
@@ -36,6 +36,14 @@ pub trait Scheduler: Sync {
     /// Called on each timer tick on `cpu` while `current` runs. Returns true
     /// to request that `current` be preempted.
     fn tick(&self, cpu: usize, current: &Task) -> bool;
+
+    /// Returns true if the policy moves unpinned tasks between CPUs (by
+    /// stealing in [`Scheduler::pick_next`]). The core then places woken
+    /// tasks on idle CPUs and kicks idle CPUs, through the remote-wake
+    /// hook, when work they could steal is queued.
+    fn balances(&self) -> bool {
+        false
+    }
 }
 
 static SCHEDULER: Once<&'static dyn Scheduler> = Once::new();
@@ -67,10 +75,23 @@ pub fn set_remote_wake_hook(hook: fn(usize)) {
     assert!(REMOTE_WAKE.set(hook).is_ok(), "remote wake hook already set");
 }
 
+/// Bit `n` is set while CPU `n` has nothing to run (its idle task is chosen).
+static IDLE_CPUS: AtomicU64 = AtomicU64::new(0);
+
 /// Queues `task` and notifies its CPU if that is not this one. IRQs must be off.
+///
+/// With a balancing policy, a new or woken task whose CPU is busy goes to an
+/// idle CPU it may use instead (pinned tasks have no other CPU to go to).
 fn enqueue(task: Arc<Task>, reason: EnqueueReason) {
+    let sched = scheduler();
+    if sched.balances() && matches!(reason, EnqueueReason::Spawned | EnqueueReason::Woken) {
+        let idle = IDLE_CPUS.load(Ordering::Relaxed) & task.affinity();
+        if idle != 0 && idle & (1 << task.cpu()) == 0 {
+            task.set_cpu_unpinned(idle.trailing_zeros() as usize);
+        }
+    }
     let target = task.cpu();
-    scheduler().enqueue(task, reason);
+    sched.enqueue(task, reason);
     if target != cpu::current_id()
         && let Some(hook) = REMOTE_WAKE.get()
     {
@@ -91,6 +112,8 @@ static CPUS: PerCpuCell<CpuState> =
 static NEED_RESCHED: PerCpu<AtomicBool> = PerCpu::new([const { AtomicBool::new(false) }; MAX_CPUS]);
 
 const IDLE_STACK: usize = 16 * 1024;
+/// How long `schedule` waits for a task to finish saving its registers.
+const SPIN_LIMIT: u32 = 1 << 20;
 
 /// Turns the calling flow of execution into this CPU's first task and
 /// creates the CPU's idle task. Call once per CPU, after its CPU id is set
@@ -216,17 +239,44 @@ fn schedule(requeue: Option<EnqueueReason>) {
         _ => {}
     }
 
-    // SAFETY: as above.
-    let next = sched.pick_next(cpu).unwrap_or_else(|| unsafe { (*st).idle.clone() }.expect("init_cpu has not run"));
-    if ptr::eq(Arc::as_ptr(&next), cur) {
-        cur.state.store(TaskState::Running as u8, Ordering::Release);
-        irq::restore(irq_state);
-        return;
-    }
-
-    // The task may still be saving its registers on the CPU that last ran it.
-    while next.on_cpu.load(Ordering::Acquire) {
-        cpu::spin_hint();
+    let mut retries = 0;
+    let next = loop {
+        // SAFETY: as above.
+        let next = sched.pick_next(cpu).unwrap_or_else(|| unsafe { (*st).idle.clone() }.expect("init_cpu has not run"));
+        if ptr::eq(Arc::as_ptr(&next), cur) {
+            IDLE_CPUS.fetch_and(!(1 << cpu), Ordering::Relaxed);
+            if cur.is_idle {
+                IDLE_CPUS.fetch_or(1 << cpu, Ordering::Relaxed);
+            }
+            cur.state.store(TaskState::Running as u8, Ordering::Release);
+            irq::restore(irq_state);
+            return;
+        }
+        // The task may still be saving its registers on the CPU that last
+        // ran it. Wait briefly; if that CPU is itself waiting for one of our
+        // tasks, give the task back and run something else meanwhile.
+        let mut spins = 0u32;
+        while next.on_cpu.load(Ordering::Acquire) && spins < SPIN_LIMIT {
+            cpu::spin_hint();
+            spins += 1;
+        }
+        if !next.on_cpu.load(Ordering::Acquire) {
+            break next;
+        }
+        retries += 1;
+        let idle = next.is_idle;
+        if !idle {
+            sched.enqueue(next, EnqueueReason::Woken);
+        }
+        if retries >= 3 || idle {
+            // SAFETY: as above.
+            break unsafe { (*st).idle.clone() }.expect("init_cpu has not run");
+        }
+    };
+    if next.is_idle {
+        IDLE_CPUS.fetch_or(1 << cpu, Ordering::Relaxed);
+    } else {
+        IDLE_CPUS.fetch_and(!(1 << cpu), Ordering::Relaxed);
     }
     next.on_cpu.store(true, Ordering::Relaxed);
     next.set_cpu(cpu);

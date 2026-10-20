@@ -1,6 +1,6 @@
 use alloc::boxed::Box;
-use core::any::Any;
 use alloc::sync::Arc;
+use core::any::Any;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::MaybeUninit;
@@ -9,6 +9,9 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize
 
 use crate::context::Context;
 use crate::sync::WaitQueue;
+
+/// Affinity mask allowing every CPU.
+pub const ALL_CPUS: u64 = u64::MAX;
 
 /// A task's unique id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -123,6 +126,9 @@ pub struct Task {
     pub(crate) is_idle: bool,
     priority: AtomicU8,
     cpu: AtomicUsize,
+    /// CPUs the task may run on (bit `n` = CPU `n`); policies that move
+    /// tasks between CPUs respect it.
+    affinity: AtomicU64,
     /// Remaining ticks of the current time slice; policies use it.
     pub(crate) slice_left: AtomicU32,
     pub(crate) entry: UnsafeCell<Option<Entry>>,
@@ -170,10 +176,56 @@ impl Task {
         self.cpu.load(Ordering::Relaxed)
     }
 
-    /// Moves the task to `cpu`'s run queue the next time it is queued.
+    /// Moves the task to `cpu`'s run queue the next time it is queued. A
+    /// task pinned to one CPU stays pinned, to the new one.
     pub fn set_cpu(&self, cpu: usize) {
         assert!(cpu < osmium_arch::MAX_CPUS);
+        if self.affinity().count_ones() == 1 {
+            self.affinity.store(1 << cpu, Ordering::Relaxed);
+        }
         self.cpu.store(cpu, Ordering::Relaxed);
+    }
+
+    /// Pins the task to `cpu`: it moves there the next time it is queued
+    /// and no policy moves it elsewhere.
+    pub fn pin(&self, cpu: usize) {
+        assert!(cpu < osmium_arch::MAX_CPUS);
+        self.affinity.store(1 << cpu, Ordering::Relaxed);
+        self.cpu.store(cpu, Ordering::Relaxed);
+    }
+
+    /// Moves the task to `cpu` without changing its affinity; the core uses
+    /// it to place an unpinned task, which `cpu` is already allowed to run.
+    pub(crate) fn set_cpu_unpinned(&self, cpu: usize) {
+        self.cpu.store(cpu, Ordering::Relaxed);
+    }
+
+    /// The CPUs the task may run on (bit `n` = CPU `n`).
+    pub fn affinity(&self) -> u64 {
+        self.affinity.load(Ordering::Relaxed)
+    }
+
+    /// Restricts the task to the CPUs in `mask`. If its current CPU is not
+    /// among them, it moves to the lowest one the next time it is queued.
+    pub fn set_affinity(&self, mask: u64) {
+        assert!(mask != 0, "a task must be allowed on some CPU");
+        self.affinity.store(mask, Ordering::Relaxed);
+        if mask & (1 << self.cpu()) == 0 {
+            self.cpu.store(mask.trailing_zeros() as usize, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns true if the task may run on `cpu`.
+    pub fn can_run_on(&self, cpu: usize) -> bool {
+        self.affinity() & (1 << cpu) != 0
+    }
+
+    /// Returns true if `cpu` may take the task from another CPU's queue now.
+    /// A task still saving its registers on its old CPU is skipped: two CPUs
+    /// that each steal the other's just-requeued task would wait on each
+    /// other forever.
+    pub(crate) fn stealable_by(&self, cpu: usize) -> bool {
+        self.can_run_on(cpu) && !self.on_cpu.load(Ordering::Acquire)
     }
 
     /// One past the top of the task's kernel stack, if it owns one (the
@@ -217,7 +269,11 @@ impl Task {
     }
 
     pub(crate) fn bootstrap(cpu: usize) -> Self {
-        Self::raw("boot", None, None, cpu, false)
+        let t = Self::raw("boot", None, None, cpu, false);
+        // It runs on this CPU's boot stack (on hosted builds, a thread's own
+        // stack): never let another CPU steal it.
+        t.affinity.store(1 << cpu, Ordering::Relaxed);
+        t
     }
 
     pub(crate) fn idle(cpu: usize, stack_size: usize) -> Arc<Self> {
@@ -245,6 +301,7 @@ impl Task {
             is_idle,
             priority: AtomicU8::new(0),
             cpu: AtomicUsize::new(cpu),
+            affinity: AtomicU64::new(ALL_CPUS),
             slice_left: AtomicU32::new(0),
             entry: UnsafeCell::new(entry),
             _stack: stack,
@@ -266,6 +323,7 @@ pub struct TaskBuilder {
     stack_size: usize,
     priority: u8,
     cpu: Option<usize>,
+    affinity: u64,
     data: Option<Box<dyn Any + Send + Sync>>,
 }
 
@@ -281,7 +339,7 @@ impl TaskBuilder {
 
     /// Starts building a task called `name`.
     pub fn new(name: &'static str) -> Self {
-        Self { name, stack_size: Self::DEFAULT_STACK, priority: 0, cpu: None, data: None }
+        Self { name, stack_size: Self::DEFAULT_STACK, priority: 0, cpu: None, affinity: ALL_CPUS, data: None }
     }
 
     /// Sets the stack size in bytes.
@@ -296,9 +354,18 @@ impl TaskBuilder {
         self
     }
 
-    /// Places the task on `cpu` (default: the spawning CPU).
+    /// Pins the task to `cpu`. By default it starts on the spawning CPU and
+    /// load-balancing policies may move it.
     pub fn cpu(mut self, cpu: usize) -> Self {
         self.cpu = Some(cpu);
+        self.affinity = 1 << cpu;
+        self
+    }
+
+    /// Restricts the task to the CPUs in `mask` (bit `n` = CPU `n`).
+    pub fn affinity(mut self, mask: u64) -> Self {
+        assert!(mask != 0, "a task must be allowed on some CPU");
+        self.affinity = mask;
         self
     }
 
@@ -311,9 +378,13 @@ impl TaskBuilder {
 
     /// Creates the task without making it runnable; see [`crate::spawn`].
     pub fn build(self, f: impl FnOnce() + Send + 'static) -> Arc<Task> {
-        let cpu = self.cpu.unwrap_or_else(osmium_arch::cpu::current_id);
+        let mut cpu = self.cpu.unwrap_or_else(osmium_arch::cpu::current_id);
+        if self.affinity & (1 << cpu) == 0 {
+            cpu = self.affinity.trailing_zeros() as usize;
+        }
         let t = Task::raw(self.name, Some(self.stack_size), Some(Box::new(f)), cpu, false);
         t.priority.store(self.priority, Ordering::Relaxed);
+        t.affinity.store(self.affinity, Ordering::Relaxed);
         if let Some(d) = self.data {
             t.data.call_once(|| d);
         }

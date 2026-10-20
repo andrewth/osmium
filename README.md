@@ -118,8 +118,8 @@ features.
   `fork`/`execve` yet, and a process has one thread. Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
-  physical hardware. The scheduler does no load balancing; tasks move only
-  when `Task::set_cpu` asks.
+  physical hardware. Load balancing (`with_stealing`) is opt-in; by default tasks
+  move only when `Task::set_cpu` asks.
 - The context switch saves FP registers only on targets that have them
   enabled (`neon`, `d`). Soft-float kernels are unaffected.
 - The hypervisor crate supplies the plumbing (memory, buses, exits, stage-2

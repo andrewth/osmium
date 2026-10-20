@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use osmium_sched::{FifoScheduler, Mutex, Semaphore, TaskBuilder, TaskState, WaitQueue};
 
-static SCHED: FifoScheduler = FifoScheduler::new(2);
+static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
 
 /// Makes the calling test thread a fresh CPU with a unique id.
 fn become_cpu() {
@@ -20,7 +20,8 @@ fn become_cpu() {
 
 fn builder(name: &'static str) -> TaskBuilder {
     // Debug builds of std formatting need more than the 64 KiB default.
-    TaskBuilder::new(name).stack_size(256 * 1024)
+    // Pinned, so other tests' CPUs (threads) never steal these tasks.
+    TaskBuilder::new(name).stack_size(256 * 1024).cpu(osmium_arch::cpu::current_id())
 }
 
 #[test]
@@ -220,4 +221,127 @@ fn task_data() {
     assert!(u.data::<u32>().is_none());
     u.set_data(9u32).unwrap();
     assert_eq!(u.data::<u32>(), Some(&9));
+}
+
+#[test]
+fn idle_cpu_steals_unpinned_work() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    become_cpu();
+    let home = osmium_arch::cpu::current_id();
+    let steals_before = SCHED.steals();
+
+    static GATE: WaitQueue = WaitQueue::new();
+    // Another "CPU" with nothing of its own to run: its boot task blocks, so
+    // its idle task runs, and an idle CPU steals.
+    let thief = std::thread::spawn(move || {
+        become_cpu();
+        GATE.wait_until(|| DONE.load(Ordering::Acquire).then_some(()));
+    });
+
+    // Wait until the thief CPU is idle (its boot task blocked on the gate).
+    while GATE.is_empty() {
+        std::thread::yield_now();
+    }
+
+    let ran_on = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let ran_on = ran_on.clone();
+            // Unpinned (no .cpu()): starts here, but any CPU may run it.
+            TaskBuilder::new("work").stack_size(256 * 1024).spawn(move || {
+                // Keep going until some steal has happened (the host decides
+                // when the thief thread runs), then a little longer so a
+                // stolen task records where it ran. Bounded either way.
+                for i in 0..1_000_000 {
+                    ran_on.lock().unwrap().push(osmium_arch::cpu::current_id());
+                    if i >= 20 && SCHED.steals() > steals_before {
+                        break;
+                    }
+                    osmium_sched::yield_now();
+                }
+            })
+        })
+        .collect();
+    for t in &tasks {
+        t.join();
+    }
+    DONE.store(true, Ordering::Release);
+    GATE.wake_all();
+    thief.join().unwrap();
+
+    let ran_on = ran_on.lock().unwrap();
+    assert!(ran_on.iter().any(|&c| c != home), "some work ran on another CPU");
+    assert!(SCHED.steals() > steals_before);
+}
+
+#[test]
+fn mutex_with_stealing_across_cpus() {
+    static GATE: WaitQueue = WaitQueue::new();
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    become_cpu();
+    let thieves: Vec<_> = (0..3)
+        .map(|_| {
+            std::thread::spawn(|| {
+                become_cpu();
+                GATE.wait_until(|| DONE.load(Ordering::Acquire).then_some(()));
+            })
+        })
+        .collect();
+    while GATE.len() < 3 {
+        std::thread::yield_now();
+    }
+    let mutex = Arc::new(Mutex::new(0u32));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let mutex = mutex.clone();
+            // Unpinned: idle CPUs steal them while they contend.
+            TaskBuilder::new("adder").stack_size(256 * 1024).spawn(move || {
+                for _ in 0..500 {
+                    let mut g = mutex.lock();
+                    let v = *g;
+                    osmium_sched::yield_now();
+                    *g = v + 1;
+                }
+            })
+        })
+        .collect();
+    for w in &workers {
+        w.join();
+    }
+    DONE.store(true, Ordering::Release);
+    GATE.wake_all();
+    for t in thieves {
+        t.join().unwrap();
+    }
+    assert_eq!(*mutex.lock(), 2000);
+}
+
+#[test]
+fn woken_task_is_placed_on_an_idle_cpu() {
+    static GATE: WaitQueue = WaitQueue::new();
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    become_cpu();
+    let home = osmium_arch::cpu::current_id();
+    let thief = std::thread::spawn(|| {
+        become_cpu();
+        GATE.wait_until(|| DONE.load(Ordering::Acquire).then_some(()));
+    });
+    while GATE.is_empty() {
+        std::thread::yield_now();
+    }
+    // This CPU stays busy (it spins instead of blocking), so the only way the
+    // unpinned task can run is on the idle CPU, where spawn placed it.
+    let ran_on = Arc::new(AtomicUsize::new(usize::MAX));
+    let r = ran_on.clone();
+    let t = TaskBuilder::new("placed").stack_size(256 * 1024).spawn(move || {
+        r.store(osmium_arch::cpu::current_id(), Ordering::Release);
+    });
+    while ran_on.load(Ordering::Acquire) == usize::MAX {
+        std::thread::yield_now();
+    }
+    assert_ne!(ran_on.load(Ordering::Acquire), home);
+    t.join();
+    DONE.store(true, Ordering::Release);
+    GATE.wake_all();
+    thief.join().unwrap();
 }

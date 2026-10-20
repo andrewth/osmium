@@ -27,8 +27,14 @@
 //! - Each CPU runs an idle task that waits for interrupts when nothing is
 //!   runnable.
 //!
-//! The scheduler keeps tasks on their CPU; wake-ups go to the task's last
-//! CPU, and [`Task::set_cpu`] migrates a task the next time it is queued.
+//! By default the scheduler keeps tasks on their CPU; wake-ups go to the
+//! task's last CPU, and [`Task::set_cpu`] migrates a task the next time it is
+//! queued. [`FifoScheduler::with_stealing`] and
+//! [`PriorityScheduler::with_stealing`] turn on load balancing: a CPU with
+//! nothing to run takes queued work from other CPUs, and new or woken tasks
+//! go to an idle CPU when their own is busy. Tasks move only within their
+//! affinity ([`Task::set_affinity`], [`Task::pin`]); [`TaskBuilder::cpu`]
+//! pins. Each CPU's boot task is pinned to it.
 //! Register [`set_remote_wake_hook`] to send an IPI when work is queued on
 //! another CPU; without it, that CPU notices at its next timer tick.
 #![no_std]
@@ -50,4 +56,4 @@ pub use core_sched::{
 };
 pub use policy::{FifoScheduler, PriorityScheduler};
 pub use sync::{Mutex, MutexGuard, Semaphore, WaitQueue};
-pub use task::{StackAllocator, Task, TaskBuilder, TaskId, TaskState, set_stack_allocator};
+pub use task::{ALL_CPUS, StackAllocator, Task, TaskBuilder, TaskId, TaskState, set_stack_allocator};

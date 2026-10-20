@@ -4,8 +4,6 @@
 
 extern crate alloc;
 
-pub mod user;
-
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -33,10 +31,12 @@ pub fn run_all(env: &Env) {
 
 /// Tasks that yield to each other interleave in FIFO order.
 pub fn cooperative() {
+    // Pinned here, so the interleaving is the same with work stealing on.
+    let cpu = osmium::arch::cpu::current_id();
     let tasks: Vec<_> = ["A", "B", "C"]
         .into_iter()
         .map(|name| {
-            TaskBuilder::new(name).spawn(move || {
+            TaskBuilder::new(name).cpu(cpu).spawn(move || {
                 for i in 0..2 {
                     println!("[task]  {name}{i}");
                     osmium::sched::yield_now();
@@ -136,7 +136,7 @@ pub fn smp(ncpus: usize) {
         for _ in 0..=ncpus {
             let here = cpu::current_id();
             p.lock().push(here);
-            osmium::sched::current().set_cpu((here + 1) % ncpus);
+            osmium::sched::current().pin((here + 1) % ncpus);
             osmium::sched::yield_now();
         }
     });
@@ -414,4 +414,39 @@ pub fn block_roundtrip<D: osmium::hal::block::BlockDevice>(disk: &mut D) -> Resu
     disk.flush()?;
     disk.read_blocks(lba, &mut back)?;
     if back == pattern { Ok(lba) } else { Err(osmium::hal::block::BlockError::Io) }
+}
+
+/// Work stealing: unpinned, CPU-bound tasks all start on this CPU; idle CPUs
+/// take them. `steals` reads the scheduler's steal counter.
+pub fn balance(ncpus: usize, steals: &dyn Fn() -> usize) {
+    use core::sync::atomic::AtomicUsize;
+    use osmium::arch::cpu;
+
+    static RAN_ON: AtomicUsize = AtomicUsize::new(0);
+    let before = steals();
+    let home = cpu::current_id();
+    let tasks: Vec<_> = (0..2 * ncpus)
+        .map(|_| {
+            // No .cpu(): spawned on this CPU, free to move.
+            TaskBuilder::new("busy").spawn(|| {
+                for _ in 0..20 {
+                    RAN_ON.fetch_or(1 << cpu::current_id(), Ordering::Relaxed);
+                    // Busy work without yielding: only preemption or an idle
+                    // CPU stealing queued tasks spreads the load.
+                    for i in 0..200_000u32 {
+                        core::hint::black_box(i);
+                    }
+                }
+            })
+        })
+        .collect();
+    for t in tasks {
+        t.join();
+    }
+    println!(
+        "[balance] {} unpinned tasks spawned on CPU {home} ran on CPUs {:#b}; {} steals",
+        2 * ncpus,
+        RAN_ON.load(Ordering::Relaxed),
+        steals() - before
+    );
 }

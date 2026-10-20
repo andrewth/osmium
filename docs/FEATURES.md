@@ -167,6 +167,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Context-switch hook (`set_switch_hook`) and `Task::kernel_stack_top`, for per-task CPU state such as the x86 TSS stack, address space or FPU
 - ✅ Remote-wake hook so kernels can IPI a CPU when work is queued there; task migration with `Task::set_cpu`
 - ✅ Ready-made policies: `FifoScheduler` (round-robin with a time slice) and `PriorityScheduler` (O(1) bitmap, 64 levels)
+- ✅ CPU affinity masks (`Task::set_affinity`, `pin`, `TaskBuilder::affinity`; `TaskBuilder::cpu` pins) and opt-in load balancing (`with_stealing`): idle CPUs steal queued tasks they may run, new and woken tasks are placed on idle CPUs, and a task still saving its registers is never stolen
 - ✅ `WaitQueue` (no lost wake-ups), sleeping `Mutex`, `Semaphore`
 - ✅ `TimerQueue`: deadline-ordered callbacks driven by the timer IRQ
 - ✅ `osmium-exec`: heap-free async executor (fixed task slots, interrupt-safe wakers, idle-until-interrupt without lost wake-ups, `run_with` for stack-pinned `async fn`s), `Signal`, `AtomicWaker`, `StaticCell`
