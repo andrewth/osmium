@@ -29,6 +29,7 @@ pub mod kind {
     pub const CONFIGURE_ENDPOINT: u32 = 12;
     pub const EVALUATE_CONTEXT: u32 = 13;
     pub const RESET_ENDPOINT: u32 = 14;
+    pub const STOP_ENDPOINT: u32 = 15;
     pub const SET_TR_DEQUEUE: u32 = 16;
     pub const NO_OP_COMMAND: u32 = 23;
     pub const TRANSFER_EVENT: u32 = 32;
@@ -53,6 +54,8 @@ pub mod completion {
     pub const SHORT_PACKET: u8 = 13;
     pub const PARAMETER: u8 = 17;
     pub const CONTEXT_STATE: u8 = 19;
+    pub const COMMAND_RING_STOPPED: u8 = 24;
+    pub const COMMAND_ABORTED: u8 = 25;
 }
 
 /// Control-word bits.
@@ -155,6 +158,12 @@ impl Trb {
     /// Reset Endpoint Command (recovers a halted endpoint).
     pub const fn reset_endpoint(slot: u8, dci: u8) -> Self {
         Self::new(kind::RESET_ENDPOINT, 0, 0, (slot as u32) << 24 | (dci as u32) << 16)
+    }
+
+    /// Stop Endpoint Command (halts a running endpoint so its ring can be
+    /// moved).
+    pub const fn stop_endpoint(slot: u8, dci: u8) -> Self {
+        Self::new(kind::STOP_ENDPOINT, 0, 0, (slot as u32) << 24 | (dci as u32) << 16)
     }
 
     /// Set TR Dequeue Pointer Command: the endpoint resumes at `dequeue`

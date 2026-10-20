@@ -14,11 +14,14 @@
 pub mod ring;
 pub mod trb;
 
+use core::mem::ManuallyDrop;
+
 use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
 use osmium_hal::mmio::IoMem;
 use osmium_hal::usb::{
     DeviceId, Direction, EndpointDescriptor, PortStatus, SetupPacket, Speed, TransferType, UsbError, UsbHost,
 };
+use osmium_mm::PhysAddr;
 
 use ring::{EventRing, ProducerRing};
 use trb::{Trb, completion, kind};
@@ -40,6 +43,13 @@ const DCBAAP: usize = 0x30;
 const CONFIG: usize = 0x38;
 const PORTSC: usize = 0x400;
 const PORT_STRIDE: usize = 0x10;
+
+/// Command Abort: stop the command ring after aborting the running command.
+const CRCR_CA: u32 = 1 << 2;
+/// Command Ring Running.
+const CRCR_CRR: u32 = 1 << 3;
+/// HCCPARAMS1: the controller can address 64 bits of memory.
+const HCC_AC64: u32 = 1 << 0;
 
 const CMD_RUN: u32 = 1 << 0;
 const CMD_RESET: u32 = 1 << 1;
@@ -81,8 +91,12 @@ pub const MAX_SLOTS: u8 = 8;
 /// never crosses the 64 KiB boundary a TRB buffer must not span.
 pub const BOUNCE_LEN: usize = 16 * 1024;
 
-/// How many times a register or the event ring is polled before giving up.
-const POLL_LIMIT: u32 = 20_000_000;
+/// How many times a register or the event ring is polled before giving up
+/// (fewer in tests, whose fake controller never answers).
+const POLL_LIMIT: u32 = if cfg!(test) { 20_000 } else { 20_000_000 };
+
+/// Bytes of one ring segment.
+const RING_BYTES: usize = ring::RING_TRBS * 16;
 
 /// Endpoint context types.
 const EP_TYPE_CONTROL: u32 = 4;
@@ -98,6 +112,8 @@ pub enum XhciError {
     Unsupported,
     /// DMA memory could not be allocated.
     NoMemory,
+    /// The controller addresses only 32 bits and DMA memory lies above 4 GiB.
+    HighMemory,
 }
 
 /// One addressed device.
@@ -109,6 +125,9 @@ struct Slot<'d, D: DmaAllocator + ?Sized> {
     /// to build on a boot stack.
     endpoints: [Option<Endpoint<'d, D>>; MAX_ENDPOINTS],
     speed: Speed,
+    /// A transfer could not be cancelled, so a TRB pointing at the shared
+    /// bounce buffer may still run: no more transfers on this slot.
+    dead: bool,
 }
 
 impl<'d, D: DmaAllocator + ?Sized> Slot<'d, D> {
@@ -141,6 +160,9 @@ struct Pending<'d, D: DmaAllocator + ?Sized> {
 pub const MAX_SUBMIT_LEN: usize = 4096;
 
 /// An xHCI controller.
+///
+/// The DMA memory is freed on drop only once the controller has halted;
+/// one that will not halt might still write to it, so it is leaked.
 pub struct Xhci<'d, D: DmaAllocator + ?Sized> {
     io: IoMem,
     op: usize,
@@ -148,13 +170,18 @@ pub struct Xhci<'d, D: DmaAllocator + ?Sized> {
     db: usize,
     ctx_size: usize,
     max_ports: u8,
+    /// The controller takes 64-bit addresses; if not, all DMA memory must
+    /// lie below 4 GiB.
+    ac64: bool,
+    /// A command could not be aborted and may still run: no more commands.
+    commands_stuck: bool,
     dma: &'d D,
-    dcbaa: OwnedDma<'d, D>,
-    _scratchpad: Option<(OwnedDma<'d, D>, OwnedDma<'d, D>)>,
-    commands: ProducerRing<'d, D>,
-    events: EventRing<'d, D>,
-    bounce: OwnedDma<'d, D>,
-    slots: [Option<Slot<'d, D>>; MAX_SLOTS as usize],
+    dcbaa: ManuallyDrop<OwnedDma<'d, D>>,
+    _scratchpad: ManuallyDrop<Option<(OwnedDma<'d, D>, OwnedDma<'d, D>)>>,
+    commands: ManuallyDrop<ProducerRing<'d, D>>,
+    events: ManuallyDrop<EventRing<'d, D>>,
+    bounce: ManuallyDrop<OwnedDma<'d, D>>,
+    slots: ManuallyDrop<[Option<Slot<'d, D>>; MAX_SLOTS as usize]>,
     interrupts: u64,
 }
 
@@ -220,6 +247,22 @@ fn ctx_get(buf: &DmaBuffer, ctx: usize, n: usize) -> u32 {
     u32::from_le(buf.load(ctx + 4 * n))
 }
 
+/// Whether a controller that takes 64-bit addresses if `ac64` can reach
+/// `len` bytes of DMA memory at `addr`.
+fn reachable(ac64: bool, addr: u64, len: usize) -> bool {
+    ac64 || addr.checked_add(len as u64).is_some_and(|end| end <= 1 << 32)
+}
+
+/// `len` bytes of DMA memory the controller can reach.
+fn new_dma<'d, D: DmaAllocator + ?Sized>(dma: &'d D, ac64: bool, len: usize) -> Option<OwnedDma<'d, D>> {
+    OwnedDma::new(dma, len).filter(|b| reachable(ac64, b.device_addr().as_u64(), len))
+}
+
+/// A transfer ring the controller can reach.
+fn new_ring<'d, D: DmaAllocator + ?Sized>(dma: &'d D, ac64: bool) -> Option<ProducerRing<'d, D>> {
+    ProducerRing::new(dma).filter(|r| reachable(ac64, r.base().as_u64(), RING_BYTES))
+}
+
 impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     /// Takes the controller whose registers are `io` away from firmware,
     /// resets it, and starts it with DMA memory from `dma`. Ports are left
@@ -234,7 +277,14 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         let db = (r(DBOFF)? & !3) as usize;
         let rt = (r(RTSOFF)? & !0x1f) as usize;
         let max_ports = (params1 >> 24) as u8;
-        if op < 0x20 || cap >> 16 < 0x0090 || max_ports == 0 || io.len() < (op + PORTSC).max(rt + 0x40).max(db + 4) {
+        // Every port's PORTSC, interrupter 0 and every doorbell must be in the window.
+        let ports_end = op + PORTSC + max_ports as usize * PORT_STRIDE;
+        let doorbells_end = db.saturating_add(4 * (MAX_SLOTS as usize + 1));
+        if op < 0x20
+            || cap >> 16 < 0x0090
+            || max_ports == 0
+            || io.len() < ports_end.max(rt.saturating_add(0x40)).max(doorbells_end)
+        {
             return Err(XhciError::BadRegisters);
         }
         let max_slots = (params1 as u8).min(MAX_SLOTS);
@@ -261,18 +311,34 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
             db,
             ctx_size,
             max_ports,
+            ac64: hccparams1 & HCC_AC64 != 0,
+            commands_stuck: false,
             dma,
-            dcbaa,
-            _scratchpad: scratchpad,
-            commands: ProducerRing::new(dma).ok_or(no_mem)?,
-            events: EventRing::new(dma).ok_or(no_mem)?,
-            bounce: OwnedDma::new(dma, BOUNCE_LEN).ok_or(no_mem)?,
-            slots: [const { None }; MAX_SLOTS as usize],
+            dcbaa: ManuallyDrop::new(dcbaa),
+            _scratchpad: ManuallyDrop::new(scratchpad),
+            commands: ManuallyDrop::new(ProducerRing::new(dma).ok_or(no_mem)?),
+            events: ManuallyDrop::new(EventRing::new(dma).ok_or(no_mem)?),
+            bounce: ManuallyDrop::new(OwnedDma::new(dma, BOUNCE_LEN).ok_or(no_mem)?),
+            slots: ManuallyDrop::new([const { None }; MAX_SLOTS as usize]),
             interrupts: 0,
             io,
         };
         if scratchpads > 0 && hc.op_read(PAGESIZE) & 1 == 0 {
             return Err(XhciError::Unsupported);
+        }
+        // Without AC64 the controller drops the high half of every address.
+        let scratch = hc._scratchpad.iter().flat_map(|(a, p)| [&**a, &**p]);
+        let buffers_ok = [&**hc.dcbaa, &**hc.bounce]
+            .into_iter()
+            .chain(scratch)
+            .all(|b| reachable(hc.ac64, b.device_addr().as_u64(), b.len()));
+        // The event ring's dequeue pointer is still its segment's start.
+        let rings = [hc.commands.base(), hc.events.dequeue_addr()];
+        if !buffers_ok
+            || !rings.iter().all(|r| reachable(hc.ac64, r.as_u64(), RING_BYTES))
+            || !reachable(hc.ac64, hc.events.table().as_u64(), 64)
+        {
+            return Err(XhciError::HighMemory);
         }
         hc.take_from_firmware((hccparams1 >> 16) as usize * 4);
         hc.reset()?;
@@ -346,12 +412,14 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         self.interrupts
     }
 
+    // `new` checked the window covers every register used, so these only
+    // guard against a bug: reads outside it give 0, writes are dropped.
     fn r32(&self, off: usize) -> u32 {
-        self.io.read(off).expect("xHCI register outside window")
+        self.io.read(off).unwrap_or(0)
     }
 
     fn w32(&self, off: usize, v: u32) {
-        self.io.write(off, v).expect("xHCI register outside window")
+        let _ = self.io.write(off, v);
     }
 
     fn op_read(&self, reg: usize) -> u32 {
@@ -488,22 +556,54 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         if endpoint & 0xf == 0 {
             return Err(UsbError::BadEndpoint); // endpoint 0 carries control transfers only
         }
-        let ep = self.slot(dev)?.endpoint(dci(endpoint)).ok_or(UsbError::BadEndpoint)?;
+        let ep = self.live_slot(dev)?.endpoint(dci(endpoint)).ok_or(UsbError::BadEndpoint)?;
         if ep.pending.is_some() {
             return Err(UsbError::Busy);
         }
         Ok(&mut ep.ring)
     }
 
-    /// Runs a command and returns its completion event.
+    /// Runs a command and returns its completion event. One that does not
+    /// complete is aborted, so it cannot run later on memory since freed.
     fn command(&mut self, cmd: Trb) -> Result<Trb, UsbError> {
-        let addr = self.commands.push(cmd).as_u64();
+        if self.commands_stuck {
+            return Err(UsbError::Controller);
+        }
+        let addr = self.commands.push(cmd);
         self.ring_doorbell(0, 0);
-        let ev = self.wait_event(|e| e.kind() == kind::COMMAND_COMPLETION && e.param == addr)?;
+        let param = addr.as_u64();
+        let ev = match self.wait_event(|e| e.kind() == kind::COMMAND_COMPLETION && e.param == param) {
+            Ok(ev) => ev,
+            Err(e) => {
+                self.abort_command(addr);
+                return Err(e);
+            }
+        };
         match ev.completion_code() {
             completion::SUCCESS => Ok(ev),
             code => Err(error_from(code)),
         }
+    }
+
+    /// Takes the timed-out command at `addr` off the ring (xHCI 1.2
+    /// §4.6.1.2): Command Abort, wait for the ring to stop, and drain the
+    /// Command Ring Stopped event. A ring that stopped on the command, or
+    /// never fetched it, would run it at the next doorbell, so it becomes a
+    /// No Op. If the ring will not stop, no further commands are issued.
+    fn abort_command(&mut self, addr: PhysAddr) {
+        if self.op_read(CRCR) & CRCR_CRR != 0 {
+            // The pointer bits are ignored while the ring runs.
+            self.op_write(CRCR, CRCR_CA);
+            if self.poll(|hc| hc.op_read(CRCR) & CRCR_CRR == 0).is_err() {
+                self.commands_stuck = true;
+                return;
+            }
+            let stopped = |e: &Trb| {
+                e.kind() == kind::COMMAND_COMPLETION && e.completion_code() == completion::COMMAND_RING_STOPPED
+            };
+            let _ = self.wait_event(stopped);
+        }
+        self.commands.cancel(addr);
     }
 
     /// Checks the controller answers commands.
@@ -514,6 +614,15 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     fn slot(&mut self, dev: DeviceId) -> Result<&mut Slot<'d, D>, UsbError> {
         let i = (dev.0 as usize).wrapping_sub(1);
         self.slots.get_mut(i).and_then(Option::as_mut).ok_or(UsbError::NoDevice)
+    }
+
+    /// The slot for `dev`, if transfers on it are still safe.
+    fn live_slot(&mut self, dev: DeviceId) -> Result<&mut Slot<'d, D>, UsbError> {
+        let slot = self.slot(dev)?;
+        if slot.dead {
+            return Err(UsbError::NoDevice);
+        }
+        Ok(slot)
     }
 
     /// Resets `port` if it is not already enabled (USB 3 ports enable
@@ -552,15 +661,24 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         ctx_set(input, ep0_ctx, 4, 8); // average TRB length
     }
 
-    /// Recovers a halted endpoint: Reset Endpoint, then move its dequeue
-    /// pointer past the failed transfer.
-    fn recover(&mut self, dev: DeviceId, dci: usize) {
+    /// Moves an endpoint's dequeue pointer past every queued TRB, after
+    /// resetting it if it `halted` on an error, or stopping it (after a
+    /// timeout, or if it was not halted after all). If the pointer cannot be
+    /// moved, a TRB pointing at the shared bounce buffer may still run, so
+    /// the slot is marked dead.
+    fn recover(&mut self, dev: DeviceId, dci: usize, halted: bool) {
         let (addr, cycle) = match self.slot(dev).ok().and_then(|s| s.endpoint(dci)) {
             Some(e) => (e.ring.enqueue_addr().as_u64(), e.ring.cycle()),
             None => return,
         };
-        let _ = self.command(Trb::reset_endpoint(dev.0, dci as u8));
-        let _ = self.command(Trb::set_tr_dequeue(dev.0, dci as u8, addr, cycle));
+        if !halted || self.command(Trb::reset_endpoint(dev.0, dci as u8)).is_err() {
+            let _ = self.command(Trb::stop_endpoint(dev.0, dci as u8));
+        }
+        if self.command(Trb::set_tr_dequeue(dev.0, dci as u8, addr, cycle)).is_err()
+            && let Ok(slot) = self.slot(dev)
+        {
+            slot.dead = true;
+        }
     }
 
     /// Runs a control transfer whose data stage (if any) uses the first
@@ -572,16 +690,30 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         }
         let dir_in = setup.direction() == Direction::In;
         let bounce = self.bounce.device_addr().as_u64();
-        let ring = &mut self.slot(dev)?.endpoint(1).ok_or(UsbError::BadEndpoint)?.ring;
-        ring.push(Trb::setup_stage(&setup));
+        let ring = &mut self.live_slot(dev)?.endpoint(1).ok_or(UsbError::BadEndpoint)?.ring;
+        let first = ring.push(Trb::setup_stage(&setup)).as_u64();
         let data = (len > 0).then(|| ring.push(Trb::data_stage(bounce, len as u32, dir_in)).as_u64());
         let status = ring.push(Trb::status_stage(!(len > 0 && dir_in))).as_u64();
         self.ring_doorbell(dev.0, 1);
 
+        // Only events for this transfer's TRBs: a late one for an earlier
+        // transfer must not complete this one.
+        let slot = dev.0;
+        let ours = move |e: &Trb| {
+            e.kind() == kind::TRANSFER_EVENT
+                && e.slot_id() == slot
+                && e.endpoint_id() == 1
+                && (e.param == first || Some(e.param) == data || e.param == status)
+        };
         let mut moved = len;
         loop {
-            let ev =
-                self.wait_event(|e| e.kind() == kind::TRANSFER_EVENT && e.slot_id() == dev.0 && e.endpoint_id() == 1)?;
+            let ev = match self.wait_event(ours) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    self.recover(dev, 1, false);
+                    return Err(e);
+                }
+            };
             match ev.completion_code() {
                 completion::SUCCESS | completion::SHORT_PACKET => {
                     if Some(ev.param) == data {
@@ -592,7 +724,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
                     }
                 }
                 code => {
-                    self.recover(dev, 1);
+                    self.recover(dev, 1, true);
                     return Err(error_from(code));
                 }
             }
@@ -606,11 +738,19 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         let bounce = self.bounce.device_addr().as_u64();
         let trb = self.idle_ring(dev, endpoint)?.push(Trb::normal(bounce, len as u32)).as_u64();
         self.ring_doorbell(dev.0, i as u32);
-        let ev = self.wait_event(|e| e.kind() == kind::TRANSFER_EVENT && e.param == trb)?;
+        let ev = match self.wait_event(|e| e.kind() == kind::TRANSFER_EVENT && e.param == trb) {
+            Ok(ev) => ev,
+            Err(e) => {
+                // Left queued, the TRB could still move data through the
+                // bounce buffer during another device's transfer.
+                self.recover(dev, i, false);
+                return Err(e);
+            }
+        };
         match ev.completion_code() {
             completion::SUCCESS | completion::SHORT_PACKET => Ok(len - (ev.residual() as usize).min(len)),
             code => {
-                self.recover(dev, i);
+                self.recover(dev, i, true);
                 Err(error_from(code))
             }
         }
@@ -645,16 +785,18 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             let _ = self.command(Trb::disable_slot(slot_id));
             return Err(UsbError::NoResources);
         }
+        if let Ok(held) = self.slot(dev) {
+            // The controller handed out a slot it already gave us: it is
+            // confused, and the device holding the slot is lost either way.
+            held.dead = true;
+            let _ = self.command(Trb::disable_slot(slot_id));
+            return Err(UsbError::Controller);
+        }
 
-        let alloc = |len| OwnedDma::new(self.dma, len).ok_or(UsbError::NoResources);
-        let (output, input) = match (alloc(32 * self.ctx_size), alloc(33 * self.ctx_size)) {
-            (Ok(o), Ok(i)) => (o, i),
-            _ => {
-                let _ = self.command(Trb::disable_slot(slot_id));
-                return Err(UsbError::NoResources);
-            }
-        };
-        let Some(ep0) = ProducerRing::new(self.dma) else {
+        let (dma, ac64, c) = (self.dma, self.ac64, self.ctx_size);
+        let (Some(output), Some(input), Some(ep0)) =
+            (new_dma(dma, ac64, 32 * c), new_dma(dma, ac64, 33 * c), new_ring(dma, ac64))
+        else {
             let _ = self.command(Trb::disable_slot(slot_id));
             return Err(UsbError::NoResources);
         };
@@ -663,7 +805,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         let input_addr = input.device_addr().as_u64();
         let mut endpoints = [const { None }; MAX_ENDPOINTS];
         endpoints[0] = Some(Endpoint { dci: 1, ring: ep0, pending: None });
-        self.slots[slot_id as usize - 1] = Some(Slot { output, input, endpoints, speed });
+        self.slots[slot_id as usize - 1] = Some(Slot { output, input, endpoints, speed, dead: false });
 
         let result = self.command(Trb::address_device(slot_id, input_addr)).and_then(|_| {
             // Learn endpoint 0's real packet size from the first 8 bytes of
@@ -693,17 +835,27 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
     }
 
     fn detach(&mut self, dev: DeviceId) {
-        if self.slot(dev).is_ok() {
-            let _ = self.command(Trb::disable_slot(dev.0));
-            self.dcbaa.store(dev.0 as usize * 8, 0u64);
-            self.slots[dev.0 as usize - 1] = None;
+        if self.slot(dev).is_err() {
+            return;
+        }
+        match self.command(Trb::disable_slot(dev.0)) {
+            // Disabled, or never enabled: the controller is done with the slot's memory.
+            Ok(_) | Err(UsbError::NoDevice) => {
+                self.dcbaa.store(dev.0 as usize * 8, 0u64);
+                self.slots[dev.0 as usize - 1] = None;
+            }
+            // It may still use the contexts and rings: keep them, dead, for a later detach to retry.
+            Err(_) => {
+                if let Ok(slot) = self.slot(dev) {
+                    slot.dead = true;
+                }
+            }
         }
     }
 
     fn configure_endpoints(&mut self, dev: DeviceId, endpoints: &[EndpointDescriptor]) -> Result<(), UsbError> {
-        let c = self.ctx_size;
-        let dma = self.dma;
-        let slot = self.slot(dev)?;
+        let (c, dma, ac64) = (self.ctx_size, self.dma, self.ac64);
+        let slot = self.live_slot(dev)?;
         let speed = slot.speed;
         let mut new_rings: [Option<(usize, ProducerRing<'_, D>)>; MAX_ENDPOINTS] = [const { None }; MAX_ENDPOINTS];
         // Endpoints the device keeps plus the new ones must fit the table.
@@ -716,29 +868,37 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         let mut last = 1;
         for (k, ep) in endpoints.iter().enumerate() {
             let i = dci(ep.address);
-            if i < 2 || ep.transfer_type() == TransferType::Isochronous {
+            if i < 2 {
                 return Err(UsbError::BadEndpoint);
             }
-            let ring = ProducerRing::new(dma).ok_or(UsbError::NoResources)?;
             let ty = match (ep.transfer_type(), ep.direction()) {
+                (TransferType::Control, _) => EP_TYPE_CONTROL,
                 (TransferType::Bulk, Direction::Out) => 2,
                 (TransferType::Interrupt, Direction::Out) => 3,
                 (TransferType::Bulk, Direction::In) => 6,
-                _ => 7,
+                (TransferType::Interrupt, Direction::In) => 7,
+                (TransferType::Isochronous, _) => return Err(UsbError::BadEndpoint),
             };
             let mps = ep.max_packet_size() as u32;
-            let mult = ep.extra_transactions() as u32;
+            // A high-speed periodic endpoint moving 2 or 3 packets a
+            // microframe has the extra ones in Max Burst Size (Mult is for
+            // SuperSpeed isochronous only). Elsewhere those bits are reserved.
+            let periodic = ep.transfer_type() == TransferType::Interrupt;
+            let burst = if periodic && speed == Speed::High { ep.extra_transactions() as u32 } else { 0 };
+            if burst > 2 {
+                return Err(UsbError::BadEndpoint);
+            }
+            let ring = new_ring(dma, ac64).ok_or(UsbError::NoResources)?;
             let ctx = (i + 1) * c;
             for n in 0..8 {
                 ctx_set(&slot.input, ctx, n, 0);
             }
             ctx_set(&slot.input, ctx, 0, interval(ep, speed) << 16);
-            ctx_set(&slot.input, ctx, 1, 3 << 1 | ty << 3 | mult << 8 | mps << 16);
+            ctx_set(&slot.input, ctx, 1, 3 << 1 | ty << 3 | burst << 8 | mps << 16);
             let deq = ring.base().as_u64() | ring.cycle() as u64;
             ctx_set(&slot.input, ctx, 2, deq as u32);
             ctx_set(&slot.input, ctx, 3, (deq >> 32) as u32);
-            let periodic = ep.transfer_type() == TransferType::Interrupt;
-            let esit = if periodic { mps * (mult + 1) } else { 0 };
+            let esit = if periodic { mps * (burst + 1) } else { 0 };
             let avg = if periodic { mps } else { 3072 };
             ctx_set(&slot.input, ctx, 4, (esit & 0xffff) << 16 | avg);
             new_rings[k] = Some((i, ring));
@@ -806,9 +966,8 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         }
         let endpoint = endpoint | 0x80;
         let i = dci(endpoint);
-        let dma = self.dma;
         self.idle_ring(dev, endpoint)?;
-        let buf = OwnedDma::new(dma, MAX_SUBMIT_LEN).ok_or(UsbError::NoResources)?;
+        let buf = new_dma(self.dma, self.ac64, MAX_SUBMIT_LEN).ok_or(UsbError::NoResources)?;
         let addr = buf.device_addr().as_u64();
         let ep = self.slot(dev)?.endpoint(i).ok_or(UsbError::BadEndpoint)?;
         let trb = ep.ring.push(Trb::normal(addr, len as u32)).as_u64();
@@ -836,7 +995,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
                 Ok(n)
             }
             code => {
-                self.recover(dev, i);
+                self.recover(dev, i, true);
                 Err(error_from(code))
             }
         })
@@ -857,9 +1016,21 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
 
 impl<D: DmaAllocator + ?Sized> Drop for Xhci<'_, D> {
     fn drop(&mut self) {
-        // Stop the controller before the rings and contexts are freed.
+        // Stop the controller before the rings and contexts are freed. One
+        // that does not halt may still write to them: they are leaked.
         self.op_write(USBCMD, self.op_read(USBCMD) & !CMD_RUN);
-        let _ = self.poll(|hc| hc.op_read(USBSTS) & STS_HALTED != 0);
+        if self.poll(|hc| hc.op_read(USBSTS) & STS_HALTED != 0).is_err() {
+            return;
+        }
+        // SAFETY: each field is dropped once, here, and not used again.
+        unsafe {
+            ManuallyDrop::drop(&mut self.slots);
+            ManuallyDrop::drop(&mut self.bounce);
+            ManuallyDrop::drop(&mut self.events);
+            ManuallyDrop::drop(&mut self.commands);
+            ManuallyDrop::drop(&mut self._scratchpad);
+            ManuallyDrop::drop(&mut self.dcbaa);
+        }
     }
 }
 
@@ -900,7 +1071,8 @@ mod tests {
 
     /// A controller over fake registers (op at 0x20, runtime at 0x200, no
     /// reset sequence) with one slot whose endpoint 3 has a `submit_in`
-    /// transfer outstanding at TRB address 0x1000.
+    /// transfer outstanding at TRB address 0x1000. Nothing answers commands
+    /// or transfers.
     fn fake<'a>(
         dma: &'a crate::virtio::testing::HostDma,
         regs: &mut [u32],
@@ -908,6 +1080,7 @@ mod tests {
         // SAFETY: the window covers the caller's array, which outlives the controller.
         let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), regs.len() * 4) };
         let mut endpoints = [const { None }; MAX_ENDPOINTS];
+        endpoints[0] = Some(Endpoint { dci: 1, ring: ProducerRing::new(dma).unwrap(), pending: None });
         let pending = Pending { buf: OwnedDma::new(dma, 8).unwrap(), trb: 0x1000, len: 8, done: None };
         endpoints[1] = Some(Endpoint { dci: 3, ring: ProducerRing::new(dma).unwrap(), pending: Some(pending) });
         let slot = Slot {
@@ -915,6 +1088,7 @@ mod tests {
             input: OwnedDma::new(dma, 1056).unwrap(),
             endpoints,
             speed: Speed::Full,
+            dead: false,
         };
         let mut slots = [const { None }; MAX_SLOTS as usize];
         slots[0] = Some(slot);
@@ -925,13 +1099,15 @@ mod tests {
             db: 0x100,
             ctx_size: 32,
             max_ports: 1,
+            ac64: true,
+            commands_stuck: false,
             dma,
-            dcbaa: OwnedDma::new(dma, 2048).unwrap(),
-            _scratchpad: None,
-            commands: ProducerRing::new(dma).unwrap(),
-            events: EventRing::new(dma).unwrap(),
-            bounce: OwnedDma::new(dma, BOUNCE_LEN).unwrap(),
-            slots,
+            dcbaa: ManuallyDrop::new(OwnedDma::new(dma, 2048).unwrap()),
+            _scratchpad: ManuallyDrop::new(None),
+            commands: ManuallyDrop::new(ProducerRing::new(dma).unwrap()),
+            events: ManuallyDrop::new(EventRing::new(dma).unwrap()),
+            bounce: ManuallyDrop::new(OwnedDma::new(dma, BOUNCE_LEN).unwrap()),
+            slots: ManuallyDrop::new(slots),
             interrupts: 0,
         }
     }
@@ -998,5 +1174,198 @@ mod tests {
         let dma = crate::virtio::testing::HostDma::default();
         assert_eq!(Xhci::new(io, &dma).err(), Some(XhciError::BadRegisters));
         assert_eq!(dma.live.get(), 0);
+    }
+
+    /// Capability registers of a halted controller with `ports` ports, op at
+    /// 0x20, doorbells at `db` and runtime registers at 0x200.
+    fn caps(regs: &mut [u32], ports: u32, db: u32, ac64: bool) {
+        regs[0] = 0x0100_0020;
+        regs[HCSPARAMS1 / 4] = ports << 24 | MAX_SLOTS as u32;
+        regs[HCCPARAMS1 / 4] = ac64 as u32;
+        regs[DBOFF / 4] = db;
+        regs[RTSOFF / 4] = 0x200;
+        regs[(0x20 + USBSTS) / 4] = STS_HALTED;
+    }
+
+    #[test]
+    fn rejects_windows_missing_ports_or_doorbells() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = [0u32; 0x110];
+        // Four ports end at 0x460, past the 0x440-byte window.
+        caps(&mut regs, 4, 0x100, true);
+        // SAFETY: the window covers a local array.
+        let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x440) };
+        assert_eq!(Xhci::new(io, &dma).err(), Some(XhciError::BadRegisters));
+        // One port fits, but the doorbells of slots 1..=8 run past the end.
+        caps(&mut regs, 1, 0x430, true);
+        // SAFETY: as above.
+        let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x440) };
+        assert_eq!(Xhci::new(io, &dma).err(), Some(XhciError::BadRegisters));
+        assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
+    fn registers_outside_the_window_do_not_panic() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let hc = fake(&dma, &mut regs);
+        assert_eq!(hc.r32(0x10_0000), 0);
+        hc.w32(0x10_0000, 1);
+        hc.ring_doorbell(255, 1);
+    }
+
+    /// Hands out memory the device sees above 4 GiB.
+    #[derive(Default)]
+    struct HighDma(crate::virtio::testing::HostDma);
+
+    impl DmaAllocator for HighDma {
+        fn alloc_coherent(&self, len: usize) -> Option<DmaBuffer> {
+            let b = self.0.alloc_coherent(len)?;
+            let high = PhysAddr::new(b.device_addr().as_u64() | 1 << 40);
+            // SAFETY: the same memory, at an address only the (fake) device uses.
+            Some(unsafe { DmaBuffer::new(b.cpu_ptr(), high, len) })
+        }
+
+        fn free_coherent(&self, buf: DmaBuffer) {
+            self.0.free_coherent(buf)
+        }
+    }
+
+    #[test]
+    fn needs_ac64_for_memory_above_4g() {
+        assert!(reachable(false, 0xffff_f000, 0x1000));
+        assert!(!reachable(false, 0xffff_f000, 0x1001));
+        assert!(reachable(true, 1 << 40, 0x1000));
+
+        let dma = HighDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        caps(&mut regs, 1, 0x100, false);
+        // SAFETY: the window covers a local array.
+        let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) };
+        assert_eq!(Xhci::new(io, &dma).err(), Some(XhciError::HighMemory));
+        // The controller was halted, so the memory was freed.
+        assert_eq!(dma.0.live.get(), 0);
+        // With AC64 it gets as far as the reset, which nothing completes here.
+        caps(&mut regs, 1, 0x100, true);
+        // SAFETY: as above.
+        let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) };
+        assert_eq!(Xhci::new(io, &dma).err(), Some(XhciError::Timeout));
+    }
+
+    fn command_completion(trb: PhysAddr, code: u8, slot: u8) -> Trb {
+        Trb {
+            param: trb.as_u64(),
+            status: (code as u32) << 24,
+            control: kind::COMMAND_COMPLETION << 10 | (slot as u32) << 24,
+        }
+    }
+
+    #[test]
+    fn timed_out_command_is_aborted() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        regs[(0x20 + CRCR) / 4] = CRCR_CRR;
+        let mut hc = fake(&dma, &mut regs);
+        assert_eq!(hc.command(Trb::disable_slot(1)).err(), Some(UsbError::Timeout));
+        // Aborted, and the TRB turned into a No Op in case the ring stopped on it.
+        assert_eq!(hc.r32(0x20 + CRCR), CRCR_CA);
+        let t = hc.commands.get(0);
+        assert_eq!((t.kind(), t.cycle()), (kind::NO_OP_COMMAND, true));
+        // A ring that is not running has not fetched its command: it is cancelled too.
+        assert_eq!(hc.command(Trb::disable_slot(1)).err(), Some(UsbError::Timeout));
+        assert_eq!(hc.commands.get(1).kind(), kind::NO_OP_COMMAND);
+        assert!(!hc.commands_stuck);
+    }
+
+    #[test]
+    fn stale_event_does_not_complete_a_control_transfer() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = fake(&dma, &mut regs);
+        // A late completion for an earlier transfer on endpoint 0.
+        hc.events.controller_write(0, transfer_event(1, 1, 0xdead_0000));
+        let mut buf = [0u8; 8];
+        let dev = DeviceId(1);
+        assert_eq!(hc.control_in(dev, SetupPacket::get_descriptor(1, 0, 8), &mut buf), Err(UsbError::Timeout));
+        // Nothing answered Stop Endpoint or Set TR Dequeue Pointer, so the
+        // queued TRBs may still use the bounce buffer: the slot is dead.
+        assert!(hc.slot(dev).unwrap().dead);
+        assert_eq!(hc.control_in(dev, SetupPacket::get_descriptor(1, 0, 8), &mut buf), Err(UsbError::NoDevice));
+        assert_eq!(hc.transfer_in(dev, 0x83, &mut buf), Err(UsbError::NoDevice));
+        assert_eq!(hc.transfer_out(dev, 0x02, &buf), Err(UsbError::NoDevice));
+    }
+
+    #[test]
+    fn failed_detach_keeps_the_slot() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = fake(&dma, &mut regs);
+        hc.detach(DeviceId(1));
+        assert!(hc.slot(DeviceId(1)).is_ok_and(|s| s.dead), "Disable Slot never completed");
+        // Disable Slot completing, even with Slot Not Enabled, frees it.
+        let next = hc.commands.enqueue_addr();
+        hc.events.controller_write(0, command_completion(next, completion::SLOT_NOT_ENABLED, 1));
+        hc.detach(DeviceId(1));
+        assert!(hc.slot(DeviceId(1)).is_err());
+    }
+
+    #[test]
+    fn drop_leaks_memory_of_a_controller_that_will_not_halt() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        drop(fake(&dma, &mut regs));
+        assert!(dma.live.get() > 0);
+        let dma = crate::virtio::testing::HostDma::default();
+        regs[(0x20 + USBSTS) / 4] = STS_HALTED;
+        drop(fake(&dma, &mut regs));
+        assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
+    fn enable_slot_returning_a_slot_in_use() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        // Port 1: connected, enabled, full speed.
+        regs[(0x20 + PORTSC) / 4] = PORT_CONNECTED | PORT_ENABLED | 1 << 10;
+        let mut hc = fake(&dma, &mut regs);
+        let output = hc.slot(DeviceId(1)).unwrap().output.device_addr();
+        let enable = hc.commands.enqueue_addr();
+        hc.events.controller_write(0, command_completion(enable, completion::SUCCESS, 1));
+        assert_eq!(hc.attach(1), Err(UsbError::Controller));
+        let slot = hc.slot(DeviceId(1)).unwrap();
+        assert_eq!(slot.output.device_addr(), output, "not overwritten");
+        assert!(slot.dead);
+        // Enable Slot, then Disable Slot (cancelled here, as nothing answered it).
+        assert_eq!(hc.commands.enqueue_addr().as_u64(), enable.as_u64() + 32);
+    }
+
+    #[test]
+    fn endpoint_context_types_and_bursts() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = fake(&dma, &mut regs);
+        hc.slot(DeviceId(1)).unwrap().speed = Speed::High;
+        let ep = |address, attributes, max_packet_size_raw| EndpointDescriptor {
+            address,
+            attributes,
+            max_packet_size_raw,
+            interval: 1,
+        };
+        let configure = hc.commands.enqueue_addr();
+        hc.events.controller_write(0, command_completion(configure, completion::SUCCESS, 1));
+        // A high-bandwidth interrupt IN endpoint (3 x 64 bytes), and a control endpoint.
+        let eps = [ep(0x81, 3, 2 << 11 | 64), ep(0x02, 0, 64)];
+        hc.configure_endpoints(DeviceId(1), &eps).unwrap();
+        let input = &hc.slot(DeviceId(1)).unwrap().input;
+        assert_eq!(ctx_get(input, 4 * 32, 1), 3 << 1 | 7 << 3 | 2 << 8 | 64 << 16);
+        assert_eq!(ctx_get(input, 4 * 32, 4) >> 16, 3 * 64, "max ESIT payload");
+        assert_eq!(ctx_get(input, 5 * 32, 1), 3 << 1 | EP_TYPE_CONTROL << 3 | 64 << 16);
+        // The reserved fourth transaction is refused, and the bits mean nothing on bulk.
+        assert_eq!(hc.configure_endpoints(DeviceId(1), &[ep(0x81, 3, 3 << 11 | 64)]), Err(UsbError::BadEndpoint));
+        let configure = hc.commands.enqueue_addr();
+        hc.events.controller_write(1, command_completion(configure, completion::SUCCESS, 1));
+        hc.configure_endpoints(DeviceId(1), &[ep(0x83, 2, 3 << 11 | 512)]).unwrap();
+        let input = &hc.slot(DeviceId(1)).unwrap().input;
+        assert_eq!(ctx_get(input, 8 * 32, 1), 3 << 1 | 6 << 3 | 512 << 16);
     }
 }

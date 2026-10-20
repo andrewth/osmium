@@ -84,6 +84,26 @@ impl<'d, D: DmaAllocator + ?Sized> ProducerRing<'d, D> {
         }
         addr
     }
+
+    /// Turns the TRB at `addr`, which the controller has not run, into a No
+    /// Op Command with the same cycle bit. Only the control word changes, so
+    /// a controller fetching it meanwhile sees either the old TRB or the No
+    /// Op. Does nothing if `addr` is not in this ring.
+    pub fn cancel(&mut self, addr: PhysAddr) {
+        let off = addr.as_u64().wrapping_sub(self.base().as_u64());
+        if !off.is_multiple_of(TRB_SIZE as u64) || off >= ((RING_TRBS - 1) * TRB_SIZE) as u64 {
+            return;
+        }
+        let i = off as usize / TRB_SIZE;
+        let cycle = load(&self.mem, i).control & flag::CYCLE;
+        self.mem.store(i * TRB_SIZE + 12, (Trb::no_op_command().control | cycle).to_le());
+    }
+
+    /// The TRB at index `i`, for tests.
+    #[cfg(test)]
+    pub(crate) fn get(&self, i: usize) -> Trb {
+        load(&self.mem, i)
+    }
 }
 
 /// The ring the controller produces events into, with its one-entry
