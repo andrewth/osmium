@@ -11,6 +11,7 @@
 //! | [`Aarch64Stage2`] | AArch64 stage 2 (guest IPA), starting level 0 | 4 | 48 |
 //! | [`VtdSecondLevel`] | Intel VT-d second-level (IOVA), 4-level | 4 | 48 |
 //! | [`AmdVi`] | AMD-Vi I/O page tables (IOVA), 4 KiB pages only | 4 | 48 |
+//! | [`Sv39Io`] | RISC-V IOMMU first stage (IOVA), Sv39 with `U` everywhere | 3 | 39, sign-extended |
 //!
 //! IOMMUs reuse the CPU formats where the hardware does: an Arm SMMUv3
 //! stage-2 context uses [`Aarch64Stage2`] and a RISC-V IOMMU G-stage context
@@ -679,5 +680,45 @@ impl PageTableFormat for AmdVi {
             f = f | MapFlags::WRITE;
         }
         f
+    }
+}
+
+/// RISC-V Sv39 as the RISC-V IOMMU's first stage walks it for a device's DMA.
+///
+/// Device accesses count as user accesses, so leaves carry `U`; `USER` and
+/// `GLOBAL` are ignored. Table entries carry `U` too: the privileged
+/// specification reserves that bit in non-leaf entries (software should
+/// clear it, hardware ignores it), but QEMU's IOMMU model refuses a walk
+/// through entries without it, and its own tests set it.
+pub struct Sv39Io;
+
+impl PageTableFormat for Sv39Io {
+    const LEVELS: usize = 3;
+    const VA_BITS: u32 = 39;
+    const SIGN_EXTEND: bool = true;
+    const MAX_LEAF_LEVEL: usize = 2;
+
+    fn table(pa: PhysAddr) -> u64 {
+        Sv39::table(pa) | rv::U
+    }
+
+    fn leaf(pa: PhysAddr, f: MapFlags, level: usize) -> u64 {
+        Sv39::leaf(pa, f.difference(MapFlags::USER | MapFlags::GLOBAL), level) | rv::U
+    }
+
+    fn is_valid(pte: u64) -> bool {
+        Sv39::is_valid(pte)
+    }
+
+    fn is_leaf(pte: u64, level: usize) -> bool {
+        Sv39::is_leaf(pte, level)
+    }
+
+    fn addr(pte: u64, level: usize) -> PhysAddr {
+        Sv39::addr(pte, level)
+    }
+
+    fn flags(pte: u64, level: usize) -> MapFlags {
+        Sv39::flags(pte & !(rv::U | rv::G), level)
     }
 }

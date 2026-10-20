@@ -10,6 +10,8 @@
 
 extern crate alloc;
 
+mod iommu;
+
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -428,6 +430,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     overflow_demo();
     demos::user::boot_vfs();
     user_demo(ncpus);
+    iommu::demo(&fdt);
 
     println!(
         "[done]  {} timer ticks, {} IPIs, {} free frames; shutting down",

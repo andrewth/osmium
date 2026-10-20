@@ -1,20 +1,21 @@
 //! The RISC-V IOMMU.
 //!
 //! [`RiscvIommu`] drives one unit (the `riscv-iommu` PCI function QEMU
-//! provides, or a platform device) with G-stage-only translation: the device
-//! directory table (two levels, indexed by the PCI requester ID) holds one
-//! device context per function, whose `iohgatp` points at a table in
-//! [`Sv39x4`] format, so IOVAs are 41 bits. Both the base (32-byte) and the
-//! extended (64-byte, `capabilities.MSI_FLAT`) context formats are handled;
-//! the MSI page table fields stay zero, so a device's MSI writes are
-//! translated like any other DMA and need their target page mapped in its
-//! domain. Software talks to the unit through a command queue (device
-//! directory and G-stage invalidations, then an `IOFENCE.C` that stores a
-//! sequence number) and reads faults from the fault queue.
+//! provides, or a platform device) with first-stage translation only: the
+//! device directory table (two levels, indexed by the PCI requester ID) holds
+//! one device context per function, whose `fsc` points at a table in
+//! [`Sv39Io`] format. IOVAs are 39 bits sign-extended, so a domain uses the
+//! lower 256 GiB. The domain number is the context's `PSCID`. Both the base
+//! (32-byte) and the extended (64-byte, `capabilities.MSI_FLAT`) context
+//! formats are handled; the MSI page table fields stay zero, so a device's MSI
+//! writes are translated like any other DMA and need their target page mapped
+//! in its domain. Software talks to the unit through a command queue (device
+//! directory and address-translation invalidations, then an `IOFENCE.C` that
+//! stores a sequence number) and reads faults from the fault queue.
 //!
 //! Until the first device attaches the unit is in `Bare` mode (pass-through);
 //! after that, unattached devices fault. Dropping the driver returns the unit
-//! to `Bare`. First-stage translation, process contexts, the page-request
+//! to `Bare`. Second-stage translation, process contexts, the page-request
 //! queue, ATS, hardware performance monitors and the interrupt lines are not
 //! used.
 
@@ -27,10 +28,10 @@ use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::Address;
 use osmium_hal::timer::Clock;
 use osmium_mm::PhysAddr;
-use osmium_mm::paging::formats::Sv39x4;
+use osmium_mm::paging::formats::Sv39Io;
 use osmium_sync::IrqSpinLock;
 
-use super::{DEFAULT_TIMEOUT_NS, Regs, wait_until};
+use super::{DEFAULT_TIMEOUT_NS, Pages, Regs, wait_until};
 
 // Registers.
 const CAPS: usize = 0x00;
@@ -49,7 +50,7 @@ const REGS_LEN: usize = 0x58;
 // capabilities.
 const CAPS_VERSION_MASK: u64 = 0xff;
 const CAPS_VERSION_1_0: u64 = 0x10;
-const CAPS_SV39X4: u64 = 1 << 17;
+const CAPS_SV39: u64 = 1 << 9;
 const CAPS_MSI_FLAT: u64 = 1 << 22;
 
 const FCTL_BE: u32 = 1 << 0;
@@ -82,16 +83,16 @@ const FAULT_BYTES: usize = 32;
 const OP_IOTINVAL: u64 = 1;
 const OP_IOFENCE: u64 = 2;
 const OP_IODIR: u64 = 3;
-const FUNC_GVMA: u64 = 1 << 7;
-const IOTINVAL_GV: u64 = 1 << 33;
+/// `IOTINVAL.VMA` (function 0) for one `PSCID`.
+const IOTINVAL_PSCV: u64 = 1 << 32;
 const IOFENCE_PR: u64 = 1 << 10;
 const IOFENCE_PW: u64 = 1 << 11;
 const IOFENCE_AV: u64 = 1 << 12;
 const IODIR_DV: u64 = 1 << 33;
 
-// Device context: translation control and G-stage pointer.
+// Device context: translation control and first-stage pointer.
 const TC_V: u64 = 1;
-const IOHGATP_SV39X4: u64 = 8 << 60;
+const FSC_SV39: u64 = 8 << 60;
 
 /// Leaf-table indices below the root: 128 base contexts or 64 extended.
 const ROOT_ENTRIES: usize = 512;
@@ -99,7 +100,7 @@ const DDT_V: u64 = 1;
 
 struct Tables<'d, D: DmaAllocator + ?Sized> {
     root: OwnedDma<'d, D>,
-    leaves: [Option<OwnedDma<'d, D>>; ROOT_ENTRIES],
+    leaves: Pages<'d, D>,
     commands: OwnedDma<'d, D>,
     faults: OwnedDma<'d, D>,
     /// Target of `IOFENCE.C` stores.
@@ -116,7 +117,6 @@ struct State<'d, D: DmaAllocator + ?Sized> {
 /// A RISC-V IOMMU.
 pub struct RiscvIommu<'d, D: DmaAllocator + Sync + ?Sized> {
     regs: Regs,
-    dma: &'d D,
     clock: &'d dyn Clock,
     segment: u16,
     /// Bytes per device context: 32 (base) or 64 (extended).
@@ -139,19 +139,18 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
         if caps == !0 || caps & CAPS_VERSION_MASK < CAPS_VERSION_1_0 {
             return Err(IommuError::BadRegisters);
         }
-        if caps & CAPS_SV39X4 == 0 {
+        if caps & CAPS_SV39 == 0 {
             return Err(IommuError::Unsupported);
         }
         let tables = Tables {
             root: OwnedDma::new(dma, 4096).ok_or(IommuError::OutOfMemory)?,
-            leaves: [const { None }; ROOT_ENTRIES],
+            leaves: Pages::new(dma, ROOT_ENTRIES)?,
             commands: OwnedDma::new(dma, CMD_BYTES << CQ_LOG2).ok_or(IommuError::OutOfMemory)?,
             faults: OwnedDma::new(dma, FAULT_BYTES << FQ_LOG2).ok_or(IommuError::OutOfMemory)?,
             fence: OwnedDma::new(dma, 4096).ok_or(IommuError::OutOfMemory)?,
         };
         let unit = Self {
             regs,
-            dma,
             clock,
             segment,
             dc_bytes: if caps & CAPS_MSI_FLAT != 0 { 64 } else { 32 },
@@ -249,7 +248,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
         st.fence_seq = st.fence_seq.wrapping_add(1);
         let seq = st.fence_seq;
         let at = Self::tables(st).fence.device_addr().as_u64();
-        self.post(st, OP_IOFENCE | IOFENCE_PR | IOFENCE_PW | IOFENCE_AV | (seq as u64) << 32, at)?;
+        self.post(st, OP_IOFENCE | IOFENCE_PR | IOFENCE_PW | IOFENCE_AV | (seq as u64) << 32, at >> 2)?;
         let word = &Self::tables(st).fence;
         let waited = self.wait(|| word.load::<u32>(0) == seq || self.regs.r32(CQCSR) & CQ_ERRORS != 0);
         if self.regs.r32(CQCSR) & CQ_ERRORS != 0 {
@@ -266,7 +265,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
 
     fn flush_device(&self, st: &mut State<'d, D>, requester: u16, domain: u16) -> Result<(), IommuError> {
         self.post(st, OP_IODIR | IODIR_DV | (requester as u64) << 40, 0)?;
-        self.post(st, OP_IOTINVAL | FUNC_GVMA | IOTINVAL_GV | (domain as u64) << 44, 0)?;
+        self.post(st, OP_IOTINVAL | IOTINVAL_PSCV | (domain as u64) << 12, 0)?;
         self.fence(st)
     }
 
@@ -287,34 +286,35 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
 }
 
 impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
-    type Format = Sv39x4;
+    type Format = Sv39Io;
 
     fn iova_limit(&self) -> u64 {
-        1 << 41
+        // Sv39 sign-extends bit 38; stay in the lower half.
+        1 << 38
     }
 
     unsafe fn attach(&self, device: DeviceId, domain: DomainId, root: PhysAddr) -> Result<(), IommuError> {
         let (index, off) = self.locate(device)?;
-        if !root.is_aligned(16 * 1024) || ppn(root) >> 44 != 0 {
+        if !root.is_aligned(4096) || ppn(root) >> 44 != 0 {
             return Err(IommuError::OutOfRange);
         }
         let mut st = self.state.lock();
         let tables = st.tables.as_mut().ok_or(IommuError::Unsupported)?;
-        if tables.leaves[index].is_none() {
-            let leaf = OwnedDma::new(self.dma, 4096).ok_or(IommuError::OutOfMemory)?;
+        let (leaf, created) = tables.leaves.get_or_alloc(index)?;
+        if created {
             barrier::dma_wmb();
             tables.root.store::<u64>(index * 8, ppn(leaf.device_addr()) << PPN_SHIFT | DDT_V);
-            tables.leaves[index] = Some(leaf);
         }
-        let leaf = tables.leaves[index].as_ref().expect("made above");
         if leaf.load::<u64>(off) & TC_V != 0 {
             return Err(IommuError::Busy);
         }
-        // G-stage only: no first stage (fsc Bare), no MSI table (msiptp Off).
-        leaf.store::<u64>(off + 8, IOHGATP_SV39X4 | (domain.0 as u64) << 44 | ppn(root));
-        for q in 2..self.dc_bytes / 8 {
+        // First stage only: no second stage (iohgatp Bare), no process table,
+        // no MSI table (msiptp Off). The domain is the PSCID.
+        for q in 1..self.dc_bytes / 8 {
             leaf.store::<u64>(off + q * 8, 0);
         }
+        leaf.store::<u64>(off + 16, (domain.0 as u64) << 12);
+        leaf.store::<u64>(off + 24, FSC_SV39 | ppn(root));
         barrier::dma_wmb();
         leaf.store::<u64>(off, TC_V);
         barrier::dma_wmb();
@@ -328,10 +328,10 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
             Ok(())
         });
         if result.is_err() {
-            let leaf = Self::tables(&st).leaves[index].as_ref().expect("made above");
+            let leaf = Self::tables(&st).leaves.get(index).expect("made above");
             leaf.store::<u64>(off, 0);
             barrier::dma_wmb();
-            leaf.store::<u64>(off + 8, 0);
+            leaf.store::<u64>(off + 24, 0);
             let _ = self.flush_device(&mut st, device.bdf(), domain.0);
         }
         result
@@ -340,11 +340,12 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
     fn detach(&self, device: DeviceId) -> Result<(), IommuError> {
         let (index, off) = self.locate(device)?;
         let mut st = self.state.lock();
-        let leaf = Self::tables(&st).leaves[index]
-            .as_ref()
+        let leaf = Self::tables(&st)
+            .leaves
+            .get(index)
             .filter(|l| l.load::<u64>(off) & TC_V != 0)
             .ok_or(IommuError::NotAttached)?;
-        let domain = (leaf.load::<u64>(off + 8) >> 44) as u16;
+        let domain = (leaf.load::<u64>(off + 16) >> 12) as u16;
         leaf.store::<u64>(off, 0);
         barrier::dma_wmb();
         for q in 1..self.dc_bytes / 8 {
@@ -356,7 +357,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
 
     fn invalidate(&self, domain: DomainId) -> Result<(), IommuError> {
         let mut st = self.state.lock();
-        self.post(&mut st, OP_IOTINVAL | FUNC_GVMA | IOTINVAL_GV | (domain.0 as u64) << 44, 0)?;
+        self.post(&mut st, OP_IOTINVAL | IOTINVAL_PSCV | (domain.0 as u64) << 12, 0)?;
         self.fence(&mut st)
     }
 
@@ -440,7 +441,7 @@ mod tests {
 
     fn fake(ext: bool) -> Fake {
         let regs = HostRegs::new(0x1000);
-        regs.w64(CAPS, 0x10 | CAPS_SV39X4 | if ext { CAPS_MSI_FLAT } else { 0 });
+        regs.w64(CAPS, 0x10 | CAPS_SV39 | if ext { CAPS_MSI_FLAT } else { 0 });
         let hw = Arc::new(Mutex::new(Hw::default()));
         let (r, h) = (regs.clone(), hw.clone());
         let pump = Pump::start(move || {
@@ -476,14 +477,15 @@ mod tests {
                         hw.log.push(std::format!("inval_ddt {:#x}", q0 >> 40));
                     }
                     OP_IOTINVAL => {
-                        assert_eq!(q0 >> 7 & 7, 1, "GVMA");
-                        assert_ne!(q0 & IOTINVAL_GV, 0);
-                        hw.log.push(std::format!("gvma {}", (q0 >> 44) & 0xffff));
+                        assert_eq!(q0 >> 7 & 7, 0, "VMA");
+                        assert_ne!(q0 & IOTINVAL_PSCV, 0);
+                        assert_eq!(q0 & (1 << 33), 0, "no GSCID");
+                        hw.log.push(std::format!("vma {}", (q0 >> 12) & 0xfffff));
                     }
                     OP_IOFENCE => {
                         assert_eq!(q0 & (IOFENCE_PR | IOFENCE_PW | IOFENCE_AV), IOFENCE_PR | IOFENCE_PW | IOFENCE_AV);
                         // SAFETY: the driver's fence word, in a live allocation.
-                        unsafe { (q1 as *mut u32).write_volatile((q0 >> 32) as u32) };
+                        unsafe { ((q1 << 2) as *mut u32).write_volatile((q0 >> 32) as u32) };
                         hw.log.push("fence".into());
                     }
                     op => panic!("unexpected command {op:#x}"),
@@ -512,7 +514,7 @@ mod tests {
             ((nl >> PPN_SHIFT) << 12) + (id as u64 % per_leaf) * size
         }
 
-        /// Translates as the unit would: G-stage Sv39x4 from the device context.
+        /// Translates as the unit would: first-stage Sv39 from the device context.
         fn translate(&self, id: u16, iova: u64, write: bool) -> Result<u64, &'static str> {
             match self.mode() {
                 1 => return Ok(iova),
@@ -531,27 +533,26 @@ mod tests {
             if self.ext {
                 assert_eq!(mem64(dc + 32), 0, "no MSI page table");
             }
-            assert_eq!(mem64(dc + 24) >> 60, 0, "no first stage");
-            let hgatp = mem64(dc + 8);
-            assert_eq!(hgatp >> 60, 8, "Sv39x4");
-            if iova >> 41 != 0 {
-                return Err("guest page fault");
+            assert_eq!(mem64(dc + 8), 0, "no second stage");
+            let fsc = mem64(dc + 24);
+            assert_eq!(fsc >> 60, 8, "Sv39");
+            // Sign extension: bits 63:39 must repeat bit 38.
+            if (iova as i64) << 25 >> 25 != iova as i64 {
+                return Err("page fault");
             }
-            let mut table = (hgatp & 0xfff_ffff_ffff) << 12;
+            let mut table = (fsc & 0xfff_ffff_ffff) << 12;
             for level in (0..3).rev() {
-                let mut idx = (iova >> (12 + 9 * level)) & 0x1ff;
-                if level == 2 {
-                    idx = (iova >> 30) & 0x7ff; // 2048-entry root
-                }
-                let e = mem64(table + idx * 8);
+                let e = mem64(table + ((iova >> (12 + 9 * level)) & 0x1ff) * 8);
                 if e & 1 == 0 {
-                    return Err("guest page fault");
+                    return Err("page fault");
                 }
                 if e & 0xe == 0 {
+                    // QEMU's model walks only through entries with U set.
+                    assert_ne!(e & 0x10, 0, "table entries carry U");
                     table = ((e >> 10) & 0xfff_ffff_ffff) << 12;
                     continue;
                 }
-                assert_ne!(e & 0x10, 0, "G-stage leaves need U");
+                assert_ne!(e & 0x10, 0, "DMA is a user access: leaves need U");
                 assert_ne!(e & 0x40, 0, "A set");
                 if write && (e & 4 == 0 || e & 0x80 == 0) || !write && e & 2 == 0 {
                     return Err("permission");
@@ -559,11 +560,11 @@ mod tests {
                 let size = 1u64 << (12 + 9 * level);
                 return Ok((((e >> 10) & 0xfff_ffff_ffff) << 12 & !(size - 1)) | (iova & (size - 1)));
             }
-            Err("guest page fault")
+            Err("page fault")
         }
 
-        fn gscid_of(&self, id: u16) -> u64 {
-            (mem64(self.dc(id) + 8) >> 44) & 0xffff
+        fn pscid_of(&self, id: u16) -> u64 {
+            (mem64(self.dc(id) + 16) >> 12) & 0xfffff
         }
 
         fn push_fault(&self, id: u16, cause: u64, ttyp: u64, addr: u64) {
@@ -596,7 +597,7 @@ mod tests {
             assert_eq!(f.regs.r32(FQCSR) & (QCSR_EN | QCSR_ON), QCSR_EN | QCSR_ON);
             assert_eq!(f.regs.r64(FQB) & 0x1f, 6, "128 entries");
             assert_eq!(f.translate(0x19, 0x1234, false), Ok(0x1234));
-            assert_eq!(dma.live(), 4, "directory root, two queues, fence word");
+            assert_eq!(dma.live(), 5, "directory root and leaf index, two queues, fence word");
             drop(unit);
             assert_eq!(dma.live(), 0);
             assert_eq!(f.regs.r32(CQCSR) & QCSR_ON, 0);
@@ -610,7 +611,7 @@ mod tests {
         let small = HostRegs::new(0x20);
         assert_eq!(RiscvIommu::new(small.io(), &dma, &clock, 0).err(), Some(IommuError::BadRegisters));
         let f = fake(false);
-        f.regs.w64(CAPS, 0x0f | CAPS_SV39X4);
+        f.regs.w64(CAPS, 0x0f | CAPS_SV39);
         assert_eq!(RiscvIommu::new(f.regs.io(), &dma, &clock, 0).err(), Some(IommuError::BadRegisters));
         f.regs.w64(CAPS, 0x10);
         assert_eq!(RiscvIommu::new(f.regs.io(), &dma, &clock, 0).err(), Some(IommuError::Unsupported));
@@ -632,22 +633,22 @@ mod tests {
             d.attach(dev(NIC)).unwrap();
             assert!(unit.translating() && f.mode() == 3, "first attach turns translation on");
             let id = dev(NIC).bdf();
-            assert_eq!(f.gscid_of(id), 0x77);
+            assert_eq!(f.pscid_of(id), 0x77);
             assert_eq!(f.translate(id, 0x20_0123, true), Ok(base + 0x123));
             assert_eq!(f.translate(id, 0x20_1fff, false), Ok(base + 0x1fff));
             assert_eq!(f.translate(id, 0x40_0000, true), Err("permission"));
-            assert_eq!(f.translate(id, 0x1_8000_0008, true), Ok(base + 0x1008), "above the first root quarter");
-            assert_eq!(f.translate(id, 0x30_0000, false), Err("guest page fault"));
-            assert_eq!(f.translate(id, 1 << 41, false), Err("guest page fault"));
+            assert_eq!(f.translate(id, 0x1_8000_0008, true), Ok(base + 0x1008), "another root slot");
+            assert_eq!(f.translate(id, 0x30_0000, false), Err("page fault"));
+            assert_eq!(f.translate(id, 1 << 39, false), Err("page fault"), "not canonical");
             assert_eq!(f.translate(dev(Address::new(5, 0, 0)).bdf(), 0x20_0000, false), Err("ddt entry not valid"));
             assert_eq!(f.translate(dev(Address::new(0, 3, 2)).bdf(), 0x20_0000, false), Err("context not valid"));
 
             d.map(0x50_0000, buf.device_addr() + 0x1000, 0x1000, MapFlags::RW).unwrap();
             assert_eq!(f.translate(id, 0x50_0008, true), Ok(base + 0x1008));
             d.unmap(0x50_0000, 0x1000).unwrap();
-            assert_eq!(f.translate(id, 0x50_0008, true), Err("guest page fault"));
+            assert_eq!(f.translate(id, 0x50_0008, true), Err("page fault"));
             let log = f.log();
-            assert!(log.contains(&std::format!("inval_ddt {id:#x}")) && log.contains(&"gvma 119".into()), "{log:?}");
+            assert!(log.contains(&std::format!("inval_ddt {id:#x}")) && log.contains(&"vma 119".into()), "{log:?}");
             assert_eq!(log.last().unwrap(), "fence");
 
             assert_eq!(d.attach(dev(NIC)), Err(IommuError::Busy));
@@ -754,7 +755,7 @@ mod tests {
         assert_eq!(mem32(pa), 0xc0ffee);
         // SAFETY: the "device" is the fake and is idle.
         unsafe { alloc.free_coherent(ring) };
-        assert_eq!(f.translate(dev(NIC).bdf(), iova, false), Err("guest page fault"));
+        assert_eq!(f.translate(dev(NIC).bdf(), iova, false), Err("page fault"));
         assert_eq!(backing.live(), 0);
         alloc.with_domain(|d| d.detach(dev(NIC))).unwrap();
     }

@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod iommu;
 mod msi;
 
 use alloc::string::String;
@@ -22,7 +23,7 @@ use core::ptr::NonNull;
 use osmium::arch::trap::{self, Access, Trap, TrapFrame};
 use osmium::arch::x86_64 as x86;
 use osmium::arch::{MAX_CPUS, cpu, irq};
-use osmium::boot::acpi::{Acpi, EcamWindow, Madt, Mcfg};
+use osmium::boot::acpi::{Acpi, Dmar, EcamWindow, Ivrs, Madt, Mcfg};
 use osmium::boot::pvh::StartInfo;
 use osmium::drivers::lapic::{self, LocalApic};
 use osmium::drivers::pit::{self, Pit};
@@ -293,6 +294,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // virtualize).
     let mut madt_ids = [None; MAX_CPUS];
     let mut ecam = None;
+    let mut iommus = iommu::Units::default();
     if let Some(rsdp) = info.rsdp() {
         // SAFETY: the boot tables identity-map the first 4 GiB, where QEMU's
         // ACPI tables live; they are only read here.
@@ -303,6 +305,16 @@ extern "C" fn kmain(start_info: usize) -> ! {
             .and_then(|a| a.find(b"MCFG"))
             .and_then(Mcfg::parse)
             .and_then(|m| m.entries().find(|e| e.segment == 0));
+        iommus.vtd = acpi
+            .as_ref()
+            .and_then(|a| a.find(b"DMAR"))
+            .and_then(Dmar::parse)
+            .and_then(|d| d.units().find(|u| u.segment == 0));
+        iommus.amd = acpi
+            .as_ref()
+            .and_then(|a| a.find(b"IVRS"))
+            .and_then(Ivrs::parse)
+            .and_then(|i| i.units().find(|u| u.segment == 0));
         let madt = acpi.and_then(|a| a.find(b"APIC")).and_then(Madt::parse);
         if let Some(m) = &madt
             && let Some(io) = m.io_apics().next()
@@ -509,6 +521,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     user_demo();
     serial_demo();
     msi::demo(ecam);
+    iommu::demo(ecam, iommus);
 
     println!(
         "[done]  {} timer ticks, {} free frames; shutting down",

@@ -128,9 +128,37 @@ if [ -n "$fat_expect" ]; then
 fi
 rm -f "$stick" "$vdisk" "$sata" "$nvdisk" "$iscsi"
 rm -rf "$tftp"
+# RISC-V IOMMU: QEMU's riscv-iommu-pci translates the DMA of every PCI device
+# on the bus, so this boot carries only an NVMe disk and QEMU's iommu-testdev.
+# The test device DMAs through a mapping, to an unmapped address and after
+# being detached; the NVMe driver then runs on addresses from an IommuDma
+# allocator, with the faults it would cause logged.
+if command -v qemu-system-riscv64 >/dev/null && qemu-system-riscv64 -device help 2>&1 | grep -q 'iommu-testdev'; then
+    iommu_disk=$(mktemp)
+    truncate -s 8M "$iommu_disk"
+    EXPECT='\[iommu\] 00:02.0 RISC-V IOMMU: Sv39 domains;riscv-iommu: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words);riscv-iommu: DMA to an unmapped IOVA blocked;riscv-iommu: detached device blocked;\[iommu\] NVMe .* attached to domain 1;\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192);\[iommu\] NVMe detached: Ok(()), 0 faults logged' \
+    boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
+        -machine virt -bios default -smp 4 -accel tcg,thread=multi \
+        -device riscv-iommu-pci -device iommu-testdev \
+        -drive if=none,id=nv0,format=raw,file="$iommu_disk" -device nvme,serial=osmium0,drive=nv0
+    rm -f "$iommu_disk"
+else
+    echo "== QEMU lacks riscv-iommu-pci or iommu-testdev; skipping the RISC-V IOMMU boot"
+fi
 EXPECT='\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/aarch64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;init: fp: exec.d program starts with cleared FP registers: ok;init: fp: FP registers inherited by fork and kept across switches: ok;init: signals: SIGUSR1 sent to myself ran its handler and returned: ok;init: signals: SIGSEGV handled in child [0-9]*, exit status 42: ok;init: signals: SIGCHLD handler ran when child [0-9]* exited: ok;init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok;init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok;init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111' \
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
+# Arm SMMUv3 in front of the PCI bus (virt,iommu=smmuv3), with QEMU's
+# iommu-testdev: stage-2 translation of the test device's DMA, a blocked
+# unmapped address and a blocked detached device.
+if command -v qemu-system-aarch64 >/dev/null && qemu-system-aarch64 -device help 2>&1 | grep -q 'iommu-testdev'; then
+    EXPECT='\[iommu\] SMMUv3 at 0x[0-9a-f]*: 44 bit I/O addresses;smmuv3: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words);smmuv3: DMA to an unmapped IOVA blocked;smmuv3: detached device blocked' \
+    boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
+        -machine virt,gic-version=2,iommu=smmuv3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi \
+        -device iommu-testdev
+else
+    echo "== QEMU lacks iommu-testdev; skipping the SMMUv3 boot"
+fi
 # The VESA BIOS sets the mode through a real-mode thunk, then virtio-vga's
 # virtio-gpu side takes over the screen, which is checked. An NVMe controller
 # (on a null block device) raises its admin completions as MSI-X interrupts.
@@ -141,6 +169,23 @@ boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
     -vga none -device virtio-vga -qmp "unix:$qmp,server=on,wait=off" \
     -blockdev driver=null-co,node-name=nv0,read-zeroes=on -device nvme,serial=osmium1,drive=nv0
 screen_wait x86_64-pc
+
+# Intel VT-d and AMD-Vi, each in front of QEMU's iommu-testdev (the DMAR or
+# IVRS table says where the unit is): a DMA through a mapping reaches memory,
+# one to an unmapped address and one after detaching are blocked. QEMU's AMD
+# model translates DMA only with dma-remap=on.
+if command -v qemu-system-x86_64 >/dev/null && qemu-system-x86_64 -device help 2>&1 | grep -q 'iommu-testdev'; then
+    EXPECT='\[iommu\] VT-d unit at 0xfed90000: 48 bit I/O addresses;vt-d: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words);vt-d: DMA to an unmapped IOVA blocked;vt-d: detached device blocked' \
+    boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
+        -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
+        -device intel-iommu,aw-bits=48 -device iommu-testdev
+    EXPECT='\[iommu\] AMD-Vi unit at 0xfed80000: 48 bit I/O addresses;amd-vi: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words);amd-vi: DMA to an unmapped IOVA blocked;amd-vi: detached device blocked' \
+    boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
+        -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
+        -device amd-iommu,dma-remap=on -device iommu-testdev
+else
+    echo "== QEMU lacks iommu-testdev; skipping the x86 IOMMU boots"
+fi
 
 # Heap-free M-mode firmware (no OpenSBI): checked for its own lines, since it
 # runs none of the scheduler demos.

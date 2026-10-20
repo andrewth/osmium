@@ -233,3 +233,73 @@ fn shared_kernel_entries() {
     assert_eq!(frames.lock().free_frames(), before, "everything freed exactly once");
     assert!(kernel_tables > 0);
 }
+
+/// Maps, translates, protects and unmaps through an IOMMU format, whose
+/// leaves carry only read and write permission.
+fn exercise_io<F: PageTableFormat>(huge: bool, high_va: u64) {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let before = frames.lock().free_frames();
+    {
+        let mut pt: PageTable<F, _> = PageTable::new(&frames).unwrap();
+        pt.map(va(0x40_0000), pa(0x1234_5000), PageSize::Size4K, MapFlags::RW).unwrap().ignore();
+        let t = pt.translate(va(0x40_0abc)).unwrap();
+        assert_eq!((t.pa, t.size, t.flags), (pa(0x1234_5abc), PageSize::Size4K, MapFlags::RW));
+        pt.map(va(high_va), pa(0x9000), PageSize::Size4K, MapFlags::READ).unwrap().ignore();
+        assert_eq!(pt.translate(va(high_va + 8)).unwrap().flags, MapFlags::READ);
+        assert_eq!(
+            pt.map(va(1 << (F::VA_BITS + 1)), pa(0), PageSize::Size4K, MapFlags::READ).err(),
+            Some(MapError::InvalidAddress)
+        );
+        assert_eq!(pt.map(va(0x60_0000), pa(0x1000), PageSize::Size4K, MapFlags::NONE).err(), Some(MapError::NoAccess));
+        pt.protect(va(0x40_0000), MapFlags::READ).unwrap().ignore();
+        assert_eq!(pt.translate(va(0x40_0000)).unwrap().flags, MapFlags::READ);
+        let (t, f) = pt.unmap(va(0x40_0000)).unwrap();
+        f.ignore();
+        assert_eq!(t.pa, pa(0x1234_5000));
+        assert!(pt.translate(va(0x40_0000)).is_none());
+        if huge {
+            pt.map(va(0x20_0000), pa(0x4000_0000), PageSize::Size2M, MapFlags::RW).unwrap().ignore();
+            assert_eq!(pt.translate(va(0x21_2345)).unwrap().pa, pa(0x4001_2345));
+        } else {
+            assert_eq!(
+                pt.map(va(0x20_0000), pa(0x4000_0000), PageSize::Size2M, MapFlags::RW).err(),
+                Some(MapError::UnsupportedSize)
+            );
+            // map_range falls back to 4 KiB pages.
+            pt.map_range(va(0x20_0000), pa(0x4000_0000), 0x20_0000 + 0x1000, MapFlags::RW).unwrap();
+            assert_eq!(pt.translate(va(0x21_2345)).unwrap().size, PageSize::Size4K);
+        }
+    }
+    assert_eq!(frames.lock().free_frames(), before, "drop frees every table");
+}
+
+#[test]
+fn vtd_second_level() {
+    exercise_io::<VtdSecondLevel>(true, 0xffff_ffff_f000);
+}
+
+#[test]
+fn amdvi() {
+    exercise_io::<AmdVi>(false, 0xffff_ffff_f000);
+}
+
+#[test]
+fn amdvi_next_level() {
+    // The root entry names a level-3 table below it, and so on down.
+    assert_eq!(AmdVi::table_at(pa(0x5000), 3) >> 9 & 7, 3);
+    assert_eq!(AmdVi::table_at(pa(0x5000), 1) >> 9 & 7, 1);
+    let leaf = AmdVi::leaf(pa(0x7000), MapFlags::RW, 0);
+    assert_eq!(leaf >> 9 & 7, 0, "a PTE ends the walk");
+    assert_eq!(leaf & (3 << 61), 3 << 61);
+    assert_eq!(AmdVi::addr(leaf, 0), pa(0x7000));
+}
+
+#[test]
+fn sv39_io() {
+    exercise_io::<Sv39Io>(true, 0x3f_ffff_f000);
+    // Every entry the walk visits has U, leaves and tables alike.
+    assert_ne!(Sv39Io::table(pa(0x5000)) & 0x10, 0);
+    assert_ne!(Sv39Io::leaf(pa(0x5000), MapFlags::READ, 0) & 0x10, 0);
+    assert_eq!(Sv39Io::flags(Sv39Io::leaf(pa(0x5000), MapFlags::RW, 0), 0), MapFlags::RW);
+}

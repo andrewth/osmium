@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod display;
+pub mod iommu;
 pub mod user;
 
 use alloc::vec::Vec;

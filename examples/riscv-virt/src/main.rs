@@ -23,6 +23,7 @@ use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::{Fdt, Node};
 use osmium::drivers::ahci::{self, Ahci};
+use osmium::drivers::iommu::riscv::RiscvIommu;
 use osmium::drivers::nvme::{self, Nvme};
 use osmium::drivers::plic::Plic;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
@@ -33,6 +34,8 @@ use osmium::drivers::virtio::{DeviceType, Transport};
 use osmium::drivers::xhci::Xhci;
 use osmium::hal::block::BlockDevice;
 use osmium::hal::console::{Console, SerialConsole, set_console};
+use osmium::hal::dma::DmaAllocator;
+use osmium::hal::iommu::{DeviceId, DomainId, IoDomain, Iommu, IommuDma};
 use osmium::hal::irq::{InterruptController, IrqTable};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci;
@@ -425,6 +428,52 @@ impl Clock for Uptime {
     }
 }
 
+/// Runs `before` ahead of every transfer on the disk it wraps.
+struct Before<'hook, B> {
+    disk: B,
+    before: &'hook dyn Fn(),
+}
+
+impl<B: BlockDevice> BlockDevice for Before<'_, B> {
+    fn block_size(&self) -> usize {
+        self.disk.block_size()
+    }
+
+    fn num_blocks(&self) -> u64 {
+        self.disk.num_blocks()
+    }
+
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), osmium::hal::block::BlockError> {
+        (self.before)();
+        self.disk.read_blocks(lba, buf)
+    }
+
+    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), osmium::hal::block::BlockError> {
+        (self.before)();
+        self.disk.write_blocks(lba, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), osmium::hal::block::BlockError> {
+        self.disk.flush()
+    }
+}
+
+/// Brings up an NVMe controller whose DMA memory comes from `dma`, and runs
+/// a block round trip on it, calling `before` ahead of each transfer.
+fn nvme_demo<D: DmaAllocator>(addr: pci::Address, io: IoMem, dma: &D, before: &dyn Fn()) {
+    let (b, d, f) = (addr.bus, addr.device, addr.function);
+    match Nvme::new(io, dma, &Uptime) {
+        Ok(disk) => {
+            let (model, nsid) = (alloc::string::String::from(disk.model()), disk.namespace());
+            let mut disk = Before { disk, before };
+            let (n, bs) = (disk.num_blocks(), disk.block_size());
+            let r = demos::block_roundtrip(&mut disk);
+            println!("[nvme]  {b:02x}:{d:02x}.{f} \"{model}\" namespace {nsid}: {n} blocks of {bs}; round trip {r:?}");
+        }
+        Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: init failed: {e:?}"),
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: the boot hart is logical CPU 0; secondaries get 1, 2, ...
@@ -652,6 +701,45 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         None => println!("[blk]   no virtio-blk device"),
     }
 
+    // --- IOMMU behind PCIe ------------------------------------------------------
+    // Before any other PCI DMA: QEMU's riscv-iommu starts out blocking it all
+    // and the driver puts it in pass-through until a device attaches.
+    let iommu = pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, pci::Class::IOMMU, 0)).and_then(
+        |(addr, base, len, _)| {
+            // SAFETY: BAR 0 was just assigned this range inside the mapped
+            // window; nothing else uses it.
+            let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
+            match RiscvIommu::new(io, &FRAMES, &Uptime, 0) {
+                Ok(unit) => {
+                    println!(
+                        "[iommu] {:02x}:{:02x}.{} RISC-V IOMMU: Sv39 domains, {} bit I/O addresses",
+                        addr.bus,
+                        addr.device,
+                        addr.function,
+                        unit.iova_limit().trailing_zeros()
+                    );
+                    Some(unit)
+                }
+                Err(e) => {
+                    println!("[iommu] {:02x}:{:02x}.{}: init failed: {e:?}", addr.bus, addr.device, addr.function);
+                    None
+                }
+            }
+        },
+    );
+
+    if let Some(unit) = &iommu {
+        match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, demos::iommu::TESTDEV_CLASS, 0)) {
+            Some((addr, base, len, _)) => {
+                // SAFETY: BAR 0 was just assigned this range inside the mapped
+                // window; nothing else uses it.
+                let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
+                demos::iommu::testdev(unit, DeviceId::new(0, addr), io, &FRAMES, "riscv-iommu");
+            }
+            None => println!("[iommu] no iommu-testdev"),
+        }
+    }
+
     // --- AHCI behind PCIe -------------------------------------------------------
     match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, ahci::CLASS, ahci::ABAR)) {
         Some((addr, base, len, _)) => {
@@ -689,18 +777,35 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             // SAFETY: BAR 0 was just assigned this range inside the mapped
             // window; nothing else uses it.
             let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
-            let (b, d, f) = (addr.bus, addr.device, addr.function);
-            match Nvme::new(io, &FRAMES, &Uptime) {
-                Ok(mut disk) => {
-                    let (n, bs) = (disk.num_blocks(), disk.block_size());
-                    let r = demos::block_roundtrip(&mut disk);
-                    println!(
-                        "[nvme]  {b:02x}:{d:02x}.{f} \"{}\" namespace {}: {n} blocks of {bs}; round trip {r:?}",
-                        disk.model(),
-                        disk.namespace()
-                    );
+            match &iommu {
+                // Behind an IOMMU the controller sees only the buffers its
+                // driver allocates from the domain, at I/O virtual addresses.
+                Some(unit) => {
+                    let id = DeviceId::new(0, addr);
+                    let domain = IoDomain::new(unit, DomainId(1), &FRAMES).expect("IOMMU domain");
+                    let dma = IommuDma::new(domain, &FRAMES, 0x10_0000..0x4000_0000).expect("IOVA window");
+                    match dma.with_domain(|d| d.attach(id)) {
+                        Ok(()) => {
+                            println!("[iommu] NVMe {id:?} attached to domain 1; its DMA now goes through the IOMMU")
+                        }
+                        Err(e) => println!("[iommu] attaching the NVMe controller failed: {e:?}"),
+                    }
+                    // QEMU 11.0 caches only the permission of the first access to
+                    // a page in its IOTLB (the NVMe driver's buffers are written
+                    // by the device first, then read), so flush it ahead of each
+                    // transfer. Newer QEMU caches the page's full permission.
+                    nvme_demo(addr, io, &dma, &|| {
+                        let _ = unit.invalidate(DomainId(1));
+                    });
+                    let mut faults = 0;
+                    while let Some(f) = unit.take_fault() {
+                        println!("[iommu] fault: {f:?}");
+                        faults += 1;
+                    }
+                    let detached = dma.with_domain(|d| d.detach(id));
+                    println!("[iommu] NVMe detached: {detached:?}, {faults} faults logged");
                 }
-                Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: init failed: {e:?}"),
+                None => nvme_demo(addr, io, &FRAMES, &|| {}),
             }
         }
         None => println!("[nvme]  no NVMe controller"),

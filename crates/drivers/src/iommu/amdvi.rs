@@ -4,14 +4,22 @@
 //! table with a 32-byte entry per requester ID (bus/device/function) points
 //! each device at a four-level I/O page table
 //! ([`osmium_mm::paging::formats::AmdVi`]). Software talks to the unit
-//! through a command buffer in memory (device-table and page invalidations, completion waits) and reads
-//! faults from an event log; both are 256 entries of 16 bytes.
+//! through a command buffer in memory (device-table and page invalidations,
+//! completion waits) and reads faults from an event log; both are 256
+//! entries of 16 bytes.
+//!
+//! The unit is switched on when the driver starts, because command
+//! processing needs it, with an all-zero device table. An invalid entry lets
+//! a device's DMA through untranslated (Linux marks idle devices blocked for
+//! that reason), so the first attach writes a blocked entry (valid, no page
+//! table, no permissions) for every other requester ID the table covers, and
+//! detaching a device blocks it again.
 //!
 //! Interrupts from attached devices are forwarded unchanged (`IntCtl` = 1 in
-//! the device table entry); interrupt remapping is not used. Unattached
-//! devices have all DMA and interrupts blocked once the unit is enabled.
-//! Only 4 KiB pages are used, the guest-translation, PPR and GA logs are left
-//! off, and the unit's own coherency control is not touched.
+//! the device table entry; blocked devices have theirs aborted); interrupt
+//! remapping is not used. Only 4 KiB pages are used, the guest-translation,
+//! PPR and GA logs are left off, and the unit's own coherency control is not
+//! touched.
 
 use core::mem::ManuallyDrop;
 
@@ -64,6 +72,9 @@ const DTE_BYTES: usize = 32;
 const DTE_V: u64 = 1 << 0;
 const DTE_TV: u64 = 1 << 1;
 const DTE_MODE_4: u64 = 4 << 9;
+const DTE_MODE_MASK: u64 = 7 << 9;
+/// Valid with translation but no page table or permissions: blocks the device.
+const DTE_BLOCKED: u64 = DTE_V | DTE_TV;
 const DTE_IR: u64 = 1 << 61;
 const DTE_IW: u64 = 1 << 62;
 /// IntCtl (bits 61:60 of the third quadword): forward interrupts as they are.
@@ -87,7 +98,8 @@ struct State<'d, D: DmaAllocator + ?Sized> {
     tail: usize,
     /// Value the next completion-wait stores.
     wait_seq: u64,
-    enabled: bool,
+    /// Whether every requester ID without a domain has been blocked.
+    blocked: bool,
 }
 
 /// An AMD-Vi IOMMU.
@@ -104,7 +116,7 @@ pub struct AmdVi<'d, D: DmaAllocator + Sync + ?Sized> {
 impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
     /// Takes over the unit whose registers are `io`, serving PCI segment
     /// `segment` and requesters on buses `0..=max_bus` (the device table costs
-    /// 8 KiB per bus). Translation stays off until the first device attaches.
+    /// 8 KiB per bus). Devices keep untranslated DMA until the first attach.
     pub fn new(io: IoMem, dma: &'d D, clock: &'d dyn Clock, segment: u16, max_bus: u8) -> Result<Self, IommuError> {
         let regs = Regs::new(io, REGS_LEN)?;
         if regs.r64(CONTROL) == !0 {
@@ -123,7 +135,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
             max_bus,
             segment,
             timeout_ns: DEFAULT_TIMEOUT_NS,
-            state: IrqSpinLock::new(State { buffers: None, tail: 0, wait_seq: 0, enabled: false }),
+            state: IrqSpinLock::new(State { buffers: None, tail: 0, wait_seq: 0, blocked: false }),
         };
         // Stop whatever firmware left running before pointing it at new tables.
         unit.regs.w64(CONTROL, 0);
@@ -135,7 +147,8 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
             unit.regs.w64(reg, 0);
         }
         unit.state.lock().buffers = Some(buffers);
-        unit.regs.w64(CONTROL, CMD_BUF_EN | EVENT_LOG_EN);
+        // The device table is all invalid, which passes DMA through.
+        unit.regs.w64(CONTROL, CMD_BUF_EN | EVENT_LOG_EN | IOMMU_EN);
         unit.wait(|| unit.regs.r64(STATUS) & (CMD_BUF_RUN | EVENT_LOG_RUN) == CMD_BUF_RUN | EVENT_LOG_RUN)?;
         Ok(unit)
     }
@@ -145,9 +158,9 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
         self.timeout_ns = timeout_ns;
     }
 
-    /// Whether translation is switched on (after the first attach).
+    /// Whether devices without a domain are blocked (after the first attach).
     pub fn translating(&self) -> bool {
-        self.regs.r64(CONTROL) & IOMMU_EN != 0
+        self.state.lock().blocked
     }
 
     fn wait(&self, done: impl FnMut() -> bool) -> Result<(), IommuError> {
@@ -193,6 +206,42 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
         self.post(st, requester as u64 | OP_INVALIDATE_DEVTAB_ENTRY << 60, 0)
     }
 
+    /// Writes a blocked entry for every requester ID without a valid one and
+    /// makes the unit reread the device table.
+    fn block_all(&self, st: &mut State<'d, D>) -> Result<(), IommuError> {
+        let count = (self.max_bus as usize + 1) * 256;
+        let devtab = &Self::buffers(st).devtab;
+        for id in 0..count {
+            let off = id * DTE_BYTES;
+            if devtab.load::<u64>(off) & DTE_V == 0 {
+                for q in 1..4 {
+                    devtab.store::<u64>(off + q * 8, 0);
+                }
+                devtab.store::<u64>(off, DTE_BLOCKED);
+            }
+        }
+        barrier::dma_wmb();
+        for id in 0..count {
+            self.invalidate_device(st, id as u16)?;
+            // The command buffer holds 255 commands.
+            if id % 64 == 63 {
+                self.sync(st)?;
+            }
+        }
+        self.sync(st)
+    }
+
+    /// Replaces `device`'s entry with a blocked one.
+    fn block(&self, st: &State<'d, D>, off: usize) {
+        let devtab = &Self::buffers(st).devtab;
+        devtab.store::<u64>(off, DTE_BLOCKED);
+        barrier::dma_wmb();
+        for q in 1..4 {
+            devtab.store::<u64>(off + q * 8, 0);
+        }
+        barrier::dma_wmb();
+    }
+
     fn check(&self, device: DeviceId) -> Result<usize, IommuError> {
         if device.segment() != self.segment || device.bus() > self.max_bus {
             return Err(IommuError::InvalidDevice);
@@ -214,10 +263,14 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for AmdVi<'_, D> {
             return Err(IommuError::OutOfRange);
         }
         let mut st = self.state.lock();
-        let devtab = &Self::buffers(&st).devtab;
-        if devtab.load::<u64>(off) & DTE_V != 0 {
+        if Self::buffers(&st).devtab.load::<u64>(off) & DTE_MODE_MASK != 0 {
             return Err(IommuError::Busy);
         }
+        if !st.blocked {
+            self.block_all(&mut st)?;
+            st.blocked = true;
+        }
+        let devtab = &Self::buffers(&st).devtab;
         devtab.store::<u64>(off + 8, domain.0 as u64);
         devtab.store::<u64>(off + 16, DTE_INTCTL_FORWARD);
         devtab.store::<u64>(off + 24, 0);
@@ -227,20 +280,9 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for AmdVi<'_, D> {
         let result = self
             .invalidate_device(&mut st, device.bdf())
             .and_then(|()| self.invalidate_pages(&mut st, domain.0))
-            .and_then(|()| self.sync(&mut st))
-            .map(|()| {
-                if !st.enabled {
-                    self.regs.w64(CONTROL, self.regs.r64(CONTROL) | IOMMU_EN);
-                    st.enabled = true;
-                }
-            });
+            .and_then(|()| self.sync(&mut st));
         if result.is_err() {
-            let devtab = &Self::buffers(&st).devtab;
-            devtab.store::<u64>(off, 0);
-            barrier::dma_wmb();
-            for q in 1..4 {
-                devtab.store::<u64>(off + q * 8, 0);
-            }
+            self.block(&st, off);
             let _ = self.invalidate_device(&mut st, device.bdf()).and_then(|()| self.sync(&mut st));
         }
         result
@@ -250,16 +292,11 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for AmdVi<'_, D> {
         let off = self.check(device)?;
         let mut st = self.state.lock();
         let devtab = &Self::buffers(&st).devtab;
-        if devtab.load::<u64>(off) & DTE_V == 0 {
+        if devtab.load::<u64>(off) & DTE_MODE_MASK == 0 {
             return Err(IommuError::NotAttached);
         }
         let domain = devtab.load::<u64>(off + 8) as u16;
-        devtab.store::<u64>(off, 0);
-        barrier::dma_wmb();
-        for q in 1..4 {
-            devtab.store::<u64>(off + q * 8, 0);
-        }
-        barrier::dma_wmb();
+        self.block(&st, off);
         self.invalidate_device(&mut st, device.bdf())?;
         self.invalidate_pages(&mut st, domain)?;
         self.sync(&mut st)
@@ -352,18 +389,19 @@ mod tests {
             let mut hw = h.lock().unwrap();
             let c = r.r64(CONTROL);
             let mut status = r.r64(STATUS) & !(CMD_BUF_RUN | EVENT_LOG_RUN);
-            if c & CMD_BUF_EN != 0 {
+            // Like QEMU's model, the queues run only while the unit is on.
+            if c & IOMMU_EN != 0 && c & CMD_BUF_EN != 0 {
                 status |= CMD_BUF_RUN;
             }
-            if c & EVENT_LOG_EN != 0 {
+            if c & IOMMU_EN != 0 && c & EVENT_LOG_EN != 0 {
                 status |= EVENT_LOG_RUN;
             }
             // Overflow is write-one-to-clear: the driver writes just that bit.
-            if r.r64(STATUS) == EVENT_OVERFLOW && status & EVENT_OVERFLOW != 0 && c & CMD_BUF_EN != 0 {
+            if r.r64(STATUS) == EVENT_OVERFLOW && status & EVENT_OVERFLOW != 0 && c & IOMMU_EN != 0 {
                 status = 0;
             }
             r.w64(STATUS, status);
-            if c & CMD_BUF_EN == 0 || hw.stall {
+            if status & CMD_BUF_RUN == 0 || hw.stall {
                 return;
             }
             let base = r.r64(CMD_BUF_BAR);
@@ -410,10 +448,15 @@ mod tests {
             let dte = tab + sid as u64 * 32;
             let q0 = mem64(dte);
             if q0 & DTE_V == 0 {
-                return Err("device blocked");
+                // An invalid entry passes DMA through untranslated.
+                return Ok(iova);
             }
             assert_ne!(q0 & DTE_TV, 0);
             let mode = (q0 >> 9) & 7;
+            if mode == 0 {
+                assert_eq!(q0 & (DTE_IR | DTE_IW), 0, "a blocked entry grants nothing");
+                return Err("device blocked");
+            }
             assert_eq!(mode, 4);
             assert_eq!(mem64(dte + 16) >> 60 & 3, 1, "interrupts forwarded");
             let (ir, iw) = (q0 & DTE_IR != 0, q0 & DTE_IW != 0);
@@ -460,9 +503,10 @@ mod tests {
     fn programs_tables_and_stays_off() {
         let (f, dma, clock) = (fake(), HostDma::default(), StdClock::default());
         let unit = setup(&dma, &clock, &f);
-        assert!(!f.translating() && !unit.translating());
+        assert!(!unit.translating());
         let c = f.regs.r64(CONTROL);
-        assert_eq!(c & (CMD_BUF_EN | EVENT_LOG_EN), CMD_BUF_EN | EVENT_LOG_EN);
+        assert_eq!(c & (CMD_BUF_EN | EVENT_LOG_EN | IOMMU_EN), CMD_BUF_EN | EVENT_LOG_EN | IOMMU_EN);
+        assert_eq!(f.translate(dev(NIC).bdf(), 0x1234, false), Ok(0x1234), "DMA passes until the first attach");
         // 8 buses x 256 functions x 32 bytes = 64 KiB = 16 pages.
         assert_eq!(f.regs.r64(DEV_TAB_BAR) & 0xfff, 15);
         assert_eq!(f.regs.r64(EVT_LOG_BAR) >> 56, 8);
@@ -491,7 +535,7 @@ mod tests {
         d.map(0x20_0000, buf.device_addr(), 0x2000, MapFlags::RW).unwrap();
         d.map(0x40_0000, buf.device_addr(), 0x1000, MapFlags::READ).unwrap();
         d.attach(dev(NIC)).unwrap();
-        assert!(f.translating(), "first attach turns the unit on");
+        assert!(unit.translating(), "first attach blocks everything else");
         let sid = dev(NIC).bdf();
         assert_eq!(f.domain_of(sid), 9);
         assert_eq!(f.translate(sid, 0x20_0123, true), Ok(base + 0x123));
@@ -499,6 +543,8 @@ mod tests {
         assert_eq!(f.translate(sid, 0x40_0000, true), Err("permission"));
         assert_eq!(f.translate(sid, 0x30_0000, false), Err("not present"));
         assert_eq!(f.translate(dev(Address::new(0, 3, 2)).bdf(), 0x20_0000, false), Err("device blocked"));
+        assert_eq!(f.translate(dev(FAR).bdf(), 0x20_0000, false), Err("device blocked"), "other buses too");
+        assert_eq!(f.translate(0x0800, 0x20_0000, false), Ok(0x20_0000), "beyond max_bus the table does not reach");
 
         d.map(0x50_0000, buf.device_addr() + 0x1000, 0x1000, MapFlags::RW).unwrap();
         assert_eq!(f.translate(sid, 0x50_0008, true), Ok(base + 0x1008));
@@ -542,7 +588,7 @@ mod tests {
         let mut d = IoDomain::new(&unit, DomainId(1), &tables).unwrap();
         assert_eq!(d.attach(DeviceId::new(1, NIC)), Err(IommuError::InvalidDevice));
         assert_eq!(d.attach(dev(Address::new(8, 0, 0))), Err(IommuError::InvalidDevice), "beyond max_bus");
-        assert!(!f.translating());
+        assert!(!unit.translating());
     }
 
     #[test]
@@ -555,9 +601,9 @@ mod tests {
             let mut d = IoDomain::new(&unit, DomainId(1), &tables).unwrap();
             assert_eq!(d.attach(dev(NIC)), Err(IommuError::Timeout));
         }
-        assert!(!f.translating());
+        assert!(!unit.translating(), "the first attach never finished");
         let tab = f.regs.r64(DEV_TAB_BAR) & ADDR_MASK;
-        assert_eq!(mem64(tab + dev(NIC).bdf() as u64 * 32), 0, "entry cleared again");
+        assert_eq!(mem64(tab + dev(NIC).bdf() as u64 * 32) & DTE_MODE_MASK, 0, "no page table left in the entry");
     }
 
     #[test]

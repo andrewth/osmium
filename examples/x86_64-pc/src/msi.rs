@@ -41,7 +41,7 @@ pub fn on_interrupt() {
     crate::LAPIC.get().expect("LAPIC initialised").eoi();
 }
 
-struct Uptime;
+pub struct Uptime;
 
 impl Clock for Uptime {
     fn now_ns(&self) -> u64 {
@@ -71,7 +71,7 @@ impl From<NvmeError> for Error {
 
 /// Identity-maps `[addr, addr + size)` as device memory (the pages not
 /// mapped yet) and returns a window onto it.
-fn map(addr: u64, size: u64) -> IoMem {
+pub fn map(addr: u64, size: u64) -> IoMem {
     let mut guard = crate::PT.lock();
     let pt = guard.as_mut().expect("as_mut returned None");
     let end = (addr + size).next_multiple_of(PAGE_SIZE as u64);

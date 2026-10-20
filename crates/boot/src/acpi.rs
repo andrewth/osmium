@@ -275,6 +275,97 @@ impl<'src> Mcfg<'src> {
     }
 }
 
+/// One DMA-remapping hardware unit, from a `DMAR` DRHD structure (Intel VT-d).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaRemapUnit {
+    /// PCI segment the unit serves.
+    pub segment: u16,
+    /// Physical base address of its registers.
+    pub base: u64,
+    /// True if the unit covers every device in the segment not claimed by
+    /// another unit (`INCLUDE_PCI_ALL`).
+    pub include_all: bool,
+}
+
+/// The DMA Remapping Reporting table (`DMAR`).
+#[derive(Clone, Copy, Debug)]
+pub struct Dmar<'src> {
+    structures: &'src [u8],
+}
+
+impl<'src> Dmar<'src> {
+    /// Parses a `DMAR` table.
+    pub fn parse(t: Table<'src>) -> Option<Self> {
+        // Host address width, flags and 10 reserved bytes precede the list.
+        (&t.signature() == b"DMAR").then(|| Some(Self { structures: t.body().get(12..)? })).flatten()
+    }
+
+    /// The remapping units (DRHD structures), in table order.
+    pub fn units(&self) -> impl Iterator<Item = DmaRemapUnit> + 'src {
+        let mut rest = self.structures;
+        core::iter::from_fn(move || {
+            loop {
+                let kind = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?);
+                let len = u16::from_le_bytes(rest.get(2..4)?.try_into().ok()?) as usize;
+                let entry = rest.get(..len).filter(|_| len >= 4)?;
+                rest = &rest[len..];
+                if kind == 0 {
+                    return Some(DmaRemapUnit {
+                        segment: u16::from_le_bytes(entry.get(6..8)?.try_into().ok()?),
+                        base: le64(entry, 8)?,
+                        include_all: entry.get(4)? & 1 != 0,
+                    });
+                }
+            }
+        })
+    }
+}
+
+/// One AMD IOMMU, from an `IVRS` IVHD block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AmdIommuUnit {
+    /// PCI segment the unit serves.
+    pub segment: u16,
+    /// Physical base address of its registers.
+    pub base: u64,
+    /// The unit's own PCI requester ID.
+    pub device_id: u16,
+}
+
+/// The I/O Virtualization Reporting Structure (`IVRS`).
+#[derive(Clone, Copy, Debug)]
+pub struct Ivrs<'src> {
+    blocks: &'src [u8],
+}
+
+impl<'src> Ivrs<'src> {
+    /// Parses an `IVRS` table.
+    pub fn parse(t: Table<'src>) -> Option<Self> {
+        // IVinfo and 8 reserved bytes precede the blocks.
+        (&t.signature() == b"IVRS").then(|| Some(Self { blocks: t.body().get(12..)? })).flatten()
+    }
+
+    /// The IOMMUs (IVHD blocks of type 10h, 11h and 40h), in table order.
+    pub fn units(&self) -> impl Iterator<Item = AmdIommuUnit> + 'src {
+        let mut rest = self.blocks;
+        core::iter::from_fn(move || {
+            loop {
+                let kind = *rest.first()?;
+                let len = u16::from_le_bytes(rest.get(2..4)?.try_into().ok()?) as usize;
+                let block = rest.get(..len).filter(|_| len >= 4)?;
+                rest = &rest[len..];
+                if matches!(kind, 0x10 | 0x11 | 0x40) {
+                    return Some(AmdIommuUnit {
+                        device_id: u16::from_le_bytes(block.get(4..6)?.try_into().ok()?),
+                        base: le64(block, 8)?,
+                        segment: u16::from_le_bytes(block.get(16..18)?.try_into().ok()?),
+                    });
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +475,46 @@ mod tests {
         mem[3] ^= 1;
         let read = |pa: u64, len: usize| mem.get(pa as usize..pa as usize + len);
         assert_eq!(Acpi::new(0, read).err(), Some(AcpiError::BadRsdp));
+    }
+    #[test]
+    fn dmar_and_ivrs_units() {
+        // DMAR: a reserved-memory structure (type 1) the walker must skip,
+        // then two DRHDs.
+        let mut dmar = Vec::from([48u8, 1]);
+        dmar.extend_from_slice(&[0; 10]);
+        dmar.extend_from_slice(&[1, 0, 8, 0, 0, 0, 0, 0]); // RMRR stub
+        for (flags, seg, base) in [(0u8, 0u16, 0xfed9_0000u64), (1, 1, 0xfedb_0000)] {
+            dmar.extend_from_slice(&[0, 0, 16, 0, flags, 0]);
+            dmar.extend_from_slice(&seg.to_le_bytes());
+            dmar.extend_from_slice(&base.to_le_bytes());
+        }
+        let t = table(b"DMAR", &dmar);
+        let units: Vec<_> = Dmar::parse(Table { data: &t }).unwrap().units().collect();
+        assert_eq!(
+            units,
+            [
+                DmaRemapUnit { segment: 0, base: 0xfed9_0000, include_all: false },
+                DmaRemapUnit { segment: 1, base: 0xfedb_0000, include_all: true },
+            ]
+        );
+        assert!(Ivrs::parse(Table { data: &t }).is_none());
+
+        // IVRS: an IVMD (type 20h) to skip, then a type 11h IVHD.
+        let mut ivrs = Vec::from([0u8; 12]);
+        ivrs.extend_from_slice(&[0x20, 0, 8, 0, 0, 0, 0, 0]);
+        let mut ivhd = Vec::from([0x11u8, 0, 24, 0]);
+        ivhd.extend_from_slice(&0x0010u16.to_le_bytes()); // device ID
+        ivhd.extend_from_slice(&[0x40, 0]); // capability offset
+        ivhd.extend_from_slice(&0xfed8_0000u64.to_le_bytes());
+        ivhd.extend_from_slice(&2u16.to_le_bytes()); // segment
+        ivhd.extend_from_slice(&[0; 6]);
+        ivrs.extend_from_slice(&ivhd);
+        let t = table(b"IVRS", &ivrs);
+        let units: Vec<_> = Ivrs::parse(Table { data: &t }).unwrap().units().collect();
+        assert_eq!(units, [AmdIommuUnit { segment: 2, base: 0xfed8_0000, device_id: 0x10 }]);
+
+        // A truncated structure ends the walk instead of panicking.
+        let t = table(b"DMAR", &dmar[..dmar.len() - 5]);
+        assert_eq!(Dmar::parse(Table { data: &t }).unwrap().units().count(), 1);
     }
 }

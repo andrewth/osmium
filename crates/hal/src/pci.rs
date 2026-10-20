@@ -204,6 +204,8 @@ impl Class {
     pub const EHCI: Self = Self { class: 0x0c, subclass: 0x03, prog_if: 0x20 };
     /// NVMe controller (01/08/02).
     pub const NVME: Self = Self { class: 0x01, subclass: 0x08, prog_if: 0x02 };
+    /// System IOMMU (08/06/00), such as the RISC-V IOMMU PCI function.
+    pub const IOMMU: Self = Self { class: 0x08, subclass: 0x06, prog_if: 0x00 };
     /// Ethernet controller (02/00/00).
     pub const ETHERNET: Self = Self { class: 0x02, subclass: 0x00, prog_if: 0x00 };
 }

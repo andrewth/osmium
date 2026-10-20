@@ -8,8 +8,12 @@
 //! registers), so no invalidation queue is needed; a queue the firmware left
 //! enabled is switched off.
 //!
-//! It needs `ECAP.C` (coherent table walks) and `CAP.SAGAW` bit 2 (4-level
-//! tables). With caching mode (`CAP.CM`, as in virtual machines) domain 0 is
+//! It needs `CAP.SAGAW` bit 2 (4-level tables) and, from [`Vtd::new`],
+//! `ECAP.C` (the unit's table walks snoop the CPU caches). A unit without it
+//! needs cache lines written back after every table change, which this tree
+//! has no way to do, so [`Vtd::new`] refuses it; QEMU's model reports the
+//! bit clear although its memory is always coherent, and
+//! [`Vtd::new_assuming_coherent`] is for that. With caching mode (`CAP.CM`, as in virtual machines) domain 0 is
 //! reserved and the driver invalidates after every change, as it does anyway.
 //! Scalable mode, interrupt remapping, device IOTLBs and nested translation
 //! are not used. Pass-through is not offered: unattached devices are blocked
@@ -29,7 +33,7 @@ use osmium_mm::PhysAddr;
 use osmium_mm::paging::formats::VtdSecondLevel;
 use osmium_sync::IrqSpinLock;
 
-use super::{DEFAULT_TIMEOUT_NS, Regs, wait_until};
+use super::{DEFAULT_TIMEOUT_NS, Pages, Regs, wait_until};
 
 // Registers.
 const VER: usize = 0x00;
@@ -81,7 +85,7 @@ const AW_48: u64 = 2;
 
 struct Tables<'d, D: DmaAllocator + ?Sized> {
     root: OwnedDma<'d, D>,
-    context: [Option<OwnedDma<'d, D>>; 256],
+    context: Pages<'d, D>,
 }
 
 struct State<'d, D: DmaAllocator + ?Sized> {
@@ -95,7 +99,6 @@ struct State<'d, D: DmaAllocator + ?Sized> {
 /// An Intel VT-d remapping unit.
 pub struct Vtd<'d, D: DmaAllocator + Sync + ?Sized> {
     regs: Regs,
-    dma: &'d D,
     clock: &'d dyn Clock,
     segment: u16,
     cap: u64,
@@ -113,14 +116,42 @@ pub struct Vtd<'d, D: DmaAllocator + Sync + ?Sized> {
 impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
     /// Takes over the unit whose registers are `io`, serving PCI segment
     /// `segment`. Translation stays off until the first device attaches.
+    /// Fails with [`IommuError::Unsupported`] if the unit does not snoop
+    /// the CPU caches when it walks tables (`ECAP.C`).
     pub fn new(io: IoMem, dma: &'d D, clock: &'d dyn Clock, segment: u16) -> Result<Self, IommuError> {
+        Self::build(io, dma, clock, segment, false)
+    }
+
+    /// Like [`new`](Self::new), but accepts a unit that reports `ECAP.C`
+    /// clear.
+    ///
+    /// # Safety
+    /// The caller guarantees the unit sees the CPU's table writes without
+    /// any cache maintenance: it is emulated, or the memory the tables
+    /// live in is uncached or write-through. Otherwise it walks stale tables.
+    pub unsafe fn new_assuming_coherent(
+        io: IoMem,
+        dma: &'d D,
+        clock: &'d dyn Clock,
+        segment: u16,
+    ) -> Result<Self, IommuError> {
+        Self::build(io, dma, clock, segment, true)
+    }
+
+    fn build(
+        io: IoMem,
+        dma: &'d D,
+        clock: &'d dyn Clock,
+        segment: u16,
+        assume_coherent: bool,
+    ) -> Result<Self, IommuError> {
         let regs = Regs::new(io, 0x100)?;
         let ver = regs.r32(VER);
         if ver == 0 || ver == !0 {
             return Err(IommuError::BadRegisters);
         }
         let (cap, ecap) = (regs.r64(CAP), regs.r64(ECAP));
-        if ecap & ECAP_C == 0 || (cap >> 8) & 0x4 == 0 {
+        if (ecap & ECAP_C == 0 && !assume_coherent) || (cap >> 8) & 0x4 == 0 {
             return Err(IommuError::Unsupported);
         }
         let nd = (cap & 7) as u32;
@@ -135,11 +166,10 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         }
         let mgaw = ((cap >> 16) & 0x3f) as u32 + 1;
         let root = OwnedDma::new(dma, 4096).ok_or(IommuError::OutOfMemory)?;
-        let tables = Tables { root, context: [const { None }; 256] };
+        let tables = Tables { root, context: Pages::new(dma, 256)? };
         let gcmd = regs.r32(GSTS) & PERSISTENT;
         let vtd = Self {
             regs,
-            dma,
             clock,
             segment,
             cap,
@@ -231,14 +261,6 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         self.regs.w64(self.iotlb, IVT | IIRG_DOMAIN | self.drain_bits() | (domain as u64) << 32);
         self.wait(|| self.regs.r64(self.iotlb) & IVT == 0)
     }
-
-    /// The context entry for `device`: its table's buffer and byte offset.
-    fn context_slot<'st>(
-        tables: &'st mut Tables<'d, D>,
-        device: DeviceId,
-    ) -> (&'st mut Option<OwnedDma<'d, D>>, usize) {
-        (&mut tables.context[device.bus() as usize], (device.bdf() & 0xff) as usize * 16)
-    }
 }
 
 impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
@@ -261,15 +283,13 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         let mut st = self.state.lock();
         let tables = st.tables.as_mut().ok_or(IommuError::Unsupported)?;
         let bus = device.bus() as usize;
-        if tables.context[bus].is_none() {
-            // Not-present until the context table is zeroed and linked.
-            let table = OwnedDma::new(self.dma, 4096).ok_or(IommuError::OutOfMemory)?;
+        let (ctx, created) = tables.context.get_or_alloc(bus)?;
+        if created {
+            // Zeroed, so every entry is not-present until linked.
             barrier::dma_wmb();
-            tables.root.store::<u64>(bus * 16, table.device_addr().as_u64() | PRESENT);
-            tables.context[bus] = Some(table);
+            tables.root.store::<u64>(bus * 16, ctx.device_addr().as_u64() | PRESENT);
         }
-        let (slot, off) = Self::context_slot(tables, device);
-        let ctx = slot.as_ref().expect("made above");
+        let off = (device.bdf() & 0xff) as usize * 16;
         if ctx.load::<u64>(off) & PRESENT != 0 {
             return Err(IommuError::Busy);
         }
@@ -284,8 +304,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         if result.is_err() {
             // Do not leave a half-attached device pointing at the caller's table.
             let tables = st.tables.as_mut().expect("checked above");
-            let (slot, off) = Self::context_slot(tables, device);
-            let ctx = slot.as_ref().expect("made above");
+            let ctx = tables.context.get(bus).expect("made above");
             ctx.store::<u64>(off, 0);
             barrier::dma_wmb();
             ctx.store::<u64>(off + 8, 0);
@@ -300,8 +319,12 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         }
         let mut st = self.state.lock();
         let tables = st.tables.as_mut().ok_or(IommuError::NotAttached)?;
-        let (slot, off) = Self::context_slot(tables, device);
-        let ctx = slot.as_ref().filter(|c| c.load::<u64>(off) & PRESENT != 0).ok_or(IommuError::NotAttached)?;
+        let off = (device.bdf() & 0xff) as usize * 16;
+        let ctx = tables
+            .context
+            .get(device.bus() as usize)
+            .filter(|c| c.load::<u64>(off) & PRESENT != 0)
+            .ok_or(IommuError::NotAttached)?;
         let domain = (ctx.load::<u64>(off + 8) >> 8) as u16;
         ctx.store::<u64>(off, 0);
         barrier::dma_wmb();
@@ -520,7 +543,7 @@ mod tests {
         assert_eq!(&log[..2], ["srtp", "ctx 0x1 did 0"], "root pointer, then a global context flush: {log:?}");
         assert!(log[2].starts_with("iotlb 1"), "global IOTLB flush");
         assert!(!f.translating() && !vtd.translating());
-        assert_eq!(dma.live(), 1, "only the root table");
+        assert_eq!(dma.live(), 2, "the root table and the context-table index");
         assert_eq!(vtd.iova_limit(), 1 << 48);
         drop(vtd);
         assert_eq!(dma.live(), 0);
@@ -539,6 +562,12 @@ mod tests {
         let f = fake(0, 0);
         f.regs.w64(ECAP, f.regs.r64(ECAP) & !ECAP_C);
         assert_eq!(Vtd::new(f.regs.io(), &dma, &clock, 0).err(), Some(IommuError::Unsupported));
+        // Without ECAP.C only the explicit constructor takes it.
+        let f = fake(0, 0);
+        f.regs.w64(ECAP, f.regs.r64(ECAP) & !ECAP_C);
+        assert_eq!(Vtd::new(f.regs.io(), &dma, &clock, 0).err(), Some(IommuError::Unsupported));
+        // SAFETY: the fake is plain memory.
+        assert!(unsafe { Vtd::new_assuming_coherent(f.regs.io(), &dma, &clock, 0) }.is_ok());
         // 3-level tables only.
         let f = fake(0, 0);
         f.regs.w64(CAP, f.regs.r64(CAP) & !(0x4 << 8));
@@ -604,7 +633,7 @@ mod tests {
         b.attach(dev(FAR)).unwrap();
         assert_eq!(f.translate(dev(NIC).bdf(), 0x1000, false), Ok(0xaaa000));
         assert_eq!(f.translate(dev(FAR).bdf(), 0x1000, false), Ok(0xbbb000));
-        assert_eq!(dma.live(), 1 + 2, "root plus a context table per bus");
+        assert_eq!(dma.live(), 2 + 2, "root, index, and a context table per bus");
         drop(a);
         drop(b);
         assert_eq!(f.translate(dev(NIC).bdf(), 0x1000, false), Err("context entry not present"));
