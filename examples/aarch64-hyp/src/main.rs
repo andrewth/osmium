@@ -17,7 +17,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use osmium::arch::aarch64::{self, psci};
 use osmium::arch::trap::{self, TrapFrame};
@@ -35,6 +35,7 @@ use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryM
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
 use osmium::virt::aarch64::{self as vm, Aarch64Vcpu};
+use osmium::virt::smp::GuestCpus;
 use osmium::virt::devices::{GIC_WINDOW, Uart16550, VirtualGicV2};
 use osmium::virt::stage2::{Stage2Table, map_guest_memory, vttbr};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
@@ -59,6 +60,14 @@ _start:
 2:  mov x0, x19
     bl kmain
 3:  wfe
+    b 3b
+
+    // Secondary CPUs start here (PSCI CPU_ON) at EL2, MMU off, x0 = &SecondaryBoot.
+    .globl secondary_start
+secondary_start:
+    ldr x1, [x0]
+    mov sp, x1
+    bl secondary_main
     b 3b
 
     .section .bss.stack, "aw", @nobits
@@ -154,7 +163,81 @@ gic_guest_end:
 "#
 );
 
+// A two-vCPU guest. CPU 0 enables SGI 1 on its (banked) vGIC interface and
+// starts CPU 1 with PSCI CPU_ON; CPU 1 prints, sends CPU 0 SGI 1 through
+// GICD_SGIR and turns itself off; CPU 0 takes the SGI (IAR reports the
+// sender) and waits for AFFINITY_INFO to say CPU 1 is off. Both enter
+// here; x0 (the CPU_ON context, 0 for the boot CPU) tells them apart.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .globl smp_guest, smp_guest_end
+smp_guest:
+    movz x9, #0x0800, lsl #16       // GICD
+    movz x10, #0x0801, lsl #16      // GICC (this CPU's)
+    movz x11, #0x1000, lsl #16      // 16550
+    cbnz x0, 5f
+    adr x1, 10f
+    bl 20f
+    mov w1, #1
+    str w1, [x9]                    // GICD_CTLR
+    str w1, [x10]                   // GICC_CTLR
+    mov w1, #0xff
+    str w1, [x10, #4]               // GICC_PMR
+    mov w1, #2
+    str w1, [x9, #0x100]            // GICD_ISENABLER0: SGI 1
+    movz x0, #0x0003
+    movk x0, #0xc400, lsl #16       // PSCI CPU_ON(1, smp_guest, 0x1234)
+    mov x1, #1
+    adr x2, smp_guest
+    movz x3, #0x1234
+    hvc #0
+    mov x20, x0
+1:  wfi
+    ldr w3, [x10, #0xc]             // GICC_IAR
+    cmp w3, #1023
+    b.eq 1b
+    str w3, [x10, #0x10]            // GICC_EOIR
+    mov w21, w3
+2:  movz x0, #0x0004
+    movk x0, #0xc400, lsl #16       // PSCI AFFINITY_INFO(1) until OFF
+    mov x1, #1
+    mov x2, #0
+    hvc #0
+    cmp x0, #1
+    b.ne 2b
+    adr x1, 12f
+    bl 20f
+    movz x0, #0x0008
+    movk x0, #0x8400, lsl #16       // PSCI SYSTEM_OFF
+    hvc #0
+3:  b 3b
+5:  mov x22, x0                     // CPU 1: x0 = the CPU_ON context
+    adr x1, 11f
+    bl 20f
+    movz w1, #1, lsl #16
+    add w1, w1, #1                  // GICD_SGIR: SGI 1 to CPU 0 only
+    str w1, [x9, #0xf00]
+    movz x0, #0x0002
+    movk x0, #0x8400, lsl #16       // PSCI CPU_OFF
+    hvc #0
+6:  b 6b
+20: ldrb w2, [x1], #1               // print the string at x1
+    cbz w2, 21f
+    strb w2, [x11]
+    b 20b
+21: ret
+10: .asciz "[smp-guest] cpu 0: starting cpu 1 with PSCI CPU_ON\n"
+11: .asciz "[smp-guest] cpu 1: up, sending cpu 0 SGI 1, turning off\n"
+12: .asciz "[smp-guest] cpu 0: got the SGI; cpu 1 is off\n"
+    .balign 4
+smp_guest_end:
+"#
+);
+
 unsafe extern "C" {
+    fn secondary_start();
     static _kernel_start: u8;
     static _etext: u8;
     static _erodata: u8;
@@ -163,6 +246,8 @@ unsafe extern "C" {
     static guest_image_end: u8;
     static gic_guest: u8;
     static gic_guest_end: u8;
+    static smp_guest: u8;
+    static smp_guest_end: u8;
 }
 
 fn sym(s: &u8) -> u64 {
@@ -184,6 +269,33 @@ static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 
 static UART: Once<SerialConsole<Pl011>> = Once::new();
 static PSCI: Once<psci::Conduit> = Once::new();
+static TTBR0: AtomicU64 = AtomicU64::new(0);
+static ONLINE: AtomicUsize = AtomicUsize::new(1);
+static SMP_VM: Once<SmpVm> = Once::new();
+
+/// Handed to a secondary CPU through `x0`.
+#[repr(C)]
+struct SecondaryBoot {
+    stack_top: u64,
+    cpu: usize,
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
+    // SAFETY: each secondary gets a distinct logical id from the boot CPU.
+    unsafe { cpu::set_current_id(boot.cpu) };
+    // SAFETY: we are on the stack the boot CPU allocated for us.
+    unsafe { trap::install() };
+    enable_mmu(PhysAddr::new(TTBR0.load(Ordering::Acquire)));
+    ONLINE.fetch_add(1, Ordering::Release);
+    // Wait for a guest, then run its vCPU with our index while it lives.
+    loop {
+        if let Some(vm) = SMP_VM.get() {
+            vcpu_loop(vm, boot.cpu);
+        }
+        core::hint::spin_loop();
+    }
+}
 static PHYS_GIC: Once<GicV2> = Once::new();
 
 fn shutdown() -> ! {
@@ -252,6 +364,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     id(&mut pt, gicd, gicd + gicd_len, rw | MapFlags::DEVICE);
     id(&mut pt, gicc, gicc + gicc_len, rw | MapFlags::DEVICE);
     enable_mmu(pt.root());
+    TTBR0.store(pt.root().0, Ordering::Release);
     println!("[mmu]   EL2 MMU on, TTBR0_EL2 {:#x}; RAM {ram_start:#x}..{ram_end:#x}", pt.root().0);
     core::mem::forget(pt);
 
@@ -270,6 +383,34 @@ extern "C" fn kmain(x0: usize) -> ! {
     vm::init_cpu();
     guest_demo();
     gic_guest_demo();
+
+    // --- Secondary CPUs, then a two-vCPU guest ------------------------------
+    let boot_mpidr = aarch64::read_mpidr_el1() & 0xff_00ff_ffff;
+    let mpidrs = fdt
+        .find_node("/cpus")
+        .expect("no /cpus")
+        .children()
+        .filter(|c| c.property("device_type").and_then(|p| p.as_str()) == Some("cpu"))
+        .filter_map(|c| c.reg().next().map(|(m, _)| m));
+    let mut ncpus = 1;
+    for mpidr in mpidrs.filter(|&m| m != boot_mpidr) {
+        let stack = alloc::vec![0u8; 64 * 1024].leak();
+        let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
+            stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
+            cpu: ncpus,
+        }));
+        // SAFETY: `secondary_start` sets up its stack from `boot`.
+        let rc = unsafe { psci::cpu_on(conduit, mpidr, secondary_start as *const () as u64, boot as *const _ as u64) };
+        assert_eq!(rc, 0, "PSCI CPU_ON {mpidr:#x} failed");
+        ncpus += 1;
+    }
+    while ONLINE.load(Ordering::Acquire) < ncpus {
+        core::hint::spin_loop();
+    }
+    println!("[smp]   {ncpus} CPUs online at EL2");
+    if ncpus >= 2 {
+        smp_guest_demo();
+    }
 
     println!("[done]  {} free frames; shutting down", FRAMES.lock().free_frames());
     shutdown()
@@ -464,6 +605,129 @@ fn gic_guest_demo() {
     drop(mem);
     // SAFETY: the guest has stopped and nothing references its RAM.
     unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
+}
+
+/// A guest shared by the host CPUs that run its vCPUs.
+struct SmpVm {
+    cpus: Arc<GuestCpus>,
+    mem: GuestMemory,
+    vttbr: u64,
+    /// Per vCPU: its MMIO bus (its own vGIC views plus the shared UART)
+    /// and its IRQ line.
+    buses: Vec<Bus>,
+    lines: Vec<Arc<AtomicBool>>,
+    done: AtomicBool,
+    /// CPU_ON's result and the IAR value (vCPU 0), the context (vCPU 1).
+    results: [AtomicU64; 3],
+}
+
+/// Runs vCPU `me` of `vm` whenever it is started, until the guest is done.
+fn vcpu_loop(vm: &SmpVm, me: usize) {
+    let pio = Bus::new();
+    while !vm.done.load(Ordering::Acquire) {
+        let Some((entry, context)) = vm.cpus.take_start(me) else {
+            core::hint::spin_loop();
+            continue;
+        };
+        let mut vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr).with_irq_line(vm.lines[me].clone());
+        vm.cpus.attach_arm(me, &mut vcpu);
+        let mut stopped = false;
+        let exit = run_vcpu(&mut vcpu, &vm.buses[me], &pio, |v, exit| match exit {
+            VmExit::Hypercall { .. } => match vm::psci::handle_smp(v, exit, Some((&vm.cpus, me))) {
+                Some(vm::psci::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
+                Some(vm::psci::Outcome::Stop) => {
+                    stopped = true;
+                    ControlFlow::Break(VmExit::Halt)
+                }
+                _ => ControlFlow::Continue(()),
+            },
+            VmExit::Halt => {
+                let deadline = vm::counter() + aarch64::counter_frequency();
+                while !v.interrupt_pending(vm::counter()) {
+                    if vm::counter() > deadline {
+                        return ControlFlow::Break(VmExit::Halt);
+                    }
+                    core::hint::spin_loop();
+                }
+                ControlFlow::Continue(())
+            }
+            VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+            other => ControlFlow::Break(other),
+        });
+        if me == 0 {
+            vm.results[0].store(vcpu.state.x[20], Ordering::Release);
+            vm.results[1].store(vcpu.state.x[21], Ordering::Release);
+        } else {
+            vm.results[2].store(vcpu.state.x[22], Ordering::Release);
+        }
+        if !stopped {
+            if exit != VmExit::Shutdown {
+                println!("[hyp]   SMP vCPU {me} stopped unexpectedly: {exit:?}");
+            }
+            vm.done.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Runs a two-vCPU guest: vCPU 0 on this CPU, vCPU 1 on host CPU 1.
+fn smp_guest_demo() {
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this guest for the rest of the run.
+    unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image in .rodata.
+    let image = unsafe {
+        let start = &raw const smp_guest;
+        core::slice::from_raw_parts(start, (&raw const smp_guest_end).offset_from(start) as usize)
+    };
+    mem.write(GUEST_RAM, image).unwrap();
+    let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
+    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    let vttbr = vttbr(s2.root(), 3);
+    core::mem::forget(s2); // in use by both CPUs until power-off
+
+    let lines: Vec<Arc<AtomicBool>> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
+    let l = lines.clone();
+    let gic = Arc::new(VirtualGicV2::with_cpus(2, 64, move |cpu, level| l[cpu].store(level, Ordering::Release)));
+    let line = Arc::new(IrqSpinLock::new(Vec::new()));
+    let uart: Arc<Uart16550> = Arc::new(Uart16550::new(move |b| {
+        let mut l = line.lock();
+        l.push(b);
+        if b == b'\n' {
+            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
+            l.clear();
+        }
+    }));
+    let buses = (0..2)
+        .map(|cpu| {
+            let bus = Bus::new();
+            bus.insert(GUEST_GICD, GIC_WINDOW, gic.distributor_for(cpu)).unwrap();
+            bus.insert(GUEST_GICC, GIC_WINDOW, gic.cpu_interface_for(cpu)).unwrap();
+            bus.insert(GUEST_UART, 8, uart.clone()).unwrap();
+            bus
+        })
+        .collect();
+    let cpus = GuestCpus::new(2);
+    cpus.request_start(0, GUEST_RAM.0, 0).unwrap();
+    let vm = SMP_VM.call_once(|| SmpVm {
+        cpus,
+        mem,
+        vttbr,
+        buses,
+        lines,
+        done: AtomicBool::new(false),
+        results: [AtomicU64::new(u64::MAX), AtomicU64::new(0), AtomicU64::new(0)],
+    });
+    vcpu_loop(vm, 0);
+    let r = |i: usize| vm.results[i].load(Ordering::Acquire);
+    println!(
+        "[hyp]   SMP guest: 2 vCPUs on host CPUs 0 and 1; CPU_ON returned {}, cpu 1 got context {:#x}, IAR {:#x}",
+        r(0) as i64,
+        r(2),
+        r(1)
+    );
+    let _ = &vm.mem;
 }
 
 fn on_trap(frame: &mut TrapFrame) {

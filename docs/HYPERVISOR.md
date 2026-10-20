@@ -72,13 +72,20 @@ unchanged inside a guest.
 
 ## Several vCPUs
 
-On RISC-V, `riscv::harts::GuestHarts` holds a guest's per-hart state. Run
-each vCPU in its own host task (pinned with `TaskBuilder::cpu`), take
-start requests with `take_start`, connect each vCPU with `attach`, and
-pass the harts to `sbi::handle_smp`, which implements SBI HSM, IPI and
-RFENCE. Created with `GuestHarts::with_kick`, an IPI or fence aimed at a
-vCPU that is running guest code on another host CPU interrupts that CPU so
-the vCPU exits and notices at once.
+`smp::GuestCpus` holds a guest's per-CPU start/stop state. Run each vCPU on
+its own host CPU (a pinned task with `TaskBuilder::cpu`, or a dedicated
+CPU loop), take start requests with `take_start`, and connect the vCPU
+(`attach` on RISC-V, `attach_arm` on AArch64). Then:
+
+- RISC-V: `riscv::sbi::handle_smp` implements SBI HSM, IPI (injected as
+  `VSSIP`) and RFENCE. Created with `GuestCpus::with_kick`, an IPI or fence
+  aimed at a vCPU that is running guest code on another host CPU interrupts
+  that CPU so the vCPU exits and notices at once.
+- AArch64: `aarch64::psci::handle_smp` implements `CPU_ON`, `CPU_OFF` and
+  `AFFINITY_INFO`; build the GIC with `VirtualGicV2::with_cpus` and give
+  each vCPU's bus its own `distributor_for`/`cpu_interface_for` views. SGIs
+  between vCPUs go through the emulated `GICD_SGIR`. A vCPU halted in `wfi`
+  notices at once; one running guest code notices at its next exit.
 
 ## Describing the machine
 
@@ -90,7 +97,7 @@ loads a kernel image.
 
 ## Current limits
 
-- AArch64 and x86 guests are single-vCPU. x86 MMIO emulation without
+- x86 guests are single-vCPU. x86 MMIO emulation without
   decode assists walks 4-level (long-mode) guest page tables, or none; 32-bit
   paging is not walked.
 - No VMX backend (QEMU's TCG does not emulate VMX).
