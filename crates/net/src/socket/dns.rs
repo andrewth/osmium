@@ -609,10 +609,9 @@ impl DnsClient {
             if let Some(msg) = reply {
                 // The connection is the server's: its answer need not be
                 // checked against a source address, only against the query.
-                let response =
-                    parse_response(msg).filter(|r| {
-                        r.id == self.queries[i].id && r.name == self.queries[i].name && r.qtype == self.queries[i].qtype
-                    });
+                let response = parse_response(msg).filter(|r| {
+                    r.id == self.queries[i].id && r.name == self.queries[i].name && r.qtype == self.queries[i].qtype
+                });
                 let (partial, ttl) = (core::mem::take(&mut job.partial), job.ttl);
                 match response {
                     // Truncation over TCP is no matter: take what there is.
@@ -858,10 +857,13 @@ mod tests {
             let query = query.to_vec();
             self.tcp_rx.clear();
             let noise = [7u8; 30];
-            let addrs: Vec<[u8; 4]> = big_answer().iter().map(|a| match a {
-                IpAddr::V4(a) => a.octets(),
-                IpAddr::V6(_) => unreachable!("big_answer is IPv4"),
-            }).collect();
+            let addrs: Vec<[u8; 4]> = big_answer()
+                .iter()
+                .map(|a| match a {
+                    IpAddr::V4(a) => a.octets(),
+                    IpAddr::V6(_) => unreachable!("big_answer is IPv4"),
+                })
+                .collect();
             let mut answers: Vec<(&[u8], u16, u32, &[u8])> = (0..30).map(|_| (Q, 16, 60, &noise[..])).collect();
             answers.extend(addrs.iter().map(|a| (Q, TYPE_A, 60, &a[..])));
             let r = response(&query, 0, &answers);
