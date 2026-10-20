@@ -130,6 +130,8 @@ pub enum Mlx4Error {
     BadPort,
     /// The port is in InfiniBand mode.
     NotEthernet,
+    /// The DMA allocator returned memory that is not 4 KiB aligned.
+    MisalignedDma,
 }
 
 /// Limits from QUERY_DEV_CAP.
@@ -276,6 +278,10 @@ fn map_blocks(
     len: usize,
     mut f: impl FnMut(u64, u64, u32) -> Result<(), Mlx4Error>,
 ) -> Result<(), Mlx4Error> {
+    // The device maps whole pages; a block below 4 KiB has no encoding.
+    if !(va | pa).is_multiple_of(PAGE as u64) {
+        return Err(Mlx4Error::MisalignedDma);
+    }
     let mut left = len.next_multiple_of(PAGE) as u64;
     while left > 0 {
         let align = (va | pa).trailing_zeros().min(63);
@@ -627,7 +633,8 @@ fn reset<C: ConfigAccess + ?Sized>(func: &Function<'_, C>, config: &IoMem, clock
             *d = func.read32(4 * i as u16);
         }
     }
-    let pcie = func.find_capability(cap::PCI_EXPRESS);
+    // Restored from `header` below, so it must lie inside the 256 bytes saved.
+    let pcie = func.find_capability(cap::PCI_EXPRESS).filter(|&at| at as usize + 0x14 <= 4 * header.len());
 
     // Hold off flash updates.
     let deadline = clock.now_ns().saturating_add(SEMAPHORE_TIMEOUT_NS);
@@ -732,6 +739,14 @@ mod tests {
             if i > 0 {
                 assert_eq!(va, blocks[i - 1].0 + (1 << blocks[i - 1].2), "contiguous");
             }
+        }
+    }
+
+    #[test]
+    fn map_blocks_rejects_unaligned_memory() {
+        for (va, pa) in [(0x1000, 0x10_0800), (0x1800, 0x10_0000)] {
+            let r = map_blocks(va, pa, 0x2000, |_, _, _| panic!("no block for unaligned memory"));
+            assert_eq!(r, Err(Mlx4Error::MisalignedDma));
         }
     }
 
