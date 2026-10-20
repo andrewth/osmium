@@ -13,6 +13,7 @@ dependencies = [
  "osmium-fs",
  "osmium-hal",
  "osmium-mm",
+ "osmium-proc",
  "osmium-sched",
  "osmium-sync",
  "osmium-virt",
@@ -69,6 +70,18 @@ name = "osmium-mm"
 version = "0.1.0"
 dependencies = [
  "osmium-arch",
+ "osmium-sync",
+]
+
+[[package]]
+name = "osmium-proc"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-boot",
+ "osmium-fs",
+ "osmium-mm",
+ "osmium-sched",
  "osmium-sync",
 ]
 

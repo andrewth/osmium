@@ -15,6 +15,7 @@
 //! | `sched` | `osmium-sched` | tasks, context switch, schedulers, wait queues, timers |
 //! | `virt` | `osmium-virt` | guest memory, stage-2 tables, device buses, VM exits |
 //! | `exec` | `osmium-exec` | heap-free async executor for firmware |
+//! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
 //!
 //! The library never defines an entry point, panic handler or global
 //! allocator: the OS assembles those from the parts it uses.
@@ -29,6 +30,8 @@ pub use osmium_drivers as drivers;
 pub use osmium_exec as exec;
 #[cfg(feature = "fs")]
 pub use osmium_fs as fs;
+#[cfg(feature = "proc")]
+pub use osmium_proc as proc;
 #[cfg(feature = "hal")]
 pub use osmium_hal as hal;
 #[cfg(feature = "mm")]

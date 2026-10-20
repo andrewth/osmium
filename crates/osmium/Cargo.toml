@@ -14,7 +14,7 @@ workspace = true
 [features]
 default = ["sync", "mm", "hal", "drivers", "boot"]
 ## Everything, including the parts that need `alloc`.
-full = ["sync", "mm", "hal", "drivers", "boot", "sched", "virt", "exec", "fs"]
+full = ["sync", "mm", "hal", "drivers", "boot", "sched", "virt", "exec", "fs", "proc"]
 sync = ["dep:osmium-sync"]
 mm = ["dep:osmium-mm"]
 hal = ["dep:osmium-hal"]
@@ -28,6 +28,8 @@ virt = ["dep:osmium-virt"]
 exec = ["dep:osmium-exec"]
 ## Virtual file system and RAM file system (needs `alloc`).
 fs = ["dep:osmium-fs"]
+## Processes, user address spaces and Linux-numbered system calls (needs `alloc`).
+proc = ["dep:osmium-proc", "sched", "fs", "mm", "boot"]
 ## RISC-V machine-mode CSRs.
 riscv-m-mode = ["osmium-arch/riscv-m-mode"]
 ## AArch64 EL2 registers.
@@ -46,3 +48,4 @@ osmium-sched = { workspace = true, optional = true }
 osmium-virt = { workspace = true, optional = true }
 osmium-exec = { workspace = true, optional = true }
 osmium-fs = { workspace = true, optional = true }
+osmium-proc = { workspace = true, optional = true }
