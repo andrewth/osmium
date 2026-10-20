@@ -152,6 +152,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ RAM disk `BlockDevice`
 - ✅ virtio-mmio transport (legacy and 1.x), split virtqueue, virtio-net `NetDevice`
 - ✅ xHCI USB host controller (`UsbHost`): polled command and event rings, root-port reset, control, bulk and interrupt transfers
+- ✅ Mellanox ConnectX-2/-3 (mlx4) Ethernet: reset, firmware start, ICM, polled raw Ethernet queue pair per port as a `NetDevice`; tested against a simulated HCA
 - 🗺 virtio-pci transport; virtio blk, console; xHCI interrupts, hubs and isochronous transfers; USB class drivers (HID, mass storage, CDC-ECM); GICv3; HPET; NVMe
 
 ### `osmium-sched`: tasks and scheduling

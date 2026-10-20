@@ -13,6 +13,7 @@
 //! | [`ramdisk::RamDisk`] | Memory-backed disk | `BlockDevice` |
 //! | [`virtio::net::VirtioNet`] | virtio network card (MMIO, legacy and 1.x) | `NetDevice` |
 //! | [`xhci::Xhci`] | xHCI USB host controller | `UsbHost` |
+//! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet (PCI, polled) | `NetDevice` per port |
 //!
 //! Every driver is constructed from an [`osmium_hal::mmio::IoMem`] (or a
 //! port base), so it works the same under any memory map and can be tested
@@ -26,6 +27,7 @@ pub mod clint;
 pub mod gicv2;
 pub mod ioapic;
 pub mod lapic;
+pub mod mlx4;
 pub mod pit;
 pub mod pl011;
 pub mod plic;
