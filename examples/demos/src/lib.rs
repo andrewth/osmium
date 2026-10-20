@@ -134,7 +134,7 @@ pub fn smp(ncpus: usize) {
 
     let path = alloc::sync::Arc::new(osmium::sync::IrqSpinLock::new(Vec::new()));
     let p = path.clone();
-    let hopper = TaskBuilder::new("hopper").spawn(move || {
+    let hopper = TaskBuilder::new("hopper").cpu(cpu::current_id()).spawn(move || {
         for _ in 0..=ncpus {
             let here = cpu::current_id();
             p.lock().push(here);
