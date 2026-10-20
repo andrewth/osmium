@@ -39,6 +39,15 @@ const OPT_PAD: u8 = 0;
 
 /// Lease assumed when the server names none.
 const DEFAULT_LEASE: u32 = 24 * 3600;
+/// The shortest lease and renewal time taken, in seconds, so that a server
+/// cannot make the client renew in a tight loop.
+const MIN_LEASE: u32 = 60;
+const MIN_RENEWAL: u32 = 30;
+
+/// Returns true if `ip` can be one host's address.
+fn unicast(ip: Ipv4Addr) -> bool {
+    !(ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback())
+}
 
 /// The fields of a DHCP message the client uses.
 #[derive(Debug)]
@@ -332,7 +341,7 @@ impl DhcpClient {
         match (self.phase, m.ty) {
             (Phase::Discovering, OFFER) => {
                 let Some(server) = m.server else { return };
-                if m.yiaddr.is_unspecified() {
+                if !unicast(m.yiaddr) {
                     return;
                 }
                 // The REQUEST keeps the DISCOVER's transaction id.
@@ -340,12 +349,38 @@ impl DhcpClient {
                 self.attempts = 0;
                 self.next_send = now;
             }
-            (Phase::Requesting { .. } | Phase::Renewing, ACK) => {
+            (Phase::Requesting { .. } | Phase::Renewing, ACK | NAK) => self.answered(now, &m),
+            _ => {}
+        }
+    }
+
+    /// Takes an ACK or NAK to a REQUEST.
+    fn answered(&mut self, now: Instant, m: &Message) {
+        // Only the server we chose may answer.
+        let server = match (self.phase, self.lease) {
+            (Phase::Requesting { server, .. }, _) | (Phase::Renewing, Some(Lease { server, .. })) => server,
+            _ => return,
+        };
+        if m.server != Some(server) {
+            return;
+        }
+        match m.ty {
+            ACK => {
+                if !unicast(m.yiaddr) || matches!(self.phase, Phase::Requesting { addr, .. } if addr != m.yiaddr) {
+                    return;
+                }
                 let prefix_len = m.mask.map_or(24, |mask| u32::from(mask).leading_ones() as u8);
-                let config = Config { address: m.yiaddr, prefix_len, gateway: m.router, dns: m.dns };
-                let lease = m.lease.unwrap_or(DEFAULT_LEASE);
-                let renewal = m.renewal.unwrap_or(lease / 2).min(lease);
-                let server = m.server.or(self.lease.map(|l| l.server)).unwrap_or(Ipv4Addr::BROADCAST);
+                if !(1..=30).contains(&prefix_len) {
+                    return;
+                }
+                let mut config = Config { address: m.yiaddr, prefix_len, gateway: m.router, dns: m.dns };
+                if m.yiaddr == config.broadcast() {
+                    return;
+                }
+                // A router off the subnet could never be reached.
+                config.gateway = m.router.filter(|&r| config.contains(r) && r != m.yiaddr && r != config.broadcast());
+                let lease = m.lease.unwrap_or(DEFAULT_LEASE).max(MIN_LEASE);
+                let renewal = m.renewal.unwrap_or(lease / 2).clamp(MIN_RENEWAL, lease);
                 let changed = self.lease.map(|l| l.config) != Some(config);
                 self.lease = Some(Lease {
                     config,
@@ -360,8 +395,7 @@ impl DhcpClient {
                     self.iface_update = Some(Some(config));
                 }
             }
-            (Phase::Requesting { .. } | Phase::Renewing, NAK) => self.restart(),
-            _ => {}
+            _ => self.restart(), // NAK
         }
     }
 }
@@ -490,7 +524,8 @@ mod tests {
         *naks.borrow_mut() = false;
         assert!(run(&mut a, &mut b, &mut now, 5000, |a, _| a.iface.config().is_some()), "rediscovered");
         a.sockets.get_mut::<DhcpClient>(h).take_event();
-        assert!(run(&mut a, &mut b, &mut now, 10_100, |a, _| a.iface.config().is_none()), "lease expired");
+        // The 10 s lease is taken as the 60 s minimum.
+        assert!(run(&mut a, &mut b, &mut now, 60_100, |a, _| a.iface.config().is_none()), "lease expired");
         assert_eq!(a.sockets.get_mut::<DhcpClient>(h).take_event(), Some(DhcpEvent::Deconfigured));
     }
 
@@ -502,5 +537,58 @@ mod tests {
         run(&mut a, &mut b, &mut now, 16_000, |_, _| false);
         // Sent at 0, 1, 3, 7 and 15 seconds.
         assert_eq!(log.borrow().len(), 5);
+    }
+
+    /// Feeds `reply` to a client that has taken the OFFER of [`OFFERED`]
+    /// from [`SERVER`], and returns the client.
+    fn requesting(reply: impl FnOnce(&mut Message)) -> DhcpClient {
+        let mut rng = crate::rng::Rng::new(1);
+        let mac = MacAddress([2, 0, 0, 0, 0, 1]);
+        let mut cx = Cx { now: Instant::ZERO, addr: None, mac, mss: 1460, rng: &mut rng };
+        let mut c = DhcpClient::new();
+        c.dispatch(&mut cx, &mut Vec::new());
+        let mut m = Message {
+            op: BOOTREPLY,
+            xid: c.xid,
+            yiaddr: OFFERED,
+            chaddr: mac,
+            ty: OFFER,
+            server: Some(SERVER),
+            mask: Some(Ipv4Addr::new(255, 255, 255, 0)),
+            router: Some(SERVER),
+            ..Message::default()
+        };
+        c.process(&mut cx, &m.emit());
+        assert_eq!(c.phase, Phase::Requesting { server: SERVER, addr: OFFERED });
+        m.ty = ACK;
+        reply(&mut m);
+        c.process(&mut cx, &m.emit());
+        c
+    }
+
+    #[test]
+    fn rejects_bad_acks() {
+        let other = Ipv4Addr::new(10, 0, 2, 9);
+        assert!(requesting(|_| {}).config().is_some());
+        assert!(requesting(|m| m.server = Some(other)).config().is_none(), "another server");
+        assert!(requesting(|m| m.server = None).config().is_none(), "no server id");
+        assert!(requesting(|m| m.yiaddr = other).config().is_none(), "not the offered address");
+        let mut c = requesting(|m| (m.ty, m.server) = (NAK, Some(other)));
+        assert!(matches!(c.phase, Phase::Requesting { .. }), "another server's NAK");
+        assert!(c.take_event().is_none());
+        for mask in [[255, 255, 255, 255], [255, 255, 255, 254], [0, 0, 0, 0]] {
+            assert!(requesting(|m| m.mask = Some(mask.into())).config().is_none(), "mask {mask:?}");
+        }
+        for router in [[10, 0, 3, 1], [10, 0, 2, 255], [10, 0, 2, 15]] {
+            let c = requesting(|m| m.router = Some(router.into()));
+            assert_eq!(c.config().unwrap().gateway, None, "router {router:?}");
+        }
+    }
+
+    #[test]
+    fn short_leases_are_lengthened() {
+        let c = requesting(|m| (m.lease, m.renewal) = (Some(1), Some(0)));
+        let l = c.lease.unwrap();
+        assert_eq!((l.renew_at, l.expires_at), (Instant::from_millis(30_000), Instant::from_millis(60_000)));
     }
 }

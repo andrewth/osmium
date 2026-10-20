@@ -28,6 +28,9 @@ const ARP_GIVE_UP: Duration = Duration::from_secs(3);
 /// transmission.
 const RX_BURST: usize = 64;
 const TTL: u8 = 64;
+/// The largest receive buffer allocated, whatever the device claims: room
+/// for an IP packet of 65535 bytes and its Ethernet header.
+const MAX_FRAME: usize = 65550;
 
 /// An interface's IPv4 configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +94,7 @@ impl Interface {
     /// transaction ids and ephemeral ports; use a hardware random number or
     /// at least a clock reading.
     pub fn new<D: NetDevice + ?Sized>(dev: &D, seed: u64) -> Self {
-        let frame = dev.max_frame_len();
+        let frame = dev.max_frame_len().min(MAX_FRAME);
         Self {
             mac: dev.mac_address(),
             mtu: frame.saturating_sub(ETH_HEADER_LEN).min(1500),
@@ -140,7 +143,7 @@ impl Interface {
     }
 
     fn mss(&self) -> u16 {
-        (self.mtu - IPV4_HEADER_LEN - TCP_HEADER_LEN) as u16
+        self.mtu.saturating_sub(IPV4_HEADER_LEN + TCP_HEADER_LEN).max(1) as u16
     }
 
     /// Receives what `dev` has, lets the sockets process it, sends what the
@@ -153,7 +156,11 @@ impl Interface {
             match dev.receive(&mut buf) {
                 Ok(n) => {
                     active = true;
-                    self.process_frame(now, &buf[..n], sockets);
+                    // A device that reports more than it could have copied
+                    // is not believed.
+                    if let Some(frame) = buf.get(..n) {
+                        self.process_frame(now, frame, sockets);
+                    }
                 }
                 Err(NetError::WouldBlock) => break,
                 Err(_) => continue,
@@ -333,7 +340,7 @@ impl Interface {
         }
         match eth.ethertype {
             ETHERTYPE_ARP => self.process_arp(now, payload),
-            ETHERTYPE_IPV4 => self.process_ipv4(now, payload, sockets),
+            ETHERTYPE_IPV4 => self.process_ipv4(now, payload, eth.dst.is_multicast(), sockets),
             _ => {}
         }
     }
@@ -342,6 +349,12 @@ impl Interface {
         let Some(arp) = ArpPacket::parse(payload) else { return };
         let Some(c) = self.config else { return };
         if arp.sender_ip.is_unspecified() || arp.sender_mac.is_multicast() {
+            return;
+        }
+        // Nobody else may claim our address or the subnet's broadcast, and
+        // hosts off the subnet are reached through the gateway.
+        let ip = arp.sender_ip;
+        if ip == c.address || ip == c.broadcast() || !(c.contains(ip) || c.gateway == Some(ip)) {
             return;
         }
         // RFC 826: update an existing entry from any packet, add one only
@@ -364,13 +377,24 @@ impl Interface {
         }
     }
 
-    fn process_ipv4(&mut self, now: Instant, bytes: &[u8], sockets: &mut SocketSet) {
+    /// Handles an IPv4 packet that arrived in a link-layer broadcast or
+    /// multicast frame if `link_multicast`.
+    fn process_ipv4(&mut self, now: Instant, bytes: &[u8], link_multicast: bool, sockets: &mut SocketSet) {
         let Some((ip, payload)) = Ipv4Header::parse(bytes) else { return };
+        // A source that is no one host's, or is ours, is forged.
+        let src = ip.src;
+        if src.is_unspecified() || src.is_broadcast() || src.is_multicast() || src.is_loopback() {
+            return;
+        }
+        if self.config.is_some_and(|c| src == c.address || src == c.broadcast()) {
+            return;
+        }
         let ours = self.config.map(|c| c.address);
         let to_us = Some(ip.dst) == ours;
         let broadcast = ip.dst.is_broadcast() || self.config.is_some_and(|c| ip.dst == c.broadcast());
         // Before it has an address the interface takes UDP to anyone, which
-        // is how a DHCP server's unicast OFFER arrives.
+        // is how a DHCP server's unicast OFFER arrives; it goes to the DHCP
+        // client alone.
         let unconfigured_udp = ours.is_none() && ip.protocol == PROTO_UDP;
         if !(to_us || broadcast || unconfigured_udp) {
             return;
@@ -401,6 +425,9 @@ impl Interface {
             }
             PROTO_UDP => {
                 let Some((udp, data)) = UdpHeader::parse(payload, ip.src, ip.dst) else { return };
+                if ours.is_none() && udp.dst_port != dhcp::CLIENT_PORT {
+                    return;
+                }
                 let dst = SocketAddrV4::new(ip.dst, udp.dst_port);
                 let src = SocketAddrV4::new(ip.src, udp.src_port);
                 let mut delivered = false;
@@ -419,7 +446,8 @@ impl Interface {
                         _ => {}
                     }
                 }
-                if !delivered && to_us {
+                // No errors about frames that went to the whole link.
+                if !delivered && to_us && !link_multicast {
                     // Port unreachable, quoting the IP header and the first
                     // eight bytes of the datagram (RFC 792).
                     let quoted = &bytes[..(bytes.len() - payload.len() + UDP_HEADER_LEN).min(bytes.len())];
@@ -574,5 +602,106 @@ mod tests {
         assert_eq!(ArpPacket::parse(arp).unwrap().target_ip, B_IP, "ARP for the gateway, not the destination");
         let (eth, ip) = EthernetHeader::parse(&sent[1]).unwrap();
         assert_eq!((eth.dst, Ipv4Header::parse(ip).unwrap().0.dst), (b.iface.mac_address(), far));
+    }
+
+    /// A UDP datagram from `src` to `dst`:`port`, in a frame to `mac`.
+    fn udp_frame(mac: MacAddress, src: Ipv4Addr, dst: Ipv4Addr, port: u16) -> Vec<u8> {
+        let udp = UdpHeader { src_port: 9, dst_port: port }.emit(src, dst, b"x");
+        let mut f = vec![0; ETH_HEADER_LEN + IPV4_HEADER_LEN + udp.len()];
+        EthernetHeader { dst: mac, src: MacAddress([2, 0, 0, 0, 0, 9]), ethertype: ETHERTYPE_IPV4 }.emit(&mut f);
+        Ipv4Header { src, dst, protocol: PROTO_UDP, ttl: 64, ident: 0, payload_len: udp.len() }
+            .emit(&mut f[ETH_HEADER_LEN..]);
+        f[ETH_HEADER_LEN + IPV4_HEADER_LEN..].copy_from_slice(&udp);
+        f
+    }
+
+    #[test]
+    fn forged_sources_are_dropped() {
+        let (a, mut b) = pair();
+        let sent = record(&mut b);
+        let hb = b.sockets.add(UdpSocket::new(8, 8));
+        b.sockets.get_mut::<UdpSocket>(hb).bind(2000).unwrap();
+        let mac = b.iface.mac_address();
+        let forged = [B_IP, Ipv4Addr::new(192, 168, 1, 255), Ipv4Addr::BROADCAST, Ipv4Addr::UNSPECIFIED];
+        for src in forged.into_iter().chain([Ipv4Addr::new(224, 0, 0, 1), Ipv4Addr::LOCALHOST]) {
+            a.dev.tx.borrow_mut().push_back(udp_frame(mac, src, B_IP, 2000));
+        }
+        // Nothing listens on 3000, but the frame went to the whole link.
+        a.dev.tx.borrow_mut().push_back(udp_frame(MacAddress::BROADCAST, A_IP, B_IP, 3000));
+        b.poll(Instant::ZERO);
+        assert!(!b.sockets.get::<UdpSocket>(hb).can_recv());
+        assert!(sent.borrow().is_empty(), "no ICMP errors");
+        a.dev.tx.borrow_mut().push_back(udp_frame(mac, A_IP, B_IP, 2000));
+        b.poll(Instant::ZERO);
+        assert!(b.sockets.get::<UdpSocket>(hb).can_recv());
+    }
+
+    #[test]
+    fn unconfigured_takes_only_dhcp() {
+        let (a, mut b) = crate::testing::link();
+        let hb = b.sockets.add(UdpSocket::new(8, 8));
+        b.sockets.get_mut::<UdpSocket>(hb).bind(2000).unwrap();
+        a.dev.tx.borrow_mut().push_back(udp_frame(b.iface.mac_address(), A_IP, B_IP, 2000));
+        b.poll(Instant::ZERO);
+        assert!(!b.sockets.get::<UdpSocket>(hb).can_recv());
+    }
+
+    #[test]
+    fn arp_cannot_claim_our_own_or_far_addresses() {
+        let (a, mut b) = pair();
+        let sent = record(&mut b);
+        for ip in [B_IP, Ipv4Addr::new(192, 168, 1, 255), Ipv4Addr::new(10, 0, 0, 1)] {
+            let arp = ArpPacket {
+                op: ARP_REQUEST,
+                sender_mac: MacAddress([2, 0, 0, 0, 0, 9]),
+                sender_ip: ip,
+                target_mac: MacAddress::default(),
+                target_ip: B_IP,
+            };
+            let mut f = vec![0; ETH_HEADER_LEN + ARP_LEN];
+            EthernetHeader { dst: MacAddress::BROADCAST, src: arp.sender_mac, ethertype: ETHERTYPE_ARP }.emit(&mut f);
+            arp.emit(&mut f[ETH_HEADER_LEN..]);
+            a.dev.tx.borrow_mut().push_back(f);
+            b.poll(Instant::ZERO);
+            assert!(!b.iface.arp.contains(ip), "{ip}");
+        }
+        assert!(sent.borrow().is_empty(), "no replies");
+    }
+
+    /// Claims more than it could have copied, and a huge frame size.
+    struct Liar;
+
+    impl NetDevice for Liar {
+        fn mac_address(&self) -> MacAddress {
+            MacAddress([2, 0, 0, 0, 0, 7])
+        }
+
+        fn max_frame_len(&self) -> usize {
+            usize::MAX
+        }
+
+        fn transmit(&mut self, _: &[u8]) -> Result<(), NetError> {
+            Ok(())
+        }
+
+        fn receive(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
+            Ok(buf.len() + 1)
+        }
+
+        fn can_receive(&self) -> bool {
+            true
+        }
+
+        fn can_transmit(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn device_lengths_are_not_trusted() {
+        let mut iface = Interface::new(&Liar, 1);
+        assert_eq!(iface.rx_buf.len(), MAX_FRAME);
+        iface.poll(Instant::ZERO, &mut Liar, &mut SocketSet::new());
+        assert_eq!(iface.mss(), 1460);
     }
 }

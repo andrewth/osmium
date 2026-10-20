@@ -167,13 +167,16 @@ pub fn arp_tagged(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u6
     req[28..32].copy_from_slice(&ME);
     req[38..42].copy_from_slice(&GATEWAY);
     println!("{tag}{mac}, link {}", if dev.link_up() { "up" } else { "down" });
-    dev.transmit(&req).expect("transmit failed");
+    if let Err(e) = dev.transmit(&req) {
+        println!("{tag}transmit failed: {e:?}");
+        return;
+    }
 
     let deadline = now_ns() + 1_000_000_000;
     let mut frame = [0u8; 1514];
     while now_ns() < deadline {
         let Ok(n) = dev.receive(&mut frame) else { continue };
-        let f = &frame[..n];
+        let Some(f) = frame.get(..n) else { continue };
         if n >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 2] && f[28..32] == GATEWAY {
             let gw = osmium::hal::net::MacAddress(f[22..28].try_into().unwrap());
             println!("{tag}ARP: {}.{}.{}.{} is at {gw}", GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3]);
@@ -205,13 +208,22 @@ pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     while now() - start < core::time::Duration::from_secs(5) && !(tcp_done && pinged_at.is_none()) {
         iface.poll(now(), dev, &mut sockets);
         if let Some(DhcpEvent::Configured(c)) = sockets.get_mut::<DhcpClient>(dhcp).take_event() {
-            let gw = c.gateway.unwrap_or(Ipv4Addr::UNSPECIFIED);
-            println!("[net]   DHCP: {}/{} via {gw}", c.address, c.prefix_len);
-            sockets.get_mut::<IcmpSocket>(ping).send_echo(gw, 1, b"osmium").unwrap();
-            pinged_at = Some(now());
+            println!("[net]   DHCP: {}/{} via {}", c.address, c.prefix_len, c.gateway.unwrap_or(Ipv4Addr::UNSPECIFIED));
+            match c.gateway.map(|gw| sockets.get_mut::<IcmpSocket>(ping).send_echo(gw, 1, b"osmium")) {
+                Some(Ok(())) => pinged_at = Some(now()),
+                Some(Err(e)) => println!("[net]   ping: {e}"),
+                None => println!("[net]   no gateway to ping"),
+            }
+            // A renewed or changed lease must not reconnect.
             let s = sockets.get_mut::<TcpSocket>(tcp);
-            s.connect(ECHO, 0).unwrap();
-            s.send(MESSAGE).unwrap();
+            if !s.is_open()
+                && !tcp_done
+                && let Err(e) = s.connect(ECHO, 0).and_then(|()| s.send(MESSAGE))
+            {
+                println!("[net]   TCP to {ECHO}: {e}");
+                s.abort();
+                tcp_done = true;
+            }
         }
         if let Some(r) = sockets.get_mut::<IcmpSocket>(ping).recv()
             && let Some(t) = pinged_at.take()

@@ -30,6 +30,9 @@ const MAX_RETRIES: u8 = 8;
 const TIME_WAIT: Duration = Duration::from_secs(10);
 /// MSS assumed when the peer sends none.
 const DEFAULT_MSS: usize = 536;
+/// The least MSS taken from a peer: a smaller one, even 0, would only make
+/// the connection crawl or stall.
+const MIN_MSS: usize = 64;
 /// Segments sent per poll.
 const MAX_BURST: usize = 16;
 
@@ -181,6 +184,21 @@ impl TcpSocket {
 
     fn reset(&mut self) {
         *self = Self::new(self.rx_cap, self.tx_cap);
+    }
+
+    /// Returns a connection that came from [`listen`](Self::listen) to
+    /// listening on its port.
+    fn relisten(&mut self) {
+        let port = self.local.port();
+        self.reset();
+        self.local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+        self.state = State::Listen;
+        self.passive = true;
+    }
+
+    /// The MSS to send with, from the peer's option and our own.
+    fn peer_mss(seg: &TcpHeader, ours: u16) -> usize {
+        usize::from(seg.mss.unwrap_or(DEFAULT_MSS as u16)).max(MIN_MSS).min(usize::from(ours))
     }
 
     /// Waits for a connection to `port` on any address of the interface.
@@ -417,6 +435,11 @@ impl TcpSocket {
                 if seg.has(TCP_ACK) || !seg.has(TCP_SYN) {
                     return reset_for(seg, payload.len());
                 }
+                // A SYN can only come from one host.
+                let ip = src.ip();
+                if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+                    return None;
+                }
                 self.local = dst;
                 self.remote = src;
                 self.rcv_nxt = seg.seq.wrapping_add(1);
@@ -424,7 +447,7 @@ impl TcpSocket {
                 self.set_iss(self.iss);
                 self.snd_wnd = u32::from(seg.window);
                 self.snd_wl1 = seg.seq;
-                self.snd_mss = usize::from(seg.mss.unwrap_or(DEFAULT_MSS as u16)).min(usize::from(cx.mss));
+                self.snd_mss = Self::peer_mss(seg, cx.mss);
                 self.state = State::SynReceived;
                 return None;
             }
@@ -444,7 +467,7 @@ impl TcpSocket {
                     return None;
                 }
                 self.rcv_nxt = seg.seq.wrapping_add(1);
-                self.snd_mss = usize::from(seg.mss.unwrap_or(DEFAULT_MSS as u16)).min(usize::from(cx.mss));
+                self.snd_mss = Self::peer_mss(seg, cx.mss);
                 self.snd_wnd = u32::from(seg.window);
                 self.snd_wl1 = seg.seq;
                 self.snd_wl2 = seg.ack;
@@ -476,12 +499,10 @@ impl TcpSocket {
             if seg.seq != self.rcv_nxt {
                 self.ack_pending = true;
             } else if self.state == State::SynReceived && self.passive {
-                let port = self.local.port();
-                self.reset();
-                self.local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-                self.state = State::Listen;
-                self.passive = true;
-            } else if matches!(self.state, State::Closing | State::LastAck | State::TimeWait) {
+                self.relisten();
+            } else if self.state == State::TimeWait {
+                // A reset must not cut TIME-WAIT short (RFC 1337).
+            } else if matches!(self.state, State::Closing | State::LastAck) {
                 self.state = State::Closed;
                 self.timer = None;
             } else {
@@ -525,7 +546,7 @@ impl TcpSocket {
         {
             // Fast retransmit (RFC 5681 3.2): a third duplicate ACK means a
             // segment was lost, not merely delayed.
-            self.dup_acks += 1;
+            self.dup_acks = self.dup_acks.saturating_add(1);
             if self.dup_acks == 3 {
                 self.snd_nxt = self.snd_una;
                 self.rtt_sample = None;
@@ -719,7 +740,13 @@ impl TcpSocket {
             self.timer = None;
             self.retries += 1;
             if self.retries > MAX_RETRIES {
-                self.fail(Error::TimedOut);
+                // A half-open connection that never completed is no error
+                // of the listener's.
+                if self.state == State::SynReceived && self.passive {
+                    self.relisten();
+                } else {
+                    self.fail(Error::TimedOut);
+                }
                 return;
             }
             self.rto = (self.rto * 2).min(MAX_RTO);
@@ -980,5 +1007,87 @@ mod tests {
         let rst = s.process(&mut cx, dst, src, &ack, &[]).unwrap();
         assert_eq!((rst.seq, rst.flags), (99, TCP_RST));
         assert_eq!(s.state(), State::Listen);
+    }
+
+    const PEER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 9), 4000);
+
+    fn syn(mss: Option<u16>) -> TcpHeader {
+        TcpHeader { src_port: 4000, dst_port: 80, seq: 1000, flags: TCP_SYN, window: 1000, mss, ..Default::default() }
+    }
+
+    /// A listener on 80 that has taken `syn` from [`PEER`].
+    fn half_open(rng: &mut crate::rng::Rng, syn: &TcpHeader) -> TcpSocket {
+        let mut s = TcpSocket::new(64, 64);
+        s.listen(80).unwrap();
+        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng };
+        assert!(s.process(&mut cx, SocketAddrV4::new(B_IP, 80), PEER, syn, &[]).is_none());
+        s
+    }
+
+    #[test]
+    fn listener_ignores_syns_from_no_one() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = TcpSocket::new(64, 64);
+        s.listen(80).unwrap();
+        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        let dst = SocketAddrV4::new(B_IP, 80);
+        for ip in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, Ipv4Addr::new(224, 0, 0, 1)] {
+            assert!(s.process(&mut cx, dst, SocketAddrV4::new(ip, 4000), &syn(None), &[]).is_none());
+            assert_eq!(s.state(), State::Listen, "SYN from {ip}");
+        }
+    }
+
+    #[test]
+    fn unanswered_syn_ack_returns_to_listen() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        assert_eq!(s.state(), State::SynReceived);
+        let mut now = Instant::ZERO;
+        let mut out = Vec::new();
+        while s.state() == State::SynReceived && now.as_millis() < 600_000 {
+            let mut cx = Cx { now, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+            s.dispatch(&mut cx, &mut out);
+            now = Instant::from_millis(now.as_millis() + 100);
+        }
+        assert_eq!(out.len(), usize::from(MAX_RETRIES) + 1, "the SYN-ACK and its retransmissions");
+        assert_eq!((s.state(), s.error(), s.local_endpoint().port()), (State::Listen, None, 80));
+    }
+
+    #[test]
+    fn tiny_peer_mss_is_raised() {
+        let mut rng = crate::rng::Rng::new(1);
+        assert_eq!(half_open(&mut rng, &syn(Some(0))).snd_mss, MIN_MSS);
+        assert_eq!(half_open(&mut rng, &syn(Some(9000))).snd_mss, 1460, "never above our own");
+    }
+
+    #[test]
+    fn time_wait_ignores_resets() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        s.state = State::TimeWait;
+        s.timer = Some(Instant::from_millis(10_000));
+        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        let rst = TcpHeader { seq: s.rcv_nxt, flags: TCP_RST, ..syn(None) };
+        s.process(&mut cx, SocketAddrV4::new(B_IP, 80), PEER, &rst, &[]);
+        assert_eq!(s.state(), State::TimeWait);
+    }
+
+    #[test]
+    fn duplicate_acks_saturate() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        let dst = SocketAddrV4::new(B_IP, 80);
+        let mut out = Vec::new();
+        let mut cx = Cx { now: Instant::ZERO, addr: Some(B_IP), mac: Default::default(), mss: 1460, rng: &mut rng };
+        s.dispatch(&mut cx, &mut out);
+        let ack = TcpHeader { seq: 1001, ack: s.iss.wrapping_add(1), flags: TCP_ACK, window: 1000, ..syn(None) };
+        s.process(&mut cx, dst, PEER, &ack, &[]);
+        assert_eq!(s.state(), State::Established);
+        s.send(b"data").unwrap();
+        s.dispatch(&mut cx, &mut out);
+        for _ in 0..300 {
+            s.process(&mut cx, dst, PEER, &ack, &[]);
+        }
+        assert_eq!(s.dup_acks, u8::MAX);
     }
 }
