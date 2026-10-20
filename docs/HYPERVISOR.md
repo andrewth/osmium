@@ -101,5 +101,6 @@ loads a kernel image.
   decode assists walks 4-level (long-mode) guest page tables, or none; 32-bit
   paging is not walked.
 - No VMX backend (QEMU's TCG does not emulate VMX).
-- AArch64 FP/SIMD registers are not switched; leave the guest's `CPACR_EL1`
-  FP access off, or run one guest per CPU.
+- FP/SIMD state is switched on RISC-V and AArch64 on the assumption that the
+  host kernel itself never uses those registers (soft-float targets); SVE is
+  not switched and traps.

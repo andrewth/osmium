@@ -15,7 +15,7 @@ use core::mem::offset_of;
 
 use osmium_arch::trap::offsets;
 
-use super::{Aarch64Vcpu, El1Regs, GuestState};
+use super::{Aarch64Vcpu, El1Regs, FpState, GuestState};
 
 global_asm!(
     r#"
@@ -157,6 +157,9 @@ pub fn init_cpu() {
     msr!("vtcr_el2", VTCR_48);
     msr!("cnthctl_el2", 3u64); // EL1PCTEN | EL1PCEN
     msr!("cntvoff_el2", 0u64);
+    // FP/SIMD untrapped (TFP = 0) so guests can use it and the switch can
+    // move it; SVE still traps (TZ). The other bits are RES1.
+    msr!("cptr_el2", 0x33ffu64);
     // SAFETY: only orders the writes above.
     unsafe { asm!("isb", options(nomem, nostack, preserves_flags)) };
 }
@@ -211,6 +214,50 @@ fn save_el1(r: &mut El1Regs) {
     r.cntv_ctl = mrs!("cntv_ctl_el0");
 }
 
+fn load_fp(fp: &FpState) {
+    // SAFETY: reads only `fp`; the host kernel keeps no FP/SIMD state.
+    unsafe {
+        asm!(
+            ".arch_extension fp",
+            ".arch_extension simd",
+            "ldp q0, q1, [{p}, #0]", "ldp q2, q3, [{p}, #32]", "ldp q4, q5, [{p}, #64]", "ldp q6, q7, [{p}, #96]",
+            "ldp q8, q9, [{p}, #128]", "ldp q10, q11, [{p}, #160]", "ldp q12, q13, [{p}, #192]", "ldp q14, q15, [{p}, #224]",
+            "ldp q16, q17, [{p}, #256]", "ldp q18, q19, [{p}, #288]", "ldp q20, q21, [{p}, #320]", "ldp q22, q23, [{p}, #352]",
+            "ldp q24, q25, [{p}, #384]", "ldp q26, q27, [{p}, #416]", "ldp q28, q29, [{p}, #448]", "ldp q30, q31, [{p}, #480]",
+            "ldr {t}, [{p}, #512]",
+            "msr fpcr, {t}",
+            "ldr {t}, [{p}, #520]",
+            "msr fpsr, {t}",
+            p = in(reg) fp as *const FpState,
+            t = out(reg) _,
+            options(nostack, readonly),
+        )
+    }
+}
+
+fn save_fp(fp: &mut FpState) {
+    // SAFETY: writes only `fp`.
+    unsafe {
+        asm!(
+            ".arch_extension fp",
+            ".arch_extension simd",
+            "stp q0, q1, [{p}, #0]", "stp q2, q3, [{p}, #32]", "stp q4, q5, [{p}, #64]", "stp q6, q7, [{p}, #96]",
+            "stp q8, q9, [{p}, #128]", "stp q10, q11, [{p}, #160]", "stp q12, q13, [{p}, #192]", "stp q14, q15, [{p}, #224]",
+            "stp q16, q17, [{p}, #256]", "stp q18, q19, [{p}, #288]", "stp q20, q21, [{p}, #320]", "stp q22, q23, [{p}, #352]",
+            "stp q24, q25, [{p}, #384]", "stp q26, q27, [{p}, #416]", "stp q28, q29, [{p}, #448]", "stp q30, q31, [{p}, #480]",
+            "mrs {t}, fpcr",
+            "str {t}, [{p}, #512]",
+            "mrs {t}, fpsr",
+            "str {t}, [{p}, #520]",
+            p = in(reg) fp as *mut FpState,
+            t = out(reg) _,
+            options(nostack),
+        )
+    }
+}
+
+const _: () = assert!(offset_of!(FpState, fpcr) == 512 && offset_of!(FpState, fpsr) == 520);
+
 /// Enters the guest and returns at its next exit.
 pub(super) fn run(v: &mut Aarch64Vcpu) {
     let daif = mrs!("daif");
@@ -229,12 +276,14 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
         unsafe { asm!("isb", "tlbi alle1is", "dsb ish", "isb", options(nostack, preserves_flags)) };
     }
     load_el1(&v.el1);
+    load_fp(&v.fp);
     // SAFETY: orders the context writes before entering the guest.
     unsafe { asm!("isb", options(nomem, nostack, preserves_flags)) };
     // SAFETY: `state` stays valid and exclusively borrowed for the guest run;
     // the assembly saves and restores every callee-saved host register.
     unsafe { osmium_el2_run(&mut v.state) };
     save_el1(&mut v.el1);
+    save_fp(&mut v.fp);
     // The guest's timer must not fire while the host runs; its level is
     // recomputed in software before the next entry.
     msr!("cntv_ctl_el0", 0u64);

@@ -120,6 +120,7 @@ if command -v qemu-system-aarch64 >/dev/null; then
         'guest exit Shutdown: 1 hypercall, 1 halt, 0 host interrupts, LSR 0x60' \
         '\[guest\] UART interrupt, received: ping' \
         'vGIC guest exit Shutdown: INTID 27 (timer) then INTID 33 (UART), [0-9]* halts, [0-9]* timer exits' \
+        'FP guests interleaved on one CPU: vCPU x0=1 got 12, x0=2 got 14 (expected 12 and 14)' \
         '2 CPUs online at EL2' '\[smp-guest\] cpu 0: got the SGI; cpu 1 is off' \
         'SMP guest: 2 vCPUs on host CPUs 0 and 1; CPU_ON returned 0, cpu 1 got context 0x1234, IAR 0x401' '\[done\]'; do
         grep -q "$line" "$hyplog" || { echo "aarch64-hyp: missing '$line'"; exit 1; }

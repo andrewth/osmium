@@ -104,8 +104,7 @@ pub struct El1Regs {
     pub tpidr_el0: u64,
     pub tpidrro_el0: u64,
     pub tpidr_el1: u64,
-    /// `CPACR_EL1`. FP/SIMD registers are not switched, so leave FPEN off
-    /// unless the guest is the only FP user on its CPU.
+    /// `CPACR_EL1` (the guest's own FP/SIMD enable).
     pub cpacr: u64,
     pub cntkctl: u64,
     pub cntv_cval: u64,
@@ -141,12 +140,27 @@ impl Default for El1Regs {
     }
 }
 
+/// The guest's FP/SIMD registers.
+#[repr(C, align(16))]
+#[derive(Clone, Debug, Default)]
+pub struct FpState {
+    /// `q0`..`q31`.
+    pub q: [u128; 32],
+    /// `FPCR`.
+    pub fpcr: u64,
+    /// `FPSR`.
+    pub fpsr: u64,
+}
+
 /// A virtual CPU running AArch64 code at EL1.
 pub struct Aarch64Vcpu {
     /// Registers and exit state.
     pub state: GuestState,
     /// EL1 system registers.
     pub el1: El1Regs,
+    /// FP/SIMD registers, loaded before every run and saved after it (the
+    /// host kernel is soft-float and keeps none).
+    pub fp: FpState,
     /// `VTTBR_EL2` (stage-2 root and VMID).
     pub vttbr: u64,
     irq: Arc<AtomicBool>,
@@ -164,7 +178,7 @@ impl Aarch64Vcpu {
         x[0] = arg;
         let state =
             GuestState { x, pc: entry.0, pstate: PSTATE_EL1H, esr: 0, far: 0, hpfar: 0, vector: 0, host: [0; 13] };
-        Self { state, el1: El1Regs::default(), vttbr, irq: Arc::new(AtomicBool::new(false)), timer: None, pending: None, running: None }
+        Self { state, el1: El1Regs::default(), fp: FpState::default(), vttbr, irq: Arc::new(AtomicBool::new(false)), timer: None, pending: None, running: None }
     }
 
     /// The vCPU's IRQ line, for an interrupt controller (a

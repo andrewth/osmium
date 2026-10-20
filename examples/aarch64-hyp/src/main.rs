@@ -236,6 +236,36 @@ smp_guest_end:
 "#
 );
 
+// Two copies run interleaved on one host CPU, each with its own x0: turn
+// FP on, compute x0 + 10 in d3, yield (hvc with x0 = 0xc6000000), add x0
+// again and report the result (hvc with x0 = 0xc6000001, result in x1).
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .globl fp_guest, fp_guest_end
+fp_guest:
+    .arch_extension fp
+    .arch_extension simd
+    mov x19, x0
+    movz x1, #0x30, lsl #16         // CPACR_EL1.FPEN = 3: FP/SIMD on
+    msr cpacr_el1, x1
+    isb
+    scvtf d1, x19
+    fmov d2, #10.0
+    fadd d3, d1, d2
+    movz x0, #0xc600, lsl #16       // yield to the other vCPU
+    hvc #0
+    fadd d3, d3, d1
+    fcvtzs x1, d3
+    movz x0, #0xc600, lsl #16       // report x1
+    add x0, x0, #1
+    hvc #0
+1:  b 1b
+fp_guest_end:
+"#
+);
+
 unsafe extern "C" {
     fn secondary_start();
     static _kernel_start: u8;
@@ -248,6 +278,8 @@ unsafe extern "C" {
     static gic_guest_end: u8;
     static smp_guest: u8;
     static smp_guest_end: u8;
+    static fp_guest: u8;
+    static fp_guest_end: u8;
 }
 
 fn sym(s: &u8) -> u64 {
@@ -383,6 +415,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     vm::init_cpu();
     guest_demo();
     gic_guest_demo();
+    fp_demo();
 
     // --- Secondary CPUs, then a two-vCPU guest ------------------------------
     let boot_mpidr = aarch64::read_mpidr_el1() & 0xff_00ff_ffff;
@@ -604,6 +637,53 @@ fn gic_guest_demo() {
     drop(s2);
     drop(mem);
     // SAFETY: the guest has stopped and nothing references its RAM.
+    unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
+}
+
+const YIELD: u64 = 0xc600_0000;
+const REPORT: u64 = 0xc600_0001;
+
+/// Interleaves two vCPUs on this CPU and checks each computed with its own
+/// FP/SIMD registers.
+fn fp_demo() {
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guests until it is freed below.
+    unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image in .rodata.
+    let image = unsafe {
+        let start = &raw const fp_guest;
+        core::slice::from_raw_parts(start, (&raw const fp_guest_end).offset_from(start) as usize)
+    };
+    mem.write(GUEST_RAM, image).unwrap();
+    let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
+    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    let (mmio, pio) = (Bus::new(), Bus::new());
+    let vttbr = vttbr(s2.root(), 4);
+    let step = |v: &mut Aarch64Vcpu| {
+        let exit = run_vcpu(v, &mmio, &pio, |_, exit| match exit {
+            VmExit::Hypercall { nr: YIELD | REPORT, .. } => ControlFlow::Break(exit),
+            VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+            other => ControlFlow::Break(other),
+        });
+        let x1 = v.state.x[1];
+        (exit, x1)
+    };
+    let mut vcpus = [Aarch64Vcpu::new(GUEST_RAM, 1, vttbr), Aarch64Vcpu::new(GUEST_RAM, 2, vttbr)];
+    let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
+    let is = |s: &(VmExit, u64), n| matches!(s.0, VmExit::Hypercall { nr, .. } if nr == n);
+    let fine = is(&steps[0], YIELD) && is(&steps[1], YIELD) && is(&steps[2], REPORT) && is(&steps[3], REPORT);
+    let (a, b) = (steps[2].1, steps[3].1);
+    println!(
+        "[hyp]   FP guests interleaved on one CPU: vCPU x0=1 got {a}, x0=2 got {b} (expected 12 and 14){}",
+        if fine && a == 12 && b == 14 { "" } else { "; MISMATCH" }
+    );
+
+    drop(s2);
+    drop(mem);
+    // SAFETY: both vCPUs are done and nothing references the guests' RAM.
     unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
 }
 
