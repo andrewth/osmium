@@ -1,4 +1,47 @@
 .section .text.osmium_trap, "ax", @progbits
+.macro osmium_kernel_vector kind
+    // Current EL with SP_ELx: check sp before the first store, in case the
+    // kernel stack has overflowed. Exactly 32 instructions (the slot size).
+    //
+    // TPIDRRO_EL0 and SP_EL0 are used as scratch and do NOT survive any
+    // current-EL exception. The kernel must not keep values in them; an
+    // EL0 user-mode return path must restore them (user TLS and stack)
+    // from the task, and the lower-EL vectors must save them before
+    // anything can take a current-EL exception.
+    msr tpidrro_el0, x0
+    msr sp_el0, x1
+    mrs x0, tpidr_el1
+    adrp x1, OSMIUM_TRAP_CPUS
+    add x1, x1, :lo12:OSMIUM_TRAP_CPUS
+    add x0, x1, x0, lsl #6          // x0 = &TrapCpu
+    ldr x1, [x0, #0x38]             // already on the exception stack?
+    cmp sp, x1
+    b.lo 1f
+    ldr x1, [x0, #0x10]
+    cmp sp, x1
+    b.ls 2f
+1:  ldr x1, [x0, #0x18]             // stack_lo (0 = no check)
+    add x1, x1, #304
+    cmp sp, x1
+    b.hs 2f
+    mov x1, sp                      // overflow: move to the exception stack
+    ldr x0, [x0, #0x10]
+    sub x0, x0, #304
+    mov sp, x0
+    str x1, [sp, #248]              // frame.sp = interrupted sp
+    mrs x0, tpidrro_el0
+    mrs x1, sp_el0
+    stp x0, x1, [sp, #0]
+    mov x0, #\kind
+    b osmium_trap_common_sp_saved
+2:  mrs x0, tpidrro_el0
+    mrs x1, sp_el0
+    sub sp, sp, #304
+    stp x0, x1, [sp, #0]
+    mov x0, #\kind
+    b osmium_trap_common
+.endm
+
 .balign 2048
 .globl osmium_trap_vectors
 osmium_trap_vectors:
@@ -30,144 +73,16 @@ osmium_vec_3:
     b osmium_trap_common
 .org osmium_trap_vectors + 0x200
 osmium_vec_4:
-    // Vector 4: check sp before the first store.
-    msr tpidrro_el0, x0
-    msr sp_el0, x1
-    mrs x0, tpidr_el1
-    adrp x1, OSMIUM_TRAP_CPUS
-    add x1, x1, :lo12:OSMIUM_TRAP_CPUS
-    add x0, x1, x0, lsl #6          // x0 = &TrapCpu
-    ldr x1, [x0, #0x38]             // already on the exception stack?
-    cmp sp, x1
-    b.lo 1f
-    ldr x1, [x0, #0x10]
-    cmp sp, x1
-    b.ls 2f
-1:  ldr x1, [x0, #0x18]             // stack_lo (0 = no check)
-    add x1, x1, #304
-    cmp sp, x1
-    b.hs 2f
-    mov x1, sp                      // overflow: move to the exception stack
-    ldr x0, [x0, #0x10]
-    sub x0, x0, #304
-    mov sp, x0
-    str x1, [sp, #248]              // frame.sp = interrupted sp
-    mrs x0, tpidrro_el0
-    mrs x1, sp_el0
-    stp x0, x1, [sp, #0]
-    mov x0, #4
-    b osmium_trap_common_sp_saved
-2:  mrs x0, tpidrro_el0
-    mrs x1, sp_el0
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #4
-    b osmium_trap_common
+    osmium_kernel_vector 4
 .org osmium_trap_vectors + 0x280
 osmium_vec_5:
-    // Vector 5: check sp before the first store.
-    msr tpidrro_el0, x0
-    msr sp_el0, x1
-    mrs x0, tpidr_el1
-    adrp x1, OSMIUM_TRAP_CPUS
-    add x1, x1, :lo12:OSMIUM_TRAP_CPUS
-    add x0, x1, x0, lsl #6          // x0 = &TrapCpu
-    ldr x1, [x0, #0x38]             // already on the exception stack?
-    cmp sp, x1
-    b.lo 1f
-    ldr x1, [x0, #0x10]
-    cmp sp, x1
-    b.ls 2f
-1:  ldr x1, [x0, #0x18]             // stack_lo (0 = no check)
-    add x1, x1, #304
-    cmp sp, x1
-    b.hs 2f
-    mov x1, sp                      // overflow: move to the exception stack
-    ldr x0, [x0, #0x10]
-    sub x0, x0, #304
-    mov sp, x0
-    str x1, [sp, #248]              // frame.sp = interrupted sp
-    mrs x0, tpidrro_el0
-    mrs x1, sp_el0
-    stp x0, x1, [sp, #0]
-    mov x0, #5
-    b osmium_trap_common_sp_saved
-2:  mrs x0, tpidrro_el0
-    mrs x1, sp_el0
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #5
-    b osmium_trap_common
+    osmium_kernel_vector 5
 .org osmium_trap_vectors + 0x300
 osmium_vec_6:
-    // Vector 6: check sp before the first store.
-    msr tpidrro_el0, x0
-    msr sp_el0, x1
-    mrs x0, tpidr_el1
-    adrp x1, OSMIUM_TRAP_CPUS
-    add x1, x1, :lo12:OSMIUM_TRAP_CPUS
-    add x0, x1, x0, lsl #6          // x0 = &TrapCpu
-    ldr x1, [x0, #0x38]             // already on the exception stack?
-    cmp sp, x1
-    b.lo 1f
-    ldr x1, [x0, #0x10]
-    cmp sp, x1
-    b.ls 2f
-1:  ldr x1, [x0, #0x18]             // stack_lo (0 = no check)
-    add x1, x1, #304
-    cmp sp, x1
-    b.hs 2f
-    mov x1, sp                      // overflow: move to the exception stack
-    ldr x0, [x0, #0x10]
-    sub x0, x0, #304
-    mov sp, x0
-    str x1, [sp, #248]              // frame.sp = interrupted sp
-    mrs x0, tpidrro_el0
-    mrs x1, sp_el0
-    stp x0, x1, [sp, #0]
-    mov x0, #6
-    b osmium_trap_common_sp_saved
-2:  mrs x0, tpidrro_el0
-    mrs x1, sp_el0
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #6
-    b osmium_trap_common
+    osmium_kernel_vector 6
 .org osmium_trap_vectors + 0x380
 osmium_vec_7:
-    // Vector 7: check sp before the first store.
-    msr tpidrro_el0, x0
-    msr sp_el0, x1
-    mrs x0, tpidr_el1
-    adrp x1, OSMIUM_TRAP_CPUS
-    add x1, x1, :lo12:OSMIUM_TRAP_CPUS
-    add x0, x1, x0, lsl #6          // x0 = &TrapCpu
-    ldr x1, [x0, #0x38]             // already on the exception stack?
-    cmp sp, x1
-    b.lo 1f
-    ldr x1, [x0, #0x10]
-    cmp sp, x1
-    b.ls 2f
-1:  ldr x1, [x0, #0x18]             // stack_lo (0 = no check)
-    add x1, x1, #304
-    cmp sp, x1
-    b.hs 2f
-    mov x1, sp                      // overflow: move to the exception stack
-    ldr x0, [x0, #0x10]
-    sub x0, x0, #304
-    mov sp, x0
-    str x1, [sp, #248]              // frame.sp = interrupted sp
-    mrs x0, tpidrro_el0
-    mrs x1, sp_el0
-    stp x0, x1, [sp, #0]
-    mov x0, #7
-    b osmium_trap_common_sp_saved
-2:  mrs x0, tpidrro_el0
-    mrs x1, sp_el0
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #7
-    b osmium_trap_common
+    osmium_kernel_vector 7
 .org osmium_trap_vectors + 0x400
 osmium_vec_8:
     sub sp, sp, #304
