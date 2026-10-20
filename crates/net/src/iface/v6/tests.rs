@@ -425,3 +425,78 @@ fn duplicate_address_detection_catches_a_clash() {
     run(&mut a, &mut b, &mut now, 3000, |_, _| false);
     assert_eq!((a.iface.v6.global(), b.iface.v6.global()), (Some(x), None));
 }
+
+/// Delivers `ra` to `a` as if the router sent it, and polls.
+fn deliver_ra(a: &mut Host, now: Instant, ra: &RouterAdvert) {
+    a.inject(icmp_frame(multicast_mac(ALL_NODES), ROUTER, ALL_NODES, 255, ICMPV6_ROUTER_ADVERT, &ra.emit()));
+    a.poll(now);
+}
+
+#[test]
+fn mtu_option_needs_a_router_with_a_lifetime() {
+    let (mut a, _b, now) = pair6();
+    let before = a.iface.ipv6_mtu();
+    deliver_ra(&mut a, now, &RouterAdvert { router_lifetime: 0, ..advert(64, true, 7000) });
+    assert_eq!(a.iface.ipv6_mtu(), before, "a router with lifetime 0 does not set the MTU");
+    deliver_ra(&mut a, now, &advert(64, true, 7000));
+    assert_eq!(a.iface.ipv6_mtu(), 1400);
+}
+
+#[test]
+fn tcp_survives_an_mtu_decrease() {
+    let (mut a, mut b, mut now) = pair6();
+    let ca = a.sockets.add(TcpSocket::new(4096, 32768));
+    let cb = b.sockets.add(TcpSocket::new(32768, 4096));
+    b.sockets.get_mut::<TcpSocket>(cb).listen_on(any6(80)).unwrap();
+    a.sockets.get_mut::<TcpSocket>(ca).connect(SocketAddr::new(ll(&b).into(), 80), 0).unwrap();
+    assert!(run(&mut a, &mut b, &mut now, 1000, |a, b| {
+        a.sockets.get::<TcpSocket>(ca).state() == TcpState::Established
+            && b.sockets.get::<TcpSocket>(cb).state() == TcpState::Established
+    }));
+    // The segment size was fixed at 1440; now the link says 1280.
+    deliver_ra(&mut a, now, &RouterAdvert { mtu: Some(1280), ..advert(64, true, 7000) });
+    assert_eq!(a.iface.ipv6_mtu(), 1280);
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    let (mut sent, mut got) = (0, Vec::new());
+    let mut buf = [0; 2048];
+    assert!(run(&mut a, &mut b, &mut now, 20_000, |a, b| {
+        sent += a.sockets.get_mut::<TcpSocket>(ca).send(&data[sent..]).unwrap_or(0);
+        while let Ok(n @ 1..) = b.sockets.get_mut::<TcpSocket>(cb).recv(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+        }
+        got.len() == data.len()
+    }));
+    assert_eq!(got, data);
+}
+
+#[test]
+fn ipv6_loopback_is_delivered_and_never_sent() {
+    let (mut a, mut b, mut now) = pair6();
+    let log = record(&mut a);
+    let ca = a.sockets.add(TcpSocket::new(4096, 4096));
+    let cb = a.sockets.add(TcpSocket::new(4096, 4096));
+    a.sockets.get_mut::<TcpSocket>(cb).listen_on(any6(80)).unwrap();
+    a.sockets.get_mut::<TcpSocket>(ca).connect(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 80), 0).unwrap();
+    assert!(run(&mut a, &mut b, &mut now, 1000, |a, _| {
+        a.sockets.get::<TcpSocket>(ca).state() == TcpState::Established
+            && a.sockets.get::<TcpSocket>(cb).state() == TcpState::Established
+    }));
+    a.sockets.get_mut::<TcpSocket>(ca).send(b"hello").unwrap();
+    let mut buf = [0; 16];
+    assert!(run(&mut a, &mut b, &mut now, 1000, |a, _| a.sockets.get::<TcpSocket>(cb).can_recv()));
+    assert_eq!(a.sockets.get_mut::<TcpSocket>(cb).recv(&mut buf), Ok(5));
+
+    // UDP too.
+    let u = a.sockets.add(UdpSocket::new(4, 4));
+    let v = a.sockets.add(UdpSocket::new(4, 4));
+    a.sockets.get_mut::<UdpSocket>(v).bind_addr(any6(7000)).unwrap();
+    a.sockets.get_mut::<UdpSocket>(u).bind_addr(any6(7001)).unwrap();
+    a.sockets.get_mut::<UdpSocket>(u).send_to(b"hi", SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 7000)).unwrap();
+    assert!(run(&mut a, &mut b, &mut now, 1000, |a, _| a.sockets.get::<UdpSocket>(v).can_recv()));
+
+    let on_wire = log.borrow().iter().any(|f| {
+        let Some((_, p)) = EthernetHeader::parse(f) else { return false };
+        Ipv6Header::parse(p).is_some_and(|(ip, _)| ip.src.is_loopback() || ip.dst.is_loopback())
+    });
+    assert!(!on_wire, "::1 never goes on the link");
+}

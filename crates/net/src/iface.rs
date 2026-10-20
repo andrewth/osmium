@@ -4,7 +4,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
@@ -15,7 +15,7 @@ use crate::igmp::{
     ALL_HOSTS, IGMP_QUERY, IGMP_REPORT_V1, IGMP_REPORT_V2, Igmp, IgmpPacket, Outgoing, PROTO_IGMP, multicast_mac,
 };
 use crate::ipopt;
-use crate::ipv6::{ETHERTYPE_IPV6, IPV6_HEADER_LEN};
+use crate::ipv6::{ETHERTYPE_IPV6, IPV6_HEADER_LEN, Ipv6Header};
 use crate::rng::Rng;
 use crate::socket::icmp::EchoReply;
 use crate::socket::tcp::reset_for;
@@ -379,7 +379,11 @@ impl Interface {
             let Some(bytes) = self.loopback.pop_front() else { break };
             self.looping = true;
             self.looped = true;
-            self.process_ipv4(now, &bytes, false, sockets);
+            if bytes.first().is_some_and(|b| b >> 4 == 6) {
+                self.process_ipv6(now, &bytes, sockets);
+            } else {
+                self.process_ipv4(now, &bytes, false, sockets);
+            }
             self.looping = false;
         }
 
@@ -447,17 +451,24 @@ impl Interface {
             return;
         }
         let (IpAddr::V4(src), IpAddr::V4(dst)) = (p.src, p.dst) else { return };
-        let header = Ipv4Header {
-            src,
-            dst,
-            protocol: p.protocol,
-            ttl: TTL,
-            ident: 0,
-            payload_len: p.payload.len(),
-        };
+        let header = Ipv4Header { src, dst, protocol: p.protocol, ttl: TTL, ident: 0, payload_len: p.payload.len() };
         let mut bytes = vec![0; IPV4_HEADER_LEN + p.payload.len()];
         header.emit(&mut bytes);
         bytes[IPV4_HEADER_LEN..].copy_from_slice(&p.payload);
+        self.loopback.push_back(bytes);
+        self.looped = true;
+    }
+
+    /// Queues an IPv6 packet to this host itself (`::1`), no device involved.
+    fn queue_loopback6(&mut self, src: Ipv6Addr, dst: Ipv6Addr, protocol: u8, payload: &[u8]) {
+        if self.loopback.len() >= TX_QUEUE {
+            return;
+        }
+        let header =
+            Ipv6Header { src, dst, next_header: protocol, hop_limit: 64, payload_len: payload.len(), fragment: None };
+        let mut bytes = vec![0; IPV6_HEADER_LEN + payload.len()];
+        header.emit(&mut bytes);
+        bytes[IPV6_HEADER_LEN..].copy_from_slice(payload);
         self.loopback.push_back(bytes);
         self.looped = true;
     }

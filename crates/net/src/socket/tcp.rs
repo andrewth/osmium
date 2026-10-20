@@ -31,6 +31,9 @@ const MIN_RTO: Duration = Duration::from_millis(200);
 const MAX_RTO: Duration = Duration::from_secs(60);
 /// Retransmissions of one segment before the connection is dropped.
 const MAX_RETRIES: u8 = 8;
+/// SYN-ACK retransmissions before a half-open connection is dropped: with
+/// the doubling timeout, about a minute (as Linux's tcp_synack_retries).
+const MAX_SYNACK_RETRIES: u8 = 5;
 /// How long a closed connection lingers in TIME-WAIT (2 MSL). Shorter than
 /// the RFC's four minutes, as most stacks are.
 const TIME_WAIT: Duration = Duration::from_secs(10);
@@ -115,6 +118,8 @@ pub struct TcpSocket {
     /// The connection came from [`listen`](Self::listen); a reset in
     /// SYN-RECEIVED returns it to LISTEN.
     passive: bool,
+    /// The address [`listen_on`](Self::listen_on) was given, which a listener returns to.
+    listen_addr: SocketAddr,
 
     rx: VecDeque<u8>,
     rx_cap: usize,
@@ -220,6 +225,7 @@ impl TcpSocket {
             remote: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             fresh: false,
             passive: false,
+            listen_addr: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             rx: VecDeque::new(),
             rx_cap: rx_cap.min(MAX_RX_CAP),
             ooo: Vec::new(),
@@ -284,11 +290,10 @@ impl TcpSocket {
     /// Returns a connection that came from [`listen`](Self::listen) to
     /// listening on its port.
     fn relisten(&mut self) {
-        let port = self.local.port();
-        let v6 = self.local.is_ipv6();
+        let addr = self.listen_addr;
         self.reset();
-        let any = if v6 { Ipv6Addr::UNSPECIFIED.into() } else { Ipv4Addr::UNSPECIFIED.into() };
-        self.local = SocketAddr::new(any, port);
+        self.local = addr;
+        self.listen_addr = addr;
         self.state = State::Listen;
         self.passive = true;
     }
@@ -317,6 +322,7 @@ impl TcpSocket {
         }
         self.reset();
         self.local = local;
+        self.listen_addr = local;
         self.state = State::Listen;
         self.passive = true;
         Ok(())
@@ -731,6 +737,7 @@ impl TcpSocket {
             && !seg.has(TCP_FIN)
             && self.snd_una != self.snd_max
             && window == self.snd_wnd
+            && window != 0
         {
             self.on_dup_ack();
         }
@@ -741,6 +748,11 @@ impl TcpSocket {
             if self.snd_wnd > 0 {
                 self.probe = false;
             }
+        }
+        // A peer that answers a zero-window probe is alive, whatever its
+        // window: only unanswered probes count toward giving up.
+        if self.snd_wnd == 0 {
+            self.retries = 0;
         }
 
         let fin_acked = self.fin_queued && self.tx.is_empty() && self.snd_una == self.tx_seq.wrapping_add(1);
@@ -1252,13 +1264,20 @@ impl TcpSocket {
             self.fresh = false;
         }
 
+        // The path MTU can fall (a router advertisement) below what this
+        // connection was set up with.
+        let options = if self.ts_ok { TS_OPTION_LEN } else { 0 };
+        let limit = usize::from(cx.mss_for(&self.remote)).saturating_sub(options).max(1);
+        self.snd_mss = self.snd_mss.min(limit);
+
         if self.timer.is_some_and(|t| now >= t) {
             self.timer = None;
             self.retries += 1;
-            if self.retries > MAX_RETRIES {
+            let half_open = self.state == State::SynReceived && self.passive;
+            if self.retries > if half_open { MAX_SYNACK_RETRIES } else { MAX_RETRIES } {
                 // A half-open connection that never completed is no error
                 // of the listener's.
-                if self.state == State::SynReceived && self.passive {
+                if half_open {
                     self.relisten();
                 } else {
                     self.fail(Error::TimedOut);
@@ -1268,11 +1287,15 @@ impl TcpSocket {
             self.rto = (self.rto * 2).min(MAX_RTO);
             // Karn's algorithm: never time a retransmitted segment.
             self.rtt_sample = None;
-            if self.snd_una != self.snd_max && !matches!(self.state, State::SynSent | State::SynReceived) {
-                self.on_timeout();
-            }
-            if self.snd_wnd == 0 && self.snd_una == self.snd_max {
+            // A zero window with data waiting is the persist timer, not a loss
+            // (RFC 1122 4.2.2.17): probe again, and do not collapse cwnd.
+            let persist = self.snd_wnd == 0
+                && !matches!(self.state, State::SynSent | State::SynReceived)
+                && (self.snd_una.wrapping_sub(self.tx_seq) as usize) < self.tx.len();
+            if persist {
                 self.probe = true;
+            } else if self.snd_una != self.snd_max && !matches!(self.state, State::SynSent | State::SynReceived) {
+                self.on_timeout();
             }
             self.snd_nxt = self.snd_una;
         }
@@ -1635,8 +1658,56 @@ mod tests {
             s.dispatch(&mut cx, &mut out);
             now = Instant::from_millis(now.as_millis() + 100);
         }
-        assert_eq!(out.len(), usize::from(MAX_RETRIES) + 1, "the SYN-ACK and its retransmissions");
+        assert_eq!(out.len(), usize::from(MAX_SYNACK_RETRIES) + 1, "the SYN-ACK and its retransmissions");
         assert_eq!((s.state(), s.error(), s.local_endpoint().port()), (State::Listen, None, 80));
+    }
+
+    #[test]
+    fn relisten_keeps_the_listen_address() {
+        let mut s = TcpSocket::new(64, 64);
+        s.listen_on(sa(B_IP, 80)).unwrap();
+        s.local = sa(Ipv4Addr::new(10, 0, 0, 9), 80);
+        s.state = State::SynReceived;
+        s.relisten();
+        assert_eq!((s.state(), s.local_endpoint()), (State::Listen, sa(B_IP, 80)));
+    }
+
+    #[test]
+    fn zero_window_probes_outlast_the_retry_limit() {
+        // B's application never reads, so its window closes. A must keep
+        // probing for far longer than the retry limit allows for lost
+        // segments, and finish once B reads.
+        let (mut a, mut b, ca, cb, mut now) = connected(1000, 8000);
+        let data = [7u8; 3000];
+        let mut sent = 0;
+        let end = now.as_millis() + 1_500_000;
+        while now.as_millis() < end {
+            sent += tcp(&mut a, ca).send(&data[sent..]).unwrap_or(0);
+            run(&mut a, &mut b, &mut now, 1000, |_, _| false);
+            assert_eq!(tcp(&mut a, ca).state(), State::Established, "at {} ms", now.as_millis());
+            assert_eq!(tcp(&mut a, ca).error(), None);
+        }
+        assert_eq!(tcp(&mut b, cb).recv_queue(), 1000);
+        let mut buf = [0u8; 4096];
+        let mut got = 0;
+        assert!(run(&mut a, &mut b, &mut now, 200_000, |_, b| {
+            while let Ok(n @ 1..) = tcp(b, cb).recv(&mut buf) {
+                got += n;
+            }
+            got == 3000
+        }));
+    }
+
+    #[test]
+    fn unanswered_zero_window_probes_time_out() {
+        let (mut a, mut b, ca, cb, mut now) = connected(1000, 8000);
+        tcp(&mut a, ca).send(&[1u8; 3000]).unwrap();
+        run(&mut a, &mut b, &mut now, 1000, |_, _| false);
+        assert_eq!(tcp(&mut b, cb).recv_queue(), 1000);
+        // B goes silent.
+        b.set_shaper(|_, _| Fate::Drop);
+        assert!(run(&mut a, &mut b, &mut now, 3_000_000, |a, _| tcp(a, ca).state() == State::Closed));
+        assert_eq!(tcp(&mut a, ca).error(), Some(Error::TimedOut));
     }
 
     #[test]

@@ -439,6 +439,16 @@ impl Interface {
         if !self.v6.enabled || IPV6_HEADER_LEN + p.payload.len() > self.v6.mtu(self.mtu) {
             return;
         }
+        // ::1 never goes on the link, as a destination or a source.
+        if dst.is_loopback() {
+            if src.is_loopback() {
+                self.queue_loopback6(src, dst, p.protocol, &p.payload);
+            }
+            return;
+        }
+        if src.is_loopback() {
+            return;
+        }
         if dst.is_multicast() {
             let frame = self.ip6_frame(multicast_mac(dst), src, dst, p.protocol, HOP_LIMIT, &p.payload);
             return self.queue_frame(frame);
@@ -489,10 +499,10 @@ impl Interface {
         // answering our duplicate address probe comes from the address.
         let own_source =
             self.v6.is_ours(ip.src) || (ip.next_header != PROTO_ICMPV6 && self.v6.is_tentative_or_ours(ip.src));
-        if ip.src.is_multicast() || ip.src.is_loopback() || own_source {
+        if ip.src.is_multicast() || (ip.src.is_loopback() && !self.looping) || own_source {
             return;
         }
-        let to_us = self.v6.is_ours(ip.dst);
+        let to_us = self.v6.is_ours(ip.dst) || (self.looping && ip.dst.is_loopback());
         let group = ip.dst == ALL_NODES || self.v6.all().any(|a| solicited_node(a.addr) == ip.dst);
         if !(to_us || group) {
             return;
@@ -703,7 +713,9 @@ impl Interface {
             let expires = now + Duration::from_secs(u64::from(ra.router_lifetime));
             self.v6.routers.push(Router { addr: ip.src, expires });
         }
-        if let Some(mtu) = ra.mtu.and_then(|m| usize::try_from(m).ok()).filter(|&m| m >= IPV6_MIN_MTU) {
+        // Only a router we accepted (lifetime above 0) may lower the MTU.
+        let accepted = self.v6.routers.iter().any(|r| r.addr == ip.src);
+        if let Some(mtu) = ra.mtu.and_then(|m| usize::try_from(m).ok()).filter(|&m| accepted && m >= IPV6_MIN_MTU) {
             self.v6.mtu = Some(mtu.min(self.mtu));
         }
         if !ra.dns.is_empty() {
