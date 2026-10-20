@@ -13,8 +13,12 @@
 //! | `SHUTDOWN` (triple fault) | [`VmExit::Shutdown`] |
 //! | Anything else | [`VmExit::Unhandled`] with the exit code |
 //!
-//! FS, GS, TR, LDTR and the syscall MSRs are not switched (no
-//! VMLOAD/VMSAVE), so guests must not depend on them yet.
+//! FS, GS, TR, LDTR, `KernelGsBase` and the syscall MSRs are switched with
+//! VMLOAD/VMSAVE around every run, keeping the host's in a page of its own.
+//! Guests start in 32-bit protected mode ([`SvmVcpu::new`]) or, after
+//! [`SvmVcpu::set_long_mode`], in 64-bit mode on their own page tables;
+//! MMIO instructions are fetched through those tables when the CPU has no
+//! decode assists.
 
 pub mod decode;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
@@ -176,6 +180,9 @@ pub struct SvmPages {
     pub iopm: (NonNull<u8>, u64),
     /// The MSR permission map (2 pages).
     pub msrpm: (NonNull<u8>, u64),
+    /// A page where VMSAVE keeps the host's FS, GS, TR, LDTR and syscall
+    /// state while the guest runs.
+    pub host: (NonNull<u8>, u64),
 }
 
 type Ack = Box<dyn Fn() -> Option<u8> + Send + Sync>;
@@ -188,6 +195,8 @@ const RFLAGS_IF: u64 = 1 << 9;
 pub struct SvmVcpu {
     vmcb: NonNull<u8>,
     vmcb_pa: u64,
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    host_pa: u64,
     /// General-purpose registers other than `rax`/`rsp`.
     pub regs: GuestRegs,
     pending_in: Option<u8>,
@@ -222,6 +231,7 @@ impl SvmVcpu {
         let mut v = Self {
             vmcb: pages.vmcb.0,
             vmcb_pa: pages.vmcb.1,
+            host_pa: pages.host.1,
             regs: GuestRegs::default(),
             pending_in: None,
             pending_mmio: None,
@@ -292,6 +302,44 @@ impl SvmVcpu {
             self.at(off + 4).cast::<u32>().write_volatile(limit);
             self.at(off + 8).cast::<u64>().write_volatile(base);
         }
+    }
+
+    /// Starts the guest in 64-bit mode instead, with paging on through the
+    /// 4-level tables at guest-physical `cr3` (and NX enabled).
+    pub fn set_long_mode(&mut self, cr3: u64) {
+        self.segment(vmcb::CS, (0x08, 0xa9b, u32::MAX, 0)); // L = 1
+        self.write64(vmcb::CR0, 0x8001_0011); // PG, WP, ET, PE
+        self.write64(vmcb::CR4, 1 << 5); // PAE
+        self.write64(vmcb::CR3, cr3);
+        self.write64(vmcb::EFER, EFER_SVME | 1 << 8 | 1 << 10 | 1 << 11); // LME, LMA, NXE
+    }
+
+    /// Translates a guest linear address through the guest's 4-level page
+    /// tables (long mode), or returns it unchanged with paging off.
+    pub fn translate(&self, linear: u64) -> Option<u64> {
+        if self.read64(vmcb::CR0) & (1 << 31) == 0 {
+            return Some(linear);
+        }
+        if self.read64(vmcb::EFER) & (1 << 10) == 0 {
+            return None; // 32-bit paging is not walked
+        }
+        let mem = self.mem.as_ref()?;
+        let mut table = self.read64(vmcb::CR3) & 0x000f_ffff_ffff_f000;
+        for level in (0..4).rev() {
+            let index = (linear >> (12 + 9 * level)) & 0x1ff;
+            let pte: u64 = mem.read_obj(GuestPhysAddr(table + index * 8)).ok()?;
+            if pte & 1 == 0 {
+                return None;
+            }
+            let addr = pte & 0x000f_ffff_ffff_f000;
+            // A large page at level 1 (2 MiB) or 2 (1 GiB).
+            if level == 0 || (level <= 2 && pte & (1 << 7) != 0) {
+                let mask = (1u64 << (12 + 9 * level)) - 1;
+                return Some((addr & !mask) | (linear & mask));
+            }
+            table = addr;
+        }
+        None
     }
 
     /// Lets the vCPU read instructions from guest memory to emulate MMIO
@@ -377,14 +425,19 @@ impl SvmVcpu {
             }
             return Some((buf, n.min(15)));
         }
-        if self.read64(vmcb::CR0) & (1 << 31) != 0 {
-            return None; // would need a guest page-table walk
-        }
         let mem = self.mem.as_ref()?;
         let linear = (self.read64(vmcb::CS + 8)).wrapping_add(self.rip());
-        // The instruction may end before the region does; read what exists.
-        let n = (1..=15).rev().find(|&n| mem.read(GuestPhysAddr(linear), &mut buf[..n]).is_ok())?;
-        Some((buf, n))
+        // Byte by byte through the guest's tables (the instruction may cross
+        // a page); stop at the first byte that cannot be read.
+        let mut n = 0;
+        while n < 15 {
+            let Some(gpa) = self.translate(linear + n as u64) else { break };
+            if mem.read(GuestPhysAddr(gpa), &mut buf[n..n + 1]).is_err() {
+                break;
+            }
+            n += 1;
+        }
+        (n > 0).then_some((buf, n))
     }
 
     /// Reads the value a byte/word/dword/qword register operand names.
@@ -610,7 +663,7 @@ mod tests {
             (NonNull::new(ptr).unwrap(), ptr as u64)
         };
         // SAFETY: leaked, exclusively owned test pages.
-        unsafe { SvmVcpu::new(SvmPages { vmcb: p(1), iopm: p(3), msrpm: p(2) }, 0x1000, 0x10_0000, 0x20_0000) }
+        unsafe { SvmVcpu::new(SvmPages { vmcb: p(1), iopm: p(3), msrpm: p(2), host: p(1) }, 0x1000, 0x10_0000, 0x20_0000) }
     }
 
     #[test]
@@ -682,6 +735,29 @@ mod tests {
 
         v.write64(vmcb::EXITCODE, exit::INVALID);
         assert_eq!(v.classify(), VmExit::Unhandled { reason: exit::INVALID });
+    }
+
+    #[test]
+    fn long_mode_page_walk() {
+        let mut ram = alloc::vec![0u8; 0x20_0000];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives the vCPU's use of `mem` in this test.
+        unsafe { mem.add_region(GuestPhysAddr(0), ram.as_mut_ptr(), 0x20_0000) };
+        // PML4 0x1000 -> PDPT 0x2000 -> PD 0x3000; PD[0] maps 2 MiB at 0, PD[1]
+        // points at a page table 0x4000 whose entry 5 maps 0x5000.
+        mem.write_obj(GuestPhysAddr(0x1000), 0x2003u64).unwrap();
+        mem.write_obj(GuestPhysAddr(0x2000), 0x3003u64).unwrap();
+        mem.write_obj(GuestPhysAddr(0x3000), 0x83u64).unwrap();
+        mem.write_obj(GuestPhysAddr(0x3008), 0x4003u64).unwrap();
+        mem.write_obj(GuestPhysAddr(0x4000 + 5 * 8), 0x5003u64).unwrap();
+        let mut v = vcpu().with_memory(Arc::new(mem));
+        v.set_long_mode(0x1000);
+        assert_eq!(v.code_bits(), 64);
+        assert_eq!(v.translate(0x12_3456), Some(0x12_3456), "2 MiB page");
+        assert_eq!(v.translate(0x20_5abc), Some(0x5abc), "4 KiB page");
+        assert_eq!(v.translate(0x20_6000), None, "not present");
+        drop(v);
+        drop(ram);
     }
 
     #[test]

@@ -138,7 +138,13 @@ pub(super) fn run(v: &mut SvmVcpu) {
         if if_on {
             asm!("sti", options(nomem, nostack));
         }
+        // The state VMRUN does not switch: FS, GS, TR, LDTR, KernelGsBase
+        // and the syscall MSRs.
+        asm!("vmsave rax", in("rax") v.host_pa, options(nostack));
+        asm!("vmload rax", in("rax") v.vmcb_pa, options(nostack));
         osmium_svm_run(&mut v.regs, v.vmcb_pa);
+        asm!("vmsave rax", in("rax") v.vmcb_pa, options(nostack));
+        asm!("vmload rax", in("rax") v.host_pa, options(nostack));
         asm!("cli", "stgi", options(nomem, nostack));
         if if_on {
             asm!("sti", options(nomem, nostack));
