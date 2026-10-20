@@ -374,7 +374,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     }
     fault_demo();
     overflow_demo();
-    osmium::proc::set_console(Arc::new(demos::user::LogConsole));
+    demos::user::boot_vfs();
     user_demo(ncpus);
 
     println!(

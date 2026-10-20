@@ -457,7 +457,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
     fault_demo();
     overflow_demo();
-    osmium::proc::set_console(Arc::new(demos::user::LogConsole));
+    demos::user::boot_vfs();
     user_demo();
     hyp::demo();
     hyp::demo_irq();

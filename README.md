@@ -35,6 +35,7 @@ colors and type.
 | `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension, AArch64 EL2 and AMD SVM vCPUs with a minimal SBI and PSCI, virtual PLIC, virtio-net | yes |
 | `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
 | `osmium-fs` | `File` trait and `Vfs` namespace (mounts, `..` across mounts, symlinks), Linux `Errno`, RAM file system, `/dev` nodes, cpio initramfs unpacking, ext2 (read and write) over any `BlockDevice` | yes |
+| `osmium-proc` | `Process` (address space, fd table, cwd, exit status, `wait`), `AddressSpace` with page-table-checked user copies, and one portable system-call dispatcher using each architecture's Linux numbers and structure layouts | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
 
 The library never defines an entry point, panic handler or global allocator;
@@ -107,8 +108,9 @@ features.
 - User mode works on all three architectures: the examples run the same
   user programs, each in its own address space (sharing the kernel's root
   page-table entries), with system calls, and all three load the same
-  Rust user program from an ELF file. `osmium-fs` provides the file
-  system, but there is no process API yet and the examples do not use it. Kernel stack overflows are caught on all three
+  Rust user program from an ELF file as an `osmium-proc` process, which
+  opens, writes and lists files in an `osmium-fs` RAM file system. There
+  is no `fork`, `execve` or `wait4` yet, and a process has one thread. Kernel stack overflows are caught on all three
   architectures when task stacks have guard pages.
 - SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
   physical hardware. The scheduler does no load balancing; tasks move only

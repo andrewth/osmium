@@ -15,6 +15,10 @@ mod sys {
     pub const BRK: u64 = 12;
     pub const GETPID: u64 = 39;
     pub const UNAME: u64 = 63;
+    pub const READ: u64 = 0;
+    pub const OPENAT: u64 = 257;
+    pub const CLOSE: u64 = 3;
+    pub const GETDENTS64: u64 = 217;
     pub const EXIT: u64 = 60;
 
     pub fn call3(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -47,6 +51,10 @@ mod sys {
     pub const BRK: u64 = 214;
     pub const GETPID: u64 = 172;
     pub const UNAME: u64 = 160;
+    pub const READ: u64 = 63;
+    pub const OPENAT: u64 = 56;
+    pub const CLOSE: u64 = 57;
+    pub const GETDENTS64: u64 = 61;
     pub const EXIT: u64 = 93;
 
     pub fn call3(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -75,6 +83,10 @@ mod sys {
     pub const BRK: u64 = 214;
     pub const GETPID: u64 = 172;
     pub const UNAME: u64 = 160;
+    pub const READ: u64 = 63;
+    pub const OPENAT: u64 = 56;
+    pub const CLOSE: u64 = 57;
+    pub const GETDENTS64: u64 = 61;
     pub const EXIT: u64 = 93;
 
     pub fn call3(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -131,6 +143,7 @@ pub extern "C" fn _start() -> ! {
     let _ = write!(buf, "hello from a Rust ELF: {primes} primes below 200, data segment says {}", unsafe { CALLS });
     write(&buf.bytes[..buf.len]);
     process_api();
+    files();
     exit(0)
 }
 
@@ -185,4 +198,53 @@ fn process_api() {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     exit(101)
+}
+
+const AT_FDCWD: u64 = -100i64 as u64;
+
+/// Opens a NUL-terminated `path` with Linux `flags` (`O_CREAT` and friends
+/// have the same values on every architecture used here).
+fn open(path: &[u8], flags: u64) -> i64 {
+    sys::call6(sys::OPENAT, [AT_FDCWD, path.as_ptr() as u64, flags, 0o644, 0, 0]) as i64
+}
+
+/// Reads files from the kernel's namespace, writes one, and lists `/`.
+fn files() {
+    let mut motd = [0u8; 64];
+    let fd = open(b"/etc/motd\0", 0);
+    let n = if fd >= 0 { sys::call3(sys::READ, fd as u64, motd.as_mut_ptr() as u64, 64) as usize } else { 0 };
+    sys::call3(sys::CLOSE, fd as u64, 0, 0);
+    let motd = core::str::from_utf8(&motd[..n.min(64)]).unwrap_or("?").trim_end();
+
+    // O_WRONLY | O_CREAT | O_TRUNC, then read it back.
+    let fd = open(b"/tmp/note\0", 0o1101);
+    let wrote = fd >= 0 && sys::call3(sys::WRITE, fd as u64, b"kept".as_ptr() as u64, 4) == 4;
+    sys::call3(sys::CLOSE, fd as u64, 0, 0);
+    let mut back = [0u8; 8];
+    let fd = open(b"/tmp/note\0", 0);
+    let round_trip = wrote && fd >= 0 && sys::call3(sys::READ, fd as u64, back.as_mut_ptr() as u64, 8) == 4
+        && &back[..4] == b"kept";
+    sys::call3(sys::CLOSE, fd as u64, 0, 0);
+
+    // Count the entries of "/", "." and ".." included.
+    let mut dents = [0u8; 512];
+    let fd = open(b"/\0", 0);
+    let mut entries = 0;
+    loop {
+        let n = sys::call3(sys::GETDENTS64, fd as u64, dents.as_mut_ptr() as u64, dents.len() as u64) as i64;
+        if n <= 0 {
+            break;
+        }
+        let mut off = 0;
+        while off < n as usize {
+            entries += 1;
+            off += u16::from_ne_bytes([dents[off + 16], dents[off + 17]]) as usize;
+        }
+    }
+    sys::call3(sys::CLOSE, fd as u64, 0, 0);
+
+    let mut buf = Buf { bytes: [0; 96], len: 0 };
+    let ok = if round_trip { "ok" } else { "FAILED" };
+    let _ = write!(buf, "/etc/motd: \"{motd}\"; /tmp/note {ok}; / has {entries} entries");
+    write(&buf.bytes[..buf.len]);
 }
