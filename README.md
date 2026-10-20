@@ -18,8 +18,9 @@ osmium takes its structure from [OSKit](https://www-old.cs.utah.edu/flux/oskit/)
 [OSTD](https://asterinas.github.io/api-docs/) (a small `unsafe` core under
 sound, safe APIs, with policy injected by the OS). See
 [docs/FEATURES.md](docs/FEATURES.md) for the survey of prior art, the design
-principles and the full feature list with status, and [DESIGN.md](DESIGN.md) for the logo,
-colors and type.
+principles and the full feature list with status, [DESIGN.md](DESIGN.md) for the logo,
+colors and type, and [docs/HYPERVISOR.md](docs/HYPERVISOR.md) for building a
+hypervisor with `osmium-virt`.
 
 ## Crates
 
