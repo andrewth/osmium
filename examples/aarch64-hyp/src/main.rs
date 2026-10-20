@@ -25,8 +25,8 @@ use osmium::arch::{cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
 use osmium::drivers::gicv2::GicV2;
 use osmium::drivers::pl011::Pl011;
-use osmium::hal::irq::InterruptController;
 use osmium::hal::console::{SerialConsole, set_console};
+use osmium::hal::irq::InterruptController;
 use osmium::hal::mmio::IoMem;
 use osmium::hal::{print, println};
 use osmium::mm::heap::LockedHeap;
@@ -35,8 +35,8 @@ use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryM
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
 use osmium::virt::aarch64::{self as vm, Aarch64Vcpu};
-use osmium::virt::smp::GuestCpus;
 use osmium::virt::devices::{GIC_WINDOW, Uart16550, VirtualGicV2};
+use osmium::virt::smp::GuestCpus;
 use osmium::virt::stage2::{Stage2Table, map_guest_memory, vttbr};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
@@ -165,13 +165,15 @@ gic_guest_end:
 
 // A two-vCPU guest. CPU 0 enables SGI 1 on its (banked) vGIC interface and
 // starts CPU 1 with PSCI CPU_ON; CPU 1 prints, sends CPU 0 SGI 1 through
-// GICD_SGIR and turns itself off; CPU 0 takes the SGI (IAR reports the
-// sender) and waits for AFFINITY_INFO to say CPU 1 is off. Both enter
+// GICD_SGIR and turns itself off. CPU 0 meanwhile spins in guest code with
+// IRQs unmasked, never exiting: the SGI reaches it only because the host
+// kicks its host CPU. Its IRQ vector takes the SGI (IAR reports the
+// sender); then it waits for AFFINITY_INFO to say CPU 1 is off. Both enter
 // here; x0 (the CPU_ON context, 0 for the boot CPU) tells them apart.
 core::arch::global_asm!(
     r#"
     .section .rodata.guest, "a"
-    .balign 4
+    .balign 0x800
     .globl smp_guest, smp_guest_end
 smp_guest:
     movz x9, #0x0800, lsl #16       // GICD
@@ -194,12 +196,13 @@ smp_guest:
     movz x3, #0x1234
     hvc #0
     mov x20, x0
-1:  wfi
-    ldr w3, [x10, #0xc]             // GICC_IAR
-    cmp w3, #1023
-    b.eq 1b
-    str w3, [x10, #0x10]            // GICC_EOIR
-    mov w21, w3
+    adr x1, 30f
+    msr vbar_el1, x1
+    isb
+    mov x23, #0
+    msr daifclr, #2                 // IRQs on
+1:  cbz x23, 1b                     // no exits: only a kick gets the SGI in
+    msr daifset, #2
 2:  movz x0, #0x0004
     movk x0, #0xc400, lsl #16       // PSCI AFFINITY_INFO(1) until OFF
     mov x1, #1
@@ -230,7 +233,14 @@ smp_guest:
 21: ret
 10: .asciz "[smp-guest] cpu 0: starting cpu 1 with PSCI CPU_ON\n"
 11: .asciz "[smp-guest] cpu 1: up, sending cpu 0 SGI 1, turning off\n"
-12: .asciz "[smp-guest] cpu 0: got the SGI; cpu 1 is off\n"
+12: .asciz "[smp-guest] cpu 0: got the SGI in guest code; cpu 1 is off\n"
+    .balign 0x800
+30: .space 0x280                    // VBAR_EL1: IRQ from EL1h at 0x280
+    ldr w3, [x10, #0xc]             // GICC_IAR
+    str w3, [x10, #0x10]            // GICC_EOIR
+    mov w21, w3
+    mov x23, #1
+    eret
     .balign 4
 smp_guest_end:
 "#
@@ -319,6 +329,10 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     // SAFETY: we are on the stack the boot CPU allocated for us.
     unsafe { trap::install() };
     enable_mmu(PhysAddr::new(TTBR0.load(Ordering::Acquire)));
+    // This CPU's GIC interface, for kicks from the other CPU.
+    let gic = PHYS_GIC.get().unwrap();
+    gic.init_cpu();
+    gic.enable(KICK_SGI);
     ONLINE.fetch_add(1, Ordering::Release);
     // Wait for a guest, then run its vCPU with our index while it lives.
     loop {
@@ -329,6 +343,9 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     }
 }
 static PHYS_GIC: Once<GicV2> = Once::new();
+/// The physical SGI one host CPU sends another to kick its vCPU out of
+/// guest code.
+const KICK_SGI: u32 = 0;
 
 fn shutdown() -> ! {
     psci::system_off(*PSCI.get().unwrap_or(&psci::Conduit::Smc))
@@ -383,7 +400,9 @@ extern "C" fn kmain(x0: usize) -> ! {
     // --- EL2 stage-1 MMU -----------------------------------------------------
     let mut pt: PageTable<Aarch64El2, &'static Frames> = PageTable::new(&FRAMES).unwrap();
     let rw = MapFlags::RW | MapFlags::GLOBAL;
-    let id = |pt: &mut PageTable<Aarch64El2, _>, a: u64, b: u64, f| pt.map_range(VirtAddr::new(a), PhysAddr::new(a), b - a, f).unwrap();
+    let id = |pt: &mut PageTable<Aarch64El2, _>, a: u64, b: u64, f| {
+        pt.map_range(VirtAddr::new(a), PhysAddr::new(a), b - a, f).unwrap()
+    };
     id(&mut pt, ram_start, kstart, rw);
     id(&mut pt, kstart, etext, MapFlags::RX | MapFlags::GLOBAL);
     id(&mut pt, etext, erodata, MapFlags::READ | MapFlags::GLOBAL);
@@ -410,6 +429,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     gic.init_distributor();
     gic.init_cpu();
     gic.enable(VTIMER_INTID);
+    gic.enable(KICK_SGI);
     println!("[gic]   physical GICv2 at {gicd:#x}/{gicc:#x}; INTID {VTIMER_INTID} forces exits");
 
     vm::init_cpu();
@@ -457,7 +477,7 @@ fn enable_mmu(root: PhysAddr) {
         | 1 << 10                // ORGN0: write-back, write-allocate
         | 3 << 12                // SH0: inner shareable
         | parange.min(5) << 16   // PS: what the CPU supports
-        | 1 << 23 | 1 << 31;     // RES1
+        | 1 << 23 | 1 << 31; // RES1
     // SAFETY: the table identity-maps the running code, its stack, the heap
     // and the UART; the barriers order the table writes.
     unsafe {
@@ -699,6 +719,8 @@ struct SmpVm {
     done: AtomicBool,
     /// CPU_ON's result and the IAR value (vCPU 0), the context (vCPU 1).
     results: [AtomicU64; 3],
+    /// Physical kick SGIs taken on exits from vCPU 0.
+    kicks: AtomicU64,
 }
 
 /// Runs vCPU `me` of `vm` whenever it is started, until the guest is done.
@@ -731,7 +753,18 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
                 }
                 ControlFlow::Continue(())
             }
-            VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+            VmExit::ExternalInterrupt => {
+                // A kick (or another physical interrupt): acknowledge it; the
+                // next entry delivers whatever the vGIC now has pending.
+                let gic = PHYS_GIC.get().unwrap();
+                if let Some(irq) = gic.claim() {
+                    if irq == KICK_SGI && me == 0 {
+                        vm.kicks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    gic.complete(irq);
+                }
+                ControlFlow::Continue(())
+            }
             other => ControlFlow::Break(other),
         });
         if me == 0 {
@@ -767,9 +800,18 @@ fn smp_guest_demo() {
     let vttbr = vttbr(s2.root(), 3);
     core::mem::forget(s2); // in use by both CPUs until power-off
 
+    // A vCPU's interrupt arriving while it runs guest code on another host
+    // CPU kicks that CPU with a physical SGI, so the guest exits and the
+    // next entry delivers it.
+    let cpus = GuestCpus::with_kick(2, |host| PHYS_GIC.get().unwrap().send_sgi(1 << host, KICK_SGI));
     let lines: Vec<Arc<AtomicBool>> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
-    let l = lines.clone();
-    let gic = Arc::new(VirtualGicV2::with_cpus(2, 64, move |cpu, level| l[cpu].store(level, Ordering::Release)));
+    let (l, c) = (lines.clone(), cpus.clone());
+    let gic = Arc::new(VirtualGicV2::with_cpus(2, 64, move |cpu, level| {
+        l[cpu].store(level, Ordering::Release);
+        if level {
+            c.kick(cpu);
+        }
+    }));
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let uart: Arc<Uart16550> = Arc::new(Uart16550::new(move |b| {
         let mut l = line.lock();
@@ -788,7 +830,6 @@ fn smp_guest_demo() {
             bus
         })
         .collect();
-    let cpus = GuestCpus::new(2);
     cpus.request_start(0, GUEST_RAM.0, 0).unwrap();
     let vm = SMP_VM.call_once(|| SmpVm {
         cpus,
@@ -798,6 +839,7 @@ fn smp_guest_demo() {
         lines,
         done: AtomicBool::new(false),
         results: [AtomicU64::new(u64::MAX), AtomicU64::new(0), AtomicU64::new(0)],
+        kicks: AtomicU64::new(0),
     });
     vcpu_loop(vm, 0);
     let r = |i: usize| vm.results[i].load(Ordering::Acquire);
@@ -807,6 +849,7 @@ fn smp_guest_demo() {
         r(2),
         r(1)
     );
+    println!("[hyp]   vCPU 0 kicked out of guest code by a host SGI {} time(s)", vm.kicks.load(Ordering::Relaxed));
     let _ = &vm.mem;
 }
 

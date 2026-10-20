@@ -84,8 +84,12 @@ CPU loop), take start requests with `take_start`, and connect the vCPU
 - AArch64: `aarch64::psci::handle_smp` implements `CPU_ON`, `CPU_OFF` and
   `AFFINITY_INFO`; build the GIC with `VirtualGicV2::with_cpus` and give
   each vCPU's bus its own `distributor_for`/`cpu_interface_for` views. SGIs
-  between vCPUs go through the emulated `GICD_SGIR`. A vCPU halted in `wfi`
-  notices at once; one running guest code notices at its next exit.
+  between vCPUs go through the emulated `GICD_SGIR`. To deliver an
+  interrupt to a vCPU running guest code on another host CPU at once,
+  create the `GuestCpus` with `with_kick` (send that CPU a physical SGI;
+  `HCR_EL2.IMO` makes it exit the guest), call `kick` from the GIC's output
+  callback when a CPU's line rises, and acknowledge the SGI on the
+  `ExternalInterrupt` exit.
 
 ## Describing the machine
 
