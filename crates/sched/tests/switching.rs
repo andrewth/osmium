@@ -378,3 +378,32 @@ fn woken_task_is_placed_on_an_idle_cpu() {
     GATE.wake_all();
     thief.join().unwrap();
 }
+
+#[test]
+fn pin_while_queued_survives_scheduling() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    become_cpu();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let other = std::thread::spawn(move || {
+        become_cpu();
+        tx.send(osmium_arch::cpu::current_id()).unwrap();
+        while !DONE.load(Ordering::Acquire) {
+            osmium_sched::yield_now();
+            std::thread::yield_now();
+        }
+    });
+    let away = rx.recv().unwrap();
+
+    let ran_on = Arc::new(AtomicUsize::new(usize::MAX));
+    let r = ran_on.clone();
+    // Queued on this CPU, then re-pinned to the other one while still Ready.
+    let t = builder("repinned").spawn(move || r.store(osmium_arch::cpu::current_id(), Ordering::Relaxed));
+    t.pin(away);
+    // Our own pick finds the task in our queue; it must be sent on, not run here.
+    osmium_sched::yield_now();
+    t.join();
+    DONE.store(true, Ordering::Release);
+    other.join().unwrap();
+    assert_eq!(ran_on.load(Ordering::Relaxed), away);
+    assert_eq!(t.affinity(), 1 << away, "scheduling does not rewrite the affinity");
+}

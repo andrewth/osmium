@@ -252,6 +252,12 @@ fn schedule(requeue: Option<EnqueueReason>) {
             irq::restore(irq_state);
             return;
         }
+        // A task re-pinned or re-targeted while queued here may no longer be
+        // allowed on this CPU; its `cpu()` was updated, so requeue it there.
+        if !next.is_idle && !next.can_run_on(cpu) {
+            enqueue(next, EnqueueReason::Yielded);
+            continue;
+        }
         // The task may still be saving its registers on the CPU that last
         // ran it. Wait briefly; if that CPU is itself waiting for one of our
         // tasks, give the task back and run something else meanwhile.
@@ -266,7 +272,8 @@ fn schedule(requeue: Option<EnqueueReason>) {
         retries += 1;
         let idle = next.is_idle;
         if !idle {
-            sched.enqueue(next, EnqueueReason::Woken);
+            // Not `Woken`: this is not a new release, so deadlines and periods must not restart.
+            sched.enqueue(next, EnqueueReason::Yielded);
         }
         if retries >= 3 || idle {
             // SAFETY: as above.
@@ -279,7 +286,8 @@ fn schedule(requeue: Option<EnqueueReason>) {
         IDLE_CPUS.fetch_and(!(1 << cpu), Ordering::Relaxed);
     }
     next.on_cpu.store(true, Ordering::Relaxed);
-    next.set_cpu(cpu);
+    // Record the CPU without touching affinity: pin()/set_affinity() may have changed it while queued.
+    next.set_cpu_unpinned(cpu);
     next.state.store(TaskState::Running as u8, Ordering::Release);
     NEED_RESCHED.for_cpu(cpu).store(false, Ordering::Relaxed);
     // The kernel never uses FP, so the registers still hold `cur`'s user
