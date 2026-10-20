@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use osmium::arch::aarch64::{self, psci};
 use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
-use osmium::arch::{cpu, irq, mmu};
+use osmium::arch::{MAX_CPUS, cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
 use osmium::drivers::gicv2::GicV2;
 use osmium::drivers::pl011::Pl011;
@@ -222,6 +222,18 @@ struct SecondaryBoot {
     cpu: usize,
 }
 
+/// Waits up to a second for `n` CPUs to be online.
+fn wait_online(n: usize) -> bool {
+    let deadline = now_ns() + 1_000_000_000;
+    while ONLINE.load(Ordering::Acquire) < n {
+        if now_ns() > deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
 fn now_ns() -> u64 {
     RATE.get().unwrap().ticks_to_ns(cpu::ticks())
 }
@@ -305,7 +317,9 @@ extern "C" fn kmain(x0: usize) -> ! {
     println!("[heap]  {s} (sum of squares {})", squares.iter().sum::<u64>());
 
     // --- Paging (stage 1, 4 KiB granule, W^X) ------------------------------
-    let ram = fdt.memory().next().expect("no memory node");
+    // The kernel's own memory node is mapped piecewise below (W^X); any
+    // other node, all of which the frame allocator was given, as RW.
+    let ram = fdt.memory().find(|&(base, len)| (base..base + len).contains(&kstart)).expect("no memory node holds the kernel");
     let ram_end = ram.0 + ram.1;
     let mut pt: PageTable<Aarch64, &'static Frames> = PageTable::new(&FRAMES).unwrap();
     let k = |f| f | MapFlags::GLOBAL;
@@ -315,6 +329,12 @@ extern "C" fn kmain(x0: usize) -> ! {
     pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).unwrap();
     pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).unwrap();
     pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).unwrap();
+    for (base, len) in fdt.memory().filter(|&m| m != ram) {
+        let (start, end) = (base.next_multiple_of(PAGE_SIZE as u64), (base + len) & !(PAGE_SIZE as u64 - 1));
+        if start < end {
+            pt.map_range(va(start), pa(start), end - start, k(MapFlags::RW)).unwrap();
+        }
+    }
     for (base, len) in [(EARLY_UART as u64, PAGE_SIZE as u64), (gicd, gicd_len), (gicc, gicc_len)] {
         pt.map_range(va(base), pa(base), len.next_multiple_of(PAGE_SIZE as u64), k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
     }
@@ -355,7 +375,7 @@ extern "C" fn kmain(x0: usize) -> ! {
         .filter(|c| c.property("device_type").and_then(|p| p.as_str()) == Some("cpu"))
         .filter_map(|c| c.reg().next().map(|(m, _)| m));
     let mut ncpus = 1;
-    for mpidr in mpidrs.filter(|&m| m != boot_mpidr) {
+    for mpidr in mpidrs.filter(|&m| m != boot_mpidr).take(MAX_CPUS - 1) {
         let stack = alloc::vec![0u8; 64 * 1024].leak();
         let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
             stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
@@ -363,11 +383,17 @@ extern "C" fn kmain(x0: usize) -> ! {
         }));
         // SAFETY: `secondary_start` sets up its stack from `boot`.
         let rc = unsafe { psci::cpu_on(conduit, mpidr, secondary_start as *const () as u64, boot as *const _ as u64) };
-        assert_eq!(rc, 0, "PSCI CPU_ON {mpidr:#x} failed");
+        // One CPU at a time: one that fails to start or never checks in
+        // ends the bring-up, so CPU indices stay dense.
+        if rc != 0 {
+            println!("[smp]   PSCI CPU_ON {mpidr:#x} failed ({rc}); continuing with {ncpus} CPUs");
+            break;
+        }
+        if !wait_online(ncpus + 1) {
+            println!("[smp]   CPU {mpidr:#x} did not check in within 1 s; continuing with {ncpus} CPUs");
+            break;
+        }
         ncpus += 1;
-    }
-    while ONLINE.load(Ordering::Acquire) < ncpus {
-        core::hint::spin_loop();
     }
     println!("[smp]   {ncpus} CPUs online");
 
@@ -704,7 +730,13 @@ fn on_trap(frame: &mut TrapFrame) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
     irq::disable();
-    println!("\n[panic] {info}");
+    // Straight to the PL011, not through the console: the panic may have
+    // come from inside println, with the console's locks held.
+    // SAFETY: the UART is already set up and mapped at this address.
+    if let Ok(mut uart) = Pl011::new(unsafe { IoMem::new(EARLY_UART as *mut u8, 0x1000) }) {
+        let _ = writeln!(osmium::hal::serial::SerialWriter(&mut uart), "\n[panic] {info}");
+    }
     shutdown()
 }

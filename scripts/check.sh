@@ -36,10 +36,17 @@ boot() {
     local log
     log=$(mktemp)
     (cd "examples/$name" && cargo build -q --release)
+    local status=0
     timeout 60 "$qemu" "$@" -nographic -m 128M \
         -kernel "examples/$name/target/$target/release/$name" \
-        -serial "file:$log" -monitor none </dev/null >/dev/null
+        -serial "file:$log" -monitor none </dev/null >/dev/null || status=$?
+    # Show what the kernel printed before judging QEMU's exit status, so a
+    # hang or crash leaves its log behind.
     sed -n '/^osmium/,$p' "$log"
+    if [ "$status" -ne 0 ]; then
+        [ "$status" -eq 124 ] && echo "$name: QEMU timed out after 60 s" || echo "$name: QEMU exited with status $status"
+        exit 1
+    fi
     for line in '\[mutex\] .* = 4000' '\[preempt\]' '\[timer\]' '4 CPUs online' \
         'mask 0b1111), mutex total 2000' 'visited CPUs \[0, 1, 2, 3, 0\]' 'PageFault' '\[done\]'; do
         grep -q "$line" "$log" || { echo "$name: missing '$line'"; exit 1; }

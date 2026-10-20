@@ -380,6 +380,18 @@ fn virtio_slots<'a>(fdt: &Fdt<'a>) -> impl Iterator<Item = (u64, u64)> + 'a {
         .filter_map(|n| n.reg().next().map(|(a, s)| (a, s.unwrap_or(0x200))))
 }
 
+/// Waits up to a second for `n` CPUs to be online.
+fn wait_online(n: usize) -> bool {
+    let deadline = now_ns() + 1_000_000_000;
+    while ONLINE.load(Ordering::Acquire) < n {
+        if now_ns() > deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
 fn now_ns() -> u64 {
     RATE.get().unwrap().ticks_to_ns(cpu::ticks())
 }
@@ -455,7 +467,9 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!("[heap]  {}(sum of squares {}), {:?}", s, squares.iter().sum::<u64>(), HEAP.stats());
 
     // --- Paging (Sv39, W^X) ------------------------------------------------
-    let ram = fdt.memory().next().expect("no memory node");
+    // The kernel's own memory node is mapped piecewise below (W^X); any
+    // other node, all of which the frame allocator was given, as RW.
+    let ram = fdt.memory().find(|&(base, len)| (base..base + len).contains(&kstart)).expect("no memory node holds the kernel");
     let ram_end = ram.0 + ram.1;
     let mut pt: PageTable<Sv39, &'static Frames> = PageTable::new(&FRAMES).unwrap();
     let k = |f| f | MapFlags::GLOBAL;
@@ -467,21 +481,43 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).unwrap();
     pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).unwrap();
     pt.map_range(va(erodata), pa(erodata), ram_end - erodata, k(MapFlags::RW)).unwrap();
-    let uart_page = uart_base & !(PAGE_SIZE as u64 - 1);
-    pt.map_range(va(uart_page), pa(uart_page), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
-    for (base, _) in virtio_slots(&fdt) {
-        let page = base & !(PAGE_SIZE as u64 - 1);
-        pt.map_range(va(page), pa(page), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
+    for (base, len) in fdt.memory().filter(|&m| m != ram) {
+        let (start, end) = (base.next_multiple_of(PAGE_SIZE as u64), (base + len) & !(PAGE_SIZE as u64 - 1));
+        if start < end {
+            pt.map_range(va(start), pa(start), end - start, k(MapFlags::RW)).unwrap();
+        }
+    }
+    // Device windows from the device tree: rounded out to whole pages, and
+    // tolerant of windows that share a page (virtio-mmio slots do) or that
+    // were mapped already.
+    let mut map_device = |base: u64, len: u64| {
+        let page = PAGE_SIZE as u64;
+        let (start, end) = (base & !(page - 1), (base + len).next_multiple_of(page));
+        let flags = k(MapFlags::RW | MapFlags::DEVICE);
+        if pt.translate(va(start)).is_none() && pt.translate(va(end - page)).is_none() {
+            if pt.map_range(va(start), pa(start), end - start, flags).is_ok() {
+                return;
+            }
+        }
+        for p in (start..end).step_by(PAGE_SIZE) {
+            if pt.translate(va(p)).is_none() {
+                pt.map(va(p), pa(p), PageSize::Size4K, flags).expect("mapping a device page").ignore();
+            }
+        }
+    };
+    map_device(uart_base, PAGE_SIZE as u64);
+    for (base, len) in virtio_slots(&fdt) {
+        map_device(base, len);
     }
     let plic_reg = fdt.find_compatible(&["riscv,plic0", "sifive,plic-1.0.0"]).and_then(|n| n.reg().next());
     if let Some((base, Some(len))) = plic_reg {
-        pt.map_range(va(base), pa(base), len, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
+        map_device(base, len);
     }
     let pcie = pcie_host(&fdt);
     let mut bars = pcie.as_ref().map(|h| pci::BarAllocator::new(h.mem.0, h.mem.1));
     if let Some(h) = &pcie {
         for (base, len) in [h.ecam, h.mem] {
-            pt.map_range(va(base), pa(base), len, k(MapFlags::RW | MapFlags::DEVICE)).unwrap();
+            map_device(base, len);
         }
     }
     // SAFETY: the table identity-maps the running code, its stack, the heap and the UART.
@@ -517,7 +553,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         .filter(|c| c.property("status").and_then(|p| p.as_str()).is_none_or(|s| s == "okay"))
         .filter_map(|c| c.reg().next().map(|(h, _)| h as usize));
     let mut ncpus = 1;
-    for h in harts.filter(|&h| h != hartid) {
+    for h in harts.filter(|&h| h != hartid).take(MAX_CPUS - 1) {
         let stack = alloc::vec![0u8; 64 * 1024].leak();
         let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
             stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
@@ -525,12 +561,18 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         }));
         HARTS[ncpus].store(h, Ordering::Relaxed);
         // SAFETY: `secondary_start` sets up gp and the stack from `boot`.
-        unsafe { sbi::hart_start(h, secondary_start as *const () as usize, boot as *const _ as usize) }
-            .expect("hart_start failed");
+        let started = unsafe { sbi::hart_start(h, secondary_start as *const () as usize, boot as *const _ as usize) };
+        // One hart at a time: a hart that fails to start or never checks in
+        // ends the bring-up, so CPU indices stay dense.
+        if let Err(e) = started {
+            println!("[smp]   hart {h} did not start ({e:?}); continuing with {ncpus} CPUs");
+            break;
+        }
+        if !wait_online(ncpus + 1) {
+            println!("[smp]   hart {h} did not check in within 1 s; continuing with {ncpus} CPUs");
+            break;
+        }
         ncpus += 1;
-    }
-    while ONLINE.load(Ordering::Acquire) < ncpus {
-        core::hint::spin_loop();
     }
     println!("[smp]   {ncpus} CPUs online");
 
@@ -967,9 +1009,17 @@ fn on_timer() {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
     irq::disable();
-    // Fall back to the firmware console in case the UART lock is held.
-    set_console(&SbiConsole);
-    println!("\n[panic] {info}");
+    // Through the firmware console, bypassing the console registry and the
+    // UART's lock: the panic may have come from inside println.
+    struct Sbi;
+    impl core::fmt::Write for Sbi {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            SbiConsole.write_str(s);
+            Ok(())
+        }
+    }
+    let _ = writeln!(Sbi, "\n[panic] {info}");
     sbi::shutdown()
 }

@@ -122,6 +122,8 @@ const DOUBLE_FAULT_IST: u8 = 1;
 const ANY_STACK_VECTORS: [u8; 3] = [1, 2, 18];
 const TIMER_VECTOR: u8 = 32;
 const SPURIOUS_VECTOR: u8 = 0xff;
+/// Where the (masked) legacy PICs deliver, so a spurious IRQ is harmless.
+const PIC_VECTORS: core::ops::Range<u8> = 0xe0..0xf0;
 /// Timer interrupt period.
 const TICK_NS: u64 = 10_000_000;
 
@@ -392,9 +394,20 @@ extern "C" fn kmain(start_info: usize) -> ! {
     let pit = Pit::new(unsafe { pit::Pio::new() });
     let tsc_hz = pit.calibrate(10_000_000, cpu::ticks);
     TSC_RATE.call_once(|| TickRate::new(tsc_hz));
-    // Mask the legacy 8259 PICs; the local APIC delivers everything.
-    // SAFETY: the PIC data ports.
+    // Move the legacy 8259 PICs off the exception vectors (their power-on
+    // bases alias IRQ 0-7 onto vectors 8-15, IRQ 0 onto #DF), then mask
+    // them; the local APIC delivers everything. Only spurious IRQ 7 or 15
+    // can still arrive, as PIC_VECTORS.start + 7 or + 15.
+    // SAFETY: the PIC command and data ports.
     unsafe {
+        x86::outb(0x20, 0x11); // ICW1: edge, cascade, ICW4 follows
+        x86::outb(0xa0, 0x11);
+        x86::outb(0x21, PIC_VECTORS.start); // ICW2: vector base
+        x86::outb(0xa1, PIC_VECTORS.start + 8);
+        x86::outb(0x21, 0x04); // ICW3: slave on IRQ 2
+        x86::outb(0xa1, 0x02);
+        x86::outb(0x21, 0x01); // ICW4: 8086 mode
+        x86::outb(0xa1, 0x01);
         x86::outb(0x21, 0xff);
         x86::outb(0xa1, 0xff);
     }
@@ -443,9 +456,17 @@ extern "C" fn kmain(start_info: usize) -> ! {
         // SAFETY: the trampoline is installed and the previous AP has
         // checked in (below); the boot tables identity-map it and the kernel.
         unsafe { apic.start_ap(apic_id.load(Ordering::Relaxed) as u8, &boot, |ns| pit.wait_ns(ns)) };
-        // One AP at a time: they share the trampoline's slots.
-        while ONLINE.load(Ordering::Acquire) <= cpu {
+        // One AP at a time: they share the trampoline's slots. One that
+        // never checks in ends the bring-up (it may still be in the
+        // trampoline), so CPU indices stay dense.
+        let deadline = now_ns() + 1_000_000_000;
+        while ONLINE.load(Ordering::Acquire) <= cpu && now_ns() < deadline {
             core::hint::spin_loop();
+        }
+        if ONLINE.load(Ordering::Acquire) <= cpu {
+            println!("[smp]   APIC id {} did not check in within 1 s; continuing with {cpu} CPUs", apic_id.load(Ordering::Relaxed));
+            ncpus = cpu;
+            break;
         }
     }
     println!("[smp]   {ncpus} CPUs online");
@@ -845,6 +866,8 @@ fn on_trap(frame: &mut TrapFrame) {
             osmium::sched::preempt_if_needed();
         }
         (SPURIOUS_VECTOR, _) => {}
+        // A spurious IRQ from a masked PIC: no EOI (none was latched).
+        (v, _) if PIC_VECTORS.contains(&v) => {}
         (_, cause @ (Trap::Breakpoint | Trap::PageFault { .. })) if RECOVER.load(Ordering::SeqCst) => {
             *RECOVERED.lock() = Some(cause);
             // `int3` is 1 byte; the faulting `mov rax, [0x1000]` is 8.
@@ -857,7 +880,13 @@ fn on_trap(frame: &mut TrapFrame) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::fmt::Write;
     irq::disable();
-    println!("\n[panic] {info}");
+    // Straight to COM1, not through the console: the panic may have come
+    // from inside println, with the console's locks held.
+    // SAFETY: the port is already set up; writes may interleave with
+    // another CPU's output, which is fine for a dying kernel.
+    let mut com1 = Uart16550::new(unsafe { Pio::new(COM1) });
+    let _ = writeln!(osmium::hal::serial::SerialWriter(&mut com1), "\n[panic] {info}");
     shutdown()
 }
