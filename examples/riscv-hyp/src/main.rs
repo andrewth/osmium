@@ -168,7 +168,13 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: linker-provided symbols.
     let (kstart, kend) = unsafe { (sym(&_kernel_start), sym(&_kernel_end)) };
     map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
-    map.reserve(PhysAddr::new(IMAGE_BASE), PhysAddr::new(IMAGE_BASE + IMAGE_WINDOW), RegionKind::Reserved).unwrap();
+    // With enough RAM, keep the window for the guest kernel image (where
+    // QEMU's loader puts it) out of the allocator.
+    let top = map.regions().iter().map(|r| r.end.0).max().unwrap_or(0);
+    let image_window = top >= IMAGE_BASE + IMAGE_WINDOW;
+    if image_window {
+        map.reserve(PhysAddr::new(IMAGE_BASE), PhysAddr::new(IMAGE_BASE + IMAGE_WINDOW), RegionKind::Reserved).unwrap();
+    }
     map.page_align_usable();
     {
         let mut buddy = FRAMES.lock();
@@ -225,6 +231,10 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
     println!("[smp]   {ncpus} host harts online, one per guest vCPU");
 
+    if !image_window {
+        println!("[hyp]   RAM ends below {:#x}: run QEMU with -m 512M and a guest kernel", IMAGE_BASE + IMAGE_WINDOW);
+        host_sbi::shutdown()
+    }
     // SAFETY: the window is reserved RAM that QEMU's loader filled (or left zero).
     let window = unsafe { core::slice::from_raw_parts(IMAGE_BASE as *const u8, IMAGE_WINDOW as usize) };
     match Elf::new(window) {
@@ -411,16 +421,20 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     // SAFETY: a fresh block owned by the guest for the rest of the run.
     unsafe { mem.add_region(GuestPhysAddr(GUEST_RAM), ram.0 as *mut u8, len) };
     // The image is linked where it runs: physical = virtual.
-    let mut loaded = 0;
-    for s in elf.segments() {
-        mem.write(GuestPhysAddr(s.vaddr), s.data).expect("guest segment outside its RAM");
-        let zeros = alloc::vec![0u8; (s.mem_size - s.data.len() as u64) as usize];
-        mem.write(GuestPhysAddr(s.vaddr + s.data.len() as u64), &zeros).expect("guest segment outside its RAM");
-        loaded += s.mem_size;
-    }
-    println!("[hyp]   guest kernel: {} KiB loaded, entry {:#x}, {harts} vCPUs", loaded >> 10, elf.entry());
-
+    let image = match mem.load_elf(elf) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[hyp]   the guest kernel does not fit its RAM ({e:?})");
+            return;
+        }
+    };
     let dtb_at = GUEST_RAM + len - GUEST_DTB_SIZE;
+    if image.end > dtb_at {
+        println!("[hyp]   the guest kernel overlaps its device tree at {dtb_at:#x}");
+        return;
+    }
+    let kib = (image.end - image.start) >> 10;
+    println!("[hyp]   guest kernel: {kib} KiB loaded, entry {:#x}, {harts} vCPUs", elf.entry());
     let dtb = GuestMachine {
         harts: harts as u32,
         isa: "rv64imac",

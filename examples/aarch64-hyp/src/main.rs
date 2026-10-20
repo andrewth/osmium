@@ -790,6 +790,9 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
                     }
                     gic.complete(irq);
                 }
+                if vm.done.load(Ordering::Acquire) {
+                    return ControlFlow::Break(VmExit::Halt);
+                }
                 ControlFlow::Continue(())
             }
             other => ControlFlow::Break(other),
@@ -805,6 +808,8 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
                 println!("[hyp]   SMP vCPU {me} stopped unexpectedly: {exit:?}");
             }
             vm.done.store(true, Ordering::Release);
+            // Get the other vCPUs out of guest code so they see it.
+            (0..vm.lines.len()).for_each(|i| vm.cpus.kick(i));
         }
     }
 }

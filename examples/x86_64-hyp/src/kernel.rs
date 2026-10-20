@@ -75,11 +75,15 @@ pub fn image() -> Option<(Elf<'static>, u32)> {
 /// 0xf4): any write ends the guest.
 struct PowerOff(Arc<AtomicBool>);
 
+/// Set when the guest powered itself off (as opposed to a vCPU failing).
+static POWERED_OFF: AtomicBool = AtomicBool::new(false);
+
 impl BusDevice for PowerOff {
     fn read(&self, _offset: u64, data: &mut [u8]) {
         data.fill(0);
     }
     fn write(&self, _offset: u64, _data: &[u8]) {
+        POWERED_OFF.store(true, Ordering::Release);
         self.0.store(true, Ordering::Release);
     }
 }
@@ -228,15 +232,16 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     let mut mem = GuestMemory::new();
     // SAFETY: a fresh block owned by the guest for the rest of the run.
     unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
-    let mut loaded = 0;
-    for s in elf.segments() {
-        // The image is linked where it runs: physical = virtual.
-        mem.write(GuestPhysAddr(s.vaddr), s.data).expect("guest segment outside its RAM");
-        let zeros = alloc::vec![0u8; (s.mem_size - s.data.len() as u64) as usize];
-        mem.write(GuestPhysAddr(s.vaddr + s.data.len() as u64), &zeros).expect("guest segment outside its RAM");
-        loaded += s.mem_size;
-    }
-    println!("[hyp]   guest kernel: {} KiB loaded, PVH entry {entry:#x}, {ncpus} vCPUs", loaded >> 10);
+    // The image is linked where it runs: physical = virtual.
+    let image = match mem.load_elf(elf) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[hyp]   the guest kernel does not fit its RAM ({e:?})");
+            return;
+        }
+    };
+    let kib = (image.end - image.start) >> 10;
+    println!("[hyp]   guest kernel: {kib} KiB loaded, PVH entry {entry:#x}, {ncpus} vCPUs");
     let blob = PcBoot {
         cpus: ncpus as u32,
         memory: &[(0, 0xa_0000), (0x10_0000, len - 0x10_0000)],
@@ -244,6 +249,10 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
         cmdline: "",
     }
     .build(BOOT_INFO);
+    if image.start < BOOT_INFO + blob.bytes.len() as u64 && BOOT_INFO < image.end {
+        println!("[hyp]   the guest kernel overlaps its boot information at {BOOT_INFO:#x}");
+        return;
+    }
     mem.write(GuestPhysAddr(BOOT_INFO), &blob.bytes).unwrap();
     let mem = Arc::new(mem);
 
@@ -318,8 +327,8 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     }
     KERNEL_VM.store(core::ptr::null_mut(), Ordering::Release);
     match exit {
+        _ if POWERED_OFF.load(Ordering::Acquire) => println!("[hyp]   guest powered off"),
         Some(e) => println!("[hyp]   guest exit {e:?} from vCPU 0"),
-        // Nobody recorded an exit: the guest wrote QEMU's power-off ports.
-        None => println!("[hyp]   guest powered off"),
+        None => println!("[hyp]   guest stopped by vCPU 1 (see above)"),
     }
 }

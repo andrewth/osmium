@@ -162,14 +162,15 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
     // SAFETY: a fresh block owned by the guest for the rest of the run.
     unsafe { mem.add_region(GuestPhysAddr(GUEST_RAM), ram.0 as *mut u8, len) };
     // The image is linked where it runs: physical = virtual.
-    let mut loaded = 0;
-    for s in elf.segments() {
-        mem.write(GuestPhysAddr(s.vaddr), s.data).expect("guest segment outside its RAM");
-        let zeros = alloc::vec![0u8; (s.mem_size - s.data.len() as u64) as usize];
-        mem.write(GuestPhysAddr(s.vaddr + s.data.len() as u64), &zeros).expect("guest segment outside its RAM");
-        loaded += s.mem_size;
-    }
-    println!("[hyp]   guest kernel: {} KiB loaded, entry {:#x}, {ncpus} vCPUs", loaded >> 10, elf.entry());
+    let image = match mem.load_elf(elf) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[hyp]   the guest kernel does not fit its RAM ({e:?})");
+            return;
+        }
+    };
+    let kib = (image.end - image.start) >> 10;
+    println!("[hyp]   guest kernel: {kib} KiB loaded, entry {:#x}, {ncpus} vCPUs", elf.entry());
     // The device tree at the base of RAM, where QEMU puts it for ELF kernels.
     let dtb = ArmMachine {
         cpus: ncpus as u32,
@@ -180,6 +181,10 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
         bootargs: "",
     }
     .to_dtb();
+    if image.start < GUEST_RAM + dtb.len() as u64 {
+        println!("[hyp]   the guest kernel overlaps its device tree at {GUEST_RAM:#x}");
+        return;
+    }
     mem.write(GuestPhysAddr(GUEST_RAM), &dtb).unwrap();
 
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");

@@ -678,6 +678,7 @@ pub fn demo_smp(ncpus: usize) {
                             }
                             ControlFlow::Continue(())
                         }
+                        VmExit::ExternalInterrupt if done.load(Ordering::Acquire) => ControlFlow::Break(VmExit::Halt),
                         VmExit::ExternalInterrupt => ControlFlow::Continue(()),
                         other => ControlFlow::Break(other),
                     });
@@ -688,6 +689,8 @@ pub fn demo_smp(ncpus: usize) {
                             println!("[hyp]   SMP guest hart {h} stopped unexpectedly: {exit:?}");
                         }
                         done.store(true, Ordering::Release);
+                        // Get the other vCPUs out of guest code so they see it.
+                        (0..2).for_each(|i| harts.kick(i));
                     }
                 }
             })

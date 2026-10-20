@@ -537,7 +537,10 @@ extern "C" fn kmain(start_info: usize) -> ! {
         let (base, end) = (kernel::IMAGE_BASE, kernel::IMAGE_BASE + kernel::IMAGE_WINDOW);
         map.reserve(PhysAddr::new(base), PhysAddr::new(end), RegionKind::Reserved).unwrap();
     }
-    let my_apic = x86::cpuid(1, 0).ebx >> 24;
+    // The boot CPU's APIC ID from its local APIC (CPUID's may be virtualized),
+    // read through the boot tables' identity map of the default address.
+    // SAFETY: the local APIC ID register, read-only.
+    let my_apic = unsafe { ((lapic::DEFAULT_BASE + 0x20) as *const u32).read_volatile() } >> 24;
     HOST_APIC_IDS[0].store(my_apic as u8, Ordering::Relaxed);
     let mut ncpus = 1;
     if let Some(rsdp) = info.rsdp() {
@@ -555,9 +558,12 @@ extern "C" fn kmain(start_info: usize) -> ! {
     map.page_align_usable();
     {
         let mut buddy = FRAMES.lock();
-        for r in map.usable() {
+        // Only what PVH's boot tables identity-map (the first 4 GiB): this
+        // kernel never builds tables of its own.
+        const BOOT_MAPPED: u64 = 1 << 32;
+        for r in map.usable().filter(|r| r.start.0 < BOOT_MAPPED) {
             // SAFETY: the memory map says the range is free RAM, identity-mapped.
-            unsafe { buddy.add_region(r.start, r.end) };
+            unsafe { buddy.add_region(r.start, PhysAddr::new(r.end.0.min(BOOT_MAPPED))) };
         }
         println!("[frame] {} free frames ({} MiB)", buddy.free_frames(), (buddy.free_frames() * PAGE_SIZE) >> 20);
     }
@@ -1043,6 +1049,9 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
                 core::hint::spin_loop();
             },
             // A kick: the next entry delivers what the APIC now has.
+            // A kick: the next entry delivers what the APIC now has, unless
+            // the guest is over.
+            VmExit::ExternalInterrupt if vm.done.load(Ordering::Acquire) => ControlFlow::Break(VmExit::Halt),
             VmExit::ExternalInterrupt => ControlFlow::Continue(()),
             other => ControlFlow::Break(other),
         });
@@ -1062,6 +1071,10 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
                 println!("[hyp]   SMP vCPU {me} stopped unexpectedly: {other:?}");
                 vm.done.store(true, Ordering::Release);
             }
+        }
+        if vm.done.load(Ordering::Acquire) {
+            // Get the other vCPUs out of guest code so they see it.
+            (0..vm.lines.len()).for_each(|i| vm.cpus.kick(i));
         }
     }
 }
