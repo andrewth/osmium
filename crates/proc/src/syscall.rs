@@ -11,6 +11,7 @@ use osmium_mm::paging::MapFlags;
 
 use crate::fd::{Access, OpenFile};
 use crate::process::{ExitStatus, Pid, Process};
+use crate::thread::Thread;
 
 /// The calls this layer implements, independent of their numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +64,18 @@ pub enum Sys {
     Getpeername,
     Setsockopt,
     Getsockopt,
+    RtSigaction,
+    RtSigprocmask,
+    RtSigreturn,
+    RtSigpending,
+    Kill,
+    Tkill,
+    Tgkill,
+    Futex,
+    SetTidAddress,
+    /// x86_64 only: sets the thread pointer (`FS.base`).
+    #[cfg(target_arch = "x86_64")]
+    ArchPrctl,
 }
 
 /// Linux system-call numbers for x86_64.
@@ -115,6 +128,16 @@ const NUMBERS: &[(u64, Sys)] = &[
     (54, Sys::Setsockopt),
     (55, Sys::Getsockopt),
     (288, Sys::Accept4),
+    (13, Sys::RtSigaction),
+    (14, Sys::RtSigprocmask),
+    (15, Sys::RtSigreturn),
+    (127, Sys::RtSigpending),
+    (62, Sys::Kill),
+    (200, Sys::Tkill),
+    (234, Sys::Tgkill),
+    (202, Sys::Futex),
+    (218, Sys::SetTidAddress),
+    (158, Sys::ArchPrctl),
 ];
 
 /// Linux system-call numbers for RISC-V and AArch64 (asm-generic).
@@ -164,6 +187,15 @@ const NUMBERS: &[(u64, Sys)] = &[
     (209, Sys::Getsockopt),
     (210, Sys::Shutdown),
     (242, Sys::Accept4),
+    (134, Sys::RtSigaction),
+    (135, Sys::RtSigprocmask),
+    (139, Sys::RtSigreturn),
+    (136, Sys::RtSigpending),
+    (129, Sys::Kill),
+    (130, Sys::Tkill),
+    (131, Sys::Tgkill),
+    (98, Sys::Futex),
+    (96, Sys::SetTidAddress),
 ];
 
 impl Sys {
@@ -229,17 +261,38 @@ pub enum Outcome {
         /// Its initial stack pointer.
         sp: u64,
     },
+    /// The process cloned a thread (see [`crate::thread`]). Return `tid` to
+    /// the caller, and start a task that resumes from a copy of its
+    /// registers with a return value of 0, stack pointer `stack` and, if
+    /// `tls` is not 0, that thread pointer.
+    Thread {
+        /// The new thread's id.
+        tid: u32,
+        /// Its stack pointer.
+        stack: u64,
+        /// Its thread pointer, or 0.
+        tls: u64,
+    },
 }
 
 type SysResult = Result<u64, Errno>;
 
 /// Handles system call `nr` with arguments `a` on behalf of `p`, the
-/// calling process. Calls may block.
+/// calling process, as its first thread. Calls may block.
 pub fn dispatch(p: &Process, nr: u64, a: [u64; 6]) -> Outcome {
+    dispatch_as(p, &p.leader(), nr, a)
+}
+
+/// [`dispatch`] on behalf of thread `th` of `p`.
+pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
     let Some(sys) = Sys::from_number(nr) else { return Outcome::Return(-(Errno::ENOSYS.0 as i64)) };
     let fd = a[0] as i32;
     let r = match sys {
-        Sys::Exit | Sys::ExitGroup => return Outcome::Exit(ExitStatus::Code(a[0] as i32)),
+        Sys::Exit => return Outcome::Exit(ExitStatus::Code(a[0] as i32)),
+        Sys::ExitGroup => {
+            crate::thread::exit_group(p, ExitStatus::Code(a[0] as i32));
+            return Outcome::Exit(ExitStatus::Code(a[0] as i32));
+        }
         Sys::Read => read(p, fd, a[1], a[2]),
         Sys::Write => write(p, fd, a[1], a[2]),
         Sys::Readv => readv(p, fd, a[1], a[2]),
@@ -259,7 +312,8 @@ pub fn dispatch(p: &Process, nr: u64, a: [u64; 6]) -> Outcome {
             path_at(p, fd, a[1]).and_then(|path| vfs()?.mkdir(&path, a[2] as u32 & 0o7777 & !p.umask())).map(|()| 0)
         }
         Sys::Unlinkat => unlinkat(p, fd, a[1], a[2]),
-        Sys::Getpid | Sys::Gettid => Ok(p.pid().0 as u64),
+        Sys::Getpid => Ok(p.pid().0 as u64),
+        Sys::Gettid => Ok(th.tid() as u64),
         Sys::Getppid => Ok(p.parent().map_or(0, |pid| pid.0 as u64)),
         Sys::Brk => Ok(p.brk(a[0])),
         Sys::Mmap => mmap(p, a[1], a[2], a[3], a[4] as i32),
@@ -269,13 +323,13 @@ pub fn dispatch(p: &Process, nr: u64, a: [u64; 6]) -> Outcome {
             Ok(0)
         }
         Sys::Uname => uname(p, a[0]),
-        Sys::Fork | Sys::Vfork => return outcome(fork(p, SIGCHLD, [0; 4])),
+        Sys::Fork | Sys::Vfork => return crate::thread::forked(p, th, outcome(fork(p, SIGCHLD, [0; 4]))),
         // asm-generic: (flags, stack, parent_tid, tls, child_tid);
         // x86_64: (flags, stack, parent_tid, child_tid, tls).
         #[cfg(target_arch = "x86_64")]
-        Sys::Clone => return outcome(fork(p, a[0], [a[1], a[2], a[3], a[4]])),
+        Sys::Clone => return crate::thread::clone(p, th, a[0], [a[1], a[2], a[3], a[4]]),
         #[cfg(not(target_arch = "x86_64"))]
-        Sys::Clone => return outcome(fork(p, a[0], [a[1], a[2], a[4], a[3]])),
+        Sys::Clone => return crate::thread::clone(p, th, a[0], [a[1], a[2], a[4], a[3]]),
         Sys::Execve => return outcome(execve(p, a[0], a[1], a[2])),
         Sys::Wait4 => wait4(p, a[0] as i32, a[1], a[2], a[3]),
         Sys::Dup => dup(p, fd),
@@ -295,6 +349,21 @@ pub fn dispatch(p: &Process, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Getpeername => crate::socket::getpeername(p, fd, a[1], a[2]),
         Sys::Setsockopt => crate::socket::setsockopt(p, fd, a[1], a[2], a[3], a[4]),
         Sys::Getsockopt => crate::socket::getsockopt(p, fd, a[1], a[2], a[3], a[4]),
+        Sys::RtSigaction => crate::signal::sigaction(p, a[0], a[1], a[2], a[3]),
+        Sys::RtSigprocmask => crate::signal::sigprocmask(p, th, a[0], a[1], a[2], a[3]),
+        Sys::RtSigpending => crate::signal::sigpending(p, th, a[0], a[1]),
+        // `handle` restores the registers; there is nothing to return to here.
+        Sys::RtSigreturn => Err(Errno::EINVAL),
+        Sys::Kill => crate::signal::kill(p, fd, a[1]),
+        Sys::Tkill => crate::signal::tkill(p, fd, a[1]),
+        Sys::Tgkill => crate::signal::tgkill(p, fd, a[1] as i32, a[2]),
+        Sys::Futex => crate::futex::futex(p, th, a[0], a[1], a[2], a[3]),
+        Sys::SetTidAddress => {
+            th.set_clear_tid(a[0]);
+            Ok(th.tid() as u64)
+        }
+        #[cfg(target_arch = "x86_64")]
+        Sys::ArchPrctl => crate::thread::arch_prctl(p, th, a[0], a[1]),
     };
     Outcome::Return(match r {
         Ok(v) => v as i64,
@@ -637,7 +706,7 @@ fn munmap(p: &Process, addr: u64, len: u64) -> SysResult {
     Ok(0)
 }
 
-fn outcome(r: Result<Outcome, Errno>) -> Outcome {
+pub(crate) fn outcome(r: Result<Outcome, Errno>) -> Outcome {
     r.unwrap_or_else(|e| Outcome::Return(-(e.0 as i64)))
 }
 
@@ -659,7 +728,7 @@ mod clone_flag {
 /// that the parent does not wait. `CLONE_CHILD_CLEARTID` is accepted and
 /// ignored: it matters only to other threads, and there are none.
 /// `tids` is (stack, parent_tid, child_tid, tls).
-fn fork(p: &Process, flags: u64, [stack, ptid, ctid, _tls]: [u64; 4]) -> Result<Outcome, Errno> {
+pub(crate) fn fork(p: &Process, flags: u64, [stack, ptid, ctid, _tls]: [u64; 4]) -> Result<Outcome, Errno> {
     use clone_flag::*;
     crate::exec::platform()?;
     let flags = flags & !EXIT_SIGNAL;
@@ -718,7 +787,11 @@ fn execve(p: &Process, path: u64, argv: u64, envp: u64) -> Result<Outcome, Errno
     let envp = get_strings(p, envp, &mut total)?;
     let argv: alloc::vec::Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let envp: alloc::vec::Vec<&[u8]> = envp.iter().map(|e| e.as_slice()).collect();
+    if p.group.live() > 1 {
+        return Err(Errno::EBUSY);
+    }
     let entry = p.exec(&path, &argv, &envp)?;
+    crate::signal::on_exec(p);
     Ok(Outcome::Exec { pc: entry.pc, sp: entry.sp })
 }
 
@@ -825,7 +898,12 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
         frame.set_return(-(Errno::ENOSYS.0 as i64) as u64);
         return None;
     };
-    match dispatch(&p, nr, args) {
+    let th = crate::thread::current_thread(&p);
+    if Sys::from_number(nr) == Some(Sys::RtSigreturn) {
+        // The saved registers include the interrupted call's result.
+        return crate::signal::sigreturn(&p, &th, frame).or_else(|| crate::signal::deliver_to(&p, &th, frame));
+    }
+    match dispatch_as(&p, &th, nr, args) {
         Outcome::Return(v) => frame.set_return(v as u64),
         Outcome::Exit(status) => return Some(status),
         Outcome::Fork { child, stack } => {
@@ -850,8 +928,9 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
             frame.set_return(child.pid().0 as u64);
         }
         Outcome::Exec { pc, sp } => start(frame, pc, sp),
+        Outcome::Thread { tid, stack, tls } => crate::thread::start(&p, tid, frame, stack, tls),
     }
-    None
+    crate::signal::deliver_to(&p, &th, frame)
 }
 
 /// Points `frame` at a new program's entry and stack, other registers clear.

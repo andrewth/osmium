@@ -50,11 +50,13 @@
 //!   (`resume_user` in `osmium_arch::riscv64` / `aarch64`), and where a new
 //!   program's stack and `mmap` area go.
 //!
-//! Each process runs a single task: `clone` makes processes (`fork`,
-//! `vfork`), not threads. Forked memory is shared copy-on-write: a trap
-//! handler passes user write faults to [`handle_page_fault`] before killing
-//! the process, and copies to user memory break the sharing themselves.
-//! `execve` loads static, non-PIE ELF executables only.
+//! A process is a group of [`Thread`]s, each with its own task: `clone` makes
+//! processes (`fork`, `vfork`) or, with `CLONE_THREAD`, threads (see
+//! [`thread`]), and [`signal`] delivers signals to user handlers. Forked
+//! memory is shared copy-on-write: a trap handler passes user write faults to
+//! [`handle_page_fault`] before raising a signal, and copies to user memory
+//! break the sharing themselves. `execve` loads static, non-PIE ELF
+//! executables only.
 #![no_std]
 
 extern crate alloc;
@@ -63,17 +65,22 @@ extern crate std;
 
 mod exec;
 pub mod fd;
+mod futex;
 mod memory;
 mod process;
+pub mod signal;
 pub mod syscall;
 pub mod net;
 pub mod socket;
+pub mod thread;
+mod uregs;
 
 pub use exec::{ARG_MAX, Platform, UserEntry, set_platform};
 pub use fd::{FdTable, OpenFile, set_console};
 pub use memory::{AddressSpace, UserMemory};
 pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for};
-pub use syscall::{Outcome, Sys, dispatch};
+pub use syscall::{Outcome, Sys, dispatch, dispatch_as};
+pub use thread::Thread;
 
 use osmium_fs::Vfs;
 use osmium_sync::Once;

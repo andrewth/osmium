@@ -55,6 +55,11 @@ pub trait UserMemory: Send + Sync {
     /// other space still shares it) and returns true, so the faulting
     /// instruction can be retried. Returns false for any other fault.
     fn cow_fault(&self, va: u64) -> bool;
+    /// Maps fresh read-only, executable pages at `va` (page-aligned) holding
+    /// `code`; the kernel's own stubs, such as the signal return trampoline.
+    fn map_code(&self, _va: u64, _code: &[u8]) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
 }
 
 /// Reference counts of the frames that forked spaces share. A frame that is
@@ -386,6 +391,15 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     fn cow_fault(&self, va: u64) -> bool {
         let mut inner = self.inner.lock();
         self.break_cow(&mut inner, va & !(PAGE - 1))
+    fn map_code(&self, va: u64, code: &[u8]) -> Result<(), Errno> {
+        if !va.is_multiple_of(PAGE) || code.len() > PAGE_SIZE || !self.is_user_range(va, va + PAGE) {
+            return Err(Errno::EINVAL);
+        }
+        self.load_flat(va, code, MapFlags::RX).map_err(|_| Errno::ENOMEM)?;
+        let inner = self.inner.lock();
+        let t = inner.pt.translate(VirtAddr::new(va)).ok_or(Errno::EFAULT)?;
+        sync_icache(inner.pt.allocator().phys_to_virt(t.pa));
+        Ok(())
     }
 }
 

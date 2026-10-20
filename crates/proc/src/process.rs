@@ -80,7 +80,9 @@ pub struct Process {
     /// Forked children not yet reaped.
     children: IrqSpinLock<Vec<Arc<Process>>>,
     /// Woken whenever one of `children` exits.
-    child_exited: WaitQueue,
+    pub(crate) child_exited: WaitQueue,
+    pub(crate) group: crate::thread::ThreadGroup,
+    pub(crate) signals: crate::signal::Signals,
 }
 
 impl core::fmt::Debug for Process {
@@ -90,6 +92,11 @@ impl core::fmt::Debug for Process {
 }
 
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
+
+/// A fresh process or thread id; both come from one sequence.
+pub(crate) fn alloc_id() -> u32 {
+    NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
 static TABLE: IrqSpinLock<BTreeMap<Pid, Weak<Process>>> = IrqSpinLock::new(BTreeMap::new());
 
 /// Default cap on the program break, above its start.
@@ -121,8 +128,9 @@ impl Process {
         files: FdTable,
         cwd: String,
     ) -> Self {
+        let pid = Pid(alloc_id());
         Self {
-            pid: Pid(NEXT_PID.fetch_add(1, Ordering::Relaxed)),
+            pid,
             parent,
             name: IrqSpinLock::new(name),
             memory: IrqSpinLock::new(memory),
@@ -135,6 +143,8 @@ impl Process {
             exited: WaitQueue::new(),
             children: IrqSpinLock::new(Vec::new()),
             child_exited: WaitQueue::new(),
+            group: crate::thread::ThreadGroup::new(pid),
+            signals: crate::signal::Signals::new(),
         }
     }
 
@@ -306,12 +316,14 @@ impl Process {
     }
 
     /// Records the exit status (the first one wins) and wakes waiters,
-    /// including a parent in `wait4`. Does not stop the task; see [`exit`].
+    /// including a parent in `wait4`, which also gets `SIGCHLD`. Does not
+    /// stop the task; see [`exit`].
     pub fn set_exited(&self, status: ExitStatus) {
         let _ = self.status.set(status);
         self.exited.wake_all();
         if let Some(parent) = self.parent.and_then(Process::find) {
             parent.child_exited.wake_all();
+            crate::signal::child_exited(&parent, self.pid);
         }
     }
 
@@ -396,11 +408,13 @@ pub fn root_for(next: &Task) -> Option<PhysAddr> {
     next.data::<Arc<Process>>().map(|p| p.root())
 }
 
-/// Ends the calling process with `status`, wakes anyone waiting for it, and
-/// ends its task. Kernel tasks just exit.
+/// Ends the calling thread with `status`, and its process with it unless
+/// other threads remain (a `Signal` status, or an earlier `exit_group`, ends
+/// them all), wakes anyone waiting, and ends its task. Kernel tasks just
+/// exit.
 pub fn exit(status: ExitStatus) -> ! {
     if let Some(p) = current() {
-        p.set_exited(status);
+        crate::thread::exiting(&p, status);
     }
     osmium_sched::exit()
 }

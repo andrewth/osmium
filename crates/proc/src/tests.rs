@@ -654,3 +654,4 @@ fn unmapping_and_remapping_forgets_copy_on_write() {
     drop((p, c));
     assert_eq!(frames.live(), 1);
 }
+mod sigthread;
