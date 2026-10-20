@@ -19,6 +19,7 @@ osmium-sched = { path = "crates/sched", version = "0.1.0" }
 osmium-boot = { path = "crates/boot", version = "0.1.0" }
 osmium-virt = { path = "crates/virt", version = "0.1.0" }
 osmium-exec = { path = "crates/exec", version = "0.1.0" }
+osmium-fs = { path = "crates/fs", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

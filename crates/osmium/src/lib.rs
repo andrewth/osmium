@@ -27,6 +27,8 @@ pub use osmium_boot as boot;
 pub use osmium_drivers as drivers;
 #[cfg(feature = "exec")]
 pub use osmium_exec as exec;
+#[cfg(feature = "fs")]
+pub use osmium_fs as fs;
 #[cfg(feature = "hal")]
 pub use osmium_hal as hal;
 #[cfg(feature = "mm")]

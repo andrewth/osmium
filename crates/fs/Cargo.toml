@@ -1,0 +1,13 @@
+[package]
+name = "osmium-fs"
+description = "Osmium: a virtual file system with mounts, a RAM file system and initramfs loading"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-sync.workspace = true
