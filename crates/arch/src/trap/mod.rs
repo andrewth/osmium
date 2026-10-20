@@ -102,6 +102,21 @@ extern "C" fn osmium_trap_dispatch(frame: &mut TrapFrame) {
 extern "C" fn osmium_trap_dispatch(frame: &mut TrapFrame) {
     frame.on_entry();
     dispatch(frame);
+    fault_bad_user_return(frame);
+}
+
+/// Before returning to ring 3, makes sure `iretq` will not fault in the
+/// kernel: a user `syscall` in the last bytes below the canonical hole saves
+/// a non-canonical return address, and `iretq` to it is a #GP at CPL 0. Such
+/// a frame is handed to the handler again as a general-protection fault
+/// from user mode, which kernels treat like any other user fault.
+#[cfg(all(bare, target_arch = "x86_64"))]
+pub(crate) fn fault_bad_user_return(frame: &mut TrapFrame) {
+    if frame.from_user() && !x86_64::is_canonical(frame.rip) {
+        (frame.vector, frame.error_code) = (13, 0);
+        dispatch(frame);
+        assert!(x86_64::is_canonical(frame.rip), "trap handler returned to non-canonical user rip {:#x}", frame.rip);
+    }
 }
 
 /// A minimal once-flag usable from `osmium-arch`, which sits below

@@ -139,6 +139,18 @@ pub unsafe fn write_cr3(v: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) v, options(nostack, preserves_flags)) }
 }
 
+/// Makes x87, MMX and SSE instructions fault on this CPU (CR0.EM and
+/// CR0.TS: `#UD` or `#NM`), for kernels that do not save FP state per task:
+/// otherwise one process's registers would be visible to the next.
+///
+/// # Safety
+/// Nothing in the kernel may use those instructions afterwards (the
+/// `x86_64-unknown-none` target does not).
+pub unsafe fn trap_fp() {
+    // SAFETY: the caller upholds the contract; EM and TS only add faults.
+    unsafe { asm!("mov {t}, cr0", "or {t}, 0xc", "mov cr0, {t}", t = out(reg) _, options(nomem, nostack, preserves_flags)) }
+}
+
 /// Reads CR2, the faulting address of the last page fault.
 #[inline]
 pub fn read_cr2() -> u64 {
@@ -319,8 +331,10 @@ impl CpuTables {
             // code/data); syscall loads CS = STAR[47:32], SS = + 8.
             wrmsr(msr::IA32_STAR, (selectors::KERNEL_DATA as u64) << 48 | (selectors::KERNEL_CODE as u64) << 32);
             wrmsr(msr::IA32_LSTAR, osmium_syscall_entry as *const () as u64);
-            // Clear IF, TF, DF and AC on entry.
-            wrmsr(msr::IA32_FMASK, 0x4_0700);
+            // Clear TF, IF, DF, NT and AC on entry, as interrupt gates do.
+            // NT matters: a user can set it with popfq, and an iretq with
+            // NT set in the kernel's RFLAGS is a #GP at CPL 0.
+            wrmsr(msr::IA32_FMASK, 0x4_4700);
             wrmsr(msr::IA32_KERNEL_GS_BASE, self as *const Self as u64);
         }
     }
@@ -406,7 +420,13 @@ pub unsafe fn enter_user(entry: u64, stack_top: u64) -> ! {
 /// addresses in the active address space.
 #[cfg(bare)]
 pub unsafe fn resume_user(frame: &crate::trap::TrapFrame) -> ! {
-    debug_assert!(frame.cs & 3 == 3 && frame.ss & 3 == 3, "resume_user needs a ring-3 frame");
+    // Returning anything but ring 3 here would hand the user kernel mode.
+    assert!(frame.cs & 3 == 3 && frame.ss & 3 == 3, "resume_user needs a ring-3 frame");
+    let mut frame = frame.clone();
+    // As on every return to ring 3: a non-canonical rip becomes a #GP for
+    // the handler rather than a fault in the kernel's iretq.
+    crate::trap::fault_bad_user_return(&mut frame);
+    let frame = &frame;
     // SAFETY: the caller upholds the contract. With interrupts disabled, the
     // return path pops the frame and iretq leaves on the user stack, so the
     // frame may sit on this stack, which nothing uses again: the next trap
@@ -493,8 +513,9 @@ osmium_tramp_start:
     rdmsr
     or $((1 << 8) | (1 << 11)), %eax
     wrmsr
-    mov %cr0, %eax
-    or $((1 << 31) | (1 << 16)), %eax
+    // Set CR0 outright rather than OR into what the AP came up with: PG,
+    // WP, NE, ET and PE, with caching on (CD and NW clear).
+    mov $((1 << 31) | (1 << 16) | (1 << 5) | (1 << 4) | 1), %eax
     mov %eax, %cr0
     ljmp $0x08, $({base} + 2f - osmium_tramp_start)
 
@@ -552,7 +573,10 @@ osmium_tramp_end:
     pub unsafe fn prepare(boot: &ApBoot) {
         let start = &raw const osmium_tramp_start as u64;
         let slot = |s: *const u8| (TRAMPOLINE + (s as u64 - start)) as *mut u64;
-        debug_assert!(boot.cr3 < 1 << 32 && boot.stack_top.is_multiple_of(16));
+        // The trampoline loads cr3 in 32-bit mode; a higher root would be
+        // silently truncated.
+        assert!(boot.cr3 < 1 << 32, "AP page table root {:#x} is above 4 GiB", boot.cr3);
+        debug_assert!(boot.stack_top.is_multiple_of(16));
         // SAFETY: slots inside the installed copy; the AP reads them only
         // after the STARTUP IPI that follows these writes.
         unsafe {

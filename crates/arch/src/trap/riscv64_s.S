@@ -86,6 +86,11 @@ osmium_trap_entry:
     sd t0, 256(sp)
     csrr t0, sstatus
     sd t0, 264(sp)
+    // Handlers run with SUM clear: a task preempted inside with_user_access
+    // keeps SUM in its frame for when it resumes, and the task switched to
+    // here must not inherit it.
+    li t0, 0x40000
+    csrc sstatus, t0
     csrr t0, scause
     sd t0, 272(sp)
     csrr t0, stval
@@ -103,9 +108,11 @@ osmium_trap_entry:
     mv a0, sp
     call osmium_trap_dispatch
     // The return path, also entered by `riscv64::resume_user` with sp at a
-    // frame and interrupts masked.
+    // frame. Interrupts stay masked from here to sret, whoever the caller:
+    // a trap taken after sepc/sstatus are loaded would overwrite them.
 .globl osmium_trap_return
 osmium_trap_return:
+    csrci sstatus, 0x2
     ld t0, 256(sp)
     csrw sepc, t0
     ld t0, 264(sp)

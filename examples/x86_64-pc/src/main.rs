@@ -116,6 +116,10 @@ const COM1_IRQ: u8 = 4;
 const DOUBLE_FAULT: u8 = 8;
 /// IST slot for the double-fault handler's stack.
 const DOUBLE_FAULT_IST: u8 = 1;
+/// Vectors that can arrive while rsp is not a kernel stack, such as in the
+/// syscall entry before it switches stacks (rsp is still the user's): debug,
+/// NMI and machine check, each with an IST stack of its own (slots 2-4).
+const ANY_STACK_VECTORS: [u8; 3] = [1, 2, 18];
 const TIMER_VECTOR: u8 = 32;
 const SPURIOUS_VECTOR: u8 = 0xff;
 /// Timer interrupt period.
@@ -132,13 +136,19 @@ static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 /// The kernel page table, shared by all CPUs.
 static PT: IrqSpinLock<Option<PageTable<X86_64, &'static Frames>>> = IrqSpinLock::new(None);
 
-/// Gives this CPU its own GDT and TSS, with a fresh stack for double faults.
+/// Gives this CPU its own GDT and TSS, with fresh stacks for double faults
+/// and for `ANY_STACK_VECTORS`.
 fn load_cpu_tables() {
     let tables = alloc::boxed::Box::leak(alloc::boxed::Box::new(x86::CpuTables::new()));
-    let stack = alloc::vec![0u8; 16 * 1024].leak();
-    tables.tss.ist[DOUBLE_FAULT_IST as usize - 1] = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
+    for slot in 0..=ANY_STACK_VECTORS.len() {
+        let stack = alloc::vec![0u8; 16 * 1024].leak();
+        tables.tss.ist[slot] = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
+    }
     let ptr = &raw mut *tables;
     CPU_TABLES[cpu::current_id()].store(ptr, Ordering::Relaxed);
+    // SAFETY: the kernel is soft-float. FP state isn't switched per task, so
+    // user FP must fault rather than leak between processes.
+    unsafe { x86::trap_fp() };
     // SAFETY: called once per CPU, with interrupts disabled.
     irq::without(|| unsafe { tables.load() });
     // SAFETY: the tables are loaded on this CPU and live forever; traps are
@@ -364,6 +374,10 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: this CPU's TSS now has a double-fault stack; APs load theirs
     // before enabling interrupts.
     unsafe { trap::set_ist(DOUBLE_FAULT, DOUBLE_FAULT_IST) };
+    for (i, &vector) in ANY_STACK_VECTORS.iter().enumerate() {
+        // SAFETY: as above; load_cpu_tables fills these IST slots too.
+        unsafe { trap::set_ist(vector, DOUBLE_FAULT_IST + 1 + i as u8) };
+    }
     osmium::sched::set_stack_allocator(&GuardedStacks);
     osmium::sched::set_switch_hook(on_switch);
     // SAFETY: the syscall handler treats every argument as untrusted.

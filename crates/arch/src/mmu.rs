@@ -27,18 +27,22 @@ mod imp {
 mod imp {
     use core::arch::asm;
 
+    /// The `tlbi` operand's VA field, bits 43:0 (VA[55:12]); the bits above
+    /// are the ASID or TTL, which a sign-extended kernel VA must not set.
+    const VA_FIELD: usize = (1 << 44) - 1;
+
     /// Invalidates the TLB entries for the page containing `va`, all ASIDs, inner shareable.
     #[inline]
     pub fn flush_page(va: usize) {
         // SAFETY: TLB maintenance only drops cached translations.
         #[cfg(not(feature = "aarch64-el2"))]
         unsafe {
-            asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) va >> 12, options(nostack, preserves_flags))
+            asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) (va >> 12) & VA_FIELD, options(nostack, preserves_flags))
         };
         // SAFETY: as above, for the EL2 regime.
         #[cfg(feature = "aarch64-el2")]
         unsafe {
-            asm!("dsb ishst", "tlbi vae2is, {}", "dsb ish", "isb", in(reg) va >> 12, options(nostack, preserves_flags))
+            asm!("dsb ishst", "tlbi vae2is, {}", "dsb ish", "isb", in(reg) (va >> 12) & VA_FIELD, options(nostack, preserves_flags))
         };
     }
 

@@ -39,6 +39,12 @@ sysreg!(read_tcr_el1, write_tcr_el1, "tcr_el1");
 sysreg!(read_mair_el1, write_mair_el1, "mair_el1");
 sysreg!(read_sctlr_el1, write_sctlr_el1, "sctlr_el1");
 sysreg!(read_vbar_el1, write_vbar_el1, "vbar_el1");
+sysreg!(
+    /// `FPEN` (bits 21:20) controls FP/SIMD traps at EL0 and EL1.
+    read_cpacr_el1,
+    write_cpacr_el1,
+    "cpacr_el1"
+);
 sysreg!(read_vttbr_el2, write_vttbr_el2, "vttbr_el2");
 sysreg!(read_vtcr_el2, write_vtcr_el2, "vtcr_el2");
 sysreg!(read_hcr_el2, write_hcr_el2, "hcr_el2");
@@ -53,6 +59,18 @@ sysreg!(read_cntv_tval_el0, write_cntv_tval_el0, "cntv_tval_el0");
 sysreg!(read_cntv_cval_el0, write_cntv_cval_el0, "cntv_cval_el0");
 sysreg!(read_cntp_ctl_el0, write_cntp_ctl_el0, "cntp_ctl_el0");
 sysreg!(read_cntp_tval_el0, write_cntp_tval_el0, "cntp_tval_el0");
+
+/// Makes FP/SIMD instructions trap at EL0 and EL1 (`CPACR_EL1.FPEN` = 0),
+/// for kernels that do not save FP state per task: otherwise one process's
+/// registers would be visible to the next. Call on each CPU.
+///
+/// # Safety
+/// Nothing running at EL1 may use FP/SIMD afterwards (softfloat targets
+/// do not).
+pub unsafe fn trap_fp() {
+    // SAFETY: the caller upholds the contract.
+    unsafe { write_cpacr_el1(read_cpacr_el1() & !(0b11 << 20)) };
+}
 
 /// Reads `ID_AA64MMFR0_EL1` (memory model features; `PARange` in bits 3:0).
 #[inline]
@@ -89,6 +107,10 @@ pub unsafe fn enter_user(entry: u64, user_sp: u64, kernel_sp: u64) -> ! {
         asm!(
             "msr daifset, #0xf",
             "msr sp_el0, {usp}",
+            // The vectors use TPIDRRO_EL0 as scratch; leave nothing of the
+            // kernel's in it or in TPIDR_EL0 for the program to read.
+            "msr tpidrro_el0, xzr",
+            "msr tpidr_el0, xzr",
             "msr elr_el1, {entry}",
             "msr spsr_el1, xzr",
             "mov sp, {ksp}",
@@ -120,7 +142,8 @@ pub unsafe fn enter_user(entry: u64, user_sp: u64, kernel_sp: u64) -> ! {
 #[cfg(all(bare, not(feature = "aarch64-el2")))]
 pub unsafe fn resume_user(frame: &crate::trap::TrapFrame, kernel_sp: u64) -> ! {
     const SIZE: usize = core::mem::size_of::<crate::trap::TrapFrame>();
-    debug_assert!(frame.spsr & 0x1f == 0, "resume_user needs an AArch64 EL0t frame");
+    // Any other mode here would hand the user a privileged context.
+    assert!(frame.spsr & 0x1f == 0, "resume_user needs an AArch64 EL0t frame");
     debug_assert!(kernel_sp.is_multiple_of(16));
     // SAFETY: the caller upholds the contract. With IRQs masked, the frame
     // is copied to the top of the kernel stack highest pair first: a source

@@ -44,6 +44,11 @@ pub struct TrapFrame {
 
 const _: () = assert!(size_of::<TrapFrame>() == 24 * 8);
 
+/// Whether `addr` is canonical for 4-level paging (bits 63:47 all equal).
+pub(super) fn is_canonical(addr: u64) -> bool {
+    ((addr as i64) << 16 >> 16) as u64 == addr
+}
+
 impl TrapFrame {
     /// The program counter the trap returns to. For a breakpoint this is the
     /// `int3` itself (as on other architectures), so a handler that wants to
