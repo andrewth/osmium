@@ -39,7 +39,10 @@ use osmium::virt::riscv::fdt::GuestMachine;
 use osmium::virt::riscv::{self, RiscvVcpu, sbi};
 use osmium::virt::smp::GuestCpus;
 use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
+use osmium::virt::virtio::{MMIO_SIZE, VirtioBlock, VirtioMmio};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
+use osmium::drivers::ramdisk::RamDisk;
+use osmium::hal::block::BlockDevice as _;
 
 core::arch::global_asm!(
     r#"
@@ -105,6 +108,10 @@ const GUEST_RAM_ORDER: u32 = 14; // 64 MiB
 const GUEST_UART: u64 = 0x1000_0000;
 const UART_IRQ: u32 = 10;
 const PLIC_BASE: u64 = 0x0c00_0000;
+/// virtio-blk over a host RAM disk, in QEMU virt's first virtio-mmio slot.
+const BLK_BASE: u64 = 0x1000_1000;
+const BLK_IRQ: u32 = 1;
+const DISK_ORDER: u32 = 10; // 4 MiB
 /// The guest's device tree, at the top of its RAM.
 const GUEST_DTB_SIZE: u64 = 0x1_0000;
 
@@ -355,7 +362,7 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
         memory: &[(GUEST_RAM, len)],
         plic: Some((PLIC_BASE, 32)),
         uarts: &[(GUEST_UART, UART_IRQ)],
-        virtio: &[],
+        virtio: &[(BLK_BASE, BLK_IRQ)],
         bootargs: "",
     }
     .to_dtb();
@@ -374,11 +381,26 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
             l[ctx / 2].store(level, Ordering::Release)
         }
     }));
+    let plic_for_blk = plic.clone();
     let p = plic.clone();
     let uart = Arc::new(Uart16550Model::new(guest_console()).with_irq(move |level| p.set_level(UART_IRQ, level)));
     let mmio = Bus::new();
     mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2 * harts), plic).unwrap();
     mmio.insert(GUEST_UART, 8, uart).unwrap();
+    // The disk: a host RAM disk the guest reaches through virtio-blk.
+    let disk_pa = FRAMES.lock().alloc(DISK_ORDER).expect("no memory for the disk");
+    let disk_len = PAGE_SIZE << DISK_ORDER;
+    // SAFETY: a fresh block, zeroed and owned by the disk for the rest of the run.
+    let disk_buf = unsafe {
+        let p = disk_pa.0 as *mut u8;
+        p.write_bytes(0, disk_len);
+        core::slice::from_raw_parts_mut(p, disk_len)
+    };
+    let p = plic_for_blk.clone();
+    let blk = Arc::new(VirtioMmio::new(VirtioBlock::new(RamDisk::new(disk_buf, 512)), mem.clone(), move |level| {
+        p.set_level(BLK_IRQ, level)
+    }));
+    mmio.insert(BLK_BASE, MMIO_SIZE, blk.clone()).unwrap();
     // An IPI or fence for a vCPU running guest code on another hart kicks
     // that hart with a host IPI.
     let cpus = GuestCpus::with_kick(harts, |cpu| {
@@ -404,6 +426,15 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     match exit {
         Some(e) => println!("[hyp]   guest exit {e:?} from vCPU 0"),
         None => println!("[hyp]   guest ended by another vCPU"),
+    }
+    // riscv-virt's block demo writes (i * 13 + 5) to the middle sector.
+    let mut sector = [0u8; 512];
+    let lba = (disk_len / 512 / 2) as u64;
+    blk.with_device(|b, _| b.disk().read_blocks(lba, &mut sector)).unwrap();
+    if sector.iter().enumerate().all(|(i, &b)| b == (i * 13 + 5) as u8) {
+        println!("[hyp]   the host RAM disk holds the guest's write to sector {lba}");
+    } else {
+        println!("[hyp]   sector {lba} of the host RAM disk was not written by the guest");
     }
 }
 
