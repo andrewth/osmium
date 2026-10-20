@@ -23,9 +23,11 @@ use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::Fdt;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
 use osmium::drivers::virtio::mmio::MmioTransport;
+use osmium::drivers::virtio::blk::VirtioBlk;
 use osmium::drivers::virtio::net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
 use osmium::drivers::xhci::Xhci;
+use osmium::hal::block::BlockDevice;
 use osmium::hal::pci;
 use osmium::hal::usb::UsbHost;
 use osmium::hal::console::{Console, SerialConsole, set_console};
@@ -437,6 +439,26 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             demos::arp(&mut net, now_ns);
         }
         None => println!("[net]   no virtio-net device"),
+    }
+
+    // --- virtio-blk ----------------------------------------------------------
+    let blk = virtio_slots(&fdt).find_map(|(base, len)| {
+        // SAFETY: the device tree puts a virtio-mmio slot here, mapped above;
+        // nothing else uses it (the net probe's transport was dropped).
+        let t = MmioTransport::new(unsafe { IoMem::new(base as *mut u8, len as usize) }).ok()?;
+        (t.device_type() == DeviceType::Block).then_some((base, t))
+    });
+    match blk {
+        Some((base, t)) => {
+            let legacy = if t.is_legacy() { "legacy" } else { "1.x" };
+            let mut disk = VirtioBlk::new(t, &FRAMES).expect("virtio-blk init failed");
+            let n = disk.num_blocks();
+            match demos::block_roundtrip(&mut disk) {
+                Ok(lba) => println!("[blk]   virtio-blk ({legacy}) at {base:#x}: {n} sectors; wrote and read back sector {lba}"),
+                Err(e) => println!("[blk]   virtio-blk ({legacy}) at {base:#x}: {n} sectors; round trip failed: {e:?}"),
+            }
+        }
+        None => println!("[blk]   no virtio-blk device"),
     }
 
     // --- xHCI behind PCIe ------------------------------------------------------

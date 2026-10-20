@@ -14,6 +14,7 @@
 use osmium_hal::virtio::device_id;
 use osmium_mm::PhysAddr;
 
+pub mod blk;
 pub mod mmio;
 pub mod net;
 pub mod queue;

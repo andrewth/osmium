@@ -177,6 +177,48 @@ pub mod net {
     }
 }
 
+/// virtio-blk (§5.2).
+pub mod blk {
+    #![allow(missing_docs)]
+
+    /// Device is read-only.
+    pub const F_RO: u64 = 1 << 5;
+    /// `blk_size` in configuration space is the preferred block size.
+    pub const F_BLK_SIZE: u64 = 1 << 6;
+    /// The device has a write cache and handles [`T_FLUSH`].
+    pub const F_FLUSH: u64 = 1 << 9;
+
+    /// Request type: read.
+    pub const T_IN: u32 = 0;
+    /// Request type: write.
+    pub const T_OUT: u32 = 1;
+    /// Request type: flush the write cache.
+    pub const T_FLUSH: u32 = 4;
+    /// Request type: read the device ID string.
+    pub const T_GET_ID: u32 = 8;
+
+    /// Request status: success.
+    pub const S_OK: u8 = 0;
+    /// Request status: I/O error.
+    pub const S_IOERR: u8 = 1;
+    /// Request status: request type not supported.
+    pub const S_UNSUPP: u8 = 2;
+
+    /// Configuration space: capacity in 512-byte sectors (le64).
+    pub const CONFIG_CAPACITY: usize = 0;
+
+    /// Configuration space: preferred block size in bytes (le32), with
+    /// [`F_BLK_SIZE`].
+    pub const CONFIG_BLK_SIZE: usize = 20;
+
+    /// Bytes in a sector, the unit of `capacity` and request addresses.
+    pub const SECTOR_SIZE: usize = 512;
+    /// Length of the request header (type, reserved, sector).
+    pub const HEADER_LEN: usize = 16;
+    /// The request queue's index.
+    pub const REQUEST_QUEUE: u16 = 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::queue::*;

@@ -294,3 +294,16 @@ pub fn fat<D: osmium::hal::block::BlockDevice + Send + 'static>(disk: D) {
         Err(e) => println!("[fat]   failed: {e}"),
     }
 }
+
+/// Writes a pattern to the middle sector of `disk`, flushes, reads it back
+/// and returns the sector number if the data matched.
+pub fn block_roundtrip<D: osmium::hal::block::BlockDevice>(disk: &mut D) -> Result<u64, osmium::hal::block::BlockError> {
+    let bs = disk.block_size();
+    let lba = disk.num_blocks() / 2;
+    let pattern: Vec<u8> = (0..bs).map(|i| (i * 13 + 5) as u8).collect();
+    let mut back = alloc::vec![0u8; bs];
+    disk.write_blocks(lba, &pattern)?;
+    disk.flush()?;
+    disk.read_blocks(lba, &mut back)?;
+    if back == pattern { Ok(lba) } else { Err(osmium::hal::block::BlockError::Io) }
+}
