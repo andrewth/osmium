@@ -10,10 +10,13 @@
 //! entries; larger transfers, and those over the controller's maximum
 //! (MDTS), are split.
 //!
-//! Every wait is bounded. If a command never completes, the driver stops
-//! using the controller (later requests fail) rather than reuse memory the
-//! controller may still write; if the controller then refuses to disable,
-//! dropping the driver leaks its DMA memory for the same reason.
+//! Every wait is bounded by a [`Clock`]: CAP.TO for the controller to
+//! change state, [`COMMAND_TIMEOUT_NS`] for a command ([`FLUSH_TIMEOUT_NS`]
+//! for a flush). If a command never completes, or the controller reports a
+//! fatal error while it runs, the driver stops using the controller (later
+//! requests fail) rather than reuse memory the controller may still write;
+//! if the controller then refuses to disable, dropping the driver leaks its
+//! DMA memory for the same reason.
 //!
 //! The [`DmaAllocator`] must hand out page-aligned memory, as frame
 //! allocators do. Namespaces with metadata, or with blocks larger than
@@ -33,6 +36,7 @@ use osmium_arch::barrier;
 use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
 use osmium_hal::mmio::IoMem;
+use osmium_hal::timer::Clock;
 
 use queue::{Queue, Sqe};
 
@@ -80,11 +84,14 @@ const CAP_CSS_NVM: u64 = 1 << 37;
 /// VS of NVMe 1.1, the first with the active namespace list.
 const VERSION_1_1: u32 = 0x0001_0100;
 
-/// Polls of CSTS per CAP.TO unit (500 ms).
-const SPINS_PER_TIMEOUT_UNIT: u32 = 1_000_000;
+/// Nanoseconds per CAP.TO unit.
+const TIMEOUT_UNIT_NS: u64 = 500_000_000;
 
-/// Polls of the completion queue before a command counts as lost.
-const COMMAND_SPINS: u32 = 1 << 28;
+/// How long a command may take before it counts as lost.
+pub const COMMAND_TIMEOUT_NS: u64 = 30_000_000_000;
+
+/// How long a flush may take: writing back a large cache can take a while.
+pub const FLUSH_TIMEOUT_NS: u64 = 120_000_000_000;
 
 /// Command identifiers run 0..=MAX_CID (0xffff is reserved).
 const MAX_CID: u16 = 0xfffe;
@@ -147,6 +154,7 @@ pub enum NvmeError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failure {
     Timeout,
+    Fatal,
     Status(u16),
 }
 
@@ -232,11 +240,13 @@ pub struct Nvme<'d, D: DmaAllocator + ?Sized> {
     regs: Regs,
     /// Freed in `drop` only once the controller is disabled.
     mem: ManuallyDrop<Memory<'d, D>>,
-    ready_spins: u32,
-    command_spins: u32,
+    clock: &'d dyn Clock,
+    /// CAP.TO: how long the controller may take to enable or disable.
+    ready_timeout_ns: u64,
     next_cid: u16,
-    /// A command was lost; the controller may still write its buffer.
-    broken: bool,
+    /// Why a command was lost (it timed out, or the controller failed);
+    /// the controller may still write its buffer.
+    broken: Option<Failure>,
     io_queues: bool,
     version: u32,
     model: [u8; 40],
@@ -252,14 +262,14 @@ pub struct Nvme<'d, D: DmaAllocator + ?Sized> {
 impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
     /// Resets the controller whose registers are `io` (all of BAR 0) and
     /// starts it with DMA memory from `dma`, serving its first active
-    /// namespace. The PCI function must already decode memory and be
-    /// allowed to master the bus.
-    pub fn new(io: IoMem, dma: &'d D) -> Result<Self, NvmeError> {
+    /// namespace; `clock` times its waits. The PCI function must already
+    /// decode memory and be allowed to master the bus.
+    pub fn new(io: IoMem, dma: &'d D, clock: &'d dyn Clock) -> Result<Self, NvmeError> {
         let r = |off: usize| io.read::<u32>(off).map_err(|_| NvmeError::BadRegisters);
         let cap = r(CAP)? as u64 | (r(CAP + 4)? as u64) << 32;
         let version = r(VS)?;
         let mqes = cap as u16;
-        let timeout = (cap >> 24 & 0xff).max(1) as u32;
+        let timeout = (cap >> 24 & 0xff).max(1);
         let stride = 4usize << (cap >> 32 & 0xf);
         let mpsmin = cap >> 48 & 0xf;
         // All ones is what a bus returns when nothing decodes the address.
@@ -281,10 +291,10 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         let mut nvme = Self {
             regs: Regs { io, stride },
             mem: ManuallyDrop::new(mem),
-            ready_spins: timeout.saturating_mul(SPINS_PER_TIMEOUT_UNIT),
-            command_spins: COMMAND_SPINS,
+            clock,
+            ready_timeout_ns: timeout * TIMEOUT_UNIT_NS,
             next_cid: 0,
-            broken: false,
+            broken: None,
             io_queues: false,
             version,
             model: [b' '; 40],
@@ -397,19 +407,28 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
 
     /// Polls CSTS until `done` holds for it, for up to CAP.TO.
     fn wait(&self, done: impl Fn(u32) -> bool) -> Result<u32, NvmeError> {
-        for _ in 0..self.ready_spins {
+        let deadline = self.clock.now_ns().saturating_add(self.ready_timeout_ns);
+        loop {
             let csts = self.regs.read(CSTS);
             if done(csts) {
                 return Ok(csts);
             }
+            if self.clock.now_ns() > deadline {
+                return Err(NvmeError::Timeout);
+            }
             osmium_arch::cpu::spin_hint();
         }
-        Err(NvmeError::Timeout)
     }
 
     /// Clears CC.EN and waits for the controller to stop, which also ends
     /// any DMA and deletes every queue.
     fn disable(&self) -> Result<(), NvmeError> {
+        // A controller still enabling (EN = 1, RDY = 0) must become ready,
+        // or fail, before EN is cleared. If it does neither in time, clear
+        // EN anyway: there is nothing better to try.
+        if self.regs.read(CC) & CC_EN != 0 {
+            let _ = self.wait(|csts| csts & (CSTS_RDY | CSTS_CFS) != 0);
+        }
         self.regs.write(CC, 0);
         self.wait(|csts| csts & CSTS_RDY == 0).map(|_| ())
     }
@@ -484,6 +503,7 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         let opcode = sqe[0] as u8;
         self.execute(false, sqe, len).map_err(|f| match f {
             Failure::Timeout => NvmeError::Timeout,
+            Failure::Fatal => NvmeError::Fatal,
             Failure::Status(s) => NvmeError::Command { opcode, sct: (s >> 8 & 7) as u8, sc: s as u8 },
         })
     }
@@ -499,8 +519,8 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
     /// first `len` bytes of the bounce buffer, and waits for its
     /// completion; returns its dword 0.
     fn execute(&mut self, io_queue: bool, mut sqe: Sqe, len: usize) -> Result<u32, Failure> {
-        if self.broken {
-            return Err(Failure::Timeout);
+        if let Some(why) = self.broken {
+            return Err(why);
         }
         let cid = self.next_cid;
         self.next_cid = if cid == MAX_CID { 0 } else { cid + 1 };
@@ -512,11 +532,23 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         let mem = &mut *self.mem;
         let queue = if io_queue { &mut mem.io } else { &mut mem.admin };
         let tail = queue.push(&sqe);
+        let timeout = match io_queue && sqe[0] as u8 == op::FLUSH {
+            true => FLUSH_TIMEOUT_NS,
+            false => COMMAND_TIMEOUT_NS,
+        };
+        let deadline = self.clock.now_ns().saturating_add(timeout);
         // The entry (and PRP list) before the doorbell.
         barrier::mb();
         self.regs.doorbell(queue.qid(), false, tail);
-        for _ in 0..self.command_spins {
+        let why = loop {
             let Some(done) = queue.pop() else {
+                // A failed controller completes nothing more.
+                if self.regs.read(CSTS) & CSTS_CFS != 0 {
+                    break Failure::Fatal;
+                }
+                if self.clock.now_ns() > deadline {
+                    break Failure::Timeout;
+                }
                 osmium_arch::cpu::spin_hint();
                 continue;
             };
@@ -528,9 +560,9 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
                     s => Err(Failure::Status(s)),
                 };
             }
-        }
-        self.broken = true;
-        Err(Failure::Timeout)
+        };
+        self.broken = Some(why);
+        Err(why)
     }
 
     /// Describes the first `len` bytes of the (page-aligned) bounce buffer:
@@ -662,7 +694,7 @@ mod tests {
         let fake = Fake::new(cfg);
         let dma = HostDma::default();
         run(&fake, || {
-            let mut nv = Nvme::new(fake.io(), &dma).unwrap();
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
             assert_eq!((nv.model(), nv.serial(), nv.firmware()), (MODEL, SERIAL, FIRMWARE));
             assert_eq!(nv.version(), 0x0001_0400);
             assert_eq!(nv.namespace(), 2, "the lowest active namespace");
@@ -705,7 +737,7 @@ mod tests {
         tweak(&mut cfg);
         let fake = Fake::new(cfg);
         let dma = HostDma::default();
-        let r = run(&fake, || Nvme::new(fake.io(), &dma).map(|nv| nv.namespace()));
+        let r = run(&fake, || Nvme::new(fake.io(), &dma, &fake).map(|nv| nv.namespace()));
         assert_eq!(dma.live.get(), 0, "nothing leaks");
         if fake.disables.load(Relaxed) > 0 || matches!(r, Err(NvmeError::Timeout | NvmeError::Fatal)) {
             assert_eq!(fake.reg(CC) & CC_EN, 0, "left disabled");
@@ -721,6 +753,8 @@ mod tests {
         assert_eq!(probe(|c| c.mpsmin = 1), Err(NvmeError::Unsupported));
         assert_eq!(probe(|c| c.css_nvm = false), Err(NvmeError::Unsupported));
         assert_eq!(probe(|c| c.never_ready = true), Err(NvmeError::Timeout));
+        // Left enabling by firmware: it gets to finish before EN is cleared.
+        assert_eq!(probe(|c| c.enabling = true), Ok(1));
         assert_eq!(probe(|c| c.fatal = true), Err(NvmeError::Fatal));
         assert_eq!(probe(|c| c.namespaces.clear()), Err(NvmeError::NoNamespace));
         assert_eq!(probe(|c| c.namespaces[0].ms = 8), Err(NvmeError::Unsupported), "metadata");
@@ -733,7 +767,7 @@ mod tests {
         let fake = Fake::new(Config::default());
         let dma = HostDma::default();
         let small = fake.io().slice(0, DOORBELLS).unwrap();
-        assert_eq!(Nvme::new(small, &dma).err(), Some(NvmeError::BadRegisters));
+        assert_eq!(Nvme::new(small, &dma, &fake).err(), Some(NvmeError::BadRegisters));
     }
 
     #[test]
@@ -745,7 +779,7 @@ mod tests {
             let new = pattern(2 * bs, 99);
             let dma = HostDma::default();
             run(&fake, || {
-                let mut nv = Nvme::new(fake.io(), &dma).unwrap();
+                let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
                 assert_eq!(nv.block_size(), bs);
                 let mut buf = vec![0u8; 2 * bs];
                 nv.read_blocks(10, &mut buf).unwrap();
@@ -775,7 +809,7 @@ mod tests {
         let fake = Fake::new(Config { vwc: false, ..Config::default() });
         let dma = HostDma::default();
         run(&fake, || {
-            let mut nv = Nvme::new(fake.io(), &dma).unwrap();
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
             assert!(!nv.has_write_cache());
             assert_eq!(nv.flush(), Ok(()));
         });
@@ -789,7 +823,7 @@ mod tests {
             let data = pattern(39 * 4096, 3);
             let dma = HostDma::default();
             run(&fake, || {
-                let mut nv = Nvme::new(fake.io(), &dma).unwrap();
+                let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
                 assert_eq!(nv.max_transfer(), if mdts == 0 { DATA_LEN } else { 8192 });
                 // 3 pages, then 16 (a full buffer), then 20 (split).
                 nv.write_blocks(0, &data[..3 * 4096]).unwrap();
@@ -828,7 +862,7 @@ mod tests {
             let fake = Fake::new(Config { mqes: 3, dstrd: 2, stray, ..Config::default() });
             let dma = HostDma::default();
             run(&fake, || {
-                let mut nv = Nvme::new(fake.io(), &dma).unwrap();
+                let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
                 assert_eq!(nv.mem.io.depth(), 4);
                 for i in 0..50u64 {
                     let block = pattern(512, i as u8);
@@ -854,7 +888,7 @@ mod tests {
         let fake = Fake::new(cfg);
         let dma = HostDma::default();
         run(&fake, || {
-            let mut nv = Nvme::new(fake.io(), &dma).unwrap();
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
             let mut buf = [0u8; 512];
             assert_eq!(nv.read_blocks(6, &mut buf), Err(BlockError::Io));
             assert_eq!(nv.write_blocks(7, &buf), Err(BlockError::Io));
@@ -880,8 +914,7 @@ mod tests {
         let fake = Fake::new(Config { ignore_io: true, ..Config::default() });
         let dma = HostDma::default();
         run(&fake, || {
-            let mut nv = Nvme::new(fake.io(), &dma).unwrap();
-            nv.command_spins = 10_000;
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
             let mut buf = [0u8; 512];
             assert_eq!(nv.read_blocks(0, &mut buf), Err(BlockError::Io));
             assert_eq!(nv.read_blocks(1, &mut buf), Err(BlockError::Io));
@@ -892,5 +925,57 @@ mod tests {
         assert_eq!(fake.io_commands().len(), 1, "nothing more was submitted");
         assert_eq!(fake.reg(CC) & CC_EN, 0, "the controller is disabled");
         assert_eq!(dma.live.get(), 0, "and once it stopped, its memory is freed");
+    }
+
+    #[test]
+    fn a_slow_flush_is_not_lost() {
+        // A minute: past the command timeout, within the flush timeout.
+        let fake = Fake::new(Config { io_delay_ns: 60_000_000_000, ..Config::default() });
+        let dma = HostDma::default();
+        run(&fake, || {
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
+            assert_eq!(nv.flush(), Ok(()));
+            assert_eq!(nv.flush(), Ok(()));
+            // A read that slow is lost, and stops the driver.
+            let mut buf = [0u8; 512];
+            assert_eq!(nv.read_blocks(0, &mut buf), Err(BlockError::Io));
+            assert_eq!(nv.flush(), Err(BlockError::Io));
+        });
+        assert_eq!(fake.io_commands().len(), 3);
+        assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
+    fn a_fatal_controller_fails_commands_at_once() {
+        let fake = Fake::new(Config { fatal_io: true, ..Config::default() });
+        let dma = HostDma::default();
+        run(&fake, || {
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
+            let start = fake.now_ns();
+            let mut buf = [0u8; 512];
+            assert_eq!(nv.read_blocks(0, &mut buf), Err(BlockError::Io));
+            assert!(fake.now_ns() - start < COMMAND_TIMEOUT_NS, "without waiting for the timeout");
+            let mut ids = [0];
+            assert_eq!(nv.active_namespaces(&mut ids), Err(NvmeError::Fatal));
+        });
+        assert_eq!(fake.io_commands().len(), 1, "nothing more was submitted");
+        assert_eq!(fake.reg(CC) & CC_EN, 0, "the controller is disabled");
+        assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
+    fn more_and_do_not_retry_are_not_failures() {
+        let fake = Fake::new(Config { status_flags: true, bad_from: 6, ..Config::default() });
+        let dma = HostDma::default();
+        run(&fake, || {
+            let mut nv = Nvme::new(fake.io(), &dma, &fake).unwrap();
+            let mut buf = [0u8; 512];
+            nv.read_blocks(5, &mut buf).unwrap();
+            assert_eq!(buf[..], disk(&fake, 0)[5 * 512..6 * 512]);
+            assert_eq!(nv.read_blocks(6, &mut buf), Err(BlockError::Io));
+            let bad = nv.admin(command(0x7f, 0, 0, 0, 0), 0);
+            assert_eq!(bad, Err(NvmeError::Command { opcode: 0x7f, sct: 0, sc: 1 }));
+            nv.flush().unwrap();
+        });
     }
 }

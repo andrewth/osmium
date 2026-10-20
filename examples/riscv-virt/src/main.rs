@@ -599,7 +599,13 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             // window; nothing else uses it.
             let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
             let (b, d, f) = (addr.bus, addr.device, addr.function);
-            match Nvme::new(io, &FRAMES) {
+            struct Time;
+            impl osmium::hal::timer::Clock for Time {
+                fn now_ns(&self) -> u64 {
+                    now_ns()
+                }
+            }
+            match Nvme::new(io, &FRAMES, &Time) {
                 Ok(mut disk) => {
                     let (n, bs) = (disk.num_blocks(), disk.block_size());
                     let r = demos::block_roundtrip(&mut disk);

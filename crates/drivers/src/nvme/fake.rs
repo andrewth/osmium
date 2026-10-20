@@ -6,14 +6,20 @@
 //! queues in DMA memory, follows their PRPs over RAM-disk namespaces, and
 //! posts completions with phase tags. It checks what the driver programs
 //! as it goes (and panics, failing the test, on anything wrong).
+//!
+//! It is also the driver's [`Clock`]: real time, plus whatever the fake
+//! skips ahead to play a controller that takes seconds without the test
+//! waiting for them.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::boxed::Box;
 use std::sync::Mutex;
+use std::time::Instant;
 use std::vec;
 use std::vec::Vec;
 
 use osmium_hal::mmio::IoMem;
+use osmium_hal::timer::Clock;
 
 use super::{ACQ, AQA, ASQ, CAP, CC, CSTS, DOORBELLS, PAGE, VS, op};
 
@@ -57,8 +63,11 @@ pub struct Config {
     pub version: u32,
     pub mdts: u8,
     pub vwc: bool,
-    /// Never sets CSTS.RDY.
+    /// Never sets CSTS.RDY (and time flies while the driver waits).
     pub never_ready: bool,
+    /// Starts enabled but not yet ready, as firmware might leave it, and
+    /// becomes ready 20 ms later; clearing EN before then is an error.
+    pub enabling: bool,
     /// Sets CSTS.CFS instead of RDY.
     pub fatal: bool,
     /// Transfers touching blocks at or past this fail as unrecovered.
@@ -67,8 +76,15 @@ pub struct Config {
     /// Posts a completion with a wrong command identifier before each
     /// I/O completion.
     pub stray: bool,
-    /// Never completes I/O commands.
+    /// Never completes I/O commands (and an hour passes).
     pub ignore_io: bool,
+    /// Sets CSTS.CFS instead of completing I/O commands.
+    pub fatal_io: bool,
+    /// Nanoseconds each I/O command takes.
+    pub io_delay_ns: u64,
+    /// Sets More in every completion's status, and Do Not Retry in failed
+    /// ones.
+    pub status_flags: bool,
     pub namespaces: Vec<Ns>,
 }
 
@@ -84,11 +100,15 @@ impl Default for Config {
             mdts: 7,
             vwc: true,
             never_ready: false,
+            enabling: false,
             fatal: false,
             bad_from: u64::MAX,
             reject_flush: false,
             stray: false,
             ignore_io: false,
+            fatal_io: false,
+            io_delay_ns: 0,
+            status_flags: false,
             namespaces: vec![Ns::new(1, 9, 1024)],
         }
     }
@@ -139,6 +159,9 @@ pub struct Fake {
     pub shutdowns: AtomicU32,
     /// Times the controller went from enabled to disabled.
     pub disables: AtomicU32,
+    start: Instant,
+    /// Nanoseconds skipped ahead.
+    skipped: AtomicU64,
 }
 
 // The driver's buffers are identity-mapped host memory.
@@ -204,7 +227,7 @@ impl Fake {
         regs[VS / 4].store(cfg.version, Ordering::Relaxed);
         // As firmware might leave it: enabled.
         regs[CC / 4].store(1, Ordering::Relaxed);
-        regs[CSTS / 4].store(1, Ordering::Relaxed);
+        regs[CSTS / 4].store(!cfg.enabling as u32, Ordering::Relaxed);
         let namespaces = Mutex::new(core::mem::take(&mut cfg.namespaces));
         Self {
             regs,
@@ -214,7 +237,14 @@ impl Fake {
             stop: AtomicBool::new(false),
             shutdowns: AtomicU32::new(0),
             disables: AtomicU32::new(0),
+            start: Instant::now(),
+            skipped: AtomicU64::new(0),
         }
+    }
+
+    /// Moves the clock `ns` ahead.
+    pub fn skip(&self, ns: u64) {
+        self.skipped.fetch_add(ns, Ordering::AcqRel);
     }
 
     pub fn io(&self) -> IoMem {
@@ -252,8 +282,19 @@ impl Fake {
         let mut sqs: [Option<Sq>; 2] = [None; 2];
         let mut cqs: [Option<Cq>; 2] = [None; 2];
         let mut enabled = false;
+        let mut ready_at = self.cfg.enabling.then(|| self.now_ns() + 20_000_000);
         while !self.stop.load(Ordering::Acquire) {
             let cc = self.reg(CC);
+            if let Some(at) = ready_at {
+                assert_eq!(cc & 1, 1, "EN cleared while the controller is still enabling");
+                if self.now_ns() >= at {
+                    ready_at = None;
+                    enabled = true;
+                    self.set_reg(CSTS, 1);
+                }
+                std::thread::yield_now();
+                continue;
+            }
             if cc & 1 == 0 {
                 if enabled {
                     self.disables.fetch_add(1, Ordering::Relaxed);
@@ -265,7 +306,9 @@ impl Fake {
             } else if !enabled && self.reg(CSTS) == 0 {
                 if self.cfg.fatal {
                     self.set_reg(CSTS, 2);
-                } else if !self.cfg.never_ready {
+                } else if self.cfg.never_ready {
+                    self.skip(100_000_000);
+                } else {
                     assert_eq!(cc, 0x0046_0001, "IOCQES 4, IOSQES 6, MPS 0, CSS 0");
                     let aqa = self.reg(AQA);
                     let (asq, acq) = (self.reg(ASQ) as u64, self.reg(ACQ) as u64);
@@ -294,10 +337,15 @@ impl Fake {
                     let (result, status) = if qid == 0 {
                         self.admin(&sqe, &mut sqs, &mut cqs)
                     } else {
-                        if self.cfg.ignore_io {
+                        if self.cfg.ignore_io || self.cfg.fatal_io {
                             self.record(1, &sqe, 0);
+                            match self.cfg.fatal_io {
+                                true => self.set_reg(CSTS, self.reg(CSTS) | 2),
+                                false => self.skip(3_600_000_000_000),
+                            }
                             continue;
                         }
+                        self.skip(self.cfg.io_delay_ns);
                         self.nvm(&sqe)
                     };
                     let cid = (sqe[0] >> 16) as u16;
@@ -315,7 +363,11 @@ impl Fake {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn post(&self, cq: &mut Cq, cqid: u16, cid: u16, sqid: u16, sqhd: u16, result: u32, status: u16) {
+    fn post(&self, cq: &mut Cq, cqid: u16, cid: u16, sqid: u16, sqhd: u16, result: u32, mut status: u16) {
+        if self.cfg.status_flags {
+            // More, and Do Not Retry.
+            status |= 1 << 13 | ((status != 0) as u16) << 14;
+        }
         // Wait for room: the queue is full when the tail would meet the head.
         loop {
             let head = self.doorbell(cqid, true);
@@ -482,5 +534,11 @@ impl Fake {
             off += n;
         }
         (0, 0)
+    }
+}
+
+impl Clock for Fake {
+    fn now_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64 + self.skipped.load(Ordering::Acquire)
     }
 }

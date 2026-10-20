@@ -17,6 +17,10 @@ pub const SQE_LEN: usize = 64;
 /// Bytes per completion queue entry (CC.IOCQES = 4).
 pub const CQE_LEN: usize = 16;
 
+/// Status code (bits 7:0) and status code type (bits 10:8) of the status
+/// field.
+const STATUS_MASK: u32 = 0x7ff;
+
 /// A command, as the sixteen dwords of a submission queue entry.
 pub type Sqe = [u32; 16];
 
@@ -29,8 +33,9 @@ pub struct Completion {
     pub sqid: u16,
     /// The command identifier the driver chose.
     pub cid: u16,
-    /// The status field (dword 3 bits 31:17): 0 for success, else status
-    /// code type in bits 10:8 and status code in bits 7:0.
+    /// Status code type and status code (dword 3 bits 27:17): 0 for
+    /// success, else the type in bits 10:8 and the code in bits 7:0. The
+    /// CRD, More and Do Not Retry bits above them are left out.
     pub status: u16,
 }
 
@@ -104,7 +109,8 @@ impl<'d, D: DmaAllocator + ?Sized> Queue<'d, D> {
             self.head = 0;
             self.phase = !self.phase;
         }
-        Some(Completion { result, sqid: (dw2 >> 16) as u16, cid: dw3 as u16, status: (dw3 >> 17) as u16 })
+        let status = (dw3 >> 17 & STATUS_MASK) as u16;
+        Some(Completion { result, sqid: (dw2 >> 16) as u16, cid: dw3 as u16, status })
     }
 
     /// The completion queue head, for the doorbell.
@@ -145,5 +151,17 @@ mod tests {
         }
         drop(q);
         assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
+    fn status_leaves_out_more_and_do_not_retry() {
+        let dma = HostDma::default();
+        let mut q = Queue::new(&dma, 1, 4).unwrap();
+        // CRD (bits 12:11), More (13) and DNR (14) of the status field.
+        for (slot, status, expected) in [(0, 1 << 13, 0), (1, 0x6000 | 0x0281, 0x0281), (2, 0x1800 | 0x0101, 0x0101)] {
+            q.push(&[0; 16]);
+            post(&q, slot, slot, true, status);
+            assert_eq!(q.pop().unwrap().status, expected);
+        }
     }
 }
