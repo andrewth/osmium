@@ -201,9 +201,9 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ RISC-V guest device trees (`riscv::fdt::GuestMachine`): harts, memory, PLIC, 16550s and virtio-mmio, in the layout Linux expects
 - ✅ virtio device models: split virtqueue over `GuestMemory`, the virtio-mmio (v2) transport as a bus device, virtio-console, virtio-blk (over any `BlockDevice`) and virtio-net (over a pluggable `NetBackend`), sharing `osmium_hal::virtio` definitions with the drivers
 - ✅ RISC-V H-extension `Vcpu` (`riscv64-hs`): world switch through the trap entry's guest-exit hook, VS CSR switching, MMIO emulation from guest-page faults (`htinst` or `hlvx`-fetched instruction, compressed forms included), `wfi` halts, host-interrupt exits, and a minimal SBI (BASE, TIME, SRST, DBCN, legacy)
-- ✅ AMD SVM `Vcpu`: VMCB setup for a 32-bit flat guest, nested paging with `X86_64` tables, VMRUN world switch under CLGI/STGI, port I/O, `hlt`, `vmmcall` and interrupt exits, virtual interrupt injection (`V_IRQ`)
+- ✅ AMD SVM `Vcpu`: VMCB setup for a 32-bit flat guest, nested paging with `X86_64` tables, VMRUN world switch under CLGI/STGI, port I/O, `hlt`, `vmmcall` and interrupt exits, MMIO from nested page faults (a decoder for the MOV/MOVZX forms drivers use, with decode assists or a fetch from guest memory), virtual interrupt injection (`V_IRQ`)
 - ✅ AArch64 EL2 `Vcpu` (`aarch64-el2`, non-VHE): world switch through guest-exit hooks in the lower-EL vectors, EL1 system-register switching, stage 2 via `VTTBR_EL2`, MMIO emulation from data-abort syndromes, trapped `wfi`, IRQ exits, a virtual-IRQ line (`HCR_EL2.VI`), and PSCI for guests
-- 🗺 VMX `Vcpu` backend, SVM MMIO emulation (nested page faults) and VMLOAD/VMSAVE state, virtual interrupt controllers (APLIC/IMSIC, vGIC), guest FP state, multi-vCPU guests
+- 🗺 VMX `Vcpu` backend, SVM VMLOAD/VMSAVE state and MMIO under guest paging, virtual interrupt controllers (APLIC/IMSIC, vGIC), guest FP state, multi-vCPU guests
 
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name
@@ -214,7 +214,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps; it also runs two guests in VS-mode under the H extension, the second built from osmium's own UART, PLIC and virtio-net drivers, taking timer, UART and virtio interrupts through the emulated PLIC
 - ✅ `examples/aarch64-virt`: the same on QEMU AArch64 `virt` (GICv2, PL011, generic timer, stage-1 paging, PSCI)
 - ✅ `examples/aarch64-hyp`: a hypervisor that stays at EL2 (QEMU `virtualization=on`), turns on the EL2 MMU and runs EL1 guests under stage 2, one of which takes its virtual timer and a UART interrupt through the emulated GICv2
-- ✅ `examples/x86_64-hyp`: enables AMD SVM (TCG with `-cpu max`) and runs a 32-bit guest under nested paging that talks to an emulated 16550 over port I/O
+- ✅ `examples/x86_64-hyp`: enables AMD SVM (TCG with `-cpu max`) and runs a 32-bit guest under nested paging that talks to emulated 16550s over port I/O and MMIO
 - ✅ `examples/x86_64-pc`: the same on QEMU q35 (PVH boot, COM1, local APIC timer, 4-level paging, ACPI MADT, INIT/SIPI trampoline)
 - ✅ `examples/riscv-firmware`: M-mode firmware with `-bios none`, no heap and no scheduler: async tasks on `osmium-exec` await CLINT timer and PLIC/UART interrupts, then power off
 - ✅ All three examples bring up 4 CPUs and run shared SMP demos (cross-CPU mutex wake-ups by IPI, task migration)

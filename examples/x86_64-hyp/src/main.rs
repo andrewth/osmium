@@ -4,7 +4,10 @@
 //!
 //! The guest prints through an emulated 16550 on port 0x3f8 (every port is
 //! intercepted, so this is not the host's COM1), reads the UART's status
-//! register, executes `hlt` and asks to be shut down with `vmmcall`.
+//! register, does the same with a second 16550 at a guest-physical address
+//! the nested page table leaves unmapped (each access a nested page fault,
+//! decoded and emulated), executes `hlt` and asks to be shut down with
+//! `vmmcall`.
 #![no_std]
 #![no_main]
 
@@ -144,11 +147,19 @@ x86_guest:
 3:  mov $0x3fd, %dx
     in %dx, %al                     // I/O exit: LSR
     movzbl %al, %edi
+    mov $0xfed00000, %ebx           // a second 16550, memory-mapped:
+6:  lodsb                           // the next string follows the first
+    test %al, %al
+    jz 7f
+    mov %al, (%ebx)                 // nested page fault -> MMIO write
+    jmp 6b
+7:  movzbl 5(%ebx), %ecx            // nested page fault -> MMIO read: LSR
     hlt                             // halt exit
     mov $1, %eax                    // hypercall 1: power off
     vmmcall
 5:  jmp 5b
 4:  .asciz "[guest] hello from SVM over port I/O\n"
+    .asciz "[guest] and over MMIO (nested page faults)\n"
 x86_guest_end:
     .code64
 "#,
@@ -233,6 +244,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
 }
 
 const GUEST_ENTRY: u64 = 0x10_0000;
+const GUEST_MMIO_UART: u64 = 0xfed0_0000;
 const GUEST_RAM_ORDER: u32 = 9; // 2 MiB at guest-physical 0
 
 /// One block of `order` frames as (host pointer, physical address).
@@ -248,6 +260,7 @@ fn guest_demo() {
     // SAFETY: a fresh block owned by this demo, reached only through `mem`
     // and the guest until it is freed below.
     unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
+    let mem = Arc::new(mem);
     // SAFETY: linker symbols bounding the guest image in .rodata.
     let image = unsafe {
         let start = &raw const x86_guest;
@@ -264,20 +277,22 @@ fn guest_demo() {
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let out = line.clone();
     let pio = Bus::new();
-    let uart = Uart16550Model::new(move |b| {
+    let console = move |b| {
         let mut l = out.lock();
         l.push(b);
         if b == b'\n' {
             print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
             l.clear();
         }
-    });
-    pio.insert(0x3f8, 8, Arc::new(uart)).unwrap();
+    };
+    pio.insert(0x3f8, 8, Arc::new(Uart16550Model::new(console.clone()))).unwrap();
     let mmio = Bus::new();
+    mmio.insert(GUEST_MMIO_UART, 8, Arc::new(Uart16550Model::new(console))).unwrap();
 
     let (vmcb, iopm, msrpm) = (block(0), block(2), block(1));
     // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-    let mut vcpu = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm }, npt.root().0, GUEST_ENTRY as u32, len as u32) };
+    let mut vcpu = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm }, npt.root().0, GUEST_ENTRY as u32, len as u32) }
+        .with_memory(mem.clone());
     let (mut hypercalls, mut halts) = (0, 0);
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |_, exit| match exit {
         VmExit::Hypercall { nr: 1, .. } => {
@@ -291,7 +306,10 @@ fn guest_demo() {
         VmExit::ExternalInterrupt => ControlFlow::Continue(()),
         other => ControlFlow::Break(other),
     });
-    println!("[hyp]   guest exit {exit:?}: {hypercalls} hypercall, {halts} halt, LSR {:#x}", vcpu.regs.rdi);
+    println!(
+        "[hyp]   guest exit {exit:?}: {hypercalls} hypercall, {halts} halt, LSR {:#x} (port) {:#x} (MMIO)",
+        vcpu.regs.rdi, vcpu.regs.rcx
+    );
 
     drop(vcpu);
     drop(npt);

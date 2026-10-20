@@ -8,6 +8,7 @@
 //! | `IOIO` (non-string) | [`VmExit::PioIn`] / [`VmExit::PioOut`] |
 //! | `HLT` | [`VmExit::Halt`] |
 //! | `VMMCALL` | [`VmExit::Hypercall`]: `nr` = `rax`, `args` = `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, `r8` |
+//! | Nested page fault on an unmapped page | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], from the instruction ([`decode`]) |
 //! | `INTR` | [`VmExit::ExternalInterrupt`] |
 //! | `SHUTDOWN` (triple fault) | [`VmExit::Shutdown`] |
 //! | Anything else | [`VmExit::Unhandled`] with the exit code |
@@ -15,14 +16,18 @@
 //! FS, GS, TR, LDTR and the syscall MSRs are not switched (no
 //! VMLOAD/VMSAVE), so guests must not depend on them yet.
 
+pub mod decode;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod hw;
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub use hw::{SvmError, enable};
 
+use alloc::sync::Arc;
 use core::ptr::NonNull;
 
+use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
+use decode::{Access, Operand};
 
 /// VMCB offsets (AMD64 APM vol. 2, appendix B).
 pub mod vmcb {
@@ -97,6 +102,10 @@ pub mod vmcb {
     pub const RAX: usize = 0x5f8;
     /// Guest PAT.
     pub const G_PAT: usize = 0x668;
+    /// Instruction bytes fetched by decode assists: count, then 15 bytes.
+    pub const INSN_LEN: usize = 0x0d0;
+    /// The fetched bytes.
+    pub const INSN_BYTES: usize = 0x0d1;
 }
 
 /// `#VMEXIT` codes.
@@ -166,6 +175,8 @@ pub struct SvmVcpu {
     /// General-purpose registers other than `rax`/`rsp`.
     pub regs: GuestRegs,
     pending_in: Option<u8>,
+    pending_mmio: Option<Access>,
+    mem: Option<Arc<GuestMemory>>,
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     flush: bool,
 }
@@ -190,7 +201,15 @@ impl SvmVcpu {
             pages.iopm.0.as_ptr().write_bytes(0xff, 3 * 4096);
             pages.msrpm.0.as_ptr().write_bytes(0xff, 2 * 4096);
         }
-        let mut v = Self { vmcb: pages.vmcb.0, vmcb_pa: pages.vmcb.1, regs: GuestRegs::default(), pending_in: None, flush: true };
+        let mut v = Self {
+            vmcb: pages.vmcb.0,
+            vmcb_pa: pages.vmcb.1,
+            regs: GuestRegs::default(),
+            pending_in: None,
+            pending_mmio: None,
+            mem: None,
+            flush: true,
+        };
         use vmcb::*;
         // INTR, NMI, HLT, IOIO, MSR, SHUTDOWN; VMRUN (required), VMMCALL.
         v.write32(INTERCEPT_MISC1, 1 << 0 | 1 << 1 | 1 << 24 | 1 << 27 | 1 << 28 | 1 << 31);
@@ -255,6 +274,108 @@ impl SvmVcpu {
         }
     }
 
+    /// Lets the vCPU read instructions from guest memory to emulate MMIO
+    /// when the CPU has no decode assists (guest paging must be off).
+    pub fn with_memory(mut self, mem: Arc<GuestMemory>) -> Self {
+        self.mem = Some(mem);
+        self
+    }
+
+    /// Reads general-purpose register `n` (0 = rax ... 15 = r15).
+    pub fn reg(&self, n: u8) -> u64 {
+        let r = &self.regs;
+        match n {
+            0 => self.rax(),
+            1 => r.rcx,
+            2 => r.rdx,
+            3 => r.rbx,
+            4 => self.read64(vmcb::RSP),
+            5 => r.rbp,
+            6 => r.rsi,
+            7 => r.rdi,
+            8 => r.r8,
+            9 => r.r9,
+            10 => r.r10,
+            11 => r.r11,
+            12 => r.r12,
+            13 => r.r13,
+            14 => r.r14,
+            _ => r.r15,
+        }
+    }
+
+    /// Writes general-purpose register `n`.
+    pub fn set_reg(&mut self, n: u8, v: u64) {
+        let r = &mut self.regs;
+        let slot = match n {
+            0 => None,
+            4 => None,
+            1 => Some(&mut r.rcx),
+            2 => Some(&mut r.rdx),
+            3 => Some(&mut r.rbx),
+            5 => Some(&mut r.rbp),
+            6 => Some(&mut r.rsi),
+            7 => Some(&mut r.rdi),
+            8 => Some(&mut r.r8),
+            9 => Some(&mut r.r9),
+            10 => Some(&mut r.r10),
+            11 => Some(&mut r.r11),
+            12 => Some(&mut r.r12),
+            13 => Some(&mut r.r13),
+            14 => Some(&mut r.r14),
+            _ => Some(&mut r.r15),
+        };
+        match slot {
+            Some(s) => *s = v,
+            None => self.write64(if n == 0 { vmcb::RAX } else { vmcb::RSP }, v),
+        }
+    }
+
+    /// The default operand size of the code segment: 16, 32 or 64.
+    fn code_bits(&self) -> u8 {
+        let attr = self.read64(vmcb::CS) >> 16 & 0xfff;
+        let lma = self.read64(vmcb::EFER) & (1 << 10) != 0;
+        if lma && attr & (1 << 9) != 0 {
+            64
+        } else if attr & (1 << 10) != 0 {
+            32
+        } else {
+            16
+        }
+    }
+
+    /// The faulting instruction's bytes: from decode assists, or from guest
+    /// memory at CS.base + RIP while paging is off.
+    fn insn_bytes(&self) -> Option<([u8; 15], usize)> {
+        let mut buf = [0u8; 15];
+        // SAFETY: the decode-assist bytes are inside the VMCB.
+        let n = unsafe { self.at(vmcb::INSN_LEN).read_volatile() } as usize;
+        if n > 0 {
+            for (i, b) in buf.iter_mut().enumerate().take(n.min(15)) {
+                // SAFETY: as above.
+                *b = unsafe { self.at(vmcb::INSN_BYTES + i).read_volatile() };
+            }
+            return Some((buf, n.min(15)));
+        }
+        if self.read64(vmcb::CR0) & (1 << 31) != 0 {
+            return None; // would need a guest page-table walk
+        }
+        let mem = self.mem.as_ref()?;
+        let linear = (self.read64(vmcb::CS + 8)).wrapping_add(self.rip());
+        // The instruction may end before the region does; read what exists.
+        let n = (1..=15).rev().find(|&n| mem.read(GuestPhysAddr(linear), &mut buf[..n]).is_ok())?;
+        Some((buf, n))
+    }
+
+    /// Reads the value a byte/word/dword/qword register operand names.
+    fn operand_value(&self, a: &Access) -> u64 {
+        match a.operand {
+            Operand::Imm(v) => v,
+            Operand::Reg(r) if a.high_byte && (4..8).contains(&r) => self.reg(r - 4) >> 8,
+            Operand::Reg(r) => self.reg(r),
+        }
+    }
+
     /// Physical address of the VMCB.
     pub fn vmcb_pa(&self) -> u64 {
         self.vmcb_pa
@@ -310,6 +431,21 @@ impl SvmVcpu {
                 let r = &self.regs;
                 VmExit::Hypercall { nr: self.rax(), args: [r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.r8] }
             }
+            // Not-present nested fault: an access to an unbacked address.
+            exit::NPF if info1 & 1 == 0 => {
+                let addr = GuestPhysAddr(self.read64(vmcb::EXITINFO2));
+                let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(&b[..n], self.code_bits())) else {
+                    return VmExit::Unhandled { reason: code };
+                };
+                if a.store {
+                    let data = self.operand_value(&a) & (u64::MAX >> (64 - 8 * a.size as u32));
+                    self.write64(vmcb::RIP, rip + a.len as u64);
+                    VmExit::MmioWrite { addr, size: a.size, data }
+                } else {
+                    self.pending_mmio = Some(a);
+                    VmExit::MmioRead { addr, size: a.size }
+                }
+            }
             exit::INTR => VmExit::ExternalInterrupt,
             exit::SHUTDOWN => VmExit::Shutdown,
             _ => VmExit::Unhandled { reason: code },
@@ -336,6 +472,24 @@ impl Vcpu for SvmVcpu {
     }
 
     fn complete_read(&mut self, value: u64) {
+        if let Some(a) = self.pending_mmio.take() {
+            let Operand::Reg(r) = a.operand else { return };
+            let value = value & (u64::MAX >> (64 - 8 * a.size as u32));
+            if a.high_byte && (4..8).contains(&r) {
+                let old = self.reg(r - 4);
+                self.set_reg(r - 4, (old & !0xff00) | value << 8);
+            } else if a.dest_size >= 4 {
+                // 32-bit destinations zero the upper half.
+                self.set_reg(r, value);
+            } else {
+                let mask = u64::MAX >> (64 - 8 * a.dest_size as u32);
+                let old = self.reg(r);
+                self.set_reg(r, (old & !mask) | value);
+            }
+            let rip = self.rip();
+            self.write64(vmcb::RIP, rip + a.len as u64);
+            return;
+        }
         if let Some(size) = self.pending_in.take() {
             let mask = u64::MAX >> (64 - 8 * size as u32);
             // 32-bit results zero the upper half; 8/16-bit ones merge.
@@ -412,6 +566,29 @@ mod tests {
         assert_eq!(v.rip(), 0x10_0006);
         v.complete_hypercall(42);
         assert_eq!(v.rax(), 42);
+
+        // mov %al, (%ebx) to an unbacked address, bytes from guest memory.
+        let mut ram = alloc::vec![0u8; 0x1000];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives the vCPU's use of `mem` in this test.
+        unsafe { mem.add_region(GuestPhysAddr(0x10_0000), ram.as_mut_ptr(), 0x1000) };
+        mem.write(GuestPhysAddr(0x10_0006), &[0x88, 0x03, 0x0f, 0xb6, 0x4b, 0x05]).unwrap();
+        let mut v = v.with_memory(Arc::new(mem));
+        v.write64(vmcb::RAX, 0x4d);
+        v.write64(vmcb::EXITCODE, exit::NPF);
+        v.write64(vmcb::EXITINFO1, 0b110);
+        v.write64(vmcb::EXITINFO2, 0xfed0_0000);
+        assert_eq!(v.classify(), VmExit::MmioWrite { addr: GuestPhysAddr(0xfed0_0000), size: 1, data: 0x4d });
+        assert_eq!(v.rip(), 0x10_0008);
+        // movzbl 5(%ebx), %ecx
+        v.regs.rcx = u64::MAX;
+        v.write64(vmcb::EXITINFO2, 0xfed0_0005);
+        assert_eq!(v.classify(), VmExit::MmioRead { addr: GuestPhysAddr(0xfed0_0005), size: 1 });
+        v.complete_read(0x60);
+        assert_eq!((v.regs.rcx, v.rip()), (0x60, 0x10_000c));
+        drop(v);
+        drop(ram);
+        let mut v = vcpu();
 
         v.write64(vmcb::EXITCODE, exit::INVALID);
         assert_eq!(v.classify(), VmExit::Unhandled { reason: exit::INVALID });
