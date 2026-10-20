@@ -5,6 +5,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use osmium_fs::{Errno, File, FileKind, OpenFlags, Vfs};
 use osmium_fs_iso9660::{IsoFs, Names};
@@ -14,6 +15,14 @@ use osmium_hal::block::{BlockDevice, BlockError};
 struct MemDisk {
     bytes: Arc<Vec<u8>>,
     block: usize,
+    /// Calls to `read_blocks`.
+    reads: Arc<AtomicUsize>,
+}
+
+impl MemDisk {
+    fn new(bytes: Arc<Vec<u8>>, block: usize) -> Self {
+        MemDisk { bytes, block, reads: Arc::default() }
+    }
 }
 
 impl BlockDevice for MemDisk {
@@ -25,6 +34,7 @@ impl BlockDevice for MemDisk {
     }
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         self.check_range(lba, buf.len())?;
+        self.reads.fetch_add(1, Ordering::Relaxed);
         let off = lba as usize * self.block;
         buf.copy_from_slice(&self.bytes[off..off + buf.len()]);
         Ok(())
@@ -80,7 +90,7 @@ fn image(cmd: &Path, args: &[&str], src: &Path) -> Arc<Vec<u8>> {
 }
 
 fn mount(bytes: &Arc<Vec<u8>>, block: usize) -> IsoFs<MemDisk> {
-    IsoFs::mount(MemDisk { bytes: bytes.clone(), block }, 9).unwrap()
+    IsoFs::mount(MemDisk::new(bytes.clone(), block), 9).unwrap()
 }
 
 fn read_all(f: &dyn File) -> Vec<u8> {
@@ -106,9 +116,9 @@ fn cat(vfs: &Vfs, path: &str) -> Vec<u8> {
 
 #[test]
 fn rejects_non_iso() {
-    let disk = MemDisk { bytes: Arc::new(vec![0u8; 1 << 20]), block: 512 };
+    let disk = MemDisk::new(Arc::new(vec![0u8; 1 << 20]), 512);
     assert_eq!(IsoFs::mount(disk, 1).err(), Some(Errno::EINVAL));
-    let tiny = MemDisk { bytes: Arc::new(vec![0u8; 4096]), block: 512 };
+    let tiny = MemDisk::new(Arc::new(vec![0u8; 4096]), 512);
     assert_eq!(IsoFs::mount(tiny, 1).err(), Some(Errno::EINVAL));
 }
 
@@ -156,6 +166,34 @@ fn rock_ridge() {
         assert_eq!(vfs.lookup("/HELLO.TXT").err(), Some(Errno::ENOENT));
         check_read_only(&vfs);
     }
+}
+
+#[test]
+fn nul_names_and_shared_directories() {
+    let Some(xorriso) = tool("xorriso") else { return };
+    let src = tree("hardening");
+    let iso = image(&xorriso, &["-as", "mkisofs", "-R"], &src);
+
+    // A NUL in a Rock Ridge name would cut it short for C programs.
+    let mut patched = (*iso).clone();
+    let nm = b"NM\x0e\x01\x00hello.txt";
+    let at = patched.windows(nm.len()).position(|w| w == nm).expect("NM entry");
+    patched[at + 5 + 2] = 0;
+    let vfs = Vfs::new(mount(&Arc::new(patched), 2048).root());
+    assert_eq!(names(&*vfs.lookup("/").unwrap()), ["Mixed Case Long Name.data", "abs", "d1", "docs", "link"]);
+
+    // Every node of a directory shares one parse of it.
+    let disk = MemDisk::new(iso.clone(), 2048);
+    let reads = disk.reads.clone();
+    let vfs = Vfs::new(IsoFs::mount(disk, 9).unwrap().root());
+    let docs = vfs.lookup("/docs").unwrap();
+    assert_eq!(names(&*docs), ["big.bin", "empty"]);
+    let before = reads.load(Ordering::Relaxed);
+    for _ in 0..3 {
+        assert_eq!(names(&*vfs.lookup("/docs").unwrap()), ["big.bin", "empty"]);
+    }
+    assert_eq!(reads.load(Ordering::Relaxed), before, "/ and /docs were parsed again");
+    drop(docs);
 }
 
 #[test]

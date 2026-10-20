@@ -31,8 +31,9 @@ mod name;
 mod record;
 mod rrip;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -55,6 +56,15 @@ const MAX_RUN: usize = 64 * 1024;
 
 /// Largest directory read into memory; a bigger one is taken as corrupt.
 const MAX_DIR: u64 = 16 << 20;
+
+/// Bytes of `CE` continuations and `CL` targets one directory read may
+/// fetch beyond the directory itself, so a crafted image cannot turn each
+/// record into many reads.
+const SUSP_BUDGET: u64 = 64 * 1024;
+
+/// Size of the directory cache at which dead entries are first swept; later
+/// sweeps happen each time it reaches a power of two.
+const DIR_CACHE_SWEEP: usize = 64;
 
 /// Where a mounted volume's names come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +110,8 @@ struct Shared<D: BlockDevice + Send + 'static> {
     /// Bytes skipped at the start of each system use area (from `SP`).
     susp_skip: usize,
     volume_id: String,
+    /// Parsed directories by inode number, shared by every node of each.
+    dirs: SpinLock<BTreeMap<u64, Weak<Vec<Entry>>>>,
 }
 
 /// A mounted ISO 9660 volume.
@@ -112,7 +124,7 @@ pub struct IsoFs<D: BlockDevice + Send + 'static> {
 pub struct Node<D: BlockDevice + Send + 'static> {
     shared: Arc<Shared<D>>,
     entry: Entry,
-    children: Once<Vec<Entry>>,
+    children: Once<Arc<Vec<Entry>>>,
 }
 
 fn kind_of(mode: u32) -> Option<FileKind> {
@@ -147,6 +159,7 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
             names: Names::Iso,
             susp_skip: 0,
             volume_id: String::new(),
+            dirs: SpinLock::new(BTreeMap::new()),
         };
 
         let (mut primary, mut joliet) = (None, None);
@@ -203,7 +216,8 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
             interleaved: false,
         };
         if shared.names == Names::RockRidge {
-            let rr = shared.rock_ridge(dot.system_use)?;
+            let mut budget = SUSP_BUDGET;
+            let rr = shared.rock_ridge(dot.system_use, &mut budget)?;
             if let Some(mode) = rr.mode {
                 root.mode = mode & 0o7777;
             }
@@ -255,16 +269,17 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     }
 
     /// The Rock Ridge entries of a record's system use area, following
-    /// continuations.
-    fn rock_ridge(&self, system_use: &[u8]) -> Result<RockRidge, Errno> {
+    /// continuations as far as `budget` bytes allow.
+    fn rock_ridge(&self, system_use: &[u8], budget: &mut u64) -> Result<RockRidge, Errno> {
         let mut rr = RockRidge::default();
         let mut more = rr.parse(system_use.get(self.susp_skip..).unwrap_or(&[]));
         let mut hops = 0;
         while let Some(ce) = more {
             hops += 1;
-            if hops > MAX_CONTINUATIONS || ce.offset as u64 + ce.len as u64 > self.lbs {
+            if hops > MAX_CONTINUATIONS || ce.offset as u64 + ce.len as u64 > self.lbs || ce.len as u64 > *budget {
                 return Err(Errno::EIO);
             }
+            *budget -= ce.len as u64;
             let mut area = vec![0u8; ce.len as usize];
             self.read_at(ce.block as u64 * self.lbs + ce.offset as u64, &mut area)?;
             more = rr.parse(&area);
@@ -274,8 +289,8 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
 
     /// The entry for record `rec`, found at byte `pos`; `None` if it is not
     /// shown (a relocated directory's original, or a name a path cannot
-    /// hold).
-    fn entry(&self, pos: u64, rec: &Record) -> Result<Option<Entry>, Errno> {
+    /// hold). Continuations and relocations are charged to `budget`.
+    fn entry(&self, pos: u64, rec: &Record, budget: &mut u64) -> Result<Option<Entry>, Errno> {
         let dir = rec.flags & flag::DIRECTORY != 0;
         let mut e = Entry {
             name: match self.names {
@@ -293,7 +308,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             interleaved: rec.interleaved,
         };
         if self.names == Names::RockRidge {
-            let mut rr = self.rock_ridge(rec.system_use)?;
+            let mut rr = self.rock_ridge(rec.system_use, budget)?;
             if rr.relocated {
                 return Ok(None);
             }
@@ -309,6 +324,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             if let Some(block) = rr.child {
                 // The directory itself lives elsewhere; its `.` has the size.
                 let start = block as u64 * self.lbs;
+                *budget = budget.checked_sub(self.lbs).ok_or(Errno::EIO)?;
                 let mut first = vec![0u8; self.lbs as usize];
                 self.read_at(start, &mut first)?;
                 let dot = Records::new(&first, first.len()).next().ok_or(Errno::EIO)??.1;
@@ -327,7 +343,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         if e.kind == FileKind::Directory {
             e.ino = e.extents[0].start;
         }
-        if e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains('/') {
+        if e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains(['/', '\0']) {
             return Ok(None);
         }
         Ok(Some(e))
@@ -341,6 +357,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         }
         let mut data = vec![0u8; ext.len as usize];
         self.read_at(ext.start, &mut data)?;
+        let mut budget = SUSP_BUDGET + ext.len;
         let mut out = Vec::new();
         // A file whose earlier extents have been seen.
         let mut partial: Option<Entry> = None;
@@ -359,7 +376,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
                 }
                 continue;
             }
-            match self.entry(ext.start + at as u64, &rec)? {
+            match self.entry(ext.start + at as u64, &rec, &mut budget)? {
                 Some(e) if !last && e.kind == FileKind::Regular => partial = Some(e),
                 Some(e) => out.push(e),
                 None => {}
@@ -378,7 +395,21 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
         if let Some(c) = self.children.get() {
             return Ok(c);
         }
-        let c = self.shared.read_dir(&self.entry)?;
+        let ino = self.entry.ino;
+        let cached = self.shared.dirs.lock().get(&ino).and_then(Weak::upgrade);
+        let c = match cached {
+            Some(c) => c,
+            None => {
+                // Parsed without the lock; a racing reader's copy is as good.
+                let c = Arc::new(self.shared.read_dir(&self.entry)?);
+                let mut dirs = self.shared.dirs.lock();
+                if dirs.len() >= DIR_CACHE_SWEEP && dirs.len().is_power_of_two() {
+                    dirs.retain(|_, d| d.strong_count() > 0);
+                }
+                dirs.insert(ino, Arc::downgrade(&c));
+                c
+            }
+        };
         Ok(self.children.call_once(|| c))
     }
 }
