@@ -274,7 +274,7 @@ static IOAPIC_INFO: Once<(u64, u32, u32, osmium::drivers::ioapic::LineMode)> = O
 
 static UART: Once<SerialConsole<Uart16550<Pio>>> = Once::new();
 static LAPIC: Once<LocalApic> = Once::new();
-static SCHED: FifoScheduler = FifoScheduler::new(2);
+static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
 static TIMERS: TimerQueue = TimerQueue::new();
 static TSC_RATE: Once<TickRate> = Once::new();
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -472,6 +472,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });
     if ncpus > 1 {
         demos::smp(ncpus);
+        demos::balance(ncpus, &|| SCHED.steals());
     }
     fault_demo();
     overflow_demo();
