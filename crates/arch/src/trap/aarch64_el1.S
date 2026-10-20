@@ -1,4 +1,4 @@
-.section .text.osmium_trap, "ax", @progbits
+.section .text.osmium_trap, "ax"
 .macro osmium_kernel_vector kind
     // Current EL with SP_ELx: check sp before the first store, in case the
     // kernel stack has overflowed. Exactly 32 instructions (the slot size).

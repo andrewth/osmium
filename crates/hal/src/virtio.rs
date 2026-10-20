@@ -12,6 +12,7 @@ pub mod device_id {
     pub const BLOCK: u32 = 2;
     pub const CONSOLE: u32 = 3;
     pub const RNG: u32 = 4;
+    pub const GPU: u32 = 16;
 }
 
 /// Device status bits (§2.1).
@@ -217,6 +218,149 @@ pub mod blk {
     pub const HEADER_LEN: usize = 16;
     /// The request queue's index.
     pub const REQUEST_QUEUE: u16 = 0;
+}
+
+/// virtio over PCI (§4.1): vendor-specific capabilities locate the
+/// register structures in the device's BARs.
+pub mod pci {
+    #![allow(missing_docs)]
+
+    /// PCI vendor ID of every virtio device.
+    pub const VENDOR_ID: u16 = 0x1af4;
+    /// Device IDs from 0x1040 are modern devices: `0x1040 + device type`.
+    pub const MODERN_DEVICE_ID_BASE: u16 = 0x1040;
+    /// Device IDs 0x1000–0x103f are transitional devices; the PCI subsystem
+    /// device ID holds the device type.
+    pub const TRANSITIONAL_DEVICE_IDS: core::ops::RangeInclusive<u16> = 0x1000..=0x103f;
+
+    /// `virtio_pci_cap` fields, as offsets from the capability.
+    pub const CAP_CFG_TYPE: u16 = 3;
+    pub const CAP_BAR: u16 = 4;
+    pub const CAP_OFFSET: u16 = 8;
+    pub const CAP_LENGTH: u16 = 12;
+    /// `virtio_pci_notify_cap.notify_off_multiplier`.
+    pub const CAP_NOTIFY_OFF_MULTIPLIER: u16 = 16;
+
+    /// `cfg_type` values.
+    pub const CAP_COMMON_CFG: u8 = 1;
+    pub const CAP_NOTIFY_CFG: u8 = 2;
+    pub const CAP_ISR_CFG: u8 = 3;
+    pub const CAP_DEVICE_CFG: u8 = 4;
+    pub const CAP_PCI_CFG: u8 = 5;
+
+    /// `virtio_pci_common_cfg` fields.
+    pub const DEVICE_FEATURE_SELECT: usize = 0x00;
+    pub const DEVICE_FEATURE: usize = 0x04;
+    pub const DRIVER_FEATURE_SELECT: usize = 0x08;
+    pub const DRIVER_FEATURE: usize = 0x0c;
+    pub const CONFIG_MSIX_VECTOR: usize = 0x10;
+    pub const NUM_QUEUES: usize = 0x12;
+    pub const DEVICE_STATUS: usize = 0x14;
+    pub const CONFIG_GENERATION: usize = 0x15;
+    pub const QUEUE_SELECT: usize = 0x16;
+    pub const QUEUE_SIZE: usize = 0x18;
+    pub const QUEUE_MSIX_VECTOR: usize = 0x1a;
+    pub const QUEUE_ENABLE: usize = 0x1c;
+    pub const QUEUE_NOTIFY_OFF: usize = 0x1e;
+    pub const QUEUE_DESC: usize = 0x20;
+    pub const QUEUE_DRIVER: usize = 0x28;
+    pub const QUEUE_DEVICE: usize = 0x30;
+    /// Bytes of the common configuration structure the driver uses.
+    pub const COMMON_CFG_LEN: usize = 0x38;
+
+    /// ISR status bit: a used ring was updated.
+    pub const ISR_QUEUE: u8 = 1;
+    /// ISR status bit: the configuration changed.
+    pub const ISR_CONFIG: u8 = 2;
+}
+
+/// virtio-gpu (§5.7): 2D commands on the control queue.
+///
+/// Every request and response starts with the 24-byte control header
+/// `type: le32, flags: le32, fence_id: le64, ctx_id: le32, ring_idx: u8,
+/// padding: [u8; 3]`. Rectangles are `x, y, width, height: le32`.
+pub mod gpu {
+    #![allow(missing_docs)]
+
+    /// The device supports 3D (virgl) commands.
+    pub const F_VIRGL: u64 = 1 << 0;
+    /// The device answers `GET_EDID`.
+    pub const F_EDID: u64 = 1 << 1;
+
+    /// Configuration space: pending events (le32).
+    pub const CONFIG_EVENTS_READ: usize = 0;
+    /// Configuration space: write 1s to clear events (le32).
+    pub const CONFIG_EVENTS_CLEAR: usize = 4;
+    /// Configuration space: number of scanouts (le32).
+    pub const CONFIG_NUM_SCANOUTS: usize = 8;
+    /// Event: the display configuration changed.
+    pub const EVENT_DISPLAY: u32 = 1;
+
+    pub const CONTROL_QUEUE: u16 = 0;
+    pub const CURSOR_QUEUE: u16 = 1;
+
+    /// Most scanouts a device has.
+    pub const MAX_SCANOUTS: usize = 16;
+
+    // Commands.
+    pub const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
+    pub const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+    pub const CMD_RESOURCE_UNREF: u32 = 0x0102;
+    pub const CMD_SET_SCANOUT: u32 = 0x0103;
+    pub const CMD_RESOURCE_FLUSH: u32 = 0x0104;
+    pub const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
+    pub const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+    pub const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
+    pub const CMD_GET_EDID: u32 = 0x010a;
+    pub const CMD_UPDATE_CURSOR: u32 = 0x0300;
+    pub const CMD_MOVE_CURSOR: u32 = 0x0301;
+
+    // Responses.
+    pub const RESP_OK_NODATA: u32 = 0x1100;
+    pub const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+    pub const RESP_OK_EDID: u32 = 0x1104;
+    pub const RESP_ERR_UNSPEC: u32 = 0x1200;
+    pub const RESP_ERR_OUT_OF_MEMORY: u32 = 0x1201;
+    pub const RESP_ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
+    pub const RESP_ERR_INVALID_RESOURCE_ID: u32 = 0x1203;
+    pub const RESP_ERR_INVALID_PARAMETER: u32 = 0x1205;
+
+    /// Header flag: `fence_id` is valid; respond only once the command has
+    /// finished.
+    pub const FLAG_FENCE: u32 = 1;
+
+    // Formats (`enum virtio_gpu_formats`), named by byte order in memory.
+    pub const FORMAT_B8G8R8A8_UNORM: u32 = 1;
+    pub const FORMAT_B8G8R8X8_UNORM: u32 = 2;
+    pub const FORMAT_A8R8G8B8_UNORM: u32 = 3;
+    pub const FORMAT_X8R8G8B8_UNORM: u32 = 4;
+    pub const FORMAT_R8G8B8A8_UNORM: u32 = 67;
+    pub const FORMAT_X8B8G8R8_UNORM: u32 = 68;
+    pub const FORMAT_A8B8G8R8_UNORM: u32 = 121;
+    pub const FORMAT_R8G8B8X8_UNORM: u32 = 134;
+
+    /// Bytes of the control header.
+    pub const HDR_LEN: usize = 24;
+    /// Bytes of one `virtio_gpu_display_one` (rect, enabled, flags).
+    pub const DISPLAY_ONE_LEN: usize = 24;
+    /// Bytes of `virtio_gpu_resp_display_info`.
+    pub const RESP_DISPLAY_INFO_LEN: usize = HDR_LEN + MAX_SCANOUTS * DISPLAY_ONE_LEN;
+    /// `resource_create_2d`: header, resource_id, format, width, height.
+    pub const RESOURCE_CREATE_2D_LEN: usize = HDR_LEN + 16;
+    /// `resource_attach_backing`: header, resource_id, nr_entries, then
+    /// [`MEM_ENTRY_LEN`]-byte entries.
+    pub const RESOURCE_ATTACH_BACKING_LEN: usize = HDR_LEN + 8;
+    /// `virtio_gpu_mem_entry`: addr le64, length le32, padding.
+    pub const MEM_ENTRY_LEN: usize = 16;
+    /// `set_scanout`: header, rect, scanout_id, resource_id.
+    pub const SET_SCANOUT_LEN: usize = HDR_LEN + 24;
+    /// `transfer_to_host_2d`: header, rect, offset le64, resource_id, padding.
+    pub const TRANSFER_TO_HOST_2D_LEN: usize = HDR_LEN + 32;
+    /// `resource_flush`: header, rect, resource_id, padding.
+    pub const RESOURCE_FLUSH_LEN: usize = HDR_LEN + 24;
+    /// `resource_unref` and `resource_detach_backing`: header,
+    /// resource_id, padding.
+    pub const RESOURCE_UNREF_LEN: usize = HDR_LEN + 8;
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+pub mod display;
 pub mod user;
 
 use alloc::vec::Vec;

@@ -615,6 +615,25 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         None => println!("[nvme]  no NVMe controller"),
     }
 
+    // --- Displays behind PCIe (virtio-gpu-pci, bochs-display) -------------------
+    if let (Some(h), Some(b)) = (pcie.as_ref(), bars.as_mut()) {
+        // SAFETY: the device tree puts the ECAM window here, mapped as device
+        // memory; the display probe is its only user meanwhile.
+        let ecam = pci::Ecam::new(unsafe { IoMem::new(h.ecam.0 as *mut u8, h.ecam.1 as usize) }, 0);
+        // SAFETY: BARs are assigned inside the memory window, mapped above.
+        let mut map = |addr: u64, size: u64| unsafe { IoMem::new(addr as *mut u8, size as usize) };
+        demos::display::pci(&ecam, 0, 640, 480, Some(b), &mut map, &FRAMES);
+    }
+    let gpu = virtio_slots(&fdt).find_map(|(base, len)| {
+        // SAFETY: a virtio-mmio slot from the device tree, mapped above;
+        // nothing else uses it.
+        let t = MmioTransport::new(unsafe { IoMem::new(base as *mut u8, len as usize) }).ok()?;
+        (t.device_type() == DeviceType::Gpu).then_some(t)
+    });
+    if let Some(t) = gpu {
+        demos::display::virtio_gpu("virtio-gpu-mmio", t, &FRAMES);
+    }
+
     // --- xHCI behind PCIe ------------------------------------------------------
     match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, pci::Class::XHCI, 0)) {
         Some((addr, base, len, pin)) => {

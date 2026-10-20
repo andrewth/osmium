@@ -1,5 +1,6 @@
 //! Multiboot2 boot information.
 
+use osmium_hal::display::{FramebufferInfo, PixelFormat};
 use osmium_mm::{MemoryMap, PhysAddr, RegionKind};
 
 use crate::{cstr, le32, le64};
@@ -59,6 +60,17 @@ pub struct Framebuffer {
     pub height: u32,
     /// Bits per pixel.
     pub bpp: u8,
+    /// Framebuffer type: 0 indexed colour, 1 direct RGB, 2 EGA text.
+    pub kind: u8,
+    /// For direct RGB, the channel layout from the colour info.
+    pub format: Option<PixelFormat>,
+}
+
+impl Framebuffer {
+    /// Its geometry, for a direct RGB framebuffer.
+    pub fn info(&self) -> Option<FramebufferInfo> {
+        Some(FramebufferInfo { width: self.width, height: self.height, stride: self.pitch, format: self.format? })
+    }
 }
 
 impl<'a> BootInfo<'a> {
@@ -175,6 +187,13 @@ impl<'a> BootInfo<'a> {
             width: le32(p, 12)?,
             height: le32(p, 16)?,
             bpp: *p.get(20)?,
+            kind: *p.get(21)?,
+            // Direct RGB colour info: position and size of red, green and
+            // blue, a byte each.
+            format: p.get(24..30).filter(|_| p[21] == 1).and_then(|c| {
+                let mask = |pos: u8, size: u8| if size == 0 || size > 8 { 0 } else { ((1u32 << size) - 1) << pos };
+                PixelFormat::from_masks(p[20], mask(c[0], c[1]), mask(c[2], c[3]), mask(c[4], c[5]))
+            }),
         })
     }
 }
@@ -228,6 +247,24 @@ mod tests {
         assert_eq!(map.total(RegionKind::Usable), 0x9_fc00 + 0x7ef_0000 - 0x10_0000);
         assert_eq!(map.total(RegionKind::Bootloader), 0x10_0000);
         assert!(info.rsdp().is_none());
+        assert!(info.framebuffer().is_none());
+
+        // An 800x600 XRGB8888 framebuffer: address, pitch, width, height,
+        // bpp, type 1 (RGB), reserved, then red 16/8, green 8/8, blue 0/8.
+        let mut fb = Vec::new();
+        fb.extend_from_slice(&0xfd00_0000u64.to_le_bytes());
+        for v in [3200u32, 800, 600] {
+            fb.extend_from_slice(&v.to_le_bytes());
+        }
+        fb.extend_from_slice(&[32, 1, 0, 0, 16, 8, 8, 8, 0, 8]);
+        let mut b = std::vec![0u8; 8];
+        tag(&mut b, TAG_FRAMEBUFFER, &fb);
+        tag(&mut b, TAG_END, &[]);
+        let total = b.len() as u32;
+        b[..4].copy_from_slice(&total.to_le_bytes());
+        let f = BootInfo::new(&b).unwrap().framebuffer().unwrap();
+        assert_eq!((f.addr, f.kind, f.format), (PhysAddr::new(0xfd00_0000), 1, Some(PixelFormat::XRGB8888)));
+        assert_eq!(f.info().map(|i| (i.width, i.height, i.stride)), Some((800, 600, 3200)));
         assert!(BootInfo::new(&b[..10]).is_err());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "osmium-boot"
-description = "Osmium: device tree and Multiboot2 parsing, FDT writer, boot memory maps"
+description = "Osmium: device tree, Multiboot2, PVH, ACPI and UEFI GOP parsing, FDT writer, boot memory maps"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,3 +16,4 @@ alloc = []
 
 [dependencies]
 osmium-mm.workspace = true
+osmium-hal.workspace = true

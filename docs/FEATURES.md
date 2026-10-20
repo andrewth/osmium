@@ -102,6 +102,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Trap entry (RISC-V S/M-mode, AArch64 EL1/EL2): full `TrapFrame`, registered handler, portable `Trap` cause decoding
 - ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
 - ✅ x86_64 IDT/trap entry (all 256 vectors, interrupt gates, `int3` normalized to point at the instruction), per-CPU GDT/TSS (`CpuTables`) with IST stacks (`trap::set_ist`)
+- ✅ x86_64 BIOS calls from long mode (`x86_64::bios`): a thunk at 0x7000 drops to real mode, runs one software interrupt and comes back, restoring GDT, IDT, CR0/CR3, EFER and the FS/GS bases; the x86_64 example sets a VESA mode with it
 - ✅ Per-process address spaces: `PageTable::share_root_entries` shares the kernel's root entries; the examples switch CR3/satp/TTBR0 in the context-switch hook from per-task data, and free each address space with its task
 - ✅ AArch64 user mode (EL1 kernels): `aarch64::enter_user` (eret to EL0t), lower-EL vectors save and restore `SP_EL0` and `TPIDRRO_EL0` in the frame, `TrapFrame::from_user`
 - ✅ RISC-V user mode: `riscv64::enter_user` (sret to U-mode), traps from U-mode land on `TrapCpu`'s kernel stack with the kernel's `tp` restored, `with_user_access` (SUM) for copying user buffers, `TrapFrame::from_user`
@@ -138,7 +139,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `NetDevice` trait and `MacAddress`
 - ✅ PCI: `ConfigAccess` over ECAM or x86 port I/O, brute-force enumeration, BAR probing and assignment (`BarAllocator`), capability lists
 - ✅ USB: setup packets, standard descriptor parsing, the `UsbHost` host-controller trait, and generic device enumeration
-- ✅ virtio constants and split-ring layout shared by drivers and device models
+- ✅ virtio constants and split-ring layout shared by drivers and device models (including virtio-pci capabilities and virtio-gpu commands)
+- ✅ Displays: `Framebuffer` over any `IoMem` (16/24/32 bpp, any channel layout from VBE, GOP or virtio-gpu; fill, per-pixel drawing, 1-bpp bitmaps for fonts, scrolling) and the `Display` trait, whose `flush` serves devices that copy from guest memory
 - 🗺 Async variants of device traits, PCI bridge walking, MSI/MSI-X
 
 ### `osmium-drivers`: reference drivers
@@ -159,7 +161,11 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Mellanox ConnectX-2/-3 (mlx4) Ethernet: reset, firmware start, ICM, polled raw Ethernet queue pair per port as a `NetDevice`; tested against a simulated HCA
 - ✅ AHCI (SATA): HBA handoff and port bring-up, IDENTIFY, READ/WRITE DMA EXT and FLUSH CACHE EXT; each disk is its own `BlockDevice` that outlives the HBA; error recovery with CLO or COMRESET; boots against QEMU `ich9-ahci` + `ide-hd`
 - ✅ NVMe: admin and one I/O queue pair (phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting, normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
-- 🗺 virtio-pci transport; virtio console; xHCI hubs and isochronous transfers; HID report descriptors; GICv3; HPET; AHCI/NVMe interrupts, NCQ and multiple queues; ATAPI
+- ✅ virtio-pci transport (modern, capability-located registers); tested against a fake function and on QEMU `virtio-gpu-pci`/`virtio-vga`
+- ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
+- ✅ Bochs DISPI display (`BochsVbe`): QEMU std VGA, `bochs-display` and `virtio-vga` modes over MMIO on any architecture or ports on x86
+- ✅ VESA BIOS Extensions: controller and mode information, mode search and LFB mode setting through a `VideoBios` (x86's real-mode thunk, or a fake in tests)
+- 🗺 virtio console; virtio-gpu cursor, EDID and interrupts; a framebuffer text console; xHCI hubs and isochronous transfers; HID report descriptors; GICv3; HPET; AHCI/NVMe interrupts, NCQ and multiple queues; ATAPI
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)
@@ -183,7 +189,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ ELF64 executables: validated parsing of loadable segments, and `Elf::load_into` any `PageTable` (per-segment permissions, zeroed `.bss`, shared pages merged); all three examples run the same Rust user program (`examples/user/hello.rs`) built as an ELF
 - ✅ PVH start-info parser and the `pvh_entry_note!` ELF-note macro
 - ✅ ACPI: RSDP/RSDT/XSDT with checksums, MADT (local APICs, x2APICs, I/O APICs), MCFG (PCI ECAM windows)
-- 🗺 UEFI boot services wrapper, Limine protocol, AML
+- ✅ UEFI: system table, console output, `LocateProtocol`, `Stall`, `ResetSystem`, and the Graphics Output Protocol (mode list, mode set, framebuffer as `FramebufferInfo`, `Blt` fill for framebuffer-less modes)
+- 🗺 Fuller UEFI boot services (memory map, `ExitBootServices`), Limine protocol, AML
 
 ### `osmium-fs`: file systems
 - ✅ `File` trait: one node (file, directory, device, symlink), stateless and offset-based like `pread`/`pwrite`, with defaults so a device implements only what it supports; `Stat`, `DirEntry`, `FileKind`
@@ -251,7 +258,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ `examples/aarch64-hyp` also boots a whole guest kernel when QEMU's loader provides one: Osmium's own `aarch64-virt` runs as a two-vCPU EL1 guest under a generated device tree (`aarch64::fdt::ArmMachine`), the emulated GICv2 and PL011 (`devices::Pl011`), the virtual timer and PSCI, with SGIs between its CPUs, preemption, migration, load balancing, EL0 processes and fork/execve/wait4
 - ✅ `examples/riscv-hyp`: boots a whole guest kernel from an ELF image QEMU's loader places in RAM, with a generated device tree, an emulated 16550 and PLIC, and SBI from the hypervisor, one vCPU per host hart (kicked with host IPIs), a virtio-blk disk over a host RAM disk and a virtio-net card bridged to the host's own virtio-net. Under check.sh the guest is Osmium's own `riscv-virt` kernel on two vCPUs, which runs its scheduler, timer preemption, cross-CPU migration and load balancing, DHCP, ping and a TCP echo through the bridged network, a block round trip the host then finds on its RAM disk, fault and stack-guard demos, U-mode processes and fork/execve/wait4 in VS-mode, skips its own hypervisor demos (no `h` in its `riscv,isa`) and shuts down through SBI
 - ✅ `examples/x86_64-hyp`: enables AMD SVM (TCG with `-cpu max`) and runs a 32-bit guest under nested paging that talks to emulated 16550s over port I/O and MMIO and takes COM1's interrupt through an emulated PIC, then a 64-bit guest with paging on
-- ✅ `examples/x86_64-pc`: the same on QEMU q35 (PVH boot, COM1, local APIC timer, 4-level paging, ACPI MADT, INIT/SIPI trampoline)
+- ✅ `examples/x86_64-pc`: the same on QEMU q35 (PVH boot, COM1, local APIC timer, 4-level paging, ACPI MADT, INIT/SIPI trampoline), plus a VESA mode set through the video BIOS in real mode and colour bars on `virtio-vga`
+- ✅ `examples/uefi`: a UEFI application for x86_64 (OVMF) and AArch64 (AAVMF) that sets a GOP mode and draws colour bars on its framebuffer (or with `Blt` on virtio-gpu); check.sh verifies the screen
 - ✅ `examples/riscv-firmware`: M-mode firmware with `-bios none`, no heap and no scheduler: async tasks on `osmium-exec` await CLINT timer and PLIC/UART interrupts, then power off
 - ✅ All three examples bring up 4 CPUs and run shared SMP demos (cross-CPU mutex wake-ups by IPI, task migration)
 - ✅ `scripts/check.sh`: tests, clippy, rustdoc, all targets, and the QEMU boot test

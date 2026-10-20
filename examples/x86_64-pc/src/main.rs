@@ -19,12 +19,13 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use osmium::arch::trap::{self, Trap, TrapFrame};
 use osmium::arch::x86_64 as x86;
 use osmium::arch::{MAX_CPUS, cpu, irq};
-use osmium::boot::acpi::{Acpi, Madt};
+use osmium::boot::acpi::{Acpi, EcamWindow, Madt, Mcfg};
 use osmium::boot::pvh::StartInfo;
 use osmium::drivers::lapic::{self, LocalApic};
 use osmium::drivers::pit::{self, Pit};
 use osmium::drivers::uart16550::{Pio, Uart16550};
 use osmium::hal::console::{SerialConsole, set_console};
+use osmium::hal::display::{Display, FramebufferInfo};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
 use osmium::hal::timer::TickRate;
@@ -255,16 +256,24 @@ extern "C" fn kmain(start_info: usize) -> ! {
         info.rsdp()
     );
 
+    // --- VESA, through the video BIOS --------------------------------------
+    // First: the BIOS needs the boot tables' identity map of low memory and
+    // the machine as SeaBIOS left it (IVT, PIC), before IRQs are ours.
+    let vesa = vesa(800, 600);
+
     // --- CPUs from the ACPI MADT (read while the boot tables map it) ---------
     // Every enabled CPU's APIC id; the boot CPU's own id comes later from
     // its local APIC's ID register (not CPUID, which a hypervisor may not
     // virtualize).
     let mut madt_ids = [None; MAX_CPUS];
+    let mut ecam = None;
     if let Some(rsdp) = info.rsdp() {
         // SAFETY: the boot tables identity-map the first 4 GiB, where QEMU's
         // ACPI tables live; they are only read here.
         let read = |pa: u64, len: usize| Some(unsafe { core::slice::from_raw_parts(pa as *const u8, len) });
-        let madt = Acpi::new(rsdp.0, read).ok().and_then(|a| a.find(b"APIC")).and_then(Madt::parse);
+        let acpi = Acpi::new(rsdp.0, read).ok();
+        ecam = acpi.as_ref().and_then(|a| a.find(b"MCFG")).and_then(Mcfg::parse).and_then(|m| m.entries().find(|e| e.segment == 0));
+        let madt = acpi.and_then(|a| a.find(b"APIC")).and_then(Madt::parse);
         if let Some(m) = &madt
             && let Some(io) = m.io_apics().next()
         {
@@ -335,6 +344,9 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: the syscall handler treats every argument as untrusted.
     unsafe { trap::allow_from_user(trap::SYSCALL_VECTOR) };
     println!("[guard] task stacks get unmapped guard pages; double faults run on IST{DOUBLE_FAULT_IST}");
+
+    // --- Displays: the VESA framebuffer, then PCI adapters (virtio-vga) -----
+    display_demo(vesa, ecam);
 
     // --- Timers: calibrate TSC and APIC timer against the PIT ---------------
     // SAFETY: the PIT and port 0x61 belong to this kernel.
@@ -409,6 +421,78 @@ extern "C" fn kmain(start_info: usize) -> ! {
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     shutdown()
+}
+
+/// Sets a `width` by `height` 32-bit VESA mode through the video BIOS, and
+/// returns its framebuffer and the video memory size.
+fn vesa(width: u16, height: u16) -> Option<(PhysAddr, FramebufferInfo, usize)> {
+    use osmium::drivers::display::vbe::{RealModeBios, Vbe};
+    // SAFETY: 0x5000..0x8000 is free low memory, kept from the frame
+    // allocator and identity-mapped (and executable) in the boot tables,
+    // whose root is below 4 GiB. Only this CPU runs, and nothing has
+    // touched the IVT, the PIC or the BIOS data area yet. Without a video
+    // BIOS (as a hypervisor's PVH guest) nothing is called.
+    let Some(bios) = (unsafe { RealModeBios::probe() }) else {
+        println!("[vesa]  no video BIOS");
+        return None;
+    };
+    // SAFETY: as above.
+    unsafe { x86::bios::install() };
+    let mut vbe = Vbe::new(bios).inspect_err(|e| println!("[vesa]  no VBE: {e:?}")).ok()?;
+    let (major, minor) = (vbe.version() >> 8, vbe.version() & 0xff);
+    let Some(mode) = vbe.find_mode(width, height, 32) else {
+        println!("[vesa]  VBE {major}.{minor}: no {width}x{height} mode among {}", vbe.modes().len());
+        return None;
+    };
+    let (addr, fb) = vbe.set_mode(&mode).inspect_err(|e| println!("[vesa]  set mode {:#x}: {e:?}", mode.mode)).ok()?;
+    println!(
+        "[vesa]  VBE {major}.{minor}, {} KiB, {} modes; set mode {:#x}: {}x{} {}bpp at {:#x}",
+        vbe.memory() / 1024,
+        vbe.modes().len(),
+        mode.mode,
+        fb.width,
+        fb.height,
+        fb.format.bpp,
+        addr.0
+    );
+    Some((addr, fb, vbe.memory()))
+}
+
+/// Draws on the VESA framebuffer, reading the mode back from the Bochs
+/// DISPI registers the BIOS programmed, then on every PCI display adapter.
+fn display_demo(vesa: Option<(PhysAddr, FramebufferInfo, usize)>, ecam: Option<EcamWindow>) {
+    use osmium::drivers::display::bochs::BochsVbe;
+    let mut guard = PT.lock();
+    let pt = guard.as_mut().unwrap();
+    // Identity-maps device memory (the pages not mapped yet); returns a
+    // window onto it.
+    let mut map = |addr: u64, size: u64| {
+        let end = (addr + size).next_multiple_of(PAGE_SIZE as u64);
+        for page in (addr & !(PAGE_SIZE as u64 - 1)..end).step_by(PAGE_SIZE) {
+            if pt.translate(VirtAddr::new(page)).is_none() {
+                let flags = MapFlags::RW | MapFlags::DEVICE | MapFlags::GLOBAL;
+                pt.map_range(VirtAddr::new(page), PhysAddr::new(page), PAGE_SIZE as u64, flags).unwrap();
+            }
+        }
+        // SAFETY: just mapped as device memory; the demo owns the device.
+        unsafe { IoMem::new(addr as *mut u8, size as usize) }
+    };
+    if let Some((addr, fb, vram)) = vesa {
+        let vram = map(addr.0, vram.max(fb.size()) as u64);
+        // SAFETY: the VGA device's DISPI and VGA ports; this kernel owns them.
+        match unsafe { BochsVbe::new_ports(vram) } {
+            Ok(mut dispi) if dispi.info() == fb => {
+                println!("[vesa]  DISPI {:#x} reads back the BIOS's mode", dispi.version());
+                demos::display::show("vesa", &mut dispi);
+            }
+            Ok(dispi) => println!("[vesa]  DISPI holds {:?}, not the BIOS's {fb:?}", dispi.info()),
+            Err(e) => println!("[vesa]  no DISPI behind the BIOS: {e:?}"),
+        }
+    }
+    let Some(ecam) = ecam else { return };
+    // Bus 0 is enough for QEMU's q35; SeaBIOS assigned the BARs.
+    let cfg = osmium::hal::pci::Ecam::new(map(ecam.base, 1 << 20), 0);
+    demos::display::pci(&cfg, 0, 800, 600, None, &mut map, &FRAMES);
 }
 
 /// The CPUID brand string (no heap needed: called before the heap exists).

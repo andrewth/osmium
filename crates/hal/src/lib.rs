@@ -18,6 +18,8 @@
 //! - [`irq::IrqTable`]: maps interrupt numbers to handlers.
 //! - [`console`]: a swappable global console behind `print!`/`println!`.
 //! - [`dma`]: DMA buffer descriptors.
+//! - [`display`]: linear framebuffers, pixel formats and the
+//!   [`display::Display`] trait.
 #![no_std]
 
 #[cfg(test)]
@@ -25,6 +27,7 @@ extern crate std;
 
 pub mod block;
 pub mod console;
+pub mod display;
 pub mod dma;
 pub mod irq;
 pub mod mmio;

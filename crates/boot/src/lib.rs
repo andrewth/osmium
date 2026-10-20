@@ -8,6 +8,8 @@
 //! - [`acpi`]: RSDP/RSDT/XSDT, MADT (CPUs, I/O APICs) and MCFG (PCI ECAM).
 //! - [`pvh`]: the PVH start-info structure (QEMU, Firecracker, Cloud
 //!   Hypervisor), plus a macro for the ELF note that advertises a PVH entry.
+//! - [`uefi`]: the UEFI system table, enough to print, set a Graphics Output
+//!   Protocol (GOP) mode and take its framebuffer, and shut down.
 //!
 //! Both can populate an [`osmium_mm::MemoryMap`], the starting point for
 //! the frame allocator.
@@ -23,6 +25,7 @@ pub mod elf;
 pub mod fdt;
 pub mod multiboot2;
 pub mod pvh;
+pub mod uefi;
 
 /// Reads a big-endian `u32` at `off`.
 pub(crate) fn be32(data: &[u8], off: usize) -> Option<u32> {

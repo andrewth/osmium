@@ -1,4 +1,4 @@
-.section .text.osmium_trap, "ax", @progbits
+.section .text.osmium_trap, "ax"
 osmium_trap_stub_0:
     push 0
     push 0
@@ -1057,7 +1057,7 @@ osmium_trap_return:
     add rsp, 32
     iretq
 
-.section .rodata.osmium_trap, "a", @progbits
+.section .rodata.osmium_trap, "a"
 .balign 8
 .globl osmium_trap_stub_table
 osmium_trap_stub_table:

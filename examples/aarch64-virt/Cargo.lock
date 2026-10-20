@@ -46,6 +46,7 @@ version = "0.1.0"
 name = "osmium-boot"
 version = "0.1.0"
 dependencies = [
+ "osmium-hal",
  "osmium-mm",
 ]
 

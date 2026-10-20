@@ -1,7 +1,7 @@
 //! virtio devices.
 //!
 //! A virtio driver is split the way the specification is: a [`Transport`]
-//! (MMIO here; PCI later) reaches the device's registers, a
+//! ([`mmio::MmioTransport`] or [`pci::PciTransport`]) reaches the device's registers, a
 //! [`queue::VirtQueue`] shares buffers with it through DMA memory, and the
 //! device driver ([`net::VirtioNet`]) speaks the device type's protocol over
 //! both.
@@ -15,8 +15,10 @@ use osmium_hal::virtio::device_id;
 use osmium_mm::PhysAddr;
 
 pub mod blk;
+pub mod gpu;
 pub mod mmio;
 pub mod net;
+pub mod pci;
 pub mod queue;
 
 /// Device type IDs.
@@ -30,6 +32,8 @@ pub enum DeviceType {
     Console,
     /// Entropy source.
     Rng,
+    /// Graphics adapter.
+    Gpu,
     /// Any other ID (0 means no device behind this transport).
     Other(u32),
 }
@@ -41,6 +45,7 @@ impl From<u32> for DeviceType {
             device_id::BLOCK => DeviceType::Block,
             device_id::CONSOLE => DeviceType::Console,
             device_id::RNG => DeviceType::Rng,
+            device_id::GPU => DeviceType::Gpu,
             other => DeviceType::Other(other),
         }
     }

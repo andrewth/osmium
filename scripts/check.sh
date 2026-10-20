@@ -53,6 +53,24 @@ boot() {
     rm -f "$log"
 }
 
+# Checks a display while QEMU runs: scripts/screen.py screendumps over QMP
+# until it sees the demos' colour bars. `screen QEMU WIDTH HEIGHT [DEVICE]`
+# sets $qmp to a fresh socket for QEMU's -qmp and starts the checker in the
+# background as $screen_pid (0 when QEMU is missing); `screen_wait NAME`
+# collects its verdict.
+screen() {
+    qmp=$(mktemp -u)
+    screen_pid=0
+    command -v "$1" >/dev/null || return 0
+    python3 -I scripts/screen.py "$qmp" "$2" "$3" 600 ${4:-} &
+    screen_pid=$!
+}
+screen_wait() {
+    [ "$screen_pid" = 0 ] && return
+    wait "$screen_pid" || { echo "$1: screen check failed"; exit 1; }
+    rm -f "$qmp"
+}
+
 # Multi-threaded TCG runs the four CPUs in parallel on host threads.
 # QEMU's user network answers the kernel's ARP request over virtio-net, then
 # osmium-net gets a DHCP lease, pings the gateway and round-trips a TCP echo
@@ -63,7 +81,9 @@ boot() {
 # stick is formatted FAT32, the kernel writes a file on it, and fsck.fat must
 # accept the result. A SATA disk behind AHCI and an NVMe namespace each take
 # a sector round trip, as does an iSCSI LUN that scripts/iscsi-target.py
-# serves through a second guestfwd.
+# serves through a second guestfwd. Colour bars go up on virtio-gpu over
+# PCI and MMIO and on bochs-display (Bochs DISPI registers, no BIOS); the
+# PCI GPU's screen is checked.
 stick=$(mktemp)
 vdisk=$(mktemp)
 sata=$(mktemp)
@@ -76,7 +96,8 @@ if PATH=$PATH:/usr/sbin command -v mkfs.fat >/dev/null; then
     PATH=$PATH:/usr/sbin mkfs.fat -F 32 -s 1 "$stick" >/dev/null
     fat_expect=';\[fat\]   wrote and read back "/osmium/Hello from osmium.txt"'
 fi
-EXPECT='ARP: 10.0.2.2 is at;DHCP: 10.0.2.15/24 via 10.0.2.2;ping 10.0.2.2: seq 1 in;TCP echo from 10.0.2.100:7: "hello over TCP";\[blk\]   virtio-blk .*: 16384 sectors;wrote and read back sector 8192;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01;wrote and read back block 79999;keyboard transfer still pending after disk I/O;\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/riscv64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111;\[guest\] hello over MMIO;\[guest\] hello over SBI;guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0;\[vguest\] timer interrupt after;\[vguest\] PLIC claim 10: received "ping";\[vguest\] PLIC claim 1: ARP reply, 10.0.2.2 is at 52:55:0a:00:02:02;\[vguest\] virtio-blk: 64 sectors; sector 3 written and read back;the host RAM disk holds the sector the guest wrote;driver guest exit Shutdown;\[smp-guest\] hart 0: got the IPI; hart 1 is stopped;SMP guest: 2 vCPUs on .*hart_start returned 0, hart 1 got opaque 0x1234;xHCI interrupts: [1-9];FP guests interleaved on one hart: vCPU a0=1 got 12, a0=2 got 14 (expected 12 and 14);\[usb\]     ecm: ARP: 10.0.2.2 is at;\[ahci\]  port 0 "QEMU HARDDISK": 16384 sectors of 512; round trip Ok(8192);\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192);\[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512;\[iscsi\] wrote and read back block 8192'"$fat_expect" \
+screen qemu-system-riscv64 640 400 gpu
+EXPECT='ARP: 10.0.2.2 is at;DHCP: 10.0.2.15/24 via 10.0.2.2;ping 10.0.2.2: seq 1 in;TCP echo from 10.0.2.100:7: "hello over TCP";\[blk\]   virtio-blk .*: 16384 sectors;wrote and read back sector 8192;INQUIRY "QEMU" "QEMU HARDDISK";interface 0: class 03/01/01;wrote and read back block 79999;keyboard transfer still pending after disk I/O;\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/riscv64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111;\[guest\] hello over MMIO;\[guest\] hello over SBI;guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0;\[vguest\] timer interrupt after;\[vguest\] PLIC claim 10: received "ping";\[vguest\] PLIC claim 1: ARP reply, 10.0.2.2 is at 52:55:0a:00:02:02;\[vguest\] virtio-blk: 64 sectors; sector 3 written and read back;the host RAM disk holds the sector the guest wrote;driver guest exit Shutdown;\[smp-guest\] hart 0: got the IPI; hart 1 is stopped;SMP guest: 2 vCPUs on .*hart_start returned 0, hart 1 got opaque 0x1234;xHCI interrupts: [1-9];FP guests interleaved on one hart: vCPU a0=1 got 12, a0=2 got 14 (expected 12 and 14);\[usb\]     ecm: ARP: 10.0.2.2 is at;\[ahci\]  port 0 "QEMU HARDDISK": 16384 sectors of 512; round trip Ok(8192);\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192);\[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512;\[iscsi\] wrote and read back block 8192;\[virtio-gpu\] 640x400 32bpp, stride 2560: colour bars drawn;\[bochs\] 640x480 32bpp, stride 2560: colour bars drawn;\[virtio-gpu-mmio\] 640x400 32bpp, stride 2560: colour bars drawn'"$fat_expect" \
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi \
     -netdev user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat,guestfwd=tcp:10.0.2.100:3260-cmd:"python3 scripts/iscsi-target.py $iscsi" -device virtio-net-device,netdev=n0 \
@@ -85,7 +106,9 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -netdev user,id=n1 -device usb-net,netdev=n1 \
     -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,drive=stick \
     -device ahci,id=ahci0 -drive if=none,id=sd0,format=raw,file="$sata" -device ide-hd,drive=sd0,bus=ahci0.0 \
-    -drive if=none,id=nv0,format=raw,file="$nvdisk" -device nvme,serial=osmium0,drive=nv0
+    -drive if=none,id=nv0,format=raw,file="$nvdisk" -device nvme,serial=osmium0,drive=nv0 \
+    -device virtio-gpu-device -device virtio-gpu-pci,id=gpu -device bochs-display -qmp "unix:$qmp,server=on,wait=off"
+screen_wait riscv-virt
 if [ -n "$fat_expect" ]; then
     echo "== fsck.fat the USB stick the kernel wrote"
     report=$(PATH=$PATH:/usr/sbin fsck.fat -n -l "$stick") || { echo "$report"; echo "riscv-virt: fsck.fat rejected the USB stick"; exit 1; }
@@ -95,9 +118,14 @@ rm -f "$stick" "$vdisk" "$sata" "$nvdisk" "$iscsi"
 EXPECT='\[guard\] task "deep" overflowed;nested Breakpoint on the exception stack;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/aarch64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111' \
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
-EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);user-2 exited with status 0;\[uart\]  COM1 IRQ 4;hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/x86_64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111' \
+# The VESA BIOS sets the mode through a real-mode thunk, then virtio-vga's
+# virtio-gpu side takes over the screen, which is checked.
+screen qemu-system-x86_64 640 400
+EXPECT='\[guard\] task "deep" overflowed;user-bad killed: PageFault;user-1 exited with status 0 (kernel sees CPU 1);user-2 exited with status 0;\[uart\]  COM1 IRQ 4;hello from process 2;4 of 4 address spaces torn down;hello from a Rust ELF: 46 primes below 200;pid [0-9]* on Osmium/x86_64: brk ok, mmap ok, writev ok;init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok;exec.d as "init child" with HOME=/;execve: child [0-9]* exited with status 5; then wait4 says -10;1 of 1 init address space torn down;/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries;\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111;\[vesa\]  VBE 3.0, .* set mode 0x[0-9a-f]*: 800x600 32bpp at;\[vesa\]  DISPI 0xb0c5 reads back the BIOS.s mode;\[vesa\] 800x600 32bpp, stride 3200: colour bars drawn;\[virtio-vga\] DISPI 0xb0c5: firmware left 800x600 32bpp;\[virtio-vga\] 640x400 32bpp, stride 2560: colour bars drawn' \
 boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
-    -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot
+    -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
+    -vga none -device virtio-vga -qmp "unix:$qmp,server=on,wait=off"
+screen_wait x86_64-pc
 
 # Heap-free M-mode firmware (no OpenSBI): checked for its own lines, since it
 # runs none of the scheduler demos.
@@ -235,6 +263,51 @@ if command -v qemu-system-x86_64 >/dev/null; then
         grep -q "$line" "$nestlog" || { echo "x86_64-hyp (guest kernel): missing '$line'"; exit 1; }
     done
     rm -f "$nestlog"
+fi
+
+# UEFI application on OVMF (x86_64) and AAVMF (AArch64): GOP sets a mode and
+# the app draws on its framebuffer, or with Blt where virtio-gpu's GOP has
+# none; the screens are checked.
+uefi() {
+    local arch=$1 qemu=$2 boot_efi=$3 width=$4 height=$5
+    shift 5
+    command -v "$qemu" >/dev/null || { echo "== $qemu not found; skipping UEFI $arch"; return; }
+    echo "== boot examples/uefi ($arch) under QEMU"
+    (cd examples/uefi && cargo build -q --release --target "$arch-unknown-uefi")
+    local esp log
+    esp=$(mktemp -d)
+    log=$(mktemp)
+    mkdir -p "$esp/EFI/BOOT"
+    cp "examples/uefi/target/$arch-unknown-uefi/release/uefi.efi" "$esp/EFI/BOOT/$boot_efi"
+    screen "$qemu" "$width" "$height"
+    timeout 120 "$qemu" "$@" -m 256M -nographic -display none -no-reboot \
+        -drive if=none,id=esp,format=raw,file="fat:rw:$esp" -device virtio-blk-pci,drive=esp \
+        -qmp "unix:$qmp,server=on,wait=off" -serial "file:$log" -monitor none </dev/null >/dev/null
+    screen_wait "uefi ($arch)"
+    # The firmware's console output is full of escape sequences.
+    local clean
+    clean=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" | tr -d '\r')
+    grep -a '^osmium\|^\[' <<<"$clean" || true
+    for line in '\[gop\] .*colour bars drawn' '\[done\]  shutting down'; do
+        grep -aq "$line" <<<"$clean" || { echo "uefi ($arch): missing '$line'"; exit 1; }
+    done
+    rm -rf "$esp" "$log"
+}
+ovmf=$(ls /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd 2>/dev/null | head -1)
+if [ -n "$ovmf" ]; then
+    uefi x86_64 qemu-system-x86_64 BOOTX64.EFI 800 600 -machine q35 -bios "$ovmf"
+else
+    echo "== no OVMF; skipping UEFI x86_64"
+fi
+aavmf=/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd
+if [ -f "$aavmf" ]; then
+    vars=$(mktemp)
+    cp /usr/share/AAVMF/AAVMF_VARS.fd "$vars"
+    uefi aarch64 qemu-system-aarch64 BOOTAA64.EFI 1280 800 -machine virt -cpu cortex-a72 \
+        -drive if=pflash,format=raw,readonly=on,file="$aavmf" -drive if=pflash,format=raw,file="$vars" -device virtio-gpu-pci
+    rm -f "$vars"
+else
+    echo "== no AAVMF; skipping UEFI aarch64"
 fi
 
 echo "all checks passed"

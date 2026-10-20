@@ -333,7 +333,7 @@ pub const SYSCALL_KERNEL_RSP: usize = core::mem::offset_of!(CpuTables, tss) + 4;
 // Bare-metal only: it jumps into the trap entry path of `trap::x86_64`.
 #[cfg(bare)]
 core::arch::global_asm!(
-    ".section .text.osmium_trap, \"ax\", @progbits",
+    ".section .text.osmium_trap, \"ax\"",
     ".globl osmium_syscall_entry",
     "osmium_syscall_entry:",
     // Interrupts are masked (FMASK). rcx = user rip, r11 = user rflags.
@@ -425,6 +425,9 @@ pub unsafe fn resume_user(frame: &crate::trap::TrapFrame) -> ! {
         )
     }
 }
+
+#[cfg(bare)]
+pub mod bios;
 
 /// Starting application processors: the real-mode trampoline a STARTUP IPI
 /// points them at, which takes them to long mode and into the kernel.
