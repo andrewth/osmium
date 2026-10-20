@@ -38,6 +38,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "osmium-exec"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-sync",
+]
+
+[[package]]
 name = "osmium-hal"
 version = "0.1.0"
 dependencies = [

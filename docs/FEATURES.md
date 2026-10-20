@@ -163,7 +163,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Ready-made policies: `FifoScheduler` (round-robin with a time slice) and `PriorityScheduler` (O(1) bitmap, 64 levels)
 - ✅ `WaitQueue` (no lost wake-ups), sleeping `Mutex`, `Semaphore`
 - ✅ `TimerQueue`: deadline-ordered callbacks driven by the timer IRQ
-- 🗺 Heap-free static tasks (Hubris/Tock style), async executor, load balancing, EDF policy
+- ✅ `osmium-exec`: heap-free async executor (fixed task slots, interrupt-safe wakers, idle-until-interrupt without lost wake-ups, `run_with` for stack-pinned `async fn`s), `Signal`, `AtomicWaker`, `StaticCell`
+- 🗺 Load balancing, EDF policy
 
 ### `osmium-boot`: boot protocols
 - ✅ Flattened Device Tree (DTB) parser: zero-copy nodes and properties, `reg` decoding with `#address-cells`/`#size-cells`, `compatible` search
