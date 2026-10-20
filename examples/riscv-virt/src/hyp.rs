@@ -9,13 +9,15 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 use core::ops::ControlFlow;
 use core::ptr::NonNull;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use osmium::hal::{print, println};
 use osmium::mm::{FrameAllocator, MapFlags, PageTable, PhysAddr, VirtAddr};
 use osmium::sync::IrqSpinLock;
 use osmium::virt::devices::{Uart16550, VirtualPlic};
+use osmium::sched::TaskBuilder;
 use osmium::virt::riscv::fdt::GuestMachine;
+use osmium::virt::riscv::harts::GuestHarts;
 use osmium::virt::riscv::{self, RiscvVcpu, sbi};
 use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
 use osmium::hal::dma::{DmaAllocator, DmaBuffer};
@@ -442,4 +444,174 @@ fn rdtime() -> u64 {
 
 fn sbi_shutdown() -> ! {
     osmium::arch::riscv64::sbi::shutdown()
+}
+
+// A two-hart guest: hart 0 starts hart 1 through SBI HSM, hart 1 sends hart
+// 0 an IPI and stops itself, hart 0 waits for the IPI (sip.SSIP) and for
+// hart 1 to report STOPPED, then powers off. Position independent.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .globl smp_guest, smp_guest_end
+smp_guest:
+    .option push
+    .option norelax
+    bnez a0, 5f
+    li a0, 11f - 10f                // hart 0
+    la a1, 10f
+    jal ra, 20f
+    li a7, 0x48534D                 // HSM hart_start(1, smp_guest, 0x1234)
+    li a6, 0
+    li a0, 1
+    la a1, smp_guest
+    li a2, 0x1234
+    ecall
+    mv s2, a0
+    li t0, 2
+    csrs sie, t0                    // SSIE
+1:  wfi
+    csrr t1, sip
+    andi t1, t1, 2
+    beqz t1, 1b
+    csrc sip, t0
+2:  li a7, 0x48534D                 // HSM hart_get_status(1) until STOPPED
+    li a6, 2
+    li a0, 1
+    ecall
+    li t2, 1
+    bne a1, t2, 2b
+    li a0, 13f - 12f
+    la a1, 12f
+    jal ra, 20f
+    li a7, 0x53525354               // SRST: shutdown
+    li a6, 0
+    li a0, 0
+    li a1, 0
+    ecall
+3:  j 3b
+5:  mv s3, a1                       // hart 1: a1 = opaque
+    li a0, 12f - 11f
+    la a1, 11f
+    jal ra, 20f
+    li a7, 0x735049                 // IPI send_ipi(mask 1, base 0)
+    li a6, 0
+    li a0, 1
+    li a1, 0
+    ecall
+    li a7, 0x48534D                 // HSM hart_stop
+    li a6, 1
+    ecall
+6:  j 6b
+20: li a7, 0x4442434E               // DBCN write(a0 bytes at a1)
+    li a6, 0
+    li a2, 0
+    ecall
+    ret
+10: .ascii "[smp-guest] hart 0: starting hart 1\n"
+11: .ascii "[smp-guest] hart 1: running, sending hart 0 an IPI, stopping\n"
+12: .ascii "[smp-guest] hart 0: got the IPI; hart 1 is stopped\n"
+13:
+    .option pop
+    .balign 4
+smp_guest_end:
+"#
+);
+
+unsafe extern "C" {
+    static smp_guest: u8;
+    static smp_guest_end: u8;
+}
+
+/// Runs the two-hart guest, each vCPU in a host task pinned to its own
+/// host CPU (1 and 2 when there are enough).
+pub fn demo_smp(ncpus: usize) {
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = 4096u64 << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guest until it is freed below.
+    unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image in .rodata.
+    let image = unsafe {
+        let start = &raw const smp_guest;
+        core::slice::from_raw_parts(start, (&raw const smp_guest_end).offset_from(start) as usize)
+    };
+    mem.write(GUEST_RAM, image).unwrap();
+    let mem = Arc::new(mem);
+    let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
+    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    let hgatp = hgatp_sv39x4(gstage.root(), 3);
+
+    let harts = GuestHarts::new(2);
+    harts.request_start(0, GUEST_RAM.0, 0).unwrap();
+    let buses = Arc::new((Bus::new(), Bus::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let results = Arc::new([AtomicU64::new(u64::MAX), AtomicU64::new(u64::MAX)]);
+
+    let tasks: Vec<_> = (0..2usize)
+        .map(|h| {
+            let (mem, harts, buses, done, results) = (mem.clone(), harts.clone(), buses.clone(), done.clone(), results.clone());
+            let cpu = if ncpus > 2 { h + 1 } else { 0 };
+            TaskBuilder::new("vcpu").cpu(cpu).spawn(move || {
+                riscv::init_cpu();
+                while !done.load(Ordering::Acquire) {
+                    let Some((entry, opaque)) = harts.take_start(h) else {
+                        osmium::sched::yield_now();
+                        continue;
+                    };
+                    let mut vcpu = RiscvVcpu::new(GuestPhysAddr(entry), h as u64, opaque, hgatp);
+                    vcpu.connect_ipi(harts.ipi_line(h));
+                    let mut stopped = false;
+                    let exit = run_vcpu(&mut vcpu, &buses.0, &buses.1, |v, exit| match exit {
+                        VmExit::Hypercall { .. } => {
+                            let mut console = |b: &[u8]| print!("{}", core::str::from_utf8(b).unwrap_or("?"));
+                            match sbi::handle_smp(v, &mem, exit, &mut console, Some((&harts, h))) {
+                                Some(sbi::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
+                                Some(sbi::Outcome::Stop) => {
+                                    stopped = true;
+                                    ControlFlow::Break(VmExit::Halt)
+                                }
+                                _ => ControlFlow::Continue(()),
+                            }
+                        }
+                        VmExit::Halt => {
+                            let deadline = riscv::time() + 10_000_000; // 1 s
+                            while !v.interrupt_pending(riscv::time()) {
+                                if riscv::time() > deadline {
+                                    return ControlFlow::Break(VmExit::Halt);
+                                }
+                                core::hint::spin_loop();
+                            }
+                            ControlFlow::Continue(())
+                        }
+                        VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+                        other => ControlFlow::Break(other),
+                    });
+                    // hart 0 records its HSM result (s2), hart 1 its opaque (s3).
+                    results[h].store(if h == 0 { vcpu.state.x[18] } else { vcpu.state.x[19] }, Ordering::Release);
+                    if !stopped {
+                        if exit != VmExit::Shutdown {
+                            println!("[hyp]   SMP guest hart {h} stopped unexpectedly: {exit:?}");
+                        }
+                        done.store(true, Ordering::Release);
+                    }
+                }
+            })
+        })
+        .collect();
+    for t in &tasks {
+        t.join();
+    }
+    let cpus = if ncpus > 2 { "host CPUs 1 and 2" } else { "host CPU 0" };
+    println!(
+        "[hyp]   SMP guest: 2 vCPUs on {cpus}; hart_start returned {}, hart 1 got opaque {:#x}",
+        results[0].load(Ordering::Acquire) as i64,
+        results[1].load(Ordering::Acquire)
+    );
+
+    drop(gstage);
+    drop(mem);
+    // SAFETY: both vCPUs have stopped and nothing references the guest's RAM.
+    unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
 }

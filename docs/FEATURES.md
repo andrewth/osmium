@@ -200,10 +200,10 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ An emulated PLIC (`VirtualPlic`, QEMU `virt` register layout) whose S-mode context outputs drive vCPU external-interrupt lines (`hvip.VSEIP`)
 - ✅ RISC-V guest device trees (`riscv::fdt::GuestMachine`): harts, memory, PLIC, 16550s and virtio-mmio, in the layout Linux expects
 - ✅ virtio device models: split virtqueue over `GuestMemory`, the virtio-mmio (v2) transport as a bus device, virtio-console, virtio-blk (over any `BlockDevice`) and virtio-net (over a pluggable `NetBackend`), sharing `osmium_hal::virtio` definitions with the drivers
-- ✅ RISC-V H-extension `Vcpu` (`riscv64-hs`): world switch through the trap entry's guest-exit hook, VS CSR switching, MMIO emulation from guest-page faults (`htinst` or `hlvx`-fetched instruction, compressed forms included), `wfi` halts, host-interrupt exits, and a minimal SBI (BASE, TIME, SRST, DBCN, legacy)
+- ✅ RISC-V H-extension `Vcpu` (`riscv64-hs`): world switch through the trap entry's guest-exit hook, VS CSR switching, MMIO emulation from guest-page faults (`htinst` or `hlvx`-fetched instruction, compressed forms included), `wfi` halts, host-interrupt exits, and a minimal SBI (BASE, TIME, SRST, DBCN, legacy), and multi-vCPU guests (`GuestHarts`: SBI HSM start/stop/status and IPIs injected as `VSSIP`)
 - ✅ AMD SVM `Vcpu`: VMCB setup for a 32-bit flat guest, nested paging with `X86_64` tables, VMRUN world switch under CLGI/STGI, port I/O, `hlt`, `vmmcall` and interrupt exits, MMIO from nested page faults (a decoder for the MOV/MOVZX forms drivers use, with decode assists or a fetch from guest memory), virtual interrupt injection (`V_IRQ`)
 - ✅ AArch64 EL2 `Vcpu` (`aarch64-el2`, non-VHE): world switch through guest-exit hooks in the lower-EL vectors, EL1 system-register switching, stage 2 via `VTTBR_EL2`, MMIO emulation from data-abort syndromes, trapped `wfi`, IRQ exits, a virtual-IRQ line (`HCR_EL2.VI`), and PSCI for guests
-- 🗺 VMX `Vcpu` backend, SVM VMLOAD/VMSAVE state and MMIO under guest paging, virtual interrupt controllers (APLIC/IMSIC, vGIC), guest FP state, multi-vCPU guests
+- 🗺 VMX `Vcpu` backend, SVM VMLOAD/VMSAVE state and MMIO under guest paging, virtual interrupt controllers (APLIC/IMSIC, vGIC), guest FP state, remote fences (SBI RFENCE) and host IPIs to kick running vCPUs
 
 ### `osmium-proc`: processes and system calls
 - ✅ `Process`: a user address space, a descriptor table of `osmium_fs::File`s, working directory, program break, `mmap` area and exit status, attached to its task through `TaskBuilder::data`; `current`, `root_for` (the switch hook's table), `exit`, `wait`, lookup by `Pid`
@@ -218,7 +218,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 ### Tooling and examples
 - ✅ Host unit and integration tests for every crate
 - ✅ Builds for `x86_64-unknown-none`, `aarch64-unknown-none-softfloat` and `riscv64imac-unknown-none-elf`
-- ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps; it also runs two guests in VS-mode under the H extension, the second built from osmium's own UART, PLIC and virtio-net drivers, taking timer, UART and virtio interrupts through the emulated PLIC
+- ✅ `examples/riscv-virt`: a bootable kernel for QEMU `virt` that uses the FDT, the memory map, the buddy allocator, the heap, W^X Sv39 paging, the 16550 driver, the scheduler with timer-interrupt preemption, and `TimerQueue` sleeps; it also runs two guests in VS-mode under the H extension, the second built from osmium's own UART, PLIC and virtio-net drivers, taking timer, UART and virtio interrupts through the emulated PLIC, and a third with two vCPUs on two host harts that start each other through SBI HSM and exchange an IPI
 - ✅ `examples/aarch64-virt`: the same on QEMU AArch64 `virt` (GICv2, PL011, generic timer, stage-1 paging, PSCI)
 - ✅ `examples/aarch64-hyp`: a hypervisor that stays at EL2 (QEMU `virtualization=on`), turns on the EL2 MMU and runs EL1 guests under stage 2, one of which takes its virtual timer and a UART interrupt through the emulated GICv2
 - ✅ `examples/x86_64-hyp`: enables AMD SVM (TCG with `-cpu max`) and runs a 32-bit guest under nested paging that talks to emulated 16550s over port I/O and MMIO

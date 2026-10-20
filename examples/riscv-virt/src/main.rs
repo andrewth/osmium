@@ -461,6 +461,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     user_demo();
     hyp::demo();
     hyp::demo_irq();
+    hyp::demo_smp(ncpus);
 
     println!("[done]  {} timer ticks, {} free frames; shutting down", TICKS.load(Ordering::Relaxed), FRAMES.lock().free_frames());
     sbi::shutdown()
