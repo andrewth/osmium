@@ -434,7 +434,40 @@ smp_ap_end:
     options(att_syntax)
 );
 
+// Two copies run interleaved on one host CPU, each with its own edi: turn
+// SSE on, compute edi + 10 in xmm3, yield (vmmcall 2), add edi again and
+// report the result (vmmcall 3, result in ebx). Each needs its own SSE
+// registers to survive the other's turn.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .globl fp_guest, fp_guest_end
+    .code32
+fp_guest:
+    mov %cr4, %eax
+    or $0x600, %eax                 // OSFXSR, OSXMMEXCPT
+    mov %eax, %cr4
+    cvtsi2sd %edi, %xmm1
+    mov $10, %eax
+    cvtsi2sd %eax, %xmm2
+    movapd %xmm1, %xmm3
+    addsd %xmm2, %xmm3
+    mov $2, %eax                    // yield to the other vCPU
+    vmmcall
+    addsd %xmm1, %xmm3
+    cvttsd2si %xmm3, %ebx
+    mov $3, %eax                    // report ebx
+    vmmcall
+1:  jmp 1b
+fp_guest_end:
+    .code64
+"#,
+    options(att_syntax)
+);
+
 unsafe extern "C" {
+    static fp_guest: u8;
+    static fp_guest_end: u8;
     static _kernel_start: u8;
     static _kernel_end: u8;
     static x86_guest: u8;
@@ -559,6 +592,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     } else {
         guest_demo();
         long_mode_demo();
+        fp_demo();
         if ncpus > 1 {
             start_host_cpu(1);
             smp_demo();
@@ -766,6 +800,71 @@ fn guest_demo() {
         f.dealloc(PhysAddr::new(iopm.1), 2);
         f.dealloc(PhysAddr::new(msrpm.1), 1);
         f.dealloc(PhysAddr::new(host.1), 0);
+        f.dealloc(ram, GUEST_RAM_ORDER);
+    }
+}
+
+/// Runs two vCPUs of an SSE-using guest interleaved on this CPU: each
+/// needs its own x87/SSE state switched in around VMRUN.
+fn fp_demo() {
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guests until it is freed below.
+    unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image.
+    mem.write(GuestPhysAddr(GUEST_ENTRY), unsafe { image(&fp_guest, &fp_guest_end) }).unwrap();
+    let mem = Arc::new(mem);
+    let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
+    npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER).unwrap();
+    let (mmio, pio) = (Bus::new(), Bus::new());
+
+    let mut pages = Vec::new();
+    let mut vcpus: Vec<SvmVcpu> = (1..=2)
+        .map(|input| {
+            let p = (block(0), block(2), block(1), block(0));
+            pages.push(p);
+            let (vmcb, iopm, msrpm, host) = p;
+            // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
+            let mut v = unsafe {
+                SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, GUEST_ENTRY as u32, len as u32)
+            }
+            .with_memory(mem.clone())
+            .with_fp_switching();
+            v.regs.rdi = input;
+            v
+        })
+        .collect();
+    let step = |v: &mut SvmVcpu| {
+        let exit = run_vcpu(v, &mmio, &pio, |_, exit| match exit {
+            VmExit::Hypercall { nr: 2 | 3, .. } => ControlFlow::Break(exit),
+            VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+            other => ControlFlow::Break(other),
+        });
+        (exit, v.regs.rbx)
+    };
+    let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
+    let is = |s: &(VmExit, u64), n| matches!(s.0, VmExit::Hypercall { nr, .. } if nr == n);
+    let fine = is(&steps[0], 2) && is(&steps[1], 2) && is(&steps[2], 3) && is(&steps[3], 3);
+    let (a, b) = (steps[2].1, steps[3].1);
+    println!(
+        "[hyp]   SSE guests interleaved on one CPU: vCPU edi=1 got {a}, edi=2 got {b} (expected 12 and 14){}",
+        if fine && a == 12 && b == 14 { "" } else { "; MISMATCH" }
+    );
+
+    drop(vcpus);
+    drop(npt);
+    drop(mem);
+    // SAFETY: the guests have stopped; nothing references these blocks.
+    unsafe {
+        let mut f = FRAMES.lock();
+        for (vmcb, iopm, msrpm, host) in pages {
+            f.dealloc(PhysAddr::new(vmcb.1), 0);
+            f.dealloc(PhysAddr::new(iopm.1), 2);
+            f.dealloc(PhysAddr::new(msrpm.1), 1);
+            f.dealloc(PhysAddr::new(host.1), 0);
+        }
         f.dealloc(ram, GUEST_RAM_ORDER);
     }
 }

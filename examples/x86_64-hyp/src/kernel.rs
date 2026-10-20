@@ -176,7 +176,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
                 other => ControlFlow::Break(other),
             }
         });
-        if !matches!(exit, VmExit::Shutdown) {
+        if !vm.done.load(Ordering::Acquire) {
             use osmium::virt::x86::vmcb;
             println!(
                 "[hyp]   vCPU {me}: {exit:?} at rip {:#x}, info1 {:#x}, info2 {:#x}, cr3 {:#x}",

@@ -142,9 +142,12 @@ recipe is the same on each:
   assists it walks 4-level (long-mode) guest page tables, or none; 32-bit
   paging is not walked. MSRs other than the syscall ones, EFER, PAT,
   `TSC_AUX` and `APIC_BASE` read as zero.
-- The x86 host does not switch FPU/SSE state: one vCPU per host CPU, on a
-  soft-float host, keeps it intact.
 - No VMX backend (QEMU's TCG does not emulate VMX).
-- FP/SIMD state is switched on RISC-V and AArch64 on the assumption that the
-  host kernel itself never uses those registers (soft-float targets); SVE is
-  not switched and traps.
+- FP/SIMD state is switched per vCPU on the assumption that the host
+  kernel itself never uses those registers (soft-float targets): always on
+  RISC-V and AArch64 (where SVE is not switched and traps), and on x86 for
+  vCPUs built `with_fp_switching` (x87 and SSE through FXSAVE/FXRSTOR, not
+  AVX). Without it an x86 guest uses the host CPU's registers as they are,
+  which is enough for one vCPU per host CPU; the whole-kernel x86 guest runs
+  that way because, under QEMU's multi-threaded TCG, switching around VMRUN
+  made it take spurious page faults that single-threaded TCG never showed.

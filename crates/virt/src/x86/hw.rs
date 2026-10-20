@@ -120,6 +120,9 @@ pub fn enable(hsave_pa: u64) -> Result<(), SvmError> {
         }
         x86::wrmsr(msr::IA32_EFER, x86::rdmsr(msr::IA32_EFER) | EFER_SVME);
         x86::wrmsr(VM_HSAVE_PA, hsave_pa);
+        // CR4.OSFXSR and OSXMMEXCPT: FXSAVE/FXRSTOR then switch the guests'
+        // SSE registers too.
+        asm!("mov {t}, cr4", "or {t}, 0x600", "mov cr4, {t}", t = out(reg) _, options(nomem, nostack));
     }
     Ok(())
 }
@@ -146,7 +149,16 @@ pub(super) fn run(v: &mut SvmVcpu) {
         // the guest's in while GIF is clear, so no host code sees it.
         let host_aux = x86::rdmsr(msr::IA32_TSC_AUX);
         x86::wrmsr(msr::IA32_TSC_AUX, v.tsc_aux);
+        // x87 and SSE state, if the vCPU has its own: loaded for the run and
+        // saved after it. The host itself never uses these registers
+        // (soft-float).
+        if v.switch_fp {
+            asm!("fxrstor64 [{}]", in(reg) v.fpu.0.as_ptr(), options(nostack, readonly));
+        }
         osmium_svm_run(&mut v.regs, v.vmcb_pa);
+        if v.switch_fp {
+            asm!("fxsave64 [{}]", in(reg) v.fpu.0.as_mut_ptr(), options(nostack));
+        }
         x86::wrmsr(msr::IA32_TSC_AUX, host_aux);
         asm!("vmsave rax", in("rax") v.vmcb_pa, options(nostack));
         asm!("vmload rax", in("rax") v.host_pa, options(nostack));

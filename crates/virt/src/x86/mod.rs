@@ -37,6 +37,20 @@ use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 use decode::{Access, Operand};
 
+/// An FXSAVE/FXRSTOR image: x87, MMX and SSE state.
+#[repr(C, align(16))]
+pub(crate) struct FxArea(pub(crate) [u8; 512]);
+
+impl FxArea {
+    /// The state after reset: x87 control word 0x37f, MXCSR 0x1f80.
+    fn reset() -> Self {
+        let mut a = [0u8; 512];
+        a[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        a[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        Self(a)
+    }
+}
+
 /// `IA32_APIC_BASE`: the bootstrap processor, and the APIC enabled.
 const APIC_BASE_BSP: u64 = 1 << 8;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
@@ -241,6 +255,9 @@ pub struct SvmVcpu {
     ack: Option<Ack>,
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     flush: bool,
+    /// The guest's x87/SSE state (an FXSAVE image), loaded around VMRUN.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    pub(crate) fpu: Box<FxArea>,
     /// The guest's `IA32_TSC_AUX`, swapped in around VMRUN.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     pub(crate) tsc_aux: u64,
@@ -248,6 +265,9 @@ pub struct SvmVcpu {
     apic_base: u64,
     /// The local APIC ID CPUID reports.
     apic_id: u8,
+    /// Whether `fpu` is switched around VMRUN.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    pub(crate) switch_fp: bool,
     /// The host CPU running this vCPU's guest code, for kicks.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
@@ -286,8 +306,10 @@ impl SvmVcpu {
             flush: true,
             running: None,
             tsc_aux: 0,
+            fpu: Box::new(FxArea::reset()),
             apic_base: 0xfee0_0000 | APIC_BASE_ENABLE | APIC_BASE_BSP,
             apic_id: 0,
+            switch_fp: false,
         };
         use vmcb::*;
         // INTR, NMI, CPUID, HLT, IOIO, MSR, SHUTDOWN; VMRUN (required), VMMCALL.
@@ -579,6 +601,15 @@ impl SvmVcpu {
     /// reads as 0.
     pub fn set_application_processor(&mut self) {
         self.apic_base &= !APIC_BASE_BSP;
+    }
+
+    /// Gives the guest x87/SSE registers of its own, loaded before each
+    /// VMRUN and saved after it (FXSAVE/FXRSTOR), so several vCPUs can
+    /// share a host CPU. Without it the guest uses the host CPU's registers
+    /// as they are, which suits one vCPU per host CPU on a soft-float host.
+    pub fn with_fp_switching(mut self) -> Self {
+        self.switch_fp = true;
+        self
     }
 
     /// Sets the local APIC ID CPUID reports to the guest (leaf 1 EBX bits 31:24
