@@ -10,7 +10,13 @@
 //!
 //! The sequence follows the PRM as iPXE's `hermon` driver uses it, with
 //! Linux's `mlx4_core` for the reset and the Ethernet queue pair settings.
-//! Everything is polled; the driver needs no interrupt line. Each port
+//! By default everything is polled and the driver needs no interrupt line.
+//! [`Mlx4::enable_msix`] switches to MSI-X: vector 0 for the asynchronous
+//! event queue (link changes), vector 1 for a second event queue that
+//! carries completion events, which the interrupt handler
+//! ([`Mlx4::handle_interrupt`]) turns into a set of ports with work to do.
+//! Polling keeps working alongside, and is the fallback when the function
+//! has no MSI-X capability or fewer than two vectors. Each port
 //! receives promiscuously (every unicast and multicast frame on the wire)
 //! because the steering tables are left empty. VLAN tags stay in the frame.
 //!
@@ -22,8 +28,17 @@
 //! during teardown, the driver leaks the memory involved rather than free
 //! memory the device may still write.
 //!
-//! Not yet supported: interrupts (MSI-X), checksum and segmentation
-//! offloads, receive-side scaling, MAC/VLAN steering, and InfiniBand.
+//! An [`EthPort`] also offers IPv4/TCP/UDP checksum offload in both
+//! directions and TCP segmentation offload (large send) through its
+//! [`transmit_offload`](EthPort::transmit_offload) and
+//! [`receive_checked`](EthPort::receive_checked) methods. The shared
+//! [`NetDevice`](osmium_hal::net::NetDevice) trait has no way to express
+//! offloads, so these are inherent methods; [`EthPort::offloads`] reports
+//! what the port can do. The offload and MSI-X paths follow the PRM and
+//! Linux's `mlx4_en` but have only run against the simulated HCA.
+//!
+//! Not yet supported: receive-side scaling, one completion vector per CPU,
+//! MAC/VLAN steering, VLAN tag offload, tunnel offloads, and InfiniBand.
 
 mod cmd;
 mod eth;
@@ -37,10 +52,11 @@ use core::mem::ManuallyDrop;
 use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
 use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::{ConfigAccess, Function, cap};
+use osmium_hal::pci::{MsiError, MsiMessage, MsixTable};
 use osmium_hal::timer::Clock;
 
 use cmd::{Ctx, Hcr, Input, MTTS_PER_WRITE, op};
-pub use eth::EthPort;
+pub use eth::{EthPort, Offloads, RxChecksum, Tso, TxError, TxOffload};
 
 /// Mellanox's PCI vendor ID.
 pub const VENDOR_ID: u16 = 0x15b3;
@@ -94,13 +110,27 @@ const LOG_NUM_MCGS: u32 = 7;
 const MCG_ENTRY_LEN: u64 = 64;
 /// MTT entries per port: one page of completion queue, two of work queues.
 const PORT_MTTS: u32 = 3;
-/// The event queue's MTT entry comes first, then each port's.
-const MAX_MTTS: u32 = 1 + PORT_MTTS * MAX_PORTS as u32;
+/// The asynchronous and completion event queues' MTT entries come first,
+/// then each port's.
+const MAX_MTTS: u32 = EQ_MTTS + PORT_MTTS * MAX_PORTS as u32;
+const EQ_MTTS: u32 = 2;
 
 const NUM_EQES: u32 = 8;
 const EQE_LEN: usize = 32;
 const EVENT_PORT_CHANGE: u32 = 0x09;
 const PORT_CHANGE_ACTIVE: u32 = 0x04;
+const EVENT_COMPLETION: u32 = 0x00;
+/// Event queue consumer index doorbell bit asking for the next event to
+/// raise an interrupt.
+const EQ_ARM: u32 = 1 << 31;
+/// Event queue states in the context: armed (will interrupt) and fired.
+const EQ_STATE_ARMED: u32 = 0x9;
+const EQ_STATE_FIRED: u32 = 0xa;
+
+/// MSI-X vector (table entry) of the asynchronous event queue.
+pub const VECTOR_ASYNC: u16 = 0;
+/// MSI-X vector of the completion event queue.
+pub const VECTOR_COMPLETION: u16 = 1;
 
 /// The protection domain of every queue and memory region.
 const PD: u32 = 0x12_3456;
@@ -132,6 +162,10 @@ pub enum Mlx4Error {
     NotEthernet,
     /// The DMA allocator returned memory that is not 4 KiB aligned.
     MisalignedDma,
+    /// MSI-X could not be set up: the function lacks the capability or has
+    /// fewer than two vectors, the table does not fit its BAR, or MSI-X is
+    /// already enabled.
+    Msix(MsiError),
 }
 
 /// Limits from QUERY_DEV_CAP.
@@ -155,6 +189,8 @@ struct Caps {
     mtt_entry: u64,
     num_ports: u8,
     dpdp: bool,
+    /// Largest LSO frame, or 0 if the device cannot segment.
+    max_gso: u32,
 }
 
 impl Caps {
@@ -182,6 +218,7 @@ impl Caps {
             mtt_entry: c.get(36, 16, 16) as u64,
             num_ports: (c.get(13, 0, 4) as u8).min(MAX_PORTS),
             dpdp: c.get(17, 12, 1) != 0,
+            max_gso: if c.get(11, 21, 1) != 0 { 1 << c.get(11, 16, 5) } else { 0 },
         };
         let sizes = [
             caps.qpc_entry,
@@ -201,6 +238,11 @@ impl Caps {
     /// the firmware does not reserve.
     fn eqn(&self) -> u32 {
         (4 * self.reserved_uars).max(self.reserved_eqs)
+    }
+
+    /// The completion event queue, next to the asynchronous one.
+    fn comp_eqn(&self) -> u32 {
+        self.eqn() + 1
     }
 }
 
@@ -231,7 +273,7 @@ fn plan_icm(caps: &Caps) -> IcmPlan {
     let log_qps = log2_ceil(caps.reserved_qps + 2 * NUM_SPECIAL_QPS - 1 + MAX_QPS);
     let log_srqs = log2_ceil(caps.reserved_srqs);
     let log_cqs = log2_ceil(caps.reserved_cqs + MAX_CQS);
-    let log_eqs = log2_ceil((caps.reserved_eqs + MAX_EQS).max(caps.eqn() + 1));
+    let log_eqs = log2_ceil((caps.reserved_eqs + MAX_EQS).max(caps.comp_eqn() + 1));
     let log_mtts = log2_ceil(caps.reserved_mtts + MAX_MTTS);
     let log_mpts = log2_ceil(caps.reserved_mrws + 1);
     let page_up = |n: u64| n.next_multiple_of(PAGE as u64) as usize;
@@ -300,6 +342,7 @@ struct Memory<'d, D: DmaAllocator + ?Sized> {
     icm_aux: Option<OwnedDma<'d, D>>,
     icm: [Option<OwnedDma<'d, D>>; 5],
     eq: Option<OwnedDma<'d, D>>,
+    comp_eq: Option<OwnedDma<'d, D>>,
 }
 
 /// How far bring-up got, so teardown undoes exactly that.
@@ -312,6 +355,7 @@ struct Stage {
     hca_up: bool,
     eq_hw: bool,
     eq_mapped: bool,
+    comp_eq_hw: bool,
 }
 
 /// A ConnectX adapter with its firmware running. Dropping it closes the HCA
@@ -330,6 +374,14 @@ pub struct Mlx4<'d, D: DmaAllocator + ?Sized> {
     lkey: u32,
     qpn_base: u32,
     eq_ci: Cell<u32>,
+    comp_eq_ci: Cell<u32>,
+    /// Set by [`Mlx4::enable_msix`]: the table, to mask on drop.
+    msix: Option<MsixTable>,
+    /// The completion event queue, once MSI-X is enabled.
+    comp_eqn: Option<u32>,
+    /// Per completion queue: events seen so far, which the arm doorbell
+    /// carries so the device can tell a fresh request from a stale one.
+    arm_sn: [Cell<u8>; MAX_PORTS as usize],
     /// Bit `n` set: port `n + 1` is open / its link is up.
     open: Cell<u8>,
     link: Cell<u8>,
@@ -362,12 +414,22 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
             clock,
             caps: Caps::default(),
             fw_version: (0, 0, 0),
-            mem: ManuallyDrop::new(Memory { firmware: None, icm_aux: None, icm: Default::default(), eq: None }),
+            mem: ManuallyDrop::new(Memory {
+                firmware: None,
+                icm_aux: None,
+                icm: Default::default(),
+                eq: None,
+                comp_eq: None,
+            }),
             icm_regions: Default::default(),
             stage: Stage::default(),
             lkey: 0,
             qpn_base: 0,
             eq_ci: Cell::new(0),
+            comp_eq_ci: Cell::new(0),
+            msix: None,
+            comp_eqn: None,
+            arm_sn: Default::default(),
             open: Cell::new(0),
             link: Cell::new(0),
         };
@@ -428,8 +490,8 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
         let mut c = Ctx::new();
         self.hcr.exec_out(op::QUERY_DEV_CAP, 0, 0, Input::None, &mut c, 256)?;
         let caps = Caps::parse(&c).ok_or(Mlx4Error::BadDevice)?;
-        // The event queue's doorbell must be below the send doorbell page.
-        if caps.eqn() / 4 >= UAR_PAGE {
+        // The event queues' doorbells must be below the send doorbell page.
+        if caps.comp_eqn() / 4 >= UAR_PAGE {
             return Err(Mlx4Error::BadDevice);
         }
         Ok(caps)
@@ -499,51 +561,170 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
         Ok(())
     }
 
-    fn eq_doorbell(&self) -> usize {
-        let eqn = self.caps.eqn() as usize;
+    fn eq_doorbell(&self, eqn: u32) -> usize {
+        let eqn = eqn as usize;
         0x800 + PAGE * (eqn / 4) + 8 * (eqn % 4)
+    }
+
+    /// Initializes `ring` and hands it to the device as event queue `eqn`,
+    /// its MTT entry at `mtt`. If `armed` the queue raises MSI-X vector
+    /// `intr` on its next event; otherwise it is "fired" and never
+    /// interrupts, and is only polled.
+    fn sw2hw_eq(&self, eqn: u32, ring: &OwnedDma<'d, D>, mtt: u32, intr: u16, armed: bool) -> Result<(), Mlx4Error> {
+        for i in 0..NUM_EQES as usize {
+            put32(ring, i * EQE_LEN + 28, 0x80); // owned by hardware
+        }
+        self.write_mtt(mtt, ring)?;
+        let mut eqc = Ctx::new();
+        // Overruns are ignored.
+        eqc.set(0, 8, 4, if armed { EQ_STATE_ARMED } else { EQ_STATE_FIRED }).set(0, 17, 1, 1);
+        eqc.set(3, 24, 5, log2_ceil(NUM_EQES));
+        eqc.set(5, 0, 8, intr as u32);
+        eqc.set_addr(6, self.mtt_addr(mtt));
+        self.hcr.exec(op::SW2HW_EQ, 0, eqn, Input::Mailbox(&eqc, 64)).map(drop)
     }
 
     fn create_eq(&mut self) -> Result<(), Mlx4Error> {
         let ring = OwnedDma::new(self.dma, NUM_EQES as usize * EQE_LEN).ok_or(Mlx4Error::NoMemory)?;
-        for i in 0..NUM_EQES as usize {
-            put32(&ring, i * EQE_LEN + 28, 0x80); // owned by hardware
-        }
-        self.write_mtt(0, &ring)?;
-        let mut eqc = Ctx::new();
-        eqc.set(0, 8, 4, 0xa).set(0, 17, 1, 1); // "fired" (never interrupts), overruns ignored
-        eqc.set(3, 24, 5, log2_ceil(NUM_EQES));
-        eqc.set_addr(6, self.mtt_addr(0));
+        let created = self.sw2hw_eq(self.caps.eqn(), &ring, 0, VECTOR_ASYNC, false);
         self.mem.eq = Some(ring);
-        self.hcr.exec(op::SW2HW_EQ, 0, self.caps.eqn(), Input::Mailbox(&eqc, 64))?;
+        created?;
         self.stage.eq_hw = true;
         self.hcr.exec(op::MAP_EQ, 0, self.caps.eqn(), Input::Imm(!0))?; // every event type
         self.stage.eq_mapped = true;
         Ok(())
     }
 
-    /// Handles pending port events (link changes).
-    pub fn poll_events(&self) {
-        let Some(ring) = &self.mem.eq else { return };
-        let mut ci = self.eq_ci.get();
+    /// Switches the adapter to MSI-X interrupts.
+    ///
+    /// `table_bar` maps the whole BAR that the function's MSI-X capability
+    /// names ([`Msix::table_bir`](osmium_hal::pci::Msix::table_bir)),
+    /// and `messages` are the address/data pairs for [`VECTOR_ASYNC`] and
+    /// [`VECTOR_COMPLETION`], as the interrupt controller allocated them.
+    /// Call it before opening ports; ports opened afterwards complete
+    /// through the completion event queue and re-arm their completion queue
+    /// as they reap it. The function needs at least two table entries; on
+    /// any error the adapter stays in polled mode (a second event queue may
+    /// remain created, unused, until drop).
+    ///
+    /// After an interrupt, call [`handle_interrupt`](Self::handle_interrupt)
+    /// with the vector that fired. `Mlx4` is not `Sync`: the caller must
+    /// keep the handler and the port operations from running concurrently
+    /// (for instance by disabling interrupts around them).
+    pub fn enable_msix<C: ConfigAccess + ?Sized>(
+        &mut self,
+        func: &Function<'_, C>,
+        table_bar: &IoMem,
+        messages: [MsiMessage; 2],
+    ) -> Result<(), Mlx4Error> {
+        if self.msix.is_some() {
+            return Err(Mlx4Error::Msix(MsiError::Unsupported));
+        }
+        let msix = func.msix().map_err(Mlx4Error::Msix)?;
+        if msix.table_size() <= VECTOR_COMPLETION {
+            return Err(Mlx4Error::Msix(MsiError::Unsupported));
+        }
+        let table = msix.table(table_bar).map_err(Mlx4Error::Msix)?;
+        for (vector, msg) in [VECTOR_ASYNC, VECTOR_COMPLETION].into_iter().zip(messages) {
+            table.set_masked(vector, true).map_err(Mlx4Error::Msix)?;
+            table.set_message(vector, msg).map_err(Mlx4Error::Msix)?;
+        }
+
+        let eqn = self.caps.comp_eqn();
+        let ring = OwnedDma::new(self.dma, NUM_EQES as usize * EQE_LEN).ok_or(Mlx4Error::NoMemory)?;
+        let created = self.sw2hw_eq(eqn, &ring, 1, VECTOR_COMPLETION, true);
+        self.mem.comp_eq = Some(ring);
+        created?;
+        self.stage.comp_eq_hw = true;
+
+        // Arm the asynchronous queue (the completion queue starts armed),
+        // then let the function send.
+        let _ = self.uar.write(self.eq_doorbell(self.caps.eqn()), (self.eq_ci.get() & 0xff_ffff | EQ_ARM).to_be());
+        msix.enable(func);
+        for vector in [VECTOR_ASYNC, VECTOR_COMPLETION] {
+            table.set_masked(vector, false).map_err(Mlx4Error::Msix)?;
+        }
+        self.msix = Some(table);
+        self.comp_eqn = Some(eqn);
+        Ok(())
+    }
+
+    /// True once [`enable_msix`](Self::enable_msix) has succeeded.
+    pub fn msix_enabled(&self) -> bool {
+        self.comp_eqn.is_some()
+    }
+
+    /// Services MSI-X vector `vector` ([`VECTOR_ASYNC`] or
+    /// [`VECTOR_COMPLETION`]) and re-arms its event queue.
+    ///
+    /// Returns a bit set of ports (bit `n` for port `n + 1`) whose
+    /// completion queue signalled: the caller wakes whatever waits on those
+    /// ports. Completions themselves are reaped by the port's own
+    /// `receive` and `transmit` calls, which also re-arm the port's
+    /// completion queue (until then it raises no further events). The async vector returns 0
+    /// (it updates [`link_up`](Self::link_up)).
+    pub fn handle_interrupt(&self, vector: u16) -> u8 {
+        match vector {
+            VECTOR_ASYNC => {
+                self.poll_events();
+                0
+            }
+            VECTOR_COMPLETION => self.poll_completion_events(),
+            _ => 0,
+        }
+    }
+
+    /// Consumes the events in `ring` from consumer index `ci`, calling
+    /// `handle(event type, ring, byte offset of the entry)` for each, and
+    /// rings the doorbell (re-arming the queue if `arm`).
+    fn drain_eq(&self, eqn: u32, ring: &DmaBuffer, ci: &Cell<u32>, arm: bool, mut handle: impl FnMut(u32, usize)) {
+        let mut at = ci.get();
         loop {
-            let off = (ci % NUM_EQES) as usize * EQE_LEN;
+            let off = (at % NUM_EQES) as usize * EQE_LEN;
             let owner = get32(ring, off + 28) >> 7 & 1;
-            if owner != (ci / NUM_EQES) & 1 {
+            if owner != (at / NUM_EQES) & 1 {
                 break;
             }
             osmium_arch::barrier::dma_rmb();
-            let head = get32(ring, off);
-            if (head >> 16) & 0xff == EVENT_PORT_CHANGE {
+            handle(get32(ring, off) >> 16 & 0xff, off);
+            at = at.wrapping_add(1);
+            let _ = self.uar.write(self.eq_doorbell(eqn), (at & 0xff_ffff).to_be());
+        }
+        ci.set(at);
+        if arm {
+            let _ = self.uar.write(self.eq_doorbell(eqn), (at & 0xff_ffff | EQ_ARM).to_be());
+        }
+    }
+
+    /// Handles pending port events (link changes).
+    pub fn poll_events(&self) {
+        let Some(ring) = &self.mem.eq else { return };
+        let arm = self.comp_eqn.is_some();
+        self.drain_eq(self.caps.eqn(), ring, &self.eq_ci, arm, |kind, off| {
+            if kind == EVENT_PORT_CHANGE {
+                let head = get32(ring, off);
                 let port = (get32(ring, off + 12) >> 28 & 3) as u8;
                 if (1..=MAX_PORTS).contains(&port) {
                     self.set_link(port, head & PORT_CHANGE_ACTIVE != 0);
                 }
             }
-            ci = ci.wrapping_add(1);
-            let _ = self.uar.write(self.eq_doorbell(), (ci & 0xff_ffff).to_be());
-        }
-        self.eq_ci.set(ci);
+        });
+    }
+
+    /// Consumes completion events; returns the ports whose queue signalled.
+    fn poll_completion_events(&self) -> u8 {
+        let (Some(ring), Some(eqn)) = (&self.mem.comp_eq, self.comp_eqn) else { return 0 };
+        let mut signalled = 0u8;
+        self.drain_eq(eqn, ring, &self.comp_eq_ci, true, |kind, off| {
+            if kind == EVENT_COMPLETION {
+                let index = (get32(ring, off + 12) & 0xff_ffff).wrapping_sub(self.caps.reserved_cqs);
+                if let Some(sn) = self.arm_sn.get(index as usize) {
+                    sn.set(sn.get().wrapping_add(1));
+                    signalled |= 1 << index;
+                }
+            }
+        });
+        signalled
     }
 
     /// Returns true if port `port`'s link is up, as last reported.
@@ -587,6 +768,16 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
             }
         };
         let eqn = self.caps.eqn();
+        if let Some(table) = &self.msix {
+            for vector in [VECTOR_ASYNC, VECTOR_COMPLETION] {
+                let _ = table.set_masked(vector, true);
+            }
+        }
+        if self.stage.comp_eq_hw {
+            let mut eqc = Ctx::new();
+            let r = self.hcr.exec_out(op::HW2SW_EQ, 1, self.caps.comp_eqn(), Input::None, &mut eqc, 64).map(|_| 0);
+            leak(&self.hcr, r);
+        }
         if self.stage.eq_mapped {
             // Failing to unmap is harmless once the queue is gone.
             let _ = self.hcr.exec(op::MAP_EQ, 0, 1 << 31 | eqn, Input::Imm(!0));
@@ -771,6 +962,7 @@ mod tests {
             mtt_entry: 8,
             num_ports: 2,
             dpdp: false,
+            max_gso: 0,
         };
         let plan = plan_icm(&caps);
         let c = &plan.init_hca;
@@ -788,7 +980,7 @@ mod tests {
             (base(48, !0), 128, 64),
         ];
         assert!(1 << c.get(13, 0, 5) >= 64 + 15 + MAX_QPS as u64);
-        assert!(1 << c.get(33, 0, 5) > caps.eqn() as u64);
+        assert!(1 << c.get(33, 0, 5) > caps.comp_eqn() as u64);
         let other = plan.regions[4];
         for (i, &(b, n, e)) in tables.iter().enumerate() {
             let len = n * e;
@@ -846,7 +1038,7 @@ mod tests {
             let dma = HostDma::default();
             assert_eq!(bring_up(&hca, &dma).err(), Some(Mlx4Error::Command { opcode, status: 0x10 }), "{stage}");
             let s = hca.state.borrow();
-            assert!(!s.fw.running && !s.fw.hca_up && s.fw.icm.is_empty() && s.fw.eq.is_none(), "{stage}");
+            assert!(!s.fw.running && !s.fw.hca_up && s.fw.icm.is_empty() && s.fw.eqs.is_empty(), "{stage}");
             assert_eq!(dma.live.get(), 0, "{stage}: nothing leaked");
         }
     }
@@ -983,5 +1175,214 @@ mod tests {
         assert_eq!(dma.live.get(), before);
         hca.state.borrow_mut().fail = None;
         drop(mlx.open_eth(1).unwrap());
+    }
+
+    fn msix_messages() -> [MsiMessage; 2] {
+        [MsiMessage { address: 0xfee0_0000, data: 0x40 }, MsiMessage { address: 0xfee0_1000, data: 0x41 }]
+    }
+
+    #[test]
+    fn msix_interrupts() {
+        let hca = FakeHca::new(ETH);
+        let dma = HostDma::default();
+        let func = Function::new(&hca, fake::ADDR).unwrap();
+        let table = hca.msix_io();
+        let mut mlx = Mlx4::new(&func, hca.config_io(), hca.uar_io(), &dma, &hca).unwrap();
+        assert!(!mlx.msix_enabled());
+        mlx.enable_msix(&func, &table, msix_messages()).unwrap();
+        assert!(mlx.msix_enabled());
+        assert_eq!(mlx.enable_msix(&func, &table, msix_messages()), Err(Mlx4Error::Msix(MsiError::Unsupported)));
+        assert_eq!(hca.config(fake::MSIX_CAP / 4) >> 31, 1, "MSI-X enabled");
+        assert_eq!((hca.msix_message(0), hca.msix_message(1)), (msix_messages()[0], msix_messages()[1]));
+        assert_eq!(hca.state.borrow().fw.eqs.len(), 2, "asynchronous and completion queues");
+
+        let mut eth = mlx.open_eth(1).unwrap();
+        let qpn = 64 + 8;
+        let mut buf = [0u8; 2048];
+        assert!(hca.take_interrupts().is_empty());
+
+        // The first frame interrupts; the completion queue then stays
+        // disarmed until the port reaps it, so the second does not.
+        assert!(hca.deliver(1, &[1; 100]) && hca.deliver(1, &[2; 100]));
+        assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION]);
+        assert_eq!(mlx.handle_interrupt(VECTOR_COMPLETION), 0b1, "port 1 signalled");
+        assert_eq!(eth.receive(&mut buf), Ok(100));
+        assert_eq!(buf[0], 1);
+        assert_eq!(eth.receive(&mut buf), Ok(100));
+        assert_eq!(buf[0], 2);
+
+        // Reaping re-armed it: the next frame, and a transmit completion, interrupt again.
+        assert!(hca.deliver(1, &[3; 100]));
+        assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION]);
+        assert_eq!(mlx.handle_interrupt(VECTOR_COMPLETION), 0b1);
+        assert_eq!(eth.receive(&mut buf), Ok(100));
+        eth.transmit(&[9; 60]).unwrap();
+        assert_eq!(hca.sent(qpn).len(), 1);
+        assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION], "send completion");
+        assert_eq!(mlx.handle_interrupt(VECTOR_COMPLETION), 0b1);
+        assert!(eth.can_transmit());
+        // `can_*` only look; the next `receive` or `transmit` re-arms.
+        assert_eq!(eth.receive(&mut buf), Err(NetError::WouldBlock));
+        for n in 0..50u8 {
+            // The arm count wraps through its two bits many times.
+            assert!(hca.deliver(1, &[n; 64]));
+            assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION], "frame {n}");
+            assert_eq!(mlx.handle_interrupt(VECTOR_COMPLETION), 0b1);
+            assert_eq!(eth.receive(&mut buf), Ok(64));
+        }
+
+        // Link changes arrive on the other vector, and are rearmed too.
+        for up in [false, true, false] {
+            hca.port_event(1, up);
+            assert_eq!(hca.take_interrupts(), [VECTOR_ASYNC]);
+            assert_eq!(mlx.handle_interrupt(VECTOR_ASYNC), 0);
+            assert_eq!(eth.link_up(), up);
+        }
+        assert_eq!(mlx.handle_interrupt(7), 0, "unknown vector");
+
+        // A second port signals its own bit.
+        let mut p2 = mlx.open_eth(2).unwrap();
+        assert!(hca.deliver(2, &[5; 64]));
+        assert_eq!(mlx.handle_interrupt(VECTOR_COMPLETION), 0b10);
+        assert_eq!(p2.receive(&mut buf), Ok(64));
+
+        drop((eth, p2));
+        drop(mlx);
+        assert!(hca.state.borrow().fw.eqs.is_empty());
+        assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
+    fn drop_masks_vectors() {
+        let hca = FakeHca::new(ETH);
+        let dma = HostDma::default();
+        let func = Function::new(&hca, fake::ADDR).unwrap();
+        let table = hca.msix_io();
+        let mut mlx = Mlx4::new(&func, hca.config_io(), hca.uar_io(), &dma, &hca).unwrap();
+        mlx.enable_msix(&func, &table, msix_messages()).unwrap();
+        let masked = |v: usize| table.read::<u32>(v * 16 + 12).unwrap() & 1;
+        assert_eq!((masked(0), masked(1)), (0, 0), "unmasked once enabled");
+        drop(mlx);
+        assert_eq!((masked(0), masked(1)), (1, 1));
+    }
+
+    #[test]
+    fn msix_falls_back_to_polling() {
+        let dma = HostDma::default();
+        let hca = FakeHca::new(ETH);
+        hca.remove_msix();
+        let func = Function::new(&hca, fake::ADDR).unwrap();
+        let mut mlx = Mlx4::new(&func, hca.config_io(), hca.uar_io(), &dma, &hca).unwrap();
+        assert_eq!(mlx.enable_msix(&func, &hca.msix_io(), msix_messages()), Err(Mlx4Error::Msix(MsiError::NotPresent)));
+        assert!(!mlx.msix_enabled());
+
+        // A BAR too small for the table is reported, not panicked on.
+        let small = hca.msix_io().slice(0, 16).unwrap();
+        let hca2 = FakeHca::new(ETH);
+        let func2 = Function::new(&hca2, fake::ADDR).unwrap();
+        let mut mlx2 = Mlx4::new(&func2, hca2.config_io(), hca2.uar_io(), &dma, &hca2).unwrap();
+        assert_eq!(mlx2.enable_msix(&func2, &small, msix_messages()), Err(Mlx4Error::Msix(MsiError::OutOfBar)));
+        assert_eq!(hca2.config(fake::MSIX_CAP / 4) >> 31, 0, "left disabled");
+        assert!(!mlx2.msix_enabled());
+
+        // Polling still works.
+        let mut eth = mlx.open_eth(1).unwrap();
+        assert!(hca.deliver(1, &[4; 80]));
+        assert!(hca.take_interrupts().is_empty(), "polled queues never interrupt");
+        let mut buf = [0u8; 2048];
+        assert_eq!(eth.receive(&mut buf), Ok(80));
+    }
+
+    #[test]
+    fn checksum_offload() {
+        let hca = FakeHca::new(ETH);
+        let dma = HostDma::default();
+        let mlx = bring_up(&hca, &dma).unwrap();
+        let mut eth = mlx.open_eth(1).unwrap();
+        let qpn = 64 + 8;
+        assert!(eth.offloads().tx_checksum && eth.offloads().rx_checksum);
+        assert_eq!(eth.offloads().tso_max_frame, 0, "the fake does not segment by default");
+
+        eth.transmit(&[1; 60]).unwrap();
+        eth.transmit_offload(&[2; 60], TxOffload { checksum: true, tso: None }).unwrap();
+        let sent = hca.sent_ex(qpn);
+        assert_eq!((sent[0].ip_csum, sent[0].l4_csum), (false, false));
+        assert_eq!((sent[1].ip_csum, sent[1].l4_csum), (true, true));
+        assert_eq!(sent[1].frame, [2; 60]);
+        let checksum = TxOffload { checksum: true, tso: None };
+        assert_eq!(eth.transmit_offload(&[0; 1519], checksum), Err(NetError::TooLarge.into()));
+
+        const L4_OK: u16 = 1 << 10 | 1 << 12; // TCP, IP header ok
+        let mut buf = [0u8; 2048];
+        for (status, sum, want) in [
+            (L4_OK, 0xffff, RxChecksum::Verified),
+            (1 << 11 | 1 << 12, 0xffff, RxChecksum::Verified), // UDP
+            (L4_OK, 0x1234, RxChecksum::Unverified),           // bad TCP sum
+            (1 << 10, 0xffff, RxChecksum::Unverified),         // bad IP header
+            (1 << 12, 0xffff, RxChecksum::Unverified),         // neither TCP nor UDP
+            (0, 0, RxChecksum::Unverified),
+        ] {
+            assert!(hca.deliver_with(1, &[7; 70], status, sum));
+            assert_eq!(eth.receive_checked(&mut buf), Ok((70, want)), "status {status:#x} sum {sum:#x}");
+        }
+        assert!(hca.deliver_with(1, &[7; 70], L4_OK, 0xffff));
+        assert_eq!(eth.receive(&mut buf), Ok(70), "plain receive ignores the verdict");
+    }
+
+    #[test]
+    fn segmentation_offload() {
+        let hca = FakeHca::new(ETH);
+        hca.state.borrow_mut().max_gso = 65536;
+        let dma = HostDma::default();
+        let mlx = bring_up(&hca, &dma).unwrap();
+        let mut eth = mlx.open_eth(1).unwrap();
+        let qpn = 64 + 8;
+        assert_eq!(eth.offloads().tso_max_frame, 16 * 1024, "bounded by the staging buffer");
+
+        let frame: Vec<u8> = (0..9000u32).map(|i| (i * 7) as u8).collect();
+        let tso = |mss, header_len| TxOffload { checksum: false, tso: Some(Tso { mss, header_len }) };
+        eth.transmit_offload(&frame, tso(1448, 54)).unwrap();
+        let sent = hca.sent_ex(qpn);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].frame, frame, "header inline, payload from the staging buffer");
+        assert_eq!(sent[0].lso, Some((1448, 54)));
+        assert!(sent[0].ip_csum && sent[0].l4_csum, "segmentation implies checksum offload");
+
+        // The largest header, and an odd one that needs padding.
+        for h in [eth::TSO_MAX_HEADER as u16, 55] {
+            eth.transmit_offload(&frame[..3000], tso(1000, h)).unwrap();
+            assert_eq!(hca.sent_ex(qpn)[0].lso, Some((1000, h as usize)));
+        }
+
+        // Only one segmentation frame is in flight; the buffer frees on completion.
+        eth.transmit_offload(&frame[..4000], tso(1000, 54)).unwrap();
+        assert_eq!(eth.transmit_offload(&frame[..4000], tso(1000, 54)), Err(NetError::WouldBlock.into()));
+        eth.transmit(&[0; 60]).unwrap(); // ordinary frames still go
+        assert_eq!(hca.sent_ex(qpn).len(), 2);
+        eth.transmit_offload(&frame[..4000], tso(1000, 54)).unwrap();
+        assert_eq!(hca.sent_ex(qpn).len(), 1);
+
+        let mut bad = |mss, h, len: usize| eth.transmit_offload(&frame[..len], tso(mss, h));
+        assert_eq!(bad(0, 54, 3000), Err(TxError::BadSegmentation));
+        assert_eq!(bad(1000, 0, 3000), Err(TxError::BadSegmentation));
+        assert_eq!(bad(1000, eth::TSO_MAX_HEADER as u16 + 1, 3000), Err(TxError::BadSegmentation));
+        assert_eq!(bad(1000, 54, 54), Err(TxError::BadSegmentation), "no payload");
+        assert_eq!(bad(1500, 54, 3000), Err(NetError::TooLarge.into()), "segments over the MTU");
+        let big = vec![0u8; 16 * 1024 + 1];
+        assert_eq!(eth.transmit_offload(&big, tso(1000, 54)), Err(NetError::TooLarge.into()));
+        assert!(hca.sent_ex(qpn).is_empty(), "nothing was posted");
+        drop(eth);
+        drop(mlx);
+        assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
+    fn segmentation_needs_device_support() {
+        let hca = FakeHca::new(ETH);
+        let dma = HostDma::default();
+        let mlx = bring_up(&hca, &dma).unwrap();
+        let mut eth = mlx.open_eth(1).unwrap();
+        let t = TxOffload { checksum: true, tso: Some(Tso { mss: 1000, header_len: 54 }) };
+        assert_eq!(eth.transmit_offload(&[0; 3000], t), Err(TxError::Unsupported));
     }
 }

@@ -8,6 +8,17 @@
 //! directions complete into one completion queue, sized so it cannot
 //! overflow; receive completions found while reaping transmit ones are
 //! queued in software until [`receive`](NetDevice::receive) asks.
+//!
+//! With MSI-X enabled on the adapter the completion queue is created
+//! disarmed and armed by doorbell whenever the port has reaped everything;
+//! the completion event queue's interrupt then disarms it until the next
+//! reap. Without MSI-X it is "fired" and only polled.
+//!
+//! Offloads are opt-in per frame through
+//! [`transmit_offload`](EthPort::transmit_offload) and
+//! [`receive_checked`](EthPort::receive_checked).
+//! A segmentation (LSO) frame is staged in a dedicated buffer, one at a
+//! time, since the regular transmit slots hold one Ethernet frame each.
 
 use core::mem::ManuallyDrop;
 
@@ -15,7 +26,7 @@ use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
 
 use super::cmd::{Ctx, Input, op};
-use super::{Mlx4, Mlx4Error, PAGE, PD, PORT_MTTS, UAR_PAGE, get32, log2_ceil, put32};
+use super::{EQ_MTTS, Mlx4, Mlx4Error, PAGE, PD, PORT_MTTS, UAR_PAGE, get32, log2_ceil, put32};
 
 /// Send queue entries (a power of two).
 pub const SQ_ENTRIES: u32 = 32;
@@ -36,6 +47,32 @@ const MAX_FRAME: usize = 1518;
 const PORT_MTU: u32 = 1500 + 14 + 4 + 4;
 
 const OPCODE_SEND: u32 = 0x0a;
+const OPCODE_LSO: u32 = 0x0e;
+/// Send control flags: completion on every entry, solicited.
+const CTRL_COMPLETE: u32 = 3 << 2 | 1 << 1;
+const CTRL_IP_CSUM: u32 = 1 << 4;
+const CTRL_L4_CSUM: u32 = 1 << 5;
+/// Bytes of a control or data segment, and of the LSO segment's fixed part.
+const SEG_LEN: usize = 16;
+const LSO_FIXED: usize = 4;
+/// Largest header the LSO segment can carry in a [`SQ_STRIDE`] entry with
+/// a control segment and one data segment around it.
+pub const TSO_MAX_HEADER: usize = SQ_STRIDE - 2 * SEG_LEN - LSO_FIXED;
+/// Bytes of the buffer a segmentation frame is staged in.
+const LSO_BUF_LEN: usize = 16 * 1024;
+
+/// Completion queue arm request: any completion.
+const CQ_DB_REQ_NOT: u32 = 2 << 24;
+/// Completion queue arm doorbell, in [`UAR_PAGE`].
+const CQ_DOORBELL: usize = 0x20;
+
+// Completion status bits (the CQE's big-endian 16-bit status word).
+const STATUS_TCP: u16 = 1 << 10;
+const STATUS_UDP: u16 = 1 << 11;
+const STATUS_IPOK: u16 = 1 << 12;
+/// The CQE checksum word when the device summed the whole TCP/UDP segment
+/// correctly.
+const CSUM_OK: u16 = 0xffff;
 const CQE_OPCODE_ERROR: u32 = 0x1e;
 /// A receive entry's terminating scatter entry.
 const INVALID_LKEY: u32 = 0x100;
@@ -49,6 +86,7 @@ const SET_PORT_RECEIVE_QP: u32 = 0x0100;
 const _: () = assert!(SQ_ENTRIES.is_power_of_two() && RX_SLOTS.is_power_of_two() && CQ_ENTRIES.is_power_of_two());
 const _: () = assert!(TX_SLOTS < SQ_ENTRIES - (2048 / SQ_STRIDE) as u32);
 const _: () = assert!(TX_SLOTS + RX_SLOTS <= CQ_ENTRIES);
+const _: () = assert!(2 * SEG_LEN + (LSO_FIXED + TSO_MAX_HEADER).next_multiple_of(SEG_LEN) <= SQ_STRIDE);
 const _: () = assert!(CQ_ENTRIES as usize * CQE_LEN <= PAGE);
 const _: () =
     assert!((SQ_ENTRIES as usize * SQ_STRIDE + RX_SLOTS as usize * RQ_STRIDE).div_ceil(PAGE) < PORT_MTTS as usize);
@@ -61,6 +99,81 @@ struct Memory<'d, D: DmaAllocator + ?Sized> {
     doorbells: OwnedDma<'d, D>,
     rx: OwnedDma<'d, D>,
     tx: OwnedDma<'d, D>,
+    /// Staging for segmentation frames; present if the device does LSO.
+    lso: Option<OwnedDma<'d, D>>,
+}
+
+/// What a port can offload to the adapter, from [`EthPort::offloads`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Offloads {
+    /// The adapter can fill in IPv4 header and TCP/UDP checksums on
+    /// transmit ([`TxOffload::checksum`]).
+    pub tx_checksum: bool,
+    /// Received frames come with a verdict on their checksums
+    /// ([`EthPort::receive_checked`]).
+    pub rx_checksum: bool,
+    /// Largest frame (headers included) [`Tso`] can take, or 0 if the
+    /// adapter cannot segment.
+    pub tso_max_frame: usize,
+}
+
+/// Whether the adapter verified a received frame's checksums.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxChecksum {
+    /// No verdict: not IP over TCP or UDP, or the adapter found a problem.
+    /// The stack must check for itself.
+    Unverified,
+    /// The IP header and the TCP or UDP checksum are both correct.
+    Verified,
+}
+
+/// TCP segmentation (large send): the adapter cuts one big frame into
+/// frames of `mss` payload bytes, copying `header_len` bytes of headers to
+/// each and fixing up lengths and checksums.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tso {
+    /// TCP payload bytes per segment.
+    pub mss: u16,
+    /// Bytes of Ethernet, IP and TCP headers at the start of the frame
+    /// (at most [`TSO_MAX_HEADER`]).
+    pub header_len: u16,
+}
+
+/// Offloads requested for one transmitted frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxOffload {
+    /// Compute the IPv4 header checksum and the TCP/UDP checksum (the TCP
+    /// or UDP checksum field must hold the pseudo-header sum).
+    pub checksum: bool,
+    /// Segment the frame. Implies `checksum`.
+    pub tso: Option<Tso>,
+}
+
+/// Why [`EthPort::transmit_offload`] refused a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxError {
+    /// The ordinary transmit errors (queue full, frame too large).
+    Net(NetError),
+    /// The adapter cannot segment.
+    Unsupported,
+    /// Zero MSS, or a header length that is zero, longer than
+    /// [`TSO_MAX_HEADER`] or than the frame.
+    BadSegmentation,
+}
+
+impl From<NetError> for TxError {
+    fn from(e: NetError) -> Self {
+        Self::Net(e)
+    }
+}
+
+/// A received frame reaped from the completion queue but not yet taken.
+#[derive(Clone, Copy, Default)]
+struct Received {
+    slot: u16,
+    len: u16,
+    error: bool,
+    checksum: bool,
 }
 
 /// How far opening got, so closing undoes exactly that.
@@ -88,9 +201,14 @@ pub struct EthPort<'h, 'd, D: DmaAllocator + ?Sized> {
     tx_done: u32,
     /// Receive entries handed to the device.
     rx_posted: u32,
-    /// Received frames reaped from the completion queue but not yet taken:
-    /// (slot, length, error), `rx_ready_count` of them from `rx_ready_head`.
-    rx_ready: [(u16, u16, bool); RX_SLOTS as usize],
+    /// Received frames reaped from the completion queue but not yet taken,
+    /// `rx_ready_count` of them from `rx_ready_head`.
+    rx_ready: [Received; RX_SLOTS as usize],
+    /// The arm count the completion queue was last armed with (MSI-X only).
+    armed_sn: Option<u8>,
+    /// Segmentation frame in flight: the value of `tx_done` that frees the
+    /// staging buffer.
+    lso_until: Option<u32>,
     rx_ready_head: usize,
     rx_ready_count: usize,
 }
@@ -122,6 +240,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
             doorbells: alloc(128)?,
             rx: alloc(RX_SLOTS as usize * SLOT_LEN)?,
             tx: alloc(TX_SLOTS as usize * SLOT_LEN)?,
+            lso: if hca.caps.max_gso > 0 { Some(alloc(LSO_BUF_LEN)?) } else { None },
         };
         let mut eth = Self {
             hca,
@@ -135,15 +254,54 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
             tx_head: 0,
             tx_done: 0,
             rx_posted: 0,
-            rx_ready: [(0, 0, false); RX_SLOTS as usize],
+            rx_ready: [Received::default(); RX_SLOTS as usize],
+            armed_sn: None,
+            lso_until: None,
             rx_ready_head: 0,
             rx_ready_count: 0,
         };
         hca.open.set(hca.open.get() | 1 << index);
-        eth.create_cq(1 + PORT_MTTS * index)?;
-        eth.create_qp(2 + PORT_MTTS * index)?;
+        eth.create_cq(EQ_MTTS + PORT_MTTS * index)?;
+        eth.create_qp(EQ_MTTS + 1 + PORT_MTTS * index)?;
+        eth.arm_cq();
         eth.start_port()?;
         Ok(eth)
+    }
+
+    /// What this port can offload to the adapter.
+    pub fn offloads(&self) -> Offloads {
+        Offloads {
+            tx_checksum: true,
+            rx_checksum: true,
+            tso_max_frame: if self.mem.lso.is_some() { (self.hca.caps.max_gso as usize).min(LSO_BUF_LEN) } else { 0 },
+        }
+    }
+
+    /// Index of this port's completion queue in the adapter's counters.
+    fn index(&self) -> usize {
+        self.port as usize - 1
+    }
+
+    /// Asks for an event on the next completion, if the adapter uses MSI-X.
+    fn arm_cq(&mut self) {
+        if self.hca.comp_eqn.is_none() {
+            return;
+        }
+        let sn = self.hca.arm_sn[self.index()].get();
+        let (word, ci) = ((sn as u32 & 3) << 28 | CQ_DB_REQ_NOT, self.cq_ci & 0xff_ffff);
+        // The record first, then the doorbell that makes the device read it.
+        put32(&self.mem.doorbells, 4, word | ci);
+        osmium_arch::barrier::dma_wmb();
+        let doorbell = ((word | self.cqn) as u64) << 32 | ci as u64;
+        let _ = self.hca.uar.write(UAR_PAGE as usize * PAGE + CQ_DOORBELL, doorbell.to_be());
+        self.armed_sn = Some(sn);
+    }
+
+    /// Re-arms the completion queue if an event disarmed it.
+    fn rearm_if_fired(&mut self) {
+        if self.hca.comp_eqn.is_some() && self.armed_sn != Some(self.hca.arm_sn[self.index()].get()) {
+            self.arm_cq();
+        }
     }
 
     /// The port number (1-based).
@@ -158,9 +316,13 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
         }
         self.hca.write_mtt(mtt, cq)?;
         let mut cqc = Ctx::new();
-        cqc.set(0, 8, 4, 0xa); // "fired": never raises an event
+        // Polled: "fired", so it never raises an event. With MSI-X the
+        // state stays 0 until the arm doorbell.
+        if self.hca.comp_eqn.is_none() {
+            cqc.set(0, 8, 4, 0xa);
+        }
         cqc.set(3, 0, 24, UAR_PAGE).set(3, 24, 5, log2_ceil(CQ_ENTRIES));
-        cqc.set(5, 0, 9, self.hca.caps.eqn());
+        cqc.set(5, 0, 9, self.hca.comp_eqn.unwrap_or(self.hca.caps.eqn()));
         cqc.set_addr(6, self.hca.mtt_addr(mtt));
         cqc.set_addr(14, self.mem.doorbells.device_addr().as_u64());
         self.hca.hcr.exec(op::SW2HW_CQ, 0, self.cqn, Input::Mailbox(&cqc, 64))?;
@@ -236,8 +398,19 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
         Ok(())
     }
 
-    /// Reaps every completion the device has written.
+    /// Reaps every completion the device has written, then (with MSI-X)
+    /// re-arms the queue, looking once more for one that raced the arming.
     fn poll_cq(&mut self) {
+        loop {
+            self.reap_cq();
+            self.rearm_if_fired();
+            if self.hca.comp_eqn.is_none() || !self.completion_ready() {
+                break;
+            }
+        }
+    }
+
+    fn reap_cq(&mut self) {
         let cq = &self.mem.cq;
         let mut reaped = false;
         loop {
@@ -253,9 +426,13 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
             } else {
                 let slot = (get32(cq, off + 24) >> 16) as u16 % RX_SLOTS as u16;
                 let len = get32(cq, off + 20).min(SLOT_LEN as u32) as u16;
+                let status = (get32(cq, off + 16) >> 16) as u16;
+                let sum = get32(cq, off + 24) as u16;
+                let l4 = status & (STATUS_TCP | STATUS_UDP) != 0;
+                let checksum = !error && l4 && status & STATUS_IPOK != 0 && sum == CSUM_OK;
                 // At most RX_SLOTS receives are outstanding, so this fits.
                 let at = (self.rx_ready_head + self.rx_ready_count) % RX_SLOTS as usize;
-                self.rx_ready[at] = (slot, len, error);
+                self.rx_ready[at] = Received { slot, len, error, checksum };
                 self.rx_ready_count += 1;
             }
             self.cq_ci = self.cq_ci.wrapping_add(1);
@@ -264,6 +441,12 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
         if reaped {
             put32(&self.mem.doorbells, 0, self.cq_ci & 0xff_ffff);
         }
+    }
+
+    /// True if the next completion queue entry is the device's.
+    fn completion_ready(&self) -> bool {
+        let tail = get32(&self.mem.cq, (self.cq_ci % CQ_ENTRIES) as usize * CQE_LEN + 28);
+        (tail >> 7) & 1 == (self.cq_ci / CQ_ENTRIES) & 1
     }
 
     /// Returns true if the completion queue holds a send (`send`) or
@@ -282,6 +465,126 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
             ci = ci.wrapping_add(1);
         }
         false
+    }
+
+    /// Transmits `frame` with the offloads in `offload`.
+    ///
+    /// With [`TxOffload::checksum`] the adapter fills in the IPv4 header
+    /// checksum and the TCP or UDP checksum. With [`TxOffload::tso`] the
+    /// frame may be up to [`Offloads::tso_max_frame`] bytes and is cut into
+    /// segments by the adapter; only one such frame is in flight at a time
+    /// (the next returns [`NetError::WouldBlock`] until it completes).
+    pub fn transmit_offload(&mut self, frame: &[u8], offload: TxOffload) -> Result<(), TxError> {
+        let tso = offload.tso;
+        let limit = if tso.is_some() { LSO_BUF_LEN } else { MAX_FRAME };
+        if tso.is_some() && self.mem.lso.is_none() {
+            return Err(TxError::Unsupported);
+        }
+        if frame.len() > limit || tso.is_some() && frame.len() > self.offloads().tso_max_frame {
+            return Err(NetError::TooLarge.into());
+        }
+        if let Some(t) = tso {
+            let h = t.header_len as usize;
+            if t.mss == 0 || h == 0 || h > TSO_MAX_HEADER || h >= frame.len() {
+                return Err(TxError::BadSegmentation);
+            }
+            // Each segment must be a legal frame.
+            if h + t.mss as usize > MAX_FRAME {
+                return Err(NetError::TooLarge.into());
+            }
+        }
+        let lso = tso.is_some();
+        if self.tx_head.wrapping_sub(self.tx_done) == TX_SLOTS || lso && self.lso_busy() {
+            self.poll_cq();
+            if self.tx_head.wrapping_sub(self.tx_done) == TX_SLOTS || lso && self.lso_busy() {
+                return Err(NetError::WouldBlock.into());
+            }
+        }
+        let slot = (self.tx_head % TX_SLOTS) as usize * SLOT_LEN;
+        let wqe = (self.tx_head % SQ_ENTRIES) as usize * SQ_STRIDE;
+        let wq: &DmaBuffer = &self.mem.wq;
+        for off in (4..SQ_STRIDE).step_by(4) {
+            wq.store(wqe + off, 0u32);
+        }
+        let mut flags = CTRL_COMPLETE;
+        if offload.checksum || tso.is_some() {
+            flags |= CTRL_IP_CSUM | CTRL_L4_CSUM;
+        }
+        let (opcode, segments, data_at, buf, data_off, data_len) = match (tso, &self.mem.lso) {
+            (Some(t), Some(lso)) => {
+                let h = t.header_len as usize;
+                lso.write(0, frame);
+                let hdr = (LSO_FIXED + h).next_multiple_of(SEG_LEN);
+                put32(wq, wqe + SEG_LEN, (t.mss as u32) << 16 | h as u32);
+                wq.write(wqe + SEG_LEN + LSO_FIXED, &frame[..h]);
+                (OPCODE_LSO, 2 + hdr / SEG_LEN, wqe + SEG_LEN + hdr, lso, h, frame.len() - h)
+            }
+            _ => {
+                self.mem.tx.write(slot, frame);
+                (OPCODE_SEND, 2, wqe + SEG_LEN, &self.mem.tx, slot, frame.len())
+            }
+        };
+        put32(wq, wqe + 4, segments as u32); // control, optional LSO header, data
+        put32(wq, wqe + 8, flags);
+        put32(wq, data_at, data_len as u32);
+        put32(wq, data_at + 4, self.hca.lkey);
+        wq.store(data_at + 8, (buf.device_addr().as_u64() + data_off as u64).to_be());
+        // The entry must be complete before its owner bit hands it over.
+        osmium_arch::barrier::dma_wmb();
+        let owner = (self.tx_head / SQ_ENTRIES) & 1;
+        put32(wq, wqe, owner << 31 | opcode);
+        osmium_arch::barrier::mb();
+        let _ = self.hca.uar.write(UAR_PAGE as usize * PAGE + SEND_DOORBELL, (self.qpn << 8).to_be());
+        self.tx_head = self.tx_head.wrapping_add(1);
+        if tso.is_some() {
+            self.lso_until = Some(self.tx_head);
+        }
+        Ok(())
+    }
+
+    /// True while a segmentation frame still owns the staging buffer.
+    fn lso_busy(&mut self) -> bool {
+        match self.lso_until {
+            // Wrapping comparison: `tx_done` has not reached `until` yet.
+            Some(until) if (self.tx_done.wrapping_sub(until) as i32) < 0 => true,
+            Some(_) => {
+                self.lso_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Like [`receive`](NetDevice::receive), also telling whether the
+    /// adapter verified the frame's IP header and TCP/UDP checksum.
+    pub fn receive_checked(&mut self, buf: &mut [u8]) -> Result<(usize, RxChecksum), NetError> {
+        if self.rx_ready_count == 0 {
+            self.poll_cq();
+        }
+        if self.rx_ready_count == 0 {
+            return Err(NetError::WouldBlock);
+        }
+        let Received { slot, len, error, checksum } = self.rx_ready[self.rx_ready_head];
+        self.rx_ready_head = (self.rx_ready_head + 1) % RX_SLOTS as usize;
+        self.rx_ready_count -= 1;
+        let len = len as usize;
+        let result = if error {
+            Err(NetError::Io)
+        } else if let Some(dst) = buf.get_mut(..len) {
+            self.mem.rx.read(slot as usize * SLOT_LEN, dst);
+            Ok((len, if checksum { RxChecksum::Verified } else { RxChecksum::Unverified }))
+        } else {
+            Err(NetError::TooLarge)
+        };
+        // Completions arrive in order, so the entry just consumed is the
+        // next to repost, and it still points at its own slot.
+        self.rx_posted = self.rx_posted.wrapping_add(1);
+        osmium_arch::barrier::dma_wmb();
+        put32(&self.mem.doorbells, 64, self.rx_posted & 0xffff);
+        // A completion event disarms the queue even if nothing was reaped
+        // here (frames already queued in software).
+        self.rearm_if_fired();
+        result
     }
 
     fn close(&mut self) {
@@ -320,63 +623,15 @@ impl<D: DmaAllocator + ?Sized> NetDevice for EthPort<'_, '_, D> {
     }
 
     fn transmit(&mut self, frame: &[u8]) -> Result<(), NetError> {
-        if frame.len() > MAX_FRAME {
-            return Err(NetError::TooLarge);
+        match self.transmit_offload(frame, TxOffload::default()) {
+            Ok(()) => Ok(()),
+            Err(TxError::Net(e)) => Err(e),
+            Err(_) => Err(NetError::Io),
         }
-        if self.tx_head.wrapping_sub(self.tx_done) == TX_SLOTS {
-            self.poll_cq();
-            if self.tx_head.wrapping_sub(self.tx_done) == TX_SLOTS {
-                return Err(NetError::WouldBlock);
-            }
-        }
-        let slot = (self.tx_head % TX_SLOTS) as usize * SLOT_LEN;
-        self.mem.tx.write(slot, frame);
-
-        let wq: &DmaBuffer = &self.mem.wq;
-        let wqe = (self.tx_head % SQ_ENTRIES) as usize * SQ_STRIDE;
-        for off in (4..SQ_STRIDE).step_by(4) {
-            wq.store(wqe + off, 0u32);
-        }
-        put32(wq, wqe + 4, 2); // two 16-byte segments: control and data
-        put32(wq, wqe + 8, 3 << 2 | 1 << 1); // always complete; solicited
-        put32(wq, wqe + 16, frame.len() as u32);
-        put32(wq, wqe + 20, self.hca.lkey);
-        wq.store(wqe + 24, (self.mem.tx.device_addr().as_u64() + slot as u64).to_be());
-        // The entry must be complete before its owner bit hands it over.
-        osmium_arch::barrier::dma_wmb();
-        let owner = (self.tx_head / SQ_ENTRIES) & 1;
-        put32(wq, wqe, owner << 31 | OPCODE_SEND);
-        osmium_arch::barrier::mb();
-        let _ = self.hca.uar.write(UAR_PAGE as usize * PAGE + SEND_DOORBELL, (self.qpn << 8).to_be());
-        self.tx_head = self.tx_head.wrapping_add(1);
-        Ok(())
     }
 
     fn receive(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
-        if self.rx_ready_count == 0 {
-            self.poll_cq();
-        }
-        if self.rx_ready_count == 0 {
-            return Err(NetError::WouldBlock);
-        }
-        let (slot, len, error) = self.rx_ready[self.rx_ready_head];
-        self.rx_ready_head = (self.rx_ready_head + 1) % RX_SLOTS as usize;
-        self.rx_ready_count -= 1;
-        let len = len as usize;
-        let result = if error {
-            Err(NetError::Io)
-        } else if let Some(dst) = buf.get_mut(..len) {
-            self.mem.rx.read(slot as usize * SLOT_LEN, dst);
-            Ok(len)
-        } else {
-            Err(NetError::TooLarge)
-        };
-        // Completions arrive in order, so the entry just consumed is the
-        // next to repost, and it still points at its own slot.
-        self.rx_posted = self.rx_posted.wrapping_add(1);
-        osmium_arch::barrier::dma_wmb();
-        put32(&self.mem.doorbells, 64, self.rx_posted & 0xffff);
-        result
+        self.receive_checked(buf).map(|(len, _)| len)
     }
 
     fn can_receive(&self) -> bool {

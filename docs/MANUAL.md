@@ -540,7 +540,7 @@ port I/O.
 | Interrupt controllers | `plic::Plic`, `gicv2::GicV2`, `lapic::LocalApic`, `ioapic::IoApic` |
 | Timers | `clint::Clint`, `pit::Pit` |
 | Block | `ramdisk::RamDisk`, `virtio::blk::VirtioBlk`, `usb::storage::UsbStorage` (fewer than 2^32 blocks, so under 2 TiB at 512 B; block sizes a power of two from 512 B to 64 KiB), `ahci::Ahci`, `nvme::Nvme`; iSCSI in `osmium::iscsi` |
-| Network | `virtio::net::VirtioNet`, `usb::ecm::UsbEthernet`, `mlx4::Mlx4` |
+| Network | `virtio::net::VirtioNet`, `usb::ecm::UsbEthernet`, `mlx4::Mlx4` (polled, or MSI-X via `enable_msix`; checksum and segmentation offloads are inherent `EthPort` methods, since `NetDevice` has no offload flags) |
 | USB | `xhci::Xhci`, `usb::hid::BootKeyboard` |
 | Display | `virtio::gpu::VirtioGpu` (virtio-gpu and virtio-vga, MMIO or PCI), `display::bochs::BochsVbe` (QEMU std VGA, bochs-display, virtio-vga in VGA mode), `display::vbe::Vbe` (VESA BIOS Extensions, x86) |
 
