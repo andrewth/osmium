@@ -19,15 +19,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::arch::x86_64 as x86;
 use osmium::arch::{cpu, irq};
+use osmium::boot::acpi::{Acpi, Madt};
 use osmium::boot::pvh::StartInfo;
+use osmium::drivers::lapic::{self, LocalApic};
 use osmium::drivers::pit::{Pio as PitPio, Pit};
 use osmium::drivers::uart16550::{Pio, Uart16550};
 use osmium::hal::console::{SerialConsole, set_console};
+use osmium::hal::mmio::IoMem;
 use osmium::hal::{print, println};
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::formats::X86_64;
@@ -41,7 +44,7 @@ use osmium::virt::smp::GuestCpus;
 use osmium::virt::x86::{self as svm, SvmPages, SvmVcpu};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
-osmium::boot::pvh_start!(kmain);
+osmium::boot::pvh_start!(kmain, ap: ap_main);
 
 // The guest: position-independent 32-bit code copied into guest RAM. It
 // runs in protected mode with paging off, flat segments.
@@ -283,7 +286,8 @@ lm_guest_end:
 // starts in real mode at 0x8000 (the host copies `smp_ap` there), prints,
 // switches to protected mode, sends the BSP a fixed IPI (vector 0x41)
 // through its own APIC's ICR, and asks to be stopped (hypercall 2). The BSP
-// takes the IPI in its IDT, prints, and powers off.
+// spins with interrupts on, takes the IPI in its IDT, prints, and powers
+// off. Each vCPU runs on its own host CPU.
 core::arch::global_asm!(
     r#"
     .section .rodata.guest, "a"
@@ -298,11 +302,10 @@ smp_bsp:
     movl $0x01000000, 0x310(%edi)   // ICR destination: APIC 1
     movl $0x00004500, 0x300(%edi)   // INIT
     movl $0x00004608, 0x300(%edi)   // STARTUP, vector 8: real mode at 0x8000
-1:  sti
-    hlt                             // wait for the AP's IPI
+    sti                             // wait for the AP's IPI in guest code
+1:  cmpb $0, SBASE + smp_flag - smp_bsp // with no exits: only a kick of
+    je 1b                           // this host CPU gets it in
     cli
-    cmpb $0, SBASE + smp_flag - smp_bsp
-    je 1b
     mov $0x3f8, %dx
     mov $SBASE + 3f - smp_bsp, %esi
 2:  lodsb
@@ -394,6 +397,8 @@ unsafe extern "C" {
     static smp_bsp_end: u8;
     static smp_ap: u8;
     static smp_ap_end: u8;
+    static boot_pml4: u8;
+    fn ap_start64();
 }
 
 fn sym(s: &u8) -> u64 {
@@ -441,6 +446,23 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: linker-provided symbols.
     let (kstart, kend) = unsafe { (sym(&_kernel_start), sym(&_kernel_end)) };
     map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).unwrap();
+    // The AP trampoline's page (and the rest of low memory) stays out of the allocator.
+    map.reserve(PhysAddr::new(0), PhysAddr::new(0x10_0000), RegionKind::Reserved).unwrap();
+    let my_apic = x86::cpuid(1, 0).ebx >> 24;
+    HOST_APIC_IDS[0].store(my_apic as u8, Ordering::Relaxed);
+    let mut ncpus = 1;
+    if let Some(rsdp) = info.rsdp() {
+        // SAFETY: the boot tables identity-map the first 4 GiB, where QEMU's
+        // ACPI tables live; they are only read here.
+        let read = |pa: u64, len: usize| Some(unsafe { core::slice::from_raw_parts(pa as *const u8, len) });
+        let madt = Acpi::new(rsdp.0, read).ok().and_then(|a| a.find(b"APIC")).and_then(Madt::parse);
+        for c in madt.iter().flat_map(|m| m.local_apics()).filter(|c| c.enabled && c.apic_id != my_apic) {
+            if ncpus < HOST_APIC_IDS.len() {
+                HOST_APIC_IDS[ncpus].store(c.apic_id as u8, Ordering::Relaxed);
+                ncpus += 1;
+            }
+        }
+    }
     map.page_align_usable();
     {
         let mut buddy = FRAMES.lock();
@@ -460,9 +482,26 @@ extern "C" fn kmain(start_info: usize) -> ! {
             shutdown()
         }
     }
+    // Host interrupts: the 8259s masked, the local APIC on for kicks. The
+    // host runs with interrupts enabled so a kick exits the guest.
+    // SAFETY: the PIC data ports.
+    unsafe {
+        x86::outb(0x21, 0xff);
+        x86::outb(0xa1, 0xff);
+    }
+    // SAFETY: the local APIC's default address, identity-mapped by the boot tables.
+    let apic = LAPIC.call_once(|| LocalApic::new(unsafe { IoMem::new(lapic::DEFAULT_BASE as *mut u8, PAGE_SIZE) }));
+    apic.enable(SPURIOUS_VECTOR);
+    irq::enable();
+
     guest_demo();
     long_mode_demo();
-    smp_demo();
+    if ncpus > 1 {
+        start_host_cpu(1);
+        smp_demo();
+    } else {
+        println!("[smp]   one host CPU: skipping the SMP guest (run QEMU with -smp 2)");
+    }
 
     println!("[done]  {} free frames; shutting down", FRAMES.lock().free_frames());
     shutdown()
@@ -475,6 +514,63 @@ const GUEST_LAPIC: u64 = 0xfee0_0000;
 const LAPIC_TIMER_HZ: u64 = 100_000_000;
 
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+
+static LAPIC: Once<LocalApic> = Once::new();
+/// Host CPU index to local APIC ID.
+static HOST_APIC_IDS: [AtomicU8; 2] = [const { AtomicU8::new(0) }; 2];
+static ONLINE: AtomicUsize = AtomicUsize::new(1);
+/// The vector one host CPU sends another to kick its vCPU out of guest code.
+const KICK_VECTOR: u8 = 0xf0;
+const SPURIOUS_VECTOR: u8 = 0xff;
+
+/// Starts host CPU `cpu` through the shared trampoline and waits for it.
+fn start_host_cpu(cpu: usize) {
+    // SAFETY: low memory is reserved and identity-mapped writable; this is
+    // the only AP start in flight.
+    unsafe { x86::smp::install() };
+    let stack = alloc::vec![0u8; 64 * 1024].leak();
+    let boot = x86::smp::ApBoot {
+        cr3: &raw const boot_pml4 as u64,
+        stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
+        entry: ap_start64 as *const () as u64,
+        cpu,
+    };
+    // SAFETY: nothing else uses the host's PIT.
+    let pit = Pit::new(unsafe { PitPio::new() });
+    let id = HOST_APIC_IDS[cpu].load(Ordering::Relaxed);
+    // SAFETY: the trampoline is installed and no other AP is in it.
+    unsafe { LAPIC.get().unwrap().start_ap(id, &boot, |ns| pit.wait_ns(ns)) };
+    while ONLINE.load(Ordering::Acquire) <= cpu {
+        core::hint::spin_loop();
+    }
+    println!("[smp]   host CPU {cpu} (APIC id {id}) online with SVM on");
+}
+
+/// Rust entry of the second host CPU: SVM on, then run vCPUs it is given.
+#[unsafe(no_mangle)]
+extern "C" fn ap_main(cpu: usize) -> ! {
+    // SAFETY: the boot CPU hands out distinct indices.
+    unsafe { cpu::set_current_id(cpu) };
+    // SAFETY: we are on the stack the boot CPU allocated for us.
+    unsafe { trap::install() };
+    LAPIC.get().unwrap().enable(SPURIOUS_VECTOR);
+    let hsave = FRAMES.lock().alloc(0).expect("host save area");
+    svm::enable(hsave.0).expect("SVM on the second CPU");
+    irq::enable();
+    ONLINE.fetch_add(1, Ordering::Release);
+    loop {
+        // SAFETY: smp_demo publishes the VM only while it lives, and waits
+        // for this CPU to let go before freeing it.
+        if let Some(vm) = unsafe { SMP_VM.load(Ordering::Acquire).as_ref() } {
+            vcpu_loop(vm, cpu);
+            vm.released.store(true, Ordering::Release);
+            while !SMP_VM.load(Ordering::Acquire).is_null() {
+                core::hint::spin_loop();
+            }
+        }
+        core::hint::spin_loop();
+    }
+}
 
 /// Host time in nanoseconds for the emulated timers: the TSC, calibrated
 /// once against the real PIT.
@@ -697,9 +793,83 @@ fn image(start: &u8, end: &u8) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(start, (end as *const u8).offset_from(start) as usize) }
 }
 
+/// A two-vCPU guest shared by both host CPUs.
+struct SmpVm {
+    cpus: Arc<GuestCpus>,
+    mem: Arc<GuestMemory>,
+    ncr3: u64,
+    ram_len: u64,
+    pio: Bus,
+    /// Per vCPU: its MMIO bus (its own local APIC), its INTR line, its APIC.
+    buses: Vec<Bus>,
+    lines: Vec<Arc<AtomicBool>>,
+    apics: Arc<[Once<Arc<VirtualLapic>>; 2]>,
+    done: AtomicBool,
+    /// Set by the second host CPU once it has stopped touching the VM.
+    released: AtomicBool,
+}
+
+static SMP_VM: AtomicPtr<SmpVm> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Runs vCPU `me` of `vm` on this host CPU whenever it is started, until
+/// the guest is done.
+fn vcpu_loop(vm: &SmpVm, me: usize) {
+    while !vm.done.load(Ordering::Acquire) {
+        let Some((entry, _)) = vm.cpus.take_start(me) else {
+            core::hint::spin_loop();
+            continue;
+        };
+        let (vmcb, iopm, msrpm, host) = (block(0), block(2), block(1), block(0));
+        // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
+        let mut v =
+            unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, vm.ncr3, entry as u32, vm.ram_len as u32) }
+                .with_memory(vm.mem.clone())
+                .with_irq_line(vm.lines[me].clone());
+        if me > 0 {
+            v.set_real_mode((entry >> 12) as u8); // started by STARTUP
+        }
+        let a = vm.apics[me].get().unwrap().clone();
+        v.connect_intr(move || a.acknowledge());
+        vm.cpus.attach_svm(me, &mut v);
+        let exit = run_vcpu(&mut v, &vm.buses[me], &vm.pio, |v, exit| match exit {
+            VmExit::Hypercall { nr: 1 | 2, .. } => ControlFlow::Break(exit),
+            VmExit::Halt => loop {
+                if v.interrupt_pending() {
+                    break ControlFlow::Continue(());
+                }
+                if vm.done.load(Ordering::Acquire) {
+                    break ControlFlow::Break(VmExit::Halt);
+                }
+                core::hint::spin_loop();
+            },
+            // A kick: the next entry delivers what the APIC now has.
+            VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+            other => ControlFlow::Break(other),
+        });
+        drop(v);
+        // SAFETY: the vCPU that owned these blocks is gone.
+        unsafe {
+            let mut f = FRAMES.lock();
+            f.dealloc(PhysAddr::new(vmcb.1), 0);
+            f.dealloc(PhysAddr::new(iopm.1), 2);
+            f.dealloc(PhysAddr::new(msrpm.1), 1);
+            f.dealloc(PhysAddr::new(host.1), 0);
+        }
+        match exit {
+            VmExit::Hypercall { nr: 2, .. } => vm.cpus.stopped(me),
+            VmExit::Hypercall { nr: 1, .. } => vm.done.store(true, Ordering::Release),
+            other => {
+                println!("[hyp]   SMP vCPU {me} stopped unexpectedly: {other:?}");
+                vm.done.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// Runs a two-vCPU guest whose BSP starts its AP with INIT and STARTUP
-/// through emulated local APICs. Both vCPUs share this host CPU: each runs
-/// until it halts with nothing to do, then the other gets a turn.
+/// through emulated local APICs: vCPU 0 on this host CPU, vCPU 1 on host
+/// CPU 1. The fixed IPI from vCPU 1 reaches vCPU 0 while it runs guest code
+/// because the host kicks host CPU 0 with a physical IPI.
 fn smp_demo() {
     const N: usize = 2;
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
@@ -712,7 +882,6 @@ fn smp_demo() {
     let (bsp, ap) = unsafe { (image(&smp_bsp, &smp_bsp_end), image(&smp_ap, &smp_ap_end)) };
     mem.write(GuestPhysAddr(GUEST_ENTRY), bsp).unwrap();
     mem.write(GuestPhysAddr(0x8000), ap).unwrap();
-    let mem = Arc::new(mem);
     let mut npt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("NPT root");
     npt.map_range(VirtAddr::new(0), PhysAddr::new(ram.0), len, MapFlags::RW | MapFlags::EXEC | MapFlags::USER).unwrap();
 
@@ -728,10 +897,18 @@ fn smp_demo() {
     let pio = Bus::new();
     pio.insert(0x3f8, 8, com1).unwrap();
 
+    // A vCPU's interrupt arriving while it runs guest code on another host
+    // CPU kicks that CPU with a physical IPI, so the guest exits and the
+    // next entry delivers it.
+    let kicks = Arc::new(AtomicU64::new(0));
+    let k = kicks.clone();
+    let cpus = GuestCpus::with_kick(N, move |host| {
+        k.fetch_add(1, Ordering::Relaxed);
+        LAPIC.get().unwrap().send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
+    });
     // One local APIC per vCPU. An ICR write the sender cannot deliver
     // itself lands in the hook: STARTUP becomes a start request, a fixed
-    // IPI is delivered to the target's APIC.
-    let cpus = GuestCpus::new(N);
+    // IPI is delivered to the target's APIC (kicking its vCPU).
     let apics: Arc<[Once<Arc<VirtualLapic>>; N]> = Arc::new([const { Once::new() }; N]);
     let lines: Vec<Arc<AtomicBool>> = (0..N).map(|_| Arc::new(AtomicBool::new(false))).collect();
     let mut buses = Vec::new();
@@ -757,76 +934,44 @@ fn smp_demo() {
         buses.push(mmio);
     }
 
-    let mut pages = Vec::new();
-    let mut make = |i: usize, entry: u32| {
-        let p = (block(0), block(2), block(1), block(0));
-        pages.push(p);
-        let (vmcb, iopm, msrpm, host) = p;
-        // SAFETY: fresh blocks of at least the required sizes, owned by the vCPU.
-        let mut v = unsafe { SvmVcpu::new(SvmPages { vmcb, iopm, msrpm, host }, npt.root().0, entry, len as u32) }
-            .with_memory(mem.clone())
-            .with_irq_line(lines[i].clone());
-        let a = apics[i].get().unwrap().clone();
-        v.connect_intr(move || a.acknowledge());
-        cpus.attach_svm(i, &mut v);
-        v
-    };
     cpus.request_start(0, GUEST_ENTRY, 0).unwrap();
-    let mut vcpus: [Option<SvmVcpu>; N] = [const { None }; N];
-    let mut switches = 0;
-    let result = 'outer: loop {
-        for i in 0..N {
-            if vcpus[i].is_none() {
-                let Some((entry, _)) = cpus.take_start(i) else { continue };
-                let mut v = make(i, entry as u32);
-                if i > 0 {
-                    v.set_real_mode((entry >> 12) as u8);
-                }
-                vcpus[i] = Some(v);
-            }
-            let v = vcpus[i].as_mut().unwrap();
-            switches += 1;
-            let exit = run_vcpu(v, &buses[i], &pio, |v, exit| match exit {
-                VmExit::Hypercall { nr: 1 | 2, .. } => ControlFlow::Break(exit),
-                VmExit::Halt if v.interrupt_pending() => ControlFlow::Continue(()),
-                VmExit::ExternalInterrupt => ControlFlow::Continue(()),
-                other => ControlFlow::Break(other),
-            });
-            match exit {
-                VmExit::Hypercall { nr: 1, .. } => break 'outer VmExit::Shutdown,
-                VmExit::Hypercall { nr: 2, .. } => {
-                    vcpus[i] = None;
-                    cpus.stopped(i);
-                }
-                VmExit::Halt => {} // the other vCPU's turn
-                other => break 'outer other,
-            }
-        }
+    let vm = SmpVm {
+        cpus,
+        mem: Arc::new(mem),
+        ncr3: npt.root().0,
+        ram_len: len,
+        pio,
+        buses,
+        lines,
+        apics,
+        done: AtomicBool::new(false),
+        released: AtomicBool::new(false),
     };
+    SMP_VM.store(&raw const vm as *mut SmpVm, Ordering::Release);
+    vcpu_loop(&vm, 0);
+    while !vm.released.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    SMP_VM.store(core::ptr::null_mut(), Ordering::Release);
     println!(
-        "[hyp]   SMP guest exit {result:?}: {N} vCPUs on one host CPU, {switches} turns; cpu 1 status {:?}",
-        cpus.status(1)
+        "[hyp]   SMP guest done: 2 vCPUs on host CPUs 0 and 1, {} kick(s); cpu 1 status {:?}",
+        kicks.load(Ordering::Relaxed),
+        vm.cpus.status(1)
     );
 
-    drop(vcpus);
-    drop(buses);
-    drop(apics);
+    drop(vm);
     drop(npt);
-    drop(mem);
-    // SAFETY: the guest has stopped; nothing references these blocks.
-    unsafe {
-        let mut f = FRAMES.lock();
-        for (vmcb, iopm, msrpm, host) in pages {
-            f.dealloc(PhysAddr::new(vmcb.1), 0);
-            f.dealloc(PhysAddr::new(iopm.1), 2);
-            f.dealloc(PhysAddr::new(msrpm.1), 1);
-            f.dealloc(PhysAddr::new(host.1), 0);
-        }
-        f.dealloc(ram, GUEST_RAM_ORDER);
-    }
+    // SAFETY: the guest has stopped; nothing references its RAM.
+    unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
 }
 
 fn on_trap(frame: &mut TrapFrame) {
+    match frame.vector() {
+        // A kick: taking it is all it is for (the guest has already exited).
+        KICK_VECTOR => return LAPIC.get().unwrap().eoi(),
+        SPURIOUS_VECTOR => return,
+        _ => {}
+    }
     panic!("unexpected trap {:?} at rip {:#x}, error {:#x}", frame.cause(), frame.pc(), frame.error_code)
 }
 

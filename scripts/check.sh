@@ -136,7 +136,7 @@ if command -v qemu-system-x86_64 >/dev/null; then
     echo "== boot examples/x86_64-hyp under QEMU"
     svmlog=$(mktemp)
     (cd examples/x86_64-hyp && cargo build -q --release)
-    timeout 60 qemu-system-x86_64 -machine q35 -cpu max -smp 1 -m 128M -nographic -no-reboot -display none \
+    timeout 60 qemu-system-x86_64 -machine q35 -cpu max -smp 2 -m 128M -nographic -no-reboot -display none \
         -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp \
         -serial "file:$svmlog" -monitor none </dev/null >/dev/null
     sed -n '/^osmium/,$p' "$svmlog"
@@ -149,7 +149,7 @@ if command -v qemu-system-x86_64 >/dev/null; then
         '64-bit guest exit Shutdown, LSR 0x60 in r12' \
         '\[smp-guest\] cpu 1: up in real mode at 0x8000 after INIT/STARTUP' \
         '\[smp-guest\] cpu 0: IPI 0x41 from cpu 1 through the local APICs' \
-        'SMP guest exit Shutdown: 2 vCPUs' '\[done\]'; do
+        'SMP guest done: 2 vCPUs on host CPUs 0 and 1, [1-9]' '\[done\]'; do
         grep -q "$line" "$svmlog" || { echo "x86_64-hyp: missing '$line'"; exit 1; }
     done
     rm -f "$svmlog"
