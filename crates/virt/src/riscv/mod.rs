@@ -15,8 +15,9 @@
 //!
 //! [`sbi`] answers the common SBI calls on top of this. The guest's timer
 //! uses `vstimecmp`, so the CPU needs the Sstc extension. The guest's
-//! floating-point state is not switched, so `sstatus.FS` stays off while it
-//! runs and guest FP instructions trap to the guest.
+//! floating-point registers ([`FpState`], D extension) are loaded before
+//! every run and saved after it if the guest has FP enabled
+//! (`vsstatus.FS`); the host kernel itself is expected not to use FP.
 
 pub mod fdt;
 pub mod harts;
@@ -117,12 +118,24 @@ impl Default for VsCsrs {
     }
 }
 
+/// The guest's floating-point registers (D extension).
+#[repr(C)]
+#[derive(Clone, Debug, Default)]
+pub struct FpState {
+    /// `f0`..`f31`.
+    pub f: [u64; 32],
+    /// `fcsr`.
+    pub fcsr: u64,
+}
+
 /// A virtual hart.
 pub struct RiscvVcpu {
     /// Registers and exit state.
     pub state: GuestState,
     /// VS-mode CSRs.
     pub csrs: VsCsrs,
+    /// Floating-point registers.
+    pub fp: FpState,
     hgatp: u64,
     pending: Option<MemOp>,
     external: Arc<AtomicBool>,
@@ -161,7 +174,7 @@ impl RiscvVcpu {
             htinst: 0,
             host: [0; 17],
         };
-        Self { state, csrs: VsCsrs::default(), hgatp, pending: None, external: Arc::new(AtomicBool::new(false)), ipi: None, running: None, fence: None }
+        Self { state, csrs: VsCsrs::default(), fp: FpState::default(), hgatp, pending: None, external: Arc::new(AtomicBool::new(false)), ipi: None, running: None, fence: None }
     }
 
     /// The vCPU's supervisor external-interrupt line, for an interrupt

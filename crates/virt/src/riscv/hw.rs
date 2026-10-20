@@ -14,7 +14,7 @@ use core::mem::offset_of;
 
 use osmium_arch::trap::offsets;
 
-use super::{GuestState, RiscvVcpu, VsCsrs};
+use super::{FpState, GuestState, RiscvVcpu, VsCsrs};
 
 global_asm!(
     r#"
@@ -199,6 +199,20 @@ macro_rules! csr_write {
 
 const HIDELEG: u64 = super::hvip::VSSIP | super::hvip::VSTIP | super::hvip::VSEIP;
 
+macro_rules! csr_set {
+    ($csr:literal, $v:expr) => {
+        // SAFETY: the hypervisor owns this hart's FS field around a run.
+        unsafe { asm!(concat!("csrs ", $csr, ", {}"), in(reg) $v, options(nomem, nostack)) }
+    };
+}
+
+macro_rules! csr_clear {
+    ($csr:literal, $v:expr) => {
+        // SAFETY: as above.
+        unsafe { asm!(concat!("csrc ", $csr, ", {}"), in(reg) $v, options(nomem, nostack)) }
+    };
+}
+
 /// Prepares this hart to run guests: delegates the guest's own exceptions
 /// and VS-level interrupts to it, lets it read the counters, and enables
 /// `vstimecmp` (Sstc). Running a vCPU does this itself on a hart that has
@@ -261,8 +275,65 @@ pub(super) fn fence_guest(hgatp: u64) {
     unsafe { asm!("fence.i", ".insn r 0x73, 0, 0x11, x0, x0, x0", options(nostack)) };
 }
 
+const SSTATUS_FS: u64 = 3 << 13;
+
+/// Loads `fp` into the FP registers. `sstatus.FS` must be on.
+fn load_fp(fp: &FpState) {
+    // SAFETY: reads only `fp`; the host kernel keeps no FP state.
+    unsafe {
+        asm!(
+            ".option push",
+            ".option arch, +d",
+            "fld f0, 0({p})", "fld f1, 8({p})", "fld f2, 16({p})", "fld f3, 24({p})",
+            "fld f4, 32({p})", "fld f5, 40({p})", "fld f6, 48({p})", "fld f7, 56({p})",
+            "fld f8, 64({p})", "fld f9, 72({p})", "fld f10, 80({p})", "fld f11, 88({p})",
+            "fld f12, 96({p})", "fld f13, 104({p})", "fld f14, 112({p})", "fld f15, 120({p})",
+            "fld f16, 128({p})", "fld f17, 136({p})", "fld f18, 144({p})", "fld f19, 152({p})",
+            "fld f20, 160({p})", "fld f21, 168({p})", "fld f22, 176({p})", "fld f23, 184({p})",
+            "fld f24, 192({p})", "fld f25, 200({p})", "fld f26, 208({p})", "fld f27, 216({p})",
+            "fld f28, 224({p})", "fld f29, 232({p})", "fld f30, 240({p})", "fld f31, 248({p})",
+            "ld {t}, 256({p})",
+            "fscsr {t}",
+            ".option pop",
+            p = in(reg) fp as *const FpState,
+            t = out(reg) _,
+            options(nostack, readonly),
+        )
+    }
+}
+
+/// Saves the FP registers into `fp`. `sstatus.FS` must be on.
+fn save_fp(fp: &mut FpState) {
+    // SAFETY: writes only `fp`.
+    unsafe {
+        asm!(
+            ".option push",
+            ".option arch, +d",
+            "fsd f0, 0({p})", "fsd f1, 8({p})", "fsd f2, 16({p})", "fsd f3, 24({p})",
+            "fsd f4, 32({p})", "fsd f5, 40({p})", "fsd f6, 48({p})", "fsd f7, 56({p})",
+            "fsd f8, 64({p})", "fsd f9, 72({p})", "fsd f10, 80({p})", "fsd f11, 88({p})",
+            "fsd f12, 96({p})", "fsd f13, 104({p})", "fsd f14, 112({p})", "fsd f15, 120({p})",
+            "fsd f16, 128({p})", "fsd f17, 136({p})", "fsd f18, 144({p})", "fsd f19, 152({p})",
+            "fsd f20, 160({p})", "fsd f21, 168({p})", "fsd f22, 176({p})", "fsd f23, 184({p})",
+            "fsd f24, 192({p})", "fsd f25, 200({p})", "fsd f26, 208({p})", "fsd f27, 216({p})",
+            "fsd f28, 224({p})", "fsd f29, 232({p})", "fsd f30, 240({p})", "fsd f31, 248({p})",
+            "frcsr {t}",
+            "sd {t}, 256({p})",
+            ".option pop",
+            p = in(reg) fp as *mut FpState,
+            t = out(reg) _,
+            options(nostack),
+        )
+    }
+}
+
 /// Enters the guest and returns at its next exit.
 pub(super) fn run(v: &mut RiscvVcpu) {
+    // FP works in a guest only while the host's sstatus.FS is on too, so it
+    // is on across every run. The vCPU's registers are always loaded (no
+    // values leak from another vCPU) and saved if the guest had FP on.
+    csr_set!("sstatus", SSTATUS_FS);
+    load_fp(&v.fp);
     // The vCPU's task may have moved to a hart that never ran a guest.
     if csr_read!("0x603") != HIDELEG {
         init_cpu();
@@ -280,6 +351,10 @@ pub(super) fn run(v: &mut RiscvVcpu) {
     // the assembly saves and restores every callee-saved host register.
     unsafe { osmium_hs_run(&mut v.state) };
     save_vs(&mut v.csrs);
+    if v.csrs.vsstatus & SSTATUS_FS != 0 {
+        save_fp(&mut v.fp);
+    }
+    csr_clear!("sstatus", SSTATUS_FS);
 }
 
 /// Reads the guest instruction at guest-virtual `pc` with `hlvx.hu`, using

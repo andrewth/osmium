@@ -22,7 +22,7 @@ use osmium::virt::riscv::{self, RiscvVcpu, sbi};
 use osmium::virt::stage2::{GStageTable, hgatp_sv39x4, map_guest_memory};
 use osmium::hal::dma::{DmaAllocator, DmaBuffer};
 use osmium::virt::virtio::{MMIO_SIZE, VirtioMmio, VirtioNetDevice};
-use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
+use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, Vcpu, VmExit, run_vcpu};
 
 use crate::FRAMES;
 
@@ -629,5 +629,92 @@ pub fn demo_smp(ncpus: usize) {
     drop(gstage);
     drop(mem);
     // SAFETY: both vCPUs have stopped and nothing references the guest's RAM.
+    unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
+}
+
+// Two copies of this run interleaved on one host hart, each with its own
+// a0: compute a0 + 10 in f3, yield (hypercall 0x0A000000) so the other
+// copy runs, then add a0 again and report f3 as an integer (hypercall
+// 0x0A000001). If FP registers were not switched, the second half would
+// see the other copy's values.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .globl fp_guest, fp_guest_end
+fp_guest:
+    .option push
+    .option arch, +d
+    li t0, 0x6000                   // sstatus.FS = Dirty: FP on
+    csrs sstatus, t0
+    mv s0, a0
+    fcvt.d.l f1, s0
+    li t1, 10
+    fcvt.d.l f2, t1
+    fadd.d f3, f1, f2
+    li a7, 0x0A000000               // yield to the other vCPU
+    ecall
+    fadd.d f3, f3, f1
+    fcvt.l.d a0, f3
+    li a7, 0x0A000001               // report a0
+    ecall
+1:  j 1b
+    .option pop
+fp_guest_end:
+"#
+);
+
+unsafe extern "C" {
+    static fp_guest: u8;
+    static fp_guest_end: u8;
+}
+
+const YIELD: u64 = 0x0a00_0000;
+const REPORT: u64 = 0x0a00_0001;
+
+/// Interleaves two vCPUs on this hart and checks each computed with its own
+/// floating-point registers.
+pub fn demo_fp() {
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = 4096u64 << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guests until it is freed below.
+    unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image in .rodata.
+    let image = unsafe {
+        let start = &raw const fp_guest;
+        core::slice::from_raw_parts(start, (&raw const fp_guest_end).offset_from(start) as usize)
+    };
+    mem.write(GUEST_RAM, image).unwrap();
+    let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
+    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).unwrap();
+    let hgatp = hgatp_sv39x4(gstage.root(), 4);
+    let (mmio, pio) = (Bus::new(), Bus::new());
+
+    // Runs `v` to its next yield or report; returns which, and a0.
+    let step = |v: &mut RiscvVcpu| {
+        let exit = run_vcpu(v, &mmio, &pio, |_, exit| match exit {
+            VmExit::Hypercall { nr: YIELD | REPORT, .. } | VmExit::Halt => ControlFlow::Break(exit),
+            VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+            other => ControlFlow::Break(other),
+        });
+        let a0 = v.state.x[10];
+        v.complete_hypercall(0);
+        (exit, a0)
+    };
+    let mut vcpus = [RiscvVcpu::new(GUEST_RAM, 1, 0, hgatp), RiscvVcpu::new(GUEST_RAM, 2, 0, hgatp)];
+    let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
+    let ok = |(e, _): &(VmExit, u64), nr| matches!(e, VmExit::Hypercall { nr: n, .. } if *n == nr);
+    let (ra, rb) = (steps[2].1, steps[3].1);
+    let fine = ok(&steps[0], YIELD) && ok(&steps[1], YIELD) && ok(&steps[2], REPORT) && ok(&steps[3], REPORT);
+    println!(
+        "[hyp]   FP guests interleaved on one hart: vCPU a0=1 got {ra}, a0=2 got {rb} (expected 12 and 14){}",
+        if fine && ra == 12 && rb == 14 { "" } else { "; MISMATCH" }
+    );
+
+    drop(gstage);
+    drop(mem);
+    // SAFETY: both vCPUs are done and nothing references the guests' RAM.
     unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
 }
