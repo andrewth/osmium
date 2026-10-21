@@ -7,7 +7,7 @@
 //! | Module | Crate | Contents |
 //! |---|---|---|
 //! | [`arch`] | `osmium-arch` | IRQ flags, CPU id, TLB maintenance, arch registers |
-//! | `sync` | `osmium-sync` | spin locks, once cells, per-CPU data, SPSC ring |
+//! | `sync` | `osmium-sync` | spin locks, once cells, per-CPU data, SPSC ring, intrusive lists |
 //! | `mm` | `osmium-mm` | addresses, memory maps, frame allocators, page tables, heap |
 //! | `hal` | `osmium-hal` | MMIO/port I/O, device traits, IRQ dispatch, console |
 //! | `drivers` | `osmium-drivers` | 16550, PL011, PLIC, GICv2, local APIC, RAM disk |

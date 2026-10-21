@@ -11,6 +11,8 @@
 //! - [`PerCpu`] and [`PerCpuCell`]: per-CPU storage indexed by
 //!   `osmium_arch::cpu::current_id`.
 //! - [`SpscRing`]: a lock-free single-producer, single-consumer ring.
+//! - [`intrusive`]: allocation-free linked lists and red-black / AVL trees whose
+//!   links live inside the elements.
 //!
 //! Sleeping locks (`Mutex`, `WaitQueue`) need a scheduler and live in
 //! `osmium-sched`.
@@ -20,6 +22,7 @@
 extern crate std;
 
 mod guard;
+pub mod intrusive;
 mod once;
 mod percpu;
 pub mod preempt;
