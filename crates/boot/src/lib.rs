@@ -8,6 +8,8 @@
 //! - [`acpi`]: RSDP/RSDT/XSDT, MADT (CPUs, I/O APICs) and MCFG (PCI ECAM).
 //! - [`pvh`]: the PVH start-info structure (QEMU, Firecracker, Cloud
 //!   Hypervisor), plus a macro for the ELF note that advertises a PVH entry.
+//! - [`pe`]: PE32+ images: parse, map and relocate `.efi` files, and move
+//!   runtime drivers to their virtual addresses.
 //! - [`uefi`]: the UEFI system table, enough to print, set a Graphics Output
 //!   Protocol (GOP) mode and take its framebuffer, and shut down.
 //!
@@ -24,6 +26,7 @@ pub mod acpi;
 pub mod elf;
 pub mod fdt;
 pub mod multiboot2;
+pub mod pe;
 pub mod pvh;
 pub mod uefi;
 

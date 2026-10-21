@@ -7,6 +7,7 @@
 //! | [`plic::Plic`] | RISC-V Platform-Level Interrupt Controller | `InterruptController` |
 //! | [`gicv2::GicV2`] | Arm Generic Interrupt Controller v2 | `InterruptController` |
 //! | [`lapic::LocalApic`] | x86 local APIC (xAPIC MMIO) | EOI, IPIs, timer, MSI messages |
+//! | [`fwcfg::FwCfg`] | QEMU `fw_cfg` (ports or MMIO, optional DMA) | named blobs: tables, kernel, ramfb |
 //! | [`pit::Pit`] | Intel 8254 PIT | calibration delays |
 //! | [`clint::Clint`] | RISC-V CLINT (M-mode timer, software IRQs) | firmware timers |
 //! | [`ioapic::IoApic`] | x86 I/O APIC | GSI routing |
@@ -38,6 +39,7 @@ extern crate std;
 pub mod ahci;
 pub mod clint;
 pub mod display;
+pub mod fwcfg;
 pub mod gicv2;
 pub mod ioapic;
 pub mod iommu;
