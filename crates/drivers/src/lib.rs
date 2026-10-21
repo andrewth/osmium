@@ -14,6 +14,9 @@
 //! | [`ramdisk::RamDisk`] | Memory-backed disk | `BlockDevice` |
 //! | [`virtio::net::VirtioNet`] | virtio network card (MMIO, legacy and 1.x) | `NetDevice` |
 //! | [`xhci::Xhci`] | xHCI USB host controller | `UsbHost` |
+//! | [`ehci::Ehci`] | EHCI USB 2.0 host controller (high-speed devices; polled) | `UsbHost` |
+//! | [`ohci::Ohci`] | OHCI USB 1.1 host controller (polled) | `UsbHost` |
+//! | [`uhci::Uhci`] | UHCI USB 1.1 host controller (I/O ports or MMIO; polled) | `UsbHost` |
 //! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet (PCI, polled) | `NetDevice` per port |
 //! | [`nvme::Nvme`] | NVM Express SSD (PCI, polled) | `BlockDevice` |
 //! | [`virtio::gpu::VirtioGpu`] | virtio GPU, 2D (MMIO, or PCI as `virtio-gpu-pci` and `virtio-vga`) | `Display` |
@@ -39,6 +42,7 @@ extern crate std;
 pub mod ahci;
 pub mod clint;
 pub mod display;
+pub mod ehci;
 pub mod fwcfg;
 pub mod gicv2;
 pub mod ioapic;
@@ -49,8 +53,11 @@ pub mod nvme;
 pub mod pit;
 pub mod pl011;
 pub mod plic;
+pub mod ohci;
 pub mod ramdisk;
 pub mod uart16550;
 pub mod usb;
+pub(crate) mod usbhc;
 pub mod virtio;
+pub mod uhci;
 pub mod xhci;

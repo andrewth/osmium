@@ -103,7 +103,7 @@ assembly. Copy them from whichever example is closest to your platform:
 
 | Example | Run | What it shows |
 |---|---|---|
-| `riscv-virt` | `cargo run --release` | The most complete one. S-mode under OpenSBI, FDT discovery, W^X Sv39, 4 harts via SBI HSM, the shared scheduler demos, guard-page overflow detection, virtio-net with DHCP/ping/TCP, virtio-blk, AHCI, NVMe and iSCSI disks, colour bars on virtio-gpu (MMIO and PCI) and bochs-display, xHCI with USB keyboard, storage (FAT32) and CDC-ECM, user processes with fork/exec/wait, and H-extension guests (`src/hyp.rs`). |
+| `riscv-virt` | `cargo run --release` | The most complete one. S-mode under OpenSBI, FDT discovery, W^X Sv39, 4 harts via SBI HSM, the shared scheduler demos, guard-page overflow detection, virtio-net with DHCP/ping/TCP, virtio-blk, AHCI, NVMe and iSCSI disks, colour bars on virtio-gpu (MMIO and PCI) and bochs-display, xHCI with USB keyboard, storage (FAT32) and CDC-ECM, EHCI and OHCI with USB storage, user processes with fork/exec/wait, and H-extension guests (`src/hyp.rs`). |
 | `aarch64-virt` | `cargo run --release` | The same kernel at EL1: PL011, GICv2, generic timer, PSCI CPU_ON, user processes with fork/exec. |
 | `x86_64-pc` | `cargo run --release` | PVH boot, ACPI MADT, COM1 over port I/O with IRQ 4 through the I/O APIC, local APIC timer calibrated by the PIT, INIT/SIPI AP bring-up, the shared demos, user processes with fork/exec, and a VESA mode set through the BIOS followed by virtio-vga (run with `-vga none -device virtio-vga`). |
 | `uefi` | see below | A UEFI application for OVMF (x86_64) and AAVMF (AArch64): sets a GOP mode and draws colour bars on the framebuffer, or with Blt where the GOP has no framebuffer. |
@@ -541,7 +541,7 @@ port I/O.
 | Timers | `clint::Clint`, `pit::Pit` |
 | Block | `ramdisk::RamDisk`, `virtio::blk::VirtioBlk`, `usb::storage::UsbStorage` (fewer than 2^32 blocks, so under 2 TiB at 512 B; block sizes a power of two from 512 B to 64 KiB), `ahci::Ahci`, `nvme::Nvme`; iSCSI in `osmium::iscsi` |
 | Network | `virtio::net::VirtioNet`, `usb::ecm::UsbEthernet`, `mlx4::Mlx4` (polled, or MSI-X via `enable_msix`; checksum and segmentation offloads are inherent `EthPort` methods, since `NetDevice` has no offload flags) |
-| USB | `xhci::Xhci` (polled, INTx, MSI or MSI-X via `enable_message_interrupts`), `usb::hid::BootKeyboard`, `usb::hub::Hub`, `usb::isoch::{IsochIn, IsochOut}` |
+| USB | `xhci::Xhci` (polled, INTx, MSI or MSI-X via `enable_message_interrupts`), `ehci::Ehci` (high-speed only; low- and full-speed devices go to the companion), `ohci::Ohci` and `uhci::Uhci` (low/full speed, hubs; all three polled, no isochronous), `usb::hid::BootKeyboard`, `usb::hub::Hub`, `usb::isoch::{IsochIn, IsochOut}` |
 | Display | `virtio::gpu::VirtioGpu` (virtio-gpu and virtio-vga, MMIO or PCI), `display::bochs::BochsVbe` (QEMU std VGA, bochs-display, virtio-vga in VGA mode), `display::vbe::Vbe` (VESA BIOS Extensions, x86) |
 
 Drivers that do DMA take a `DmaAllocator`, and `LockedFrames` is one.

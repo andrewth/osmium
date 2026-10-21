@@ -23,8 +23,10 @@ use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::{Fdt, Node};
 use osmium::drivers::ahci::{self, Ahci};
+use osmium::drivers::ehci::Ehci;
 use osmium::drivers::iommu::riscv::RiscvIommu;
 use osmium::drivers::nvme::{self, Nvme};
+use osmium::drivers::ohci::Ohci;
 use osmium::drivers::plic::Plic;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
 use osmium::drivers::virtio::blk::VirtioBlk;
@@ -170,6 +172,10 @@ type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
 /// no way to quiet a level-triggered line the handler could not service.
 /// Another CPU holding the lock only delays the handler until it releases.
 static XHCI: Once<osmium::sync::IrqSpinLock<Xhci<'static, Frames>>> = Once::new();
+
+/// The EHCI and OHCI controllers, polled, so under a plain interrupt-masking lock.
+static EHCI: Once<osmium::sync::IrqSpinLock<Ehci<'static, Frames>>> = Once::new();
+static OHCI: Once<osmium::sync::IrqSpinLock<Ohci<'static, Frames>>> = Once::new();
 
 /// The platform interrupt controller, once the device tree has been read.
 static PLIC: Once<Plic> = Once::new();
@@ -873,6 +879,50 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             println!("[usb]   xHCI interrupts: {}", xhci.lock().interrupts_handled());
         }
         None => println!("[usb]   no xHCI controller"),
+    }
+
+    // --- EHCI and OHCI behind PCIe ---------------------------------------------
+    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, pci::Class::EHCI, 0)) {
+        Some((addr, base, len, _)) => {
+            // SAFETY: BAR 0 was just assigned this range inside the mapped
+            // window; nothing else uses it.
+            let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
+            match Ehci::new(io, &FRAMES, &Uptime) {
+                Ok(hc) => {
+                    println!(
+                        "[usb]   EHCI at {:02x}:{:02x}.{} BAR0 {base:#x}, {} ports",
+                        addr.bus,
+                        addr.device,
+                        addr.function,
+                        hc.ports()
+                    );
+                    demos::usb(EHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc)), now_ns);
+                }
+                Err(e) => println!("[usb]   EHCI init failed: {e:?}"),
+            }
+        }
+        None => println!("[usb]   no EHCI controller"),
+    }
+    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, osmium::drivers::ohci::CLASS, 0)) {
+        Some((addr, base, len, _)) => {
+            // SAFETY: BAR 0 was just assigned this range inside the mapped
+            // window; nothing else uses it.
+            let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
+            match Ohci::new(io, &FRAMES, &Uptime) {
+                Ok(hc) => {
+                    println!(
+                        "[usb]   OHCI at {:02x}:{:02x}.{} BAR0 {base:#x}, {} ports",
+                        addr.bus,
+                        addr.device,
+                        addr.function,
+                        hc.ports()
+                    );
+                    demos::usb(OHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc)), now_ns);
+                }
+                Err(e) => println!("[usb]   OHCI init failed: {e:?}"),
+            }
+        }
+        None => println!("[usb]   no OHCI controller"),
     }
 
     demos::run_all(&demos::Env { timers: &TIMERS, ticks: &TICKS, now_ns });

@@ -88,7 +88,7 @@ screen_wait() {
 # QEMU's user network answers the kernel's ARP request over virtio-net, then
 # osmium-net gets a DHCP lease, pings the gateway, resolves a name through
 # the user network's DNS and round-trips a TCP echo through a guestfwd to cat. Behind
-# the xHCI controller, a USB stick on a scratch image answers a SCSI INQUIRY and
+# the xHCI controller (and likewise EHCI and OHCI, each with its own stick), a USB stick on a scratch image answers a SCSI INQUIRY and
 # takes a block write while the keyboard's interrupt transfer stays pending. A
 # guest runs in VS-mode under the H extension. With dosfstools installed the
 # stick is formatted FAT32, the kernel writes a file on it, and fsck.fat must
@@ -98,25 +98,31 @@ screen_wait() {
 # PCI and MMIO and on bochs-display (Bochs DISPI registers, no BIOS); the
 # PCI GPU's screen is checked.
 stick=$(mktemp)
+stick_ehci=$(mktemp)
+stick_ohci=$(mktemp)
 vdisk=$(mktemp)
 sata=$(mktemp)
 nvdisk=$(mktemp)
 iscsi=$(mktemp)
 truncate -s 8M "$vdisk" "$sata" "$nvdisk" "$iscsi"
-truncate -s 40000K "$stick"
+truncate -s 40000K "$stick" "$stick_ehci" "$stick_ohci"
 tftp=$(mktemp -d)
 echo "hello over UDP" >"$tftp/osmium.txt"
 fat_expect=
 if PATH=$PATH:/usr/sbin command -v mkfs.fat >/dev/null; then
     PATH=$PATH:/usr/sbin mkfs.fat -F 32 -s 1 "$stick" >/dev/null
+    PATH=$PATH:/usr/sbin mkfs.fat -F 32 -s 1 "$stick_ehci" >/dev/null
+    PATH=$PATH:/usr/sbin mkfs.fat -F 32 -s 1 "$stick_ohci" >/dev/null
     fat_expect='@@\[fat\]   wrote and read back "/osmium/Hello from osmium.txt"'
 fi
 screen qemu-system-riscv64 640 400 gpu
-EXPECT='ARP: 10.0.2.2 is at@@DHCP: 10.0.2.15/24 via 10.0.2.2@@ping 10.0.2.2: seq 1 in@@TCP echo from 10.0.2.100:7: "hello over TCP"@@\[blk\]   virtio-blk .*: 16384 sectors@@wrote and read back sector 8192@@INQUIRY "QEMU" "QEMU HARDDISK"@@interface 0: class 03/01/01@@wrote and read back block 79999@@keyboard transfer still pending after disk I/O@@\[guard\] task "deep" overflowed@@nested Breakpoint on the exception stack@@user-bad killed: PageFault@@user-1 exited with status 0 (kernel sees CPU 1)@@hello from process 2@@4 of 4 address spaces torn down@@hello from a Rust ELF: 46 primes below 200@@pid [0-9]* on Osmium/riscv64: brk ok, mmap ok, writev ok@@init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok@@exec.d as "init child" with HOME=/@@execve: child [0-9]* exited with status 5; then wait4 says -10@@init: fp: exec.d program starts with cleared FP registers: ok@@init: fp: FP registers inherited by fork and kept across switches: ok@@init: signals: SIGUSR1 sent to myself ran its handler and returned: ok@@init: signals: SIGSEGV handled in child [0-9]*, exit status 42: ok@@init: signals: SIGCHLD handler ran when child [0-9]* exited: ok@@init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok@@init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok@@init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok@@1 of 1 init address space torn down@@/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries@@\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111@@\[guest\] hello over MMIO@@\[guest\] hello over SBI@@guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0@@\[vguest\] timer interrupt after@@\[vguest\] PLIC claim 10: received "ping"@@\[vguest\] PLIC claim 1: ARP reply, 10.0.2.2 is at 52:55:0a:00:02:02@@\[vguest\] virtio-blk: 64 sectors; sector 3 written and read back@@the host RAM disk holds the sector the guest wrote@@driver guest exit Shutdown@@\[smp-guest\] hart 0: got the IPI; hart 1 is stopped@@SMP guest: 2 vCPUs on .*hart_start returned 0, hart 1 got opaque 0x1234@@xHCI interrupts: [1-9]@@FP guests interleaved on one hart: vCPU a0=1 got 12, a0=2 got 14 (expected 12 and 14)@@\[usb\]     ecm: ARP: 10.0.2.2 is at@@\[ahci\]  port 0 "QEMU HARDDISK": 16384 sectors of 512; round trip Ok(8192)@@\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192)@@\[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512@@\[iscsi\] wrote and read back block 8192@@\[virtio-gpu\] 640x400 32bpp, stride 2560: colour bars drawn@@\[bochs\] 640x480 32bpp, stride 2560: colour bars drawn@@\[virtio-gpu-mmio\] 640x400 32bpp, stride 2560: colour bars drawn@@DNS: localhost is 127.0.0.1@@\[sock\]  10.0.2.15 on the socket stack@@net: TCP echo from 10.0.2.100:7 via 10.0.2.15:[0-9]*: sent 18, got "hello over sockets"@@net: TCP read after the server closed: 0@@net: UDP TFTP from 10.0.2.2:[0-9]*: opcode 3 block 1: "hello over UDP"@@net: socketpair: epoll idle 0, ready 1 with data 42; sendmsg 9, recvmsg 9: "ping-pong"@@net: UDP loopback: bind 0, sent 5, peeked 5 then read 5 from 127.0.0.1:[0-9]*: "local"@@\[sock\]  net exited'"$fat_expect" \
+EXPECT='ARP: 10.0.2.2 is at@@DHCP: 10.0.2.15/24 via 10.0.2.2@@ping 10.0.2.2: seq 1 in@@TCP echo from 10.0.2.100:7: "hello over TCP"@@\[blk\]   virtio-blk .*: 16384 sectors@@wrote and read back sector 8192@@INQUIRY "QEMU" "QEMU HARDDISK"@@interface 0: class 03/01/01@@wrote and read back block 79999@@keyboard transfer still pending after disk I/O@@\[guard\] task "deep" overflowed@@nested Breakpoint on the exception stack@@user-bad killed: PageFault@@user-1 exited with status 0 (kernel sees CPU 1)@@hello from process 2@@4 of 4 address spaces torn down@@hello from a Rust ELF: 46 primes below 200@@pid [0-9]* on Osmium/riscv64: brk ok, mmap ok, writev ok@@init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok@@exec.d as "init child" with HOME=/@@execve: child [0-9]* exited with status 5; then wait4 says -10@@init: fp: exec.d program starts with cleared FP registers: ok@@init: fp: FP registers inherited by fork and kept across switches: ok@@init: signals: SIGUSR1 sent to myself ran its handler and returned: ok@@init: signals: SIGSEGV handled in child [0-9]*, exit status 42: ok@@init: signals: SIGCHLD handler ran when child [0-9]* exited: ok@@init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok@@init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok@@init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok@@1 of 1 init address space torn down@@/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries@@\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111@@\[guest\] hello over MMIO@@\[guest\] hello over SBI@@guest exit Shutdown: 2 hypercalls, 1 halt, [1-9][0-9]* host interrupts, LSR 0x60, DBCN error 0@@\[vguest\] timer interrupt after@@\[vguest\] PLIC claim 10: received "ping"@@\[vguest\] PLIC claim 1: ARP reply, 10.0.2.2 is at 52:55:0a:00:02:02@@\[vguest\] virtio-blk: 64 sectors; sector 3 written and read back@@the host RAM disk holds the sector the guest wrote@@driver guest exit Shutdown@@\[smp-guest\] hart 0: got the IPI; hart 1 is stopped@@SMP guest: 2 vCPUs on .*hart_start returned 0, hart 1 got opaque 0x1234@@xHCI interrupts: [1-9]@@FP guests interleaved on one hart: vCPU a0=1 got 12, a0=2 got 14 (expected 12 and 14)@@\[usb\]     ecm: ARP: 10.0.2.2 is at@@\[usb\]   EHCI at .*, 6 ports@@\[usb\]   OHCI at .*, 3 ports@@\[ahci\]  port 0 "QEMU HARDDISK": 16384 sectors of 512; round trip Ok(8192)@@\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192)@@\[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512@@\[iscsi\] wrote and read back block 8192@@\[virtio-gpu\] 640x400 32bpp, stride 2560: colour bars drawn@@\[bochs\] 640x480 32bpp, stride 2560: colour bars drawn@@\[virtio-gpu-mmio\] 640x400 32bpp, stride 2560: colour bars drawn@@DNS: localhost is 127.0.0.1@@\[sock\]  10.0.2.15 on the socket stack@@net: TCP echo from 10.0.2.100:7 via 10.0.2.15:[0-9]*: sent 18, got "hello over sockets"@@net: TCP read after the server closed: 0@@net: UDP TFTP from 10.0.2.2:[0-9]*: opcode 3 block 1: "hello over UDP"@@net: socketpair: epoll idle 0, ready 1 with data 42; sendmsg 9, recvmsg 9: "ping-pong"@@net: UDP loopback: bind 0, sent 5, peeked 5 then read 5 from 127.0.0.1:[0-9]*: "local"@@\[sock\]  net exited'"$fat_expect" \
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi \
     -netdev user,id=n0,tftp="$tftp",guestfwd=tcp:10.0.2.100:7-cmd:cat,guestfwd=tcp:10.0.2.100:3260-cmd:"python3 scripts/iscsi-target.py $iscsi" -device virtio-net-device,netdev=n0 \
-    -device qemu-xhci -device usb-kbd \
+    -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
+    -device usb-ehci,id=ehci -drive if=none,id=stick-ehci,format=raw,file="$stick_ehci" -device usb-storage,bus=ehci.0,drive=stick-ehci \
+    -device pci-ohci,id=ohci -drive if=none,id=stick-ohci,format=raw,file="$stick_ohci" -device usb-storage,bus=ohci.0,drive=stick-ohci \
     -drive if=none,id=vd0,format=raw,file="$vdisk" -device virtio-blk-device,drive=vd0 \
     -netdev user,id=n1 -device usb-net,netdev=n1 \
     -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,drive=stick \
@@ -128,8 +134,12 @@ if [ -n "$fat_expect" ]; then
     echo "== fsck.fat the USB stick the kernel wrote"
     report=$(PATH=$PATH:/usr/sbin fsck.fat -n -l "$stick") || { echo "$report"; echo "riscv-virt: fsck.fat rejected the USB stick"; exit 1; }
     grep -q "/OSMIUM/Hello from osmium.txt" <<<"$report" || { echo "$report"; echo "riscv-virt: file missing on the USB stick"; exit 1; }
+    for extra in "$stick_ehci" "$stick_ohci"; do
+        report=$(PATH=$PATH:/usr/sbin fsck.fat -n -l "$extra") || { echo "$report"; echo "riscv-virt: fsck.fat rejected a stick behind EHCI or OHCI"; exit 1; }
+        grep -q "/OSMIUM/Hello from osmium.txt" <<<"$report" || { echo "$report"; echo "riscv-virt: file missing on a stick behind EHCI or OHCI"; exit 1; }
+    done
 fi
-rm -f "$stick" "$vdisk" "$sata" "$nvdisk" "$iscsi"
+rm -f "$stick" "$stick_ehci" "$stick_ohci" "$vdisk" "$sata" "$nvdisk" "$iscsi"
 rm -rf "$tftp"
 # RISC-V IOMMU: QEMU's riscv-iommu-pci translates the DMA of every PCI device
 # on the bus, so this boot carries only an NVMe disk and QEMU's iommu-testdev.
