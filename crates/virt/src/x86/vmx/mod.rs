@@ -1,7 +1,7 @@
 //! An Intel VMX vCPU.
 //!
 //! [`VmxVcpu`] owns a VMCS and runs a guest with EPT, VPID and unrestricted
-//! guest mode, so guests start the way [`SvmVcpu`](super::SvmVcpu) guests do:
+//! guest mode, so guests start the way [`SvmVcpu`](super::svm::SvmVcpu) guests do:
 //! in 32-bit protected mode ([`VmxVcpu::new`]), in real mode like an AP after
 //! STARTUP ([`VmxVcpu::set_real_mode`]) or in 64-bit mode on their own page
 //! tables ([`VmxVcpu::set_long_mode`]). Every I/O port and MSR access exits.

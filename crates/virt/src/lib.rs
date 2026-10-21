@@ -18,7 +18,7 @@
 //! - [`virtio`]: virtio device models behind the virtio-mmio transport.
 //!
 //! Hardware backends implement [`Vcpu`]: RISC-V H ([`riscv::RiscvVcpu`]),
-//! AArch64 EL2 ([`aarch64::Aarch64Vcpu`]) and AMD SVM ([`x86::SvmVcpu`])
+//! AArch64 EL2 ([`aarch64::Aarch64Vcpu`]) and AMD SVM ([`x86::svm::SvmVcpu`])
 //! and Intel VMX ([`x86::vmx::VmxVcpu`]). `docs/HYPERVISOR.md` shows how the pieces
 //! fit together.
 #![no_std]

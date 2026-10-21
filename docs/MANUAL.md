@@ -885,7 +885,7 @@ let exit = run_vcpu(&mut vcpu, &mmio_bus, &pio_bus, |v, exit| match exit {
 |---|---|---|---|
 | `riscv::RiscvVcpu` | `riscv64-hs` | HS-mode | `VirtualPlic` |
 | `aarch64::Aarch64Vcpu` | `aarch64-el2` | EL2 (non-VHE) | `VirtualGicV2` |
-| `x86::SvmVcpu` | none | long mode + AMD SVM | `VirtualPic`, or a `VirtualLapic` per vCPU plus `VirtualIoApic` |
+| `x86::svm::SvmVcpu` | none | long mode + AMD SVM | `VirtualPic`, or a `VirtualLapic` per vCPU plus `VirtualIoApic` |
 
 Device models are an emulated 16550, an 8254 PIT, and virtio-mmio console,
 block and net. Multi-vCPU guests run on all three architectures through

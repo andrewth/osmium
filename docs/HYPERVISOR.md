@@ -39,7 +39,7 @@ claims returns all ones; a write to one is dropped, as on real hardware.
 
 ## Backends
 
-| | RISC-V (`riscv::RiscvVcpu`) | AArch64 (`aarch64::Aarch64Vcpu`) | x86 (`x86::SvmVcpu`) |
+| | RISC-V (`riscv::RiscvVcpu`) | AArch64 (`aarch64::Aarch64Vcpu`) | x86 (`x86::svm::SvmVcpu`) |
 |---|---|---|---|
 | Host runs in | HS-mode | EL2, non-VHE | long mode with SVM on |
 | Feature | `riscv64-hs` (osmium-arch and osmium-virt) | `aarch64-el2` | none (bare-metal x86_64) |
@@ -158,7 +158,7 @@ recipe is the same on each:
   gate's IST slot is not used). `examples/x86_64-hyp` picks SVM or VMX at
   boot (`backend.rs`) and runs all of its demos and the x86_64-pc guest kernel
   on either; QEMU's TCG does not emulate VMX, so VMX has only run under nested
-  KVM (`examples/x86_64-vmx`, `x86_64-hyp` with `-accel kvm -cpu host`).
+  KVM (`examples/x86_64-hyp` with `-accel kvm -cpu host`).
 - FP/SIMD state is switched per vCPU on the assumption that the host
   kernel itself never uses those registers (soft-float targets): always on
   RISC-V and AArch64 (where SVE is not switched and traps), and on x86 for

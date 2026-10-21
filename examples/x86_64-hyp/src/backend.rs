@@ -14,7 +14,7 @@ use osmium::sync::Once;
 use osmium::virt::smp::GuestCpus;
 use osmium::virt::stage2::eptp;
 use osmium::virt::x86::vmx::{self, VmxPages, VmxVcpu};
-use osmium::virt::x86::{self as svm, SvmPages, SvmVcpu};
+use osmium::virt::x86::svm::{self, SvmPages, SvmVcpu};
 use osmium::virt::{GuestMemory, GuestPhysAddr, Vcpu, VmExit};
 
 use crate::{FRAMES, Frames, block};
@@ -242,7 +242,7 @@ impl Cpu {
     pub fn describe(&self) -> alloc::string::String {
         match self {
             Self::Svm(v) => {
-                use osmium::virt::x86::vmcb;
+                use osmium::virt::x86::svm::vmcb;
                 alloc::format!(
                     "rip {:#x}, info1 {:#x}, info2 {:#x}, cr3 {:#x}",
                     v.rip(),

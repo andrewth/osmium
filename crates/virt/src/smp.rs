@@ -131,7 +131,7 @@ impl GuestCpus {
     }
 
     /// Connects an SVM vCPU as CPU `cpu`, so kicks find it.
-    pub fn attach_svm(&self, cpu: usize, vcpu: &mut crate::x86::SvmVcpu) {
+    pub fn attach_svm(&self, cpu: usize, vcpu: &mut crate::x86::svm::SvmVcpu) {
         vcpu.running = Some(self.slots[cpu].running.clone());
     }
 
