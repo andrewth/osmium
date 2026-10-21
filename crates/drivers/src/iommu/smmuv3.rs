@@ -422,7 +422,7 @@ mod tests {
     use super::*;
 
     const NIC: Address = Address::new(0, 3, 1);
-    const FAR: Address = Address::new(0, 9, 0);
+    const FAR: Address = Address::new(0, 5, 0);
 
     fn dev(a: Address) -> DeviceId {
         DeviceId::new(0, a)
