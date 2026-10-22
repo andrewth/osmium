@@ -404,23 +404,30 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
     /// `queued`, else PxCI) or the port reports an error. Returns whether
     /// it did, and whether the error bits were set.
     ///
-    /// With an idle hook, the port's interrupts are armed before each look
-    /// at the registers and the hook runs after it, so a completion that
+    /// With an idle hook, a wait that is not yet over arms the port's
+    /// interrupts and looks again before the hook runs, so a completion that
     /// lands in between wakes the hook instead of being slept through. The
     /// interrupt handler masks the port again ([`super::AhciIrq`]), which
-    /// is why the arming repeats.
+    /// is why the arming repeats. A finished command is seen before the
+    /// arming, so its status bits never raise an interrupt nobody waits for.
     fn wait_slots(&self, mask: u32, queued: bool) -> (Result<(), AhciError>, bool) {
         let reg = if queued { SACT } else { CI };
-        for _ in 0..POLL_LIMIT {
-            if self.idle.is_some() {
-                self.w(IE, IE_WAIT);
-            }
+        let look = || {
             let failed = self.r(IS) & IS_ERRORS != 0;
-            if failed || self.r(reg) & mask == 0 {
+            (failed || self.r(reg) & mask == 0).then_some(failed)
+        };
+        for _ in 0..POLL_LIMIT {
+            if let Some(failed) = look() {
                 return (Ok(()), failed);
             }
             match self.idle {
-                Some(idle) => idle(),
+                Some(idle) => {
+                    self.w(IE, IE_WAIT);
+                    if let Some(failed) = look() {
+                        return (Ok(()), failed);
+                    }
+                    idle();
+                }
                 None => osmium_arch::cpu::spin_hint(),
             }
         }

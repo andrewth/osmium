@@ -106,9 +106,11 @@ impl InterruptController for Plic {
         (irq != 0).then_some(irq)
     }
 
-    /// Ignores ids [`InterruptController::claim`] never returns.
+    /// Completes any id the hardware handed out, even one above the
+    /// configured source count (the claim would otherwise stay pending);
+    /// ignores only id 0, which [`InterruptController::claim`] never returns.
     fn complete(&self, irq: u32) {
-        if self.valid(irq) {
+        if irq != 0 {
             let _ = self.io.write(self.context() + CLAIM, irq);
         }
     }
@@ -173,6 +175,14 @@ mod tests {
         assert_eq!(mem.iter().filter(|&&v| v != 0).count(), 2, "only source 53's priority and enable bit");
         assert_eq!(mem[53], 1);
         assert_eq!(mem[0x2080 / 4 + 1], 1 << 21);
+
+        // Completion is not range-checked: it only writes the claim register.
+        // SAFETY: as above.
+        let plic = Plic::new(unsafe { IoMem::new(mem.as_mut_ptr().cast(), 0x40_0000) }, Plic::supervisor_context)
+            .with_num_sources(53);
+        plic.complete(54);
+        drop(plic);
+        assert_eq!(mem[0x20_1004 / 4], 54);
 
         // A window too small for the enables is not a panic.
         // SAFETY: as above.

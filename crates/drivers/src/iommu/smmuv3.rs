@@ -38,6 +38,7 @@ const CR0: usize = 0x20;
 const CR0ACK: usize = 0x24;
 const CR1: usize = 0x28;
 const CR2: usize = 0x2c;
+const GBPA: usize = 0x44;
 const GERROR: usize = 0x60;
 const GERRORN: usize = 0x64;
 const STRTAB_BASE: usize = 0x80;
@@ -70,6 +71,9 @@ const CR1_COHERENT: u32 = 3 << 10 | 1 << 8 | 1 << 6 | 3 << 4 | 1 << 2 | 1;
 const CR2_RECINVSID: u32 = 1 << 1;
 const BASE_RA: u64 = 1 << 62;
 const GERROR_CMDQ_ERR: u32 = 1 << 0;
+// GBPA: global bypass attributes, used while SMMUEN is clear.
+const GBPA_ABORT: u32 = 1 << 20;
+const GBPA_UPDATE: u32 = 1 << 31;
 
 // Commands (opcode in bits 7:0).
 const CMD_CFGI_STE: u64 = 0x03;
@@ -195,6 +199,12 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Smmuv3<'d, D> {
         };
         // Reconfiguration needs the unit off.
         unit.set_cr0(0)?;
+        // Until the first attach, let DMA bypass the unit rather than abort,
+        // as with the other IOMMUs here; the reset value is implementation
+        // defined. Changes to GBPA take effect through the UPDATE handshake.
+        unit.wait(|| unit.regs.r32(GBPA) & GBPA_UPDATE == 0)?;
+        unit.regs.w32(GBPA, unit.regs.r32(GBPA) & !GBPA_ABORT | GBPA_UPDATE);
+        unit.wait(|| unit.regs.r32(GBPA) & GBPA_UPDATE == 0)?;
         unit.regs.w32(CR1, CR1_COHERENT);
         unit.regs.w32(CR2, CR2_RECINVSID);
         unit.regs.w64(STRTAB_BASE, buffers.strtab.device_addr().as_u64() & ADDR_MASK_4 & !0x3f | BASE_RA);
@@ -267,7 +277,8 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Smmuv3<'d, D> {
         let cmds = &Self::buffers(st).commands;
         cmds.store::<u64>(at, q0);
         cmds.store::<u64>(at + 8, q1);
-        barrier::dma_wmb();
+        // The producer write is MMIO: only a full barrier orders the command before it.
+        barrier::mb();
         st.prod = (prod + 1) & mask;
         self.regs.w32(CMDQ_PROD, st.prod);
         Ok(())
@@ -283,10 +294,20 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Smmuv3<'d, D> {
         });
         let active = self.regs.r32(GERROR) ^ self.regs.r32(GERRORN);
         if active & GERROR_CMDQ_ERR != 0 {
-            // Acknowledge, and resynchronize our producer with the unit.
-            self.regs.w32(GERRORN, self.regs.r32(GERROR));
-            st.prod = self.regs.r32(CMDQ_CONS) & mask;
+            // The unit stopped at the faulting command (CONS). Replace it with
+            // a CMD_SYNC, which cannot fault, and empty the queue, both
+            // before acknowledging: the unit resumes at CONS on the
+            // acknowledgement and must find nothing to run.
+            let cons = self.regs.r32(CMDQ_CONS) & mask;
+            let at = (cons & ((1u32 << self.cmdq_log2) - 1)) as usize * CMD_BYTES;
+            let cmds = &Self::buffers(st).commands;
+            cmds.store::<u64>(at, CMD_SYNC);
+            cmds.store::<u64>(at + 8, 0);
+            st.prod = cons;
+            barrier::mb();
             self.regs.w32(CMDQ_PROD, st.prod);
+            barrier::mb();
+            self.regs.w32(GERRORN, self.regs.r32(GERROR));
             return Err(IommuError::Hardware);
         }
         done
@@ -386,6 +407,8 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Smmuv3<'_, D> {
         let events = &Self::buffers(&st).events;
         let (q0, q1, q2) = (events.load::<u64>(at), events.load::<u64>(at + 8), events.load::<u64>(at + 16));
         // Advance, and acknowledge an overflow the unit flagged (bit 31).
+        // The slot is the unit's again once CONS moves: finish reading first.
+        barrier::mb();
         self.regs.w32(EVENTQ_CONS, (prod & 1 << 31) | (cons + 1) & mask);
         let sid = ((q0 >> 32) as u32).wrapping_sub(self.stream_offset);
         Some(Fault {
@@ -456,7 +479,11 @@ mod tests {
             let mut hw = h.lock().unwrap();
             let cr0 = r.r32(CR0);
             r.w32(CR0ACK, cr0);
-            if cr0 & CR0_CMDQEN == 0 || hw.stall {
+            // Writes to GBPA complete at once.
+            r.w32(GBPA, r.r32(GBPA) & !GBPA_UPDATE);
+            // A command error stops the queue until it is acknowledged.
+            let errored = (r.r32(GERROR) ^ r.r32(GERRORN)) & GERROR_CMDQ_ERR != 0;
+            if cr0 & CR0_CMDQEN == 0 || hw.stall || errored {
                 return;
             }
             let base = r.r64(CMDQ_BASE);
@@ -684,13 +711,25 @@ mod tests {
             f.hw.lock().unwrap().stall = false;
             // The stuck commands run once the unit recovers; give it time.
             std::thread::sleep(core::time::Duration::from_millis(10));
+            let before = f.log().len();
             f.hw.lock().unwrap().error_next = true;
             assert_eq!(d.attach(dev(NIC)), Err(IommuError::Hardware));
             std::thread::sleep(core::time::Duration::from_millis(10));
+            // Only the rollback's own cfgi, tlbi and sync ran; the rejected
+            // attach's commands were dropped, not re-executed.
+            assert_eq!(f.log().len(), before + 3, "{:?}", f.log());
             // The error was acknowledged and the queue still works.
             d.attach(dev(NIC)).unwrap();
         }
         assert_eq!(f.regs.r32(GERROR), f.regs.r32(GERRORN));
+    }
+
+    #[test]
+    fn unit_resets_to_bypass() {
+        let (f, dma, clock) = (fake(0, 0), HostDma::default(), StdClock::default());
+        f.regs.w32(GBPA, GBPA_ABORT);
+        let _unit = setup(&dma, &clock, &f);
+        assert_eq!(f.regs.r32(GBPA) & GBPA_ABORT, 0, "DMA passes until the first attach");
     }
 
     #[test]

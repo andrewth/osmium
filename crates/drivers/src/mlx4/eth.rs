@@ -291,7 +291,8 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
         let (word, ci) = ((sn as u32 & 3) << 28 | CQ_DB_REQ_NOT, self.cq_ci & 0xff_ffff);
         // The record first, then the doorbell that makes the device read it.
         put32(&self.mem.doorbells, 4, word | ci);
-        osmium_arch::barrier::dma_wmb();
+        // The doorbell is an MMIO write: only a full barrier orders the record before it.
+        osmium_arch::barrier::mb();
         let doorbell = ((word | self.cqn) as u64) << 32 | ci as u64;
         let _ = self.hca.uar.write(UAR_PAGE as usize * PAGE + CQ_DOORBELL, doorbell.to_be());
         self.armed_sn = Some(sn);

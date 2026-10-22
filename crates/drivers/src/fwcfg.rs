@@ -15,8 +15,10 @@
 //! ```
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{Ordering, fence};
+use osmium_arch::barrier;
 
+/// Most directory entries walked, whatever count the device reports.
+const MAX_FILES: u32 = 4096;
 const SEL_SIGNATURE: u16 = 0x0000;
 const SEL_ID: u16 = 0x0001;
 const SEL_FILE_DIR: u16 = 0x0019;
@@ -120,7 +122,8 @@ impl<I: FwCfgIo> FwCfg<I> {
             write_volatile(&raw mut (*d).address, addr.to_be());
             write_volatile(&raw mut (*d).control, control.to_be());
         }
-        fence(Ordering::SeqCst);
+        // The block must be visible to the device before the doorbell write.
+        barrier::mb();
         let block = self.io.dma_address(d.cast());
         if !self.io.start_dma(block) {
             return false;
@@ -132,6 +135,8 @@ impl<I: FwCfgIo> FwCfg<I> {
                 return false;
             }
             if c == 0 {
+                // Order the device's writes to the buffer after the control read.
+                barrier::dma_rmb();
                 return true;
             }
             core::hint::spin_loop();
@@ -181,7 +186,8 @@ impl<I: FwCfgIo> FwCfg<I> {
         for b in &mut n {
             *b = self.io.read8();
         }
-        for _ in 0..u32::from_be_bytes(n) {
+        // A dead device reads as all ones; do not walk four billion entries.
+        for _ in 0..u32::from_be_bytes(n).min(MAX_FILES) {
             let mut e = [0u8; DIR_ENTRY];
             for b in &mut e {
                 *b = self.io.read8();
@@ -295,5 +301,23 @@ mod tests {
             }
         }
         assert!(!FwCfg::new(Dead).detect());
+    }
+
+    #[test]
+    fn directory_walk_is_capped() {
+        struct Ones(usize);
+        impl FwCfgIo for Ones {
+            fn select(&mut self, _: u16) {}
+            fn read8(&mut self) -> u8 {
+                self.0 += 1;
+                0xFF
+            }
+            fn start_dma(&mut self, _: u64) -> bool {
+                false
+            }
+        }
+        let mut cfg = FwCfg::new(Ones(0));
+        cfg.for_each_file(|_, _| true);
+        assert!(cfg.io.0 <= 4 + MAX_FILES as usize * DIR_ENTRY);
     }
 }

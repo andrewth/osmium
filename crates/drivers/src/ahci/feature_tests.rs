@@ -201,6 +201,10 @@ fn interrupts_wake_the_waiter() {
         disk.flush().unwrap();
         let (idles, handled) = IDLES.with(|c| c.get());
         assert!(idles > 0 && handled > 0, "slept {idles}, interrupted {handled}");
+        // One command: the interrupt that woke the waiter is the only one.
+        let raised = fake::with(|f| f.irq_raises);
+        disk.read_blocks(0, &mut buf[..512]).unwrap();
+        assert_eq!(fake::with(|f| f.irq_raises), raised + 1, "no interrupt after the command finished");
         fake::with(|f| {
             assert!(!f.irq_asserted(), "nothing left asserted");
             assert_eq!(f.port_reg(0, IE), 0, "disarmed between commands");

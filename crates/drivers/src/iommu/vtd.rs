@@ -74,6 +74,8 @@ const IOTLB_DR: u64 = 1 << 49;
 
 // FSTS bits.
 const FSTS_PFO: u32 = 1 << 0;
+/// Primary pending fault: a record waits, and FRI says which.
+const FSTS_PPF: u32 = 1 << 1;
 
 /// Fault recording register: F (bit 127), read/write type and reason.
 const FRCD_F: u64 = 1 << 63;
@@ -296,7 +298,8 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         ctx.store::<u64>(off + 8, AW_48 | (domain.0 as u64) << 8);
         barrier::dma_wmb();
         ctx.store::<u64>(off, root.as_u64() | PRESENT);
-        barrier::dma_wmb();
+        // The next steps write registers: only a full barrier orders the entry before them.
+        barrier::mb();
         let result = self
             .flush_write_buffer(&st)
             .and_then(|()| self.invalidate_device(device, domain.0))
@@ -308,6 +311,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
             ctx.store::<u64>(off, 0);
             barrier::dma_wmb();
             ctx.store::<u64>(off + 8, 0);
+            barrier::mb();
             let _ = self.invalidate_device(device, domain.0);
         }
         result
@@ -329,7 +333,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         ctx.store::<u64>(off, 0);
         barrier::dma_wmb();
         ctx.store::<u64>(off + 8, 0);
-        barrier::dma_wmb();
+        barrier::mb();
         self.flush_write_buffer(&st)?;
         self.invalidate_device(device, domain)
     }
@@ -342,6 +346,15 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
 
     fn take_fault(&self) -> Option<Fault> {
         let mut st = self.state.lock();
+        // With a record pending, FRI names the oldest one: take it as the
+        // cursor, so records left by firmware or an earlier owner are found.
+        let fsts = self.regs.r32(FSTS);
+        if fsts & FSTS_PPF != 0 {
+            let fri = (fsts >> 8 & 0xff) as usize;
+            if fri < self.nfr {
+                st.next_fault = fri;
+            }
+        }
         let at = self.frcd + st.next_fault * 16;
         let hi = self.regs.r64(at + 8);
         if hi & FRCD_F == 0 {
@@ -689,6 +702,19 @@ mod tests {
         f.hw.lock().unwrap().stall = false;
         let mut d = IoDomain::new(&vtd, DomainId(1), &tables).unwrap();
         d.attach(dev(NIC)).unwrap();
+    }
+
+    #[test]
+    fn fault_cursor_follows_fri() {
+        let (f, dma, clock) = (fake(0, 0), HostDma::default(), StdClock::default());
+        let vtd = setup(&f, &dma, &clock);
+        // A record left at index 1 (as after firmware ran), with FRI pointing at it.
+        f.record_fault(1, dev(FAR).bdf(), 0x9000, 5, true);
+        f.regs.w32(FSTS, FSTS_PPF | 1 << 8);
+        assert_eq!(vtd.take_fault().unwrap().iova, 0x9000);
+        std::thread::sleep(core::time::Duration::from_millis(5));
+        f.regs.w32(FSTS, 0);
+        assert_eq!(vtd.take_fault(), None);
     }
 
     #[test]

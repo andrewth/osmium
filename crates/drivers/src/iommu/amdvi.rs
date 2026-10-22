@@ -45,7 +45,12 @@ const CMD_TAIL: usize = 0x2008;
 const EVT_HEAD: usize = 0x2010;
 const EVT_TAIL: usize = 0x2018;
 const STATUS: usize = 0x2020;
+const EFR: usize = 0x0030;
 const REGS_LEN: usize = 0x2028;
+
+// Extended Feature Register bits.
+/// INVALIDATE_IOMMU_ALL is supported.
+const EFR_IA: u64 = 1 << 6;
 
 // CONTROL bits.
 const IOMMU_EN: u64 = 1 << 0;
@@ -66,6 +71,7 @@ const ENTRY: usize = 16;
 const OP_COMPLETION_WAIT: u64 = 0x1;
 const OP_INVALIDATE_DEVTAB_ENTRY: u64 = 0x2;
 const OP_INVALIDATE_PAGES: u64 = 0x3;
+const OP_INVALIDATE_ALL: u64 = 0x8;
 
 // Device table entry.
 const DTE_BYTES: usize = 32;
@@ -179,7 +185,8 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
         let cmds = &Self::buffers(st).commands;
         cmds.store::<u64>(st.tail, q0);
         cmds.store::<u64>(st.tail + 8, q1);
-        barrier::dma_wmb();
+        // The tail write is MMIO: only a full barrier orders the command before it.
+        barrier::mb();
         st.tail = next;
         self.regs.w64(CMD_TAIL, next as u64);
         Ok(())
@@ -208,27 +215,40 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
 
     /// Writes a blocked entry for every requester ID without a valid one and
     /// makes the unit reread the device table.
-    fn block_all(&self, st: &mut State<'d, D>) -> Result<(), IommuError> {
+    ///
+    /// Takes the state lock itself, one batch of requester IDs at a time, so
+    /// interrupts are never off for the whole 65536-entry table. A unit with
+    /// EFR.IA then needs one INVALIDATE_IOMMU_ALL; others get an invalidation
+    /// per entry in the same batches.
+    fn block_all(&self) -> Result<(), IommuError> {
+        const BATCH: usize = 64;
         let count = (self.max_bus as usize + 1) * 256;
-        let devtab = &Self::buffers(st).devtab;
-        for id in 0..count {
-            let off = id * DTE_BYTES;
-            if devtab.load::<u64>(off) & DTE_V == 0 {
-                for q in 1..4 {
-                    devtab.store::<u64>(off + q * 8, 0);
+        let invalidate_all = self.regs.r64(EFR) & EFR_IA != 0;
+        for first in (0..count).step_by(BATCH) {
+            let mut st = self.state.lock();
+            let devtab = &Self::buffers(&st).devtab;
+            for id in first..(first + BATCH).min(count) {
+                let off = id * DTE_BYTES;
+                if devtab.load::<u64>(off) & DTE_V == 0 {
+                    for q in 1..4 {
+                        devtab.store::<u64>(off + q * 8, 0);
+                    }
+                    devtab.store::<u64>(off, DTE_BLOCKED);
                 }
-                devtab.store::<u64>(off, DTE_BLOCKED);
+            }
+            barrier::dma_wmb();
+            if !invalidate_all {
+                for id in first..(first + BATCH).min(count) {
+                    self.invalidate_device(&mut st, id as u16)?;
+                }
+                self.sync(&mut st)?;
             }
         }
-        barrier::dma_wmb();
-        for id in 0..count {
-            self.invalidate_device(st, id as u16)?;
-            // The command buffer holds 255 commands.
-            if id % 64 == 63 {
-                self.sync(st)?;
-            }
+        let mut st = self.state.lock();
+        if invalidate_all {
+            self.post(&mut st, OP_INVALIDATE_ALL << 60, 0)?;
         }
-        self.sync(st)
+        self.sync(&mut st)
     }
 
     /// Replaces `device`'s entry with a blocked one.
@@ -240,6 +260,21 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
             devtab.store::<u64>(off + q * 8, 0);
         }
         barrier::dma_wmb();
+    }
+
+    /// Resumes a halted event log. Overflow stops logging until EventLogEn
+    /// is cleared, the overflow bit acknowledged and EventLogEn set again.
+    fn restart_event_log(&self) {
+        let control = self.regs.r64(CONTROL);
+        self.regs.w64(CONTROL, control & !EVENT_LOG_EN);
+        if self.wait(|| self.regs.r64(STATUS) & EVENT_LOG_RUN == 0).is_err() {
+            // Still running: try again on the next call.
+            self.regs.w64(CONTROL, control);
+            return;
+        }
+        self.regs.w64(STATUS, EVENT_OVERFLOW);
+        self.regs.w64(CONTROL, control | EVENT_LOG_EN);
+        let _ = self.wait(|| self.regs.r64(STATUS) & EVENT_LOG_RUN != 0);
     }
 
     fn check(&self, device: DeviceId) -> Result<usize, IommuError> {
@@ -267,7 +302,14 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for AmdVi<'_, D> {
             return Err(IommuError::Busy);
         }
         if !st.blocked {
-            self.block_all(&mut st)?;
+            // Entries are blocked in batches under their own locking; an
+            // entry attached meanwhile is valid and left alone.
+            drop(st);
+            self.block_all()?;
+            st = self.state.lock();
+            if Self::buffers(&st).devtab.load::<u64>(off) & DTE_MODE_MASK != 0 {
+                return Err(IommuError::Busy);
+            }
             st.blocked = true;
         }
         let devtab = &Self::buffers(&st).devtab;
@@ -310,18 +352,22 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for AmdVi<'_, D> {
 
     fn take_fault(&self) -> Option<Fault> {
         let st = self.state.lock();
-        let head = self.regs.r64(EVT_HEAD) as usize;
-        let tail = self.regs.r64(EVT_TAIL) as usize;
+        // The pointers are byte offsets of 16-byte entries; hardware bits
+        // outside that must not index past the log.
+        let offset = |reg| self.regs.r64(reg) as usize & (QUEUE_BYTES - ENTRY);
+        let (head, tail) = (offset(EVT_HEAD), offset(EVT_TAIL));
         if head == tail {
             // Logging stopped on overflow; the log is empty now, so resume it.
             if self.regs.r64(STATUS) & EVENT_OVERFLOW != 0 {
-                self.regs.w64(STATUS, EVENT_OVERFLOW);
+                self.restart_event_log();
             }
             return None;
         }
         barrier::dma_rmb();
         let events = &Self::buffers(&st).events;
         let (q0, q1) = (events.load::<u64>(head), events.load::<u64>(head + 8));
+        // The slot is the unit's again once the head moves: finish reading first.
+        barrier::mb();
         self.regs.w64(EVT_HEAD, ((head + ENTRY) % QUEUE_BYTES) as u64);
         let requester = q0 as u16;
         Some(Fault {
@@ -373,6 +419,9 @@ mod tests {
         log: Vec<std::string::String>,
         /// Ignores the command buffer.
         stall: bool,
+        /// The event log stopped on overflow and needs EventLogEn toggled.
+        evt_halted: bool,
+        prev_overflow: bool,
     }
 
     struct Fake {
@@ -392,6 +441,16 @@ mod tests {
             // Like QEMU's model, the queues run only while the unit is on.
             if c & IOMMU_EN != 0 && c & CMD_BUF_EN != 0 {
                 status |= CMD_BUF_RUN;
+            }
+            // Overflow halts logging (the run bit stays up) until software
+            // clears and sets EventLogEn.
+            let overflow = status & EVENT_OVERFLOW != 0;
+            if overflow && !hw.prev_overflow {
+                hw.evt_halted = true;
+            }
+            hw.prev_overflow = overflow;
+            if c & EVENT_LOG_EN == 0 {
+                hw.evt_halted = false;
             }
             if c & IOMMU_EN != 0 && c & EVENT_LOG_EN != 0 {
                 status |= EVENT_LOG_RUN;
@@ -415,6 +474,10 @@ mod tests {
                         assert_eq!(q0 & 1, 1, "store requested");
                         set_mem64(q0 & 0x000f_ffff_ffff_fff8, q1);
                         hw.log.push("wait".into());
+                    }
+                    OP_INVALIDATE_ALL => {
+                        assert_ne!(r.r64(EFR) & EFR_IA, 0, "only when the unit advertises it");
+                        hw.log.push("all".into());
                     }
                     OP_INVALIDATE_DEVTAB_ENTRY => hw.log.push(std::format!("devtab {:#x}", q0 & 0xffff)),
                     OP_INVALIDATE_PAGES => {
@@ -487,6 +550,9 @@ mod tests {
         }
 
         fn push_event(&self, sid: u16, kind: u64, flags: u64, addr: u64) {
+            if self.hw.lock().unwrap().evt_halted {
+                return; // lost: the log is stopped
+            }
             let base = self.regs.r64(EVT_LOG_BAR) & ADDR_MASK;
             let tail = self.regs.r64(EVT_TAIL);
             set_mem64(base + tail, sid as u64 | flags << 48 | kind << 60);
@@ -626,13 +692,56 @@ mod tests {
     }
 
     #[test]
-    fn overflow_is_acknowledged_once_drained() {
+    fn overflow_restarts_the_event_log() {
         let (f, dma, clock) = (fake(), HostDma::default(), StdClock::default());
         let unit = setup(&dma, &clock, &f);
         f.regs.w64(STATUS, f.regs.r64(STATUS) | EVENT_OVERFLOW);
+        // The unit halts the log; take_fault toggles EventLogEn to resume it.
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+        while !f.hw.lock().unwrap().evt_halted {
+            assert!(std::time::Instant::now() < deadline, "the fake never halted");
+            std::thread::yield_now();
+        }
         assert_eq!(unit.take_fault(), None);
-        std::thread::sleep(core::time::Duration::from_millis(5));
+        assert!(!f.hw.lock().unwrap().evt_halted, "EventLogEn was toggled");
         assert_eq!(f.regs.r64(STATUS) & EVENT_OVERFLOW, 0);
+        assert_ne!(f.regs.r64(STATUS) & EVENT_LOG_RUN, 0, "logging resumed");
+        assert_ne!(f.regs.r64(CONTROL) & EVENT_LOG_EN, 0);
+        f.push_event(dev(NIC).bdf(), 2, 0, 0x4000);
+        assert_eq!(unit.take_fault().unwrap().iova, 0x4000);
+    }
+
+    #[test]
+    fn bogus_event_pointers_are_masked() {
+        let (f, dma, clock) = (fake(), HostDma::default(), StdClock::default());
+        let unit = setup(&dma, &clock, &f);
+        f.push_event(dev(NIC).bdf(), 2, 0, 0x7000);
+        // Reserved high bits and low bits set by the hardware.
+        f.regs.w64(EVT_TAIL, f.regs.r64(EVT_TAIL) | 0xffff_0000_0000_0007);
+        f.regs.w64(EVT_HEAD, 0x8000_0000_0000_0003);
+        assert_eq!(unit.take_fault().unwrap().iova, 0x7000);
+        assert_eq!(unit.take_fault(), None);
+    }
+
+    #[test]
+    fn first_attach_blocks_in_batches() {
+        for ia in [false, true] {
+            let (f, dma, clock, tables) = (fake(), HostDma::default(), StdClock::default(), HostTables::default());
+            if ia {
+                f.regs.w64(EFR, EFR_IA);
+            }
+            let unit = setup(&dma, &clock, &f);
+            let mut d = IoDomain::new(&unit, DomainId(1), &tables).unwrap();
+            d.attach(dev(NIC)).unwrap();
+            let log = f.log();
+            let devtabs = log.iter().filter(|l| l.starts_with("devtab")).count();
+            if ia {
+                assert!(log.contains(&"all".into()) && devtabs == 1, "{devtabs} per-device invalidations");
+            } else {
+                assert!(!log.contains(&"all".into()) && devtabs >= 8 * 256, "{devtabs}");
+            }
+            assert_eq!(f.translate(dev(FAR).bdf(), 0x1000, false), Err("device blocked"));
+        }
     }
 
     #[test]

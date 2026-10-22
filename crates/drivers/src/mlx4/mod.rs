@@ -459,7 +459,9 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
     fn start_firmware(&mut self) -> Result<(), Mlx4Error> {
         let mut fw = Ctx::new();
         self.hcr.exec_out(op::QUERY_FW, 0, 0, Input::None, &mut fw, 256)?;
-        self.fw_version = (fw.get(0, 0, 16) as u16, fw.get(1, 16, 16) as u16, fw.get(1, 0, 16) as u16);
+        // Dword 0 holds the page count above the major revision; dword 1 the
+        // sub-minor above the minor (the layout Linux and iPXE decode).
+        self.fw_version = (fw.get(0, 0, 16) as u16, fw.get(1, 0, 16) as u16, fw.get(1, 16, 16) as u16);
         let pages = fw.get(0, 16, 16) as usize;
         if pages == 0 {
             return Err(Mlx4Error::BadDevice);
@@ -688,6 +690,8 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
             osmium_arch::barrier::dma_rmb();
             handle(get32(ring, off) >> 16 & 0xff, off);
             at = at.wrapping_add(1);
+            // The entry is the adapter's again once the doorbell moves: finish reading first.
+            osmium_arch::barrier::mb();
             let _ = self.uar.write(self.eq_doorbell(eqn), (at & 0xff_ffff).to_be());
         }
         ci.set(at);

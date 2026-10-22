@@ -286,7 +286,9 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
     }
 
     /// Waits for the next completed request, polling at most `spins` times.
-    /// `None` means the device is too slow or broke the protocol.
+    /// `None` means the device is too slow or broke the protocol; either way
+    /// the queue is then marked broken, because the device may still read or
+    /// write the request's buffers and they must not be reused.
     pub fn wait_used(&mut self, spins: u32) -> Option<(u16, u32)> {
         for _ in 0..spins {
             if let Some(done) = self.pop_used() {
@@ -297,6 +299,7 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
             }
             core::hint::spin_loop();
         }
+        self.broken = true;
         None
     }
 }

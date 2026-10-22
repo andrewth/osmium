@@ -366,7 +366,7 @@ impl FakeHca {
         }
         let fw = &mut s.fw;
         match opcode {
-            op::QUERY_FW => self.out_mailbox(&[FW_PAGES << 16 | 2, 42 << 16 | 5000]),
+            op::QUERY_FW => self.out_mailbox(&[FW_PAGES << 16 | 2, 5000 << 16 | 42]),
             op::MAP_FA | op::MAP_ICM | op::MAP_ICM_AUX => {
                 assert_eq!(in_mod, 1);
                 let m = self.mailbox(4);

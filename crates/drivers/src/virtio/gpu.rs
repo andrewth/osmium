@@ -251,17 +251,16 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         let old_backing = self.backing.replace(backing);
         (self.resource, self.scanout) = (id, scanout);
         // The old resource is no longer scanned out. Unreferencing it
-        // detaches its backing, which is freed only after that succeeds.
+        // detaches its backing, which is freed only after that succeeds. If
+        // it fails the host may still hold the backing, so it is leaked; the
+        // new mode is already live, so that is not an error of this call.
         let unref = |gpu: &mut Self| match old {
             0 => Ok(()),
             old => gpu.command_nodata(Cmd::new(CMD_RESOURCE_UNREF).u32(old).u32(0), &[]),
         };
         match unref(self) {
             Ok(()) => drop(old_backing),
-            Err(e) => {
-                core::mem::forget(old_backing);
-                return Err(e);
-            }
+            Err(_) => core::mem::forget(old_backing),
         }
         self.flush_all()?;
         Ok(info)
@@ -350,6 +349,8 @@ mod tests {
         scanout: Option<(u32, Rect)>,
         flushed: Vec<Rect>,
         log: Vec<u32>,
+        /// Fails the unreference of this resource.
+        fail_unref: Option<u32>,
     }
 
     impl Host {
@@ -412,6 +413,9 @@ mod tests {
                     ok
                 }
                 CMD_RESOURCE_UNREF => {
+                    if self.fail_unref == Some(w(0)) {
+                        return (RESP_ERR_UNSPEC, vec![]);
+                    }
                     if self.resources.remove(&w(0)).is_none() {
                         return invalid;
                     }
@@ -448,11 +452,17 @@ mod tests {
     }
 
     fn with_host(body: impl FnOnce(&mut VirtioGpu<'_, FakeTransport, HostDma>)) -> Host {
+        let (host, live) = run_host(Host::default(), body);
+        assert_eq!(live, 0, "everything freed");
+        host
+    }
+
+    /// Runs `body` against `host`; returns it and how many DMA buffers are still live.
+    fn run_host(mut host: Host, body: impl FnOnce(&mut VirtioGpu<'_, FakeTransport, HostDma>)) -> (Host, usize) {
         let dma = HostDma::default();
         let mut gpu = VirtioGpu::new(device(), &dma).unwrap();
         let (size, addrs) = gpu.transport().queue(CONTROL_QUEUE);
         let stop = AtomicBool::new(false);
-        let mut host = Host::default();
         std::thread::scope(|s| {
             let server = s.spawn(|| serve(DeviceSide::new(size, addrs), &mut host, &stop));
             // Stop the device even if `body` panics, so the scope can end.
@@ -468,8 +478,7 @@ mod tests {
             server.join().unwrap();
         });
         drop(gpu);
-        assert_eq!(dma.live.get(), 0, "everything freed");
-        host
+        (host, dma.live.get())
     }
 
     #[test]
@@ -538,8 +547,25 @@ mod tests {
         let dma = HostDma::default();
         let mut gpu = VirtioGpu::new(device(), &dma).unwrap();
         assert_eq!(gpu.display_info(), Err(DisplayError::Device));
+        assert!(gpu.queue.is_broken());
+        let in_flight = gpu.queue.in_flight();
+        assert_eq!(gpu.display_info(), Err(DisplayError::Device));
+        assert_eq!(gpu.queue.in_flight(), in_flight, "nothing new was queued");
         drop(gpu);
         assert_eq!(dma.live.get(), 0, "reset acknowledged, so everything freed");
+    }
+
+    #[test]
+    fn failed_unref_of_the_old_mode_still_switches() {
+        let host = Host { fail_unref: Some(1), ..Host::default() };
+        let (host, live) = run_host(host, |gpu| {
+            gpu.set_mode(0, 8, 8).unwrap();
+            // The old resource cannot be released: the new mode is live regardless.
+            assert_eq!(gpu.set_mode(0, 16, 16).unwrap().width, 16);
+            assert_eq!(gpu.info().width, 16);
+        });
+        assert_eq!(host.scanout.map(|(id, _)| id), Some(2));
+        assert_eq!(live, 1, "the old backing is leaked, not freed under the host");
     }
 
     #[test]

@@ -15,8 +15,8 @@
 //! MSI-X vector instead, and the driver sleeps through an [`Interrupts::idle`]
 //! hook between completions; the caller programs the MSI-X table and the
 //! interrupt handler, which calls [`IrqSignal::notify`]. Admin commands are
-//! always polled. The interrupt mask registers (INTMS) stay masked, as they
-//! must with MSI-X.
+//! always polled. The interrupt mask registers (INTMS) are written only when
+//! polling; the spec forbids touching them with MSI-X.
 //!
 //! Every wait is bounded by a [`Clock`]: CAP.TO for the controller to
 //! change state, [`COMMAND_TIMEOUT_NS`] for a command ([`FLUSH_TIMEOUT_NS`]
@@ -553,8 +553,11 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         if csts & CSTS_CFS != 0 {
             return Err(NvmeError::Fatal);
         }
-        // Completions are polled.
-        self.regs.write(INTMS, u32::MAX);
+        // Pin interrupts stay masked when completions are polled. With MSI-X
+        // the spec forbids touching INTMS/INTMC.
+        if self.irq.is_none() {
+            self.regs.write(INTMS, u32::MAX);
+        }
         Ok(())
     }
 
@@ -688,6 +691,8 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
                     idle(irq, seen);
                     continue;
                 };
+                // The entries are the controller's again once the head moves: finish reading first.
+                barrier::mb();
                 self.regs.doorbell(qid, true, self.mem.io.head());
                 let found = slots.iter().position(|s| matches!(s, Some((cid, _)) if *cid == done.cid));
                 // Anything else is stray.
@@ -751,6 +756,8 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
                 idle(irq, seen);
                 continue;
             };
+            // The entries are the controller's again once the head moves: finish reading first.
+            barrier::mb();
             self.regs.doorbell(queue.qid(), true, queue.head());
             // Nothing else is in flight, so anything else is stray.
             if done.cid == cid && done.sqid == queue.qid() {
@@ -1098,7 +1105,7 @@ mod tests {
                 let mut nv = Nvme::with_interrupts(fake.io(), &dma, &fake, irq).unwrap();
                 assert!(nv.interrupt_driven());
                 assert_eq!(fake.cq_flags.load(Relaxed), QUEUE_PC | QUEUE_IEN | 5 << 16, "IEN and vector 5");
-                assert_eq!(fake.reg(INTMS), u32::MAX, "INTMS is for pin interrupts; MSI-X leaves it alone");
+                assert_eq!(fake.reg(INTMS), 0, "INTMS is for pin interrupts; MSI-X leaves it alone");
                 assert_eq!(fake.signal.count(), 0, "admin completions raise nothing here");
                 pipelined_roundtrip(&fake, &mut nv);
                 assert_eq!(fake.max_inflight.load(Relaxed) as usize, SLOTS);

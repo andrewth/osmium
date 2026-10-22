@@ -167,6 +167,8 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
                 return Err(IommuError::Unsupported);
             }
         }
+        // The zeroed queue memory must be visible before the unit is pointed at it.
+        barrier::mb();
         unit.regs.w64(CQB, ppn(tables.commands.device_addr()) << PPN_SHIFT | (CQ_LOG2 - 1) as u64);
         unit.regs.w64(FQB, ppn(tables.faults.device_addr()) << PPN_SHIFT | (FQ_LOG2 - 1) as u64);
         unit.state.lock().tables = Some(tables);
@@ -236,7 +238,8 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
         let cmds = &Self::tables(st).commands;
         cmds.store::<u64>(at, q0);
         cmds.store::<u64>(at + 8, q1);
-        barrier::dma_wmb();
+        // The tail write is MMIO: only a full barrier orders the command before it.
+        barrier::mb();
         st.cq_tail = next;
         self.regs.w32(CQT, next);
         Ok(())
@@ -376,6 +379,8 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
         let faults = &Self::tables(&st).faults;
         let at = head as usize * FAULT_BYTES;
         let (q0, iotval) = (faults.load::<u64>(at), faults.load::<u64>(at + 16));
+        // The slot is the unit's again once the head moves: finish reading first.
+        barrier::mb();
         self.regs.w32(FQH, (head + 1) & mask);
         let requester = (q0 >> 40) as u16;
         // Transaction types 3 and 6 are untranslated and translated writes.

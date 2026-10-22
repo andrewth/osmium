@@ -379,6 +379,18 @@ mod tests {
     }
 
     #[test]
+    fn timeout_breaks_the_queue() {
+        let dma = HostDma::default();
+        let mut b = VirtioBlk::new(device(feature::VERSION_1, SECTORS), &dma).unwrap();
+        let mut buf = [0u8; 512];
+        assert_eq!(b.read_blocks(0, &mut buf), Err(BlockError::Io));
+        assert!(b.queue.is_broken(), "the device may still own the bounce buffers");
+        let in_flight = b.queue.in_flight();
+        assert_eq!(b.read_blocks(1, &mut buf), Err(BlockError::Io));
+        assert_eq!(b.queue.in_flight(), in_flight, "nothing new was queued");
+    }
+
+    #[test]
     fn drop_resets_the_device() {
         let dma = HostDma::default();
         let b = VirtioBlk::new(device(feature::VERSION_1, 1), &dma).unwrap();

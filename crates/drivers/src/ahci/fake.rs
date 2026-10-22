@@ -252,6 +252,8 @@ pub struct FakeHba {
     pub now: u64,
     /// The HBA's IS register.
     hba_is: u32,
+    /// How many times a port status bit met an armed PxIE bit.
+    pub irq_raises: u32,
 }
 
 /// A clock on the fake HBA's time, which each reading moves on by 1 µs.
@@ -330,6 +332,7 @@ impl FakeHba {
             log: Vec::new(),
             now: 0,
             hba_is: 0,
+            irq_raises: 0,
         }
     }
 
@@ -364,6 +367,7 @@ impl FakeHba {
     /// Raises the HBA's IS bit for `p` if the port has an enabled status.
     fn sync_irq(&mut self, p: usize) {
         if self.ports[p].is & self.regs.port_reg(p, IE) != 0 {
+            self.irq_raises += 1;
             self.hba_is |= 1 << p;
             self.regs.set(HBA_IS, self.hba_is);
         }
