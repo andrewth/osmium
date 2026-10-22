@@ -26,6 +26,7 @@
 //! | [`usb::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
 //! | [`usb::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
 //! | [`usb::ecm::UsbEthernet`] | USB Ethernet (CDC-ECM) on any `UsbHost` | `NetDevice` |
+//! | [`usb::ncm::UsbNcm`] | USB Ethernet (CDC-NCM; simulator-tested only) on any `UsbHost` | `NetDevice` |
 //! | [`iommu::vtd::Vtd`] | Intel VT-d DMA remapping unit | `Iommu` |
 //! | [`iommu::amdvi::AmdVi`] | AMD-Vi (AMD IOMMU) unit | `Iommu` |
 //! | [`iommu::smmuv3::Smmuv3`] | Arm SMMUv3 | `Iommu` |

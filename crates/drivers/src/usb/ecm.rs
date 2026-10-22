@@ -38,7 +38,7 @@ const CS_INTERFACE: u8 = 0x24;
 const SUBTYPE_UNION: u8 = 0x06;
 const SUBTYPE_ETHERNET: u8 = 0x0f;
 
-const SET_ETHERNET_PACKET_FILTER: u8 = 0x43;
+pub(super) const SET_ETHERNET_PACKET_FILTER: u8 = 0x43;
 /// Packet filter bits (CDC ECM table 62).
 pub mod filter {
     #![allow(missing_docs)]
@@ -90,80 +90,91 @@ impl EcmFunction {
     /// with an alternate setting that has a bulk IN and a bulk OUT endpoint.
     /// Returns `None` for anything else, including truncated descriptors.
     pub fn parse(config: &[u8]) -> Option<Self> {
-        let mut control: Option<u8> = None;
-        let mut in_control = false;
-        let mut union_data: Option<u8> = None;
-        let mut ethernet: Option<(u8, u16)> = None;
-        let mut interrupt = None;
-        // The data interface alternate settings seen so far, with their bulk
-        // endpoints; the first complete one for the right interface wins.
-        let mut candidate: Candidate = None;
-        let mut data: Option<(u8, u8, EndpointDescriptor, EndpointDescriptor)> = None;
-        // Closes the alternate setting being collected: it is the data
-        // interface if complete, and the union (if any) names its interface.
-        fn finish(
-            c: &mut Candidate,
-            union_data: Option<u8>,
-            data: &mut Option<(u8, u8, EndpointDescriptor, EndpointDescriptor)>,
-        ) {
-            if let Some((n, alt, Some(i), Some(o))) = c.take()
-                && data.is_none()
-                && union_data.is_none_or(|u| u == n)
-            {
-                *data = Some((n, alt, i, o));
-            }
+        parse_cdc(config, SUBCLASS_ECM, |_| {})
+    }
+}
+
+/// Finds a communications interface of `subclass` and its data interface in
+/// `config`, as [`EcmFunction::parse`] does for ECM. Every class-specific
+/// descriptor of the communications interface is also passed to
+/// `functional`, for the subclass's own (NCM's, say).
+pub(super) fn parse_cdc(config: &[u8], subclass: u8, mut functional: impl FnMut(&[u8])) -> Option<EcmFunction> {
+    let mut control: Option<u8> = None;
+    let mut in_control = false;
+    let mut union_data: Option<u8> = None;
+    let mut ethernet: Option<(u8, u16)> = None;
+    let mut interrupt = None;
+    // The data interface alternate settings seen so far, with their bulk
+    // endpoints; the first complete one for the right interface wins.
+    let mut candidate: Candidate = None;
+    let mut data: Option<(u8, u8, EndpointDescriptor, EndpointDescriptor)> = None;
+    // Closes the alternate setting being collected: it is the data
+    // interface if complete, and the union (if any) names its interface.
+    fn finish(
+        c: &mut Candidate,
+        union_data: Option<u8>,
+        data: &mut Option<(u8, u8, EndpointDescriptor, EndpointDescriptor)>,
+    ) {
+        if let Some((n, alt, Some(i), Some(o))) = c.take()
+            && data.is_none()
+            && union_data.is_none_or(|u| u == n)
+        {
+            *data = Some((n, alt, i, o));
         }
-        for d in Descriptors::new(config) {
-            match d.ok()? {
-                Descriptor::Interface(i) => {
-                    finish(&mut candidate, union_data, &mut data);
-                    in_control = i.class == CLASS_COMMUNICATIONS && i.subclass == SUBCLASS_ECM && i.alternate == 0;
-                    if in_control && control.is_none() {
-                        control = Some(i.number);
-                    } else {
-                        in_control &= control == Some(i.number);
-                    }
-                    if i.class == CLASS_DATA && i.alternate != 0 {
-                        candidate = Some((i.number, i.alternate, None, None));
+    }
+    for d in Descriptors::new(config) {
+        match d.ok()? {
+            Descriptor::Interface(i) => {
+                finish(&mut candidate, union_data, &mut data);
+                in_control = i.class == CLASS_COMMUNICATIONS && i.subclass == subclass && i.alternate == 0;
+                if in_control && control.is_none() {
+                    control = Some(i.number);
+                } else {
+                    in_control &= control == Some(i.number);
+                }
+                if i.class == CLASS_DATA && i.alternate != 0 {
+                    candidate = Some((i.number, i.alternate, None, None));
+                }
+            }
+            Descriptor::Endpoint(e) => {
+                if in_control && e.transfer_type() == TransferType::Interrupt && e.direction() == Direction::In {
+                    interrupt.get_or_insert(e);
+                }
+                if let Some((_, _, i, o)) = &mut candidate
+                    && e.transfer_type() == TransferType::Bulk
+                {
+                    match e.direction() {
+                        Direction::In => _ = i.get_or_insert(e),
+                        Direction::Out => _ = o.get_or_insert(e),
                     }
                 }
-                Descriptor::Endpoint(e) => {
-                    if in_control && e.transfer_type() == TransferType::Interrupt && e.direction() == Direction::In {
-                        interrupt.get_or_insert(e);
-                    }
-                    if let Some((_, _, i, o)) = &mut candidate
-                        && e.transfer_type() == TransferType::Bulk
-                    {
-                        match e.direction() {
-                            Direction::In => _ = i.get_or_insert(e),
-                            Direction::Out => _ = o.get_or_insert(e),
-                        }
-                    }
-                }
-                Descriptor::Other(d) if in_control && d[1] == CS_INTERFACE && d.len() >= 3 => match d[2] {
+            }
+            Descriptor::Other(d) if in_control && d[1] == CS_INTERFACE && d.len() >= 3 => {
+                functional(d);
+                match d[2] {
                     SUBTYPE_UNION if d.len() >= 5 && union_data.is_none() => union_data = Some(d[4]),
                     SUBTYPE_ETHERNET if d.len() >= 13 && ethernet.is_none() => {
                         ethernet = Some((d[3], u16::from_le_bytes([d[8], d[9]])));
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
+            _ => {}
         }
-        finish(&mut candidate, union_data, &mut data);
-        let (mac_string, max_segment) = ethernet?;
-        let (data_interface, data_alternate, bulk_in, bulk_out) = data?;
-        Some(Self {
-            control_interface: control?,
-            data_interface,
-            data_alternate,
-            mac_string,
-            max_segment: if max_segment == 0 { DEFAULT_SEGMENT } else { max_segment },
-            interrupt,
-            bulk_in,
-            bulk_out,
-        })
     }
+    finish(&mut candidate, union_data, &mut data);
+    let (mac_string, max_segment) = ethernet?;
+    let (data_interface, data_alternate, bulk_in, bulk_out) = data?;
+    Some(EcmFunction {
+        control_interface: control?,
+        data_interface,
+        data_alternate,
+        mac_string,
+        max_segment: if max_segment == 0 { DEFAULT_SEGMENT } else { max_segment },
+        interrupt,
+        bulk_in,
+        bulk_out,
+    })
 }
 
 /// Parses a string descriptor holding a MAC address as 12 hexadecimal
@@ -207,7 +218,7 @@ pub fn parse_notification(b: &[u8]) -> Option<Notification> {
     })
 }
 
-fn bad(e: UsbError) -> NetError {
+pub(super) fn bad(e: UsbError) -> NetError {
     match e {
         UsbError::NoDevice => NetError::LinkDown,
         _ => NetError::Io,
@@ -346,7 +357,7 @@ impl<H: UsbHost> UsbEthernet<H> {
 }
 
 /// Reads string `index` and parses it as a MAC address.
-fn read_mac<H: UsbHost>(host: &mut H, dev: DeviceId, index: u8) -> Result<MacAddress, UsbError> {
+pub(super) fn read_mac<H: UsbHost>(host: &mut H, dev: DeviceId, index: u8) -> Result<MacAddress, UsbError> {
     // String 0 lists the supported language IDs; use the first.
     let mut buf = [0u8; 255];
     let get =
