@@ -70,18 +70,21 @@ fn now() -> Option<u64> {
 
 /// Runs `scan` until it returns `Some`, sleeping between attempts, and
 /// returns that; returns `None` once `timeout_ns` (`None` for no limit) has
-/// passed.
-pub(crate) fn wait<R>(timeout_ns: Option<u64>, mut scan: impl FnMut() -> Option<R>) -> Option<R> {
+/// passed. `EINTR` if the calling thread is interrupted by a signal or its
+/// process is ending, with nothing ready (see
+/// [`crate::signal::current_interrupted`]).
+pub(crate) fn wait<R>(timeout_ns: Option<u64>, mut scan: impl FnMut() -> Option<R>) -> Result<Option<R>, Errno> {
     if let Some(r) = scan() {
-        return Some(r);
+        return Ok(Some(r));
     }
     if timeout_ns == Some(0) {
-        return None;
+        return Ok(None);
     }
     let deadline = timeout_ns.and_then(|t| now().map(|n| n.saturating_add(t)));
     READY.wait_until(|| match scan() {
-        Some(r) => Some(Some(r)),
-        None if deadline.is_some_and(|d| now().is_some_and(|n| n >= d)) => Some(None),
+        Some(r) => Some(Ok(Some(r))),
+        None if crate::signal::current_interrupted() => Some(Err(Errno::EINTR)),
+        None if deadline.is_some_and(|d| now().is_some_and(|n| n >= d)) => Some(Ok(None)),
         None => None,
     })
 }
@@ -161,7 +164,7 @@ fn do_poll(p: &Process, fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult 
             .collect();
         revents.iter().any(|&r| r != 0).then_some(revents)
     };
-    let revents = wait(timeout, scan);
+    let revents = wait(timeout, scan)?;
     let ready = revents.as_ref().map_or(0, |r| r.iter().filter(|&&r| r != 0).count());
     for (i, c) in raw.as_chunks_mut::<POLLFD_LEN>().0.iter_mut().enumerate() {
         let r = revents.as_ref().map_or(0, |r| r[i]) as u16;
@@ -230,7 +233,7 @@ fn do_select(p: &Process, nfds: u64, sets: [u64; 3], timeout: Option<u64>) -> Sy
         }
         (count > 0).then_some((out, count))
     };
-    let (out, count) = wait(timeout, scan).unwrap_or(([vec![0; len], vec![0; len], vec![0; len]], 0));
+    let (out, count) = wait(timeout, scan)?.unwrap_or(([vec![0; len], vec![0; len], vec![0; len]], 0));
     for (va, bits) in s.user.iter().zip(out.iter()) {
         if *va != 0 {
             p.memory().write(*va, bits)?;

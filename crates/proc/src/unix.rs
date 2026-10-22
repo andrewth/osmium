@@ -130,7 +130,7 @@ impl UnixSocket {
             if !wait_for_data {
                 return Err(Errno::EAGAIN);
             }
-            wait(None, || Self::readable(&self.pair.lock(), self.side, self.dgram).then_some(()));
+            wait(None, || Self::readable(&self.pair.lock(), self.side, self.dgram).then_some(()))?;
         }
     }
 
@@ -176,7 +176,7 @@ impl UnixSocket {
             if !wait_for_room {
                 return Err(Errno::EAGAIN);
             }
-            wait(None, || Self::writable(&self.pair.lock(), self.side, self.dgram).then_some(()));
+            wait(None, || Self::writable(&self.pair.lock(), self.side, self.dgram).then_some(()))?;
         }
     }
 

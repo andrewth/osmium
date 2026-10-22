@@ -17,9 +17,12 @@
 //! page the kernel maps in the process's `mmap` area.
 //!
 //! Not implemented: queued real-time signals, `sigaltstack`, `sigsuspend`,
-//! stopping and continuing (stop signals are ignored), and restarting
-//! interrupted system calls (`SA_RESTART`): a blocked `futex` wait fails with
-//! `EINTR`; other blocking calls are not interrupted.
+//! stopping and continuing (stop signals are ignored), a credential model for
+//! `kill` (see its documentation), and restarting
+//! interrupted system calls (`SA_RESTART`): a blocked call (`futex`, `poll`,
+//! `select`, `epoll_wait`, pipe and socket reads and writes, `accept`,
+//! `connect`, `wait4`) fails with `EINTR` when a signal it would act on
+//! arrives or the process is ending.
 #![cfg_attr(
     not(any(test, target_arch = "riscv64", target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64"))),
     allow(dead_code)
@@ -188,8 +191,19 @@ impl Signals {
 /// Wakes everything a signal may have to interrupt: futex waiters, and a
 /// parent in `wait4`.
 fn poke(p: &Process) {
-    crate::futex::interrupt();
+    wake_blocked();
     p.child_exited.wake_all();
+}
+
+/// Makes every thread blocked in a futex wait, `poll`, `select`, `epoll`,
+/// pipe, socket or `accept`/`connect`/`recv`/`send` look again, so that one
+/// that is interrupted or whose process is ending gives up.
+pub(crate) fn wake_blocked() {
+    crate::futex::interrupt();
+    crate::poll::notify();
+    if let Some(stack) = crate::net::stack() {
+        stack.wake_waiters();
+    }
 }
 
 /// Sends `sig` to the process as a whole (`kill`): any thread that does not
@@ -263,6 +277,15 @@ pub(crate) fn interrupted(p: &Process, th: &Thread) -> bool {
         & !th.mask.load(Ordering::SeqCst)
         & !p.signals.ignored.load(Ordering::SeqCst)
         != 0
+}
+
+/// [`interrupted`] for the calling task's thread; false for a task that is
+/// not a thread of a process (a kernel task never gives up a wait). Blocking
+/// calls check it after each wake-up, after looking for what they wait for.
+pub(crate) fn current_interrupted() -> bool {
+    let Some(p) = crate::process::current() else { return false };
+    let th = crate::thread::current_thread(&p);
+    interrupted(&p, &th)
 }
 
 /// Takes the lowest-numbered pending signal `th` does not block.
@@ -523,6 +546,11 @@ fn signo(sig: u64) -> Result<u8, Errno> {
 
 /// `kill(pid, sig)`: `pid` 0 means the caller's own process; there are no
 /// process groups, so negative pids fail.
+///
+/// There is no credential check, on purpose: Osmium has no users (every
+/// process reports uid and gid 0, see `execve`'s auxiliary vector), so any
+/// process may signal any other, including `SIGKILL`. A kernel that wants
+/// isolation between programs must filter `kill` and `tkill` itself.
 pub(crate) fn kill(p: &Process, pid: i32, sig: u64) -> Result<u64, Errno> {
     let sig = signo(sig)?;
     let target = match pid {

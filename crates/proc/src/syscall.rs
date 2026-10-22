@@ -10,6 +10,7 @@ use osmium_fs::{Errno, FileKind, OpenFlags, PATH_MAX, Stat};
 use osmium_mm::paging::MapFlags;
 
 use crate::fd::{Access, OpenFile};
+use crate::poll::user_add;
 use crate::process::{ExitStatus, Pid, Process};
 use crate::thread::Thread;
 
@@ -352,6 +353,9 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Fstat => open_file(p, fd).and_then(|f| put_stat(p, a[1], &f.file().stat())),
         Sys::Newfstatat => newfstatat(p, fd, a[1], a[2], a[3]),
         Sys::Getdents64 => getdents64(p, fd, a[1], a[2]),
+        // The argument is forwarded as an opaque integer: nothing here
+        // dereferences it, and an implementation of `File::ioctl` that does
+        // must go through `p.memory()`, never read it as a kernel pointer.
         Sys::Ioctl => open_file(p, fd).and_then(|f| f.file().ioctl(a[1] as u32, a[2] as usize).map(|v| v as u64)),
         Sys::Getcwd => getcwd(p, a[0], a[1]),
         Sys::Chdir => chdir(p, a[0]),
@@ -465,7 +469,7 @@ fn read(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         };
-        if let Err(e) = p.memory().write(buf + done, &kbuf[..n]) {
+        if let Err(e) = user_add(buf, done).and_then(|va| p.memory().write(va, &kbuf[..n])) {
             if done > 0 {
                 break;
             }
@@ -492,7 +496,7 @@ fn write(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
             break;
         }
         let want = ((len - done) as usize).min(CHUNK);
-        if let Err(e) = p.memory().read(buf + done, &mut kbuf[..want]) {
+        if let Err(e) = user_add(buf, done).and_then(|va| p.memory().read(va, &mut kbuf[..want])) {
             if done > 0 {
                 break;
             }
@@ -521,18 +525,28 @@ fn sigpipe(p: &Process, f: &OpenFile, e: Errno) {
     }
 }
 
-/// The `struct iovec { base, len }` array at `iov`.
+/// The `struct iovec { base, len }` array at `iov`. The lengths must sum to
+/// no more than `isize::MAX` (`EINVAL`).
 fn iovecs(p: &Process, iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64)>, Errno> {
     if count > 1024 {
         return Err(Errno::EINVAL);
     }
-    (0..count).map(|i| Ok((user_u64(p, iov + i * 16)?, user_u64(p, iov + i * 16 + 8)?))).collect()
+    let mut total = 0u64;
+    (0..count)
+        .map(|i| {
+            let at = user_add(iov, i * 16)?;
+            let (base, len) = (user_u64(p, at)?, user_u64(p, user_add(at, 8)?)?);
+            total = total.checked_add(len).filter(|&t| t <= isize::MAX as u64).ok_or(Errno::EINVAL)?;
+            Ok((base, len))
+        })
+        .collect()
 }
 
 fn readv(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
     let mut total = 0;
     for (base, len) in iovecs(p, iov, count)? {
         let n = read(p, fd, base, len)?;
+        // Cannot overflow: the lengths sum to at most `isize::MAX`.
         total += n;
         if n < len {
             break;
@@ -561,7 +575,7 @@ fn writev(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
             let n = ((len - done) as usize).min(GATHER - pending.len());
             let start = pending.len();
             pending.resize(start + n, 0);
-            p.memory().read(base + done, &mut pending[start..])?;
+            p.memory().read(user_add(base, done)?, &mut pending[start..])?;
             done += n as u64;
             if pending.len() == GATHER && !flush(&mut pending)? {
                 return Ok(total);
@@ -817,6 +831,7 @@ fn munmap(p: &Process, addr: u64, len: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     p.memory().unmap(addr, len);
+    p.mmap_release(addr, len);
     Ok(0)
 }
 
@@ -863,11 +878,21 @@ pub(crate) fn fork(p: &Process, flags: u64, [stack, ptid, ctid, _tls]: [u64; 4])
     }
     let child = p.fork()?;
     let tid = child.pid().0.to_ne_bytes();
-    if flags & PARENT_SETTID != 0 {
-        p.memory().write(ptid, &tid)?;
-    }
-    if flags & CHILD_SETTID != 0 {
-        child.memory().write(ctid, &tid)?;
+    // The checks above can be overtaken (another thread may unmap the page,
+    // or a copy-on-write copy may find no memory): then the child must not
+    // stay behind as a registered child that never runs.
+    let settid = || -> Result<(), Errno> {
+        if flags & PARENT_SETTID != 0 {
+            p.memory().write(ptid, &tid)?;
+        }
+        if flags & CHILD_SETTID != 0 {
+            child.memory().write(ctid, &tid)?;
+        }
+        Ok(())
+    };
+    if let Err(e) = settid() {
+        p.forget_child(child.pid());
+        return Err(e);
     }
     Ok(Outcome::Fork { child: child.pid(), stack })
 }
@@ -901,10 +926,13 @@ fn execve(p: &Process, th: &Thread, path: u64, argv: u64, envp: u64) -> Result<O
     let envp = user_strings(p, envp, &mut total)?;
     let argv: alloc::vec::Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let envp: alloc::vec::Vec<&[u8]> = envp.iter().map(|e| e.as_slice()).collect();
+    // Everything that can fail for want of a good executable happens before
+    // the other threads are ended: a failed execve leaves them running.
+    let prepared = p.exec_prepare(&path, &argv, &envp)?;
     if p.group.live() > 1 {
         crate::thread::exec_begin(p, th)?;
     }
-    let entry = p.exec(&path, &argv, &envp)?;
+    let entry = p.exec_commit(prepared);
     crate::signal::on_exec(p);
     Ok(Outcome::Exec { pc: entry.pc, sp: entry.sp })
 }

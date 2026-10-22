@@ -109,7 +109,7 @@ impl File for PipeReader {
             if self.is_nonblocking() {
                 return Err(Errno::EAGAIN);
             }
-            wait(None, || Self::ready(&self.pipe.lock()).then_some(()));
+            wait(None, || Self::ready(&self.pipe.lock()).then_some(()))?;
         }
     }
 
@@ -170,10 +170,13 @@ impl File for PipeWriter {
                 return if done > 0 { Ok(done) } else { Err(Errno::EAGAIN) };
             }
             let want = if buf.len() <= PIPE_BUF { need } else { 1 };
-            wait(None, || {
+            let waited = wait(None, || {
                 let s = self.pipe.lock();
                 (s.no_reader || CAPACITY - s.data.len() >= want).then_some(())
             });
+            if let Err(e) = waited {
+                return if done > 0 { Ok(done) } else { Err(e) };
+            }
         }
     }
 

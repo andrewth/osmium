@@ -11,6 +11,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use osmium_fs::Errno;
 use osmium_hal::net::NetDevice;
 use osmium_net::{Instant, Interface, SocketHandle, SocketSet, TcpSocket};
 use osmium_sched::WaitQueue;
@@ -117,16 +118,26 @@ impl NetStack {
     /// `deadline` (nanoseconds), and returns whether it did. `ready` is
     /// evaluated under the stack's lock, without polling, after each wake-up;
     /// every poll wakes the waiters, so a deadline is noticed within one.
-    pub(crate) fn wait(&self, deadline: Option<u64>, mut ready: impl FnMut(&SocketSet) -> bool) -> bool {
+    /// `EINTR` if the calling thread is interrupted by a signal or its
+    /// process is ending (see [`crate::signal::current_interrupted`]).
+    pub(crate) fn wait(&self, deadline: Option<u64>, mut ready: impl FnMut(&SocketSet) -> bool) -> Result<bool, Errno> {
         self.events.wait_until(|| {
             if ready(&self.inner.lock().sockets) {
-                Some(true)
+                Some(Ok(true))
+            } else if crate::signal::current_interrupted() {
+                Some(Err(Errno::EINTR))
             } else if deadline.is_some_and(|d| (self.now_ns)() >= d) {
-                Some(false)
+                Some(Ok(false))
             } else {
                 None
             }
         })
+    }
+
+    /// Makes every thread blocked in [`wait`](Self::wait) look again: for
+    /// signals and process exit.
+    pub(crate) fn wake_waiters(&self) {
+        self.events.wake_all();
     }
 
     /// The stack's clock, in nanoseconds.

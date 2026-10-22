@@ -2,6 +2,7 @@
 //! and the kernel hooks that `fork` and `execve` need.
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -105,6 +106,15 @@ impl Process {
     ///
     /// On failure the process is unchanged.
     pub fn exec(&self, path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<UserEntry, Errno> {
+        let prepared = self.exec_prepare(path, argv, envp)?;
+        Ok(self.exec_commit(prepared))
+    }
+
+    /// The first half of [`exec`](Self::exec): reads and validates the
+    /// executable and builds the complete new image (memory, break, stack)
+    /// without touching the process, so that a failure leaves it, and its
+    /// other threads, alone.
+    pub(crate) fn exec_prepare(&self, path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Prepared, Errno> {
         let platform = platform()?;
         let size = argv.iter().chain(envp).map(|a| a.len() + 1 + 8).sum::<usize>();
         if size > ARG_MAX {
@@ -115,6 +125,7 @@ impl Process {
         if elf.machine() != MACHINE || elf.is_pie() {
             return Err(Errno::ENOEXEC);
         }
+        let brk_limit = brk_limit(&elf, platform)?;
         // Build the new image completely before touching the process.
         let memory = (platform.new_memory)()?;
         let brk = memory.load_elf(&elf)?;
@@ -137,8 +148,16 @@ impl Process {
 
         let name = path.rsplit('/').next().unwrap_or(path);
         let memory: Arc<dyn UserMemory> = memory.into();
+        Ok(Prepared { name: String::from(name), memory, brk, brk_limit, entry: UserEntry { pc: elf.entry(), sp } })
+    }
+
+    /// The second half of [`exec`](Self::exec): switches the process to the
+    /// image built by [`exec_prepare`](Self::exec_prepare). Cannot fail.
+    pub(crate) fn exec_commit(&self, prepared: Prepared) -> UserEntry {
+        let platform = platform().expect("the image was built for a platform");
+        let Prepared { name, memory, brk, brk_limit, entry } = prepared;
         let root = memory.root();
-        let old = self.replace_image(name, memory, brk, platform.mmap_area.clone());
+        let old = self.replace_image(&name, memory, brk, brk_limit, platform.mmap_area.clone());
         (platform.activate)(root);
         drop(old);
         if osmium_arch::fp::enabled() {
@@ -147,8 +166,40 @@ impl Process {
             // are; a kernel that enabled FP enables it on every CPU.
             unsafe { osmium_arch::fp::FpState::new().restore() };
         }
-        Ok(UserEntry { pc: elf.entry(), sp })
+        entry
     }
+}
+
+/// A new program image built by [`Process::exec_prepare`], not yet in use.
+pub(crate) struct Prepared {
+    name: String,
+    memory: Arc<dyn UserMemory>,
+    brk: u64,
+    brk_limit: u64,
+    entry: UserEntry,
+}
+
+/// Whether the non-empty ranges `a` and `b` share an address.
+fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
+    !a.is_empty() && !b.is_empty() && a.start < b.end && b.start < a.end
+}
+
+/// Checks that the ELF image, the stack and the `mmap` area are disjoint
+/// (`ENOEXEC` if not), and returns where the program break must stop: at
+/// its usual limit above the image, or at the next of those that is in the
+/// way.
+fn brk_limit(elf: &Elf<'_>, platform: &Platform) -> Result<u64, Errno> {
+    let loaded = || elf.segments().filter(|s| s.mem_size != 0);
+    let lo = loaded().map(|s| s.vaddr).min().unwrap_or(0) & !0xfff;
+    let hi = loaded().map(|s| s.vaddr.saturating_add(s.mem_size)).max().unwrap_or(0);
+    let hi = hi.checked_next_multiple_of(4096).ok_or(Errno::ENOEXEC)?;
+    let stack_lo = platform.stack_top.checked_sub(platform.stack_size).ok_or(Errno::ENOEXEC)?;
+    let others = [stack_lo..platform.stack_top, platform.mmap_area.clone()];
+    if overlaps(&others[0], &others[1]) || others.iter().any(|r| overlaps(r, &(lo..hi))) {
+        return Err(Errno::ENOEXEC);
+    }
+    let limit = hi.saturating_add(crate::process::BRK_MAX);
+    Ok(others.iter().filter(|r| r.start >= hi && !r.is_empty()).map(|r| r.start).fold(limit, u64::min))
 }
 
 /// `AT_HWCAP` in Linux's encoding. FP/SIMD is listed only once

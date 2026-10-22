@@ -276,7 +276,7 @@ impl SocketFile {
                 return Err(Errno::EAGAIN);
             }
             // The snapshot only decides when to wake; the claim above rechecks.
-            if !self.net.wait(deadline, |s| snapshot.iter().any(|&h| ready(s, h))) {
+            if !self.net.wait(deadline, |s| snapshot.iter().any(|&h| ready(s, h)))? {
                 return Err(Errno::EAGAIN);
             }
         }
@@ -336,7 +336,7 @@ impl SocketFile {
             if self.is_nonblocking() {
                 return Err(Errno::EINPROGRESS);
             }
-            self.net.wait(None, |s| s.get::<TcpSocket>(h).state() != TcpState::SynSent);
+            self.net.wait(None, |s| s.get::<TcpSocket>(h).state() != TcpState::SynSent)?;
         }
         self.net.peek(|_, s| {
             let t = s.get::<TcpSocket>(h);
@@ -379,7 +379,7 @@ impl SocketFile {
                         let t = s.get::<TcpSocket>(h);
                         t.can_send() || !t.may_send()
                     };
-                    if !self.net.wait(deadline, ready) {
+                    if !self.net.wait(deadline, ready)? {
                         return Err(Errno::EAGAIN);
                     }
                     continue;
@@ -410,7 +410,7 @@ impl SocketFile {
         loop {
             match self.net.op(|_, s| s.get_mut::<UdpSocket>(h).send_to(data, to)) {
                 Ok(()) => return Ok(data.len()),
-                Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_send()) => {}
+                Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_send())? => {}
                 Err(e) => return Err(net_errno(e)),
             }
         }
@@ -450,8 +450,8 @@ impl SocketFile {
                         let copied = full.min(buf.len());
                         return Ok(Received { copied, truncated: full > copied, from: Some(v4(from)) });
                     }
-                    Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_recv()) => {
-                    }
+                    Err(Error::WouldBlock)
+                        if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_recv())? => {}
                     Err(e) => return Err(net_errno(e)),
                 }
             }
@@ -465,7 +465,7 @@ impl SocketFile {
             };
             match got {
                 Ok(n) => return Ok(Received { copied: n, truncated: false, from: None }),
-                Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| readable(s.get::<TcpSocket>(h))) => {}
+                Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| readable(s.get::<TcpSocket>(h)))? => {}
                 Err(Error::InvalidState) => return Err(Errno::ENOTCONN),
                 Err(e) => return Err(net_errno(e)),
             }

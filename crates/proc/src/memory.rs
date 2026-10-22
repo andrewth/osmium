@@ -277,6 +277,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn unmap(&self, va: u64, len: u64) {
+        debug_assert_threads_pinned();
         let end = va.saturating_add(len);
         let mut inner = self.inner.lock();
         // Every user page is one of ours, so visit those rather than each
@@ -288,8 +289,9 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             flush.flush();
             inner.cow.remove(&page);
             if inner.frames.remove(&page) == Some(t.pa) {
-                // A process is single-threaded, so no other CPU holds a stale
-                // TLB entry for the page.
+                // The flush above is local to this CPU. That is enough
+                // because all of a process's threads share one CPU (`clone`
+                // pins them), so no other CPU holds a stale TLB entry.
                 self.release(t.pa);
             }
         }
@@ -342,6 +344,8 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn fork(&self) -> Result<Box<dyn UserMemory>, Errno> {
+        // Making pages read-only flushes this CPU only: see `unmap`.
+        debug_assert_threads_pinned();
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
         let mut pt = PageTable::new(self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
@@ -415,6 +419,22 @@ impl<F: PageTableFormat, A: TableAlloc + Clone> Drop for AddressSpace<F, A> {
         for pa in core::mem::take(&mut self.inner.get_mut().frames).into_values() {
             self.release(pa);
         }
+    }
+}
+
+/// Page-table changes flush the TLB of this CPU only, which is enough while
+/// every thread of a process runs on one CPU. Checks that the calling task,
+/// if it is one of several threads of a process, is pinned to one CPU. Only
+/// in kernels: the host tests run without a scheduler.
+fn debug_assert_threads_pinned() {
+    if cfg!(all(debug_assertions, target_os = "none"))
+        && let Some(p) = crate::process::current()
+        && p.group.live() > 1
+    {
+        debug_assert!(
+            osmium_sched::current().affinity().count_ones() == 1,
+            "threads of one process must be pinned to one CPU: page-table flushes are local"
+        );
     }
 }
 

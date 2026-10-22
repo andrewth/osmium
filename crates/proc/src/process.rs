@@ -70,8 +70,8 @@ pub struct Process {
     /// Replaced by `execve`, which is why it is shared and locked.
     memory: IrqSpinLock<Arc<dyn UserMemory>>,
     brk: IrqSpinLock<Brk>,
-    /// Next address `mmap` hands out (growing upwards), and its end.
-    mmap: IrqSpinLock<(u64, u64)>,
+    /// The address range `mmap` hands out, and which parts of it are free.
+    mmap: IrqSpinLock<MmapArea>,
     files: Mutex<FdTable>,
     cwd: IrqSpinLock<String>,
     umask: u32,
@@ -99,8 +99,71 @@ pub(crate) fn alloc_id() -> u32 {
 }
 static TABLE: IrqSpinLock<BTreeMap<Pid, Weak<Process>>> = IrqSpinLock::new(BTreeMap::new());
 
+/// The `mmap` area: a range of addresses and the free parts of it, as
+/// non-adjacent `start -> end` ranges. Allocation is first fit; freeing
+/// merges neighbours, so mapping and unmapping can go on for ever.
+#[derive(Clone)]
+struct MmapArea {
+    start: u64,
+    end: u64,
+    free: BTreeMap<u64, u64>,
+    /// Most bytes of the area that may be in use at once.
+    limit: u64,
+}
+
+impl MmapArea {
+    fn new(range: core::ops::Range<u64>) -> Self {
+        let mut free = BTreeMap::new();
+        if range.start < range.end {
+            free.insert(range.start, range.end);
+        }
+        Self { start: range.start, end: range.end, free, limit: u64::MAX }
+    }
+
+    /// Bytes of the area in use.
+    fn used(&self) -> u64 {
+        (self.end - self.start) - self.free.iter().map(|(s, e)| e - s).sum::<u64>()
+    }
+
+    /// Takes the first free range that holds `len` bytes.
+    fn alloc(&mut self, len: u64) -> Result<u64, Errno> {
+        if self.used().checked_add(len).is_none_or(|u| u > self.limit) {
+            return Err(Errno::ENOMEM);
+        }
+        let (&s, &e) = self.free.iter().find(|&(s, e)| e - s >= len).ok_or(Errno::ENOMEM)?;
+        self.free.remove(&s);
+        if s + len < e {
+            self.free.insert(s + len, e);
+        }
+        Ok(s)
+    }
+
+    /// Returns `from..to` (clipped to the area) to the free ranges. Parts
+    /// that are already free stay so.
+    fn release(&mut self, from: u64, to: u64) {
+        let (mut from, mut to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return;
+        }
+        // Merge with a free range that touches or overlaps on the left...
+        if let Some((&s, &e)) = self.free.range(..=from).next_back()
+            && e >= from
+        {
+            self.free.remove(&s);
+            from = s;
+            to = to.max(e);
+        }
+        // ...and with every one that starts inside or right at the end.
+        while let Some((&s, &e)) = self.free.range(from..=to).next() {
+            self.free.remove(&s);
+            to = to.max(e);
+        }
+        self.free.insert(from, to);
+    }
+}
+
 /// Default cap on the program break, above its start.
-const BRK_MAX: u64 = 64 << 20;
+pub(crate) const BRK_MAX: u64 = 64 << 20;
 
 impl Process {
     /// Creates a process over `memory`. The program break starts at
@@ -116,7 +179,8 @@ impl Process {
     /// will fill.
     pub fn new_boxed(name: &'static str, memory: Box<dyn UserMemory>, brk_start: u64) -> Arc<Self> {
         let brk = Brk { start: brk_start, end: brk_start, limit: brk_start.saturating_add(BRK_MAX) };
-        Self::register(Self::with(None, name, memory.into(), brk, (0, 0), FdTable::with_console(), String::from("/")))
+        let files = FdTable::with_console();
+        Self::register(Self::with(None, name, memory.into(), brk, MmapArea::new(0..0), files, String::from("/")))
     }
 
     fn with(
@@ -124,7 +188,7 @@ impl Process {
         name: &'static str,
         memory: Arc<dyn UserMemory>,
         brk: Brk,
-        mmap: (u64, u64),
+        mmap: MmapArea,
         files: FdTable,
         cwd: String,
     ) -> Self {
@@ -167,7 +231,7 @@ impl Process {
             self.name(),
             memory,
             *self.brk.lock(),
-            *self.mmap.lock(),
+            self.mmap.lock().clone(),
             files,
             self.cwd(),
         ));
@@ -191,10 +255,17 @@ impl Process {
                 // must not happen here, under the queue's lock.
                 Some(i) => Some(Ok(Some(children.swap_remove(i)))),
                 None if nohang => Some(Ok(None)),
+                None if crate::signal::current_interrupted() => Some(Err(Errno::EINTR)),
                 None => None,
             }
         })?;
         Ok(reaped.map(|c| (c.pid, c.exit_status().expect("reaped children have exited"))))
+    }
+
+    /// Drops the child `pid` that [`fork`](Self::fork) made but that never
+    /// got a task, so `wait4` does not wait for it.
+    pub(crate) fn forget_child(&self, pid: Pid) {
+        self.children.lock().retain(|c| c.pid != pid);
     }
 
     /// Forked children that have not been reaped, exited or not.
@@ -205,7 +276,24 @@ impl Process {
     /// Lets `mmap` place anonymous mappings in `range` (page-aligned).
     /// Without it, `mmap` fails with `ENOMEM`.
     pub fn set_mmap_area(&self, range: core::ops::Range<u64>) {
-        *self.mmap.lock() = (range.start, range.end);
+        *self.mmap.lock() = MmapArea::new(range);
+    }
+
+    /// Caps the bytes of the `mmap` area that may be in use at once (rounded
+    /// to pages, reservations included); `mmap` fails with `ENOMEM` beyond
+    /// it. By default only the size of the area limits a process, so a
+    /// kernel that wants one process not to take all the frames sets this.
+    /// It applies to the current area only: [`set_mmap_area`](Self::set_mmap_area)
+    /// and `execve` reset it.
+    pub fn set_mmap_limit(&self, bytes: u64) {
+        self.mmap.lock().limit = bytes;
+    }
+
+    /// Returns `addr..addr + len` to the `mmap` area for reuse, after the
+    /// memory there was unmapped. Parts outside the area, or already free,
+    /// are ignored.
+    pub(crate) fn mmap_release(&self, addr: u64, len: u64) {
+        self.mmap.lock().release(addr, addr.saturating_add(len));
     }
 
     /// Creates the process's task from `builder` and makes it runnable.
@@ -275,10 +363,11 @@ impl Process {
         name: &str,
         memory: Arc<dyn UserMemory>,
         brk_start: u64,
+        brk_limit: u64,
         mmap: core::ops::Range<u64>,
     ) -> Arc<dyn UserMemory> {
-        *self.brk.lock() = Brk { start: brk_start, end: brk_start, limit: brk_start.saturating_add(BRK_MAX) };
-        *self.mmap.lock() = (mmap.start, mmap.end);
+        *self.brk.lock() = Brk { start: brk_start, end: brk_start, limit: brk_limit };
+        *self.mmap.lock() = MmapArea::new(mmap);
         *self.name.lock() = intern(name);
         self.files.lock().close_on_exec();
         core::mem::replace(&mut *self.memory.lock(), memory)
@@ -356,14 +445,16 @@ impl Process {
     pub fn mmap_anon(&self, len: u64, flags: MapFlags) -> Result<u64, Errno> {
         let len = len.checked_next_multiple_of(PAGE).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         let mut area = self.mmap.lock();
-        let va = area.0;
-        if va.checked_add(len).is_none_or(|end| end > area.1) {
-            return Err(Errno::ENOMEM);
-        }
+        let va = area.alloc(len)?;
         if flags != MapFlags::NONE {
-            self.memory().map_anon(va, len, flags)?;
+            let memory = self.memory();
+            if let Err(e) = memory.map_anon(va, len, flags) {
+                // Give back what was mapped before it ran out.
+                memory.unmap(va, len);
+                area.release(va, va + len);
+                return Err(e);
+            }
         }
-        area.0 += len;
         Ok(va)
     }
 }

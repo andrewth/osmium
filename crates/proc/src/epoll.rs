@@ -248,7 +248,7 @@ pub(crate) fn wait_events(p: &Process, epfd: i32, events: u64, max: u64, timeout
     let ready = wait(timeout, || {
         let v = ep.collect(max);
         (!v.is_empty()).then_some(v)
-    })
+    })?
     .unwrap_or_default();
     let mut out = alloc::vec![0u8; ready.len() * EVENT_LEN];
     for (c, r) in out.as_chunks_mut::<EVENT_LEN>().0.iter_mut().zip(&ready) {

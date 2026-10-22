@@ -379,7 +379,7 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
     if live == 0 {
         p.set_exited(status);
     } else if group_wide.is_some() {
-        crate::futex::interrupt();
+        crate::signal::wake_blocked();
     }
 }
 
@@ -391,7 +391,7 @@ pub(crate) fn exec_begin(p: &Process, th: &Thread) -> Result<(), Errno> {
     if !doom_others(p, th) {
         return Err(Errno::EINTR);
     }
-    crate::futex::interrupt();
+    crate::signal::wake_blocked();
     p.child_exited.wake_all();
     p.group.ended.wait_until(|| {
         if th.doomed.load(Ordering::SeqCst) || p.group.exiting.get().is_some() {

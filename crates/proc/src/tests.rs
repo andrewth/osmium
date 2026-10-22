@@ -242,13 +242,67 @@ fn brk_and_mmap_map_memory() {
     // leaving an entry with no permissions that the table walk misreads.
     let live = frames.live();
     let none = call(&p, Sys::Mmap, &[0, 0x2000, 0, 0x22, u64::MAX, 0]);
-    assert_eq!(none, 0x100_4000);
+    assert_eq!(none, 0x100_0000, "the freed range is reused");
     assert_eq!(frames.live(), live);
     assert!(p.memory().read(none as u64, &mut [0]).is_err());
     assert_eq!(call(&p, Sys::Munmap, &[none as u64, 0x2000]), 0);
     // A length spanning the address space visits only mapped pages.
     assert_eq!(call(&p, Sys::Munmap, &[0, u64::MAX - 0xfff]), 0);
     assert_eq!(call(&p, Sys::Munmap, &[0, u64::MAX]), -(Errno::EINVAL.0 as i64), "rounds past 2^64");
+}
+
+#[test]
+fn mmap_reuses_unmapped_ranges_for_ever() {
+    let (p, frames) = process("mmap-reuse");
+    let mmap = |len: u64| call(&p, Sys::Mmap, &[0, len, 3, 0x22, u64::MAX, 0]);
+    let munmap = |a: i64, len: u64| call(&p, Sys::Munmap, &[a as u64, len]);
+    let enomem = -(Errno::ENOMEM.0 as i64);
+    // (Page tables made by the first mapping stay.)
+    assert_eq!(munmap(mmap(0x8_0000), 0x8_0000), 0);
+    let live = frames.live();
+    // The area is 1 MiB: far more cumulative mappings than that must work.
+    for _ in 0..1000 {
+        let a = mmap(0x8_0000);
+        assert_eq!(a, 0x100_0000);
+        assert_eq!(munmap(a, 0x8_0000), 0);
+    }
+    assert_eq!(frames.live(), live);
+
+    // First fit, and neighbours merge: free in an order that needs every kind of merge.
+    let (a, b, c, d) = (mmap(0x4_0000), mmap(0x4_0000), mmap(0x4_0000), mmap(0x4_0000));
+    assert_eq!((a, b, c, d), (0x100_0000, 0x104_0000, 0x108_0000, 0x10c_0000));
+    assert_eq!(mmap(0x1000), enomem, "the area is full");
+    assert_eq!(munmap(a, 0x4_0000), 0);
+    assert_eq!(munmap(c, 0x4_0000), 0);
+    assert_eq!(mmap(0x8_0000), enomem, "two separate holes");
+    assert_eq!(munmap(b, 0x4_0000), 0);
+    assert_eq!(munmap(b, 0x4_0000), 0, "unmapping twice frees nothing more");
+    assert_eq!(mmap(0xc_0000), a, "a, b and c merged into one hole");
+    assert_eq!(mmap(0x4_0000), enomem, "d is still mapped");
+    assert_eq!(munmap(d, 0x4_0000), 0);
+    assert_eq!(mmap(0x4_0000), d);
+
+    // A partial unmap frees just that part, in the middle of a mapping.
+    assert_eq!(munmap(a + 0x1000, 0x1000), 0);
+    assert_eq!(mmap(0x2000), enomem, "one page is free");
+    assert_eq!(mmap(0x1000), a + 0x1000);
+    // Unmapping outside the area (the break, say) does not add to it.
+    assert_eq!(munmap(0x40_0000, 0x1000), 0);
+    assert_eq!(mmap(0x1000), enomem);
+}
+
+#[test]
+fn mmap_limit_caps_mapped_memory() {
+    let (p, _) = process("mmap-limit");
+    p.set_mmap_limit(0x3000);
+    let mmap = |len: u64| call(&p, Sys::Mmap, &[0, len, 3, 0x22, u64::MAX, 0]);
+    let a = mmap(0x2000);
+    assert_eq!(a, 0x100_0000);
+    assert_eq!(mmap(0x2000), -(Errno::ENOMEM.0 as i64), "over the cap");
+    let b = mmap(0x1000);
+    assert!(b > 0);
+    assert_eq!(call(&p, Sys::Munmap, &[a as u64, 0x2000]), 0);
+    assert!(mmap(0x2000) > 0, "unmapping makes room");
 }
 
 #[test]
@@ -654,4 +708,33 @@ fn unmapping_and_remapping_forgets_copy_on_write() {
     drop((p, c));
     assert_eq!(frames.live(), 1);
 }
+#[test]
+fn iovec_arithmetic_is_checked() {
+    let (p, _) = process("iov-overflow");
+    let efault = -(Errno::EFAULT.0 as i64);
+    let einval = -(Errno::EINVAL.0 as i64);
+    // The array itself wraps past the top of the address space.
+    assert_eq!(call(&p, Sys::Readv, &[0, u64::MAX - 7, 2]), efault);
+    assert_eq!(call(&p, Sys::Writev, &[1, u64::MAX - 7, 2]), efault);
+    // Lengths that add up to more than a signed size.
+    let iov: Vec<u8> = [DATA, u64::MAX / 2, DATA, u64::MAX / 2].iter().flat_map(|v| v.to_ne_bytes()).collect();
+    put(&p, DATA + 0x300, &iov);
+    assert_eq!(call(&p, Sys::Readv, &[0, DATA + 0x300, 2]), einval);
+    assert_eq!(call(&p, Sys::Writev, &[1, DATA + 0x300, 2]), einval);
+    // A buffer that wraps.
+    assert_eq!(call(&p, Sys::Write, &[1, u64::MAX - 3, 8]), efault);
+    assert_eq!(call(&p, Sys::Read, &[0, u64::MAX - 3, 8]), efault);
+}
+
+#[test]
+fn a_child_that_never_got_a_task_can_be_forgotten() {
+    let (p, _) = process("forget");
+    let child = p.fork().unwrap();
+    assert_eq!(p.children(), [child.pid()]);
+    p.forget_child(child.pid());
+    assert!(p.children().is_empty(), "wait4 no longer waits for it");
+    assert_eq!(call(&p, Sys::Wait4, &[u64::MAX, 0, 1, 0]), -(Errno::ECHILD.0 as i64));
+}
+
+mod blocked;
 mod sigthread;

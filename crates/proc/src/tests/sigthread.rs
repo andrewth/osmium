@@ -731,3 +731,21 @@ fn clone_during_an_exec_is_refused_instead_of_escaping_the_doom() {
     assert!(matches!(out, Outcome::Return(v) if v == -(Errno::EINTR.0 as i64)), "{out:?}");
     assert_eq!(p.group.live(), 2, "no thread was added");
 }
+
+#[test]
+fn a_failed_execve_leaves_the_other_threads_alone() {
+    platform();
+    let (p, _) = process("exec-fail");
+    let main = p.leader();
+    let Outcome::Thread { tid, .. } = clone_thread(&p, &main, clone_flags(), STACK, DATA + 0x10, DATA + 0x20, 0) else {
+        panic!("no thread")
+    };
+    let sibling = p.group.find(tid).unwrap();
+    put(&p, DATA + 0x100, b"/missing\0/hello.txt\0");
+    assert_eq!(callt(&p, &main, Sys::Execve, &[DATA + 0x100, 0, 0]), -(Errno::ENOENT.0 as i64));
+    assert_eq!(callt(&p, &main, Sys::Execve, &[DATA + 0x109, 0, 0]), -(Errno::EACCES.0 as i64), "not executable");
+    assert!(!sibling.doomed.load(Ordering::SeqCst), "the sibling was not marked to end");
+    assert_eq!(p.group.live(), 2);
+    let mut regs = Regs::<true>::new();
+    assert_eq!(signal::deliver_to(&p, &sibling, &mut regs), None, "and keeps running");
+}
