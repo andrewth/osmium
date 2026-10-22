@@ -12,7 +12,7 @@ use osmium_hal::dma::DmaAllocator;
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
 
 use super::cmd::{Ctx, Input, op};
-use super::queue::{CTRL_COMPLETE, OPCODE_SEND, QpSetup, Queues, SEG_LEN, SQ_STRIDE};
+use super::queue::{CTRL_COMPLETE, Geometry, OPCODE_SEND, QpSetup, Queues, SEG_LEN, SET_DATA, SQ_STRIDE};
 use super::{Mlx4, Mlx4Error, put32};
 
 /// Bytes per buffer slot.
@@ -132,7 +132,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
         hca.set_link(port, query.get(0, 31, 1) != 0);
 
         let lso = if hca.caps.max_gso > 0 { LSO_BUF_LEN } else { 0 };
-        let mut eth = Self { q: Queues::new(hca, port, SLOT_LEN, SLOT_LEN, lso)?, mac, lso_until: None };
+        let geometry = Geometry { rx_slot: SLOT_LEN, tx_slot: SLOT_LEN, lso };
+        let mut eth = Self { q: Queues::new(hca, port, SET_DATA, geometry)?, mac, lso_until: None };
+        hca.open.set(hca.open.get() | 1 << (port - 1));
         eth.q.create_cq()?;
         eth.create_qp()?;
         eth.q.arm_cq();
@@ -161,15 +163,17 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
     fn create_qp(&mut self) -> Result<(), Mlx4Error> {
         let port = self.q.port as u32;
         self.q.create_qp(&QpSetup {
-            service: 7, // raw Ethernet ("MLX")
+            service: 7,              // raw Ethernet ("MLX")
+            mtu_msgmax: 7 << 5 | 31, // Ethernet MTU, largest message
             init_optpar: 0,
+            rtr_optpar: 0,
+            rts_optpar: 0,
             init: &|c| {
                 // Leave VLAN tags in received frames (Linux sets this
                 // whenever VLAN stripping is off).
                 c.set(50, 30, 1, 1);
             },
             rtr: &|c| {
-                c.set(4, 29, 3, 7).set(4, 24, 5, 31); // Ethernet MTU, largest message
                 c.set(16, 24, 8, 0x83 | (port - 1) << 6); // default schedule queue of this port
             },
             // Ack timeout and retries (unused).
@@ -295,6 +299,12 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
         };
         self.q.repost();
         result
+    }
+}
+
+impl<D: DmaAllocator + ?Sized> Drop for EthPort<'_, '_, D> {
+    fn drop(&mut self) {
+        self.q.hca.open.set(self.q.hca.open.get() & !(1 << (self.q.port - 1)));
     }
 }
 

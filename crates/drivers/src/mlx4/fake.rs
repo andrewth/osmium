@@ -18,7 +18,7 @@ use osmium_hal::pci::{Address, ConfigAccess, MsiMessage};
 use osmium_hal::timer::Clock;
 
 use super::cmd::{HCR, op};
-use super::{CONFIG_LEN, RESET, RESET_SEMAPHORE, UAR_LEN, UAR_PAGE};
+use super::{CONFIG_LEN, PD, RESET, RESET_SEMAPHORE, UAR_LEN, UAR_PAGE};
 
 pub const ADDR: Address = Address::new(0, 3, 0);
 pub const MAC: [u8; 6] = [0x00, 0x02, 0xc9, 0x12, 0x34, 0x56];
@@ -65,8 +65,8 @@ struct Cq {
     db: u64,
     pi: u32,
     eqn: u32,
-    /// The arm doorbell value already used up by an event.
-    spent_arm: Option<u64>,
+    /// The arm record value already used up by an event.
+    spent_arm: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -92,6 +92,93 @@ pub struct Sent {
     /// The datagram segment of an unreliable datagram send; `frame` is then
     /// the payload.
     pub ud: Option<UdSend>,
+    /// An "MLX" entry of a special queue pair: the packet it describes.
+    pub mlx: Option<MlxSend>,
+}
+
+/// A send entry of queue pair 0 or 1: the control fields, the headers
+/// packed inline, and the datagram.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MlxSend {
+    pub vl15: bool,
+    pub slr: bool,
+    pub sl: u8,
+    pub rlid: u16,
+    pub packet: Packet,
+    pub payload: Vec<u8>,
+    /// Entry size in 16-byte units.
+    pub size: u32,
+}
+
+/// A packet's headers, decoded from the wire format.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Packet {
+    pub vl: u8,
+    pub sl: u8,
+    pub lnh: u8,
+    pub dlid: u16,
+    pub slid: u16,
+    pub length: u16,
+    pub grh: Option<PacketGrh>,
+    pub opcode: u8,
+    pub solicited: bool,
+    pub pad: u8,
+    pub pkey: u16,
+    pub dest_qpn: u32,
+    pub psn: u32,
+    pub qkey: u32,
+    pub src_qpn: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct PacketGrh {
+    pub traffic_class: u8,
+    pub flow_label: u32,
+    pub payload_length: u16,
+    pub next_header: u8,
+    pub hop_limit: u8,
+    pub source: [u8; 16],
+    pub dest: [u8; 16],
+}
+
+impl Packet {
+    /// Decodes LRH, optional GRH, BTH and DETH.
+    pub fn decode(h: &[u8]) -> Self {
+        let w = |at: usize| u32::from_be_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]]);
+        let (lnh, mut at) = (h[1] & 3, 8);
+        let grh = (lnh == 3).then(|| {
+            let g = PacketGrh {
+                traffic_class: (w(8) >> 20) as u8,
+                flow_label: w(8) & 0xf_ffff,
+                payload_length: (w(12) >> 16) as u16,
+                next_header: (w(12) >> 8) as u8,
+                hop_limit: w(12) as u8,
+                source: h[16..32].try_into().unwrap(),
+                dest: h[32..48].try_into().unwrap(),
+            };
+            assert_eq!(w(8) >> 28, 6, "IP version of the global route header");
+            at += 40;
+            g
+        });
+        assert_eq!(h.len(), at + 20, "the header is exactly LRH [GRH] BTH DETH");
+        Self {
+            vl: h[0] >> 4,
+            sl: h[1] >> 4,
+            lnh,
+            dlid: u16::from_be_bytes([h[2], h[3]]),
+            slid: u16::from_be_bytes([h[6], h[7]]),
+            length: u16::from_be_bytes([h[4], h[5]]) & 0x7ff,
+            grh,
+            opcode: h[at],
+            solicited: h[at + 1] & 0x80 != 0,
+            pad: h[at + 1] >> 4 & 3,
+            pkey: u16::from_be_bytes([h[at + 2], h[at + 3]]),
+            dest_qpn: w(at + 4) & 0xff_ffff,
+            psn: w(at + 8) & 0xff_ffff,
+            qkey: w(at + 12),
+            src_qpn: w(at + 16) & 0xff_ffff,
+        }
+    }
 }
 
 /// The address vector, queue pair and key of a datagram send entry.
@@ -133,12 +220,16 @@ pub struct IbState {
     pub gid_prefix: u64,
     pub guids: [u64; 8],
     pub pkeys: [u16; 16],
+    /// The SL-to-VL table, a nibble per service level.
+    pub sl2vl: [u8; 8],
 }
 
 pub const NODE_GUID: u64 = 0x0002_c903_0012_3456;
 pub const GID_PREFIX: u64 = 0xfe80_0000_0000_0000;
 pub const SM_LID: u16 = 1;
 pub const IB_PKEYS: usize = 16;
+/// The capability mask the firmware advertises before SET_PORT.
+pub const IB_CAPS: u32 = 0x0259_0848;
 
 impl IbState {
     fn new(port: usize) -> Self {
@@ -146,18 +237,21 @@ impl IbState {
         guids[0] = NODE_GUID + 1 + port as u64;
         let mut pkeys = [0; IB_PKEYS];
         pkeys[0] = 0xffff;
-        Self { lid: 0, sm_lid: 0, sm_sl: 0, lmc: 0, state: 1, gid_prefix: GID_PREFIX, guids, pkeys }
+        Self { lid: 0, sm_lid: 0, sm_sl: 0, lmc: 0, state: 1, gid_prefix: GID_PREFIX, guids, pkeys, sl2vl: [0; 8] }
     }
 }
 
-/// What INIT_PORT told the firmware about an InfiniBand port.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IbInit {
-    pub vl_cap: u32,
-    pub width: u32,
-    pub mtu: u32,
-    pub gids: u32,
-    pub pkeys: u32,
+/// (slid, my_qpn, rqpn, sl, g_path, pkey, GRH) of a received datagram, as
+/// MAD_IFC takes them.
+pub type WorkCompletion = (u32, u32, u32, u8, u8, u16, [u8; 40]);
+
+/// What a management datagram handed to MAD_IFC came with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MadIfcCall {
+    pub port: u32,
+    pub op_mod: u32,
+    pub wc: Option<WorkCompletion>,
+    pub mad: Vec<u8>,
 }
 
 /// The hash bucket the firmware puts a multicast GID in (a stand-in for
@@ -173,6 +267,9 @@ struct Qp {
     qkey: u32,
     init_optpar: u32,
     state: u8, // 1 INIT, 2 RTR, 3 RTS
+    /// Queue pair 0 or 1 ("MLX" service on an InfiniBand port).
+    special: bool,
+    mtu_msgmax: u32,
     mtt: u64,
     log_sq: u32,
     log_sq_stride: u32,
@@ -214,21 +311,30 @@ pub struct Firmware {
     pub port_up: [bool; 2],
     /// The capability mask SET_PORT gave each InfiniBand port.
     pub ib_caps: [Option<u32>; 2],
-    pub ib_init: [Option<IbInit>; 2],
+    /// The virtual lane count and MTU limit it asked for.
+    pub ib_set: [Option<(u32, u32)>; 2],
+    /// INIT_PORT has run on this InfiniBand port.
+    pub ib_init: [bool; 2],
+    /// Management datagrams the firmware agent was asked to answer.
+    pub mad_ifc: Vec<MadIfcCall>,
     /// Multicast group table entries in use, by index (16 dwords each).
     pub mcg: BTreeMap<u32, [u32; 16]>,
 }
 
 #[derive(Default)]
 pub struct State {
-    /// Firmware without INIT_PORT parameters.
-    pub old_port_cmds: bool,
     pub ib: [Option<IbState>; 2],
+    /// SET_PORT refuses more virtual lanes than this (0 means no limit).
+    pub ib_max_vls: u32,
+    /// Port state changes the agent made, to report as port events.
+    port_events: Vec<(u8, bool)>,
     now: u64,
     /// Every opcode issued, in order.
     pub log: Vec<u16>,
-    /// Make this opcode fail with this status.
+    /// Make this opcode fail with this status, after letting it succeed
+    /// `fail_skip` times.
     pub fail: Option<(u16, u8)>,
+    pub fail_skip: u32,
     /// Make this opcode never complete.
     pub hang: Option<u16>,
     pub semaphore_stuck: bool,
@@ -296,7 +402,7 @@ impl FakeHca {
         config[PCIE_CAP / 4 + 4] = 0x0000_0040;
         let ib = [0, 1]
             .map(|p| matches!(ports[p], Some(PortKind::InfiniBand | PortKind::Vpi { .. })).then(|| IbState::new(p)));
-        let state = State { ports, link: [true, false], config, ib, ..State::default() };
+        let state = State { ports, link: [true, false], config, ib, ib_max_vls: 4, ..State::default() };
         Self {
             bar0: bar0.as_mut_ptr(),
             uar: uar.as_mut_ptr(),
@@ -416,9 +522,17 @@ impl FakeHca {
         let in_param = (self.bar(HCR) as u64) << 32 | self.bar(HCR + 4) as u64;
         s.log.push(opcode);
         let mut out = 0;
-        let status = match s.fail {
-            Some((o, status)) if o == opcode => status,
-            _ => match self.command(&mut s, opcode, op_mod, in_mod, in_param) {
+        let failing = match s.fail {
+            Some((o, status)) if o == opcode && s.fail_skip == 0 => Some(status),
+            Some((o, _)) if o == opcode => {
+                s.fail_skip -= 1;
+                None
+            }
+            _ => None,
+        };
+        let status = match failing {
+            Some(status) => status,
+            None => match self.command(&mut s, opcode, op_mod, in_mod, in_param) {
                 Ok(v) => {
                     out = v;
                     0
@@ -426,6 +540,11 @@ impl FakeHca {
                 Err(status) => status,
             },
         };
+        for (port, up) in core::mem::take(&mut s.port_events) {
+            if let Some(eqn) = s.fw.async_eqn {
+                self.post_event(&mut s, eqn, 0x09, if up { 4 } else { 1 }, 12, (port as u32) << 28);
+            }
+        }
         self.set_bar(HCR + 12, (out >> 32) as u32);
         self.set_bar(HCR + 16, out as u32);
         // Done: status, the same toggle, `go` clear.
@@ -492,7 +611,6 @@ impl FakeHca {
                 c[8] = RSVD_MTTS_LOG << 28 | RSVD_MRWS_LOG << 8;
                 c[11] = if s.max_gso > 0 { 0x20 | s.max_gso.trailing_zeros() } else { 0 } << 16;
                 c[13] = 2;
-                c[16] = (s.old_port_cmds as u32) << 6;
                 c[17] = (s.dpdp as u32) << 12;
                 c[18] = RSVD_UARS << 28;
                 c[32] = 256;
@@ -638,16 +756,27 @@ impl FakeHca {
             op::RST2INIT_QP => {
                 let c = self.mailbox(128);
                 let service = c[2] >> 16 & 0xf;
-                assert!(matches!(service, 3 | 7), "raw Ethernet or datagram service type");
+                assert!(matches!(service, 0 | 3 | 7), "reliable, datagram, or raw/special service type");
                 assert_eq!(c[5] & 0xff_ffff, UAR_PAGE);
                 assert_eq!(c[6] & 0xff_ffff, in_mod, "local QPN");
-                if service == 3 {
-                    // Only the optional parameters named in the mask take effect.
-                    assert_eq!(c[0], 0x30, "partition key index and queue key");
-                    assert_eq!(c[2] >> 11 & 3, 3, "migrated");
+                assert_eq!(c[2] >> 28, 1, "entering INIT");
+                assert_eq!(c[2] >> 11 & 3, 3, "migrated");
+                assert_eq!(c[3] & 0xff_ffff, PD);
+                assert_eq!(c[30] >> 28, 8, "acknowledgment request frequency");
+                assert_eq!(c[30] >> 11 & 1, 1, "fast registration");
+                assert_eq!(c[4] >> 4 & 1, 1, "kernel queue pair");
+                let special = fw.special_qp.is_some_and(|base| (base..base + 4).contains(&in_mod));
+                let mtu_msgmax = c[4] >> 24;
+                match (service, special) {
+                    (7, false) => assert_eq!((c[0], mtu_msgmax), (0, 7 << 5 | 31), "raw Ethernet"),
+                    (7, true) => assert_eq!((c[0], mtu_msgmax), (0x30, 5 << 5 | 11), "special queue pair"),
+                    (3, _) => assert_eq!((c[0], mtu_msgmax), (0x30, 5 << 5 | 13), "datagram queue pair"),
+                    _ => {}
                 }
                 let qp = Qp {
                     service,
+                    special,
+                    mtu_msgmax,
                     pkey_index: c[8] & 0xff,
                     qkey: c[44],
                     init_optpar: c[0],
@@ -671,14 +800,20 @@ impl FakeHca {
             op::INIT2RTR_QP | op::RTR2RTS_QP => {
                 let c = self.mailbox(128);
                 let qp = fw.qps.get_mut(&in_mod).ok_or(BAD_STATE)?;
-                if qp.state != if opcode == op::INIT2RTR_QP { 1 } else { 2 } {
+                let (from, to) = if opcode == op::INIT2RTR_QP { (1, 2) } else { (2, 3) };
+                if qp.state != from {
                     return Err(BAD_STATE);
                 }
+                assert_eq!(c[2] >> 28, to as u32, "entering the next state");
+                assert_eq!(c[2] >> 16 & 0xf, qp.service, "service type in every transition");
+                assert_eq!(c[4] >> 24, qp.mtu_msgmax, "MTU and message size in every transition");
                 if opcode == op::INIT2RTR_QP {
-                    assert_eq!(c[4] >> 29, if qp.service == 7 { 7 } else { 5 }, "MTU");
                     qp.sched_queue = c[16] >> 24;
+                    if qp.special && qp.sched_queue & 0x3f == 0x3f {
+                        // queue pair 0 has its own schedule queue
+                    }
                 }
-                qp.state += 1;
+                qp.state = to;
             }
             op::TO_RST_QP => {
                 assert!(
@@ -692,7 +827,15 @@ impl FakeHca {
                 if s.ib[port].is_none() {
                     return Err(BAD_PARAM);
                 }
-                fw.ib_caps[port] = Some(self.mailbox(2)[1]);
+                let m = self.mailbox(2);
+                let (vls, mtu) = (m[0] >> 4 & 0xf, m[0] >> 12 & 0xf);
+                assert_eq!(m[0] & !(0xf << 4 | 0xf << 12), 1 << 22 | 1 << 21, "change the MTU and VL limits only");
+                assert!(matches!(vls, 1 | 2 | 4 | 8), "a VL count");
+                if s.ib_max_vls != 0 && vls > s.ib_max_vls {
+                    return Err(0x08); // exceeds the device's limits
+                }
+                fw.ib_caps[port] = Some(m[1]);
+                fw.ib_set[port] = Some((vls, mtu));
             }
             op::SET_PORT => {
                 assert_eq!(op_mod, 1, "Ethernet SET_PORT");
@@ -712,18 +855,11 @@ impl FakeHca {
                 fw.port_up[p] = true;
                 // InfiniBand mode is what SET_PORT with operation modifier 0 selected.
                 if let (Some(ib), Some(_)) = (&mut s.ib[p], fw.ib_caps[p]) {
-                    if !s.old_port_cmds {
-                        let m = self.mailbox(3);
-                        fw.ib_init[p] = Some(IbInit {
-                            vl_cap: m[0] >> 4 & 0xf,
-                            width: m[0] >> 8 & 0xf,
-                            mtu: m[1] >> 16,
-                            gids: m[1] & 0xffff,
-                            pkeys: m[2] & 0xffff,
-                        });
-                    } else {
-                        assert_eq!(in_param, 0, "old firmware takes no parameters");
-                    }
+                    assert_eq!(in_param, 0, "INIT_PORT takes no parameters");
+                    // The port starts when queue pair 0 is ready to receive.
+                    let qp0 = fw.special_qp.expect("special queue pairs configured") + p as u32;
+                    assert!(fw.qps.get(&qp0).is_some_and(|q| q.state == 2), "INIT_PORT with queue pair 0 in RTR");
+                    fw.ib_init[p] = true;
                     if ib.state == 1 && s.link[p] {
                         ib.state = 2;
                     }
@@ -732,19 +868,30 @@ impl FakeHca {
             op::CLOSE_PORT => {
                 let p = in_mod as usize - 1;
                 fw.port_up[p] = false;
+                fw.ib_init[p] = false;
                 if let (Some(ib), Some(_)) = (&mut s.ib[p], fw.ib_caps[p].take()) {
                     // The link drops and the subnet manager's settings go with it.
                     *ib = IbState { guids: ib.guids, pkeys: ib.pkeys, ..IbState::new(p) };
                 }
             }
             op::MAD_IFC => {
-                assert_eq!(op_mod, 3, "ignoring both keys");
-                let port = in_mod as usize - 1;
-                let ib = s.ib[port].as_ref().ok_or(BAD_PARAM)?;
-                if !fw.port_up[port] {
-                    return Err(BAD_STATE);
-                }
-                self.out_mailbox(&self.sma(ib, port, fw.ib_caps[port].unwrap_or(0)));
+                assert!(matches!(op_mod, 3 | 4), "ignore both keys, or check them for a received work completion");
+                let port = (in_mod & 0xffff) as usize - 1;
+                let ib = s.ib[port].as_mut().ok_or(BAD_PARAM)?;
+                let ext = op_mod == 4;
+                let m = self.mailbox(if ext { 128 } else { 64 });
+                let wc = ext.then(|| {
+                    let mut grh = [0u8; 40];
+                    for i in 0..10 {
+                        grh[4 * i..4 * i + 4].copy_from_slice(&m[80 + i].to_be_bytes());
+                    }
+                    (in_mod >> 16, m[64], m[66], (m[67] >> 28) as u8, (m[67] >> 16) as u8, m[68] as u16, grh)
+                });
+                let mad: Vec<u8> = m[..64].iter().flat_map(|d| d.to_be_bytes()).collect();
+                fw.mad_ifc.push(MadIfcCall { port: port as u32 + 1, op_mod, wc, mad });
+                let caps = fw.ib_caps[port].unwrap_or(IB_CAPS);
+                let reply = self.sma(ib, port, caps, &m[..64], &mut s.port_events);
+                self.out_mailbox(&reply);
             }
             op::MGID_HASH => {
                 let m = self.mailbox(4);
@@ -778,7 +925,7 @@ impl FakeHca {
     /// Writes a completion for entry `counter` of `qpn`'s send or receive
     /// queue, and queues an event if its completion queue is armed.
     fn complete(&self, fw: &mut Firmware, qpn: u32, send: bool, counter: u32, len: u32, csum: (u16, u16)) {
-        self.complete_ud(fw, qpn, send, counter, len, csum, (0, 0));
+        self.complete_ud(fw, qpn, send, counter, len, csum, (0, 0, 0));
     }
 
     /// Like [`complete`](Self::complete), with the sender fields of a
@@ -792,7 +939,7 @@ impl FakeHca {
         counter: u32,
         len: u32,
         csum: (u16, u16),
-        sender: (u32, u32),
+        sender: (u32, u32, u32),
     ) {
         let (status, checksum) = csum;
         let qp = &fw.qps[&qpn];
@@ -803,6 +950,7 @@ impl FakeHca {
         assert!(cq.pi.wrapping_sub(ci) < n, "completion queue overflow");
         let pa = Self::translate(fw, cq.mtt, (cq.pi % n) as usize * 32);
         wr(pa, qpn);
+        wr(pa + 4, sender.2);
         wr(pa + 8, sender.0);
         wr(pa + 12, sender.1);
         wr(pa + 16, (status as u32) << 16);
@@ -810,15 +958,14 @@ impl FakeHca {
         wr(pa + 24, counter << 16 | checksum as u32);
         let owner = (cq.pi / n) & 1;
         wr(pa + 28, owner << 7 | (send as u32) << 6 | if send { 0x0a } else { 0 });
-        // Armed by a doorbell (and its record) not yet spent on an event.
-        let arm = (self.uar_reg(UAR_PAGE as usize * 4096 + 0x20) as u64) << 32
-            | self.uar_reg(UAR_PAGE as usize * 4096 + 0x24) as u64;
-        let armed = arm >> 32 & 0xff_ffff == cqn as u64 && arm >> 56 & 3 == 2 && Some(arm) != cq.spent_arm;
-        assert!(!armed || rd(cq.db + 4) == (arm >> 32) as u32 & !0xff_ffff | arm as u32 & 0xff_ffff, "arm record");
+        // Armed by the queue's arm record (written just before its doorbell)
+        // not yet spent on an event.
+        let record = rd(cq.db + 4);
+        let armed = record >> 24 & 7 == 2 && Some(record) != cq.spent_arm;
         let cq = fw.cqs.get_mut(&cqn).unwrap();
         cq.pi += 1;
         if armed {
-            cq.spent_arm = Some(arm);
+            cq.spent_arm = Some(record);
             fw.notify.push(cqn);
         }
     }
@@ -882,12 +1029,44 @@ impl FakeHca {
             if ctrl >> 31 != (qp.sq_next / n) & 1 {
                 break;
             }
-            assert_eq!(self.uar_reg(UAR_PAGE as usize * 4096 + 0x14), qpn << 8, "send doorbell");
+            // One doorbell register serves every queue pair, so it names the last to ring it.
+            assert!(fw.qps.contains_key(&(self.uar_reg(UAR_PAGE as usize * 4096 + 0x14) >> 8)), "send doorbell");
             let flags = rd(wqe + 8);
-            assert_eq!(flags & 0xe, 0xe, "completion and solicited");
+            assert_eq!(flags & 0xc, 0xc, "completion");
+            assert!(qp.special || flags & 2 != 0, "solicited");
             let (ip_csum, l4_csum) = (flags & 1 << 4 != 0, flags & 1 << 5 != 0);
             let segments = rd(wqe + 4) & 0x3f;
-            let (frame, lso, ud) = match ctrl & 0x1f {
+            let (frame, lso, ud, mlx) = match ctrl & 0x1f {
+                0x0a if qp.special => {
+                    let (size, rlid) = (rd(wqe + 4) & 0x3f, (rd(wqe + 12) >> 16) as u16);
+                    // The headers sit in inline segments, none across a 64-byte boundary.
+                    let (mut header, mut at) = (Vec::new(), wqe + 16);
+                    while rd(at) >> 31 != 0 {
+                        let len = (rd(at) & 0x7fff_ffff) as usize;
+                        assert!(at % 64 + 4 + len as u64 <= 64, "inline segment crosses a 64-byte boundary");
+                        for i in 0..len {
+                            // SAFETY: inside the send queue entry, identity-mapped.
+                            header.push(unsafe { ((at + 4 + i as u64) as *const u8).read_volatile() });
+                        }
+                        at = (at + 4 + len as u64).next_multiple_of(16);
+                    }
+                    let (len, addr) = (rd(at), (rd(at + 8) as u64) << 32 | rd(at + 12) as u64);
+                    assert_eq!(Some(rd(at + 4)), fw.lkey, "lkey");
+                    assert_eq!(rd(at + 16), 1 << 31 | 4, "inline segment for the checksum");
+                    assert_eq!(size as u64 * 16, at + 32 - wqe, "entry size covers exactly the segments");
+                    // SAFETY: the driver's transmit buffer, identity-mapped.
+                    let payload = unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }.to_vec();
+                    let mlx = MlxSend {
+                        vl15: flags & 1 << 17 != 0,
+                        slr: flags & 1 << 16 != 0,
+                        sl: (flags >> 8 & 0xf) as u8,
+                        rlid,
+                        packet: Packet::decode(&header),
+                        payload: payload.clone(),
+                        size,
+                    };
+                    (payload, None, None, Some(mlx))
+                }
                 0x0a if qp.service == 3 => {
                     assert_eq!(segments, 5, "control + datagram + one data segment");
                     let (av, d) = (wqe + 16, wqe + 64);
@@ -916,7 +1095,7 @@ impl FakeHca {
                     let addr = (rd(d + 8) as u64) << 32 | rd(d + 12) as u64;
                     // SAFETY: the driver's transmit buffer, identity-mapped.
                     let frame = unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }.to_vec();
-                    (frame, None, Some(ud))
+                    (frame, None, Some(ud), None)
                 }
                 0x0a => {
                     assert_eq!(segments, 2, "control + one data segment");
@@ -924,7 +1103,7 @@ impl FakeHca {
                     assert_eq!(Some(rd(wqe + 20)), fw.lkey, "lkey");
                     let addr = (rd(wqe + 24) as u64) << 32 | rd(wqe + 28) as u64;
                     // SAFETY: the driver's transmit buffer, identity-mapped.
-                    (unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }.to_vec(), None, None)
+                    (unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }.to_vec(), None, None, None)
                 }
                 0x0e => {
                     let (mss, hdr) = (rd(wqe + 16) >> 16, (rd(wqe + 16) & 0xffff) as usize);
@@ -942,11 +1121,11 @@ impl FakeHca {
                     let addr = (rd(d + 8) as u64) << 32 | rd(d + 12) as u64;
                     // SAFETY: the driver's LSO staging buffer, identity-mapped.
                     frame.extend_from_slice(unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) });
-                    (frame, Some((mss as u16, hdr)), None)
+                    (frame, Some((mss as u16, hdr)), None, None)
                 }
                 other => panic!("unexpected send opcode {other:#x}"),
             };
-            frames.push(Sent { frame, ip_csum, l4_csum, lso, ud });
+            frames.push(Sent { frame, ip_csum, l4_csum, lso, ud, mlx });
             let counter = qp.sq_next & 0xffff;
             fw.qps.get_mut(&qpn).unwrap().sq_next += 1;
             let mut fw = core::mem::take(&mut s.fw);
@@ -1011,17 +1190,23 @@ impl FakeHca {
         self.post_event(&mut s, eqn, 0x09, if up { 4 } else { 1 }, 12, (port as u32) << 28);
     }
 
-    /// The subnet management agent: answers the Get in the input mailbox.
-    fn sma(&self, ib: &IbState, port: usize, caps: u32) -> [u32; 64] {
-        let m = self.mailbox(64);
-        assert_eq!(m[0], 0x0101_0101, "LID-routed subnet management Get, version 1");
-        let (attr, modifier) = ((m[4] >> 16) as u16, m[5]);
+    /// The subnet management agent: answers the Get or Set in `m` (the first
+    /// 256 bytes of the input mailbox), and reports state changes through
+    /// `events`.
+    fn sma(&self, ib: &mut IbState, port: usize, caps: u32, m: &[u32], events: &mut Vec<(u8, bool)>) -> [u32; 64] {
+        let (class, method) = ((m[0] >> 16) as u8, m[0] as u8);
+        assert_eq!(m[0] >> 24, 1, "base version");
+        assert!(matches!(class, 0x01 | 0x81 | 0x04), "management class {class:#x}");
+        assert!(matches!(method, 1 | 2 | 7), "Get, Set or TrapRepress");
+        let (attr, modifier, set) = ((m[4] >> 16) as u16, m[5], method == 2);
         let mut r = [0u32; 64];
-        r[..6].copy_from_slice(&m[..6]);
-        r[0] = 0x0101_0181; // GetResp
-        let data = &mut r[16..];
+        r.copy_from_slice(&m[..64]);
+        r[0] = r[0] & !0xff | 0x81; // GetResp
+        r[16..32].fill(0);
         let mut status = 0;
+        let (req, data) = (&m[16..32], &mut r[16..32]);
         match attr {
+            _ if class == 0x04 => {} // performance management: an empty answer
             0x0011 => {
                 data[0] = 1 << 24 | 1 << 16 | 1 << 8 | 2; // versions, channel adapter, two ports
                 data[1] = (NODE_GUID >> 32) as u32;
@@ -1040,6 +1225,24 @@ impl FakeHca {
                 }
             }
             0x0015 => {
+                assert_eq!(modifier, port as u32 + 1, "PortInfo of this port");
+                if set {
+                    (ib.lid, ib.sm_lid) = ((req[4] >> 16) as u16, req[4] as u16);
+                    ib.lmc = (req[8] >> 8 & 7) as u8;
+                    ib.sm_sl = (req[9] >> 24 & 0xf) as u8;
+                    let before = ib.state;
+                    match (ib.state, req[8] >> 24 & 0xf) {
+                        (_, 0) => {}
+                        (_, 1) => ib.state = 1,
+                        (_, 2) => ib.state = 2,
+                        (2 | 3, 3) => ib.state = 3,
+                        (3 | 4, 4) => ib.state = 4,
+                        _ => status = 0x001c, // not a legal transition
+                    }
+                    if ib.state != before {
+                        events.push((port as u8 + 1, ib.state == 4));
+                    }
+                }
                 data[2] = (ib.gid_prefix >> 32) as u32;
                 data[3] = ib.gid_prefix as u32;
                 data[4] = (ib.lid as u32) << 16 | ib.sm_lid as u32;
@@ -1047,7 +1250,7 @@ impl FakeHca {
                 data[7] = (port as u32 + 1) << 24;
                 let physical = if ib.state >= 2 { 5 } else { 2 };
                 data[8] = (1 << 4 | ib.state as u32) << 24 | physical << 20 | (ib.lmc as u32) << 8;
-                let neighbor = if ib.state >= 3 { 4 } else { 0 };
+                let neighbor = if ib.state >= 3 { 5 } else { 0 };
                 data[9] = (neighbor << 4 | ib.sm_sl as u32) << 24 | 4 << 20;
                 data[10] = 5 << 16; // the port's MTU capability: 4096
             }
@@ -1056,11 +1259,46 @@ impl FakeHca {
                     data[i / 2] |= (*k as u32) << if i % 2 == 0 { 16 } else { 0 };
                 }
             }
+            0x0017 => {
+                if set {
+                    ib.sl2vl = [req[0].to_be_bytes(), req[1].to_be_bytes()].concat().try_into().unwrap();
+                }
+                data[0] = u32::from_be_bytes(ib.sl2vl[..4].try_into().unwrap());
+                data[1] = u32::from_be_bytes(ib.sl2vl[4..].try_into().unwrap());
+            }
             0x0014 | 0x0016 => status = 0x001c,
             _ => status = 0x000c,
         }
-        r[1] = status << 16;
+        r[1] = status << 16 | (r[1] & 0xffff);
         r
+    }
+
+    /// Queue pair 0 or 1 (`gsi`) of port `port`.
+    pub fn special_qpn(&self, port: u8, gsi: bool) -> u32 {
+        self.state.borrow().fw.special_qp.expect("configured") + if gsi { 2 } else { 0 } + port as u32 - 1
+    }
+
+    /// Runs the receive engine for a management datagram arriving at queue
+    /// pair 0 or 1 of `port`; false if it was dropped.
+    pub fn deliver_mad(
+        &self,
+        port: u8,
+        gsi: bool,
+        from: UdFrom,
+        grh: Option<[u8; 40]>,
+        mad: &[u8; 256],
+        pkey_index: u8,
+    ) -> bool {
+        let qpn = self.special_qpn(port, gsi);
+        let mut s = self.state.borrow_mut();
+        if !s.fw.port_up[port as usize - 1] {
+            return false;
+        }
+        let mut fw = core::mem::take(&mut s.fw);
+        let delivered = self.receive_ud(&mut fw, port, qpn, 0, from, grh, mad, pkey_index, true);
+        s.fw = fw;
+        self.flush_events(&mut s);
+        delivered
     }
 
     /// What the subnet manager and the link made of InfiniBand port `port`.
@@ -1097,7 +1335,7 @@ impl FakeHca {
         let mut s = self.state.borrow_mut();
         let active = s.ib[port as usize - 1].as_ref().is_some_and(|ib| ib.state == 4);
         let mut fw = core::mem::take(&mut s.fw);
-        let delivered = active && self.receive_ud(&mut fw, port, dqpn, qkey, from, grh, payload);
+        let delivered = active && self.receive_ud(&mut fw, port, dqpn, qkey, from, grh, payload, 0, false);
         s.fw = fw;
         self.flush_events(&mut s);
         delivered
@@ -1125,7 +1363,7 @@ impl FakeHca {
         };
         let taken = members
             .into_iter()
-            .filter(|&qpn| self.receive_ud(&mut fw, port, qpn, qkey, from, Some(grh), payload))
+            .filter(|&qpn| self.receive_ud(&mut fw, port, qpn, qkey, from, Some(grh), payload, 0, false))
             .count();
         s.fw = fw;
         self.flush_events(&mut s);
@@ -1142,12 +1380,15 @@ impl FakeHca {
         from: UdFrom,
         grh: Option<[u8; 40]>,
         payload: &[u8],
+        pkey_index: u8,
+        special: bool,
     ) -> bool {
-        let Some(qp) = fw.qps.get(&qpn).filter(|q| q.service == 3 && q.qkey == qkey) else {
+        let Some(qp) = fw.qps.get(&qpn).filter(|q| if special { q.special } else { q.service == 3 && q.qkey == qkey })
+        else {
             return false;
         };
-        assert_eq!(qp.state, 3, "receiving into a QP not in RTS");
-        if qp.sched_queue != 0x83 | (port as u32 - 1) << 6 {
+        assert!(qp.state >= if special { 2 } else { 3 }, "receiving into a QP not ready");
+        if qp.sched_queue >> 6 & 1 != port as u32 - 1 {
             return false; // a member of the group, but on the other port
         }
         let posted = rd(qp.db) & 0xffff;
@@ -1173,7 +1414,7 @@ impl FakeHca {
         fw.qps.get_mut(&qpn).unwrap().rq_next += 1;
         let source = (grh.is_some() as u32) << 31 | (from.path_bits as u32 & 0x7f) << 24 | from.qpn & 0xff_ffff;
         let route = (from.sl as u32) << 28 | from.lid as u32;
-        self.complete_ud(fw, qpn, false, counter, total as u32, (0, 0), (source, route));
+        self.complete_ud(fw, qpn, false, counter, total as u32, (0, 0), (source, route, pkey_index as u32));
         true
     }
 

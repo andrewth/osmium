@@ -38,30 +38,32 @@
 //! Linux's `mlx4_en` but have only run against the simulated HCA.
 //!
 //! [`Mlx4::open_ib`] turns a port whose cable carries InfiniBand into an
-//! [`IbPort`]: one completion queue and one unreliable datagram (UD) queue
-//! pair, for sending and receiving datagrams addressed by LID and queue
-//! pair number, with hardware multicast attach. The port's subnet
-//! management agent runs in the adapter's firmware, so a subnet manager
-//! elsewhere on the fabric brings the link up and assigns the LID;
-//! [`IbPort::query`] reports where it stands. Dual-protocol ports (VPI) take
+//! [`IbPort`]: queue pair 0 (subnet management) and 1 (general services),
+//! and an unreliable datagram (UD) queue pair for sending and receiving
+//! datagrams addressed by LID and queue pair number, with hardware multicast
+//! attach. The firmware's management agent only answers questions put to
+//! it (MAD_IFC); the subnet manager's packets arrive on queue pair 0 and
+//! [`IbPort::service`] has to pass them to the agent and send the answers
+//! back, or the port never gets a LID. Dual-protocol ports (VPI) take
 //! either [`open_eth`](Mlx4::open_eth) or [`open_ib`](Mlx4::open_ib), by what
 //! the cable senses (if nothing is sensed, by which one the caller asks
-//! for). The InfiniBand path follows the PRM as Linux's `mlx4_ib` uses it
-//! and has only run against the simulated HCA.
+//! for). The InfiniBand path follows Linux's `mlx4_ib` and the PRM as it
+//! uses them, and has only run against the simulated HCA.
 //!
 //! Not yet supported: receive-side scaling, one completion vector per CPU,
-//! MAC/VLAN steering, VLAN tag offload, tunnel offloads, and, for
-//! InfiniBand, the special queue pairs 0 and 1 (so no sending or receiving
-//! of management datagrams: no subnet administration queries, multicast
-//! joins or connection management), reliable connections, and SR-IOV.
+//! MAC/VLAN steering, VLAN tag offload, tunnel offloads, and for InfiniBand
+//! subnet administration, reliable connections and SR-IOV.
 
 mod cmd;
 mod eth;
 mod ib;
+mod mad;
 mod queue;
 
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod tests_ib;
 
 use core::cell::Cell;
 use core::mem::ManuallyDrop;
@@ -75,6 +77,7 @@ use osmium_hal::timer::Clock;
 use cmd::{Ctx, Hcr, Input, MTTS_PER_WRITE, op};
 pub use eth::{EthPort, Offloads, RxChecksum, TSO_MAX_HEADER, Tso, TxError, TxOffload};
 pub use ib::{Datagram, Destination, Gid, GlobalHeader, IbPort, PortInfo, PortState, Route};
+use mad::MAD_LEN;
 
 /// Mellanox's PCI vendor ID.
 pub const VENDOR_ID: u16 = 0x15b3;
@@ -119,18 +122,21 @@ const UAR_PAGE: u32 = 128;
 pub const MAX_PORTS: u8 = 2;
 
 // Resources set aside beyond the firmware's reserved ones. These are
-// policy: one queue pair, completion queue and MTT range per port.
+// policy: each port has `SETS_PER_PORT` sets of one queue pair, completion
+// queue and MTT range (see `queue`); queue pairs 0 and 1 take the special
+// numbers, the rest one number each.
 const NUM_SPECIAL_QPS: u32 = 8;
-const MAX_QPS: u32 = 8;
-const MAX_CQS: u32 = 8;
+const MAX_SETS: u32 = queue::SETS_PER_PORT as u32 * MAX_PORTS as u32;
+const MAX_QPS: u32 = MAX_SETS;
+const MAX_CQS: u32 = MAX_SETS;
 const MAX_EQS: u32 = 8;
 const LOG_NUM_MCGS: u32 = 7;
 const MCG_ENTRY_LEN: u64 = 64;
-/// MTT entries per port: one page of completion queue, two of work queues.
+/// MTT entries per set: one page of completion queue, two of work queues.
 const PORT_MTTS: u32 = 3;
 /// The asynchronous and completion event queues' MTT entries come first,
-/// then each port's.
-const MAX_MTTS: u32 = EQ_MTTS + PORT_MTTS * MAX_PORTS as u32;
+/// then each set's.
+const MAX_MTTS: u32 = EQ_MTTS + PORT_MTTS * MAX_SETS;
 const EQ_MTTS: u32 = 2;
 
 const NUM_EQES: u32 = 8;
@@ -152,8 +158,6 @@ pub const VECTOR_COMPLETION: u16 = 1;
 
 /// The protection domain of every queue and memory region.
 const PD: u32 = 0x12_3456;
-/// Bytes of a management datagram.
-const MAD_LEN: usize = 256;
 
 /// What a dual-protocol port's cable carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,8 +237,6 @@ struct Caps {
     dpdp: bool,
     /// Largest LSO frame, or 0 if the device cannot segment.
     max_gso: u32,
-    /// Old firmware: INIT_PORT takes no parameters.
-    old_port_cmds: bool,
 }
 
 impl Caps {
@@ -263,7 +265,6 @@ impl Caps {
             num_ports: (c.get(13, 0, 4) as u8).min(MAX_PORTS),
             dpdp: c.get(17, 12, 1) != 0,
             max_gso: if c.get(11, 21, 1) != 0 { 1 << c.get(11, 16, 5) } else { 0 },
-            old_port_cmds: c.get(16, 6, 1) != 0,
         };
         let sizes = [
             caps.qpc_entry,
@@ -426,7 +427,7 @@ pub struct Mlx4<'d, D: DmaAllocator + ?Sized> {
     comp_eqn: Option<u32>,
     /// Per completion queue: events seen so far, which the arm doorbell
     /// carries so the device can tell a fresh request from a stale one.
-    arm_sn: [Cell<u8>; MAX_PORTS as usize],
+    arm_sn: [Cell<u8>; MAX_SETS as usize],
     /// Bit `n` set: port `n + 1` is open / its link is up.
     open: Cell<u8>,
     link: Cell<u8>,
@@ -489,6 +490,12 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
         hca.hcr.exec(op::CONF_SPECIAL_QP, 0, special, Input::None)?;
         hca.qpn_base = special + NUM_SPECIAL_QPS;
         Ok(hca)
+    }
+
+    /// The first of the special queue pair numbers: queue pair 0 of port 1
+    /// and 2, then queue pair 1 of port 1 and 2.
+    fn special_qpn(&self) -> u32 {
+        self.qpn_base - NUM_SPECIAL_QPS
     }
 
     /// Number of ports.
@@ -769,7 +776,8 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
                 let index = (get32(ring, off + 4) & 0xff_ffff).wrapping_sub(self.caps.reserved_cqs);
                 if let Some(sn) = self.arm_sn.get(index as usize) {
                     sn.set(sn.get().wrapping_add(1));
-                    signalled |= 1 << index;
+                    // A port's sets are interleaved with the other port's.
+                    signalled |= 1 << (index % MAX_PORTS as u32);
                 }
             }
         });
@@ -818,6 +826,39 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
                 _ => {}
             }
         }
+    }
+
+    /// Passes a management datagram to the port's agent in the firmware
+    /// (MAD_IFC) and returns its answer. Without `wc`, the datagram comes
+    /// from this host and its keys are not checked; with it, from the
+    /// fabric as described.
+    fn mad_ifc(&self, port: u8, request: &[u8; MAD_LEN], wc: Option<&mad::MadWc>) -> Result<[u8; MAD_LEN], Mlx4Error> {
+        let mut input = Ctx::new();
+        for i in 0..MAD_LEN / 4 {
+            input.set(i, 0, 32, mad::be32(request, 4 * i));
+        }
+        let (mut in_mod, mut op_mod, mut len) = (port as u32, 0x3u8, MAD_LEN);
+        if let Some(wc) = wc {
+            // The work completion the datagram arrived with follows it.
+            let ext = MAD_LEN / 4;
+            input.set(ext, 0, 32, wc.my_qpn).set(ext + 2, 0, 32, wc.src_qpn);
+            input.set(ext + 3, 24, 8, (wc.sl as u32) << 4);
+            input.set(ext + 3, 16, 8, wc.path_bits as u32 & 0x7f | if wc.grh.is_some() { 0x80 } else { 0 });
+            input.set(ext + 4, 0, 16, wc.pkey_index as u32);
+            if let Some(raw) = &wc.grh {
+                for i in 0..mad::GRH_LEN / 4 {
+                    input.set(ext + 16 + i, 0, 32, mad::be32(raw, 4 * i));
+                }
+            }
+            (in_mod, op_mod, len) = (in_mod | (wc.slid as u32) << 16, 0x4, 2 * MAD_LEN);
+        }
+        let mut reply = Ctx::new();
+        self.hcr.exec_out(op::MAD_IFC, op_mod, in_mod, Input::Mailbox(&input, len), &mut reply, MAD_LEN)?;
+        let mut out = [0u8; MAD_LEN];
+        for i in 0..MAD_LEN / 4 {
+            out[4 * i..4 * i + 4].copy_from_slice(&reply.dword(i).to_be_bytes());
+        }
+        Ok(out)
     }
 
     /// Asks the port's subnet management agent for `attr` (block
@@ -1039,7 +1080,6 @@ mod tests {
             num_ports: 2,
             dpdp: false,
             max_gso: 0,
-            old_port_cmds: false,
         };
         let plan = plan_icm(&caps);
         let c = &plan.init_hca;
@@ -1052,7 +1092,7 @@ mod tests {
             (base(18, !0x1f), 1 << c.get(19, 0, 5), 64),
             (base(20, !0x1f), 1 << c.get(21, 0, 5), 64),
             (base(32, !0x1f), 1 << c.get(33, 0, 5), 64),
-            (base(64, !0), 32, 8), // log2(16 reserved + 7) rounded up
+            (base(64, !0), 1 << log2_ceil(16 + MAX_MTTS), 8),
             (base(60, !0), 1 << c.get(62, 0, 6), 64),
             (base(48, !0), 128, 64),
         ];
@@ -1461,369 +1501,5 @@ mod tests {
         let mut eth = mlx.open_eth(1).unwrap();
         let t = TxOffload { checksum: true, tso: Some(Tso { mss: 1000, header_len: 54 }) };
         assert_eq!(eth.transmit_offload(&[0; 3000], t), Err(TxError::Unsupported));
-    }
-
-    const IB: [Option<PortKind>; 2] = [Some(PortKind::InfiniBand), Some(PortKind::InfiniBand)];
-    const QKEY: u32 = 0x1234_5678;
-
-    fn peer(lid: u16, qpn: u32) -> fake::UdFrom {
-        fake::UdFrom { lid, qpn, sl: 0, path_bits: 0 }
-    }
-
-    /// A global route header as the wire carries it.
-    fn grh_bytes(h: &GlobalHeader) -> [u8; 40] {
-        let mut raw = [0u8; 40];
-        raw[..4].copy_from_slice(&(6u32 << 28 | (h.traffic_class as u32) << 20 | h.flow_label).to_be_bytes());
-        raw[7] = h.hop_limit;
-        raw[8..24].copy_from_slice(&h.src.0);
-        raw[24..].copy_from_slice(&h.dst.0);
-        raw
-    }
-
-    #[test]
-    fn infiniband_port_opens_and_reports() {
-        let hca = FakeHca::new(IB);
-        let dma = HostDma::default();
-        let mlx = bring_up(&hca, &dma).unwrap();
-        let before = dma.live.get();
-        let ib = mlx.open_ib(1, QKEY).unwrap();
-        {
-            let s = hca.state.borrow();
-            let pos = |o| s.log.iter().position(|&x| x == o).unwrap();
-            assert!(pos(op::SET_PORT) < pos(op::INIT_PORT) && pos(op::INIT_PORT) < pos(op::SW2HW_CQ));
-            assert_eq!(s.fw.ib_caps[0], Some(0));
-            // The 4096-byte MTU the port can do is held to the 2048 the buffers fit.
-            let init = fake::IbInit { vl_cap: 3, width: 2, mtu: 2048, gids: 8, pkeys: 16 };
-            assert_eq!(s.fw.ib_init[0], Some(init));
-            assert!(s.fw.port_up[0] && !s.fw.port_up[1]);
-        }
-        assert_eq!((hca.qps(), hca.cqs()), ([72].to_vec(), [128].to_vec()));
-        assert_eq!((ib.port(), ib.qpn(), ib.qkey()), (1, 72, QKEY));
-        assert_eq!(hca.ud_qp(72), (0, QKEY, 0x30), "partition key 0, our queue key");
-        assert_eq!((ib.max_payload(), ib.gid_table_len(), ib.pkey_table_len()), (2048, 8, 16));
-
-        assert_eq!(mlx.open_ib(1, QKEY).err(), Some(Mlx4Error::BadPort));
-        assert_eq!(mlx.open_eth(1).err(), Some(Mlx4Error::BadPort), "open, whichever way");
-        assert_eq!(
-            (mlx.open_ib(0, 0).err(), mlx.open_ib(3, 0).err()),
-            (Some(Mlx4Error::BadPort), Some(Mlx4Error::BadPort))
-        );
-
-        // Linked but unmanaged, then configured by the subnet manager.
-        let info = ib.query().unwrap();
-        assert_eq!((info.state, info.lid, info.sm_lid, info.mtu), (PortState::Initializing, 0, 0, 0));
-        assert_eq!(info.physical_state, 5);
-        assert_eq!(info.gid_prefix, fake::GID_PREFIX);
-        assert!(!ib.is_active().unwrap());
-        hca.sm_configure(1, 7);
-        let info = ib.query().unwrap();
-        assert_eq!((info.state, info.lid, info.sm_lid, info.sm_sl, info.lmc), (PortState::Active, 7, 1, 0, 0));
-        assert_eq!(info.mtu, 2048);
-        assert!(ib.is_active().unwrap() && ib.link_up());
-
-        let guid = hca.ib_state(1).guids[0];
-        assert_eq!(ib.gid(0).unwrap(), Gid::new(fake::GID_PREFIX, guid));
-        assert_eq!((ib.gid(0).unwrap().prefix(), ib.gid(0).unwrap().guid()), (fake::GID_PREFIX, guid));
-        assert_eq!(ib.gid(1).unwrap().guid(), 0, "an unset GUID");
-        assert_eq!(ib.gid(8).err(), Some(Mlx4Error::Mad(0x1c)));
-        assert_eq!((ib.pkey(0), ib.pkey(1)), (Ok(0xffff), Ok(0)));
-        assert_eq!(ib.pkey(16).err(), Some(Mlx4Error::Mad(0x1c)));
-        assert_eq!(ib.node_guid(), Ok(fake::NODE_GUID));
-
-        drop(ib);
-        assert!(hca.qps().is_empty() && hca.cqs().is_empty());
-        assert!(!hca.state.borrow().fw.port_up[0]);
-        assert_eq!(hca.ib_state(1).state, 1, "closing drops the link and the subnet manager's settings");
-        assert_eq!(dma.live.get(), before);
-        drop(mlx.open_ib(1, QKEY).unwrap());
-        drop(mlx);
-        assert_eq!(dma.live.get(), 0);
-    }
-
-    #[test]
-    fn infiniband_needs_an_infiniband_port() {
-        let hca = FakeHca::new([Some(PortKind::Ethernet), Some(PortKind::InfiniBand)]);
-        let dma = HostDma::default();
-        let mlx = bring_up(&hca, &dma).unwrap();
-        assert_eq!(mlx.open_ib(1, QKEY).err(), Some(Mlx4Error::NotInfiniBand));
-        assert_eq!(mlx.open_eth(2).err(), Some(Mlx4Error::NotEthernet));
-        // Neither attempt claimed the port.
-        drop(mlx.open_eth(1).unwrap());
-        drop(mlx.open_ib(2, QKEY).unwrap());
-
-        // Dual-protocol ports go by the cable; an unsensed cable by the caller's choice.
-        for (sensed, ib_ok, eth_ok) in [(1, true, false), (2, false, true), (0, true, true)] {
-            let hca = FakeHca::new([Some(PortKind::Vpi { sense_after: 0, sensed }), None]);
-            hca.state.borrow_mut().dpdp = true;
-            let mlx = bring_up(&hca, &dma).unwrap();
-            assert_eq!(mlx.open_ib(1, QKEY).is_ok(), ib_ok, "sensed {sensed}");
-            assert_eq!(mlx.open_eth(1).is_ok(), eth_ok, "sensed {sensed}");
-        }
-    }
-
-    #[test]
-    fn infiniband_old_firmware_takes_no_init_parameters() {
-        let hca = FakeHca::new(IB);
-        hca.state.borrow_mut().old_port_cmds = true;
-        let dma = HostDma::default();
-        let mlx = bring_up(&hca, &dma).unwrap();
-        let ib = mlx.open_ib(2, QKEY).unwrap();
-        assert_eq!(hca.state.borrow().fw.ib_init, [None, None]);
-        assert_eq!(ib.qpn(), 73, "the second port's queue pair");
-    }
-
-    #[test]
-    fn failed_infiniband_open_unwinds() {
-        for opcode in [op::SET_PORT, op::INIT_PORT, op::SW2HW_CQ, op::RST2INIT_QP, op::INIT2RTR_QP, op::RTR2RTS_QP] {
-            let hca = FakeHca::new(IB);
-            let dma = HostDma::default();
-            let mlx = bring_up(&hca, &dma).unwrap();
-            let before = dma.live.get();
-            hca.state.borrow_mut().fail = Some((opcode, 0x10));
-            assert_eq!(mlx.open_ib(1, QKEY).err(), Some(Mlx4Error::Command { opcode, status: 0x10 }), "{opcode:#x}");
-            hca.state.borrow_mut().fail = None;
-            assert!(hca.qps().is_empty() && hca.cqs().is_empty(), "{opcode:#x}");
-            assert!(!hca.state.borrow().fw.port_up[0], "{opcode:#x}: port closed");
-            assert_eq!(dma.live.get(), before, "{opcode:#x}");
-            drop(mlx.open_ib(1, QKEY).unwrap());
-        }
-    }
-
-    #[test]
-    fn datagrams() {
-        let hca = FakeHca::new(IB);
-        let dma = HostDma::default();
-        let mlx = bring_up(&hca, &dma).unwrap();
-        let mut ib = mlx.open_ib(1, QKEY).unwrap();
-        let qpn = ib.qpn();
-        let mut buf = [0u8; 4096];
-        assert_eq!(ib.receive(&mut buf), Err(NetError::WouldBlock));
-        assert!(!hca.deliver_ud(1, qpn, QKEY, peer(9, 0x55), None, b"early"), "port not active yet");
-        hca.sm_configure(1, 7);
-
-        // A local datagram: address vector without a global route header.
-        let dest = Destination { lid: 9, qpn: 0x12_3456, qkey: 0x8765_4321, sl: 3, path_bits: 1, route: None };
-        ib.send(&dest, b"hello").unwrap();
-        let sent = hca.sent_ex(qpn);
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].frame, b"hello");
-        assert_eq!(
-            sent[0].ud,
-            Some(fake::UdSend {
-                port: 1,
-                pd: PD,
-                dlid: 9,
-                path_bits: 1,
-                grh: false,
-                sl: 3,
-                sgid_index: 0,
-                hop_limit: 0,
-                traffic_class: 0,
-                flow_label: 0,
-                dgid: [0; 16],
-                dqpn: 0x12_3456,
-                qkey: 0x8765_4321,
-            })
-        );
-
-        // A routed one.
-        let route = Route {
-            dgid: Gid::new(0xfe80_0000_0000_0001, 0x1122_3344_5566_7788),
-            sgid_index: 2,
-            hop_limit: 64,
-            traffic_class: 0xa5,
-            flow_label: 0xf_edcb,
-        };
-        ib.send(&Destination { route: Some(route), ..Destination::local(0x20, 0x77, QKEY) }, &[1; 2048]).unwrap();
-        let ud = hca.sent_ex(qpn).remove(0).ud.unwrap();
-        assert_eq!((ud.dlid, ud.dqpn, ud.grh, ud.sgid_index, ud.hop_limit), (0x20, 0x77, true, 2, 64));
-        assert_eq!((ud.traffic_class, ud.flow_label, ud.dgid), (0xa5, 0xf_edcb, route.dgid.0));
-
-        // Limits.
-        assert_eq!(ib.send(&dest, &[0; 2049]), Err(NetError::TooLarge));
-        assert!(ib.can_transmit());
-        for _ in 0..queue::TX_SLOTS {
-            ib.send(&dest, b"x").unwrap();
-        }
-        assert!(!ib.can_transmit());
-        assert_eq!(ib.send(&dest, b"x"), Err(NetError::WouldBlock));
-        assert_eq!(hca.sent_ex(qpn).len(), queue::TX_SLOTS as usize);
-        assert!(ib.can_transmit());
-
-        // Receiving: the payload without the header slot, and who sent it.
-        let from = fake::UdFrom { lid: 0x31, qpn: 0xab_cdef, sl: 5, path_bits: 2 };
-        assert!(hca.deliver_ud(1, qpn, QKEY, from, None, b"reply"));
-        assert!(ib.can_receive());
-        let got = ib.receive(&mut buf).unwrap();
-        assert_eq!(&buf[..got.len], b"reply");
-        assert_eq!((got.src_lid, got.src_qpn, got.sl, got.path_bits, got.grh), (0x31, 0xab_cdef, 5, 2, None));
-        assert_eq!(ib.receive(&mut buf), Err(NetError::WouldBlock));
-
-        let header = GlobalHeader {
-            src: Gid::new(0xfe80_0000_0000_0001, 0xaaaa_bbbb_cccc_dddd),
-            dst: ib.gid(0).unwrap(),
-            hop_limit: 7,
-            traffic_class: 0x11,
-            flow_label: 0x1_2345,
-        };
-        assert!(hca.deliver_ud(1, qpn, QKEY, from, Some(grh_bytes(&header)), &[9; 2048]));
-        let got = ib.receive(&mut buf).unwrap();
-        assert_eq!((got.len, got.grh), (2048, Some(header)));
-        assert_eq!(buf[..2048], [9; 2048]);
-
-        // Not for us: wrong key, wrong queue pair. Too big for the caller: dropped, entry reused.
-        assert!(!hca.deliver_ud(1, qpn, QKEY ^ 1, from, None, b"x"));
-        assert!(!hca.deliver_ud(1, qpn + 1, QKEY, from, None, b"x"));
-        assert!(hca.deliver_ud(1, qpn, QKEY, from, None, &[3; 100]));
-        assert_eq!(ib.receive(&mut buf[..99]), Err(NetError::TooLarge));
-        assert_eq!(ib.receive(&mut buf), Err(NetError::WouldBlock));
-
-        // Several laps of every ring, both ways.
-        for n in 0..100u32 {
-            let payload: Vec<u8> = (0..1 + n * 20).map(|b| (b + n) as u8).collect();
-            assert!(hca.deliver_ud(1, qpn, QKEY, peer(n as u16 + 1, n), None, &payload));
-            ib.send(&Destination::local(n as u16 + 1, n, QKEY), &payload[..1 + n as usize]).unwrap();
-            let got = ib.receive(&mut buf).unwrap();
-            assert_eq!((&buf[..got.len], got.src_lid, got.src_qpn), (&payload[..], n as u16 + 1, n), "datagram {n}");
-            assert_eq!(hca.sent_ex(qpn)[0].frame, &payload[..1 + n as usize]);
-        }
-        // A burst fills every posted receive entry; the rest are dropped.
-        for n in 0..queue::RX_SLOTS + 2 {
-            assert_eq!(hca.deliver_ud(1, qpn, QKEY, from, None, &[n as u8; 64]), n < queue::RX_SLOTS);
-        }
-        for n in 0..queue::RX_SLOTS {
-            assert_eq!(ib.receive(&mut buf).map(|d| d.len), Ok(64));
-            assert_eq!(buf[0], n as u8);
-        }
-
-        drop(ib);
-        drop(mlx);
-        assert_eq!(dma.live.get(), 0);
-    }
-
-    #[test]
-    fn infiniband_multicast() {
-        let hca = FakeHca::new(IB);
-        let dma = HostDma::default();
-        let mlx = bring_up(&hca, &dma).unwrap();
-        let mut one = mlx.open_ib(1, QKEY).unwrap();
-        let mut two = mlx.open_ib(2, QKEY).unwrap();
-        hca.sm_configure(1, 7);
-        hca.sm_configure(2, 8);
-        let group = Gid::new(0xff12_601b_ffff_0000, 0x0000_0000_ffff_ffff);
-        let note = |mgid: &Gid, to: u8| hca.deliver_multicast(to, &mgid.0, QKEY, peer(3, 4), [0; 40], b"all");
-        let mut buf = [0u8; 64];
-
-        assert_eq!(note(&group, 1), 0, "nobody is in the group yet");
-        one.attach_multicast(group).unwrap();
-        one.attach_multicast(group).unwrap(); // idempotent
-        assert_eq!(hca.state.borrow().fw.mcg[&fake::mgid_hash(&group.0)][1] & 0xff_ffff, 1);
-        assert_eq!(note(&group, 1), 1);
-        assert_eq!(one.receive(&mut buf).map(|d| d.len), Ok(3));
-        assert_eq!(one.receive(&mut buf), Err(NetError::WouldBlock));
-        assert_eq!(note(&group, 2), 0, "port 2's queue pair is not a member");
-
-        // Another queue pair joins the same entry.
-        two.attach_multicast(group).unwrap();
-        assert_eq!(hca.state.borrow().fw.mcg[&fake::mgid_hash(&group.0)][1] & 0xff_ffff, 2);
-        assert_eq!((note(&group, 1), note(&group, 2)), (1, 1));
-        assert_eq!(one.receive(&mut buf).map(|d| d.len), Ok(3));
-        assert_eq!(two.receive(&mut buf).map(|d| d.len), Ok(3));
-
-        // A different group sharing the bucket cannot be attached.
-        let hash = fake::mgid_hash(&group.0);
-        let rival = (0u64..)
-            .map(|n| Gid::new(0xff12_601b_ffff_0000, n))
-            .find(|g| *g != group && fake::mgid_hash(&g.0) == hash)
-            .unwrap();
-        assert_eq!(one.attach_multicast(rival), Err(Mlx4Error::Multicast));
-        assert_eq!(one.detach_multicast(rival), Err(Mlx4Error::Multicast), "never attached");
-
-        // Leaving: the entry empties only when the last member goes.
-        one.detach_multicast(group).unwrap();
-        assert_eq!((note(&group, 1), note(&group, 2)), (0, 1));
-        assert_eq!(two.receive(&mut buf).map(|d| d.len), Ok(3));
-        one.attach_multicast(rival).unwrap_err();
-        two.detach_multicast(group).unwrap();
-        assert!(hca.state.borrow().fw.mcg.is_empty());
-        one.attach_multicast(rival).unwrap();
-        one.detach_multicast(rival).unwrap();
-
-        // At most MAX_GROUPS groups per port.
-        let groups: Vec<Gid> = (1u64..)
-            .map(|n| Gid::new(0xff12_601b_ffff_0000, n))
-            .scan(Vec::new(), |taken: &mut Vec<u32>, g| {
-                let h = fake::mgid_hash(&g.0);
-                Some((!taken.contains(&h)).then(|| {
-                    taken.push(h);
-                    g
-                }))
-            })
-            .flatten()
-            .take(5)
-            .collect();
-        for g in &groups[..4] {
-            one.attach_multicast(*g).unwrap();
-        }
-        assert_eq!(one.attach_multicast(groups[4]), Err(Mlx4Error::Multicast));
-        // Dropping the port leaves every group; the fake rejects a queue pair destroyed while attached.
-        two.attach_multicast(groups[0]).unwrap();
-        drop(one);
-        assert_eq!(hca.state.borrow().fw.mcg.len(), 1);
-        drop(two);
-        assert!(hca.state.borrow().fw.mcg.is_empty());
-        drop(mlx);
-        assert_eq!(dma.live.get(), 0);
-    }
-
-    #[test]
-    fn infiniband_interrupts() {
-        let hca = FakeHca::new(IB);
-        let dma = HostDma::default();
-        let func = Function::new(&hca, fake::ADDR).unwrap();
-        let mut mlx = Mlx4::new(&func, hca.config_io(), hca.uar_io(), &dma, &hca).unwrap();
-        mlx.enable_msix(&func, &hca.msix_io(), msix_messages()).unwrap();
-        let mut ib = mlx.open_ib(1, QKEY).unwrap();
-        let qpn = ib.qpn();
-        let mut buf = [0u8; 64];
-
-        // The subnet manager's activation is a port event on the other vector.
-        hca.sm_configure(1, 7);
-        assert_eq!(hca.take_interrupts(), [VECTOR_ASYNC]);
-        assert_eq!(mlx.handle_interrupt(VECTOR_ASYNC), 0);
-        assert!(ib.link_up());
-
-        // One interrupt per reap, then the queue is armed again.
-        for n in 0..10u8 {
-            assert!(hca.deliver_ud(1, qpn, QKEY, peer(2, 3), None, &[n; 8]));
-            assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION], "datagram {n}");
-            assert_eq!(mlx.handle_interrupt(VECTOR_COMPLETION), 0b1);
-            assert_eq!(ib.receive(&mut buf).map(|d| d.len), Ok(8));
-        }
-        ib.send(&Destination::local(2, 3, QKEY), b"ping").unwrap();
-        assert_eq!(hca.sent(qpn).len(), 1);
-        assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION], "send completion");
-    }
-
-    #[test]
-    fn ethernet_and_infiniband_ports_coexist() {
-        let hca = FakeHca::new([Some(PortKind::Ethernet), Some(PortKind::InfiniBand)]);
-        let dma = HostDma::default();
-        let mlx = bring_up(&hca, &dma).unwrap();
-        let mut eth = mlx.open_eth(1).unwrap();
-        let mut ib = mlx.open_ib(2, QKEY).unwrap();
-        hca.sm_configure(2, 5);
-        let mut buf = [0u8; 2048];
-        assert!(hca.deliver(1, &[1; 100]) && hca.deliver_ud(2, ib.qpn(), QKEY, peer(1, 1), None, &[2; 100]));
-        assert_eq!(eth.receive(&mut buf), Ok(100));
-        assert_eq!(buf[0], 1);
-        assert_eq!(ib.receive(&mut buf).map(|d| d.len), Ok(100));
-        assert_eq!(buf[0], 2);
-        // (The fake reads the one shared doorbell register, so reap each send in turn.)
-        eth.transmit(&[3; 60]).unwrap();
-        assert_eq!(hca.sent(72), [vec![3; 60]]);
-        ib.send(&Destination::local(1, 1, QKEY), &[4; 60]).unwrap();
-        assert_eq!(ib.qpn(), 73);
-        assert_eq!(hca.sent(73), [vec![4; 60]]);
     }
 }

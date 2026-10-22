@@ -1,48 +1,79 @@
-//! An InfiniBand port: one completion queue and one unreliable datagram
-//! (UD) queue pair.
+//! An InfiniBand port: queue pair 0 and 1 for management, and an
+//! unreliable datagram (UD) queue pair for data, each with its own
+//! completion queue.
 //!
 //! The port is brought up the way `mlx4_ib` does: SET_PORT with the
-//! capabilities this driver implements (none beyond the firmware's own),
-//! INIT_PORT with the table sizes the port reported, then the queues. The
-//! link trains and the subnet manager assigns a LID without further help
-//! from here, because the subnet management agent (queue pair 0) lives in
-//! the firmware; [`IbPort::query`] and friends ask it, through MAD_IFC, how
-//! far that has got.
+//! capability mask the firmware already advertises, then queue pair 0 is
+//! created and taken to ready-to-receive, which is when the port is
+//! initialized (INIT_PORT) and the link starts to train. The firmware does
+//! not answer subnet management packets on its own: they arrive on queue
+//! pair 0, and [`IbPort::service`] hands each to the firmware's agent
+//! (MAD_IFC) and sends its answer back. Until a subnet manager has
+//! configured the port through those packets, it has no LID and stays in
+//! the initializing state, so `service` must run regularly (from the idle
+//! loop or after the completion interrupt) for the whole life of the port.
 //!
 //! A datagram goes out as a send entry of a control segment, a datagram
 //! segment carrying the address vector, queue pair number and queue key,
 //! and one data segment. Every received datagram is preceded in its buffer
 //! by a 40-byte global route header slot, filled in only if the sender
-//! used one. Both share the rings of [`Queues`] with the Ethernet port.
+//! used one. The special queue pairs build the local, global and transport
+//! headers themselves ("MLX" send entries) and the device appends the
+//! checksum. All of them share the rings of [`Queues`] with the Ethernet
+//! port.
 //!
 //! Multicast groups are attached to the queue pair directly in the
 //! adapter's group table, one hash bucket per group; a group whose bucket
 //! another group holds cannot be attached (no chaining into the auxiliary
-//! entries). Joining a group with the subnet administrator is up to the
-//! caller, and needs queue pair 1, which this driver does not implement.
+//! entries).
 
 use osmium_hal::dma::DmaAllocator;
 use osmium_hal::net::NetError;
 
 use super::cmd::{Ctx, Input, op};
-use super::queue::{CTRL_COMPLETE, OPCODE_SEND, QpSetup, Queues, SEG_LEN, optpar};
+use super::mad::{self, CLASS_PERF, GrhFields, LID_PERMISSIVE, MAD_LEN, MadWc, QP1_QKEY, UdHeader};
+use super::queue::{
+    CTRL_COMPLETE, Geometry, OPCODE_SEND, QpSetup, Queues, SEG_LEN, SET_DATA, SET_QP0, SET_QP1, optpar,
+};
 use super::{LOG_NUM_MCGS, MCG_ENTRY_LEN, Mlx4, Mlx4Error, PD, put32};
 
-/// Bytes of the global route header slot ahead of every received datagram.
-pub const GRH_LEN: usize = 40;
-/// The IB MTU enumeration value the port is limited to: 2048 bytes.
-const IB_MTU_2048: u32 = 4;
-/// Largest datagram payload.
-pub const MAX_PAYLOAD: usize = 2048;
-const RX_SLOT_LEN: usize = (GRH_LEN + MAX_PAYLOAD).next_multiple_of(64);
-/// The queue pair context's MTU (4096) and maximum message size (2^11) as
-/// `mlx4_ib` programs them for datagram queue pairs.
-const QP_MTU_MSGMAX: (u32, u32) = (5, 11);
+pub use super::mad::GRH_LEN;
 
+/// The IB MTU enumeration value of 4096 bytes.
+const IB_MTU_4096: u32 = 5;
+/// Largest datagram payload the buffers hold.
+pub const MAX_PAYLOAD: usize = 4096;
+const RX_SLOT_LEN: usize = (GRH_LEN + MAX_PAYLOAD).next_multiple_of(64);
+/// Receive slot of the special queue pairs: the header slot and a datagram.
+const MAD_SLOT_LEN: usize = (GRH_LEN + MAD_LEN).next_multiple_of(64);
+/// The context's MTU (4096) and maximum message size as `mlx4_ib` programs
+/// them: 2^11 for the special queue pairs, 2^13 for datagram ones.
+const MTU_MSGMAX_SPECIAL: u32 = IB_MTU_4096 << 5 | 11;
+const MTU_MSGMAX_UD: u32 = IB_MTU_4096 << 5 | 13;
+/// The schedule queue of a port's queue pair 0 and of the others (low bits;
+/// the port selects bit 6, the service level bits 2–5).
+const SCHED_QP0: u32 = 0x3f;
+const SCHED_DEFAULT: u32 = 0x83;
+
+// SET_PORT with operation modifier 0 (InfiniBand): which fields to change,
+// and where the values sit.
 const SET_PORT_INFINIBAND: u8 = 0;
+const CHANGE_VL_CAP: u32 = 1 << 21;
+const CHANGE_MTU_CAP: u32 = 1 << 22;
+const SET_PORT_VL_CAP_SHIFT: u32 = 4;
+const SET_PORT_MTU_CAP_SHIFT: u32 = 12;
+/// The firmware's "exceeds device limits" status, which SET_PORT answers
+/// when the port cannot do that many virtual lanes.
+const STATUS_EXCEED_LIMITS: u8 = 0x08;
+
 const SEND_SEGMENTS: usize = 5;
 const DATAGRAM_SEG: usize = SEG_LEN;
 const DATA_SEG: usize = DATAGRAM_SEG + 48;
+
+// Send control flags of the "MLX" entries.
+const MLX_VL15: u32 = 1 << 17;
+const MLX_SLR: u32 = 1 << 16;
+const INLINE: u32 = 1 << 31;
 
 // Subnet management attributes.
 const ATTR_NODE_INFO: u16 = 0x0011;
@@ -61,6 +92,8 @@ const PKEYS_PER_BLOCK: u16 = 32;
 const MAX_GROUPS: usize = 4;
 /// Queue pairs one group table entry holds.
 const MCG_QPS: usize = (MCG_ENTRY_LEN as usize - 32) / 4;
+/// General services datagrams kept for the caller while `service` runs.
+const BACKLOG: usize = 4;
 
 const _: () = assert!(DATA_SEG + SEG_LEN <= 128);
 const _: () = assert!(SEND_SEGMENTS * SEG_LEN == DATA_SEG + SEG_LEN);
@@ -216,21 +249,234 @@ pub struct Datagram {
 #[derive(Clone, Copy)]
 struct PortCaps {
     mtu: u32,
-    width: u32,
-    vls: u32,
     gids: u16,
     pkeys: u16,
+}
+
+/// A management datagram taken from a special queue pair.
+#[derive(Clone)]
+pub(super) struct RxMad {
+    pub mad: [u8; MAD_LEN],
+    pub slid: u16,
+    pub src_qpn: u32,
+    pub sl: u8,
+    pub path_bits: u8,
+    pub pkey_index: u8,
+    /// The global route header, if the sender used one.
+    pub grh: Option<[u8; GRH_LEN]>,
+}
+
+/// Where a management datagram goes.
+pub(super) struct MadDest {
+    pub lid: u16,
+    pub qpn: u32,
+    pub qkey: u32,
+    pub sl: u8,
+    pub path_bits: u8,
+    pub pkey: u16,
+    pub grh: Option<GrhFields>,
+}
+
+/// Queue pair 0 or 1 of a port.
+struct Special<'h, 'd, D: DmaAllocator + ?Sized> {
+    q: Queues<'h, 'd, D>,
+    /// The packet sequence number of the next send.
+    psn: u32,
+}
+
+/// Runs `f` with the transitions of a special queue pair: queue key `qkey`
+/// (0 for queue pair 0, [`QP1_QKEY`] for 1), schedule queue `sched`.
+fn with_special_setup<R>(qkey: u32, sched: u32, port: u32, f: impl FnOnce(&QpSetup<'_>) -> R) -> R {
+    let init = |c: &mut Ctx| {
+        c.set(8, 0, 8, 0); // partition key index 0
+        c.set(44, 0, 32, qkey);
+    };
+    let rtr = |c: &mut Ctx| {
+        c.set(16, 24, 8, (port - 1) << 6 | sched);
+    };
+    f(&QpSetup {
+        service: 7, // "MLX": the header is built in the send entry
+        mtu_msgmax: MTU_MSGMAX_SPECIAL,
+        init_optpar: optpar::PKEY_INDEX | optpar::Q_KEY,
+        rtr_optpar: 0,
+        rts_optpar: 0,
+        init: &init,
+        rtr: &rtr,
+        rts: &|_| {},
+    })
+}
+
+/// Runs `f` with the transitions of the datagram queue pair: queue key
+/// `qkey`.
+fn with_ud_setup<R>(qkey: u32, port: u32, f: impl FnOnce(&QpSetup<'_>) -> R) -> R {
+    let init = |c: &mut Ctx| {
+        c.set(8, 0, 8, 0); // partition key index 0: the default partition
+        c.set(44, 0, 32, qkey);
+    };
+    let rtr = |c: &mut Ctx| {
+        c.set(16, 24, 8, (port - 1) << 6 | SCHED_DEFAULT);
+    };
+    f(&QpSetup {
+        service: 3, // unreliable datagram
+        mtu_msgmax: MTU_MSGMAX_UD,
+        init_optpar: optpar::PKEY_INDEX | optpar::Q_KEY,
+        rtr_optpar: 0,
+        rts_optpar: 0,
+        init: &init,
+        rtr: &rtr,
+        rts: &|_| {},
+    })
+}
+
+impl<'h, 'd, D: DmaAllocator + ?Sized> Special<'h, 'd, D> {
+    fn new(hca: &'h Mlx4<'d, D>, port: u8, set: u8) -> Result<Self, Mlx4Error> {
+        let geometry = Geometry { rx_slot: MAD_SLOT_LEN, tx_slot: MAD_LEN, lso: 0 };
+        Ok(Self { q: Queues::new(hca, port, set, geometry)?, psn: 0 })
+    }
+
+    fn is_qp0(&self) -> bool {
+        self.q.qpn == self.q.hca.special_qpn() + self.q.port as u32 - 1
+    }
+
+    /// (queue key, schedule queue, port) of this queue pair.
+    fn params(&self) -> (u32, u32, u32) {
+        if self.is_qp0() { (0, SCHED_QP0, self.q.port as u32) } else { (QP1_QKEY, SCHED_DEFAULT, self.q.port as u32) }
+    }
+
+    /// Takes the queue pair from reset to ready-to-receive.
+    fn ready_to_receive(&mut self) -> Result<(), Mlx4Error> {
+        let (qkey, sched, port) = self.params();
+        with_special_setup(qkey, sched, port, |s| {
+            self.q.qp_init(s)?;
+            self.q.qp_rtr(s)
+        })
+    }
+
+    fn ready_to_send(&mut self) -> Result<(), Mlx4Error> {
+        let (qkey, sched, port) = self.params();
+        with_special_setup(qkey, sched, port, |s| self.q.qp_rts(s))
+    }
+
+    /// Sends one management datagram as an "MLX" entry: a control segment
+    /// holding the routing, the packed headers inline, the datagram, and an
+    /// inline segment where the device puts the checksum.
+    fn send(&mut self, vl: u8, dest: &MadDest, mad: &[u8; MAD_LEN]) -> Result<(), NetError> {
+        if self.q.tx_full() {
+            self.q.poll_cq();
+            if self.q.tx_full() {
+                return Err(NetError::WouldBlock);
+            }
+        }
+        let permissive = dest.lid == LID_PERMISSIVE;
+        let header = UdHeader {
+            vl,
+            sl: dest.sl,
+            dlid: dest.lid,
+            // The device fills in the LID; the packet carries the path bits
+            // it is to be added to, or the permissive LID of a directed route.
+            slid: if permissive { LID_PERMISSIVE } else { dest.path_bits as u16 & 0x7f },
+            grh: dest.grh,
+            pkey: dest.pkey,
+            solicited: false,
+            dest_qpn: dest.qpn,
+            psn: self.psn,
+            qkey: dest.qkey,
+            src_qpn: self.q.qpn,
+            payload: MAD_LEN,
+        };
+        self.psn = self.psn.wrapping_add(1) & 0xff_ffff;
+        let mut packed = [0u8; mad::UD_HEADER_MAX];
+        let n = header.pack(&mut packed);
+
+        let (wqe, slot) = self.q.begin_send();
+        self.q.mem.tx.write(slot, mad);
+        let buf = self.q.mem.tx.device_addr().as_u64() + slot as u64;
+        let lkey = self.q.hca.lkey;
+        let wq = self.q.wq();
+
+        // Inline segments may not cross a 64-byte boundary, so a header that
+        // does not fit up to the next one takes two.
+        let inline = wqe + SEG_LEN;
+        let room = 64 - ((inline + 4) % 64);
+        let seg_len = if n <= room {
+            put32(wq, inline, INLINE | n as u32);
+            wq.write(inline + 4, &packed[..n]);
+            (4 + n).next_multiple_of(16)
+        } else {
+            put32(wq, inline, INLINE | room as u32);
+            wq.write(inline + 4, &packed[..room]);
+            let second = inline + 4 + room;
+            wq.write(second + 4, &packed[room..n]);
+            put32(wq, second, INLINE | (n - room) as u32);
+            (8 + n).next_multiple_of(16)
+        };
+        let data = wqe + SEG_LEN + seg_len;
+        put32(wq, data, MAD_LEN as u32);
+        put32(wq, data + 4, lkey);
+        wq.store(data + 8, buf.to_be());
+        let icrc = data + SEG_LEN;
+        put32(wq, icrc + 4, 0);
+        put32(wq, icrc, INLINE | 4);
+
+        let flags = CTRL_COMPLETE & !2 // completion, not solicited
+            | if self.is_qp0() { MLX_VL15 } else { 0 }
+            | if permissive { MLX_SLR } else { 0 }
+            | (dest.sl as u32 & 0xf) << 8;
+        put32(wq, wqe + 4, ((SEG_LEN + seg_len + 2 * SEG_LEN) / SEG_LEN) as u32);
+        put32(wq, wqe + 8, flags);
+        put32(wq, wqe + 12, (dest.lid as u32) << 16);
+        self.q.finish_send(wqe, OPCODE_SEND);
+        Ok(())
+    }
+
+    /// Takes the next received management datagram.
+    fn receive(&mut self) -> Option<RxMad> {
+        loop {
+            let got = self.q.next_received()?;
+            let ok = !got.error && got.len as usize >= GRH_LEN + MAD_LEN;
+            let rx = ok.then(|| {
+                let mut mad = [0u8; MAD_LEN];
+                self.q.read_rx(got.slot, GRH_LEN, &mut mad);
+                let grh = got.grh.then(|| {
+                    let mut raw = [0u8; GRH_LEN];
+                    self.q.read_rx(got.slot, 0, &mut raw);
+                    raw
+                });
+                RxMad {
+                    mad,
+                    slid: got.src_lid,
+                    src_qpn: got.src_qpn,
+                    sl: got.sl,
+                    path_bits: got.src_path_bits,
+                    pkey_index: got.pkey_index,
+                    grh,
+                }
+            });
+            self.q.repost();
+            if rx.is_some() {
+                return rx;
+            }
+        }
+    }
 }
 
 /// A port of an [`Mlx4`] in InfiniBand mode. Dropping it detaches its
 /// multicast groups, closes the port and frees its queues.
 pub struct IbPort<'h, 'd, D: DmaAllocator + ?Sized> {
-    q: Queues<'h, 'd, D>,
+    // Dropped in this order: queue pair 0 last, since resetting it is what
+    // closes the port.
+    ud: Queues<'h, 'd, D>,
+    gsi: Special<'h, 'd, D>,
+    smi: Special<'h, 'd, D>,
     qkey: u32,
     mtu: u32,
     gids: u16,
     pkeys: u16,
+    /// The SL-to-VL table (four bits per service level), as the subnet
+    /// manager last set it.
+    sl2vl: [u8; 8],
     groups: [Option<Gid>; MAX_GROUPS],
+    backlog: [Option<RxMad>; BACKLOG],
 }
 
 impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
@@ -248,9 +494,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         }
         hca.set_link(port, query.get(0, 31, 1) != 0);
         let caps = PortCaps {
-            mtu: query.get(0, 16, 4).min(IB_MTU_2048),
-            width: query.get(1, 8, 4),
-            vls: query.get(2, 0, 4),
+            mtu: query.get(0, 16, 4).min(IB_MTU_4096),
             gids: 1 << query.get(1, 4, 4),
             pkeys: 1 << query.get(1, 0, 4),
         };
@@ -258,68 +502,79 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
             return Err(Mlx4Error::BadDevice);
         }
 
+        // The capability mask the port advertises is the one it already has.
+        let capability_mask = hca.query_mad(port, ATTR_PORT_INFO, port as u32)?.dword(MAD_DATA + 5);
+        Self::set_port(hca, port, &caps, capability_mask)?;
+
+        // Queue pair 0 first: its transition to ready-to-receive starts the
+        // port, and the others follow once it is up. The locals drop in the
+        // reverse order, queue pair 0 last, if anything fails.
+        let mut smi = Special::new(hca, port, SET_QP0)?;
+        smi.q.create_cq()?;
+        smi.ready_to_receive()?;
+        hca.hcr.exec(op::INIT_PORT, 0, port as u32, Input::None)?;
+        smi.q.stage.port_up = true;
+        smi.ready_to_send()?;
+        smi.q.arm_cq();
+
+        let mut gsi = Special::new(hca, port, SET_QP1)?;
+        gsi.q.create_cq()?;
+        gsi.ready_to_receive()?;
+        gsi.ready_to_send()?;
+        gsi.q.arm_cq();
+
+        let geometry = Geometry { rx_slot: RX_SLOT_LEN, tx_slot: MAX_PAYLOAD, lso: 0 };
+        let mut ud = Queues::new(hca, port, SET_DATA, geometry)?;
+        ud.create_cq()?;
+        with_ud_setup(qkey, port as u32, |s| ud.create_qp(s))?;
+        ud.arm_cq();
+
         let mut ib = Self {
-            q: Queues::new(hca, port, RX_SLOT_LEN, MAX_PAYLOAD, 0)?,
+            ud,
+            gsi,
+            smi,
             qkey,
             mtu: caps.mtu,
             gids: caps.gids,
             pkeys: caps.pkeys,
+            sl2vl: [0; 8],
             groups: [None; MAX_GROUPS],
+            backlog: [const { None }; BACKLOG],
         };
-        ib.start_port(&caps)?;
-        ib.q.create_cq()?;
-        ib.create_qp()?;
-        ib.q.arm_cq();
+        hca.open.set(hca.open.get() | 1 << (port - 1));
+        ib.refresh_sl2vl();
         Ok(ib)
     }
 
-    fn start_port(&mut self, caps: &PortCaps) -> Result<(), Mlx4Error> {
-        let (hcr, port) = (&self.q.hca.hcr, self.q.port as u32);
-        // The capability mask the port advertises: dword 1. This driver
-        // implements none of the optional management classes.
-        let set = Ctx::new();
-        hcr.exec(op::SET_PORT, SET_PORT_INFINIBAND, port, Input::Mailbox(&set, 256))?;
-
-        if self.q.hca.caps.old_port_cmds {
-            hcr.exec(op::INIT_PORT, 0, port, Input::None)?;
-        } else {
-            let mut init = Ctx::new();
-            init.set(0, 4, 4, caps.vls).set(0, 8, 4, caps.width);
-            init.set(1, 16, 16, 128 << caps.mtu).set(1, 0, 16, caps.gids as u32);
-            init.set(2, 0, 16, caps.pkeys as u32);
-            hcr.exec(op::INIT_PORT, 0, port, Input::Mailbox(&init, 256))?;
+    /// SET_PORT in InfiniBand mode: the capability mask, the MTU limit and the
+    /// number of virtual lanes (as many as the port will take).
+    fn set_port(hca: &Mlx4<'d, D>, port: u8, caps: &PortCaps, capability_mask: u32) -> Result<(), Mlx4Error> {
+        let mut result = Ok(0);
+        for vls in [8u32, 4, 2, 1] {
+            let mut set = Ctx::new();
+            set.set(
+                0,
+                0,
+                32,
+                CHANGE_MTU_CAP | CHANGE_VL_CAP | caps.mtu << SET_PORT_MTU_CAP_SHIFT | vls << SET_PORT_VL_CAP_SHIFT,
+            );
+            set.set(1, 0, 32, capability_mask);
+            result = hca.hcr.exec(op::SET_PORT, SET_PORT_INFINIBAND, port as u32, Input::Mailbox(&set, 256));
+            if !matches!(result, Err(Mlx4Error::Command { status: STATUS_EXCEED_LIMITS, .. })) {
+                break;
+            }
         }
-        self.q.stage.port_up = true;
-        Ok(())
-    }
-
-    fn create_qp(&mut self) -> Result<(), Mlx4Error> {
-        let (port, qkey) = (self.q.port as u32, self.qkey);
-        let (mtu, msgmax) = QP_MTU_MSGMAX;
-        self.q.create_qp(&QpSetup {
-            service: 3, // unreliable datagram
-            init_optpar: optpar::PKEY_INDEX | optpar::Q_KEY,
-            init: &|c| {
-                c.set(4, 29, 3, mtu).set(4, 24, 5, msgmax);
-                c.set(8, 0, 8, 0); // partition key index 0: the default partition
-                c.set(44, 0, 32, qkey);
-            },
-            rtr: &|c| {
-                c.set(4, 29, 3, mtu).set(4, 24, 5, msgmax);
-                c.set(16, 24, 8, 0x83 | (port - 1) << 6); // default schedule queue of this port
-            },
-            rts: &|_| {},
-        })
+        result.map(drop)
     }
 
     /// The port number (1-based).
     pub fn port(&self) -> u8 {
-        self.q.port
+        self.ud.port
     }
 
     /// The queue pair number datagrams to this port are addressed to.
     pub fn qpn(&self) -> u32 {
-        self.q.qpn
+        self.ud.qpn
     }
 
     /// The queue key datagrams must carry to be received.
@@ -345,13 +600,13 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
     /// True if the port's link is up, as last reported by the adapter's
     /// events (the logical state is in [`query`](Self::query)).
     pub fn link_up(&self) -> bool {
-        self.q.hca.link_up(self.q.port)
+        self.ud.hca.link_up(self.ud.port)
     }
 
     /// Asks the firmware's subnet management agent for the port's state,
     /// LID and the rest of PortInfo.
     pub fn query(&self) -> Result<PortInfo, Mlx4Error> {
-        let m = self.q.hca.query_mad(self.q.port, ATTR_PORT_INFO, 0)?;
+        let m = self.ud.hca.query_mad(self.ud.port, ATTR_PORT_INFO, self.ud.port as u32)?;
         let d = |dw: usize| MAD_DATA + dw;
         let mtu = match m.get(d(9), 28, 4) {
             n @ 1..=5 => 128 << n,
@@ -380,7 +635,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         if index >= self.gids {
             return Err(Mlx4Error::Mad(MAD_INVALID_FIELD));
         }
-        let guids = self.q.hca.query_mad(self.q.port, ATTR_GUID_INFO, (index / GUIDS_PER_BLOCK) as u32)?;
+        let guids = self.ud.hca.query_mad(self.ud.port, ATTR_GUID_INFO, (index / GUIDS_PER_BLOCK) as u32)?;
         let at = MAD_DATA + 2 * (index % GUIDS_PER_BLOCK) as usize;
         let guid = (guids.dword(at) as u64) << 32 | guids.dword(at + 1) as u64;
         Ok(Gid::new(self.query()?.gid_prefix, guid))
@@ -391,15 +646,154 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         if index >= self.pkeys {
             return Err(Mlx4Error::Mad(MAD_INVALID_FIELD));
         }
-        let keys = self.q.hca.query_mad(self.q.port, ATTR_PKEY_TABLE, (index / PKEYS_PER_BLOCK) as u32)?;
+        let keys = self.ud.hca.query_mad(self.ud.port, ATTR_PKEY_TABLE, (index / PKEYS_PER_BLOCK) as u32)?;
         let entry = (index % PKEYS_PER_BLOCK) as usize;
         Ok(keys.get(MAD_DATA + entry / 2, if entry % 2 == 0 { 16 } else { 0 }, 16) as u16)
     }
 
     /// The node GUID shared by the adapter's ports.
     pub fn node_guid(&self) -> Result<u64, Mlx4Error> {
-        let m = self.q.hca.query_mad(self.q.port, ATTR_NODE_INFO, 0)?;
+        let m = self.ud.hca.query_mad(self.ud.port, ATTR_NODE_INFO, 0)?;
         Ok((m.dword(MAD_DATA + 3) as u64) << 32 | m.dword(MAD_DATA + 4) as u64)
+    }
+
+    /// Reads the SL-to-VL table the agent holds, for the special queue
+    /// pairs' packets.
+    fn refresh_sl2vl(&mut self) {
+        if let Ok(m) = self.ud.hca.query_mad(self.ud.port, mad::ATTR_SL_TO_VL_TABLE, 0) {
+            let words = [m.dword(MAD_DATA), m.dword(MAD_DATA + 1)];
+            self.sl2vl = [words[0].to_be_bytes(), words[1].to_be_bytes()].concat().try_into().expect("8 bytes");
+        }
+    }
+
+    /// The virtual lane service level `sl` maps to.
+    fn vl_for(&self, sl: u8) -> u8 {
+        let both = self.sl2vl[(sl >> 1 & 7) as usize];
+        if sl & 1 != 0 { both & 0xf } else { both >> 4 }
+    }
+
+    /// Does the work the port needs done to stay on the fabric: answers the
+    /// subnet manager's packets on queue pair 0 and performance queries on
+    /// queue pair 1, and keeps other general services datagrams for
+    /// [`take_general`](Self::take_general). Call it whenever a completion
+    /// may have arrived (after an interrupt, or from the idle loop); a port
+    /// whose queue pair 0 is not served cannot be configured and times out
+    /// on the fabric.
+    pub fn service(&mut self) {
+        while let Some(rx) = self.smi.receive() {
+            self.handle_subnet_management(rx);
+        }
+        while let Some(rx) = self.gsi.receive() {
+            self.handle_general(rx);
+        }
+    }
+
+    /// Takes a general services datagram that `service` did not answer
+    /// itself (a subnet administration reply, for example).
+    #[allow(dead_code)] // the subnet administration client uses it
+    pub(super) fn take_general(&mut self) -> Option<RxMad> {
+        self.backlog.iter_mut().find_map(Option::take)
+    }
+
+    /// Sends a general services datagram from queue pair 1.
+    #[allow(dead_code)] // the subnet administration client uses it
+    pub(super) fn send_general(&mut self, dest: &MadDest, mad: &[u8; MAD_LEN]) -> Result<(), NetError> {
+        let vl = self.vl_for(dest.sl);
+        self.gsi.send(vl, dest, mad)
+    }
+
+    /// The reply address for a datagram received on a special queue pair.
+    fn reply_to(&self, rx: &RxMad, qp0: bool) -> MadDest {
+        let pkey = if qp0 { 0 } else { self.pkey(rx.pkey_index as u16).unwrap_or(0xffff) };
+        let pkey = if qp0 { self.pkey(0).unwrap_or(0xffff) } else { pkey };
+        MadDest {
+            lid: rx.slid,
+            qpn: rx.src_qpn,
+            qkey: if qp0 { 0 } else { QP1_QKEY },
+            sl: rx.sl,
+            path_bits: rx.path_bits,
+            pkey,
+            grh: rx.grh.map(|raw| {
+                let first = mad::be32(&raw, 0);
+                GrhFields {
+                    traffic_class: (first >> 20) as u8,
+                    flow_label: first & 0xf_ffff,
+                    hop_limit: raw[7],
+                    source: raw[24..40].try_into().expect("16 bytes"),
+                    dest: raw[8..24].try_into().expect("16 bytes"),
+                }
+            }),
+        }
+    }
+
+    /// Passes a datagram to the firmware's management agent and returns its
+    /// answer, if it has one.
+    fn run_agent(&self, rx: &RxMad, qp0: bool) -> Option<[u8; MAD_LEN]> {
+        let wc = MadWc {
+            slid: rx.slid,
+            my_qpn: if qp0 { self.smi.q.qpn } else { self.gsi.q.qpn },
+            src_qpn: rx.src_qpn,
+            sl: rx.sl,
+            path_bits: rx.path_bits,
+            pkey_index: rx.pkey_index,
+            grh: rx.grh,
+        };
+        self.ud.hca.mad_ifc(self.ud.port, &rx.mad, Some(&wc)).ok()
+    }
+
+    fn handle_subnet_management(&mut self, rx: RxMad) {
+        let mut request = rx.mad;
+        let (class, method) = (request[1], request[3]);
+        if method == mad::METHOD_TRAP && rx.slid == 0 {
+            return; // a trap from a neighbor; this port has no subnet manager to tell
+        }
+        let routed = match class {
+            mad::CLASS_SUBN_LID_ROUTED | mad::CLASS_SUBN_DIRECTED_ROUTE => {
+                matches!(method, mad::METHOD_GET | mad::METHOD_SET | mad::METHOD_TRAP_REPRESS)
+                    && mad::be16(&request, 16) != mad::ATTR_SM_INFO // the agent cannot answer SMInfo
+            }
+            _ => false,
+        };
+        if !routed {
+            return;
+        }
+        let directed = class == mad::CLASS_SUBN_DIRECTED_ROUTE;
+        if directed && !mad::dr_receive(&mut request, self.ud.port) {
+            return;
+        }
+        let forwarded = RxMad { mad: request, ..rx.clone() };
+        let Some(mut reply) = self.run_agent(&forwarded, true) else { return };
+        if mad::be16(&reply, 4) == 0 {
+            self.snoop(&request, &reply);
+        }
+        if directed && !mad::dr_respond(&mut reply, self.ud.port) {
+            return;
+        }
+        if method == mad::METHOD_TRAP_REPRESS {
+            return; // no answer to a repress
+        }
+        let dest = self.reply_to(&rx, true);
+        let _ = self.smi.send(15, &dest, &reply);
+    }
+
+    /// Keeps up with what the subnet manager changes that this driver uses.
+    fn snoop(&mut self, request: &[u8; MAD_LEN], reply: &[u8; MAD_LEN]) {
+        if request[3] == mad::METHOD_SET && mad::be16(request, 16) == mad::ATTR_SL_TO_VL_TABLE {
+            self.sl2vl.copy_from_slice(&reply[64..72]);
+        }
+    }
+
+    fn handle_general(&mut self, rx: RxMad) {
+        let (class, method) = (rx.mad[1], rx.mad[3]);
+        if class == CLASS_PERF && matches!(method, mad::METHOD_GET | mad::METHOD_SET) {
+            if let Some(reply) = self.run_agent(&rx, false) {
+                let dest = self.reply_to(&rx, false);
+                let vl = self.vl_for(dest.sl);
+                let _ = self.gsi.send(vl, &dest, &reply);
+            }
+        } else if let Some(slot) = self.backlog.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(rx);
+        }
     }
 
     /// Sends `payload` as one datagram to `dest`.
@@ -410,23 +804,25 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         if payload.len() > self.max_payload() {
             return Err(NetError::TooLarge);
         }
-        if self.q.tx_full() {
-            self.q.poll_cq();
-            if self.q.tx_full() {
+        if self.ud.tx_full() {
+            self.ud.poll_cq();
+            if self.ud.tx_full() {
                 return Err(NetError::WouldBlock);
             }
         }
-        let (wqe, slot) = self.q.begin_send();
-        self.q.mem.tx.write(slot, payload);
-        let buf = self.q.mem.tx.device_addr().as_u64() + slot as u64;
-        let wq = self.q.wq();
+        let (wqe, slot) = self.ud.begin_send();
+        self.ud.mem.tx.write(slot, payload);
+        let buf = self.ud.mem.tx.device_addr().as_u64() + slot as u64;
+        let lkey = self.ud.hca.lkey;
+        let port = self.ud.port;
+        let wq = self.ud.wq();
         put32(wq, wqe + 4, SEND_SEGMENTS as u32);
         put32(wq, wqe + 8, CTRL_COMPLETE);
 
         // The datagram segment: address vector, then queue pair and key.
         let av = wqe + DATAGRAM_SEG;
         let (route, grh) = (dest.route.unwrap_or(Route::NONE), dest.route.is_some());
-        put32(wq, av, PD | (self.q.port as u32) << 24);
+        put32(wq, av, PD | (port as u32) << 24);
         let g_slid = (dest.path_bits & 0x7f) as u32 | if grh { 0x80 } else { 0 };
         put32(wq, av + 4, g_slid << 16 | dest.lid as u32);
         put32(wq, av + 8, (route.sgid_index as u32) << 16 | route.hop_limit as u32); // maximum static rate: 0
@@ -438,9 +834,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
 
         let data = wqe + DATA_SEG;
         put32(wq, data, payload.len() as u32);
-        put32(wq, data + 4, self.q.hca.lkey);
+        put32(wq, data + 4, lkey);
         wq.store(data + 8, buf.to_be());
-        self.q.finish_send(wqe, OPCODE_SEND);
+        self.ud.finish_send(wqe, OPCODE_SEND);
         Ok(())
     }
 
@@ -448,14 +844,14 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
     ///
     /// A datagram larger than `buf` is dropped ([`NetError::TooLarge`]).
     pub fn receive(&mut self, buf: &mut [u8]) -> Result<Datagram, NetError> {
-        let Some(got) = self.q.next_received() else {
+        let Some(got) = self.ud.next_received() else {
             return Err(NetError::WouldBlock);
         };
         // The device counts the header slot whether or not the sender used one.
         let result = match (got.len as usize).checked_sub(GRH_LEN) {
             Some(len) if !got.error => match buf.get_mut(..len) {
                 Some(dst) => {
-                    self.q.read_rx(got.slot, GRH_LEN, dst);
+                    self.ud.read_rx(got.slot, GRH_LEN, dst);
                     Ok(Datagram {
                         len,
                         src_lid: got.src_lid,
@@ -469,13 +865,13 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
             },
             _ => Err(NetError::Io),
         };
-        self.q.repost();
+        self.ud.repost();
         result
     }
 
     fn read_grh(&self, slot: u16) -> GlobalHeader {
         let mut raw = [0u8; GRH_LEN];
-        self.q.read_rx(slot, 0, &mut raw);
+        self.ud.read_rx(slot, 0, &mut raw);
         let first = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
         let gid = |at: usize| Gid(raw[at..at + 16].try_into().expect("16 bytes"));
         GlobalHeader {
@@ -489,12 +885,12 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
 
     /// True if a datagram can be taken now (or after reaping).
     pub fn can_receive(&self) -> bool {
-        self.q.can_receive()
+        self.ud.can_receive()
     }
 
     /// True if a datagram can be posted now (or after reaping).
     pub fn can_transmit(&self) -> bool {
-        self.q.can_transmit()
+        self.ud.can_transmit()
     }
 
     /// Attaches the queue pair to multicast group `mgid`, so that
@@ -521,7 +917,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
     /// Adds this queue pair to (`attach`) or removes it from the group
     /// table entry of `mgid`.
     fn update_group(&self, mgid: Gid, attach: bool) -> Result<(), Mlx4Error> {
-        let hcr = &self.q.hca.hcr;
+        let hcr = &self.ud.hca.hcr;
         let mut key = Ctx::new();
         for i in 0..4 {
             key.set(i, 0, 32, u32::from_be_bytes(mgid.0[4 * i..4 * i + 4].try_into().expect("4 bytes")));
@@ -547,7 +943,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         for (i, m) in members.iter_mut().enumerate().take(count) {
             *m = entry.dword(8 + i) & 0xff_ffff;
         }
-        let found = members[..count].iter().position(|&m| m == self.q.qpn);
+        let found = members[..count].iter().position(|&m| m == self.ud.qpn);
         if attach {
             if found.is_some() {
                 return Ok(());
@@ -555,7 +951,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
             if count == MCG_QPS {
                 return Err(Mlx4Error::Multicast);
             }
-            members[count] = self.q.qpn;
+            members[count] = self.ud.qpn;
             count += 1;
         } else {
             let at = found.ok_or(Mlx4Error::Multicast)?;
@@ -590,5 +986,6 @@ impl<D: DmaAllocator + ?Sized> Drop for IbPort<'_, '_, D> {
         for group in self.groups.into_iter().flatten() {
             let _ = self.update_group(group, false);
         }
+        self.ud.hca.open.set(self.ud.hca.open.get() & !(1 << (self.ud.port - 1)));
     }
 }
