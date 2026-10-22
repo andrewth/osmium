@@ -142,6 +142,10 @@ pub fn parse(bytes: &[u8]) -> Vec<Entry> {
             }
             _ => (short_to_string(&short, e[12]), offset),
         };
+        // A short name no path could reach is skipped, like such a long one.
+        if !usable(&name) {
+            continue;
+        }
         out.push(Entry {
             name,
             short,
@@ -153,6 +157,20 @@ pub fn parse(bytes: &[u8]) -> Vec<Entry> {
         });
     }
     out
+}
+
+/// True if directory contents `bytes` hold nothing but `.`, `..` and free
+/// slots. Judged on raw slots, so an entry `parse` hides still counts.
+pub fn is_empty(bytes: &[u8]) -> bool {
+    for e in bytes.as_chunks::<ENTRY_SIZE>().0 {
+        match e[0] {
+            END => return true,
+            FREE => {}
+            _ if e[11] & 0x3f != attr::LONG_NAME && matches!(&e[..2], b". " | b"..") && e[2..11] == [b' '; 9] => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Most UTF-16 units in a long name (§7).
@@ -260,5 +278,32 @@ mod tests {
         let full: Vec<u8> = [a, a].iter().flatten().copied().collect();
         assert_eq!(find_free(&full, 1), 64, "a full directory must grow");
         assert_eq!(short_names(&v), [*b"A          ", *b"A          "]);
+    }
+
+    #[test]
+    fn unreachable_short_names_are_skipped() {
+        let es = [
+            short_entry(b"A/B     TXT", 0, 0, 0, 0),
+            short_entry(b"           ", 0, 0, 0, 0),
+            short_entry(b"A\0B     TXT", 0, 0, 0, 0),
+            short_entry(b"OK      TXT", 0, 0, 0, 0),
+        ];
+        let got = parse(&dir(&es));
+        assert_eq!(got.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["OK.TXT"]);
+    }
+
+    #[test]
+    fn emptiness_is_judged_on_raw_slots() {
+        let mut free = short_entry(b"GONE       ", 0, 0, 0, 0);
+        free[0] = FREE;
+        let dots = dot_entries(5, 0);
+        let dots: Vec<[u8; 32]> = dots.as_chunks::<32>().0.to_vec();
+        assert!(is_empty(&dir(&dots)));
+        assert!(is_empty(&dir(&[free])));
+        // Hidden from `parse`, but still an entry.
+        let hidden = short_entry(b"A/B     TXT", 0, 0, 0, 0);
+        assert!(parse(&dir(&[hidden])).is_empty());
+        assert!(!is_empty(&dir(&[hidden])));
+        assert!(!is_empty(&dir(&lfn_entries("orphan", 1))));
     }
 }

@@ -697,3 +697,34 @@ fn a_full_mkfs_floppy_stays_consistent() {
     fsck(&path, &disk);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn rmdir_counts_entries_that_cannot_be_listed() {
+    let disk = crafted(65535);
+    root_entry(&disk, 0, b"SUB        ", 0x10, 3, 0);
+    set_fat(&disk, 3, 0x0fff_ffff);
+    // Cluster 3 holds `.`, `..` and a name with a slash, which no lookup finds.
+    let mut e = [0u8; 96];
+    e[..11].copy_from_slice(b".          ");
+    e[11] = 0x10;
+    e[32..43].copy_from_slice(b"..         ");
+    e[43] = 0x10;
+    e[64..75].copy_from_slice(b"A/B     TXT");
+    disk.put(DATA_START + 512, &e);
+    let fs = FatFs::mount(disk, 1).unwrap();
+    let root = fs.root();
+    assert!(names(&*root.lookup("sub").unwrap()).is_empty());
+    assert_eq!(root.remove("sub", true).err(), Some(Errno::ENOTEMPTY));
+}
+
+#[test]
+fn readdir_sees_changes_made_after_it_was_cached() {
+    let fs = FatFs::mount(crafted(65535), 1).unwrap();
+    let root = fs.root();
+    root.create("one", FileKind::Regular, 0o644).unwrap();
+    assert_eq!(names(&*root), ["one"]);
+    root.create("two", FileKind::Regular, 0o644).unwrap();
+    assert_eq!(names(&*root), ["one", "two"]);
+    root.remove("one", false).unwrap();
+    assert_eq!(names(&*root), ["two"]);
+}

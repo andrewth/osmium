@@ -140,7 +140,13 @@ impl Vfs {
         let mut node = match parent.dir.lookup(name) {
             Ok(node) => node,
             Err(Errno::ENOENT) if parent.trailing_slash => return Err(Errno::EISDIR),
-            Err(Errno::ENOENT) => return parent.dir.create(name, FileKind::Regular, mode & 0o7777),
+            Err(Errno::ENOENT) => match parent.dir.create(name, FileKind::Regular, mode & 0o7777) {
+                Ok(node) => return Ok(node),
+                // Created by someone else since the lookup: open that one
+                // unless the caller insisted on a new file.
+                Err(Errno::EEXIST) if !flags.contains(OpenFlags::EXCL) => parent.dir.lookup(name)?,
+                Err(e) => return Err(e),
+            },
             Err(e) => return Err(e),
         };
         // A mount point shows the mounted root, not the covered directory.

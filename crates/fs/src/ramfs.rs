@@ -427,4 +427,37 @@ mod tests {
         assert_eq!(f.lookup("x").err(), Some(Errno::ENOTDIR));
         assert_eq!(root.read(0, &mut [0; 4]).err(), Some(Errno::EISDIR));
     }
+
+    /// A directory that loses a creation race: its first lookup misses, and
+    /// by the time `create` runs the name exists.
+    struct Racy {
+        inner: Arc<dyn File>,
+        missed: core::sync::atomic::AtomicBool,
+    }
+
+    impl File for Racy {
+        fn stat(&self) -> crate::Stat {
+            self.inner.stat()
+        }
+
+        fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
+            if !self.missed.swap(true, core::sync::atomic::Ordering::SeqCst) {
+                return Err(Errno::ENOENT);
+            }
+            self.inner.lookup(name)
+        }
+
+        fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
+            self.inner.create(name, kind, mode)?;
+            Err(Errno::EEXIST)
+        }
+    }
+
+    #[test]
+    fn open_create_retries_after_losing_a_race() {
+        let racy = |_| Vfs::new(Arc::new(Racy { inner: RamFs::new(1).root(), missed: false.into() }));
+        let f = racy(0).open("/f", RW | OpenFlags::CREATE, 0o644).unwrap();
+        assert_eq!(f.stat().kind, FileKind::Regular);
+        assert_eq!(racy(0).open("/f", RW | OpenFlags::CREATE | OpenFlags::EXCL, 0o644).err(), Some(Errno::EEXIST));
+    }
 }

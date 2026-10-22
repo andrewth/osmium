@@ -82,6 +82,9 @@ struct Volume<D: BlockDevice + Send + 'static> {
     info: Option<FsInfo>,
     /// The FAT sector last read, for walking chains without rereading it.
     fat_cache: Option<(u32, Vec<u8>)>,
+    /// The last directory parsed by `readdir` (by first cluster), so that
+    /// walking it by index parses it once; any write clears it.
+    dir_cache: Option<(u32, Vec<dir::Entry>)>,
     /// Nodes in use, by node id.
     nodes: BTreeMap<u64, NodeState<D>>,
     /// Node id by inode number, for nodes still linked into a directory.
@@ -129,6 +132,7 @@ impl<D: BlockDevice + Send + 'static> FatFs<D> {
             geo,
             info: None,
             fat_cache: None,
+            dir_cache: None,
             nodes: BTreeMap::new(),
             by_ino: BTreeMap::new(),
             next_id: 0,
@@ -198,6 +202,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     }
 
     fn write_sector(&mut self, sector: u32, buf: &[u8]) -> Result<(), Errno> {
+        self.dir_cache = None;
         self.dev.write_blocks(sector as u64 * self.blocks_per_sector, buf).map_err(io_error)
     }
 
@@ -280,7 +285,10 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
                     result = self.write_sector(at, &buf);
                 }
             }
-            self.fat_cache = Some((sector, buf));
+            // A sector whose writes failed is not what the disk holds.
+            if result.is_ok() {
+                self.fat_cache = Some((sector, buf));
+            }
             result?;
             done += n;
         }
@@ -362,8 +370,12 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
             self.write_sector(first + s, &zero)?;
         }
         self.set_fat_entry(c, self.geo.kind.eoc())?;
-        if let Some(p) = prev {
-            self.set_fat_entry(p, c)?;
+        if let Some(p) = prev
+            && let Err(e) = self.set_fat_entry(p, c)
+        {
+            // Do not leave the new cluster marked in use and unreachable.
+            let _ = self.set_fat_entry(c, FAT_FREE);
+            return Err(e);
         }
         if let Some(info) = &mut self.info {
             // A count that was wrong becomes unknown.
@@ -794,8 +806,13 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     fn readdir(&self, index: usize) -> Result<Option<DirEntry>, Errno> {
         let mut vol = self.shared.vol.lock();
         let first = self.dir_cluster(&mut vol)?;
-        let bytes = vol.dir_bytes(first)?;
-        let Some(e) = dir::parse(&bytes).into_iter().nth(index) else { return Ok(None) };
+        if vol.dir_cache.as_ref().is_none_or(|(f, _)| *f != first) {
+            let bytes = vol.dir_bytes(first)?;
+            vol.dir_cache = Some((first, dir::parse(&bytes)));
+        }
+        let Some(e) = vol.dir_cache.as_ref().and_then(|(_, entries)| entries.get(index)).cloned() else {
+            return Ok(None);
+        };
         let ino = vol.entry_ino(first, e.offset)?;
         let kind = if e.is_dir() { FileKind::Directory } else { FileKind::Regular };
         Ok(Some(DirEntry { ino, kind, name: e.name }))
@@ -893,7 +910,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         }
         if e.is_dir() {
             let contents = vol.dir_bytes(e.first)?;
-            if !dir::parse(&contents).is_empty() {
+            if !dir::is_empty(&contents) {
                 return Err(Errno::ENOTEMPTY);
             }
         }

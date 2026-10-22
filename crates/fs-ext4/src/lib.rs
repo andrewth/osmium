@@ -359,6 +359,10 @@ struct Fs<D: BlockDevice + Send + 'static> {
     /// last reference goes.
     nodes: BTreeMap<u32, Weak<Node<D>>>,
     st_dev: u64,
+    /// Sorted, disjoint block ranges `[start, end)` holding superblock
+    /// backups, descriptors, bitmaps and inode tables, which file data and
+    /// block maps must never name.
+    meta_zones: Vec<(u64, u64)>,
 }
 
 /// An ext2, ext3 or ext4 file system on a block device.
@@ -410,6 +414,7 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
             clock: no_clock,
             nodes: BTreeMap::new(),
             st_dev: devno,
+            meta_zones: Vec::new(),
         };
         let mut sbuf = vec![0; SUPERBLOCK_LEN];
         fs.read_bytes(SUPERBLOCK_OFFSET, &mut sbuf)?;
@@ -510,6 +515,7 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
             return Err(Errno::EINVAL);
         }
         fs.check_layout()?;
+        fs.meta_zones = fs.compute_meta_zones();
         let shared = Arc::new(Shared { fs: SpinLock::new(fs) });
         Ok(Ext2 { shared })
     }
@@ -600,7 +606,48 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok(())
     }
 
+    /// Whether block `b` lies in a metadata zone found by `check_layout`.
+    fn in_meta_zone(&self, b: u64) -> bool {
+        let i = self.meta_zones.partition_point(|&(start, _)| start <= b);
+        i > 0 && b < self.meta_zones[i - 1].1
+    }
+
+    /// The merged metadata zones: every group's superblock backup and
+    /// descriptors, bitmaps and inode table.
+    fn compute_meta_zones(&self) -> Vec<(u64, u64)> {
+        let itable =
+            (get32(&self.sb, sb::INODES_PER_GROUP) as u64 * self.inode_size as u64).div_ceil(self.block_size as u64);
+        let mut zones = Vec::with_capacity(self.group_count as usize * 3);
+        for g in 0..self.group_count {
+            let start = self.group_start(g);
+            zones.push((start, start + self.base_meta_blocks(g)));
+            for (field, len) in [(gd::BLOCK_BITMAP, 1), (gd::INODE_BITMAP, 1), (gd::INODE_TABLE, itable)] {
+                let loc = self.group_get(g, field);
+                zones.push((loc, loc.saturating_add(len)));
+            }
+        }
+        zones.retain(|&(start, end)| start < end);
+        zones.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(zones.len());
+        for (start, end) in zones {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
+    /// Reads a data, directory, indirect or extent block; refuses metadata
+    /// zones, which only a corrupt image would name.
     fn read_block(&mut self, b: u64) -> Result<Vec<u8>, Errno> {
+        if self.in_meta_zone(b) {
+            return Err(Errno::EIO);
+        }
+        self.read_raw_block(b)
+    }
+
+    fn read_raw_block(&mut self, b: u64) -> Result<Vec<u8>, Errno> {
         if b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
         }
@@ -609,7 +656,16 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok(buf)
     }
 
+    /// Writes a data, directory, indirect or extent block; refuses metadata
+    /// zones, so a crafted image cannot make a write clobber them.
     fn write_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
+        if self.in_meta_zone(b) {
+            return Err(Errno::EIO);
+        }
+        self.write_raw_block(b, buf)
+    }
+
+    fn write_raw_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
         if b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
         }
@@ -929,7 +985,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if self.csum != Csum::None && self.group_flags(g) & flag != 0 {
             return Ok(self.init_bitmap(g, kind));
         }
-        let bits = self.read_block(self.group_get(g, loc))?;
+        let bits = self.read_raw_block(self.group_get(g, loc))?;
         if self.csum == Csum::Crc32c {
             let wide = csum.1 + csum.2 <= self.desc_size;
             let mask = if wide { u32::MAX } else { 0xffff };
@@ -973,7 +1029,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             Bitmap::Block => (gd::BLOCK_BITMAP, gd::BLOCK_BITMAP_CSUM, BG_BLOCK_UNINIT),
             Bitmap::Inode => (gd::INODE_BITMAP, gd::INODE_BITMAP_CSUM, BG_INODE_UNINIT),
         };
-        self.write_block(self.group_get(g, loc), bits)?;
+        self.write_raw_block(self.group_get(g, loc), bits)?;
         let flags = self.group_flags(g);
         if flags & flag != 0 {
             self.set_group_flags(g, flags & !flag);
@@ -1076,7 +1132,11 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             let Some(i) = self.take_bit(g, Bitmap::Inode, 0, per_group)? else { continue };
             let ino = g * per_group + i + 1;
             if ino < self.first_ino {
-                // A reserved inode marked free: the bitmap is corrupt.
+                // A reserved inode marked free: the bitmap is corrupt. Put
+                // the bit back as it was; no counter has changed yet.
+                let mut bits = self.load_bitmap(g, Bitmap::Inode)?;
+                bits[i as usize / 8] &= !(1 << (i % 8));
+                self.store_bitmap(g, Bitmap::Inode, &bits)?;
                 return Err(Errno::EIO);
             }
             self.adjust_group(g, gd::FREE_INODES, -1);
@@ -1118,7 +1178,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     fn free_inode(&mut self, ino: u32) -> Result<(), Errno> {
         let mut inode = self.read_inode(ino)?;
         let dir = inode.kind() == FileKind::Directory;
-        if !self.is_inline(&inode) {
+        if self.has_block_map(&inode) {
             self.truncate_blocks(ino, &mut inode, 0)?;
         }
         let acl = inode.file_acl();
@@ -1169,6 +1229,12 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     // ---- Block maps ----
+
+    /// Whether the inode's `i_block` is a block map or extent tree. Device
+    /// inodes keep their number there and fast symbolic links their target.
+    fn has_block_map(&self, inode: &Inode) -> bool {
+        matches!(inode.kind(), FileKind::Regular | FileKind::Directory | FileKind::Symlink) && !self.is_inline(inode)
+    }
 
     /// Whether a symbolic link keeps its target in the block map's bytes.
     fn is_inline(&self, inode: &Inode) -> bool {
@@ -1342,6 +1408,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             return Ok(0);
         }
         let len = ((size - off) as usize).min(buf.len());
+        if !matches!(inode.kind(), FileKind::Regular | FileKind::Directory | FileKind::Symlink) {
+            return Err(Errno::EINVAL);
+        }
         if self.is_inline(&inode) {
             // The target must fit the 60-byte block map.
             if size >= 60 {
@@ -1665,9 +1734,10 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         }
         // No room: append a block.
         let mut inode = self.read_inode(dir)?;
-        let size = inode.size();
-        let b = self.bmap(dir, &mut inode, size / self.block_size as u64, true)?;
-        inode.set_size(size + self.block_size as u64);
+        // A size that is not a block multiple still ends in a partial block.
+        let next = inode.size().div_ceil(self.block_size as u64);
+        let b = self.bmap(dir, &mut inode, next, true)?;
+        inode.set_size((next + 1) * self.block_size as u64);
         self.write_inode(dir, &inode)?;
         let (mut data, space) = self.new_dir_block();
         self.write_record(&mut data, 0, ino, space, name, kind);
@@ -1700,7 +1770,20 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     fn is_empty_dir(&mut self, dir: u32) -> Result<bool, Errno> {
-        Ok(self.dir_entry(dir, 0)?.is_none())
+        // Judge on raw records: an entry `dir_entry` hides (an odd name)
+        // still keeps the directory from being removed.
+        let found = self.scan_dir(dir, |fs, _, data| {
+            let (mut off, space) = (0, fs.dir_space(data));
+            while off < space {
+                let (ino, rec_len, name) = fs.record(data, off)?;
+                if ino != 0 && name != b"." && name != b".." {
+                    return Ok(Some(()));
+                }
+                off += rec_len;
+            }
+            Ok(None)
+        })?;
+        Ok(found.is_none())
     }
 
     fn create(&mut self, dir: u32, name: &str, kind: FileKind, mode: u32) -> Result<u32, Errno> {
@@ -2496,5 +2579,72 @@ mod tests {
         let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
         ext2.root().lookup("holes").unwrap().truncate(0).unwrap();
         fsck(&scratch, &unmount(ext2), &[]);
+    }
+
+    /// Free-block counts: the superblock's, then each group's.
+    fn free_counts(ext2: &Ext2<VecDisk>) -> Vec<u64> {
+        let fs = ext2.shared.fs.lock();
+        let mut counts = vec![fs.free_blocks()];
+        counts.extend((0..fs.group_count).map(|g| fs.group_get(g, gd::FREE_BLOCKS)));
+        counts
+    }
+
+    #[test]
+    fn unlinking_a_device_inode_leaves_the_bitmaps_alone() {
+        let scratch = Scratch::new("devnode");
+        for kind in [EXT2, EXT4_GROUPS] {
+            let Some(image) = mkfs(&scratch, kind, 1024, 8 << 20, None) else { return };
+            // Major 1, minor 3 is i_block[0] = 0x103: block 259.
+            let image = debugfs(&scratch, image, &["mknod null c 1 3", "mknod fifo p"]);
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let before = free_counts(&ext2);
+            let vfs = Vfs::new(ext2.root());
+            assert_eq!(vfs.stat("/null", true).unwrap().rdev, makedev(1, 3));
+            vfs.unlink("/null").unwrap();
+            vfs.unlink("/fifo").unwrap();
+            drop(vfs);
+            assert_eq!(before, free_counts(&ext2));
+            fsck(&scratch, &unmount(ext2), &[]);
+        }
+    }
+
+    #[test]
+    fn data_blocks_in_metadata_zones_are_refused() {
+        let scratch = Scratch::new("metazone");
+        let Some(image) = mkfs(&scratch, EXT2, 1024, 4 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root());
+        vfs.open("/f", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, b"data").unwrap();
+        let ino = ext2.root().lookup("f").unwrap().stat().ino as u32;
+        {
+            let mut fs = ext2.shared.fs.lock();
+            let table = fs.group_get(0, gd::INODE_TABLE);
+            assert!(fs.in_meta_zone(table) && fs.in_meta_zone(1) && !fs.in_meta_zone(0));
+            // Point the file's first block at the inode table.
+            let mut inode = fs.read_inode(ino).unwrap();
+            inode.set_block(0, table as u32);
+            fs.write_inode(ino, &inode).unwrap();
+        }
+        let f = vfs.lookup("/f").unwrap();
+        assert_eq!(f.write(0, b"x").err(), Some(Errno::EIO));
+        assert_eq!(f.read(0, &mut [0; 4]).err(), Some(Errno::EIO));
+    }
+
+    #[test]
+    fn directory_emptiness_counts_unlistable_names() {
+        let scratch = Scratch::new("emptydir");
+        let Some(image) = mkfs(&scratch, EXT2, 1024, 4 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root());
+        vfs.mkdir("/d", 0o755).unwrap();
+        let d = ext2.root().lookup("d").unwrap().stat().ino as u32;
+        {
+            let mut fs = ext2.shared.fs.lock();
+            assert!(fs.is_empty_dir(d).unwrap());
+            // A name with a slash can never be listed or looked up.
+            fs.add_entry(d, "a/b", 12, FileKind::Regular).unwrap();
+            assert!(!fs.is_empty_dir(d).unwrap());
+        }
+        assert_eq!(vfs.rmdir("/d").err(), Some(Errno::ENOTEMPTY));
     }
 }
