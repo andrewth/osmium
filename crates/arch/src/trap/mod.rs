@@ -60,7 +60,8 @@ pub enum Trap {
     IllegalInstruction,
     /// A misaligned access or program counter.
     Misaligned {
-        /// The faulting address.
+        /// The faulting address. x86_64 `#AC` does not report the data
+        /// address, so there this is the faulting instruction's address.
         addr: usize,
     },
     /// Anything else, with the raw cause value.

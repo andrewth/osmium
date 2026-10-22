@@ -119,7 +119,8 @@ impl PageSize {
         match level {
             0 => Self::Size4K,
             1 => Self::Size2M,
-            _ => Self::Size1G,
+            2 => Self::Size1G,
+            _ => panic!("no leaf size above 1 GiB"), // find_leaf filters larger foreign leaves
         }
     }
 }
@@ -557,6 +558,10 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
                 return Err(UnmapError::NotMapped);
             }
             if F::is_leaf(pte, level) {
+                // A foreign leaf above 1 GiB (Sv48 512 GiB) has no `PageSize`; leave it alone.
+                if level > PageSize::Size1G.level() {
+                    return Err(UnmapError::NotMapped);
+                }
                 return Ok((e, level));
             }
             table = F::addr(pte, level);

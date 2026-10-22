@@ -87,6 +87,9 @@ impl<const N: usize> Executor<N> {
     }
 
     /// Polls every ready task once. Returns how many were polled.
+    ///
+    /// Each task is polled with its slot locked, so with interrupts masked
+    /// on this CPU; a task must not block or spin waiting for an interrupt.
     pub fn poll_once(&'static self) -> usize {
         self.pending.store(false, Ordering::Release);
         let mut polled = 0;
@@ -124,10 +127,14 @@ impl<const N: usize> Executor<N> {
     /// types cannot be named in a `static`: pin them in place with
     /// `core::pin::pin!` and pass them here.
     ///
-    /// Panics if the tasks do not fit. Requires `panic = "abort"`: an
-    /// unwinding panic would free the caller's frame while slots still
-    /// point into it.
-    pub fn run_with(&'static self, tasks: &mut [Pin<&mut (dyn Future<Output = ()> + Send)>]) -> ! {
+    /// Panics if the tasks do not fit.
+    ///
+    /// # Safety
+    ///
+    /// Panics must abort (`panic = "abort"`): an unwinding panic, from this
+    /// call or from a task, would free the caller's frame while the slots
+    /// still point into it, and a later poll would use freed memory.
+    pub unsafe fn run_with(&'static self, tasks: &mut [Pin<&mut (dyn Future<Output = ()> + Send)>]) -> ! {
         for task in tasks.iter_mut() {
             // SAFETY: this function never returns, so the caller's frame
             // (where the futures live) outlives every poll; with
@@ -141,8 +148,14 @@ impl<const N: usize> Executor<N> {
     /// Like [`Executor::run_with`], but returns once every task in the
     /// executor has finished, so firmware can go on (for example, hand off
     /// to an OS). Sound because no slot can still refer to the caller's
-    /// futures when it returns. Requires `panic = "abort"`.
-    pub fn run_to_completion(&'static self, tasks: &mut [Pin<&mut (dyn Future<Output = ()> + Send)>]) {
+    /// futures when it returns.
+    ///
+    /// # Safety
+    ///
+    /// Panics must abort (`panic = "abort"`): unwinding out of this call (a
+    /// full executor, a panicking task) would free the caller's frame while
+    /// unfinished slots still point into it.
+    pub unsafe fn run_to_completion(&'static self, tasks: &mut [Pin<&mut (dyn Future<Output = ()> + Send)>]) {
         for task in tasks.iter_mut() {
             // SAFETY: we return only when all slots are empty (every task
             // completed and was dropped from its slot), so the extended

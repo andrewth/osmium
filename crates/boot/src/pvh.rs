@@ -54,7 +54,8 @@ macro_rules! pvh_entry_note {
 /// and calls `ap_main`.
 ///
 /// The linker script must place `.text.entry` and `.bss.boot` and keep
-/// `.note.Xen`, all below 4 GiB.
+/// `.note.Xen`, all below 4 GiB. `osmium_boot_stack_top` must be below 2 GiB:
+/// the 64-bit entry loads it with a sign-extended 32-bit immediate.
 ///
 /// ```ignore
 /// osmium_boot::pvh_start!(kmain);

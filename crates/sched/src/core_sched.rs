@@ -208,7 +208,7 @@ fn current_ptr() -> *const Task {
 /// The core of the scheduler: optionally requeue the current task, pick the
 /// next one and switch to it.
 fn schedule(requeue: Option<EnqueueReason>) {
-    debug_assert_eq!(preempt::count(), 0, "scheduling while holding a spin lock");
+    assert_eq!(preempt::count(), 0, "scheduling while holding a spin lock");
     let irq_state = irq::save_and_disable();
     let cpu = cpu::current_id();
     let sched = scheduler();

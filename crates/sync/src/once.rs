@@ -14,6 +14,13 @@ const READY: u8 = 2;
 /// Contexts that race to initialize spin until the winner finishes. If the
 /// initializer panics, later callers spin forever; kernels normally abort on
 /// panic, so this is not handled.
+///
+/// Initialization must not be re-entered on the same CPU: if an interrupt
+/// handler (or the initializer itself) calls `call_once` on the same cell
+/// while its initializer is running, it spins forever waiting for the code it
+/// interrupted. Do not touch a cell from interrupt context unless it is
+/// known to be initialized (check [`Once::get`] there), or mask interrupts
+/// around the first access.
 pub struct Once<T> {
     state: AtomicU8,
     value: UnsafeCell<MaybeUninit<T>>,

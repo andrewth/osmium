@@ -305,13 +305,17 @@ impl<const LEVELS: usize, const VA_BITS: u32> PageTableFormat for Riscv<LEVELS, 
         // A and D are preset so hardware without A/D updating does not fault.
         let mut e = (pa.0 >> 12) << 10 | rv::V | rv::A;
         // W without R is reserved, so writable implies readable.
-        if f.contains(MapFlags::READ) || f.contains(MapFlags::WRITE) {
+        // Execute-only device memory is meaningless (X is dropped), and an entry with R=W=X=0 is a
+        // table pointer, so such a request becomes a readable mapping instead.
+        let exec = f.contains(MapFlags::EXEC) && !f.contains(MapFlags::DEVICE);
+        let device_exec_only = f.contains(MapFlags::EXEC) && !exec;
+        if f.contains(MapFlags::READ) || f.contains(MapFlags::WRITE) || device_exec_only {
             e |= rv::R;
         }
         if f.contains(MapFlags::WRITE) {
             e |= rv::W | rv::D;
         }
-        if f.contains(MapFlags::EXEC) && !f.contains(MapFlags::DEVICE) {
+        if exec {
             e |= rv::X;
         }
         if f.contains(MapFlags::USER) {

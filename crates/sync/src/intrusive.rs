@@ -9,7 +9,9 @@
 //! elements that embed a [`TreeLink`] and name their key with a [`KeyAdapter`].
 //! [`IntervalTree`](interval::IntervalTree) finds the elements whose `u64` ranges overlap a
 //! query range. None of the collections does any locking; wrap one in a [`SpinLock`](crate::SpinLock)
-//! to share one.
+//! to share one. The collections hold `NonNull` pointers, so they are neither `Send` nor `Sync`: to put
+//! one in a `static` or hand it to another CPU, wrap it in a type of your own with
+//! `unsafe impl Send`, justified by the elements being `Send` and only reachable through that lock.
 
 pub mod avltree;
 mod bst;

@@ -74,6 +74,10 @@ impl Ecam {
 
     fn offset(&self, addr: Address, offset: u16) -> Option<usize> {
         let bus = addr.bus.checked_sub(self.first_bus)? as usize;
+        // Offsets past the 4 KiB function space are not accessible (reads give all ones).
+        if offset >= 0x1000 {
+            return None;
+        }
         Some(bus << 20 | (addr.device as usize) << 15 | (addr.function as usize) << 12 | (offset as usize & 0xffc))
     }
 }
@@ -641,6 +645,14 @@ mod tests {
         assert_eq!(f.capabilities().count(), 48);
     }
 
+    /// Offsets of 4 KiB and up must not alias register 0.
+    fn backing_probe(ecam: &Ecam) {
+        ecam.write32(Address::new(0, 0, 0), 0, 0x1234);
+        assert_eq!(ecam.read32(Address::new(0, 0, 0), 0x1000), !0);
+        ecam.write32(Address::new(0, 0, 0), 0x1000, 0x5678);
+        assert_eq!(ecam.read32(Address::new(0, 0, 0), 0), 0x1234);
+    }
+
     #[test]
     fn ecam_offsets() {
         let mut backing = std::vec![0u32; (2 << 20) / 4];
@@ -650,6 +662,7 @@ mod tests {
         assert_eq!(ecam.max_bus(), 1);
         ecam.write32(Address::new(1, 3, 2), 0x10, 0xabcd);
         assert_eq!(ecam.read32(Address::new(5, 0, 0), 0), !0, "outside the window");
+        backing_probe(&ecam);
         drop(ecam);
         assert_eq!(backing[(1 << 20 | 3 << 15 | 2 << 12 | 0x10) / 4], 0xabcd);
     }

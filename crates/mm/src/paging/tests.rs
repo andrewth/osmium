@@ -156,6 +156,10 @@ fn encodings() {
     assert_eq!(X86_64::leaf(pa(0x20_0000), MapFlags::RX | MapFlags::GLOBAL, 1), 0x20_01a1);
     assert_eq!(Sv39::leaf(pa(0x8020_0000), MapFlags::RW, 0), 0x2008_00c7);
     assert_eq!(Sv39::table(pa(0x8020_1000)), 0x2008_0401);
+    // EXEC|DEVICE alone must not encode R=W=X=0, which is a table pointer above level 0.
+    let e = Sv39::leaf(pa(0x1000_0000), MapFlags::EXEC | MapFlags::DEVICE, 1);
+    assert!(Sv39::is_leaf(e, 1), "{e:#x}");
+    assert_eq!(e & 0b1110, 0b0010, "readable, not executable");
     // AArch64 kernel RX page: AF | SH inner | AP RO | nG clear | UXN | page | valid.
     assert_eq!(Aarch64::leaf(pa(0x4000_0000), MapFlags::RX | MapFlags::GLOBAL, 0), 0x0040_0000_4000_0783);
     assert_eq!(Ept::leaf(pa(0x1000), MapFlags::RW | MapFlags::EXEC, 0), 0x1077);

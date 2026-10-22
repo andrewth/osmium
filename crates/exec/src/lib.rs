@@ -33,7 +33,8 @@
 //!
 //! fn main_loop() -> ! {
 //!     // No heap: the futures live on this (never-returning) stack frame.
-//!     EXEC.run_with(&mut [pin!(echo()), pin!(heartbeat())])
+//!     // SAFETY: this program is built with `panic = "abort"`.
+//!     unsafe { EXEC.run_with(&mut [pin!(echo()), pin!(heartbeat())]) }
 //! }
 //! # let _ = (uart_irq, main_loop);
 //! ```

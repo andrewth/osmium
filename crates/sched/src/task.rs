@@ -214,9 +214,14 @@ impl Task {
     ///
     /// # Panics
     ///
-    /// If `cpu` is not below [`osmium_arch::MAX_CPUS`].
+    /// If `cpu` is not below [`osmium_arch::MAX_CPUS`], or the task's affinity
+    /// does not allow it (the scheduler could never run it there).
     pub fn set_cpu(&self, cpu: usize) {
         assert!(cpu < osmium_arch::MAX_CPUS);
+        assert!(
+            self.affinity().count_ones() == 1 || self.can_run_on(cpu),
+            "set_cpu: CPU {cpu} is outside the affinity"
+        );
         if self.affinity().count_ones() == 1 {
             self.affinity.store(1 << cpu, Ordering::Relaxed);
         }
@@ -488,5 +493,24 @@ impl TaskBuilder {
         let t = self.build(f);
         crate::spawn(t.clone());
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "outside the affinity")]
+    fn set_cpu_outside_affinity_panics() {
+        let t = TaskBuilder::new("t").affinity(1 << 2 | 1 << 3).build(|| {});
+        t.set_cpu(5);
+    }
+
+    #[test]
+    fn set_cpu_inside_affinity() {
+        let t = TaskBuilder::new("t").affinity(1 << 2 | 1 << 3).build(|| {});
+        t.set_cpu(3);
+        assert_eq!(t.cpu(), 3);
     }
 }

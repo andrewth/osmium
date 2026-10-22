@@ -39,12 +39,13 @@ const MAX_TABLE: usize = 1 << 20;
 impl<'src> Table<'src> {
     /// The four-byte signature (`b"APIC"`, `b"MCFG"`, ...).
     pub fn signature(&self) -> [u8; 4] {
-        self.data[..4].try_into().expect("fixed-width slice")
+        // `data` is public, so it may be shorter than a header: report an all-zero signature then.
+        self.data.get(..4).and_then(|s| s.try_into().ok()).unwrap_or([0; 4])
     }
 
     /// Table contents after the standard header.
     pub fn body(&self) -> &'src [u8] {
-        &self.data[HEADER..]
+        self.data.get(HEADER..).unwrap_or(&[])
     }
 }
 
@@ -168,8 +169,9 @@ impl<'src> Madt<'src> {
         let entries = body.get(8..)?;
         // A type-5 entry overrides the 32-bit address.
         for (typ, e) in Self::walk(entries) {
-            if typ == 5 {
-                addr = le64(e, 4)?;
+            // A truncated override entry is ignored rather than failing the whole table.
+            if let (5, Some(a)) = (typ, le64(e, 4)) {
+                addr = a;
             }
         }
         Some(Self { local_apic_addr: addr, entries })
@@ -381,6 +383,20 @@ mod tests {
         let sum = t.iter().fold(0u8, |a, &b| a.wrapping_add(b));
         t[9] = 0u8.wrapping_sub(sum);
         t
+    }
+
+    #[test]
+    fn short_tables_and_override_entries() {
+        let short = Table { data: b"AP" };
+        assert_eq!(short.signature(), [0; 4]);
+        assert!(short.body().is_empty());
+        let mut body = Vec::new();
+        body.extend_from_slice(&0xfee0_0000u32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&[5, 6, 0, 0, 1, 2]); // truncated LAPIC address override
+        let t = table(b"APIC", &body);
+        let madt = Madt::parse(Table { data: &t }).expect("a short override entry is skipped");
+        assert_eq!(madt.local_apic_addr(), 0xfee0_0000);
     }
 
     #[test]

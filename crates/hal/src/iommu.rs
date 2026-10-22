@@ -368,9 +368,14 @@ impl<'iommu, I: Iommu, A: TableAlloc, B: DmaAllocator> IommuDma<'iommu, I, A, B>
     ///
     /// Choose a window below [`Iommu::iova_limit`] that avoids the platform's
     /// reserved ranges (x86 reserves `0xfee0_0000..0xfef0_0000` for MSIs) and
-    /// the first page.
+    /// the first page. Returns [`IommuError::OutOfRange`] if the window is
+    /// above the limit or not page-aligned.
     pub fn new(domain: IoDomain<'iommu, I, A>, backing: &'iommu B, window: Range<u64>) -> Result<Self, IommuError> {
-        if window.end > domain.iommu.iova_limit() {
+        let page = PAGE_SIZE as u64;
+        if window.end > domain.iommu.iova_limit()
+            || !window.start.is_multiple_of(page)
+            || !window.end.is_multiple_of(page)
+        {
             return Err(IommuError::OutOfRange);
         }
         let iovas = IovaAllocator::new(window);
@@ -604,6 +609,13 @@ mod tests {
         d.attach(NIC).unwrap();
         drop(d);
         assert_ne!(tables.live.get(), 0, "tables kept: the device may still walk them");
+    }
+
+    #[test]
+    fn dma_window_must_be_page_aligned() {
+        let (iommu, tables, backing) = (FakeIommu::default(), HostTables::default(), HostDma::default());
+        let domain = IoDomain::new(&iommu, DomainId(2), &tables).unwrap();
+        assert_eq!(IommuDma::new(domain, &backing, 0x10_0010..0x20_0000).err(), Some(IommuError::OutOfRange));
     }
 
     #[test]

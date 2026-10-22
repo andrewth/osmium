@@ -103,6 +103,7 @@ impl TrapFrame {
                 };
                 Trap::PageFault { addr: self.cr2 as usize, access }
             }
+            // #AC reports no data address; the instruction address is all there is.
             17 => Trap::Misaligned { addr: self.rip as usize },
             SYSCALL_VECTOR => Trap::Syscall,
             v if v >= 32 => Trap::Interrupt(Interrupt::External),

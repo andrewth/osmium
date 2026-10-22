@@ -201,6 +201,9 @@ pub fn load(file: &[u8], info: &PeInfo, dest: &mut [u8], load_addr: u64) -> Resu
             match entry >> 12 {
                 REL_ABSOLUTE => {}
                 REL_DIR64 => {
+                    if at.checked_add(8).is_none_or(|e| e > size) {
+                        return Err(PeError::Malformed);
+                    }
                     let v = u64_at(dest, at)?.wrapping_add(delta);
                     dest[at..at + 8].copy_from_slice(&v.to_le_bytes());
                 }
@@ -231,8 +234,12 @@ fn for_each_fixup(image: &[u8], info: &PeInfo, mut f: impl FnMut(usize)) -> Resu
         return Ok(());
     }
     let size = info.size_of_image as usize;
+    // Every site is bounds-checked against `size_of_image`, so `image` must cover all of it.
+    if image.len() < size {
+        return Err(PeError::Malformed);
+    }
     let (start, len) = (info.reloc_rva as usize, info.reloc_size as usize);
-    let end = start.checked_add(len).filter(|&e| e <= size && e <= image.len()).ok_or(PeError::Malformed)?;
+    let end = start.checked_add(len).filter(|&e| e <= size).ok_or(PeError::Malformed)?;
     let mut off = start;
     while off + 8 <= end {
         let page = u32_at(image, off)? as usize;
@@ -401,6 +408,9 @@ mod tests {
         assert_eq!(collect_fixups(&mem, &info, &mut fx), Ok(1));
         assert_eq!(fx[0], Fixup { rva: 0x1008, reserved: 0, value: 0x20_0000 + 0x1234 });
         assert_eq!(collect_fixups(&mem, &info, &mut []), Err(PeError::BufferTooSmall));
+        // An image shorter than size_of_image is an error, not a panic.
+        assert_eq!(count_fixups(&mem[..0x1004], &info), Err(PeError::Malformed));
+        assert_eq!(collect_fixups(&mem[..0x1004], &info, &mut fx), Err(PeError::Malformed));
         // Moved to virtual base 0xffff_8000_0000_0000 (delta wraps).
         let delta = 0xffff_8000_0000_0000u64.wrapping_sub(0x20_0000);
         let mut moved = mem.clone();
