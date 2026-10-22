@@ -89,7 +89,6 @@ const _: () =
     assert!((SQ_ENTRIES as usize * SQ_STRIDE + RX_SLOTS as usize * RQ_STRIDE).div_ceil(PAGE) < PORT_MTTS as usize);
 
 /// Optional-parameter bits of the queue pair transition commands.
-#[allow(dead_code)] // the reliable connection ones are used once those exist
 pub(super) mod optpar {
     pub const RRE: u32 = 1 << 1;
     pub const RAE: u32 = 1 << 2;
@@ -135,6 +134,8 @@ pub(super) struct Received {
     pub src_path_bits: u8,
     pub pkey_index: u8,
     pub grh: bool,
+    /// For an error: why (the completion's syndrome).
+    pub syndrome: u8,
 }
 
 /// How far opening got, so closing undoes exactly that.
@@ -164,7 +165,9 @@ pub(super) struct QpSetup<'f> {
     /// datagram, 7 raw Ethernet or "MLX" (the special queue pairs).
     pub service: u32,
     /// The context's MTU (high 3 bits) and maximum message size (low 5, as
-    /// a power of two).
+    /// a power of two), in the first transition and in the others (a
+    /// reliable connection's path MTU is not known before it is connected).
+    pub init_mtu_msgmax: u32,
     pub mtu_msgmax: u32,
     /// Optional-parameter masks of the three transitions ([`optpar`]).
     pub init_optpar: u32,
@@ -190,6 +193,8 @@ pub(super) struct Queues<'h, 'd, D: DmaAllocator + ?Sized> {
     /// Send entries posted and completed.
     pub tx_head: u32,
     pub tx_done: u32,
+    /// How each completed send ended (0: well), by completion number.
+    pub tx_syndrome: [u8; SQ_ENTRIES as usize],
     /// Receive entries handed to the device.
     rx_posted: u32,
     /// Packets reaped from the completion queue but not yet taken,
@@ -236,6 +241,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
             cq_ci: 0,
             tx_head: 0,
             tx_done: 0,
+            tx_syndrome: [0; SQ_ENTRIES as usize],
             rx_posted: 0,
             rx_ready: [Received::default(); RX_SLOTS as usize],
             rx_ready_head: 0,
@@ -307,9 +313,10 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
     /// completion queues.
     fn context(&self, setup: &QpSetup<'_>, state: u32) -> Ctx {
         let mut c = Ctx::new();
+        let mtu_msgmax = if state == 1 { setup.init_mtu_msgmax } else { setup.mtu_msgmax };
         c.set(2, 28, 4, state).set(2, 16, 4, setup.service).set(2, 11, 2, 3); // path migration: migrated
         c.set(3, 0, 24, PD);
-        c.set(4, 24, 8, setup.mtu_msgmax);
+        c.set(4, 24, 8, mtu_msgmax);
         c.set(4, 19, 4, log2_ceil(RX_SLOTS)).set(4, 16, 3, RQ_STRIDE.trailing_zeros() - 4);
         c.set(4, 11, 4, log2_ceil(SQ_ENTRIES)).set(4, 8, 3, SQ_STRIDE.trailing_zeros() - 4);
         c.set(5, 0, 24, UAR_PAGE).set(6, 0, 24, self.qpn);
@@ -409,7 +416,10 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
             }
             osmium_arch::barrier::dma_rmb();
             let error = tail & 0x1f == CQE_OPCODE_ERROR;
+            // An error completion says why in the low byte of its fourth dword.
+            let syndrome = if error { get32(cq, off + 24) as u8 } else { 0 };
             if tail & 0x40 != 0 {
+                self.tx_syndrome[self.tx_done as usize % SQ_ENTRIES as usize] = syndrome;
                 self.tx_done = self.tx_done.wrapping_add(1);
             } else {
                 let slot = (get32(cq, off + 24) >> 16) as u16 % RX_SLOTS as u16;
@@ -432,6 +442,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
                     src_path_bits: (source >> 24 & 0x7f) as u8,
                     pkey_index: (get32(cq, off + 4) & 0x7f) as u8,
                     grh: source >> 31 != 0,
+                    syndrome,
                 };
                 self.rx_ready_count += 1;
             }
@@ -544,7 +555,10 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
         self.rearm_if_fired();
     }
 
-    fn close(&mut self) {
+    /// Takes the queue pair and completion queue back from the adapter (the
+    /// port is closed first if this set started it). Nothing it was given
+    /// is touched afterwards, so its memory can be freed or reused.
+    pub fn shutdown(&mut self) {
         let hcr = &self.hca.hcr;
         let leak = |r: Result<u64, Mlx4Error>| {
             if r.is_err() {
@@ -563,12 +577,13 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
             let mut cqc = Ctx::new();
             leak(hcr.exec_out(op::HW2SW_CQ, 0, self.cqn, Input::None, &mut cqc, 64).map(|_| 0));
         }
+        self.stage = Stage::default();
     }
 }
 
 impl<D: DmaAllocator + ?Sized> Drop for Queues<'_, '_, D> {
     fn drop(&mut self) {
-        self.close();
+        self.shutdown();
         if !self.hca.hcr.is_wedged() {
             // SAFETY: dropped once, here; the device no longer uses it.
             unsafe { ManuallyDrop::drop(&mut self.mem) }

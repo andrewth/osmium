@@ -31,13 +31,16 @@ use osmium_hal::dma::DmaAllocator;
 use osmium_hal::net::NetError;
 
 use super::cmd::{Ctx, Input, op};
+mod rc;
+
 use super::mad::{self, CLASS_PERF, GrhFields, LID_PERMISSIVE, MAD_LEN, MadWc, QP1_QKEY, UdHeader};
 use super::queue::{
-    CTRL_COMPLETE, Geometry, OPCODE_SEND, QpSetup, Queues, SEG_LEN, SET_DATA, SET_QP0, SET_QP1, optpar,
+    CTRL_COMPLETE, Geometry, OPCODE_SEND, QpSetup, Queues, RC_QPS, SEG_LEN, SET_DATA, SET_QP0, SET_QP1, optpar,
 };
 use super::{LOG_NUM_MCGS, MCG_ENTRY_LEN, Mlx4, Mlx4Error, PD, put32};
 
 pub use super::mad::GRH_LEN;
+pub use rc::{MAX_MESSAGE, RcEvent, RcFailure, RcId, RcInfo, RcParams, RcState, RcWindow, WINDOW_LEN};
 
 /// The IB MTU enumeration value of 4096 bytes.
 const IB_MTU_4096: u32 = 5;
@@ -296,6 +299,7 @@ fn with_special_setup<R>(qkey: u32, sched: u32, port: u32, f: impl FnOnce(&QpSet
     };
     f(&QpSetup {
         service: 7, // "MLX": the header is built in the send entry
+        init_mtu_msgmax: MTU_MSGMAX_SPECIAL,
         mtu_msgmax: MTU_MSGMAX_SPECIAL,
         init_optpar: optpar::PKEY_INDEX | optpar::Q_KEY,
         rtr_optpar: 0,
@@ -318,6 +322,7 @@ fn with_ud_setup<R>(qkey: u32, port: u32, f: impl FnOnce(&QpSetup<'_>) -> R) -> 
     };
     f(&QpSetup {
         service: 3, // unreliable datagram
+        init_mtu_msgmax: MTU_MSGMAX_UD,
         mtu_msgmax: MTU_MSGMAX_UD,
         init_optpar: optpar::PKEY_INDEX | optpar::Q_KEY,
         rtr_optpar: 0,
@@ -466,6 +471,7 @@ pub struct IbPort<'h, 'd, D: DmaAllocator + ?Sized> {
     // Dropped in this order: queue pair 0 last, since resetting it is what
     // closes the port.
     ud: Queues<'h, 'd, D>,
+    rc: [Option<rc::Rc<'h, 'd, D>>; RC_QPS as usize],
     gsi: Special<'h, 'd, D>,
     smi: Special<'h, 'd, D>,
     qkey: u32,
@@ -531,6 +537,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
 
         let mut ib = Self {
             ud,
+            rc: [const { None }; RC_QPS as usize],
             gsi,
             smi,
             qkey,
@@ -675,7 +682,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
     /// Does the work the port needs done to stay on the fabric: answers the
     /// subnet manager's packets on queue pair 0 and performance queries on
     /// queue pair 1, and keeps other general services datagrams for
-    /// [`take_general`](Self::take_general). Call it whenever a completion
+    /// the subnet administration client. Call it whenever a completion
     /// may have arrived (after an interrupt, or from the idle loop); a port
     /// whose queue pair 0 is not served cannot be configured and times out
     /// on the fabric.

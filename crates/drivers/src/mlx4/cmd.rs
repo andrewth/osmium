@@ -25,6 +25,7 @@ pub mod op {
     pub const CLOSE_PORT: u16 = 0x00a;
     pub const SET_PORT: u16 = 0x00c;
     pub const SW2HW_MPT: u16 = 0x00d;
+    pub const HW2SW_MPT: u16 = 0x00f;
     pub const WRITE_MTT: u16 = 0x011;
     pub const MAP_EQ: u16 = 0x012;
     pub const SW2HW_EQ: u16 = 0x013;

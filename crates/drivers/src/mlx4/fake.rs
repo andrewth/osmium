@@ -260,8 +260,61 @@ pub fn mgid_hash(gid: &[u8; 16]) -> u32 {
     gid.iter().fold(0u32, |a, &b| a.wrapping_mul(31).wrapping_add(b as u32)) & 127
 }
 
+/// What a reliable connection's transitions told the firmware, and where
+/// its packet sequence numbers stand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RcCtx {
+    pub pkey_index: u32,
+    /// Remote access at INIT and at RTR: bit 2 read, bit 1 write, bit 0 atomic.
+    pub init_access: u32,
+    pub access: u32,
+    pub remote_qpn: u32,
+    pub dlid: u32,
+    pub grh: bool,
+    pub path_bits: u32,
+    pub sched_queue: u32,
+    pub sgid_index: u32,
+    pub hop_limit: u32,
+    pub tclass_flow: u32,
+    pub dgid: [u8; 16],
+    pub max_dest_rd_log: u32,
+    pub rq_psn: u32,
+    pub min_rnr_timer: u32,
+    pub ack_timeout: u32,
+    pub retry: u32,
+    pub rnr_retry: u32,
+    pub max_rd_log: u32,
+    pub sq_psn: u32,
+    /// The path MTU in bytes.
+    pub mtu_bytes: u32,
+    /// The next packet number this end sends, and expects from the peer.
+    pub send_psn: u32,
+    pub recv_psn: u32,
+}
+
+/// A memory region the adapter holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mr {
+    pub key: u32,
+    pub start: u64,
+    pub len: u64,
+    /// The permission bits of the table entry (local read 10, local write 11,
+    /// remote read 12, remote write 13, atomic 14).
+    pub access: u32,
+}
+
+/// What a completion queue entry reports.
+#[derive(Clone, Copy)]
+enum Cqe {
+    /// Success, with this opcode.
+    Ok(u32),
+    /// Failure, with this syndrome.
+    Err(u8),
+}
+
 #[derive(Default, Debug)]
 struct Qp {
+    rc: RcCtx,
     service: u32,
     pkey_index: u32,
     qkey: u32,
@@ -315,6 +368,8 @@ pub struct Firmware {
     pub ib_set: [Option<(u32, u32)>; 2],
     /// INIT_PORT has run on this InfiniBand port.
     pub ib_init: [bool; 2],
+    /// The memory regions, by table index.
+    pub mrs: BTreeMap<u32, Mr>,
     /// Management datagrams the firmware agent was asked to answer.
     pub mad_ifc: Vec<MadIfcCall>,
     /// Multicast group table entries in use, by index (16 dwords each).
@@ -610,7 +665,9 @@ impl FakeHca {
                 c[6] = RSVD_EQS << 24 | RSVD_CQS_LOG << 8;
                 c[8] = RSVD_MTTS_LOG << 28 | RSVD_MRWS_LOG << 8;
                 c[11] = if s.max_gso > 0 { 0x20 | s.max_gso.trailing_zeros() } else { 0 } << 16;
+                c[10] = 6 << 16 | 6;
                 c[13] = 2;
+                c[14] = 31 << 24;
                 c[17] = (s.dpdp as u32) << 12;
                 c[18] = RSVD_UARS << 28;
                 c[32] = 256;
@@ -663,11 +720,27 @@ impl FakeHca {
             }
             op::CLOSE_HCA => fw.hca_up = false,
             op::SW2HW_MPT => {
-                assert_eq!(in_mod, 1 << RSVD_MRWS_LOG);
                 let m = self.mailbox(16);
-                assert_eq!(m[0] & 1 << 9, 1 << 9, "physical addressing");
-                assert_eq!(m[10] & 1 << 22, 1 << 22, "covers everything");
-                fw.lkey = Some(m[2].rotate_left(8));
+                assert_eq!(m[0] >> 28, 0xf, "owned by the adapter");
+                assert_eq!(m[0] & (1 << 17 | 1 << 9 | 1 << 8), 1 << 17 | 1 << 9 | 1 << 8, "a physical-address region");
+                assert_eq!(m[3], PD | 3 << 24, "protection domain");
+                let (start, len) = ((m[4] as u64) << 32 | m[5] as u64, (m[6] as u64) << 32 | m[7] as u64);
+                let access = m[0] & 0x7c00;
+                if in_mod == 1 << RSVD_MRWS_LOG {
+                    // The one the work queue entries use: everything, for the adapter only.
+                    assert_eq!((start, len, access), (0, u64::MAX, 3 << 10), "local access to everything, no remote");
+                    fw.lkey = Some(m[2].rotate_left(8));
+                } else {
+                    assert!(in_mod > 1 << RSVD_MRWS_LOG && in_mod < 1 << (RSVD_MRWS_LOG + 1), "a window's table entry");
+                    assert!(len > 0 && len < u64::MAX, "a window is a bounded range");
+                }
+                if fw.mrs.insert(in_mod, Mr { key: m[2], start, len, access }).is_some() {
+                    return Err(BAD_STATE);
+                }
+            }
+            op::HW2SW_MPT => {
+                assert_eq!(op_mod, 1, "no output wanted");
+                fw.mrs.remove(&in_mod).ok_or(BAD_STATE)?;
             }
             op::WRITE_MTT => {
                 let m = self.mailbox(4 + 2 * in_mod as usize);
@@ -771,9 +844,13 @@ impl FakeHca {
                     (7, false) => assert_eq!((c[0], mtu_msgmax), (0, 7 << 5 | 31), "raw Ethernet"),
                     (7, true) => assert_eq!((c[0], mtu_msgmax), (0x30, 5 << 5 | 11), "special queue pair"),
                     (3, _) => assert_eq!((c[0], mtu_msgmax), (0x30, 5 << 5 | 13), "datagram queue pair"),
-                    _ => {}
+                    // The MTU is the connection's, not known yet; the key and write access are
+                    // named, and the read access is held back until there are responder resources.
+                    (0, _) => assert_eq!((c[0], mtu_msgmax, c[38] >> 13 & 7), (0x1e, 0, 2), "reliable connection"),
+                    _ => unreachable!(),
                 }
                 let qp = Qp {
+                    rc: RcCtx { pkey_index: c[8] & 0xff, init_access: c[38] >> 13 & 7, ..RcCtx::default() },
                     service,
                     special,
                     mtu_msgmax,
@@ -806,11 +883,43 @@ impl FakeHca {
                 }
                 assert_eq!(c[2] >> 28, to as u32, "entering the next state");
                 assert_eq!(c[2] >> 16 & 0xf, qp.service, "service type in every transition");
+                if qp.service == 0 && opcode == op::INIT2RTR_QP {
+                    qp.mtu_msgmax = c[4] >> 24;
+                }
                 assert_eq!(c[4] >> 24, qp.mtu_msgmax, "MTU and message size in every transition");
                 if opcode == op::INIT2RTR_QP {
                     qp.sched_queue = c[16] >> 24;
-                    if qp.special && qp.sched_queue & 0x3f == 0x3f {
-                        // queue pair 0 has its own schedule queue
+                }
+                if qp.service == 0 {
+                    let r = &mut qp.rc;
+                    match opcode {
+                        op::INIT2RTR_QP => {
+                            // Primary path, schedule queue, RNR timeout, responder resources, access.
+                            assert_eq!(c[0], 1 << 7 | 1 << 16 | 1 << 6 | 1 << 9 | 0xe, "optional parameters");
+                            assert_eq!(c[4] >> 24 & 0x1f, 31, "maximum message size from the device");
+                            r.mtu_bytes = 128 << (c[4] >> 29);
+                            r.remote_qpn = c[7] & 0xff_ffff;
+                            r.dlid = c[9] & 0xffff;
+                            r.grh = c[9] >> 16 & 0x80 != 0;
+                            r.path_bits = c[9] >> 16 & 0x7f;
+                            (r.sgid_index, r.hop_limit) = (c[10] >> 16 & 0xff, c[10] & 0xff);
+                            r.tclass_flow = c[11];
+                            for i in 0..4 {
+                                r.dgid[4 * i..4 * i + 4].copy_from_slice(&c[12 + i].to_be_bytes());
+                            }
+                            r.sched_queue = c[16] >> 24;
+                            r.max_dest_rd_log = c[38] >> 21 & 7;
+                            r.access = c[38] >> 13 & 7;
+                            (r.rq_psn, r.min_rnr_timer) = (c[39] & 0xff_ffff, c[39] >> 24 & 0x1f);
+                            r.recv_psn = r.rq_psn;
+                        }
+                        _ => {
+                            assert_eq!(c[0], 1 << 14 | 1 << 12 | 1 << 13 | 1 << 8, "optional parameters");
+                            r.ack_timeout = c[10] >> 27;
+                            (r.retry, r.rnr_retry, r.max_rd_log) = (c[30] >> 16 & 7, c[30] >> 13 & 7, c[30] >> 21 & 7);
+                            r.sq_psn = c[32] & 0xff_ffff;
+                            r.send_psn = r.sq_psn;
+                        }
                     }
                 }
                 qp.state = to;
@@ -935,7 +1044,8 @@ impl FakeHca {
     /// Writes a completion for entry `counter` of `qpn`'s send or receive
     /// queue, and queues an event if its completion queue is armed.
     fn complete(&self, fw: &mut Firmware, qpn: u32, send: bool, counter: u32, len: u32, csum: (u16, u16)) {
-        self.complete_ud(fw, qpn, send, counter, len, csum, (0, 0, 0));
+        let cqe = Cqe::Ok(if send { 0x0a } else { 1 });
+        self.complete_ud(fw, qpn, send, counter, len, csum, (0, 0, 0), cqe);
     }
 
     /// Like [`complete`](Self::complete), with the sender fields of a
@@ -950,6 +1060,7 @@ impl FakeHca {
         len: u32,
         csum: (u16, u16),
         sender: (u32, u32, u32),
+        cqe: Cqe,
     ) {
         let (status, checksum) = csum;
         let qp = &fw.qps[&qpn];
@@ -965,9 +1076,18 @@ impl FakeHca {
         wr(pa + 12, sender.1);
         wr(pa + 16, (status as u32) << 16);
         wr(pa + 20, len);
-        wr(pa + 24, counter << 16 | checksum as u32);
         let owner = (cq.pi / n) & 1;
-        wr(pa + 28, owner << 7 | (send as u32) << 6 | if send { 0x0a } else { 0 });
+        match cqe {
+            Cqe::Ok(opcode) => {
+                wr(pa + 24, counter << 16 | checksum as u32);
+                wr(pa + 28, owner << 7 | (send as u32) << 6 | opcode);
+            }
+            // An error completion: the entry, the vendor syndrome and the syndrome.
+            Cqe::Err(syndrome) => {
+                wr(pa + 24, counter << 16 | syndrome as u32);
+                wr(pa + 28, owner << 7 | (send as u32) << 6 | 0x1e);
+            }
+        }
         // Armed by the queue's arm record (written just before its doorbell)
         // not yet spent on an event.
         let record = rd(cq.db + 4);
@@ -1144,6 +1264,152 @@ impl FakeHca {
         }
         self.flush_events(&mut s);
         frames
+    }
+
+    /// The state of queue pair `qpn`: 1 INIT, 2 RTR, 3 RTS, 6 error.
+    pub fn qp_state(&self, qpn: u32) -> u8 {
+        self.state.borrow().fw.qps[&qpn].state
+    }
+
+    /// Where a reliable connection stands.
+    pub fn rc_ctx(&self, qpn: u32) -> RcCtx {
+        self.state.borrow().fw.qps[&qpn].rc.clone()
+    }
+
+    /// Runs the send engine of reliable connection `qpn` against its peer
+    /// (another queue pair of this adapter): executes the entries posted,
+    /// as far as the peer allows, and returns how many it finished. A send
+    /// to a peer with no receive ready waits there, or fails after the
+    /// retries the connection allows.
+    pub fn rc_run(&self, qpn: u32) -> usize {
+        let mut s = self.state.borrow_mut();
+        let mut done = 0;
+        loop {
+            let mut fw = core::mem::take(&mut s.fw);
+            let progressed = self.rc_step(&mut fw, qpn);
+            s.fw = fw;
+            if !progressed {
+                break;
+            }
+            done += 1;
+        }
+        self.flush_events(&mut s);
+        done
+    }
+
+    fn rc_step(&self, fw: &mut Firmware, qpn: u32) -> bool {
+        let qp = &fw.qps[&qpn];
+        assert_eq!(qp.service, 0, "a reliable connection");
+        assert!(qp.state >= 3, "sending from a queue pair not in RTS");
+        let (n, stride) = (1u32 << qp.log_sq, 1usize << qp.log_sq_stride);
+        let wqe = Self::translate(fw, qp.mtt, (qp.sq_next % n) as usize * stride);
+        let ctrl = rd(wqe);
+        if ctrl >> 31 != (qp.sq_next / n) & 1 {
+            return false;
+        }
+        let counter = qp.sq_next & 0xffff;
+        let advance = |fw: &mut Firmware| fw.qps.get_mut(&qpn).unwrap().sq_next += 1;
+        if qp.state == 6 {
+            advance(fw);
+            self.complete_ud(fw, qpn, true, counter, 0, (0, 0), (0, 0, 0), Cqe::Err(5)); // flushed
+            return true;
+        }
+        let (opcode, size) = (ctrl & 0x1f, rd(wqe + 4) & 0x3f);
+        assert_eq!(rd(wqe + 8) & 0xe, 0xe, "completion and solicited");
+        let mut at = wqe + 16;
+        let remote = (opcode != 0x0a).then(|| {
+            let r = ((rd(at) as u64) << 32 | rd(at + 4) as u64, rd(at + 8));
+            at += 16;
+            r
+        });
+        let (len, lkey) = (rd(at) as usize, rd(at + 4));
+        let local = (rd(at + 8) as u64) << 32 | rd(at + 12) as u64;
+        assert_eq!(Some(lkey), fw.lkey, "lkey");
+        assert_eq!(size as u64 * 16, at + 16 - wqe, "the entry size covers exactly its segments");
+
+        let me = &qp.rc;
+        let peer_qpn = me.remote_qpn;
+        let peer = fw.qps.get(&peer_qpn).filter(|p| p.service == 0 && p.state >= 2 && p.rc.remote_qpn == qpn);
+        let (rnr_retry, mtu) = (me.rnr_retry, me.mtu_bytes as usize);
+        let packets = len.div_ceil(mtu).max(1) as u32;
+        let step: Result<Option<u32>, u8> = match peer {
+            None => Err(0x15), // nobody answers: retries exceeded
+            Some(peer) if peer.state == 6 => Err(0x15),
+            Some(peer) => {
+                assert_eq!(me.send_psn & 0xff_ffff, peer.rc.recv_psn & 0xff_ffff, "packet sequence numbers agree");
+                match opcode {
+                    0x0a => {
+                        let posted = rd(peer.db) & 0xffff;
+                        if peer.rq_next & 0xffff == posted {
+                            if rnr_retry == 7 { Ok(None) } else { Err(0x16) }
+                        } else {
+                            let (rn, rstride) = (1u32 << peer.log_rq, 1usize << peer.log_rq_stride);
+                            let sq_len = (1usize << peer.log_sq) << peer.log_sq_stride;
+                            let rwqe = Self::translate(fw, peer.mtt, sq_len + (peer.rq_next % rn) as usize * rstride);
+                            let room = rd(rwqe) as usize;
+                            let raddr = (rd(rwqe + 8) as u64) << 32 | rd(rwqe + 12) as u64;
+                            let rcounter = peer.rq_next & 0xffff;
+                            if len > room {
+                                // The message does not fit: the receiver fails, and so does the sender.
+                                let p = fw.qps.get_mut(&peer_qpn).unwrap();
+                                (p.rq_next, p.state) = (p.rq_next + 1, 6);
+                                self.complete_ud(fw, peer_qpn, false, rcounter, 0, (0, 0), (0, 0, 0), Cqe::Err(1));
+                                Err(0x14)
+                            } else {
+                                // SAFETY: both are driver buffers, identity-mapped.
+                                unsafe { core::ptr::copy_nonoverlapping(local as *const u8, raddr as *mut u8, len) };
+                                fw.qps.get_mut(&peer_qpn).unwrap().rq_next += 1;
+                                self.complete_ud(
+                                    fw,
+                                    peer_qpn,
+                                    false,
+                                    rcounter,
+                                    len as u32,
+                                    (0, 0),
+                                    (0, 0, 0),
+                                    Cqe::Ok(1),
+                                );
+                                Ok(Some(0))
+                            }
+                        }
+                    }
+                    0x08 | 0x10 => {
+                        let (raddr, rkey) = remote.unwrap();
+                        let (need, granted) = if opcode == 0x08 { (1 << 13, 2) } else { (1 << 12, 4) };
+                        let region = fw.mrs.values().find(|m| m.key == rkey.rotate_right(8));
+                        let fits = |m: &Mr| {
+                            m.access & need != 0
+                                && raddr >= m.start
+                                && raddr.checked_add(len as u64).is_some_and(|end| end <= m.start.saturating_add(m.len))
+                        };
+                        if !region.is_some_and(fits) || peer.rc.access & granted == 0 {
+                            Err(0x13) // remote access error
+                        } else {
+                            let (from, to) = if opcode == 0x08 { (local, raddr) } else { (raddr, local) };
+                            // SAFETY: the driver's buffers, identity-mapped, checked against the region.
+                            unsafe { core::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, len) };
+                            Ok(Some(if opcode == 0x10 { len as u32 } else { 0 }))
+                        }
+                    }
+                    other => panic!("unexpected reliable connection opcode {other:#x}"),
+                }
+            }
+        };
+        match step {
+            Ok(None) => return false, // waiting for the peer
+            Ok(Some(bytes)) => {
+                fw.qps.get_mut(&qpn).unwrap().rc.send_psn += packets;
+                fw.qps.get_mut(&peer_qpn).unwrap().rc.recv_psn += packets;
+                advance(fw);
+                self.complete_ud(fw, qpn, true, counter, bytes, (0, 0), (0, 0, 0), Cqe::Ok(opcode));
+            }
+            Err(syndrome) => {
+                advance(fw);
+                fw.qps.get_mut(&qpn).unwrap().state = 6;
+                self.complete_ud(fw, qpn, true, counter, 0, (0, 0), (0, 0, 0), Cqe::Err(syndrome));
+            }
+        }
+        true
     }
 
     /// Runs the receive engine for one frame arriving on `port`. Returns
@@ -1424,7 +1690,8 @@ impl FakeHca {
         fw.qps.get_mut(&qpn).unwrap().rq_next += 1;
         let source = (grh.is_some() as u32) << 31 | (from.path_bits as u32 & 0x7f) << 24 | from.qpn & 0xff_ffff;
         let route = (from.sl as u32) << 28 | from.lid as u32;
-        self.complete_ud(fw, qpn, false, counter, total as u32, (0, 0), (source, route, pkey_index as u32));
+        let sender = (source, route, pkey_index as u32);
+        self.complete_ud(fw, qpn, false, counter, total as u32, (0, 0), sender, Cqe::Ok(1));
         true
     }
 

@@ -163,7 +163,8 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
     fn create_qp(&mut self) -> Result<(), Mlx4Error> {
         let port = self.q.port as u32;
         self.q.create_qp(&QpSetup {
-            service: 7,              // raw Ethernet ("MLX")
+            service: 7, // raw Ethernet ("MLX")
+            init_mtu_msgmax: 7 << 5 | 31,
             mtu_msgmax: 7 << 5 | 31, // Ethernet MTU, largest message
             init_optpar: 0,
             rtr_optpar: 0,

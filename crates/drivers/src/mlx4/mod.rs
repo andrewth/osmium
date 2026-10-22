@@ -68,6 +68,8 @@ mod fake;
 mod tests_ib;
 #[cfg(test)]
 mod tests_ipoib;
+#[cfg(test)]
+mod tests_rc;
 
 use core::cell::Cell;
 use core::mem::ManuallyDrop;
@@ -81,6 +83,7 @@ use osmium_hal::timer::Clock;
 use cmd::{Ctx, Hcr, Input, MTTS_PER_WRITE, op};
 pub use eth::{EthPort, Offloads, RxChecksum, TSO_MAX_HEADER, Tso, TxError, TxOffload};
 pub use ib::{Datagram, Destination, Gid, GlobalHeader, IbPort, PortInfo, PortState, Route};
+pub use ib::{MAX_MESSAGE, RcEvent, RcFailure, RcId, RcInfo, RcParams, RcState, RcWindow, WINDOW_LEN};
 pub use ipoib::IpoibPort;
 use mad::MAD_LEN;
 pub use sa::{Group, JoinError};
@@ -143,6 +146,9 @@ const PORT_MTTS: u32 = 3;
 /// The asynchronous and completion event queues' MTT entries come first,
 /// then each set's.
 const MAX_MTTS: u32 = EQ_MTTS + PORT_MTTS * MAX_SETS;
+/// Memory regions for reliable connections' RDMA windows, after the one
+/// covering everything.
+const RC_WINDOWS: u32 = queue::RC_QPS as u32 * MAX_PORTS as u32;
 const EQ_MTTS: u32 = 2;
 
 const NUM_EQES: u32 = 8;
@@ -161,6 +167,18 @@ const EQ_STATE_FIRED: u32 = 0xa;
 pub const VECTOR_ASYNC: u16 = 0;
 /// MSI-X vector of the completion event queue.
 pub const VECTOR_COMPLETION: u16 = 1;
+
+// Memory region table entry flags and permissions.
+const MPT_SW_OWNS: u32 = 0xf << 28;
+const MPT_MIO: u32 = 1 << 17;
+const MPT_PHYSICAL: u32 = 1 << 9;
+const MPT_REGION: u32 = 1 << 8;
+const MPT_LOCAL_READ: u32 = 1 << 10;
+const MPT_LOCAL_WRITE: u32 = 1 << 11;
+const MPT_REMOTE_READ: u32 = 1 << 12;
+const MPT_REMOTE_WRITE: u32 = 1 << 13;
+/// Protection domain flag: the region can be invalidated by a send.
+const MPT_PD_EN_INV: u32 = 3 << 24;
 
 /// The protection domain of every queue and memory region.
 const PD: u32 = 0x12_3456;
@@ -208,6 +226,8 @@ pub enum Mlx4Error {
     /// The firmware's subnet management agent rejected a management
     /// datagram query; the value is the MAD status.
     Mad(u16),
+    /// An argument is outside what the port or the adapter can do.
+    BadParameter,
     /// A multicast group could not be attached: its table entry belongs to
     /// another group or is full, or the port already has as many groups as
     /// it tracks.
@@ -243,6 +263,11 @@ struct Caps {
     dpdp: bool,
     /// Largest LSO frame, or 0 if the device cannot segment.
     max_gso: u32,
+    /// log2 of the largest message, and of the RDMA reads a queue pair can
+    /// have outstanding as requester and as responder.
+    log_max_msg_sz: u32,
+    log_max_req_rd: u32,
+    log_max_res_rd: u32,
 }
 
 impl Caps {
@@ -271,6 +296,9 @@ impl Caps {
             num_ports: (c.get(13, 0, 4) as u8).min(MAX_PORTS),
             dpdp: c.get(17, 12, 1) != 0,
             max_gso: if c.get(11, 21, 1) != 0 { 1 << c.get(11, 16, 5) } else { 0 },
+            log_max_msg_sz: c.get(14, 24, 5),
+            log_max_req_rd: c.get(10, 16, 6),
+            log_max_res_rd: c.get(10, 0, 6),
         };
         let sizes = [
             caps.qpc_entry,
@@ -327,7 +355,7 @@ fn plan_icm(caps: &Caps) -> IcmPlan {
     let log_cqs = log2_ceil(caps.reserved_cqs + MAX_CQS);
     let log_eqs = log2_ceil((caps.reserved_eqs + MAX_EQS).max(caps.comp_eqn() + 1));
     let log_mtts = log2_ceil(caps.reserved_mtts + MAX_MTTS);
-    let log_mpts = log2_ceil(caps.reserved_mrws + 1);
+    let log_mpts = log2_ceil(caps.reserved_mrws + 1 + RC_WINDOWS);
     let page_up = |n: u64| n.next_multiple_of(PAGE as u64) as usize;
 
     let mut regions = [IcmRegion::default(); 5];
@@ -405,6 +433,7 @@ struct Stage {
     /// Bytes of each ICM region mapped so far.
     icm_mapped: [usize; 5],
     hca_up: bool,
+    mpt_hw: bool,
     eq_hw: bool,
     eq_mapped: bool,
     comp_eq_hw: bool,
@@ -434,6 +463,9 @@ pub struct Mlx4<'d, D: DmaAllocator + ?Sized> {
     /// Per completion queue: events seen so far, which the arm doorbell
     /// carries so the device can tell a fresh request from a stale one.
     arm_sn: [Cell<u8>; MAX_SETS as usize],
+    /// Per RDMA window: how many times it has been registered, so each
+    /// registration has a key of its own.
+    window_variant: [Cell<u8>; RC_WINDOWS as usize],
     /// Bit `n` set: port `n + 1` is open / its link is up.
     open: Cell<u8>,
     link: Cell<u8>,
@@ -482,6 +514,7 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
             msix: None,
             comp_eqn: None,
             arm_sn: Default::default(),
+            window_variant: Default::default(),
             open: Cell::new(0),
             link: Cell::new(0),
         };
@@ -585,15 +618,47 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
     }
 
     /// One physical-address memory region over everything, so work queue
-    /// entries can carry bus addresses directly.
+    /// entries can carry bus addresses directly. Only the adapter itself may
+    /// use it: it grants no access to the other end of a connection.
     fn setup_mpt(&mut self) -> Result<(), Mlx4Error> {
         let key = self.caps.reserved_mrws | MKEY_PREFIX;
         self.lkey = key.rotate_left(8);
+        self.write_mpt(self.caps.reserved_mrws, key, 0, u64::MAX, MPT_LOCAL_READ | MPT_LOCAL_WRITE)?;
+        self.stage.mpt_hw = true;
+        Ok(())
+    }
+
+    /// Hands memory region `index` to the adapter: physical addresses
+    /// `start..start + len` (as `mlx4_ib`'s DMA regions are), with the
+    /// permissions in `access`; `key` is the value in its table entry.
+    fn write_mpt(&self, index: u32, key: u32, start: u64, len: u64, access: u32) -> Result<(), Mlx4Error> {
         let mut mpt = Ctx::new();
-        // Region, physical addressing, local and remote read/write, atomic.
-        mpt.set(0, 8, 7, 0x7f);
-        mpt.set(2, 0, 32, key).set(3, 0, 24, PD).set(10, 22, 1, 1); // len64: the whole space
-        self.hcr.exec(op::SW2HW_MPT, 0, self.caps.reserved_mrws, Input::Mailbox(&mpt, 64)).map(drop)
+        mpt.set(0, 0, 32, MPT_SW_OWNS | MPT_MIO | MPT_REGION | MPT_PHYSICAL | access);
+        mpt.set(2, 0, 32, key).set(3, 0, 32, PD | MPT_PD_EN_INV);
+        mpt.set(4, 0, 32, (start >> 32) as u32).set(5, 0, 32, start as u32);
+        mpt.set(6, 0, 32, (len >> 32) as u32).set(7, 0, 32, len as u32);
+        self.hcr.exec(op::SW2HW_MPT, 0, index, Input::Mailbox(&mpt, 64)).map(drop)
+    }
+
+    /// Registers the memory at bus address `addr`, `len` bytes, for remote
+    /// read and write by window number `slot`; returns the key the other end
+    /// uses. Each registration of a slot has a key of its own, so a key that
+    /// was revoked stays dead.
+    fn register_window(&self, slot: u32, addr: u64, len: usize) -> Result<u32, Mlx4Error> {
+        let variant = self.window_variant[slot as usize].get().wrapping_add(1);
+        self.window_variant[slot as usize].set(variant);
+        let index = self.caps.reserved_mrws + 1 + slot;
+        let key = (variant as u32) << 24 | index;
+        let access = MPT_LOCAL_READ | MPT_LOCAL_WRITE | MPT_REMOTE_READ | MPT_REMOTE_WRITE;
+        self.write_mpt(index, key, addr, len as u64, access)?;
+        Ok(key.rotate_left(8))
+    }
+
+    /// Takes window `slot` back from the adapter: nothing the other end does
+    /// reaches the memory afterwards.
+    fn unregister_window(&self, slot: u32) -> Result<(), Mlx4Error> {
+        let index = self.caps.reserved_mrws + 1 + slot;
+        self.hcr.exec(op::HW2SW_MPT, 1, index, Input::None).map(drop)
     }
 
     /// Byte address of MTT entry `index` (counted past the reserved ones).
@@ -920,6 +985,9 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
             let r = self.hcr.exec_out(op::HW2SW_EQ, 1, eqn, Input::None, &mut eqc, 64).map(|_| 0);
             leak(&self.hcr, r);
         }
+        if self.stage.mpt_hw {
+            leak(&self.hcr, self.hcr.exec(op::HW2SW_MPT, 1, self.caps.reserved_mrws, Input::None));
+        }
         if self.stage.hca_up {
             leak(&self.hcr, self.hcr.exec(op::CLOSE_HCA, 0, 0, Input::None));
         }
@@ -1096,6 +1164,9 @@ mod tests {
             num_ports: 2,
             dpdp: false,
             max_gso: 0,
+            log_max_msg_sz: 31,
+            log_max_req_rd: 6,
+            log_max_res_rd: 6,
         };
         let plan = plan_icm(&caps);
         let c = &plan.init_hca;
