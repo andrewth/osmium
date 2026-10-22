@@ -88,6 +88,15 @@ impl Socket {
         }
     }
 
+    /// The port a TCP or UDP socket is bound to, if it is bound.
+    fn local_port(&self) -> Option<u16> {
+        match self {
+            Socket::Tcp(s) => Some(s.local_endpoint().port()).filter(|&p| p != 0),
+            Socket::Udp(s) => s.local_endpoint().map(|a| a.port()),
+            Socket::Icmp(_) | Socket::Dhcp(_) => None,
+        }
+    }
+
     pub(crate) fn dispatch(&mut self, cx: &mut Cx, out: &mut Vec<Packet>) {
         match self {
             Socket::Tcp(s) => s.dispatch(cx, out),
@@ -215,6 +224,48 @@ impl SocketSet {
     pub(crate) fn poll_at(&self) -> Option<Instant> {
         self.iter().filter_map(|(_, s)| s.poll_at()).min()
     }
+
+    /// Returns true if a TCP or UDP socket of the set is bound to `port`.
+    pub(crate) fn port_in_use(&self, port: u16) -> bool {
+        self.iter().any(|(_, s)| s.local_port() == Some(port))
+    }
+
+    /// A random ephemeral port that no socket of the set is bound to (or,
+    /// should the range be crowded, the last one tried).
+    pub(crate) fn free_ephemeral_port(&self, rng: &mut Rng) -> u16 {
+        let mut port = rng.ephemeral_port();
+        for _ in 0..64 {
+            if !self.port_in_use(port) {
+                break;
+            }
+            port = rng.ephemeral_port();
+        }
+        port
+    }
+
+    /// Gives each TCP connection that is waiting to send its SYN from an
+    /// unchosen port a random one that is free.
+    pub(crate) fn assign_ephemeral_ports(&mut self, rng: &mut Rng) {
+        if !self.iter().any(|(_, s)| matches!(s, Socket::Tcp(t) if t.needs_port())) {
+            return;
+        }
+        let mut used: Vec<u16> = self.iter().filter_map(|(_, s)| s.local_port()).collect();
+        for (_, s) in self.iter_mut() {
+            if let Socket::Tcp(t) = s
+                && t.needs_port()
+            {
+                let mut port = rng.ephemeral_port();
+                for _ in 0..64 {
+                    if !used.contains(&port) {
+                        break;
+                    }
+                    port = rng.ephemeral_port();
+                }
+                used.push(port);
+                t.set_ephemeral_port(port);
+            }
+        }
+    }
 }
 
 /// Returns true if a socket bound to `bound` takes traffic for `dst`: the
@@ -224,4 +275,28 @@ pub(crate) fn binds(bound: SocketAddr, dst: SocketAddr) -> bool {
     bound.port() == dst.port()
         && bound.is_ipv4() == dst.is_ipv4()
         && (bound.ip().is_unspecified() || bound.ip() == dst.ip())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_ports_avoid_bound_ports() {
+        let first = Rng::new(5).ephemeral_port();
+        let mut set = SocketSet::new();
+        let mut udp = UdpSocket::new(1, 1);
+        udp.bind(first).unwrap();
+        set.add(udp);
+        assert!(set.port_in_use(first));
+        let port = set.free_ephemeral_port(&mut Rng::new(5));
+        assert_ne!(port, first);
+        // A connection that waits for a port gets a free one, too.
+        let mut tcp = TcpSocket::new(64, 64);
+        tcp.connect(SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 80), 0).unwrap();
+        let h = set.add(tcp);
+        set.assign_ephemeral_ports(&mut Rng::new(5));
+        let got = set.get::<TcpSocket>(h).local_endpoint().port();
+        assert!(got >= 49152 && got != first);
+    }
 }

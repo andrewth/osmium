@@ -118,6 +118,8 @@ pub(super) struct State {
     routers: Vec<Router>,
     gateway: Option<Ipv6Addr>,
     dns: Vec<Ipv6Addr>,
+    /// When the servers in `dns` stop being valid.
+    dns_expires: Option<Instant>,
     /// The MTU a router advertised.
     mtu: Option<usize>,
     neighbors: Vec<Neighbor>,
@@ -144,6 +146,7 @@ impl State {
             routers: Vec::new(),
             gateway: None,
             dns: Vec::new(),
+            dns_expires: None,
             mtu: None,
             neighbors: Vec::new(),
             requests: Vec::new(),
@@ -203,7 +206,8 @@ impl State {
             .iter()
             .filter_map(|a| a.expires)
             .chain(self.prefixes.iter().filter_map(|p| p.expires))
-            .chain(self.routers.iter().map(|r| r.expires));
+            .chain(self.routers.iter().map(|r| r.expires))
+            .chain(self.dns_expires);
         let nd = self.requests.iter().map(|r| r.last + NS_RETRY);
         dad.chain(self.rs_next).chain(expiry).chain(nd).min()
     }
@@ -373,6 +377,10 @@ impl Interface {
         v6.addrs.retain(|a| a.expires.is_none_or(|t| t > now));
         v6.prefixes.retain(|p| p.expires.is_none_or(|t| t > now));
         v6.routers.retain(|r| r.expires > now);
+        if v6.dns_expires.is_some_and(|t| t <= now) {
+            v6.dns.clear();
+            v6.dns_expires = None;
+        }
 
         // Neighbor solicitation retries.
         let mut i = 0;
@@ -570,6 +578,7 @@ impl Interface {
         let socket = {
             let mut exact = None;
             let mut listen = None;
+            let mut queued = None;
             for (h, s) in sockets.iter() {
                 if let Socket::Tcp(s) = s {
                     if s.accepts_exact(dst, src) {
@@ -579,9 +588,12 @@ impl Interface {
                     if listen.is_none() && s.accepts_listen(dst) {
                         listen = Some(h);
                     }
+                    if queued.is_none() && s.accepts_queued(dst) {
+                        queued = Some(h);
+                    }
                 }
             }
-            exact.or(listen)
+            exact.or(listen).or(queued)
         };
         let rst = match socket {
             Some(h) => {
@@ -657,7 +669,32 @@ impl Interface {
         if tentative {
             return;
         }
-        let Some(ll) = ns.source_ll.filter(|m| !m.is_multicast()) else { return };
+        if ip.src.is_multicast() {
+            return;
+        }
+        let Some(ll) = ns.source_ll.filter(|m| !m.is_multicast()) else {
+            // A unicast solicitation needs no source link-layer option
+            // (RFC 4861 7.2.3, 7.2.4): answer from the neighbor cache, or
+            // look the sender up so that its next probe finds an entry.
+            if ip.dst == ns.target
+                && ns.source_ll.is_none()
+                && let Some(ll) = self.v6.lookup(ip.src, now)
+            {
+                let advert = NeighborAdvert {
+                    router: false,
+                    solicited: true,
+                    override_: true,
+                    target: ns.target,
+                    target_ll: Some(self.mac),
+                };
+                self.send_icmp6(ll, ns.target, ip.src, ICMPV6_NEIGHBOR_ADVERT, &advert.emit());
+            } else if ip.dst == ns.target && ns.source_ll.is_none() && !self.v6.requests.iter().any(|r| r.ip == ip.src)
+            {
+                self.v6.requests.push(Request { ip: ip.src, first: now, last: now });
+                self.send_ns(ip.src, Some(IpAddr::V6(ns.target)));
+            }
+            return;
+        };
         self.learned6(now, ip.src, ll);
         let advert = NeighborAdvert {
             router: false,
@@ -708,19 +745,33 @@ impl Interface {
             self.learned6(now, ip.src, ll);
         }
         // The router: listed while its lifetime lasts, gone at 0.
-        self.v6.routers.retain(|r| r.addr != ip.src);
-        if ra.router_lifetime > 0 && self.v6.routers.len() < MAX_ROUTERS {
+        if ra.router_lifetime == 0 {
+            self.v6.routers.retain(|r| r.addr != ip.src);
+        } else {
+            // Updated in place, so that the default router (the first) does
+            // not change with every advertisement.
             let expires = now + Duration::from_secs(u64::from(ra.router_lifetime));
-            self.v6.routers.push(Router { addr: ip.src, expires });
+            if let Some(r) = self.v6.routers.iter_mut().find(|r| r.addr == ip.src) {
+                r.expires = expires;
+            } else if self.v6.routers.len() < MAX_ROUTERS {
+                self.v6.routers.push(Router { addr: ip.src, expires });
+            }
         }
         // Only a router we accepted (lifetime above 0) may lower the MTU.
         let accepted = self.v6.routers.iter().any(|r| r.addr == ip.src);
         if let Some(mtu) = ra.mtu.and_then(|m| usize::try_from(m).ok()).filter(|&m| accepted && m >= IPV6_MIN_MTU) {
             self.v6.mtu = Some(mtu.min(self.mtu));
         }
+        // RDNSS (RFC 8106): lifetime 0 withdraws a server; others replace the
+        // list and last for their lifetime.
+        self.v6.dns.retain(|d| !ra.dns_withdrawn.contains(d));
         if !ra.dns.is_empty() {
             let usable = |d: &&Ipv6Addr| !d.is_multicast() && !d.is_unspecified();
             self.v6.dns = ra.dns.iter().filter(usable).copied().take(MAX_DNS).collect();
+            self.v6.dns_expires = lifetime(now, ra.dns_lifetime);
+        }
+        if self.v6.dns.is_empty() {
+            self.v6.dns_expires = None;
         }
         for p in &ra.prefixes {
             // Link-local prefixes and nonsense are ignored.

@@ -2,7 +2,10 @@
 //!
 //! A listening socket takes a single connection: on a SYN it turns into
 //! that connection. A server that wants several at once listens with
-//! several sockets on the same port.
+//! several sockets on the same port. While a listener is half-open
+//! (SYN-RECEIVED) it queues the SYNs of other peers, and moves on to the
+//! next one when the SYN-ACK goes unanswered for a retransmission timeout,
+//! so that a single unanswered (say, spoofed) SYN cannot hold the port.
 //!
 //! Data that arrives past a gap is held, within the receive window, until
 //! the gap is filled; each out-of-order segment is acknowledged at once so
@@ -37,6 +40,14 @@ const MAX_SYNACK_RETRIES: u8 = 5;
 /// How long a closed connection lingers in TIME-WAIT (2 MSL). Shorter than
 /// the RFC's four minutes, as most stacks are.
 const TIME_WAIT: Duration = Duration::from_secs(10);
+/// SYNs from other peers a half-open listener remembers.
+const SYN_BACKLOG: usize = 8;
+/// How long a queued SYN stays worth answering.
+const SYN_QUEUE_LIFE: Duration = Duration::from_secs(5);
+/// Challenge ACKs sent in a burst, and the interval at which the allowance
+/// refills by one (RFC 5961 7).
+const CHALLENGE_BURST: u32 = 10;
+const CHALLENGE_REFILL: Duration = Duration::from_millis(100);
 /// MSS assumed when the peer sends none.
 const DEFAULT_MSS: usize = 536;
 /// The least MSS taken from a peer: a smaller one, even 0, would only make
@@ -102,6 +113,14 @@ pub(crate) fn reset_for(seg: &TcpHeader, len: usize) -> Option<TcpHeader> {
         rst.flags = TCP_RST | TCP_ACK;
     }
     Some(rst)
+}
+
+/// A SYN held for a half-open listener.
+struct QueuedSyn {
+    dst: SocketAddr,
+    src: SocketAddr,
+    seg: TcpHeader,
+    at: Instant,
 }
 
 /// One TCP connection, or a listener waiting for one.
@@ -211,6 +230,12 @@ pub struct TcpSocket {
     last_ack_sent: u32,
     /// The time of the segment being processed or built.
     clock: Instant,
+    /// SYNs from other peers that arrived while this listener was
+    /// half-open.
+    backlog: Vec<QueuedSyn>,
+    /// Challenge ACKs still allowed, and when the allowance last grew.
+    challenge_tokens: u32,
+    challenge_at: Instant,
 }
 
 impl TcpSocket {
@@ -277,6 +302,9 @@ impl TcpSocket {
             ts_recent_at: Instant::ZERO,
             last_ack_sent: 0,
             clock: Instant::ZERO,
+            backlog: Vec::new(),
+            challenge_tokens: CHALLENGE_BURST,
+            challenge_at: Instant::ZERO,
         }
     }
 
@@ -545,6 +573,37 @@ impl TcpSocket {
         !matches!(self.state, State::Closed | State::Listen) && self.local == dst && self.remote == src
     }
 
+    /// Returns true if the connection waits to send its SYN from a port the
+    /// interface has yet to choose.
+    pub(crate) fn needs_port(&self) -> bool {
+        self.fresh && self.local.port() == 0
+    }
+
+    pub(crate) fn set_ephemeral_port(&mut self, port: u16) {
+        self.local.set_port(port);
+    }
+
+    /// Returns true if the socket is a listener that is half-open and so
+    /// queues SYNs to `dst` from other peers.
+    pub(crate) fn accepts_queued(&self, dst: SocketAddr) -> bool {
+        self.state == State::SynReceived && self.passive && binds(self.listen_addr, dst)
+    }
+
+    /// Spends one challenge ACK (RFC 5961 7), or says the budget is gone.
+    fn challenge_ack(&mut self, now: Instant) -> bool {
+        let elapsed = now - self.challenge_at;
+        let steps = (elapsed.as_millis() / CHALLENGE_REFILL.as_millis()) as u32;
+        if steps > 0 {
+            self.challenge_tokens = self.challenge_tokens.saturating_add(steps).min(CHALLENGE_BURST);
+            self.challenge_at = now;
+        }
+        if self.challenge_tokens == 0 {
+            return false;
+        }
+        self.challenge_tokens -= 1;
+        true
+    }
+
     /// Returns true if the socket listens for connections to `dst`.
     pub(crate) fn accepts_listen(&self, dst: SocketAddr) -> bool {
         self.state == State::Listen && binds(self.local, dst)
@@ -601,21 +660,10 @@ impl TcpSocket {
                 if seg.has(TCP_ACK) || !seg.has(TCP_SYN) {
                     return reset_for(seg, payload.len());
                 }
-                // A SYN can only come from one host.
-                let ip = src.ip();
-                if ip.is_unspecified() || ip.is_multicast() || matches!(ip, IpAddr::V4(a) if a.is_broadcast()) {
+                if !Self::syn_source_ok(src) {
                     return None;
                 }
-                self.local = dst;
-                self.remote = src;
-                self.rcv_nxt = seg.seq.wrapping_add(1);
-                self.set_iss(cx.rng.isn(dst, src, now));
-                self.ts_offset = cx.rng.next_u32();
-                self.snd_wnd = u32::from(seg.window);
-                self.snd_wl1 = seg.seq;
-                self.snd_mss = Self::peer_mss(seg, cx.mss_for(&dst));
-                self.negotiate(seg);
-                self.state = State::SynReceived;
+                self.accept_syn(cx, dst, src, seg);
                 return None;
             }
             State::SynSent => {
@@ -647,6 +695,25 @@ impl TcpSocket {
             _ => {}
         }
 
+        if self.state == State::SynReceived && self.passive && (src != self.remote || dst != self.local) {
+            return self.queue_syn(now, dst, src, seg, payload.len());
+        }
+        // RFC 6191: a SYN with a sequence number past the old connection's
+        // starts a new one. Only a listener's connection can do that here,
+        // and not one with unread data.
+        if self.state == State::TimeWait
+            && self.passive
+            && self.rx.is_empty()
+            && seg.has(TCP_SYN)
+            && !seg.has(TCP_ACK | TCP_RST)
+            && before(self.rcv_nxt, seg.seq)
+            && Self::syn_source_ok(src)
+        {
+            self.relisten();
+            self.accept_syn(cx, dst, src, seg);
+            return None;
+        }
+
         // Synchronized states, and SYN-RECEIVED. First, is the segment in
         // the receive window (RFC 9293 3.10.7.4)?
         let seg_len = payload.len() as u32 + u32::from(seg.has(TCP_SYN)) + u32::from(seg.has(TCP_FIN));
@@ -675,7 +742,7 @@ impl TcpSocket {
             // Only an exact match resets (RFC 5961 3.2); anything else in the
             // window gets a challenge ACK.
             if seg.seq != self.rcv_nxt {
-                self.ack_pending = true;
+                self.ack_pending = self.challenge_ack(now);
             } else if self.state == State::SynReceived && self.passive {
                 self.relisten();
             } else if self.state == State::TimeWait {
@@ -692,7 +759,7 @@ impl TcpSocket {
         if seg.has(TCP_SYN) {
             // A SYN in a synchronized state: challenge ACK (RFC 5961 4.2).
             // In SYN-RECEIVED this resends the SYN-ACK.
-            self.ack_pending = true;
+            self.ack_pending = self.challenge_ack(now);
             return None;
         }
 
@@ -831,6 +898,72 @@ impl TcpSocket {
             };
         }
         None
+    }
+
+    /// A SYN can only come from one host.
+    fn syn_source_ok(src: SocketAddr) -> bool {
+        let ip = src.ip();
+        !(ip.is_unspecified() || ip.is_multicast() || matches!(ip, IpAddr::V4(a) if a.is_broadcast()))
+    }
+
+    /// Takes `seg`, a SYN from `src`, as the start of this listener's
+    /// connection.
+    fn accept_syn(&mut self, cx: &mut Cx, dst: SocketAddr, src: SocketAddr, seg: &TcpHeader) {
+        self.local = dst;
+        self.remote = src;
+        self.rcv_nxt = seg.seq.wrapping_add(1);
+        self.set_iss(cx.rng.isn(dst, src, cx.now));
+        self.ts_offset = cx.rng.next_u32();
+        self.snd_wnd = u32::from(seg.window);
+        self.snd_wl1 = seg.seq;
+        self.snd_mss = Self::peer_mss(seg, cx.mss_for(&dst));
+        self.negotiate(seg);
+        self.state = State::SynReceived;
+    }
+
+    /// A segment from a peer other than the one a half-open listener is
+    /// answering: a SYN waits its turn, anything else gets what a listener
+    /// gives it.
+    fn queue_syn(
+        &mut self,
+        now: Instant,
+        dst: SocketAddr,
+        src: SocketAddr,
+        seg: &TcpHeader,
+        len: usize,
+    ) -> Option<TcpHeader> {
+        if seg.has(TCP_RST) {
+            return None;
+        }
+        if seg.has(TCP_ACK) || !seg.has(TCP_SYN) {
+            return reset_for(seg, len);
+        }
+        if !Self::syn_source_ok(src) {
+            return None;
+        }
+        self.backlog.retain(|q| now - q.at < SYN_QUEUE_LIFE);
+        let queued = QueuedSyn { dst, src, seg: *seg, at: now };
+        if let Some(q) = self.backlog.iter_mut().find(|q| q.src == src && q.dst == dst) {
+            *q = queued;
+        } else if self.backlog.len() < SYN_BACKLOG {
+            self.backlog.push(queued);
+        }
+        None
+    }
+
+    /// Gives up on the half-open connection for the oldest queued SYN that
+    /// is still fresh. Returns false if there is none.
+    fn promote_queued(&mut self, cx: &mut Cx) -> bool {
+        self.backlog.retain(|q| cx.now - q.at < SYN_QUEUE_LIFE);
+        if self.backlog.is_empty() {
+            return false;
+        }
+        let next = self.backlog.remove(0);
+        let backlog = core::mem::take(&mut self.backlog);
+        self.relisten();
+        self.backlog = backlog;
+        self.accept_syn(cx, next.dst, next.src, &next.seg);
+        true
     }
 
     fn set_iss(&mut self, iss: u32) {
@@ -1270,10 +1403,13 @@ impl TcpSocket {
         let limit = usize::from(cx.mss_for(&self.remote)).saturating_sub(options).max(1);
         self.snd_mss = self.snd_mss.min(limit);
 
-        if self.timer.is_some_and(|t| now >= t) {
+        let half_open = self.state == State::SynReceived && self.passive;
+        let expired = self.timer.is_some_and(|t| now >= t);
+        if expired && half_open && self.promote_queued(cx) {
+            // The unanswered SYN made way for the next peer's.
+        } else if expired {
             self.timer = None;
             self.retries += 1;
-            let half_open = self.state == State::SynReceived && self.passive;
             if self.retries > if half_open { MAX_SYNACK_RETRIES } else { MAX_RETRIES } {
                 // A half-open connection that never completed is no error
                 // of the listener's.
@@ -1660,6 +1796,110 @@ mod tests {
         }
         assert_eq!(out.len(), usize::from(MAX_SYNACK_RETRIES) + 1, "the SYN-ACK and its retransmissions");
         assert_eq!((s.state(), s.error(), s.local_endpoint().port()), (State::Listen, None, 80));
+    }
+
+    fn test_cx(rng: &mut crate::rng::Rng, now: Instant) -> Cx<'_> {
+        Cx {
+            now,
+            addr: Some(B_IP),
+            mac: Default::default(),
+            mss: 1460,
+            mss6: 1440,
+            addr6: None,
+            link_local6: None,
+            rng,
+        }
+    }
+
+    const PEER2: SocketAddr = sa(Ipv4Addr::new(192, 168, 1, 10), 5000);
+
+    #[test]
+    fn spoofed_syn_does_not_hold_the_listener() {
+        let mut rng = crate::rng::Rng::new(1);
+        // A spoofed SYN from PEER that will never be answered.
+        let mut s = half_open(&mut rng, &syn(None));
+        let mut out = Vec::new();
+        s.dispatch(&mut test_cx(&mut rng, Instant::ZERO), &mut out);
+        assert_eq!(out.len(), 1);
+        // A real client's SYN is queued, not reset and not lost.
+        let real = TcpHeader { src_port: 5000, seq: 7000, ..syn(Some(1460)) };
+        let at = Instant::from_millis(10);
+        assert!(s.process(&mut test_cx(&mut rng, at), sa(B_IP, 80), PEER2, &real, &[]).is_none());
+        assert_eq!((s.state(), s.remote_endpoint()), (State::SynReceived, PEER));
+        // The spoofed half-open connection yields at its first timeout.
+        out.clear();
+        s.dispatch(&mut test_cx(&mut rng, Instant::from_millis(1100)), &mut out);
+        assert_eq!((s.state(), s.remote_endpoint()), (State::SynReceived, PEER2));
+        assert_eq!(out.len(), 1, "a SYN-ACK to the real client");
+        let (synack, _) = TcpHeader::parse(&out[0].payload, B_IP, PEER2.ip()).expect("a TCP segment");
+        assert_eq!((synack.flags, synack.ack), (TCP_SYN | TCP_ACK, 7001));
+        let ack = TcpHeader {
+            src_port: 5000,
+            dst_port: 80,
+            seq: 7001,
+            ack: synack.seq.wrapping_add(1),
+            flags: TCP_ACK,
+            window: 1000,
+            ..Default::default()
+        };
+        let at = Instant::from_millis(1200);
+        assert!(s.process(&mut test_cx(&mut rng, at), sa(B_IP, 80), PEER2, &ack, &[]).is_none());
+        assert_eq!(s.state(), State::Established);
+    }
+
+    #[test]
+    fn half_open_listener_resets_stray_acks_and_bounds_its_queue() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        let at = Instant::from_millis(5);
+        let stray = TcpHeader { src_port: 5000, dst_port: 80, seq: 1, ack: 99, flags: TCP_ACK, ..Default::default() };
+        let rst = s.process(&mut test_cx(&mut rng, at), sa(B_IP, 80), PEER2, &stray, &[]).expect("a reset");
+        assert_eq!((rst.seq, rst.flags), (99, TCP_RST));
+        for port in 6000..6100 {
+            let h = TcpHeader { src_port: port, ..syn(None) };
+            let src = sa(Ipv4Addr::new(192, 168, 1, 10), port);
+            assert!(s.process(&mut test_cx(&mut rng, at), sa(B_IP, 80), src, &h, &[]).is_none());
+        }
+        assert_eq!(s.backlog.len(), SYN_BACKLOG);
+        assert_eq!(s.remote_endpoint(), PEER);
+    }
+
+    #[test]
+    fn challenge_acks_are_rate_limited() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        let mut sent = 0;
+        let mut out = Vec::new();
+        // In-window resets that are not exact, 100 of them in one instant.
+        let rst = TcpHeader { src_port: 4000, dst_port: 80, seq: 1005, flags: TCP_RST, ..Default::default() };
+        let at = Instant::from_millis(1);
+        for _ in 0..100 {
+            s.process(&mut test_cx(&mut rng, at), sa(B_IP, 80), PEER, &rst, &[]);
+            out.clear();
+            s.dispatch(&mut test_cx(&mut rng, at), &mut out);
+            sent += out.len();
+        }
+        // The SYN-ACK itself plus no more than the burst.
+        assert!(sent <= 1 + CHALLENGE_BURST as usize, "{sent} segments");
+        // The allowance refills with time.
+        assert!(s.challenge_ack(Instant::from_millis(1000)));
+    }
+
+    #[test]
+    fn time_wait_takes_a_new_syn_with_a_higher_sequence_number() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        s.state = State::TimeWait;
+        s.timer = Some(Instant::from_millis(10_000));
+        let at = Instant::from_millis(100);
+        // An old duplicate SYN is not a new connection.
+        let old = TcpHeader { seq: 500, ..syn(None) };
+        s.process(&mut test_cx(&mut rng, at), sa(B_IP, 80), PEER, &old, &[]);
+        assert_eq!(s.state(), State::TimeWait);
+        let newer = TcpHeader { seq: 9000, ..syn(None) };
+        assert!(s.process(&mut test_cx(&mut rng, at), sa(B_IP, 80), PEER, &newer, &[]).is_none());
+        assert_eq!((s.state(), s.remote_endpoint()), (State::SynReceived, PEER));
+        assert_eq!(s.rcv_nxt, 9001);
     }
 
     #[test]

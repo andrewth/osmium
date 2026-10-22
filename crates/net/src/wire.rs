@@ -677,3 +677,41 @@ mod tests {
         assert_eq!(ArpPacket::parse(&b), Some(p));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod fuzz_tests {
+    use super::*;
+
+    /// A xorshift generator, so that the inputs are the same on every run.
+    pub(crate) fn rand(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn arbitrary_tcp_segments_do_not_panic() {
+        let (src, dst) = (core::net::Ipv4Addr::new(10, 0, 0, 1), core::net::Ipv4Addr::new(10, 0, 0, 2));
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let mut parsed = 0;
+        for _ in 0..20_000 {
+            let len = 20 + (rand(&mut state) % 64) as usize;
+            let mut b: Vec<u8> = (0..len).map(|_| rand(&mut state) as u8).collect();
+            // A plausible data offset, and a valid checksum, so that the
+            // options are reached.
+            b[12] = ((5 + rand(&mut state) % 11) as u8) << 4;
+            b[16] = 0;
+            b[17] = 0;
+            let sum = checksum::finish(checksum::add(checksum::pseudo_header(src, dst, PROTO_TCP, b.len()), &b));
+            b[16..18].copy_from_slice(&sum.to_be_bytes());
+            if TcpHeader::parse(&b, src, dst).is_some() {
+                parsed += 1;
+            }
+            // And with a checksum that does not fit.
+            b[17] ^= 1;
+            let _ = TcpHeader::parse(&b, src, dst);
+        }
+        assert!(parsed > 5_000, "the generator reaches the option parser ({parsed})");
+    }
+}

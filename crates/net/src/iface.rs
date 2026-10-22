@@ -312,6 +312,12 @@ impl Interface {
         self.rng.ephemeral_port()
     }
 
+    /// Like [`ephemeral_port`](Self::ephemeral_port), but a port no TCP or
+    /// UDP socket of `sockets` is bound to.
+    pub fn ephemeral_port_in(&mut self, sockets: &SocketSet) -> u16 {
+        sockets.free_ephemeral_port(&mut self.rng)
+    }
+
     fn mss(&self) -> u16 {
         self.mtu.saturating_sub(IPV4_HEADER_LEN + TCP_HEADER_LEN).max(1) as u16
     }
@@ -353,6 +359,7 @@ impl Interface {
 
         self.poll_v6(now);
 
+        sockets.assign_ephemeral_ports(&mut self.rng);
         let mut out = Vec::new();
         for (_, s) in sockets.iter_mut() {
             if self.tx.len() >= TX_QUEUE / 2 {
@@ -811,7 +818,10 @@ impl Interface {
                 if !delivered && to_us && !link_multicast {
                     // Port unreachable, quoting the IP header and the first
                     // eight bytes of the datagram (RFC 792).
-                    let quoted = &bytes[..(bytes.len() - payload.len() + UDP_HEADER_LEN).min(bytes.len())];
+                    // Not the frame's padding, which `bytes` may carry past
+                    // the packet.
+                    let header_len = usize::from(bytes[0] & 0xf) * 4;
+                    let quoted = &bytes[..header_len + payload.len().min(UDP_HEADER_LEN)];
                     // The ident and seq fields are the message's four unused bytes.
                     let header =
                         IcmpHeader { ty: ICMP_DEST_UNREACHABLE, code: ICMP_PORT_UNREACHABLE, ident: 0, seq: 0 };
@@ -841,6 +851,7 @@ impl Interface {
                 let socket = {
                     let mut exact = None;
                     let mut listen = None;
+                    let mut queued = None;
                     for (h, s) in sockets.iter() {
                         if let Socket::Tcp(s) = s {
                             if s.accepts_exact(dst, src) {
@@ -850,9 +861,12 @@ impl Interface {
                             if listen.is_none() && s.accepts_listen(dst) {
                                 listen = Some(h);
                             }
+                            if queued.is_none() && s.accepts_queued(dst) {
+                                queued = Some(h);
+                            }
                         }
                     }
-                    exact.or(listen)
+                    exact.or(listen).or(queued)
                 };
                 let rst = match socket {
                     Some(h) => sockets.get_mut::<crate::TcpSocket>(h).process(&mut cx, dst, src, &tcp, data),
@@ -1012,6 +1026,24 @@ mod tests {
         a.dev.tx.borrow_mut().push_back(udp_frame(mac, A_IP, B_IP, 2000));
         b.poll(Instant::ZERO);
         assert!(b.sockets.get::<UdpSocket>(hb).can_recv());
+    }
+
+    #[test]
+    fn icmp_unreachable_quotes_the_header_and_eight_bytes_only() {
+        let (mut a, mut b) = pair();
+        let sent = record(&mut b);
+        let mut frame = udp_frame(b.iface.mac_address(), A_IP, B_IP, 3000);
+        frame.extend_from_slice(&[0xee; 20]); // link-layer padding
+        a.dev.tx.borrow_mut().push_back(frame);
+        let mut now = Instant::ZERO;
+        run(&mut a, &mut b, &mut now, 50, |_, _| false);
+        let sent = sent.borrow();
+        let errors: Vec<_> =
+            sent.iter().filter(|f| f.len() > 34 && f[12..14] == [8, 0] && f[34] == ICMP_DEST_UNREACHABLE).collect();
+        assert_eq!(errors.len(), 1);
+        let ip = &errors[0][ETH_HEADER_LEN..];
+        let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+        assert_eq!(total, IPV4_HEADER_LEN + 8 + IPV4_HEADER_LEN + UDP_HEADER_LEN, "no padding in the quote");
     }
 
     #[test]

@@ -345,7 +345,11 @@ struct NdOptions {
     target_ll: Option<MacAddress>,
     mtu: Option<u32>,
     prefixes: Vec<PrefixInfo>,
+    /// Servers of RDNSS options with a lifetime, and the longest of those.
     rdnss: Vec<Ipv6Addr>,
+    rdnss_lifetime: u32,
+    /// Servers of RDNSS options with lifetime 0: no longer to be used.
+    rdnss_withdrawn: Vec<Ipv6Addr>,
 }
 
 /// Walks the options in `b`; `None` if one is malformed (a zero length
@@ -377,8 +381,14 @@ fn parse_options(mut b: &[u8]) -> Option<NdOptions> {
                 }
             }
             OPT_RDNSS if len >= 24 && (len - 8) % 16 == 0 => {
+                let lifetime = be32(opt, 4)?;
                 for chunk in opt[8..].as_chunks::<16>().0.iter().take(4) {
-                    o.rdnss.push(Ipv6Addr::from(*chunk));
+                    if lifetime == 0 {
+                        o.rdnss_withdrawn.push(Ipv6Addr::from(*chunk));
+                    } else {
+                        o.rdnss.push(Ipv6Addr::from(*chunk));
+                        o.rdnss_lifetime = o.rdnss_lifetime.max(lifetime);
+                    }
                 }
             }
             _ => {}
@@ -526,6 +536,10 @@ pub struct RouterAdvert {
     pub prefixes: Vec<PrefixInfo>,
     /// Recursive DNS servers (RFC 8106).
     pub dns: Vec<Ipv6Addr>,
+    /// Seconds the servers in `dns` are valid; `u32::MAX` is infinite.
+    pub dns_lifetime: u32,
+    /// Servers the router withdrew (lifetime 0).
+    pub dns_withdrawn: Vec<Ipv6Addr>,
 }
 
 impl RouterAdvert {
@@ -542,6 +556,8 @@ impl RouterAdvert {
             mtu: o.mtu,
             prefixes: o.prefixes,
             dns: o.rdnss,
+            dns_lifetime: o.rdnss_lifetime,
+            dns_withdrawn: o.rdnss_withdrawn,
         })
     }
 
@@ -572,11 +588,13 @@ impl RouterAdvert {
             b.extend_from_slice(&[0; 4]);
             b.extend_from_slice(&p.prefix.octets());
         }
-        if !self.dns.is_empty() {
-            b.extend_from_slice(&[OPT_RDNSS, 1 + 2 * self.dns.len() as u8, 0, 0]);
-            b.extend_from_slice(&u32::MAX.to_be_bytes());
-            for d in &self.dns {
-                b.extend_from_slice(&d.octets());
+        for (servers, lifetime) in [(&self.dns, self.dns_lifetime), (&self.dns_withdrawn, 0)] {
+            if !servers.is_empty() {
+                b.extend_from_slice(&[OPT_RDNSS, 1 + 2 * servers.len() as u8, 0, 0]);
+                b.extend_from_slice(&lifetime.to_be_bytes());
+                for d in servers {
+                    b.extend_from_slice(&d.octets());
+                }
             }
         }
         b
@@ -726,6 +744,8 @@ mod tests {
                 prefix: "2001:db8:1:2::".parse().unwrap(),
             }],
             dns: alloc::vec![SRC],
+            dns_lifetime: 600,
+            dns_withdrawn: alloc::vec![DST],
         };
         assert_eq!(RouterAdvert::parse(&ra.emit()), Some(ra));
     }
@@ -740,5 +760,58 @@ mod tests {
         assert!(NeighborSolicit::parse(&ns).is_none());
         assert!(NeighborSolicit::parse(&[0; 10]).is_none());
         assert!(RouterAdvert::parse(&[0; 8]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::wire::fuzz_tests::rand;
+
+    #[test]
+    fn arbitrary_bytes_do_not_panic_the_ipv6_parsers() {
+        let mut state = 0x1234_5678_9abc_def1;
+        // Valid messages to mutate, so that the options are reached.
+        let ra = RouterAdvert {
+            hop_limit: 64,
+            managed: false,
+            other: false,
+            router_lifetime: 100,
+            source_ll: Some(MacAddress([2; 6])),
+            mtu: Some(1500),
+            prefixes: alloc::vec![PrefixInfo {
+                prefix_len: 64,
+                on_link: true,
+                autonomous: true,
+                valid_lifetime: 10,
+                preferred_lifetime: 5,
+                prefix: Ipv6Addr::LOCALHOST,
+            }],
+            dns: alloc::vec![Ipv6Addr::LOCALHOST],
+            dns_lifetime: 5,
+            dns_withdrawn: alloc::vec![Ipv6Addr::UNSPECIFIED],
+        }
+        .emit();
+        let ns = NeighborSolicit { target: Ipv6Addr::LOCALHOST, source_ll: Some(MacAddress([2; 6])) }.emit();
+        for round in 0..20_000 {
+            let mut m = if round % 2 == 0 { ra.clone() } else { ns.clone() };
+            for _ in 0..1 + rand(&mut state) % 4 {
+                let at = (rand(&mut state) % m.len() as u64) as usize;
+                m[at] = rand(&mut state) as u8;
+            }
+            m.truncate((rand(&mut state) % (m.len() as u64 + 1)) as usize);
+            let _ = RouterAdvert::parse(&m);
+            let _ = NeighborSolicit::parse(&m);
+            let _ = NeighborAdvert::parse(&m);
+            let _ = RouterSolicit::parse(&m);
+            let _ = parse_echo(&m);
+            let raw: Vec<u8> = (0..rand(&mut state) % 120).map(|_| rand(&mut state) as u8).collect();
+            let _ = Ipv6Header::parse(&raw);
+            let mut packet = alloc::vec![0x60, 0, 0, 0, 0, raw.len() as u8, (rand(&mut state) % 64) as u8, 64];
+            packet.extend_from_slice(&[0; 32]);
+            packet.extend_from_slice(&raw);
+            let _ = Ipv6Header::parse(&packet);
+            let _ = Icmpv6Header::parse(&raw, Ipv6Addr::LOCALHOST, Ipv6Addr::LOCALHOST);
+        }
     }
 }

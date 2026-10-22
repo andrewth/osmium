@@ -1,7 +1,7 @@
 //! A DNS stub resolver (RFC 1035) for IPv4 and IPv6 addresses.
 //!
-//! [`DnsClient`] owns a [`UdpSocket`] in the [`SocketSet`] and is polled
-//! like the other clients: [`resolve`](DnsClient::resolve) starts a lookup,
+//! [`DnsClient`] puts a [`UdpSocket`] in the [`SocketSet`] for each query it
+//! sends, on a fresh random port, and is polled like the other clients: [`resolve`](DnsClient::resolve) starts a lookup,
 //! [`poll`](DnsClient::poll) sends queries, retries them with backoff and
 //! reads the answers, and [`result`](DnsClient::result) takes the outcome.
 //! It asks the servers it was given, or else the one DHCP reported. Answers
@@ -12,8 +12,9 @@
 //! [`result_ip`](DnsClient::result_ip)); a caller that wants both starts both
 //! and prefers the family it can reach. Servers may be IPv4 or IPv6: the
 //! ones the interface learned from DHCP and from router advertisements are
-//! used unless some are set. A response is believed only if it comes
-//! from a configured server, echoes the query's random id and question, and
+//! used unless some are set. A response is believed only if it arrives on
+//! the port that query was sent from, from the address and port of the
+//! server it was sent to, echoes the query's random id and question, and
 //! its records belong to the name asked for (directly or through the
 //! `CNAME`s that lead from it).
 //!
@@ -149,6 +150,9 @@ struct Query {
     /// The record type asked for, `TYPE_A` or `TYPE_AAAA`.
     qtype: u16,
     id: u16,
+    /// The socket each attempt was sent from (a random port of its own), and
+    /// the server it went to; only that server's answer to that socket counts.
+    socks: Vec<(SocketHandle, SocketAddr)>,
     started: Instant,
     attempts: u8,
     next_try: Instant,
@@ -164,15 +168,14 @@ struct CacheEntry {
 
 /// A DNS resolver; see the module documentation.
 pub struct DnsClient {
-    socket: SocketHandle,
-    /// The socket for IPv6 servers, added when the first is used.
-    socket6: Option<SocketHandle>,
     servers: Vec<IpAddr>,
     queries: Vec<Query>,
     cache: Vec<CacheEntry>,
     jobs: Vec<TcpJob>,
     /// TCP sockets that are done, closing, and when to give up on that.
     closing: Vec<(SocketHandle, Instant)>,
+    /// Query sockets of lookups that are over, to remove at the next poll.
+    dead: Vec<SocketHandle>,
     rng: Rng,
     next_handle: u32,
 }
@@ -328,21 +331,18 @@ fn parse_response(msg: &[u8]) -> Option<Response> {
 }
 
 impl DnsClient {
-    /// A resolver with its socket added to `sockets`, bound to a random
-    /// port, and its ids drawn from `iface`'s random number generator.
+    /// A resolver whose ids and ports are drawn from `iface`'s random number
+    /// generator.
     /// Servers come from the interface's configuration (DHCP) unless
     /// [`set_servers`](Self::set_servers) names some.
-    pub fn new(iface: &mut Interface, sockets: &mut SocketSet) -> Self {
-        let mut socket = UdpSocket::new(8, 8);
-        socket.bind(iface.ephemeral_port()).expect("a fresh socket binds");
+    pub fn new(iface: &mut Interface, _sockets: &mut SocketSet) -> Self {
         Self {
-            socket: sockets.add(socket),
-            socket6: None,
             servers: Vec::new(),
             queries: Vec::new(),
             cache: Vec::new(),
             jobs: Vec::new(),
             closing: Vec::new(),
+            dead: Vec::new(),
             rng: Rng::new(iface.random_u64()),
             next_handle: 0,
         }
@@ -357,18 +357,6 @@ impl DnsClient {
     /// Like [`set_servers`](Self::set_servers), with IPv4 and IPv6 servers.
     pub fn set_servers_ip(&mut self, servers: &[IpAddr]) {
         self.servers = servers.to_vec();
-    }
-
-    /// The socket handle, so that a caller can remove the socket. If IPv6
-    /// servers are used there is a second one, [`socket6`](Self::socket6).
-    pub fn socket(&self) -> SocketHandle {
-        self.socket
-    }
-
-    /// The handle of the socket that talks to IPv6 servers, once one has been
-    /// asked.
-    pub fn socket6(&self) -> Option<SocketHandle> {
-        self.socket6
     }
 
     /// Starts looking up the IPv4 addresses of `name`. A dotted-quad is
@@ -396,6 +384,7 @@ impl DnsClient {
             handle,
             tcp: Tcp::No,
             id: 0,
+            socks: Vec::new(),
             started: now,
             attempts: 0,
             next_try: now,
@@ -443,11 +432,16 @@ impl DnsClient {
         let i = self.queries.iter().position(|q| q.handle == query);
         let Some(i) = i else { return Some(Err(DnsError::Cancelled)) };
         self.queries[i].result.as_ref()?;
-        self.queries.remove(i).result.map(|(r, _)| r)
+        let q = self.queries.remove(i);
+        self.dead.extend(q.socks.iter().map(|&(h, _)| h));
+        q.result.map(|(r, _)| r)
     }
 
     /// Abandons `query`.
     pub fn cancel(&mut self, query: DnsQuery) {
+        for q in self.queries.iter().filter(|q| q.handle == query) {
+            self.dead.extend(q.socks.iter().map(|&(h, _)| h));
+        }
         self.queries.retain(|q| q.handle != query);
     }
 
@@ -484,15 +478,14 @@ impl DnsClient {
         self.cache.push(entry);
     }
 
-    fn handle_response(&mut self, msg: &[u8], from: IpAddr, now: Instant) {
+    /// Takes a response that reached one of query `i`'s sockets from the
+    /// server that socket asked.
+    fn handle_response(&mut self, i: usize, msg: &[u8], from: IpAddr, now: Instant) {
         let Some(r) = parse_response(msg) else { return };
-        let Some(i) = self
-            .queries
-            .iter()
-            .position(|q| q.result.is_none() && q.id == r.id && q.name == r.name && q.qtype == r.qtype)
-        else {
+        let q = &self.queries[i];
+        if q.result.is_some() || q.id != r.id || q.name != r.name || q.qtype != r.qtype {
             return;
-        };
+        }
         if r.truncated && r.rcode == 0 {
             // The answer is partial: get all of it over TCP. One attempt
             // only; a second truncated datagram changes nothing.
@@ -648,11 +641,15 @@ impl DnsClient {
     /// Call it whenever the interface is polled.
     pub fn poll(&mut self, now: Instant, iface: &Interface, sockets: &mut SocketSet) {
         let servers = self.servers(iface);
+        self.remove_dead(sockets);
         let mut buf = [0u8; MAX_RESPONSE];
-        for socket in [Some(self.socket), self.socket6].into_iter().flatten() {
-            while let Ok((n, from)) = sockets.get_mut::<UdpSocket>(socket).recv_from(&mut buf) {
-                if n <= buf.len() && from.port() == SERVER_PORT && servers.contains(&from.ip()) {
-                    self.handle_response(&buf[..n], from.ip(), now);
+        for i in 0..self.queries.len() {
+            for k in 0..self.queries[i].socks.len() {
+                let (socket, server) = self.queries[i].socks[k];
+                while let Ok((n, from)) = sockets.get_mut::<UdpSocket>(socket).recv_from(&mut buf) {
+                    if n <= buf.len() && from == server && servers.contains(&server.ip()) {
+                        self.handle_response(i, &buf[..n], from.ip(), now);
+                    }
                 }
             }
         }
@@ -675,19 +672,17 @@ impl DnsClient {
                 }
                 let server = SocketAddr::new(servers[usize::from(q.attempts) % servers.len()], SERVER_PORT);
                 let message = encode_query(q.id, &q.name, q.qtype);
-                let socket = if server.is_ipv6() {
-                    *self.socket6.get_or_insert_with(|| {
-                        let mut s = UdpSocket::new(8, 8);
-                        s.bind_addr(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), self.rng.ephemeral_port()))
-                            .expect("a fresh socket binds");
-                        sockets.add(s)
-                    })
-                } else {
-                    self.socket
-                };
-                match sockets.get_mut::<UdpSocket>(socket).send_to(&message, server) {
+                // A port of its own for each query, so that an off-path forger
+                // must guess it as well as the id (RFC 5452).
+                let any = if server.is_ipv6() { Ipv6Addr::UNSPECIFIED.into() } else { Ipv4Addr::UNSPECIFIED.into() };
+                let mut socket = UdpSocket::new(4, 4);
+                socket
+                    .bind_addr(SocketAddr::new(any, sockets.free_ephemeral_port(&mut self.rng)))
+                    .expect("a fresh socket binds");
+                match socket.send_to(&message, server) {
                     Ok(()) => {
                         let q = &mut self.queries[i];
+                        q.socks.push((sockets.add(socket), server));
                         q.next_try = now + FIRST_TIMEOUT * (1 << q.attempts);
                         q.attempts += 1;
                     }
@@ -697,13 +692,27 @@ impl DnsClient {
                 }
             }
         }
+        for q in &mut self.queries {
+            if q.result.is_some() {
+                self.dead.extend(q.socks.drain(..).map(|(h, _)| h));
+            }
+        }
+        self.remove_dead(sockets);
         self.queries.retain(|q| q.result.as_ref().is_none_or(|(_, at)| now - *at < RESULT_KEEP));
+    }
+
+    /// Removes the sockets of queries that are over.
+    fn remove_dead(&mut self, sockets: &mut SocketSet) {
+        for h in self.dead.drain(..) {
+            sockets.remove(h);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::socket::Socket;
     use crate::testing::sa;
     use crate::testing::{A_IP, B_IP, Fate, Host, config, pair, run};
 
@@ -966,7 +975,7 @@ mod tests {
             t.dns.poll(t.now, &t.a.iface, &mut t.a.sockets);
             t.now = Instant::from_millis(t.now.as_millis() + 1);
         }
-        assert_eq!(t.a.sockets.iter().count(), 1, "only the UDP socket is left");
+        assert_eq!(t.a.sockets.iter().count(), 0, "the query and TCP sockets are gone");
         assert!(t.dns.jobs.is_empty() && t.dns.closing.is_empty());
     }
 
@@ -990,7 +999,7 @@ mod tests {
         let mut query = encode_query(t.dns.queries[0].id, "none.example", TYPE_A);
         query[2] = 0x83;
         query[3] = 0x80;
-        t.dns.handle_response(&query, IpAddr::V4(B_IP), t.now);
+        t.dns.handle_response(0, &query, IpAddr::V4(B_IP), t.now);
         assert_eq!(t.wait(q, 5000), Some(Err(DnsError::Truncated)));
     }
 
@@ -1095,7 +1104,10 @@ mod tests {
         let q = t.dns.resolve("victim.example", t.now).unwrap();
         t.a.poll(t.now);
         t.dns.poll(t.now, &t.a.iface, &mut t.a.sockets);
-        let port = t.a.sockets.get::<UdpSocket>(t.dns.socket()).local_endpoint().unwrap().port();
+        let (sock, server) = t.dns.queries[0].socks[0];
+        assert_eq!(server, sa(B_IP, 53));
+        let port = t.a.sockets.get::<UdpSocket>(sock).local_endpoint().unwrap().port();
+        assert!(port >= 49152, "a random port");
         let query_id = t.dns.queries[0].id;
         let evil = [6, 6, 6, 6];
         let spoof = |id: u16, name: &str, from_port: u16| {
@@ -1124,6 +1136,42 @@ mod tests {
         t.b.sockets.get_mut::<UdpSocket>(t.server.socket).bind(53).unwrap();
         t.now = now;
         assert_eq!(t.wait(q, 3000), Some(Ok(alloc::vec![IpAddr::from(IP1)])));
+    }
+
+    #[test]
+    fn each_query_has_its_own_port_and_answers_only_reach_their_own() {
+        let mut t = Setup::new();
+        let q1 = t.dns.resolve("one.example", t.now).unwrap();
+        let q2 = t.dns.resolve("two.example", t.now).unwrap();
+        t.a.poll(t.now);
+        t.dns.poll(t.now, &t.a.iface, &mut t.a.sockets);
+        let port_of = |t: &Setup, i: usize| {
+            let (sock, _) = t.dns.queries[i].socks[0];
+            t.a.sockets.get::<UdpSocket>(sock).local_endpoint().unwrap().port()
+        };
+        let (p1, p2) = (port_of(&t, 0), port_of(&t, 1));
+        assert_ne!(p1, p2);
+        // A well-formed answer to the first query (right id, question and
+        // server address and port) arriving on the second query's port.
+        let evil = [6, 6, 6, 6];
+        let id1 = t.dns.queries[0].id;
+        let forged = response(&encode_query(id1, "one.example", TYPE_A), 0, &[(Q, TYPE_A, 600, &evil)]);
+        t.b.sockets.get_mut::<UdpSocket>(t.server.socket).close();
+        let s = t.b.sockets.get_mut::<UdpSocket>(t.server.socket);
+        s.bind(53).unwrap();
+        s.send_to(&forged, sa(A_IP, p2)).unwrap();
+        let mut now = t.now;
+        run(&mut t.a, &mut t.b, &mut now, 5, |_, _| false);
+        t.dns.poll(now, &t.a.iface, &mut t.a.sockets);
+        assert_eq!(t.dns.result_ip(q1), None, "an answer on another query's port is not believed");
+        // On its own port the same datagram is accepted.
+        t.b.sockets.get_mut::<UdpSocket>(t.server.socket).send_to(&forged, sa(A_IP, p1)).unwrap();
+        run(&mut t.a, &mut t.b, &mut now, 5, |_, _| false);
+        t.dns.poll(now, &t.a.iface, &mut t.a.sockets);
+        assert_eq!(t.dns.result_ip(q1), Some(Ok(alloc::vec![IpAddr::from(Ipv4Addr::from(evil))])));
+        t.dns.cancel(q2);
+        t.dns.poll(now, &t.a.iface, &mut t.a.sockets);
+        assert!(t.a.sockets.iter().all(|(_, s)| !matches!(s, Socket::Udp(_))), "query sockets are removed");
     }
 
     #[test]
@@ -1207,9 +1255,43 @@ mod tests {
         }
         assert_eq!(r6, Some(Ok(alloc::vec![IpAddr::V6(aaaa)])));
         assert_eq!(r4, Some(Err(DnsError::NoAddress)));
-        assert!(dns.socket6().is_some(), "queries to an IPv6 server used the IPv6 socket");
+        assert!(a.sockets.iter().all(|(_, s)| !matches!(s, Socket::Udp(_))), "query sockets are removed");
         // The AAAA answer is cached apart from the A lookup.
         let again = dns.resolve6("host.example", now).unwrap();
         assert_eq!(dns.result_ip(again), Some(Ok(alloc::vec![IpAddr::V6(aaaa)])));
+    }
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::wire::fuzz_tests::rand;
+
+    #[test]
+    fn arbitrary_responses_do_not_panic() {
+        let mut state = 0x0bad_cafe_f00d_5eed;
+        let mut query = encode_query(7, "www.example.com", TYPE_A);
+        // A response with a compressed answer name, to mutate.
+        query[2] = 0x81;
+        query[3] = 0x80;
+        query[7] = 1;
+        let question_end = query.len();
+        query.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 1, 0, 0, 4, 1, 2, 3, 4]);
+        assert!(parse_response(&query).is_some());
+        for _ in 0..30_000 {
+            let mut m = query.clone();
+            for _ in 0..1 + rand(&mut state) % 4 {
+                let at = (rand(&mut state) % m.len() as u64) as usize;
+                m[at] = rand(&mut state) as u8;
+            }
+            if rand(&mut state) % 4 == 0 {
+                m.truncate(question_end + (rand(&mut state) % 17) as usize);
+            }
+            let _ = parse_response(&m);
+        }
+        for _ in 0..10_000 {
+            let raw: Vec<u8> = (0..rand(&mut state) % 80).map(|_| rand(&mut state) as u8).collect();
+            let _ = parse_response(&raw);
+        }
     }
 }

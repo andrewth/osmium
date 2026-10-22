@@ -36,8 +36,8 @@ impl UdpSocket {
     }
 
     /// Binds the socket to `port` on every IPv4 address of the interface.
-    /// [`Interface::ephemeral_port`](crate::Interface::ephemeral_port)
-    /// picks one for a client. Use [`bind_addr`](Self::bind_addr) with
+    /// [`Interface::ephemeral_port_in`](crate::Interface::ephemeral_port_in)
+    /// picks one for a client that no socket of the set already has. Use [`bind_addr`](Self::bind_addr) with
     /// `[::]` for an IPv6 socket.
     pub fn bind(&mut self, port: u16) -> Result<(), Error> {
         self.bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))

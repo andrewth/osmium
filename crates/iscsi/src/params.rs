@@ -158,6 +158,26 @@ const TIME2RETAIN: u16 = 0;
 const MIN_DSL: u64 = 512;
 const MAX_DSL: u64 = (1 << 24) - 1;
 
+/// Keys that are negotiated at most once per login (RFC 7143 section 6.2): a
+/// second appearance, from either side, would renegotiate the result.
+const ONCE: [&str; 15] = [
+    "AuthMethod",
+    "HeaderDigest",
+    "DataDigest",
+    "MaxRecvDataSegmentLength",
+    "MaxBurstLength",
+    "FirstBurstLength",
+    "MaxOutstandingR2T",
+    "MaxConnections",
+    "ErrorRecoveryLevel",
+    "DefaultTime2Wait",
+    "DefaultTime2Retain",
+    "InitialR2T",
+    "ImmediateData",
+    "DataPDUInOrder",
+    "DataSequenceInOrder",
+];
+
 /// Tracks one login's negotiation.
 pub(crate) struct Negotiator {
     offer: Offer,
@@ -167,11 +187,13 @@ pub(crate) struct Negotiator {
     offered: Vec<&'static str>,
     /// CHAP is the only authentication we accept.
     chap: bool,
+    /// The [`ONCE`] keys the target has answered or offered already.
+    settled: Vec<&'static str>,
 }
 
 impl Negotiator {
     pub(crate) fn new(offer: Offer) -> Self {
-        Self { offer, params: Params::default(), offered: Vec::new(), chap: false }
+        Self { offer, params: Params::default(), offered: Vec::new(), chap: false, settled: Vec::new() }
     }
 
     fn offer(&mut self, out: &mut Vec<u8>, key: &'static str, value: &str) {
@@ -268,6 +290,12 @@ impl Negotiator {
         let pairs = text::parse(data).ok_or(IscsiError::Protocol("malformed login text"))?;
         let mut replies = Vec::new();
         for (key, value) in pairs {
+            if let Some(&once) = ONCE.iter().find(|&&k| k == key) {
+                if self.settled.contains(&once) {
+                    return Err(bad("target renegotiated a key"));
+                }
+                self.settled.push(once);
+            }
             let ours = match self.offered.iter().position(|k| *k == key) {
                 Some(i) => {
                     self.offered.swap_remove(i);
@@ -497,6 +525,28 @@ mod tests {
         n.operational_keys(false);
         n.respond(b"ImmediateData=Reject\0InitialR2T=Irrelevant\0").unwrap();
         assert_eq!((n.params.immediate_data, n.params.initial_r2t), (true, true));
+    }
+
+    #[test]
+    fn an_answered_key_cannot_be_renegotiated() {
+        let mut n = Negotiator::new(Offer::default());
+        n.operational_keys(false);
+        n.respond(b"MaxBurstLength=65536\0").unwrap();
+        let burst = n.params.max_burst_length;
+        // A later response, offering the key afresh, does not change it.
+        assert!(matches!(n.respond(b"MaxBurstLength=4096\0"), Err(IscsiError::Negotiation(_))));
+        assert_eq!(n.params.max_burst_length, burst);
+        // Nor does a repeat inside one response, or of a target's own offer.
+        let mut n = Negotiator::new(Offer::default());
+        n.security_keys("i", Some("t"), false);
+        let twice = n.respond(b"ErrorRecoveryLevel=0\0ErrorRecoveryLevel=0\0");
+        assert!(matches!(twice, Err(IscsiError::Negotiation(_))));
+        let mut n = Negotiator::new(Offer::default());
+        n.security_keys("i", Some("t"), false);
+        n.respond(b"AuthMethod=None\0InitialR2T=Yes\0").unwrap();
+        assert!(matches!(n.respond(b"InitialR2T=No\0"), Err(IscsiError::Negotiation(_))));
+        // Declarative keys that may repeat are fine.
+        n.respond(b"TargetAddress=a\0TargetAddress=b\0").unwrap();
     }
 
     #[test]

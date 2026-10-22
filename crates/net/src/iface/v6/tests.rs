@@ -49,6 +49,8 @@ fn advert(prefix_len: u8, autonomous: bool, valid: u32) -> RouterAdvert {
             prefix: PREFIX,
         }],
         dns: vec!["2001:db8::53".parse().unwrap()],
+        dns_lifetime: 1800,
+        dns_withdrawn: vec![],
     }
 }
 
@@ -499,4 +501,60 @@ fn ipv6_loopback_is_delivered_and_never_sent() {
         Ipv6Header::parse(p).is_some_and(|(ip, _)| ip.src.is_loopback() || ip.dst.is_loopback())
     });
     assert!(!on_wire, "::1 never goes on the link");
+}
+
+#[test]
+fn default_router_is_stable_across_advertisements() {
+    let (mut a, _b, now) = pair6();
+    let other: Ipv6Addr = "fe80::2".parse().unwrap();
+    let ra = advert(64, true, 7000).emit();
+    deliver_ra(&mut a, now, &advert(64, true, 7000));
+    a.inject(icmp_frame(multicast_mac(ALL_NODES), other, ALL_NODES, 255, ICMPV6_ROUTER_ADVERT, &ra));
+    a.poll(now);
+    assert_eq!(a.iface.ipv6_gateway(), Some(ROUTER));
+    // Both keep advertising; the first stays the default.
+    for _ in 0..3 {
+        deliver_ra(&mut a, now, &advert(64, true, 7000));
+        a.inject(icmp_frame(multicast_mac(ALL_NODES), other, ALL_NODES, 255, ICMPV6_ROUTER_ADVERT, &ra));
+        a.poll(now);
+        assert_eq!(a.iface.ipv6_gateway(), Some(ROUTER));
+    }
+    assert_eq!(a.iface.v6.routers.len(), 2);
+}
+
+#[test]
+fn rdnss_lifetimes_are_honoured() {
+    let (mut a, _b, now) = pair6();
+    let dns: Ipv6Addr = "2001:db8::53".parse().unwrap();
+    deliver_ra(&mut a, now, &RouterAdvert { dns_lifetime: 100, ..advert(64, true, 7000) });
+    assert_eq!(a.iface.ipv6_dns(), [dns]);
+    // Lifetime 0 withdraws the server.
+    deliver_ra(&mut a, now, &RouterAdvert { dns: vec![], dns_withdrawn: vec![dns], ..advert(64, true, 7000) });
+    assert!(a.iface.ipv6_dns().is_empty());
+    // A server is forgotten when its lifetime ends.
+    deliver_ra(&mut a, now, &RouterAdvert { dns_lifetime: 100, ..advert(64, true, 7000) });
+    assert_eq!(a.iface.ipv6_dns(), [dns]);
+    a.poll(Instant::from_millis(99_000));
+    assert_eq!(a.iface.ipv6_dns(), [dns]);
+    a.poll(Instant::from_millis(101_000));
+    assert!(a.iface.ipv6_dns().is_empty());
+}
+
+#[test]
+fn unicast_solicitation_without_a_link_layer_option_is_answered() {
+    let (mut a, _b, now) = pair6();
+    let (a_ll, a_mac) = (ll(&a), a.iface.mac_address());
+    let log = record(&mut a);
+    let body = NeighborSolicit { target: a_ll, source_ll: None }.emit();
+    // From a neighbor we know: an advertisement goes to its address.
+    a.iface.v6.insert(ROUTER, ROUTER_MAC, now);
+    a.inject(icmp_frame(a_mac, ROUTER, a_ll, 255, ICMPV6_NEIGHBOR_SOLICIT, &body));
+    a.poll(now);
+    assert_eq!(icmp_sent(&log), [(ICMPV6_NEIGHBOR_ADVERT, 0, ROUTER)]);
+    // From one we do not know: we look it up.
+    log.borrow_mut().clear();
+    let stranger: Ipv6Addr = "fe80::55".parse().unwrap();
+    a.inject(icmp_frame(a_mac, stranger, a_ll, 255, ICMPV6_NEIGHBOR_SOLICIT, &body));
+    a.poll(now);
+    assert_eq!(icmp_sent(&log), [(ICMPV6_NEIGHBOR_SOLICIT, 0, solicited_node(stranger))]);
 }

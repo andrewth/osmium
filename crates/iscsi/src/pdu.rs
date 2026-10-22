@@ -1183,3 +1183,41 @@ mod tests {
         assert_eq!(Message::DataIn(DataIn { stat_sn: 9, status: Some(0), ..Default::default() }).stat_sn(), Some(9));
     }
 }
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+
+    #[test]
+    fn arbitrary_pdus_and_text_do_not_panic() {
+        let mut state = 0x5eed_1234_abcd_ef01u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let mut pdu = Pdu::new((rand() % 0x40) as u8);
+            for b in &mut pdu.bhs[1..] {
+                *b = rand() as u8;
+            }
+            pdu.data = (0..rand() % 64).map(|_| rand() as u8).collect();
+            let _ = crate::text::parse(&pdu.data);
+            let _ = Message::decode(pdu);
+        }
+        let mut reader = PduReader::new(1024);
+        for round in 0..5_000 {
+            let bytes: Vec<u8> = (0..rand() % 200).map(|_| rand() as u8).collect();
+            reader.push(&bytes);
+            for _ in 0..4 {
+                if !matches!(reader.next_pdu(), Ok(Some(_))) {
+                    break;
+                }
+            }
+            if round % 16 == 0 {
+                reader = PduReader::new(1024);
+            }
+        }
+    }
+}
