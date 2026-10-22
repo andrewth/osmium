@@ -57,13 +57,17 @@
 mod cmd;
 mod eth;
 mod ib;
+mod ipoib;
 mod mad;
 mod queue;
+mod sa;
 
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
 mod tests_ib;
+#[cfg(test)]
+mod tests_ipoib;
 
 use core::cell::Cell;
 use core::mem::ManuallyDrop;
@@ -77,7 +81,9 @@ use osmium_hal::timer::Clock;
 use cmd::{Ctx, Hcr, Input, MTTS_PER_WRITE, op};
 pub use eth::{EthPort, Offloads, RxChecksum, TSO_MAX_HEADER, Tso, TxError, TxOffload};
 pub use ib::{Datagram, Destination, Gid, GlobalHeader, IbPort, PortInfo, PortState, Route};
+pub use ipoib::IpoibPort;
 use mad::MAD_LEN;
+pub use sa::{Group, JoinError};
 
 /// Mellanox's PCI vendor ID.
 pub const VENDOR_ID: u16 = 0x15b3;
@@ -811,6 +817,16 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
             return Err(Mlx4Error::BadPort);
         }
         IbPort::open(self, port, qkey)
+    }
+
+    /// Opens port `port` (1-based) as an IP over InfiniBand interface: an
+    /// [`IbPort`] that joins the IPoIB broadcast group and presents
+    /// Ethernet frames.
+    pub fn open_ipoib(&self, port: u8) -> Result<IpoibPort<'_, 'd, D>, Mlx4Error> {
+        if !(1..=self.caps.num_ports).contains(&port) || self.open.get() & 1 << (port - 1) != 0 {
+            return Err(Mlx4Error::BadPort);
+        }
+        IpoibPort::open(self, port)
     }
 
     /// Waits up to [`SENSE_TIMEOUT_NS`] for a dual-protocol port to tell

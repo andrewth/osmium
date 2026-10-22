@@ -14,7 +14,6 @@ pub const QP1_QKEY: u32 = 0x8001_0000;
 
 // Management classes.
 pub const CLASS_SUBN_LID_ROUTED: u8 = 0x01;
-#[allow(dead_code)] // the subnet administration client uses it
 pub const CLASS_SUBN_ADM: u8 = 0x03;
 pub const CLASS_PERF: u8 = 0x04;
 pub const CLASS_SUBN_DIRECTED_ROUTE: u8 = 0x81;

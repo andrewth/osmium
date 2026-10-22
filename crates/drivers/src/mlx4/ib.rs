@@ -688,15 +688,32 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         }
     }
 
+    /// True if a management datagram is waiting for [`service`](Self::service).
+    pub fn management_pending(&self) -> bool {
+        self.smi.q.can_receive() || self.gsi.q.can_receive()
+    }
+
+    /// The adapter's clock.
+    pub(super) fn now_ns(&self) -> u64 {
+        self.ud.hca.clock.now_ns()
+    }
+
+    /// Changes the queue key of the datagram queue pair, as a multicast
+    /// group's queue key (IPoIB's) requires after joining.
+    pub fn set_qkey(&mut self, qkey: u32) -> Result<(), Mlx4Error> {
+        let port = self.ud.port as u32;
+        with_ud_setup(self.qkey, port, |s| self.ud.qp_set_qkey(s, qkey))?;
+        self.qkey = qkey;
+        Ok(())
+    }
+
     /// Takes a general services datagram that `service` did not answer
     /// itself (a subnet administration reply, for example).
-    #[allow(dead_code)] // the subnet administration client uses it
     pub(super) fn take_general(&mut self) -> Option<RxMad> {
         self.backlog.iter_mut().find_map(Option::take)
     }
 
     /// Sends a general services datagram from queue pair 1.
-    #[allow(dead_code)] // the subnet administration client uses it
     pub(super) fn send_general(&mut self, dest: &MadDest, mad: &[u8; MAD_LEN]) -> Result<(), NetError> {
         let vl = self.vl_for(dest.sl);
         self.gsi.send(vl, dest, mad)

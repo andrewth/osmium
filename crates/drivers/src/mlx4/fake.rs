@@ -815,6 +815,16 @@ impl FakeHca {
                 }
                 qp.state = to;
             }
+            op::RTS2RTS_QP => {
+                let c = self.mailbox(128);
+                let qp = fw.qps.get_mut(&in_mod).ok_or(BAD_STATE)?;
+                if qp.state != 3 {
+                    return Err(BAD_STATE);
+                }
+                assert_eq!((c[0], c[2] >> 28), (1 << 5, 3), "only the queue key changes, in ready-to-send");
+                assert_eq!(qp.service, 3, "queue keys belong to datagram queue pairs");
+                qp.qkey = c[44];
+            }
             op::TO_RST_QP => {
                 assert!(
                     !fw.mcg.values().any(|e| e[8..8 + (e[1] & 0xff_ffff) as usize].contains(&in_mod)),
@@ -1416,6 +1426,11 @@ impl FakeHca {
         let route = (from.sl as u32) << 28 | from.lid as u32;
         self.complete_ud(fw, qpn, false, counter, total as u32, (0, 0), (source, route, pkey_index as u32));
         true
+    }
+
+    /// Lets `ns` nanoseconds of the adapter's clock go by.
+    pub fn advance(&self, ns: u64) {
+        self.state.borrow_mut().now += ns;
     }
 
     /// Keeps the flash semaphore taken, as during a firmware update.

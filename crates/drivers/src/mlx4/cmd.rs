@@ -34,6 +34,7 @@ pub mod op {
     pub const RST2INIT_QP: u16 = 0x019;
     pub const INIT2RTR_QP: u16 = 0x01a;
     pub const RTR2RTS_QP: u16 = 0x01b;
+    pub const RTS2RTS_QP: u16 = 0x01c;
     pub const TO_RST_QP: u16 = 0x021;
     pub const CONF_SPECIAL_QP: u16 = 0x023;
     pub const MAD_IFC: u16 = 0x024;

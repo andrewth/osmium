@@ -14,21 +14,21 @@ use super::queue;
 use super::*;
 use crate::virtio::testing::HostDma;
 
-const IB: [Option<PortKind>; 2] = [Some(PortKind::InfiniBand), Some(PortKind::InfiniBand)];
-const QKEY: u32 = 0x1234_5678;
+pub(super) const IB: [Option<PortKind>; 2] = [Some(PortKind::InfiniBand), Some(PortKind::InfiniBand)];
+pub(super) const QKEY: u32 = 0x1234_5678;
 const PERMISSIVE: u16 = 0xffff;
 
-fn bring_up<'d>(hca: &'d FakeHca, dma: &'d HostDma) -> Result<Mlx4<'d, HostDma>, Mlx4Error> {
+pub(super) fn bring_up<'d>(hca: &'d FakeHca, dma: &'d HostDma) -> Result<Mlx4<'d, HostDma>, Mlx4Error> {
     let func = Function::new(hca, fake::ADDR).unwrap();
     Mlx4::new(&func, hca.config_io(), hca.uar_io(), dma, hca)
 }
 
-fn peer(lid: u16, qpn: u32) -> UdFrom {
+pub(super) fn peer(lid: u16, qpn: u32) -> UdFrom {
     UdFrom { lid, qpn, sl: 0, path_bits: 0 }
 }
 
 /// A global route header as the wire carries it.
-fn grh_bytes(h: &GlobalHeader) -> [u8; 40] {
+pub(super) fn grh_bytes(h: &GlobalHeader) -> [u8; 40] {
     let mut raw = [0u8; 40];
     raw[..4].copy_from_slice(&(6u32 << 28 | (h.traffic_class as u32) << 20 | h.flow_label).to_be_bytes());
     raw[7] = h.hop_limit;

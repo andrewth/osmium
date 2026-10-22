@@ -371,6 +371,13 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
         self.hca.hcr.exec(op::RTR2RTS_QP, 0, self.qpn, Input::Mailbox(&c, 512)).map(drop)
     }
 
+    /// Changes the queue key of a queue pair that is ready to send.
+    pub fn qp_set_qkey(&mut self, setup: &QpSetup<'_>, qkey: u32) -> Result<(), Mlx4Error> {
+        let mut c = self.context(setup, 3);
+        c.set(0, 0, 32, optpar::Q_KEY).set(44, 0, 32, qkey);
+        self.hca.hcr.exec(op::RTS2RTS_QP, 0, self.qpn, Input::Mailbox(&c, 512)).map(drop)
+    }
+
     /// Creates the queue pair and takes it to ready-to-send, with every
     /// receive entry posted.
     pub fn create_qp(&mut self, setup: &QpSetup<'_>) -> Result<(), Mlx4Error> {
