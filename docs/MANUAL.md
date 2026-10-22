@@ -540,7 +540,7 @@ port I/O.
 | Interrupt controllers | `plic::Plic`, `gicv2::GicV2`, `lapic::LocalApic`, `ioapic::IoApic` |
 | Timers | `clint::Clint`, `pit::Pit` |
 | Block | `ramdisk::RamDisk`, `virtio::blk::VirtioBlk`, `usb::storage::UsbStorage` (fewer than 2^32 blocks, so under 2 TiB at 512 B; block sizes a power of two from 512 B to 64 KiB), `ahci::Ahci`, `nvme::Nvme`; iSCSI in `osmium::iscsi` |
-| Network | `virtio::net::VirtioNet`, `usb::ecm::UsbEthernet`, `usb::ncm::UsbNcm`, `mlx4::Mlx4` (polled, or MSI-X via `enable_msix`; checksum and segmentation offloads are inherent `EthPort` methods, since `NetDevice` has no offload flags) |
+| Network | `virtio::net::VirtioNet`, `usb::ecm::UsbEthernet`, `usb::ncm::UsbNcm`, `mlx4::Mlx4` (polled, or MSI-X via `enable_msix`; checksum and segmentation offloads are inherent `EthPort` methods, since `NetDevice` has no offload flags; InfiniBand ports are `IbPort`, which sends and receives UD datagrams and is not a `NetDevice`) |
 | USB | `xhci::Xhci` (polled, INTx, MSI or MSI-X via `enable_message_interrupts`), `ehci::Ehci` (high-speed only; low- and full-speed devices go to the companion), `ohci::Ohci` and `uhci::Uhci` (low/full speed, hubs; all three polled, no isochronous), `usb::hid::BootKeyboard`, `usb::hub::Hub`, `usb::isoch::{IsochIn, IsochOut}` |
 | Display | `virtio::gpu::VirtioGpu` (virtio-gpu and virtio-vga, MMIO or PCI), `display::bochs::BochsVbe` (QEMU std VGA, bochs-display, virtio-vga in VGA mode), `display::vbe::Vbe` (VESA BIOS Extensions, x86) |
 

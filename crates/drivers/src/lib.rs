@@ -17,7 +17,7 @@
 //! | [`ehci::Ehci`] | EHCI USB 2.0 host controller (high-speed devices; polled) | `UsbHost` |
 //! | [`ohci::Ohci`] | OHCI USB 1.1 host controller (polled) | `UsbHost` |
 //! | [`uhci::Uhci`] | UHCI USB 1.1 host controller (I/O ports or MMIO; polled) | `UsbHost` |
-//! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet (PCI, polled) | `NetDevice` per port |
+//! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet and InfiniBand (PCI, polled or MSI-X) | `NetDevice` per Ethernet port, UD datagrams per InfiniBand port |
 //! | [`nvme::Nvme`] | NVM Express SSD (PCI, polled) | `BlockDevice` |
 //! | [`virtio::gpu::VirtioGpu`] | virtio GPU, 2D (MMIO, or PCI as `virtio-gpu-pci` and `virtio-vga`) | `Display` |
 //! | [`display::bochs::BochsVbe`] | Bochs DISPI: QEMU std VGA, `bochs-display`, `virtio-vga` in VGA mode | `Display` |

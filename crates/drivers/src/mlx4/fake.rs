@@ -89,10 +89,89 @@ pub struct Sent {
     /// (mss, header length) of a segmentation entry; `frame` is then the
     /// whole unsegmented frame.
     pub lso: Option<(u16, usize)>,
+    /// The datagram segment of an unreliable datagram send; `frame` is then
+    /// the payload.
+    pub ud: Option<UdSend>,
+}
+
+/// The address vector, queue pair and key of a datagram send entry.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UdSend {
+    pub port: u8,
+    pub pd: u32,
+    pub dlid: u16,
+    pub path_bits: u8,
+    pub grh: bool,
+    pub sl: u8,
+    pub sgid_index: u8,
+    pub hop_limit: u8,
+    pub traffic_class: u8,
+    pub flow_label: u32,
+    pub dgid: [u8; 16],
+    pub dqpn: u32,
+    pub qkey: u32,
+}
+
+/// Where a datagram handed to [`FakeHca::deliver_ud`] came from.
+#[derive(Clone, Copy, Debug)]
+pub struct UdFrom {
+    pub lid: u16,
+    pub qpn: u32,
+    pub sl: u8,
+    pub path_bits: u8,
+}
+
+/// The state the subnet manager and the link set for an InfiniBand port.
+#[derive(Clone, Debug)]
+pub struct IbState {
+    pub lid: u16,
+    pub sm_lid: u16,
+    pub sm_sl: u8,
+    pub lmc: u8,
+    /// 1 down, 2 initializing, 3 armed, 4 active.
+    pub state: u8,
+    pub gid_prefix: u64,
+    pub guids: [u64; 8],
+    pub pkeys: [u16; 16],
+}
+
+pub const NODE_GUID: u64 = 0x0002_c903_0012_3456;
+pub const GID_PREFIX: u64 = 0xfe80_0000_0000_0000;
+pub const SM_LID: u16 = 1;
+pub const IB_PKEYS: usize = 16;
+
+impl IbState {
+    fn new(port: usize) -> Self {
+        let mut guids = [0; 8];
+        guids[0] = NODE_GUID + 1 + port as u64;
+        let mut pkeys = [0; IB_PKEYS];
+        pkeys[0] = 0xffff;
+        Self { lid: 0, sm_lid: 0, sm_sl: 0, lmc: 0, state: 1, gid_prefix: GID_PREFIX, guids, pkeys }
+    }
+}
+
+/// What INIT_PORT told the firmware about an InfiniBand port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IbInit {
+    pub vl_cap: u32,
+    pub width: u32,
+    pub mtu: u32,
+    pub gids: u32,
+    pub pkeys: u32,
+}
+
+/// The hash bucket the firmware puts a multicast GID in (a stand-in for
+/// the real function).
+pub fn mgid_hash(gid: &[u8; 16]) -> u32 {
+    gid.iter().fold(0u32, |a, &b| a.wrapping_mul(31).wrapping_add(b as u32)) & 127
 }
 
 #[derive(Default, Debug)]
 struct Qp {
+    service: u32,
+    pkey_index: u32,
+    qkey: u32,
+    init_optpar: u32,
     state: u8, // 1 INIT, 2 RTR, 3 RTS
     mtt: u64,
     log_sq: u32,
@@ -133,10 +212,18 @@ pub struct Firmware {
     pub port_mtu: [u32; 2],
     pub promisc_qpn: [Option<u32>; 2],
     pub port_up: [bool; 2],
+    /// The capability mask SET_PORT gave each InfiniBand port.
+    pub ib_caps: [Option<u32>; 2],
+    pub ib_init: [Option<IbInit>; 2],
+    /// Multicast group table entries in use, by index (16 dwords each).
+    pub mcg: BTreeMap<u32, [u32; 16]>,
 }
 
 #[derive(Default)]
 pub struct State {
+    /// Firmware without INIT_PORT parameters.
+    pub old_port_cmds: bool,
+    pub ib: [Option<IbState>; 2],
     now: u64,
     /// Every opcode issued, in order.
     pub log: Vec<u16>,
@@ -207,7 +294,9 @@ impl FakeHca {
         config[MSIX_CAP / 4 + 2] = MSIX_PBA as u32;
         config[PCIE_CAP / 4 + 2] = DEVCTL;
         config[PCIE_CAP / 4 + 4] = 0x0000_0040;
-        let state = State { ports, link: [true, false], config, ..State::default() };
+        let ib = [0, 1]
+            .map(|p| matches!(ports[p], Some(PortKind::InfiniBand | PortKind::Vpi { .. })).then(|| IbState::new(p)));
+        let state = State { ports, link: [true, false], config, ib, ..State::default() };
         Self {
             bar0: bar0.as_mut_ptr(),
             uar: uar.as_mut_ptr(),
@@ -403,6 +492,7 @@ impl FakeHca {
                 c[8] = RSVD_MTTS_LOG << 28 | RSVD_MRWS_LOG << 8;
                 c[11] = if s.max_gso > 0 { 0x20 | s.max_gso.trailing_zeros() } else { 0 } << 16;
                 c[13] = 2;
+                c[16] = (s.old_port_cmds as u32) << 6;
                 c[17] = (s.dpdp as u32) << 12;
                 c[18] = RSVD_UARS << 28;
                 c[32] = 256;
@@ -503,10 +593,12 @@ impl FakeHca {
                 };
                 let link = s.link[in_mod as usize - 1] as u32;
                 let m = MAC.map(u32::from);
+                // The InfiniBand MTU capability is 4096, beyond what the
+                // driver uses; 4 widths, 8 GIDs and 16 partition keys; 8 VLs.
                 self.out_mailbox(&[
-                    link << 31 | eth << 25 | ib << 24 | 1500,
-                    0,
-                    0,
+                    link << 31 | eth << 25 | ib << 24 | 5 << 16 | 1500,
+                    2 << 8 | 3 << 4 | 4,
+                    3,
                     0,
                     m[0] << 8 | m[1],
                     m[2] << 24 | m[3] << 16 | m[4] << 8 | m[5],
@@ -545,10 +637,20 @@ impl FakeHca {
             }
             op::RST2INIT_QP => {
                 let c = self.mailbox(128);
-                assert_eq!(c[2] >> 16 & 0xf, 7, "raw Ethernet service type");
+                let service = c[2] >> 16 & 0xf;
+                assert!(matches!(service, 3 | 7), "raw Ethernet or datagram service type");
                 assert_eq!(c[5] & 0xff_ffff, UAR_PAGE);
                 assert_eq!(c[6] & 0xff_ffff, in_mod, "local QPN");
+                if service == 3 {
+                    // Only the optional parameters named in the mask take effect.
+                    assert_eq!(c[0], 0x30, "partition key index and queue key");
+                    assert_eq!(c[2] >> 11 & 3, 3, "migrated");
+                }
                 let qp = Qp {
+                    service,
+                    pkey_index: c[8] & 0xff,
+                    qkey: c[44],
+                    init_optpar: c[0],
                     state: 1,
                     mtt: (c[52] as u64 & 0xff) << 32 | (c[53] & !7) as u64,
                     log_sq: c[4] >> 11 & 0xf,
@@ -573,13 +675,24 @@ impl FakeHca {
                     return Err(BAD_STATE);
                 }
                 if opcode == op::INIT2RTR_QP {
-                    assert_eq!(c[4] >> 29, 7, "Ethernet MTU");
+                    assert_eq!(c[4] >> 29, if qp.service == 7 { 7 } else { 5 }, "MTU");
                     qp.sched_queue = c[16] >> 24;
                 }
                 qp.state += 1;
             }
             op::TO_RST_QP => {
+                assert!(
+                    !fw.mcg.values().any(|e| e[8..8 + (e[1] & 0xff_ffff) as usize].contains(&in_mod)),
+                    "queue pair {in_mod} destroyed while attached to a multicast group"
+                );
                 fw.qps.remove(&in_mod).ok_or(BAD_STATE)?;
+            }
+            op::SET_PORT if op_mod == 0 => {
+                let port = in_mod as usize - 1;
+                if s.ib[port].is_none() {
+                    return Err(BAD_PARAM);
+                }
+                fw.ib_caps[port] = Some(self.mailbox(2)[1]);
             }
             op::SET_PORT => {
                 assert_eq!(op_mod, 1, "Ethernet SET_PORT");
@@ -594,8 +707,69 @@ impl FakeHca {
                     _ => return Err(BAD_PARAM),
                 }
             }
-            op::INIT_PORT => fw.port_up[in_mod as usize - 1] = true,
-            op::CLOSE_PORT => fw.port_up[in_mod as usize - 1] = false,
+            op::INIT_PORT => {
+                let p = in_mod as usize - 1;
+                fw.port_up[p] = true;
+                // InfiniBand mode is what SET_PORT with operation modifier 0 selected.
+                if let (Some(ib), Some(_)) = (&mut s.ib[p], fw.ib_caps[p]) {
+                    if !s.old_port_cmds {
+                        let m = self.mailbox(3);
+                        fw.ib_init[p] = Some(IbInit {
+                            vl_cap: m[0] >> 4 & 0xf,
+                            width: m[0] >> 8 & 0xf,
+                            mtu: m[1] >> 16,
+                            gids: m[1] & 0xffff,
+                            pkeys: m[2] & 0xffff,
+                        });
+                    } else {
+                        assert_eq!(in_param, 0, "old firmware takes no parameters");
+                    }
+                    if ib.state == 1 && s.link[p] {
+                        ib.state = 2;
+                    }
+                }
+            }
+            op::CLOSE_PORT => {
+                let p = in_mod as usize - 1;
+                fw.port_up[p] = false;
+                if let (Some(ib), Some(_)) = (&mut s.ib[p], fw.ib_caps[p].take()) {
+                    // The link drops and the subnet manager's settings go with it.
+                    *ib = IbState { guids: ib.guids, pkeys: ib.pkeys, ..IbState::new(p) };
+                }
+            }
+            op::MAD_IFC => {
+                assert_eq!(op_mod, 3, "ignoring both keys");
+                let port = in_mod as usize - 1;
+                let ib = s.ib[port].as_ref().ok_or(BAD_PARAM)?;
+                if !fw.port_up[port] {
+                    return Err(BAD_STATE);
+                }
+                self.out_mailbox(&self.sma(ib, port, fw.ib_caps[port].unwrap_or(0)));
+            }
+            op::MGID_HASH => {
+                let m = self.mailbox(4);
+                let gid: Vec<u8> = m.iter().flat_map(|d| d.to_be_bytes()).collect();
+                return Ok(mgid_hash(&gid.try_into().unwrap()) as u64);
+            }
+            op::READ_MCG => {
+                assert!(in_mod < 128);
+                self.out_mailbox(&fw.mcg.get(&in_mod).copied().unwrap_or([0; 16]));
+            }
+            op::WRITE_MCG => {
+                assert!(in_mod < 128);
+                let e: [u32; 16] = self.mailbox(16).try_into().unwrap();
+                let count = (e[1] & 0xff_ffff) as usize;
+                assert!(count <= 8 && e[1] >> 24 == 0 && e[0] == 0, "entry header");
+                if count == 0 {
+                    assert!(e.iter().all(|&d| d == 0), "an empty entry is all zeros");
+                    fw.mcg.remove(&in_mod);
+                } else {
+                    let gid: Vec<u8> = e[4..8].iter().flat_map(|d| d.to_be_bytes()).collect();
+                    assert_eq!(mgid_hash(&gid.try_into().unwrap()), in_mod, "group in its hash bucket");
+                    assert!(e[8 + count..].iter().all(|&d| d == 0), "unused member slots are clear");
+                    fw.mcg.insert(in_mod, e);
+                }
+            }
             _ => return Err(BAD_OP),
         }
         Ok(0)
@@ -604,6 +778,22 @@ impl FakeHca {
     /// Writes a completion for entry `counter` of `qpn`'s send or receive
     /// queue, and queues an event if its completion queue is armed.
     fn complete(&self, fw: &mut Firmware, qpn: u32, send: bool, counter: u32, len: u32, csum: (u16, u16)) {
+        self.complete_ud(fw, qpn, send, counter, len, csum, (0, 0));
+    }
+
+    /// Like [`complete`](Self::complete), with the sender fields of a
+    /// datagram receive: the CQE's third and fourth dwords.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_ud(
+        &self,
+        fw: &mut Firmware,
+        qpn: u32,
+        send: bool,
+        counter: u32,
+        len: u32,
+        csum: (u16, u16),
+        sender: (u32, u32),
+    ) {
         let (status, checksum) = csum;
         let qp = &fw.qps[&qpn];
         let cqn = if send { qp.cqn_send } else { qp.cqn_recv };
@@ -613,6 +803,8 @@ impl FakeHca {
         assert!(cq.pi.wrapping_sub(ci) < n, "completion queue overflow");
         let pa = Self::translate(fw, cq.mtt, (cq.pi % n) as usize * 32);
         wr(pa, qpn);
+        wr(pa + 8, sender.0);
+        wr(pa + 12, sender.1);
         wr(pa + 16, (status as u32) << 16);
         wr(pa + 20, len);
         wr(pa + 24, counter << 16 | checksum as u32);
@@ -695,14 +887,44 @@ impl FakeHca {
             assert_eq!(flags & 0xe, 0xe, "completion and solicited");
             let (ip_csum, l4_csum) = (flags & 1 << 4 != 0, flags & 1 << 5 != 0);
             let segments = rd(wqe + 4) & 0x3f;
-            let (frame, lso) = match ctrl & 0x1f {
+            let (frame, lso, ud) = match ctrl & 0x1f {
+                0x0a if qp.service == 3 => {
+                    assert_eq!(segments, 5, "control + datagram + one data segment");
+                    let (av, d) = (wqe + 16, wqe + 64);
+                    let (slid, route) = (rd(av + 4), rd(av + 12));
+                    let mut dgid = [0u8; 16];
+                    for i in 0..4 {
+                        dgid[4 * i..4 * i + 4].copy_from_slice(&rd(av + 16 + 4 * i as u64).to_be_bytes());
+                    }
+                    let ud = UdSend {
+                        port: (rd(av) >> 24) as u8,
+                        pd: rd(av) & 0xff_ffff,
+                        dlid: slid as u16,
+                        path_bits: (slid >> 16 & 0x7f) as u8,
+                        grh: slid >> 23 & 1 != 0,
+                        sl: (route >> 28) as u8,
+                        sgid_index: (rd(av + 8) >> 16) as u8,
+                        hop_limit: rd(av + 8) as u8,
+                        traffic_class: (route >> 20) as u8,
+                        flow_label: route & 0xf_ffff,
+                        dgid,
+                        dqpn: rd(av + 32),
+                        qkey: rd(av + 36),
+                    };
+                    let len = rd(d);
+                    assert_eq!(Some(rd(d + 4)), fw.lkey, "lkey");
+                    let addr = (rd(d + 8) as u64) << 32 | rd(d + 12) as u64;
+                    // SAFETY: the driver's transmit buffer, identity-mapped.
+                    let frame = unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }.to_vec();
+                    (frame, None, Some(ud))
+                }
                 0x0a => {
                     assert_eq!(segments, 2, "control + one data segment");
                     let len = rd(wqe + 16);
                     assert_eq!(Some(rd(wqe + 20)), fw.lkey, "lkey");
                     let addr = (rd(wqe + 24) as u64) << 32 | rd(wqe + 28) as u64;
                     // SAFETY: the driver's transmit buffer, identity-mapped.
-                    (unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }.to_vec(), None)
+                    (unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) }.to_vec(), None, None)
                 }
                 0x0e => {
                     let (mss, hdr) = (rd(wqe + 16) >> 16, (rd(wqe + 16) & 0xffff) as usize);
@@ -720,11 +942,11 @@ impl FakeHca {
                     let addr = (rd(d + 8) as u64) << 32 | rd(d + 12) as u64;
                     // SAFETY: the driver's LSO staging buffer, identity-mapped.
                     frame.extend_from_slice(unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) });
-                    (frame, Some((mss as u16, hdr)))
+                    (frame, Some((mss as u16, hdr)), None)
                 }
                 other => panic!("unexpected send opcode {other:#x}"),
             };
-            frames.push(Sent { frame, ip_csum, l4_csum, lso });
+            frames.push(Sent { frame, ip_csum, l4_csum, lso, ud });
             let counter = qp.sq_next & 0xffff;
             fw.qps.get_mut(&qpn).unwrap().sq_next += 1;
             let mut fw = core::mem::take(&mut s.fw);
@@ -789,6 +1011,172 @@ impl FakeHca {
         self.post_event(&mut s, eqn, 0x09, if up { 4 } else { 1 }, 12, (port as u32) << 28);
     }
 
+    /// The subnet management agent: answers the Get in the input mailbox.
+    fn sma(&self, ib: &IbState, port: usize, caps: u32) -> [u32; 64] {
+        let m = self.mailbox(64);
+        assert_eq!(m[0], 0x0101_0101, "LID-routed subnet management Get, version 1");
+        let (attr, modifier) = ((m[4] >> 16) as u16, m[5]);
+        let mut r = [0u32; 64];
+        r[..6].copy_from_slice(&m[..6]);
+        r[0] = 0x0101_0181; // GetResp
+        let data = &mut r[16..];
+        let mut status = 0;
+        match attr {
+            0x0011 => {
+                data[0] = 1 << 24 | 1 << 16 | 1 << 8 | 2; // versions, channel adapter, two ports
+                data[1] = (NODE_GUID >> 32) as u32;
+                data[2] = NODE_GUID as u32;
+                data[3] = (NODE_GUID >> 32) as u32;
+                data[4] = NODE_GUID as u32;
+                let guid = ib.guids[0];
+                data[5] = (guid >> 32) as u32;
+                data[6] = guid as u32;
+                data[9] = (port as u32 + 1) << 24;
+            }
+            0x0014 if modifier == 0 => {
+                for (i, g) in ib.guids.iter().enumerate() {
+                    data[2 * i] = (g >> 32) as u32;
+                    data[2 * i + 1] = *g as u32;
+                }
+            }
+            0x0015 => {
+                data[2] = (ib.gid_prefix >> 32) as u32;
+                data[3] = ib.gid_prefix as u32;
+                data[4] = (ib.lid as u32) << 16 | ib.sm_lid as u32;
+                data[5] = caps;
+                data[7] = (port as u32 + 1) << 24;
+                let physical = if ib.state >= 2 { 5 } else { 2 };
+                data[8] = (1 << 4 | ib.state as u32) << 24 | physical << 20 | (ib.lmc as u32) << 8;
+                let neighbor = if ib.state >= 3 { 4 } else { 0 };
+                data[9] = (neighbor << 4 | ib.sm_sl as u32) << 24 | 4 << 20;
+                data[10] = 5 << 16; // the port's MTU capability: 4096
+            }
+            0x0016 if modifier == 0 => {
+                for (i, k) in ib.pkeys.iter().enumerate() {
+                    data[i / 2] |= (*k as u32) << if i % 2 == 0 { 16 } else { 0 };
+                }
+            }
+            0x0014 | 0x0016 => status = 0x001c,
+            _ => status = 0x000c,
+        }
+        r[1] = status << 16;
+        r
+    }
+
+    /// What the subnet manager and the link made of InfiniBand port `port`.
+    pub fn ib_state(&self, port: u8) -> IbState {
+        self.state.borrow().ib[port as usize - 1].clone().expect("an InfiniBand port")
+    }
+
+    /// The subnet manager configures InfiniBand port `port`: assigns `lid`
+    /// and activates it, which the adapter reports as a port event.
+    pub fn sm_configure(&self, port: u8, lid: u16) {
+        let mut s = self.state.borrow_mut();
+        let p = port as usize - 1;
+        s.link[p] = true;
+        let ib = s.ib[p].as_mut().expect("an InfiniBand port");
+        (ib.lid, ib.sm_lid, ib.state) = (lid, SM_LID, 4);
+        let eqn = s.fw.async_eqn.expect("event queue mapped");
+        self.post_event(&mut s, eqn, 0x09, 4, 12, (port as u32) << 28);
+    }
+
+    /// Runs the receive engine for one datagram arriving at `port` for
+    /// queue pair `dqpn`: dropped (false) unless the port is active, the
+    /// queue pair exists with key `qkey` and has a receive entry posted.
+    /// The buffer gets the 40-byte header slot then `payload`; `grh` (if
+    /// any) fills the slot.
+    pub fn deliver_ud(
+        &self,
+        port: u8,
+        dqpn: u32,
+        qkey: u32,
+        from: UdFrom,
+        grh: Option<[u8; 40]>,
+        payload: &[u8],
+    ) -> bool {
+        let mut s = self.state.borrow_mut();
+        let active = s.ib[port as usize - 1].as_ref().is_some_and(|ib| ib.state == 4);
+        let mut fw = core::mem::take(&mut s.fw);
+        let delivered = active && self.receive_ud(&mut fw, port, dqpn, qkey, from, grh, payload);
+        s.fw = fw;
+        self.flush_events(&mut s);
+        delivered
+    }
+
+    /// Delivers a datagram sent to multicast group `mgid` to every member
+    /// queue pair on `port`; returns how many took it.
+    pub fn deliver_multicast(
+        &self,
+        port: u8,
+        mgid: &[u8; 16],
+        qkey: u32,
+        from: UdFrom,
+        grh: [u8; 40],
+        payload: &[u8],
+    ) -> usize {
+        let mut s = self.state.borrow_mut();
+        let active = s.ib[port as usize - 1].as_ref().is_some_and(|ib| ib.state == 4);
+        let mut fw = core::mem::take(&mut s.fw);
+        let members: Vec<u32> = match fw.mcg.get(&mgid_hash(mgid)) {
+            Some(e) if active && e[4..8].iter().flat_map(|d| d.to_be_bytes()).eq(mgid.iter().copied()) => {
+                e[8..8 + (e[1] & 0xff_ffff) as usize].to_vec()
+            }
+            _ => Vec::new(),
+        };
+        let taken = members
+            .into_iter()
+            .filter(|&qpn| self.receive_ud(&mut fw, port, qpn, qkey, from, Some(grh), payload))
+            .count();
+        s.fw = fw;
+        self.flush_events(&mut s);
+        taken
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn receive_ud(
+        &self,
+        fw: &mut Firmware,
+        port: u8,
+        qpn: u32,
+        qkey: u32,
+        from: UdFrom,
+        grh: Option<[u8; 40]>,
+        payload: &[u8],
+    ) -> bool {
+        let Some(qp) = fw.qps.get(&qpn).filter(|q| q.service == 3 && q.qkey == qkey) else {
+            return false;
+        };
+        assert_eq!(qp.state, 3, "receiving into a QP not in RTS");
+        if qp.sched_queue != 0x83 | (port as u32 - 1) << 6 {
+            return false; // a member of the group, but on the other port
+        }
+        let posted = rd(qp.db) & 0xffff;
+        if qp.rq_next & 0xffff == posted {
+            return false;
+        }
+        let (n, stride) = (1u32 << qp.log_rq, 1usize << qp.log_rq_stride);
+        let sq_len = (1usize << qp.log_sq) << qp.log_sq_stride;
+        let wqe = Self::translate(fw, qp.mtt, sq_len + (qp.rq_next % n) as usize * stride);
+        let room = rd(wqe);
+        assert_eq!(Some(rd(wqe + 4)), fw.lkey);
+        assert_eq!(rd(wqe + 20), 0x100, "scatter list terminator");
+        let addr = (rd(wqe + 8) as u64) << 32 | rd(wqe + 12) as u64;
+        let total = 40 + payload.len();
+        if total > room as usize {
+            return false;
+        }
+        // SAFETY: the driver's receive buffer, identity-mapped.
+        let dst = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, total) };
+        dst[..40].copy_from_slice(&grh.unwrap_or([0; 40]));
+        dst[40..].copy_from_slice(payload);
+        let counter = qp.rq_next & 0xffff;
+        fw.qps.get_mut(&qpn).unwrap().rq_next += 1;
+        let source = (grh.is_some() as u32) << 31 | (from.path_bits as u32 & 0x7f) << 24 | from.qpn & 0xff_ffff;
+        let route = (from.sl as u32) << 28 | from.lid as u32;
+        self.complete_ud(fw, qpn, false, counter, total as u32, (0, 0), (source, route));
+        true
+    }
+
     /// Keeps the flash semaphore taken, as during a firmware update.
     pub fn hold_semaphore(&self) {
         self.state.borrow_mut().semaphore_stuck = true;
@@ -797,6 +1185,15 @@ impl FakeHca {
 
     pub fn qps(&self) -> Vec<u32> {
         self.state.borrow().fw.qps.keys().copied().collect()
+    }
+
+    /// A datagram queue pair's partition key index, queue key and the
+    /// optional-parameter mask of its RST2INIT.
+    pub fn ud_qp(&self, qpn: u32) -> (u32, u32, u32) {
+        let s = self.state.borrow();
+        let qp = &s.fw.qps[&qpn];
+        assert_eq!(qp.service, 3);
+        (qp.pkey_index, qp.qkey, qp.init_optpar)
     }
 
     pub fn cqs(&self) -> Vec<u32> {

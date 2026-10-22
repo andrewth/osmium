@@ -36,6 +36,10 @@ pub mod op {
     pub const RTR2RTS_QP: u16 = 0x01b;
     pub const TO_RST_QP: u16 = 0x021;
     pub const CONF_SPECIAL_QP: u16 = 0x023;
+    pub const MAD_IFC: u16 = 0x024;
+    pub const READ_MCG: u16 = 0x025;
+    pub const WRITE_MCG: u16 = 0x026;
+    pub const MGID_HASH: u16 = 0x027;
     pub const QUERY_PORT: u16 = 0x043;
     pub const SENSE_PORT: u16 = 0x04d;
     pub const RUN_FW: u16 = 0xff6;
