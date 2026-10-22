@@ -52,8 +52,8 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::FxArea;
 use super::decode::{self, Access, Operand};
+use super::{APIC_BASE_ADDR, FxArea, apic_base_write_ok, injectable};
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 
@@ -552,7 +552,7 @@ impl VmxVcpu {
             fpu: Box::new(FxArea::reset()),
             switch_fp: false,
             running: None,
-            apic_base: 0xfee0_0000 | APIC_BASE_ENABLE | APIC_BASE_BSP,
+            apic_base: APIC_BASE_ADDR | APIC_BASE_ENABLE | APIC_BASE_BSP,
             apic_id: 0,
             pending_exception: None,
             dr: [0; 4],
@@ -1005,18 +1005,24 @@ impl VmxVcpu {
             .saved_vectoring
             .take()
             .unwrap_or_else(|| (self.vmcs.read(IDT_VECTORING_INFO), self.vmcs.read(IDT_VECTORING_ERRCODE)));
-        if !core::mem::replace(&mut self.vectoring_done, true)
+        let vectored = !core::mem::replace(&mut self.vectoring_done, true)
             && vectoring & EVENT_VALID != 0
-            && !(4..=6).contains(&(vectoring >> 8 & 7))
-        {
+            && !(4..=6).contains(&(vectoring >> 8 & 7));
+        if let Some(e) = self.pending_exception.take() {
+            // An exception raised while an event was being delivered (the
+            // reflected #DB or #AC) is benign: the two are handled serially,
+            // so it is taken now in place of the interrupted delivery. Were
+            // the old event queued first, the new one would land at an
+            // unrelated RIP after the next exit.
+            let e = injectable(e, self.cr0());
+            info = e & 0xffff_ffff;
+            code = e >> 32;
+        } else if vectored {
             // A software interrupt or exception is not injected again: RIP
             // still points at its instruction, which runs again.
             info = vectoring & 0xffff_ffff;
             code = vectoring_code;
             window = self.irq.load(Ordering::Acquire);
-        } else if let Some(e) = self.pending_exception.take() {
-            info = e & 0xffff_ffff;
-            code = e >> 32;
         } else if self.irq.load(Ordering::Acquire) {
             let open = self.rflags() & RFLAGS_IF != 0 && self.vmcs.read(GUEST_INTERRUPTIBILITY) & 3 == 0;
             if !open {
@@ -1030,6 +1036,18 @@ impl VmxVcpu {
         let base = if self.dr_switch { self.caps.proc_dr } else { self.caps.proc };
         let proc = base | if window { caps::proc::INTERRUPT_WINDOW } else { 0 };
         self.vmcs.write(PROC_CTLS, proc as u64);
+    }
+
+    /// Called with host interrupts off, just before the entry: if the INTR
+    /// line went up after [`prepare_entry`](Self::prepare_entry) sampled it,
+    /// asks for an exit when the guest can take it, instead of letting the
+    /// guest run on until some other exit.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    fn resample_irq(&mut self) {
+        if self.irq.load(Ordering::Acquire) {
+            let proc = self.vmcs.read(vmcs::PROC_CTLS);
+            self.vmcs.write(vmcs::PROC_CTLS, proc | caps::proc::INTERRUPT_WINDOW as u64);
+        }
     }
 
     /// Answers the CPUID that caused a `CPUID` exit from the host's, as
@@ -1076,6 +1094,7 @@ impl VmxVcpu {
                     v & !(EFER_WRITABLE | EFER_LMA) != 0 || (self.cr0() & CR0_PG != 0 && (v ^ efer) & EFER_LME != 0)
                 }
                 0x277 => !pat_ok(v),
+                0x1b => !apic_base_write_ok(v),
                 0xc000_0082 | 0xc000_0102 | 0xc000_0100 | 0xc000_0101 | 0x175 | 0x176 => !canonical(v),
                 _ => false,
             };
@@ -1340,7 +1359,10 @@ impl VmxVcpu {
             }
             // An access to an address nothing is mapped at (the entry grants
             // no permission at all).
-            exit::EPT_VIOLATION if q & 3 != 0 && q & 0x38 == 0 => {
+            // A fault in the walk of the guest's own page tables (bit 7: the
+            // linear address is valid; bit 8 clear: the access was to a
+            // paging structure) is not an access by the instruction.
+            exit::EPT_VIOLATION if q & 3 != 0 && q & 0x38 == 0 && q & 0x180 != 0x80 => {
                 let addr = GuestPhysAddr(self.vmcs.read(vmcs::GUEST_PHYS_ADDR));
                 let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(&b[..n], self.code_bits())) else {
                     return VmExit::Unhandled { reason: reason as u64 };

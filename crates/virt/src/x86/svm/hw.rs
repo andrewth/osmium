@@ -128,15 +128,77 @@ pub fn enable(hsave_pa: u64) -> Result<(), SvmError> {
 }
 
 /// The VMCB each CPU last ran. Every vCPU uses ASID 1, so a CPU that runs
-/// a different VMCB than last time (another vCPU, a vCPU that moved, or a
-/// new VM in a reused page) flushes the guest TLB first.
+/// a different VMCB than last time (another vCPU or a new VM in a reused
+/// page) flushes the guest TLB first, and so does a vCPU that last ran on
+/// another CPU (its local INVLPGs there never reached this one's TLB).
 static LAST_VMCB: [core::sync::atomic::AtomicU64; osmium_arch::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; osmium_arch::MAX_CPUS];
+
+/// The host's debug registers, around a guest run.
+struct HostDr {
+    addr: [u64; 4],
+    dr6: u64,
+    dr7: u64,
+}
+
+impl HostDr {
+    const ZERO: Self = Self { addr: [0; 4], dr6: 0, dr7: 0 };
+
+    /// Reads DR0-DR3, DR6 and DR7.
+    ///
+    /// # Safety
+    /// Ring 0.
+    unsafe fn save() -> Self {
+        let (mut a, mut d6, mut d7) = ([0u64; 4], 0u64, 0u64);
+        // SAFETY: reading debug registers has no side effects.
+        unsafe {
+            asm!("mov {}, dr0", out(reg) a[0], options(nomem, nostack, preserves_flags));
+            asm!("mov {}, dr1", out(reg) a[1], options(nomem, nostack, preserves_flags));
+            asm!("mov {}, dr2", out(reg) a[2], options(nomem, nostack, preserves_flags));
+            asm!("mov {}, dr3", out(reg) a[3], options(nomem, nostack, preserves_flags));
+            asm!("mov {}, dr6", out(reg) d6, options(nomem, nostack, preserves_flags));
+            asm!("mov {}, dr7", out(reg) d7, options(nomem, nostack, preserves_flags));
+        }
+        Self { addr: a, dr6: d6, dr7: d7 }
+    }
+
+    /// Writes DR0-DR3 from `self`.
+    ///
+    /// # Safety
+    /// Ring 0, with no host breakpoint of DR7 depending on the old values.
+    unsafe fn load_addresses(&self) {
+        // SAFETY: the caller is ring 0.
+        unsafe {
+            asm!("mov dr0, {}", in(reg) self.addr[0], options(nomem, nostack, preserves_flags));
+            asm!("mov dr1, {}", in(reg) self.addr[1], options(nomem, nostack, preserves_flags));
+            asm!("mov dr2, {}", in(reg) self.addr[2], options(nomem, nostack, preserves_flags));
+            asm!("mov dr3, {}", in(reg) self.addr[3], options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    /// Puts the host's debug registers back, DR7 last so no breakpoint is
+    /// armed while the addresses are in flux (and idle first, since the
+    /// guest's DR7 is live after the exit).
+    ///
+    /// # Safety
+    /// Ring 0.
+    unsafe fn restore(&self) {
+        // SAFETY: the caller is ring 0.
+        unsafe {
+            asm!("mov dr7, {}", in(reg) 0x400u64, options(nomem, nostack, preserves_flags));
+            self.load_addresses();
+            asm!("mov dr6, {}", in(reg) self.dr6, options(nomem, nostack, preserves_flags));
+            asm!("mov dr7, {}", in(reg) self.dr7, options(nomem, nostack, preserves_flags));
+        }
+    }
+}
 
 /// Enters the guest and returns at its next `#VMEXIT`.
 pub(super) fn run(v: &mut SvmVcpu) {
     let cpu = osmium_arch::cpu::current_id();
-    if LAST_VMCB[cpu].swap(v.vmcb_pa, core::sync::atomic::Ordering::Relaxed) != v.vmcb_pa {
+    let last = LAST_VMCB[cpu].swap(v.vmcb_pa, core::sync::atomic::Ordering::Relaxed);
+    let last_cpu = core::mem::replace(&mut v.last_cpu, cpu);
+    if crate::vcpu::tlb_may_be_stale(last, v.vmcb_pa, last_cpu, cpu) {
         v.write32(super::vmcb::TLB_CONTROL, 1);
     }
     let flags: u64;
@@ -148,6 +210,9 @@ pub(super) fn run(v: &mut SvmVcpu) {
     // exit the guest. The assembly preserves every callee-saved register.
     unsafe {
         asm!("clgi", options(nomem, nostack));
+        // An INTR raised since the interrupt setup was sampled is looked at
+        // again now that nothing can slip in between.
+        v.resample_irq();
         if if_on {
             asm!("sti", options(nomem, nostack));
         }
@@ -158,6 +223,14 @@ pub(super) fn run(v: &mut SvmVcpu) {
         // TSC_AUX (what RDTSCP and RDPID return) is not in the VMCB: swap
         // the guest's in while GIF is clear, so no host code sees it.
         let host_aux = x86::rdmsr(msr::IA32_TSC_AUX);
+        // The guest's DR7 is loaded by VMRUN, but DR0-DR3 (whose accesses
+        // are intercepted and read as zero) would still hold the host's
+        // addresses: a spurious #DB, and a guest-visible hit on a host
+        // address. Zero them for the run; the host's DR7 and DR6 are not
+        // saved by VMRUN either.
+        let host_dr = HostDr::save();
+        asm!("mov dr7, {}", in(reg) 0x400u64, options(nomem, nostack, preserves_flags));
+        HostDr::ZERO.load_addresses();
         x86::wrmsr(msr::IA32_TSC_AUX, v.tsc_aux);
         // x87 and SSE state, if the vCPU has its own: loaded for the run and
         // saved after it. The host itself never uses these registers
@@ -170,6 +243,7 @@ pub(super) fn run(v: &mut SvmVcpu) {
             asm!("fxsave64 [{}]", in(reg) v.fpu.0.as_mut_ptr(), options(nostack));
         }
         x86::wrmsr(msr::IA32_TSC_AUX, host_aux);
+        host_dr.restore();
         asm!("vmsave rax", in("rax") v.vmcb_pa, options(nostack));
         asm!("vmload rax", in("rax") v.host_pa, options(nostack));
         asm!("cli", "stgi", options(nomem, nostack));

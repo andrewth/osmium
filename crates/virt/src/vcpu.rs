@@ -71,6 +71,22 @@ pub(crate) fn new_vcpu_id() -> u64 {
     NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
+/// "No CPU yet": the initial value of a vCPU's last-run CPU.
+#[cfg_attr(not(any(target_os = "none", target_arch = "aarch64", target_arch = "riscv64")), allow(dead_code))]
+pub(crate) const NO_CPU: usize = usize::MAX;
+
+/// Whether the translations cached on `cpu` may be stale for a vCPU about to
+/// run there. The CPU's TLB is tagged with the guest's ASID/VMID/VPID, which
+/// does not tell vCPUs apart (they may share a tag, and a new VM may reuse an
+/// old one's), and a vCPU that ran elsewhere in between may have done local
+/// invalidations that never reached `cpu`. So flush if the vCPU that last
+/// ran on `cpu` was another (`last_on_cpu` against `this`), or if this vCPU
+/// last ran on another CPU (`last_cpu` against `cpu`).
+#[cfg_attr(not(any(target_os = "none", target_arch = "aarch64", target_arch = "riscv64")), allow(dead_code))]
+pub(crate) fn tlb_may_be_stale<T: PartialEq>(last_on_cpu: T, this: T, last_cpu: usize, cpu: usize) -> bool {
+    last_on_cpu != this || last_cpu != cpu
+}
+
 /// A virtual CPU that a hardware backend (VMX, SVM, EL2, H-extension)
 /// implements.
 pub trait Vcpu {
@@ -128,4 +144,22 @@ fn read(bus: &Bus, addr: u64, size: u8) -> u64 {
     let mut out = [0u8; 8];
     out[..n].copy_from_slice(&buf[..n]);
     u64::from_le_bytes(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrating_vcpu_flushes_even_if_it_was_the_last_one_here() {
+        // First run anywhere.
+        assert!(tlb_may_be_stale(0, 7, NO_CPU, 0));
+        // Same vCPU, same CPU: keep the TLB.
+        assert!(!tlb_may_be_stale(7, 7, 0, 0));
+        // Another vCPU ran here since.
+        assert!(tlb_may_be_stale(8, 7, 0, 0));
+        // vCPU 7 ran on CPU 1 meanwhile (and may have flushed locally there),
+        // and nothing else ran on CPU 0: its entries on CPU 0 are stale.
+        assert!(tlb_may_be_stale(7, 7, 1, 0));
+    }
 }

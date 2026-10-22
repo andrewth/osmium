@@ -37,7 +37,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::decode::{self, Access, Operand};
 #[cfg(any(test, all(target_arch = "x86_64", target_os = "none")))]
 use super::patch_cpuid;
-use super::{APIC_BASE_BSP, APIC_BASE_ENABLE, FxArea};
+use super::{APIC_BASE_ADDR, APIC_BASE_BSP, APIC_BASE_ENABLE, FxArea, apic_base_write_ok, injectable};
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 
@@ -258,9 +258,15 @@ pub struct SvmVcpu {
     apic_id: u8,
     /// An exception to raise in the guest at the next entry (EVENTINJ form).
     pending_exception: Option<u64>,
+    /// The virtual interrupt [`set_virtual_irq`](Self::set_virtual_irq)
+    /// requested, which every entry's interrupt setup keeps armed.
+    virtual_irq: Option<u8>,
     /// Whether `fpu` is switched around VMRUN.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     pub(crate) switch_fp: bool,
+    /// The host CPU this vCPU last ran on, to flush the TLB when it moves.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    pub(crate) last_cpu: usize,
     /// The host CPU running this vCPU's guest code, for kicks.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
@@ -300,10 +306,12 @@ impl SvmVcpu {
             running: None,
             tsc_aux: 0,
             fpu: Box::new(FxArea::reset()),
-            apic_base: 0xfee0_0000 | APIC_BASE_ENABLE | APIC_BASE_BSP,
+            apic_base: APIC_BASE_ADDR | APIC_BASE_ENABLE | APIC_BASE_BSP,
             apic_id: 0,
             switch_fp: false,
             pending_exception: None,
+            virtual_irq: None,
+            last_cpu: crate::vcpu::NO_CPU,
         };
         use vmcb::*;
         // INTR, NMI, CPUID, INVD, HLT, INVLPGA, IOIO, MSR, SHUTDOWN; and every
@@ -591,18 +599,20 @@ impl SvmVcpu {
         self.write64(vmcb::EVENTINJ, 0);
         let pending = self.read64(vmcb::EXITINTINFO);
         self.write64(vmcb::EXITINTINFO, 0);
-        // A software interrupt (type 4) is not re-injected: RIP still points
-        // at its INTn, which runs again.
-        if pending & EVENT_VALID != 0 && (pending >> 8) & 7 != 4 {
+        let mut window = false;
+        if let Some(e) = self.pending_exception.take() {
+            // An exception raised while an event was being delivered (the
+            // reflected #DB or #AC) is benign: the two are handled serially,
+            // so it is taken now in place of the interrupted delivery. Were
+            // the old event injected first, the new one would land at an
+            // unrelated RIP after the next exit.
+            self.write64(vmcb::EVENTINJ, injectable(e, self.read64(vmcb::CR0)));
+        } else if pending & EVENT_VALID != 0 && (pending >> 8) & 7 != 4 {
+            // A software interrupt (type 4) is not re-injected: RIP still
+            // points at its INTn, which runs again.
             self.write64(vmcb::EVENTINJ, pending);
             return;
-        }
-        if let Some(e) = self.pending_exception.take() {
-            self.write64(vmcb::EVENTINJ, e);
-            return;
-        }
-        let mut window = false;
-        if self.irq.load(Ordering::Acquire) {
+        } else if self.irq.load(Ordering::Acquire) {
             let open = self.read64(vmcb::RFLAGS) & RFLAGS_IF != 0 && self.read64(vmcb::INT_STATE) & 1 == 0;
             if open {
                 if let Some(vector) = self.ack.as_ref().and_then(|a| a()) {
@@ -612,13 +622,38 @@ impl SvmVcpu {
                 window = true;
             }
         }
-        // A virtual interrupt is taken (and VINTR fires) only when V_INTR_PRIO
-        // exceeds V_TPR, so the window request uses the highest priority.
-        let v = self.read64(vmcb::V_INTR) & !(1 << 8);
-        let v = if window { v & !(0xf << 16) | 1 << 8 | 0xf << 16 } else { v };
+        self.set_window(window);
+    }
+
+    /// Arms or clears the interrupt-window request. A virtual interrupt is
+    /// taken (and VINTR fires) only when V_INTR_PRIO exceeds V_TPR, so the
+    /// request uses the highest priority. The VMCB has one virtual-interrupt
+    /// slot: while [`set_virtual_irq`](Self::set_virtual_irq) holds it, that
+    /// interrupt is what is armed and no window exit is requested (the
+    /// pending INTR line is looked at again at the next exit).
+    fn set_window(&mut self, window: bool) {
+        let mut v = self.read64(vmcb::V_INTR) & !(1 << 8);
+        let mut want_exit = window;
+        if let Some(vec) = self.virtual_irq {
+            v = v & !(0xff << 32) | 1 << 8 | 0xf << 16 | (vec as u64) << 32;
+            want_exit = false;
+        } else if window {
+            v = v & !(0xf << 16) | 1 << 8 | 0xf << 16;
+        }
         self.write64(vmcb::V_INTR, v);
         let i = self.intercepts() & !INTERCEPT_VINTR;
-        self.write32(vmcb::INTERCEPT_MISC1, if window { i | INTERCEPT_VINTR } else { i });
+        self.write32(vmcb::INTERCEPT_MISC1, if want_exit { i | INTERCEPT_VINTR } else { i });
+    }
+
+    /// Called with GIF clear, just before VMRUN: if the INTR line went up
+    /// after [`prepare_interrupts`](Self::prepare_interrupts) sampled it,
+    /// asks for an exit when the guest can take it, instead of letting the
+    /// guest run on until some other exit.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    fn resample_irq(&mut self) {
+        if self.irq.load(Ordering::Acquire) {
+            self.set_window(true);
+        }
     }
 
     /// Marks this vCPU as an application processor: `IA32_APIC_BASE.BSP`
@@ -683,7 +718,10 @@ impl SvmVcpu {
             // Values VMRUN would reject raise #GP in the guest instead.
             const EFER_VALID: u64 = 1 | 1 << 8 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 15;
             let pat_ok = |v: u64| v.to_le_bytes().iter().all(|&t| matches!(t, 0 | 1 | 4 | 5 | 6 | 7));
-            if (msr == 0xc000_0080 && v & !EFER_VALID != 0) || (msr == 0x277 && !pat_ok(v)) {
+            let bad = (msr == 0xc000_0080 && v & !EFER_VALID != 0)
+                || (msr == 0x277 && !pat_ok(v))
+                || (msr == 0x1b && !apic_base_write_ok(v));
+            if bad {
                 self.pending_exception = Some(13 | 3 << 8 | 1 << 11 | EVENT_VALID); // #GP(0)
                 return;
             }
@@ -745,12 +783,8 @@ impl SvmVcpu {
     /// Requests (or withdraws) a virtual interrupt with `vector`, delivered
     /// when the guest has interrupts enabled.
     pub fn set_virtual_irq(&mut self, vector: Option<u8>) {
-        let v = self.read64(vmcb::V_INTR) & !(1 << 8 | 0xff << 32);
-        let v = match vector {
-            Some(vec) => v | 1 << 8 | 0xf << 16 | (vec as u64) << 32,
-            None => v,
-        };
-        self.write64(vmcb::V_INTR, v);
+        self.virtual_irq = vector;
+        self.set_window(false);
     }
 
     /// Handles the exits the guest must never see the host for: SVM
@@ -829,7 +863,9 @@ impl SvmVcpu {
                 VmExit::Hypercall { nr: self.rax(), args: [r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.r8] }
             }
             // Not-present nested fault: an access to an unbacked address.
-            exit::NPF if info1 & 1 == 0 => {
+            // (EXITINFO1 bit 33: the fault was in the walk of the guest's own
+            // page tables, not an access by the instruction.)
+            exit::NPF if info1 & 1 == 0 && info1 & (1 << 33) == 0 => {
                 let addr = GuestPhysAddr(self.read64(vmcb::EXITINFO2));
                 let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(&b[..n], self.code_bits())) else {
                     return VmExit::Unhandled { reason: code };

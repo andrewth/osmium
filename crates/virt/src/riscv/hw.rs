@@ -181,10 +181,48 @@ osmium_hs_exit:
     scratch2 = const offsets::SCRATCH2,
 );
 
+// A `hlvx.hu` that cannot fault into the host: another vCPU may change the
+// guest's page tables between the exit and this read, and the resulting
+// guest-page fault would otherwise reach the host's trap table. Interrupts
+// are masked and `stvec` points at a local handler for the one instruction;
+// the handler resumes after it with a1 = 1.
+global_asm!(
+    r#"
+    .section .text.osmium_hs, "ax", @progbits
+    .balign 4
+    .globl osmium_hs_hlvx
+osmium_hs_hlvx:
+    la t0, 1f
+    csrrw t0, stvec, t0
+    csrrci t2, sstatus, 2    // SIE off
+    li a1, 0
+    .insn r 0x73, 4, 0x32, a0, a0, x3    // hlvx.hu a0, (a0)
+2:
+    csrw stvec, t0
+    andi t2, t2, 2
+    csrs sstatus, t2
+    ret
+    .balign 4
+1:
+    la t1, 2b
+    csrw sepc, t1
+    li a1, 1
+    sret
+"#
+);
+
+/// What `osmium_hs_hlvx` returns in `a0` and `a1`.
+#[repr(C)]
+struct Hlvx {
+    value: u64,
+    fault: u64,
+}
+
 const _: () = assert!(offset_of!(GuestState, x) == 0, "the stub addresses x[i] as 8*i");
 
 unsafe extern "C" {
     fn osmium_hs_run(state: *mut GuestState);
+    fn osmium_hs_hlvx(addr: u64) -> Hlvx;
 }
 
 macro_rules! csr_read {
@@ -379,7 +417,11 @@ pub(super) fn run(v: &mut RiscvVcpu) {
     // A different vCPU than this hart last ran (or a new VM that reuses an
     // old one's VMID and root): install its hgatp and flush.
     let cpu = osmium_arch::cpu::current_id();
-    let switched = LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id;
+    let last = LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed);
+    // Also a vCPU that last ran on another hart: its VMID's entries here may
+    // predate `hfence.vvma`s it did there (which are local to that hart).
+    let last_cpu = core::mem::replace(&mut v.last_cpu, cpu);
+    let switched = crate::vcpu::tlb_may_be_stale(last, v.id, last_cpu, cpu);
     // `flush_stage2` was called since the last entry: the G-stage tables changed.
     let stale = core::mem::take(&mut v.flush);
     if switched || stale || csr_read!("0x680") != v.hgatp.0 {
@@ -388,6 +430,9 @@ pub(super) fn run(v: &mut RiscvVcpu) {
         // only invalidate TLB entries.
         unsafe { asm!(".insn r 0x73, 0, 0x31, x0, x0, x0", ".insn r 0x73, 0, 0x11, x0, x0, x0", options(nostack)) };
     }
+    // Sampled again now that interrupts are masked: a line raised since
+    // `Vcpu::run` copied it would otherwise wait for the next exit.
+    v.sync_lines();
     load_vs(&v.csrs);
     // SAFETY: `state` stays valid and exclusively borrowed for the guest run;
     // the assembly saves and restores every callee-saved host register.
@@ -404,18 +449,18 @@ pub(super) fn run(v: &mut RiscvVcpu) {
 }
 
 /// Reads the guest instruction at guest-virtual `pc` with `hlvx.hu`, using
-/// the guest's own translation. Only called right after the guest executed
-/// it, so its page is mapped.
+/// the guest's own translation. `None` if a read faults (the guest's page
+/// tables changed under another vCPU since it executed the instruction).
 pub(super) fn fetch(pc: u64) -> Option<u32> {
     let hlvx = |addr: u64| {
-        let v: u64;
-        // SAFETY: a hypervisor load from guest memory with the guest's privilege.
-        unsafe { asm!(".insn r 0x73, 4, 0x32, {0}, {1}, x3", out(reg) v, in(reg) addr, options(nostack, readonly)) };
-        v & 0xffff
+        // SAFETY: a hypervisor load from guest memory with the guest's
+        // privilege; the stub catches the guest-page fault itself.
+        let r = unsafe { osmium_hs_hlvx(addr) };
+        (r.fault == 0).then_some(r.value & 0xffff)
     };
-    let lo = hlvx(pc);
+    let lo = hlvx(pc)?;
     if lo & 3 != 3 {
         return Some(lo as u32);
     }
-    Some((lo | hlvx(pc.wrapping_add(2)) << 16) as u32)
+    Some((lo | hlvx(pc.wrapping_add(2))? << 16) as u32)
 }

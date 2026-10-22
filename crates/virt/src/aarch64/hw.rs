@@ -140,8 +140,12 @@ macro_rules! msr {
 /// `HCR_EL2` while a guest runs: stage 2 on (VM), set/way invalidation
 /// upgraded (SWIO), physical IRQ/FIQ/SError to EL2 (IMO, FMO, AMO), WFI and
 /// SMC trapped (TWI, TSC), IMPLEMENTATION DEFINED and auxiliary control
-/// registers trapped (TIDCP, TACR), and an AArch64 EL1 (RW).
-pub const HCR_GUEST: u64 = 1 << 0 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 13 | 1 << 19 | 1 << 20 | 1 << 21 | 1 << 31;
+/// registers trapped (TIDCP, TACR), and an AArch64 EL1 (RW). FB (bit 9)
+/// forces the guest's TLB and instruction-cache maintenance to broadcast:
+/// the vCPUs of a VM share a VMID and may run on other CPUs, so a "local"
+/// invalidation by the guest must reach every CPU that can hold its entries.
+pub const HCR_GUEST: u64 =
+    1 << 0 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 9 | 1 << 13 | 1 << 19 | 1 << 20 | 1 << 21 | 1 << 31;
 /// `HCR_EL2.VI`: a virtual IRQ is pending for the guest.
 pub const HCR_VI: u64 = 1 << 7;
 
@@ -292,7 +296,11 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     // A different vCPU than this CPU last ran (or a new VM that reuses an
     // old one's VMID and root): install its VTTBR and flush.
     let cpu = osmium_arch::cpu::current_id();
-    let switched = LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed) != v.id;
+    let last = LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed);
+    // Also a vCPU that last ran on another CPU: entries of its VMID cached
+    // here may predate invalidations done while it ran there.
+    let last_cpu = core::mem::replace(&mut v.last_cpu, cpu);
+    let switched = crate::vcpu::tlb_may_be_stale(last, v.id, last_cpu, cpu);
     // `flush_stage2` was called since the last entry: the tables changed.
     let stale = core::mem::take(&mut v.flush);
     if switched || mrs!("vttbr_el2") != v.vttbr {

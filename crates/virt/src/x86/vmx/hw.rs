@@ -521,6 +521,7 @@ pub(super) fn run(v: &mut VmxVcpu) -> Result<(), ()> {
     // other code on this CPU changes the current VMCS or the state written below.
     unsafe { asm!("cli", options(nomem, nostack)) };
     make_current(v.vmcs.pa);
+    v.resample_irq();
     if core::mem::take(&mut v.flush) {
         // SAFETY: VMX operation is on.
         unsafe {

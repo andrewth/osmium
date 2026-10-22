@@ -139,6 +139,13 @@ fn mmio_through_ept_violations() {
     // A write to a read-only page (bit 3: readable) is not MMIO.
     exit_with(&mut v, exit::EPT_VIOLATION, 0b1010, 0);
     assert_eq!(v.classify(), VmExit::Unhandled { reason: exit::EPT_VIOLATION as u64 });
+    // A fault in the walk of the guest's own page tables (bit 7 set, bit 8
+    // clear) is not an access by the instruction at RIP.
+    exit_with(&mut v, exit::EPT_VIOLATION, 0b10 | 1 << 7, 0);
+    assert_eq!(v.classify(), VmExit::Unhandled { reason: exit::EPT_VIOLATION as u64 });
+    v.write(vmcs::GUEST_RIP, 0x10_0000);
+    exit_with(&mut v, exit::EPT_VIOLATION, 0b10 | 1 << 7 | 1 << 8, 0);
+    assert!(matches!(v.classify(), VmExit::MmioWrite { .. }), "the final translation is the instruction's");
     drop(v);
     drop(ram);
 }
@@ -158,6 +165,14 @@ fn msrs() {
     wrmsr(&mut v, 0xc000_0103, 0x1_0000_0003);
     assert_eq!(rdmsr(&mut v, 0xc000_0103), 3, "TSC_AUX is 32 bits");
     assert_eq!(rdmsr(&mut v, 0x1b), 0xfee0_0900, "xAPIC enabled, BSP");
+    // Relocating, disabling or x2APIC-enabling the APIC is not supported: #GP.
+    for bad in [0xfee0_1800, 0xfee0_0000, 0xfee0_0800 | 1 << 10, 0xfee0_0800 | 1 << 9] {
+        wrmsr(&mut v, 0x1b, bad);
+        assert_eq!(v.pending_exception.take(), Some(GP), "{bad:#x}");
+    }
+    wrmsr(&mut v, 0x1b, 0xfee0_0800);
+    assert!(v.pending_exception.is_none());
+    assert_eq!(rdmsr(&mut v, 0x1b), 0xfee0_0900, "BSP is read-only");
     v.set_application_processor();
     assert_eq!(rdmsr(&mut v, 0x1b), 0xfee0_0800);
     assert_eq!(rdmsr(&mut v, 0x8b), 0, "unknown MSRs read as zero");
@@ -371,6 +386,39 @@ fn interrupt_injection() {
     v.prepare_entry();
     assert_eq!(v.read(vmcs::ENTRY_INTR_INFO), GP & 0xffff_ffff);
     assert_eq!(v.read(vmcs::ENTRY_ERRCODE), 5);
+
+    // In real mode there is no error code: asking for one fails the entry.
+    v.write(vmcs::GUEST_CR0, v.cr0() & !CR0_PE);
+    v.pending_exception = Some(GP);
+    v.prepare_entry();
+    assert_eq!(v.read(vmcs::ENTRY_INTR_INFO), 13 | 3 << 8 | EVENT_VALID);
+    assert_eq!(v.read(vmcs::ENTRY_ERRCODE), 0);
+}
+
+#[test]
+fn reflected_exception_during_delivery_is_taken_at_once() {
+    let mut v = vcpu();
+    // An interrupt's delivery was cut short by an intercepted #AC: the #AC
+    // is taken now, not queued behind the re-injected event.
+    v.write(vmcs::IDT_VECTORING_INFO, 0x30 | EVENT_VALID);
+    v.vectoring_done = false;
+    v.write(vmcs::EXIT_INTR_INFO, EVENT_VALID | 3 << 8 | 17);
+    assert!(v.reflect(exit::EXCEPTION_NMI));
+    v.prepare_entry();
+    assert_eq!(v.read(vmcs::ENTRY_INTR_INFO), 17 | 3 << 8 | 1 << 11 | EVENT_VALID);
+    assert!(v.pending_exception.is_none());
+}
+
+#[test]
+fn irq_raised_after_sampling_requests_a_window() {
+    let mut v = vcpu();
+    let window = |v: &VmxVcpu| v.read(vmcs::PROC_CTLS) & caps::proc::INTERRUPT_WINDOW as u64 != 0;
+    v.prepare_entry();
+    v.resample_irq();
+    assert!(!window(&v));
+    v.irq_line().store(true, Ordering::SeqCst);
+    v.resample_irq();
+    assert!(window(&v));
 }
 
 #[test]

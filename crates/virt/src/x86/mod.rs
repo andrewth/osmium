@@ -24,6 +24,25 @@ impl FxArea {
 /// `IA32_APIC_BASE`: the bootstrap processor, and the APIC enabled.
 pub(crate) const APIC_BASE_BSP: u64 = 1 << 8;
 pub(crate) const APIC_BASE_ENABLE: u64 = 1 << 11;
+/// The one place the emulated xAPIC can be.
+pub(crate) const APIC_BASE_ADDR: u64 = 0xfee0_0000;
+
+/// Whether a guest WRMSR of `v` to `IA32_APIC_BASE` is one this model
+/// supports: the xAPIC stays enabled, at its default address, with x2APIC
+/// off and the reserved bits (7:0, 9, 63:36) clear. The BSP bit (8) is
+/// read-only and ignored. Anything else is a #GP, as on hardware.
+pub(crate) fn apic_base_write_ok(v: u64) -> bool {
+    const RESERVED: u64 = 0xff | 1 << 9 | 1 << 10 | !0 << 36;
+    v & RESERVED == 0 && v & APIC_BASE_ENABLE != 0 && v & 0xf_ffff_f000 == APIC_BASE_ADDR
+}
+
+/// An event-injection word (the VMX interruption information with the error
+/// code in bits 63:32, which is also SVM's `EVENTINJ`) as the CPU may take
+/// it: in real mode (`CR0.PE` clear) an exception has no error code, and
+/// asking for one fails the VM entry.
+pub(crate) fn injectable(event: u64, cr0: u64) -> u64 {
+    if cr0 & 1 == 0 { event & 0xffff_ffff & !(1 << 11) } else { event }
+}
 
 /// What a guest sees of the host's CPUID `leaf` (`[eax, ebx, ecx, edx]`):
 /// its own local APIC ID (leaf 1 EBX bits 31:24, leaf 0xB EDX), the
@@ -54,4 +73,29 @@ pub fn patch_cpuid(leaf: u32, [mut a, mut b, mut c, mut d]: [u32; 4], apic_id: u
         _ => {}
     }
     [a, b, c, d]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_mode_events_carry_no_error_code() {
+        let gp = 13 | 3 << 8 | 1 << 11 | 1 << 31 | 5 << 32;
+        assert_eq!(injectable(gp, 1), gp, "protected mode keeps it");
+        assert_eq!(injectable(gp, 0), 13 | 3 << 8 | 1 << 31, "real mode drops it");
+    }
+
+    #[test]
+    fn apic_base_writes_are_validated() {
+        let ok = APIC_BASE_ADDR | APIC_BASE_ENABLE;
+        assert!(apic_base_write_ok(ok));
+        assert!(apic_base_write_ok(ok | APIC_BASE_BSP), "BSP is ignored, not rejected");
+        assert!(!apic_base_write_ok(ok | 1 << 10), "x2APIC");
+        assert!(!apic_base_write_ok(ok | 1 << 9), "reserved");
+        assert!(!apic_base_write_ok(ok | 1), "reserved");
+        assert!(!apic_base_write_ok(ok | 1 << 40), "reserved");
+        assert!(!apic_base_write_ok(APIC_BASE_ADDR), "disabling is not supported");
+        assert!(!apic_base_write_ok(0xfee0_1000 | APIC_BASE_ENABLE), "relocation is not supported");
+    }
 }

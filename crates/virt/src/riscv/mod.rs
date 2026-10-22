@@ -151,6 +151,9 @@ pub struct RiscvVcpu {
     /// The G-stage tables changed: `hfence.gvma` before the next entry.
     #[cfg_attr(not(all(target_arch = "riscv64", feature = "riscv64-hs")), allow(dead_code))]
     pub(crate) flush: bool,
+    /// The hart this vCPU last ran on ([`NO_CPU`](crate::vcpu::NO_CPU) before the first run).
+    #[cfg_attr(not(all(target_arch = "riscv64", feature = "riscv64-hs")), allow(dead_code))]
+    pub(crate) last_cpu: usize,
 }
 
 /// SBI virtual-interrupt bits in `hvip`.
@@ -209,6 +212,7 @@ impl RiscvVcpu {
             running: None,
             fence: None,
             flush: false,
+            last_cpu: crate::vcpu::NO_CPU,
             id: crate::vcpu::new_vcpu_id(),
             mem: None,
         }
@@ -301,6 +305,17 @@ impl RiscvVcpu {
             // Load or store guest-page fault: emulate as MMIO.
             21 | 23 => {
                 let addr = GuestPhysAddr(s.htval << 2 | (s.stval & 3));
+                // A fault in the walk of the guest's own VS-stage tables
+                // reports a pseudo-instruction (non-zero, bit 0 clear): the
+                // instruction at `sepc` did not make this access.
+                if s.htinst != 0 && s.htinst & 1 == 0 {
+                    return VmExit::Unhandled { reason: cause };
+                }
+                // A fault on memory the guest owns (a permission fault on a
+                // mapped page) is not MMIO either.
+                if self.mem.as_ref().is_some_and(|m| m.host_ptr(addr, 1).is_some()) {
+                    return VmExit::Unhandled { reason: cause };
+                }
                 let op = insn::decode_transformed(s.htinst).or_else(|| fetch(s.pc).and_then(insn::decode));
                 match op {
                     Some(op) if op.store && cause == 23 => {
@@ -391,7 +406,7 @@ impl Vcpu for RiscvVcpu {
                 let vsatp = self.csrs.vsatp;
                 self.classify(|pc| fetch_soft(&mem, vsatp, pc))
             }
-            None => self.classify(|pc| hw::fetch(pc)),
+            None => self.classify(hw::fetch),
         }
     }
 
@@ -469,6 +484,22 @@ mod tests {
         let e = v.classify(|pc| (pc == 0x8000_0004).then_some(0xc11c));
         assert_eq!(e, VmExit::MmioWrite { addr: GuestPhysAddr(0x1000_0000), size: 4, data: 0x1234_5678 });
         assert_eq!(v.state.pc, 0x8000_0006);
+
+        // A fault in the guest's own page-table walk: the pseudo-instruction
+        // for an implicit read (0x2000) or write (0x2020).
+        assert_eq!(exit(&mut v, 21, 0, 0x1000_0000 >> 2, 0x2000), VmExit::Unhandled { reason: 21 });
+        assert_eq!(exit(&mut v, 23, 0, 0x1000_0000 >> 2, 0x2020), VmExit::Unhandled { reason: 23 });
+
+        // A fault on a page the guest has mapped is not MMIO.
+        let mut ram = alloc::vec![0u8; 0x1000];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives `mem`.
+        unsafe { mem.add_region(GuestPhysAddr(0x9000_0000), ram.as_mut_ptr(), 0x1000) };
+        let mut w = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), HartId(0), 0, Hgatp(0)).with_memory(Arc::new(mem));
+        assert_eq!(exit(&mut w, 23, 0x9000_0010, 0x9000_0010 >> 2, 0x0000_4283), VmExit::Unhandled { reason: 23 });
+        assert!(matches!(exit(&mut w, 21, 0x1000_0005, 0x1000_0005 >> 2, 0x0000_4283), VmExit::MmioRead { .. }));
+        drop(w);
+        drop(ram);
 
         // A fault on an instruction we cannot decode.
         assert_eq!(exit(&mut v, 21, 0, 0, 0), VmExit::Unhandled { reason: 21 });

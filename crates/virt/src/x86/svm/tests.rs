@@ -122,6 +122,14 @@ fn msrs() {
     wrmsr(&mut v, 0xc000_0103, 3); // TSC_AUX
     assert_eq!((v.tsc_aux, rdmsr(&mut v, 0xc000_0103)), (3, 3));
     assert_eq!(rdmsr(&mut v, 0x1b), 0xfee0_0900, "xAPIC enabled, BSP");
+    // Relocating, disabling or x2APIC-enabling the APIC is not supported: #GP.
+    for bad in [0xfee0_1800, 0xfee0_0000, 0xfee0_0800 | 1 << 10, 0xfee0_0800 | 1 << 9] {
+        wrmsr(&mut v, 0x1b, bad);
+        assert_eq!(v.pending_exception.take(), Some(13 | 3 << 8 | 1 << 11 | EVENT_VALID), "{bad:#x}");
+    }
+    wrmsr(&mut v, 0x1b, 0xfee0_0800);
+    assert!(v.pending_exception.is_none());
+    assert_eq!(rdmsr(&mut v, 0x1b), 0xfee0_0900, "BSP is read-only");
     v.set_application_processor();
     assert_eq!(rdmsr(&mut v, 0x1b), 0xfee0_0800);
     assert_eq!(rdmsr(&mut v, 0x8b), 0, "unknown MSRs read as zero");
@@ -190,6 +198,13 @@ fn io_hlt_vmmcall() {
     assert_eq!(v.classify(), VmExit::MmioRead { addr: GuestPhysAddr(0xfed0_0005), size: 1 });
     v.complete_read(0x60);
     assert_eq!((v.regs.rcx, v.rip()), (0x60, 0x10_000c));
+    // A fault in the walk of the guest's own page tables (EXITINFO1 bit 33)
+    // is not an access by the instruction.
+    v.write64(vmcb::RIP, 0x10_0006);
+    v.write64(vmcb::EXITINFO1, 0b110 | 1 << 33);
+    assert_eq!(v.classify(), VmExit::Unhandled { reason: exit::NPF });
+    v.write64(vmcb::EXITINFO1, 0b110 | 1 << 32);
+    assert!(matches!(v.classify(), VmExit::MmioWrite { .. }), "the final translation is the instruction's");
     drop(v);
     drop(ram);
     let mut v = vcpu();
@@ -294,4 +309,51 @@ fn stage2_flush_is_requested() {
     v.flush = false;
     v.flush_stage2();
     assert!(v.flush);
+}
+
+#[test]
+fn virtual_irq_survives_interrupt_setup() {
+    let mut v = vcpu();
+    v.set_virtual_irq(Some(0x41));
+    v.prepare_interrupts();
+    let vi = v.read64(vmcb::V_INTR);
+    assert_ne!(vi & 1 << 8, 0, "V_IRQ stays armed");
+    assert_eq!(vi >> 32 & 0xff, 0x41);
+    assert_eq!(vi >> 16 & 0xf, 0xf);
+    v.set_virtual_irq(None);
+    v.prepare_interrupts();
+    assert_eq!(v.read64(vmcb::V_INTR) & 1 << 8, 0);
+}
+
+#[test]
+fn reflected_exception_during_delivery_is_taken_at_once() {
+    let mut v = vcpu();
+    // An interrupt's delivery was cut short by an intercepted #AC: the #AC
+    // is injected now, not queued behind the re-injected event.
+    v.write64(vmcb::EXITINTINFO, 0x30 | EVENT_VALID);
+    assert!(v.reflect(exit::EXCEPTION + 17));
+    v.prepare_interrupts();
+    assert_eq!(v.read64(vmcb::EVENTINJ), 17 | 3 << 8 | 1 << 11 | EVENT_VALID);
+    assert!(v.pending_exception.is_none());
+}
+
+#[test]
+fn real_mode_exceptions_have_no_error_code() {
+    let mut v = vcpu();
+    v.write64(vmcb::CR0, 0x10);
+    v.pending_exception = Some(13 | 3 << 8 | 1 << 11 | EVENT_VALID);
+    v.prepare_interrupts();
+    assert_eq!(v.read64(vmcb::EVENTINJ), 13 | 3 << 8 | EVENT_VALID);
+}
+
+#[test]
+fn irq_raised_after_sampling_requests_a_window() {
+    let mut v = vcpu();
+    v.prepare_interrupts();
+    v.resample_irq();
+    assert_eq!(v.intercepts() & INTERCEPT_VINTR, 0);
+    v.irq_line().store(true, Ordering::SeqCst);
+    v.resample_irq();
+    assert_ne!(v.intercepts() & INTERCEPT_VINTR, 0);
+    assert_ne!(v.read64(vmcb::V_INTR) & 1 << 8, 0);
 }

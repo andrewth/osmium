@@ -5,7 +5,7 @@
 //!
 //! | Exception | Exit |
 //! |---|---|
-//! | Data abort from EL1/EL0 with a valid syndrome (ISV) | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], address from `HPFAR_EL2` and `FAR_EL2` |
+//! | Stage-2 translation fault on a data access from EL1/EL0 with a valid syndrome (ISV), not in a stage-1 walk | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], address from `HPFAR_EL2` and `FAR_EL2` |
 //! | `HVC` (or a trapped `SMC`) | [`VmExit::Hypercall`]: `nr` = `x0` (the SMCCC function ID), `args` = `x1`..`x6` |
 //! | Trapped `WFI` (`HCR_EL2.TWI`) | [`VmExit::Halt`] |
 //! | IRQ or FIQ taken while the guest ran | [`VmExit::ExternalInterrupt`] |
@@ -186,6 +186,9 @@ pub struct Aarch64Vcpu {
     /// The stage-2 tables changed: invalidate the VMID before the next entry.
     #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
     pub(crate) flush: bool,
+    /// The CPU this vCPU last ran on ([`NO_CPU`](crate::vcpu::NO_CPU) before the first run).
+    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    pub(crate) last_cpu: usize,
 }
 
 impl Aarch64Vcpu {
@@ -218,6 +221,7 @@ impl Aarch64Vcpu {
             pending: None,
             running: None,
             flush: false,
+            last_cpu: crate::vcpu::NO_CPU,
         }
     }
 
@@ -307,7 +311,11 @@ impl Aarch64Vcpu {
                 }
                 VmExit::Hypercall { nr: s.x[0], args: [s.x[1], s.x[2], s.x[3], s.x[4], s.x[5], s.x[6]] }
             }
-            ec::DABT_LOWER if esr & (1 << 24) != 0 => {
+            // Only a translation fault (DFSC 0b0001xx) on the instruction's own
+            // access is an unbacked address. A permission or access-flag fault
+            // is on a page that is mapped, and S1PTW marks a fault in the
+            // walk of the guest's stage-1 tables: neither is MMIO.
+            ec::DABT_LOWER if esr & (1 << 24) != 0 && esr & (1 << 7) == 0 && esr & 0x3c == 0x04 => {
                 // ISV: SAS[23:22], SSE[21], SRT[20:16], SF[15], WnR[6].
                 let size = 1u8 << ((esr >> 22) & 3);
                 let reg = ((esr >> 16) & 31) as u8;
@@ -387,6 +395,9 @@ mod tests {
 
     const IL: u64 = 1 << 25;
     const ISV: u64 = 1 << 24;
+    /// DFSC: translation fault, level 3.
+    const TRANS: u64 = 0b000111;
+    const S1PTW: u64 = 1 << 7;
 
     #[test]
     fn trapped_sysregs_read_as_zero() {
@@ -411,23 +422,33 @@ mod tests {
         let mut v = Aarch64Vcpu::new(GuestPhysAddr(0x4000_0000), 0, 0);
         // strb w1, [x0] to 0x0900_0000.
         v.state.x[1] = 0x1234_5641;
-        let esr = ec::DABT_LOWER << 26 | IL | ISV | 1 << 16 | 1 << 6;
+        let esr = ec::DABT_LOWER << 26 | IL | ISV | 1 << 16 | 1 << 6 | TRANS;
         let e = exit(&mut v, vector::SYNC, esr, 0x0900_0000, 0x0900_0000 >> 8);
         assert_eq!(e, VmExit::MmioWrite { addr: GuestPhysAddr(0x0900_0000), size: 1, data: 0x41 });
         assert_eq!(v.state.pc, 0x4000_0004);
 
         // ldrsh x3, [x0, #0x18]: 2 bytes, sign-extended into a 64-bit register.
-        let esr = ec::DABT_LOWER << 26 | IL | ISV | 1 << 22 | 1 << 21 | 3 << 16 | 1 << 15;
+        let esr = ec::DABT_LOWER << 26 | IL | ISV | 1 << 22 | 1 << 21 | 3 << 16 | 1 << 15 | TRANS;
         let e = exit(&mut v, vector::SYNC, esr, 0x0900_0018, 0x0900_0000 >> 8);
         assert_eq!(e, VmExit::MmioRead { addr: GuestPhysAddr(0x0900_0018), size: 2 });
         v.complete_read(0x8001);
         assert_eq!((v.state.x[3], v.state.pc), (0xffff_ffff_ffff_8001, 0x4000_0008));
 
         // ldr w4, [...]: 32-bit destination.
-        let esr = ec::DABT_LOWER << 26 | IL | ISV | 2 << 22 | 4 << 16;
+        let esr = ec::DABT_LOWER << 26 | IL | ISV | 2 << 22 | 4 << 16 | TRANS;
         exit(&mut v, vector::SYNC, esr, 0x100, 0x0900_0000 >> 8);
         v.complete_read(0xffff_ffff_dead_beef);
         assert_eq!(v.state.x[4], 0xdead_beef);
+
+        // A permission fault (DFSC 0b0011xx) on a mapped page, an access-flag
+        // fault, and a fault in the guest's own stage-1 walk are not MMIO.
+        let ok = ec::DABT_LOWER << 26 | IL | ISV | 1 << 16 | 1 << 6;
+        for bad in [ok | 0b001111, ok | 0b001011, ok | TRANS | S1PTW] {
+            assert_eq!(
+                exit(&mut v, vector::SYNC, bad, 0x0900_0000, 0x0900_0000 >> 8),
+                VmExit::Unhandled { reason: bad }
+            );
+        }
 
         // No syndrome (e.g. a load pair): not emulated.
         let esr = ec::DABT_LOWER << 26 | IL;
