@@ -164,12 +164,12 @@ fn load_cpu_tables() {
     unsafe { (&*ptr).enable_syscall() };
 }
 
-/// Application processors' first stacks (`AP_STACKS[cpu]`), where each
-/// stays as its CPU's bootstrap task.
+/// Application processors' first stacks (`AP_STACKS[cpu - 1]`; the boot CPU
+/// has its own), where each stays as its CPU's bootstrap task.
 #[repr(align(16))]
 #[allow(dead_code)] // only its address is used
 struct ApStack([u8; 64 * 1024]);
-static mut AP_STACKS: [ApStack; MAX_CPUS] = [const { ApStack([0; 64 * 1024]) }; MAX_CPUS];
+static mut AP_STACKS: [ApStack; MAX_CPUS - 1] = [const { ApStack([0; 64 * 1024]) }; MAX_CPUS - 1];
 
 /// Each CPU's GDT and TSS, so the switch hook can update `rsp[0]`.
 static CPU_TABLES: [core::sync::atomic::AtomicPtr<x86::CpuTables>; MAX_CPUS] =
@@ -531,7 +531,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
         // In the kernel image, not the heap: the AP first runs on the boot
         // tables, which map only the first 4 GiB.
         // SAFETY: only the address is taken; this AP is its sole user.
-        let stack = unsafe { &raw mut AP_STACKS[cpu] };
+        let stack = unsafe { &raw mut AP_STACKS[cpu - 1] };
         let boot = x86::smp::ApBoot {
             cr3: &raw const boot_pml4 as u64,
             stack_top: (stack as u64 + size_of::<ApStack>() as u64) & !15,
@@ -673,9 +673,11 @@ extern "C" fn ap_main(cpu: usize) -> ! {
     unsafe { x86::write_cr3(CR3.load(Ordering::Acquire)) };
     // SAFETY: the boot CPU hands out distinct indices.
     unsafe { cpu::set_current_id(cpu) };
-    load_cpu_tables();
-    // SAFETY: we are on the stack the boot CPU allocated for us.
+    // SAFETY: we are on the stack the boot CPU allocated for us. Traps go in
+    // first, as on the boot CPU, so an exception while the tables load is
+    // handled rather than a triple fault.
     unsafe { trap::install() };
+    load_cpu_tables();
     let apic = LAPIC.get().expect("LAPIC initialised");
     apic.enable(SPURIOUS_VECTOR);
     osmium::sched::init_cpu();

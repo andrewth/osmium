@@ -4,7 +4,10 @@
 Connects to QEMU's QMP socket and takes screendumps until the picture is
 WIDTHxHEIGHT (any size if both are 0) and shows the eight colour bars of
 examples/demos/src/display.rs, or fails after TIMEOUT seconds or when QEMU
-exits. DEVICE picks a display by its qdev id when there are several.
+exits. TIMEOUT counts from the moment QEMU's socket accepts a connection, so
+a cargo build that runs between starting this script and QEMU does not use it
+up; waiting for the socket itself gives up after CONNECT_TIMEOUT seconds.
+DEVICE picks a display by its qdev id when there are several.
 
     screen.py QMP_SOCKET WIDTH HEIGHT [TIMEOUT] [DEVICE]
 """
@@ -14,6 +17,8 @@ import socket
 import sys
 import tempfile
 import time
+
+CONNECT_TIMEOUT = 1800
 
 BARS = [
     (0xff, 0xff, 0xff),
@@ -83,8 +88,8 @@ def main():
     sock, width, height = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     timeout = float(sys.argv[4]) if len(sys.argv) > 4 else 60
     device = sys.argv[5] if len(sys.argv) > 5 else None
+    s, command = qmp(sock, time.time() + CONNECT_TIMEOUT)
     deadline = time.time() + timeout
-    s, command = qmp(sock, deadline)
     args = {"device": device} if device else {}
     problem = "no screendump"
     with tempfile.TemporaryDirectory() as d:

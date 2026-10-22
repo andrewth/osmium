@@ -516,6 +516,8 @@ extern "C" fn kmain(start_info: usize) -> ! {
     trap::set_handler(on_trap);
     // SAFETY: we run on the boot stack from here on.
     unsafe { trap::install() };
+    // SAFETY: the only CPU so far; the id must not depend on TSC_AUX's reset value.
+    unsafe { cpu::set_current_id(0) };
 
     // SAFETY: COM1 belongs to this kernel.
     let mut uart = Uart16550::new(unsafe { Pio::new(COM1) });

@@ -614,13 +614,14 @@ async fn ticker() { for _ in 0..5 { let n = TICKS.wait().await; println!("tick {
 TICKS.signal(TICK_COUNT.fetch_add(1, Relaxed) + 1);
 
 // in main:
-EXEC.run_to_completion(&mut [pin!(ticker()), pin!(console(consumer))]);
+// SAFETY: this firmware is built with panic = "abort".
+unsafe { EXEC.run_to_completion(&mut [pin!(ticker()), pin!(console(consumer))]) };
 ```
 
 - When nothing is ready, the executor sleeps with `irq::enable_and_wait`,
   which cannot lose a wake-up.
-- `run_with` and `run_to_completion` keep the futures in your stack frame,
-  so they **require `panic = "abort"`**.
+- `run_with` and `run_to_completion` are `unsafe fn`s: they keep the futures
+  in your stack frame, so the caller must guarantee `panic = "abort"`.
 - `StaticCell` gives you a `&'static mut` without a heap.
 
 ## 9. File systems

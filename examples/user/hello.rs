@@ -134,8 +134,23 @@ impl Write for Buf {
 /// Lives in the writable data segment.
 static mut CALLS: u64 = 0;
 
+/// Entry. The kernel enters with `rsp % 16 == 0`; the SysV ABI wants 8 at a
+/// function's first instruction, so x86_64 reaches `main` through a `call`.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    core::arch::naked_asm!("call {}", sym main)
+}
+
+/// Entry: the stack is already aligned on the other architectures.
+#[cfg(not(target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! {
+    main()
+}
+
+extern "C" fn main() -> ! {
     let primes = (2u64..200).filter(|n| (2..*n).take_while(|d| d * d <= *n).all(|d| n % d != 0)).count();
     // SAFETY: single-threaded program.
     unsafe { CALLS += 1 };

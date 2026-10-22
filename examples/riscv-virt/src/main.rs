@@ -859,7 +859,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             // SAFETY: BAR 0 was just assigned this range inside the mapped
             // window; nothing else uses it.
             let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
-            let mut hc = Xhci::new(io, &FRAMES).expect("xHCI init failed");
+            let mut hc = Xhci::with_clock(io, &FRAMES, &Uptime).expect("xHCI init failed");
             hc.no_op().expect("xHCI command ring");
             println!(
                 "[usb]   xHCI at {:02x}:{:02x}.{} BAR0 {base:#x}, {} ports",

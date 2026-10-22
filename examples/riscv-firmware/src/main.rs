@@ -113,7 +113,8 @@ extern "C" fn fw_main(hart: usize) -> ! {
         "[fw]    CLINT timer every 10 ms, UART IRQ {UART_IRQ} through the PLIC; async tasks on a heap-free executor"
     );
 
-    EXEC.run_to_completion(&mut [pin!(ticker()), pin!(console(consumer))]);
+    // SAFETY: this firmware is built with panic = "abort".
+    unsafe { EXEC.run_to_completion(&mut [pin!(ticker()), pin!(console(consumer))]) };
 
     println!("[fw]    all tasks finished after {} timer interrupts; powering off", TICK_COUNT.load(Ordering::Relaxed));
     // SAFETY: QEMU's SiFive test device: 0x5555 means "pass, power off".
