@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod iommu;
 mod msi;
+mod usb;
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -568,6 +569,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     demos::user::boot_vfs();
     user_demo();
     serial_demo();
+    usb::demo(ecam);
     msi::demo(ecam);
     iommu::demo(ecam, iommus);
 

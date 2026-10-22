@@ -105,7 +105,7 @@ assembly. Copy them from whichever example is closest to your platform:
 |---|---|---|
 | `riscv-virt` | `cargo run --release` | The most complete one. S-mode under OpenSBI, FDT discovery, W^X Sv39, 4 harts via SBI HSM, the shared scheduler demos, guard-page overflow detection, virtio-net with DHCP/ping/TCP, virtio-blk, AHCI, NVMe and iSCSI disks, colour bars on virtio-gpu (MMIO and PCI) and bochs-display, xHCI with USB keyboard, storage (FAT32) and CDC-ECM, EHCI and OHCI with USB storage, user processes with fork/exec/wait, and H-extension guests (`src/hyp.rs`). |
 | `aarch64-virt` | `cargo run --release` | The same kernel at EL1: PL011, GICv2, generic timer, PSCI CPU_ON, user processes with fork/exec. |
-| `x86_64-pc` | `cargo run --release` | PVH boot, ACPI MADT, COM1 over port I/O with IRQ 4 through the I/O APIC, local APIC timer calibrated by the PIT, INIT/SIPI AP bring-up, the shared demos, user processes with fork/exec, and a VESA mode set through the BIOS followed by virtio-vga (run with `-vga none -device virtio-vga`). |
+| `x86_64-pc` | `cargo run --release` | PVH boot, ACPI MADT, COM1 over port I/O with IRQ 4 through the I/O APIC, local APIC timer calibrated by the PIT, INIT/SIPI AP bring-up, the shared demos, user processes with fork/exec, a VESA mode set through the BIOS followed by virtio-vga (run with `-vga none -device virtio-vga`), and UHCI and EHCI with USB storage, an EHCI handing full-speed devices to its UHCI companions (see the x86_64-pc command line in `scripts/check.sh`). |
 | `uefi` | see below | A UEFI application for OVMF (x86_64) and AAVMF (AArch64): sets a GOP mode and draws colour bars on the framebuffer, or with Blt where the GOP has no framebuffer. |
 | `riscv-firmware` | `cargo run --release` | M-mode firmware with no heap and no scheduler: two async tasks on `osmium-exec` await CLINT timer and UART interrupts. |
 | `aarch64-hyp` | `cargo run --release` (add `-smp 2` for the SMP guest), or see below | An EL2 hypervisor: emulated 16550 and GICv2, a virtual timer, PSCI, a 2-vCPU guest. Given the aarch64-virt image and 512 MiB, it boots that kernel as a two-vCPU guest instead. |
@@ -990,6 +990,8 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
   transfers carry at most 4 KiB per service interval, SuperSpeed burst sizes
   from companion descriptors are ignored, and a SuperSpeed hub port that
   needs a warm reset is not recovered.
+- UHCI, OHCI and EHCI are polled only, without isochronous endpoints, and
+  EHCI supports no hubs.
 
 ### Troubleshooting
 

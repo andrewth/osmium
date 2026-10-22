@@ -349,6 +349,11 @@ where
         let mut config = alloc::vec![0u8; 512];
         let dev = match enumerate(&mut host, port, &mut config) {
             Ok(dev) => dev,
+            // An EHCI port lets go of a device that is not high-speed.
+            Err(_) if !host.port_status(port).connected => {
+                println!("[usb]   port {port}: handed to a companion controller");
+                continue;
+            }
             Err(e) => {
                 println!("[usb]   port {port}: enumeration failed: {e}");
                 continue;

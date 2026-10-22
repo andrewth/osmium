@@ -31,7 +31,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
 | `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2, IOMMU formats), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA, display), IOMMU domains and `IommuDma`, linear framebuffers with pixel formats, `IrqTable`, global console with `println!` | no |
-| `osmium-drivers` | NS16550A, PL011, RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, i8254 PIT, RAM disk, Mellanox ConnectX-3 (mlx4) Ethernet (polled or MSI-X, checksum and segmentation offload; simulator-tested only, no RSS or steering), virtio-net and virtio-blk (MMIO, legacy and 1.x), xHCI USB host controller (interrupt-driven), USB mass storage, HID boot keyboards and CDC-ECM Ethernet, AHCI (SATA) and NVMe disks, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers, virtio-pci transport, virtio-gpu (also as virtio-vga), QEMU `fw_cfg` (ports or MMIO, DMA), Bochs DISPI (QEMU std VGA, bochs-display) and VESA BIOS (VBE) mode setting | no |
+| `osmium-drivers` | NS16550A, PL011, RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, i8254 PIT, RAM disk, Mellanox ConnectX-3 (mlx4) Ethernet (polled or MSI-X, checksum and segmentation offload; simulator-tested only, no RSS or steering), virtio-net and virtio-blk (MMIO, legacy and 1.x), xHCI USB host controller (interrupt-driven), UHCI, OHCI and EHCI (polled), USB mass storage, HID boot keyboards and CDC-ECM Ethernet, AHCI (SATA) and NVMe disks, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers, virtio-pci transport, virtio-gpu (also as virtio-vga), QEMU `fw_cfg` (ports or MMIO, DMA), Bochs DISPI (QEMU std VGA, bochs-display) and VESA BIOS (VBE) mode setting | no |
 | `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG/DMAR/IVRS reader, ELF64 loader, PE32+ loader and relocator, UEFI system table and GOP | writer only |
 | `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
 | `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension, AArch64 EL2 and AMD SVM vCPUs with SBI and PSCI (multi-vCPU guests), emulated PLIC, GICv2, 8259 PIC, 8254 PIT and local APIC, virtio-net | yes |
@@ -142,6 +142,8 @@ features.
   Isochronous transfers are limited to 4 KiB per service interval, SuperSpeed
   burst sizes from companion descriptors are ignored, and a SuperSpeed hub
   port needing a warm reset is not recovered.
+- UHCI, OHCI and EHCI are polled only, without isochronous endpoints, and
+  EHCI supports no hubs.
 
 ## License
 

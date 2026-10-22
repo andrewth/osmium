@@ -175,13 +175,36 @@ fi
 # The VESA BIOS sets the mode through a real-mode thunk, then virtio-vga's
 # virtio-gpu side takes over the screen, which is checked. An NVMe controller
 # (on a null block device) raises its admin completions as MSI-X interrupts.
+# A USB stick behind a UHCI controller (I/O ports) gets the same block write
+# and, with dosfstools, the same FAT32 file as riscv-virt's sticks, as does
+# a high-speed stick on an ICH9 EHCI controller. The full-speed usb-net on
+# that EHCI is handed to one of its three companion UHCI controllers, which
+# resolves ARP through it.
+stick_uhci=$(mktemp)
+stick_ehci=$(mktemp)
+truncate -s 40000K "$stick_uhci" "$stick_ehci"
+for s in "$stick_uhci" "$stick_ehci"; do
+    [ -z "$fat_expect" ] || PATH=$PATH:/usr/sbin mkfs.fat -F 32 -s 1 "$s" >/dev/null
+done
 screen qemu-system-x86_64 640 400
-EXPECT='\[guard\] task "deep" overflowed@@user-bad killed: PageFault@@user-1 exited with status 0 (kernel sees CPU 1)@@user-2 exited with status 0@@\[uart\]  COM1 IRQ 4@@hello from process 2@@4 of 4 address spaces torn down@@hello from a Rust ELF: 46 primes below 200@@pid [0-9]* on Osmium/x86_64: brk ok, mmap ok, writev ok@@init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok@@exec.d as "init child" with HOME=/@@execve: child [0-9]* exited with status 5; then wait4 says -10@@init: fp: exec.d program starts with cleared FP registers: ok@@init: fp: FP registers inherited by fork and kept across switches: ok@@init: signals: SIGUSR1 sent to myself ran its handler and returned: ok@@init: signals: SIGSEGV handled in child [0-9]*, exit status 42: ok@@init: signals: SIGCHLD handler ran when child [0-9]* exited: ok@@init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok@@init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok@@init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok@@init: signals: SIGUSR1 sent to myself ran its handler and returned: ok@@init: signals: SIGSEGV handled in child [0-9]*, exit status 42: ok@@init: signals: SIGCHLD handler ran when child [0-9]* exited: ok@@init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok@@init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok@@init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok@@1 of 1 init address space torn down@@/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries@@\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111@@\[vesa\]  VBE 3.0, .* set mode 0x[0-9a-f]*: 800x600 32bpp at@@\[vesa\]  DISPI 0xb0c5 reads back the BIOS.s mode@@\[vesa\] 800x600 32bpp, stride 3200: colour bars drawn@@\[virtio-vga\] DISPI 0xb0c5: firmware left 800x600 32bpp@@\[virtio-vga\] 640x400 32bpp, stride 2560: colour bars drawn@@\[msi\]   nvme MSI-X vector 0x50 delivered to APIC@@\[msi\]   masked entry 0 held an IDENTIFY completion pending in the PBA; unmasking delivered it@@\[msi\]   nvme completions by interrupt: 512 KiB read in commands of up to [0-9]* KiB, up to [0-9]* in flight, [1-9][0-9]* interrupts' \
+EXPECT='\[guard\] task "deep" overflowed@@user-bad killed: PageFault@@user-1 exited with status 0 (kernel sees CPU 1)@@user-2 exited with status 0@@\[uart\]  COM1 IRQ 4@@hello from process 2@@4 of 4 address spaces torn down@@hello from a Rust ELF: 46 primes below 200@@pid [0-9]* on Osmium/x86_64: brk ok, mmap ok, writev ok@@init: fork: pid [0-9]* reaped child [0-9]* (status 7); parent.s memory unchanged: ok@@exec.d as "init child" with HOME=/@@execve: child [0-9]* exited with status 5; then wait4 says -10@@init: fp: exec.d program starts with cleared FP registers: ok@@init: fp: FP registers inherited by fork and kept across switches: ok@@init: signals: SIGUSR1 sent to myself ran its handler and returned: ok@@init: signals: SIGSEGV handled in child [0-9]*, exit status 42: ok@@init: signals: SIGCHLD handler ran when child [0-9]* exited: ok@@init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok@@init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok@@init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok@@init: signals: SIGUSR1 sent to myself ran its handler and returned: ok@@init: signals: SIGSEGV handled in child [0-9]*, exit status 42: ok@@init: signals: SIGCHLD handler ran when child [0-9]* exited: ok@@init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok@@init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok@@init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok@@1 of 1 init address space torn down@@/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries@@\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111@@\[vesa\]  VBE 3.0, .* set mode 0x[0-9a-f]*: 800x600 32bpp at@@\[vesa\]  DISPI 0xb0c5 reads back the BIOS.s mode@@\[vesa\] 800x600 32bpp, stride 3200: colour bars drawn@@\[virtio-vga\] DISPI 0xb0c5: firmware left 800x600 32bpp@@\[virtio-vga\] 640x400 32bpp, stride 2560: colour bars drawn@@\[msi\]   nvme MSI-X vector 0x50 delivered to APIC@@\[msi\]   masked entry 0 held an IDENTIFY completion pending in the PBA; unmasking delivered it@@\[msi\]   nvme completions by interrupt: 512 KiB read in commands of up to [0-9]* KiB, up to [0-9]* in flight, [1-9][0-9]* interrupts@@\[usb\]   UHCI at .*, 2 ports@@\[usb\]   EHCI at .*, 6 ports@@\[usb\]   port [0-9]: handed to a companion controller@@\[usb\]     ecm: ARP: 10.0.2.2 is at@@\[usb\]     mass storage: INQUIRY "QEMU" "QEMU HARDDISK"@@\[usb\]     disk: wrote and read back block 79999'"$fat_expect" \
 boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
     -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
     -vga none -device virtio-vga -qmp "unix:$qmp,server=on,wait=off" \
-    -blockdev driver=null-co,node-name=nv0,read-zeroes=on -device nvme,serial=osmium1,drive=nv0
+    -blockdev driver=null-co,node-name=nv0,read-zeroes=on -device nvme,serial=osmium1,drive=nv0 \
+    -device piix3-usb-uhci,id=uhci -drive if=none,id=stick-uhci,format=raw,file="$stick_uhci" -device usb-storage,bus=uhci.0,drive=stick-uhci \
+    -device ich9-usb-ehci1,id=ehci -device ich9-usb-uhci1,masterbus=ehci.0,firstport=0 \
+    -device ich9-usb-uhci2,masterbus=ehci.0,firstport=2 -device ich9-usb-uhci3,masterbus=ehci.0,firstport=4 \
+    -drive if=none,id=stick-ehci,format=raw,file="$stick_ehci" -device usb-storage,bus=ehci.0,drive=stick-ehci \
+    -netdev user,id=n1 -device usb-net,netdev=n1,bus=ehci.0
 screen_wait x86_64-pc
+if [ -n "$fat_expect" ] && command -v qemu-system-x86_64 >/dev/null; then
+    for s in "$stick_uhci" "$stick_ehci"; do
+        report=$(PATH=$PATH:/usr/sbin fsck.fat -n -l "$s") || { echo "$report"; echo "x86_64-pc: fsck.fat rejected a stick behind UHCI or EHCI"; exit 1; }
+        grep -q "/OSMIUM/Hello from osmium.txt" <<<"$report" || { echo "$report"; echo "x86_64-pc: file missing on a stick behind UHCI or EHCI"; exit 1; }
+    done
+fi
+rm -f "$stick_uhci" "$stick_ehci"
 
 # Intel VT-d and AMD-Vi, each in front of QEMU's iommu-testdev (the DMAR or
 # IVRS table says where the unit is): a DMA through a mapping reaches memory,
