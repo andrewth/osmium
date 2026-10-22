@@ -39,6 +39,7 @@ use core::mem::ManuallyDrop;
 use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
 use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::{ConfigAccess, Function, MsiError, MsiMessage};
+use osmium_hal::timer::Clock;
 use osmium_hal::usb::{
     DeviceId, Direction, EndpointDescriptor, IsochHost, IsochStart, PortStatus, SetupPacket, Speed, TransferType,
     UsbError, UsbHost,
@@ -47,6 +48,8 @@ use osmium_mm::PhysAddr;
 
 use ring::{EventRing, ProducerRing};
 use trb::{Trb, completion, kind};
+
+use crate::usbhc::{BULK_TIMEOUT_NS, CONTROL_TIMEOUT_NS};
 
 // Capability registers.
 const CAPLENGTH_HCIVERSION: usize = 0x00;
@@ -107,6 +110,11 @@ const ERDP_BUSY: u32 = 1 << 3;
 const EXT_CAP_LEGACY: u32 = 1;
 const LEGACY_BIOS_OWNED: u32 = 1 << 16;
 const LEGACY_OS_OWNED: u32 = 1 << 24;
+/// The bits of USBLEGCTLSTS (the dword after the capability header) that are
+/// not SMI enables and so are written back as read.
+const LEGACY_KEEP_BITS: u32 = 3 << 1 | 0xff << 5 | 7 << 17;
+/// The write-1-to-clear SMI status bits of USBLEGCTLSTS.
+const LEGACY_SMI_STATUS: u32 = 7 << 29;
 
 /// Devices this driver handles at once (slot IDs 1..=MAX_SLOTS).
 pub const MAX_SLOTS: u8 = 8;
@@ -116,8 +124,43 @@ pub const MAX_SLOTS: u8 = 8;
 pub const BOUNCE_LEN: usize = 16 * 1024;
 
 /// How many times a register or the event ring is polled before giving up
-/// (fewer in tests, whose fake controller never answers).
+/// when the controller was built without a clock (fewer in tests, whose fake
+/// controller never answers).
 const POLL_LIMIT: u32 = if cfg!(test) { 20_000 } else { 20_000_000 };
+
+/// How long a register bit may take to change (reset, run/halt, firmware handoff).
+const REGISTER_TIMEOUT_NS: u64 = if cfg!(test) { 50_000_000 } else { 1_000_000_000 };
+
+/// Time a device gets to recover after the reset of a hub port.
+const RESET_RECOVERY_NS: u64 = 10_000_000;
+
+/// How long a port reset may take to report completion.
+const PORT_RESET_TIMEOUT_NS: u64 = if cfg!(test) { 50_000_000 } else { 500_000_000 };
+
+/// Time limit of a polling loop: by the clock if the controller has one,
+/// else by counting polls.
+struct Deadline<'d> {
+    clock: Option<&'d dyn Clock>,
+    end: u64,
+    polls: u32,
+}
+
+impl<'d> Deadline<'d> {
+    fn new(clock: Option<&'d dyn Clock>, ns: u64) -> Self {
+        Self { clock, end: clock.map_or(0, |c| c.now_ns().saturating_add(ns)), polls: 0 }
+    }
+
+    /// Whether the time is up; call after each unsuccessful poll.
+    fn expired(&mut self) -> bool {
+        match self.clock {
+            Some(c) => c.now_ns() > self.end,
+            None => {
+                self.polls += 1;
+                self.polls >= POLL_LIMIT
+            }
+        }
+    }
+}
 
 /// Bytes of one ring segment.
 const RING_BYTES: usize = ring::RING_TRBS * 16;
@@ -271,6 +314,8 @@ pub struct Xhci<'d, D: DmaAllocator + ?Sized> {
     /// With message interrupts (never shared) every one is serviced,
     /// whatever `USBSTS` and `IMAN` say.
     mode: InterruptMode,
+    /// Times the waits; without it they count polls instead.
+    clock: Option<&'d dyn Clock>,
 }
 
 /// How the controller's interrupt reaches the CPU.
@@ -373,7 +418,20 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     /// Takes the controller whose registers are `io` away from firmware,
     /// resets it, and starts it with DMA memory from `dma`. Ports are left
     /// as the reset found them; [`UsbHost::attach`] resets each one.
+    ///
+    /// Waits are counted in polls, which is a shorter or longer time depending
+    /// on the CPU; prefer [`with_clock`](Self::with_clock).
     pub fn new(io: IoMem, dma: &'d D) -> Result<Self, XhciError> {
+        Self::build(io, dma, None)
+    }
+
+    /// Like [`new`](Self::new), but every wait is limited by `clock`: a second
+    /// for register changes, five for commands and transfers.
+    pub fn with_clock(io: IoMem, dma: &'d D, clock: &'d dyn Clock) -> Result<Self, XhciError> {
+        Self::build(io, dma, Some(clock))
+    }
+
+    fn build(io: IoMem, dma: &'d D, clock: Option<&'d dyn Clock>) -> Result<Self, XhciError> {
         let r = |off: usize| io.read::<u32>(off).map_err(|_| XhciError::BadRegisters);
         let cap = r(CAPLENGTH_HCIVERSION)?;
         let op = (cap & 0xff) as usize;
@@ -429,6 +487,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
             isoch: ManuallyDrop::new([const { None }; MAX_ISOCH_ENDPOINTS]),
             interrupts: 0,
             mode: InterruptMode::Intx,
+            clock,
             io,
         };
         if scratchpads > 0 && hc.op_read(PAGESIZE) & 1 == 0 {
@@ -460,7 +519,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         hc.rt_write(IMAN, 0);
 
         hc.op_write(USBCMD, CMD_RUN);
-        hc.poll(|hc| hc.op_read(USBSTS) & STS_HALTED == 0).map_err(|_| XhciError::Timeout)?;
+        hc.poll(REGISTER_TIMEOUT_NS, |hc| hc.op_read(USBSTS) & STS_HALTED == 0).map_err(|_| XhciError::Timeout)?;
         for port in 1..=hc.max_ports {
             let sc = hc.portsc(port);
             if sc & PORT_POWER == 0 {
@@ -631,14 +690,17 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         self.op_write(PORTSC + (port as usize - 1) * PORT_STRIDE, v)
     }
 
-    fn poll(&self, mut done: impl FnMut(&Self) -> bool) -> Result<(), UsbError> {
-        for _ in 0..POLL_LIMIT {
+    fn poll(&self, ns: u64, mut done: impl FnMut(&Self) -> bool) -> Result<(), UsbError> {
+        let mut deadline = Deadline::new(self.clock, ns);
+        loop {
             if done(self) {
                 return Ok(());
             }
+            if deadline.expired() {
+                return Err(UsbError::Timeout);
+            }
             osmium_arch::cpu::spin_hint();
         }
-        Err(UsbError::Timeout)
     }
 
     /// Claims the controller from BIOS/SMM if the USB Legacy Support
@@ -650,7 +712,12 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
                 if cap & LEGACY_BIOS_OWNED != 0 {
                     self.w32(off, cap | LEGACY_OS_OWNED);
                     // Firmware that never lets go keeps it; carry on anyway.
-                    let _ = self.poll(|hc| hc.r32(off) & LEGACY_BIOS_OWNED == 0);
+                    let _ = self.poll(REGISTER_TIMEOUT_NS, |hc| hc.r32(off) & LEGACY_BIOS_OWNED == 0);
+                }
+                // No more SMIs for USB events, and the pending ones are acknowledged.
+                if off + 8 <= self.io.len() {
+                    let ctl = self.r32(off + 4);
+                    self.w32(off + 4, ctl & LEGACY_KEEP_BITS | LEGACY_SMI_STATUS);
                 }
                 return;
             }
@@ -663,28 +730,33 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
 
     fn reset(&self) -> Result<(), XhciError> {
         let timeout = |_| XhciError::Timeout;
-        self.poll(|hc| hc.op_read(USBSTS) & STS_NOT_READY == 0).map_err(timeout)?;
+        self.poll(REGISTER_TIMEOUT_NS, |hc| hc.op_read(USBSTS) & STS_NOT_READY == 0).map_err(timeout)?;
         self.op_write(USBCMD, self.op_read(USBCMD) & !CMD_RUN);
-        self.poll(|hc| hc.op_read(USBSTS) & STS_HALTED != 0).map_err(timeout)?;
+        self.poll(REGISTER_TIMEOUT_NS, |hc| hc.op_read(USBSTS) & STS_HALTED != 0).map_err(timeout)?;
         self.op_write(USBCMD, CMD_RESET);
-        self.poll(|hc| hc.op_read(USBCMD) & CMD_RESET == 0 && hc.op_read(USBSTS) & STS_NOT_READY == 0).map_err(timeout)
+        self.poll(REGISTER_TIMEOUT_NS, |hc| {
+            hc.op_read(USBCMD) & CMD_RESET == 0 && hc.op_read(USBSTS) & STS_NOT_READY == 0
+        })
+        .map_err(timeout)
     }
 
     /// Waits for the event that `matches`, discarding others (port status
     /// changes are read from `PORTSC` instead).
-    fn wait_event(&mut self, matches: impl Fn(&Trb) -> bool) -> Result<Trb, UsbError> {
-        for _ in 0..POLL_LIMIT {
+    fn wait_event(&mut self, ns: u64, matches: impl Fn(&Trb) -> bool) -> Result<Trb, UsbError> {
+        let mut deadline = Deadline::new(self.clock, ns);
+        loop {
             if let Some(ev) = self.events.pop() {
                 self.write_erdp();
                 if matches(&ev) {
                     return Ok(ev);
                 }
                 self.route(ev);
+            } else if deadline.expired() {
+                return Err(UsbError::Timeout);
             } else {
                 osmium_arch::cpu::spin_hint();
             }
         }
-        Err(UsbError::Timeout)
     }
 
     /// Files an event nobody is waiting for: the completion of a
@@ -743,7 +815,8 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         let addr = self.commands.push(cmd);
         self.ring_doorbell(0, 0);
         let param = addr.as_u64();
-        let ev = match self.wait_event(|e| e.kind() == kind::COMMAND_COMPLETION && e.param == param) {
+        let ev = match self.wait_event(CONTROL_TIMEOUT_NS, |e| e.kind() == kind::COMMAND_COMPLETION && e.param == param)
+        {
             Ok(ev) => ev,
             Err(e) => {
                 self.abort_command(addr);
@@ -765,14 +838,14 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         if self.op_read(CRCR) & CRCR_CRR != 0 {
             // The pointer bits are ignored while the ring runs.
             self.op_write(CRCR, CRCR_CA);
-            if self.poll(|hc| hc.op_read(CRCR) & CRCR_CRR == 0).is_err() {
+            if self.poll(REGISTER_TIMEOUT_NS, |hc| hc.op_read(CRCR) & CRCR_CRR == 0).is_err() {
                 self.commands_stuck = true;
                 return;
             }
             let stopped = |e: &Trb| {
                 e.kind() == kind::COMMAND_COMPLETION && e.completion_code() == completion::COMMAND_RING_STOPPED
             };
-            let _ = self.wait_event(stopped);
+            let _ = self.wait_event(REGISTER_TIMEOUT_NS, stopped);
         }
         self.commands.cancel(addr);
     }
@@ -805,7 +878,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         }
         if sc & PORT_ENABLED == 0 {
             self.set_portsc(port, (sc & PORT_PRESERVE) | PORT_RESET);
-            self.poll(|hc| hc.portsc(port) & PORT_RESET_CHANGE != 0)?;
+            self.poll(PORT_RESET_TIMEOUT_NS, |hc| hc.portsc(port) & PORT_RESET_CHANGE != 0)?;
         }
         let sc = self.portsc(port);
         // Acknowledge every change so the next connect is seen afresh.
@@ -938,7 +1011,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         };
         let mut moved = len;
         loop {
-            let ev = match self.wait_event(ours) {
+            let ev = match self.wait_event(CONTROL_TIMEOUT_NS, ours) {
                 Ok(ev) => ev,
                 Err(e) => {
                     self.recover(dev, 1, false);
@@ -969,7 +1042,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         let bounce = self.bounce.device_addr().as_u64();
         let trb = self.idle_ring(dev, endpoint)?.push(Trb::normal(bounce, len as u32)).as_u64();
         self.ring_doorbell(dev.0, i as u32);
-        let ev = match self.wait_event(|e| e.kind() == kind::TRANSFER_EVENT && e.param == trb) {
+        let ev = match self.wait_event(BULK_TIMEOUT_NS, |e| e.kind() == kind::TRANSFER_EVENT && e.param == trb) {
             Ok(ev) => ev,
             Err(e) => {
                 // Left queued, the TRB could still move data through the
@@ -1037,6 +1110,11 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             _ => (0, 0),
         };
         let topo = Topology { route, root_port: parent.topo.root_port, parent: hub.0, tt };
+        // The device gets 10 ms to recover from the hub's port reset before
+        // its first request (USB 2.0 §9.2.6.2); only a controller with a clock can wait.
+        if self.clock.is_some() {
+            let _ = self.poll(RESET_RECOVERY_NS, |_| false);
+        }
         self.address_device(topo, speed)
     }
 
@@ -1418,7 +1496,7 @@ impl<D: DmaAllocator + ?Sized> Drop for Xhci<'_, D> {
         // Stop the controller before the rings and contexts are freed. One
         // that does not halt may still write to them: they are leaked.
         self.op_write(USBCMD, self.op_read(USBCMD) & !CMD_RUN);
-        if self.poll(|hc| hc.op_read(USBSTS) & STS_HALTED != 0).is_err() {
+        if self.poll(REGISTER_TIMEOUT_NS, |hc| hc.op_read(USBSTS) & STS_HALTED != 0).is_err() {
             return;
         }
         // SAFETY: each field is dropped once, here, and not used again.
@@ -1517,6 +1595,7 @@ mod tests {
             isoch: ManuallyDrop::new([const { None }; MAX_ISOCH_ENDPOINTS]),
             interrupts: 0,
             mode: InterruptMode::Intx,
+            clock: None,
         }
     }
 
@@ -1659,6 +1738,25 @@ mod tests {
         // SAFETY: as above.
         let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) };
         assert_eq!(Xhci::new(io, &dma).err(), Some(XhciError::Timeout));
+    }
+
+    #[test]
+    fn waits_use_the_clock_and_the_smi_enables_are_cleared() {
+        use crate::usbhc::fakedev::TickClock;
+        let dma = HighDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        caps(&mut regs, 1, 0x100, true);
+        // A legacy support capability at 0x300 with every SMI enable and status bit set.
+        regs[HCCPARAMS1 / 4] |= 0xc0 << 16;
+        regs[0xc0] = EXT_CAP_LEGACY;
+        regs[0xc1] = u32::MAX;
+        // SAFETY: the window covers a local array.
+        let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) };
+        let clock = TickClock::default();
+        // The reset never completes: the time limit, not a count of polls, ends the wait.
+        assert_eq!(Xhci::with_clock(io, &dma, &clock).err(), Some(XhciError::Timeout));
+        assert!(clock.now_ns() >= REGISTER_TIMEOUT_NS, "waited the whole time");
+        assert_eq!(regs[0xc1], LEGACY_KEEP_BITS | LEGACY_SMI_STATUS);
     }
 
     fn command_completion(trb: PhysAddr, code: u8, slot: u8) -> Trb {

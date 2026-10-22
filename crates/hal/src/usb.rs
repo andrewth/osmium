@@ -574,6 +574,9 @@ pub trait UsbHost {
     /// the device's route string and, for a low- or full-speed device behind
     /// a high-speed hub, its transaction translator from `hub`.
     ///
+    /// The device gets the 10 ms it needs to recover from the port reset
+    /// (USB 2.0 §9.2.6.2) before the first request; the controller waits it out.
+    ///
     /// Controllers without hub support return [`UsbError::Unsupported`].
     fn attach_hub_port(&mut self, hub: DeviceId, port: u8, speed: Speed) -> Result<DeviceId, UsbError> {
         let _ = (hub, port, speed);
@@ -859,14 +862,15 @@ pub fn read_configuration<H: UsbHost + ?Sized>(
 /// by [`read_configuration`]) and enables the endpoints of every interface's
 /// alternate setting 0. [`enumerate`] does this for configuration 0; call it
 /// again to switch to another. Endpoints the previous configuration enabled
-/// are not disabled.
+/// are not disabled. A configuration with more endpoints in its alternate
+/// settings 0 than the 30 supported fails with [`UsbError::NoResources`]
+/// before the device is touched.
 pub fn set_configuration<H: UsbHost + ?Sized>(
     host: &mut H,
     dev: DeviceId,
     config: &[u8],
 ) -> Result<ConfigurationDescriptor, UsbError> {
     let header = ConfigurationDescriptor::parse(config)?;
-    host.control_out(dev, SetupPacket::set_configuration(header.value), &[])?;
 
     const MAX_ENDPOINTS: usize = 30;
     let mut endpoints =
@@ -876,13 +880,16 @@ pub fn set_configuration<H: UsbHost + ?Sized>(
     for d in Descriptors::new(config) {
         match d? {
             Descriptor::Interface(i) => in_default = i.alternate == 0,
-            Descriptor::Endpoint(e) if in_default && count < MAX_ENDPOINTS => {
-                endpoints[count] = e;
+            Descriptor::Endpoint(e) if in_default => {
+                // Checked before the device is configured: dropping an endpoint silently would leave it unusable.
+                let slot = endpoints.get_mut(count).ok_or(UsbError::NoResources)?;
+                *slot = e;
                 count += 1;
             }
             _ => {}
         }
     }
+    host.control_out(dev, SetupPacket::set_configuration(header.value), &[])?;
     if count > 0 {
         host.configure_endpoints(dev, &endpoints[..count])?;
     }

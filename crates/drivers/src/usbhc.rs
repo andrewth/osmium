@@ -42,6 +42,9 @@ pub const CONTROL_TIMEOUT_NS: u64 = if cfg!(test) { 50_000_000 } else { 5_000_00
 /// How long a bulk or interrupt transfer may keep being NAKed.
 pub const BULK_TIMEOUT_NS: u64 = if cfg!(test) { 50_000_000 } else { 5_000_000_000 };
 
+/// Time a device gets to recover after the reset of a hub port.
+const RESET_RECOVERY_NS: u64 = 10_000_000;
+
 /// Time a device gets to settle after `SET_ADDRESS` (USB 2.0 §9.2.6.3).
 const SET_ADDRESS_RECOVERY_NS: u64 = 10_000_000;
 
@@ -58,6 +61,8 @@ pub struct Ep {
     pub toggle: bool,
     /// The slot of a transfer started by `submit_in`.
     pub pending: Option<usize>,
+    /// The length that transfer was started with.
+    pub pending_len: usize,
 }
 
 /// An addressed device.
@@ -177,10 +182,15 @@ pub trait Hc {
     /// moved by the data stage.
     fn control(&mut self, pipe: &Pipe, setup: SetupPacket, data: Data<'_>) -> Result<usize, UsbError>;
 
-    /// Runs a bulk or interrupt transfer starting at data toggle `toggle`
-    /// and returns the bytes moved. An empty `Data::Out` sends one
-    /// zero-length packet. An IN transfer ends at a short packet.
-    fn bulk(&mut self, pipe: &Pipe, toggle: bool, data: Data<'_>) -> Result<usize, UsbError>;
+    /// The most bytes one [`bulk_chunk`](Self::bulk_chunk) takes on `pipe`; a
+    /// multiple of the packet size.
+    fn chunk_max(&self, pipe: &Pipe) -> usize;
+
+    /// Runs one piece (at most [`chunk_max`](Self::chunk_max) bytes) of a bulk
+    /// or interrupt transfer starting at data toggle `toggle` and returns the
+    /// bytes moved. An empty `Data::Out` sends one zero-length packet. An IN
+    /// piece ends at a short packet, which may be a zero-length one.
+    fn bulk_chunk(&mut self, pipe: &Pipe, toggle: bool, data: Data<'_>) -> Result<usize, UsbError>;
 
     /// Starts an IN transfer of up to `len` bytes and returns the slot to
     /// pass to [`poll`](Self::poll).
@@ -200,14 +210,52 @@ pub fn packets(len: usize, mps: u16) -> usize {
     len.div_ceil(mps.max(1) as usize).max(1)
 }
 
-/// The data toggle after a transfer of `len` bytes that started at `toggle`.
-pub fn toggle_after(toggle: bool, len: usize, mps: u16) -> bool {
-    toggle ^ (packets(len, mps) % 2 == 1)
+/// The data toggle after a transfer that started at `toggle`, asked for
+/// `requested` bytes and moved `moved`. An IN transfer that stops short of
+/// `requested` on a whole number of packets was ended by a zero-length packet,
+/// which carries a toggle of its own.
+pub fn toggle_after(toggle: bool, moved: usize, requested: usize, mps: u16) -> bool {
+    let zlp = moved > 0 && moved < requested && moved.is_multiple_of(mps.max(1) as usize);
+    toggle ^ ((packets(moved, mps) + zlp as usize) % 2 == 1)
+}
+
+/// Runs a bulk or interrupt transfer in pieces the controller takes. Returns
+/// the bytes moved and the toggle the next packet carries.
+pub fn bulk<H: Hc + ?Sized>(
+    hc: &mut H,
+    pipe: &Pipe,
+    toggle: bool,
+    mut data: Data<'_>,
+) -> Result<(usize, bool), UsbError> {
+    if pipe.mps == 0 {
+        return Err(UsbError::BadEndpoint);
+    }
+    let total = data.len();
+    let chunk_max = hc.chunk_max(pipe).max(1);
+    let mut done = 0;
+    let mut toggle = toggle;
+    loop {
+        let n = (total - done).min(chunk_max);
+        let piece = match &mut data {
+            Data::None => Data::None,
+            Data::In(buf) => Data::In(&mut buf[done..done + n]),
+            Data::Out(buf) => Data::Out(&buf[done..done + n]),
+        };
+        let moved = hc.bulk_chunk(pipe, toggle, piece)?.min(n);
+        done += moved;
+        toggle = toggle_after(toggle, moved, n, pipe.mps);
+        // A short packet ends an IN transfer; an empty OUT is one packet.
+        if done >= total || moved < n {
+            return Ok((done, toggle));
+        }
+    }
 }
 
 /// Whether the whole of `buf` lies below 4 GiB, as the 32-bit pointers of
-/// UHCI, OHCI and the EHCI structures here require.
+/// UHCI, OHCI and the EHCI structures here require. Also checks the
+/// alignment `DmaAllocator::alloc_coherent` promises, which they rely on.
 pub fn below_4g(buf: &DmaBuffer) -> bool {
+    assert!(buf.device_addr().as_u64() % 4096 == 0, "DmaAllocator::alloc_coherent returned an unaligned buffer");
     buf.device_addr().as_u64().checked_add(buf.len() as u64).is_some_and(|end| end <= 1 << 32)
 }
 
@@ -310,6 +358,9 @@ pub fn attach_hub_port<H: Hc + ?Sized>(hc: &mut H, hub: DeviceId, speed: Speed) 
     if !matches!(speed, Speed::Low | Speed::Full) {
         return Err(UsbError::Unsupported);
     }
+    // The hub class driver has no clock: the device's 10 ms recovery from
+    // its port reset (USB 2.0 §9.2.6.2) is given here.
+    delay(hc.clock(), RESET_RECOVERY_NS);
     address_device(hc, speed, Some(hub.0))
 }
 
@@ -342,9 +393,6 @@ pub fn configure_endpoints<H: Hc + ?Sized>(
     endpoints: &[EndpointDescriptor],
 ) -> Result<(), UsbError> {
     let d = *hc.devices().get(dev.0).ok_or(UsbError::NoDevice)?;
-    for slot in d.eps.iter().flatten().filter_map(|e| e.pending) {
-        hc.cancel(slot);
-    }
     let mut eps = [None; MAX_ENDPOINTS];
     let mut next = 0;
     for e in endpoints {
@@ -364,7 +412,19 @@ pub fn configure_endpoints<H: Hc + ?Sized>(
             }
         };
         let Some(entry) = eps.get_mut(slot) else { return Err(UsbError::NoResources) };
-        *entry = Some(Ep { address: e.address, ttype, mps: e.max_packet_size(), toggle: false, pending: None });
+        *entry = Some(Ep {
+            address: e.address,
+            ttype,
+            mps: e.max_packet_size(),
+            toggle: false,
+            pending: None,
+            pending_len: 0,
+        });
+    }
+    // Only now that the new table is known good are the old transfers
+    // abandoned; the new table has none pending.
+    for slot in d.eps.iter().flatten().filter_map(|e| e.pending) {
+        hc.cancel(slot);
     }
     hc.devices().get(dev.0).ok_or(UsbError::NoDevice)?.eps = eps;
     Ok(())
@@ -434,9 +494,9 @@ pub fn transfer_in<H: Hc + ?Sized>(
     if buf.is_empty() {
         return Ok(0);
     }
-    let n = hc.bulk(&pipe, ep.toggle, Data::In(buf))?;
+    let (n, toggle) = bulk(hc, &pipe, ep.toggle, Data::In(buf))?;
     if let Some(e) = ep_mut(hc, dev, ep.address) {
-        e.toggle = toggle_after(ep.toggle, n, ep.mps);
+        e.toggle = toggle;
     }
     Ok(n)
 }
@@ -447,9 +507,9 @@ pub fn transfer_out<H: Hc + ?Sized>(hc: &mut H, dev: DeviceId, endpoint_addr: u8
     if ep.pending.is_some() {
         return Err(UsbError::Busy);
     }
-    let n = hc.bulk(&pipe, ep.toggle, Data::Out(data))?;
+    let (_, toggle) = bulk(hc, &pipe, ep.toggle, Data::Out(data))?;
     if let Some(e) = ep_mut(hc, dev, ep.address) {
-        e.toggle = toggle_after(ep.toggle, n, ep.mps);
+        e.toggle = toggle;
     }
     Ok(())
 }
@@ -466,6 +526,7 @@ pub fn submit_in<H: Hc + ?Sized>(hc: &mut H, dev: DeviceId, endpoint_addr: u8, l
     let slot = hc.submit(&pipe, ep.toggle, len)?;
     if let Some(e) = ep_mut(hc, dev, ep.address) {
         e.pending = Some(slot);
+        e.pending_len = len;
     }
     Ok(())
 }
@@ -487,7 +548,7 @@ pub fn poll_in<H: Hc + ?Sized>(
     if let Some(e) = ep_mut(hc, dev, ep.address) {
         e.pending = None;
         if let Ok(n) = done {
-            e.toggle = toggle_after(ep.toggle, n, ep.mps);
+            e.toggle = toggle_after(ep.toggle, n, ep.pending_len, ep.mps);
         }
     }
     Some(done)
@@ -686,6 +747,10 @@ pub mod fakedev {
         pub toggle_errors: usize,
         /// Transactions seen: (endpoint address, PID).
         pub log: Vec<(u8, u8)>,
+        /// An IN transfer that ends on a full packet is terminated by a
+        /// zero-length packet, as a gadget does.
+        pub zlp_after_full: bool,
+        zlp_pending: bool,
         setup: [u8; 8],
         control_in: Vec<u8>,
         control_out_len: usize,
@@ -729,6 +794,8 @@ pub mod fakedev {
                 toggles: [false; 256],
                 toggle_errors: 0,
                 log: Vec::new(),
+                zlp_after_full: false,
+                zlp_pending: false,
                 setup: [0; 8],
                 control_in: Vec::new(),
                 control_out_len: 0,
@@ -857,11 +924,17 @@ pub mod fakedev {
                 }
                 (0x81, IN) => {
                     if self.loopback.is_empty() {
-                        return Reply::Nak;
+                        if !self.zlp_pending {
+                            return Reply::Nak;
+                        }
+                        self.zlp_pending = false;
+                        self.check_toggle(endpoint, toggle);
+                        return Reply::Ack(Vec::new());
                     }
                     self.check_toggle(endpoint, toggle);
                     let n = self.loopback.len().min(max).min(64);
                     let chunk: Vec<u8> = self.loopback.drain(..n).collect();
+                    self.zlp_pending = self.zlp_after_full && n == 64 && self.loopback.is_empty();
                     Reply::Ack(chunk)
                 }
                 (0x83, IN) => match self.report.take() {
@@ -874,6 +947,28 @@ pub mod fakedev {
                 _ => Reply::Stall,
             }
         }
+    }
+
+    /// A bulk IN transfer larger than the data, which ends on a full packet
+    /// and a zero-length one, must leave the data toggle where the device has
+    /// it: the next transfer arrives intact and every packet is in step.
+    pub fn zlp_terminated_in<H: UsbHost>(host: &mut H, dev: &Rc<RefCell<Device>>, port: u8) {
+        let mut config = [0u8; 256];
+        let id = enumerate(host, port, &mut config).expect("enumerate").id;
+        dev.borrow_mut().zlp_after_full = true;
+        let full: Vec<u8> = (0..64).collect();
+        for round in 0..3u8 {
+            host.transfer_out(id, 0x02, &full).unwrap();
+            let mut buf = [0u8; 256];
+            assert_eq!(host.transfer_in(id, 0x81, &mut buf), Ok(64), "round {round}");
+            assert_eq!(&buf[..64], &full[..]);
+            // The next transfer, which a wrong toggle would lose.
+            host.transfer_out(id, 0x02, &[round + 1; 5]).unwrap();
+            let mut small = [0u8; 16];
+            assert_eq!(host.transfer_in(id, 0x81, &mut small), Ok(5), "round {round}");
+            assert_eq!(&small[..5], &[round + 1; 5]);
+        }
+        assert_eq!(dev.borrow().toggle_errors, 0, "every packet carried the toggle the device expected");
     }
 
     /// Drives a controller through the whole `UsbHost` surface against the

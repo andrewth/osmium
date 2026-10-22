@@ -224,6 +224,8 @@ pub struct Ohci<'d, D: DmaAllocator + ?Sized> {
     dma: &'d D,
     ports: u8,
     devs: DevTable,
+    /// The synchronous transfer's memory may still be in use by the controller.
+    wedged: bool,
     mem: ManuallyDrop<Mem<'d, D>>,
 }
 
@@ -253,6 +255,7 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
             dma,
             ports: ndp,
             devs: DevTable::new(),
+            wedged: false,
             mem: ManuallyDrop::new(Mem { hcca, eds, sync, pending: [const { None }; MAX_PENDING] }),
         };
         hc.build_schedule();
@@ -318,7 +321,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
             }
         }
         let interval = match self.r32(FM_INTERVAL) & 0x3fff {
-            0 => DEFAULT_FRAME_INTERVAL,
+            // A value too small for the largest-packet computation is as bad as none.
+            fi if fi <= 210 => DEFAULT_FRAME_INTERVAL,
             fi => fi,
         };
         let toggle = !self.r32(FM_INTERVAL) & FM_INTERVAL_TOGGLE;
@@ -357,9 +361,9 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
 
     /// Waits for the controller to finish the frame it is in, so that it no
     /// longer reads an endpoint descriptor that was just skipped.
-    fn next_frame(&self) {
+    fn next_frame(&self) -> bool {
         let start = self.r32(FM_NUMBER) & 0xffff;
-        usbhc::wait(self.clock, 3_000_000, || self.r32(FM_NUMBER) & 0xffff != start);
+        usbhc::wait(self.clock, 3_000_000, || self.r32(FM_NUMBER) & 0xffff != start)
     }
 
     /// Writes descriptor `i` of `x`, linked to descriptor `i + 1`.
@@ -417,16 +421,19 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
     }
 
     /// Skips the endpoint descriptor again and waits until the controller
-    /// has surely let go of it and the transfer's descriptors.
-    fn disarm(&self, ed: usize) {
+    /// has surely let go of it and the transfer's descriptors. False if the
+    /// controller did not go on to another frame: it may still be using them,
+    /// so the caller must not free or reuse their memory.
+    fn disarm(&self, ed: usize) -> bool {
         self.set_ed_word(ed, 0, self.ed_word(ed, 0) | ED_SKIP);
         osmium_arch::barrier::mb();
-        self.next_frame();
+        let quiet = self.next_frame();
         // Acknowledge the done queue the controller built, so that it
         // keeps no descriptor of ours for later.
         if self.r32(INTERRUPT_STATUS) & INT_WDH != 0 {
             self.w32(INTERRUPT_STATUS, INT_WDH);
         }
+        quiet
     }
 
     /// How far the transfer has got, from its descriptors' condition codes.
@@ -465,13 +472,17 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
 
     /// Runs the transfer built into the synchronous `Xfer`.
     fn run_sync(&mut self, plan: Plan, pipe: &Pipe, timeout_ns: u64) -> Result<usize, UsbError> {
+        if self.wedged {
+            return Err(UsbError::Timeout);
+        }
         self.arm(&self.mem.sync, &plan, pipe);
         let mut outcome = Progress::Running;
         let done = usbhc::wait(self.clock, timeout_ns, || {
             outcome = self.progress(&self.mem.sync, &plan);
             !matches!(outcome, Progress::Running)
         });
-        self.disarm(plan.ed);
+        // The synchronous memory is not reused if the controller may still use it.
+        self.wedged |= !self.disarm(plan.ed);
         if done {
             // Read the result again now its frame has passed (see `progress`).
             outcome = self.progress(&self.mem.sync, &plan);
@@ -550,32 +561,22 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
         Ok(moved)
     }
 
-    fn bulk(&mut self, pipe: &Pipe, toggle: bool, data: Data<'_>) -> Result<usize, UsbError> {
-        if pipe.mps == 0 {
-            return Err(UsbError::BadEndpoint);
+    fn chunk_max(&self, _pipe: &Pipe) -> usize {
+        PIECE
+    }
+
+    fn bulk_chunk(&mut self, pipe: &Pipe, toggle: bool, data: Data<'_>) -> Result<usize, UsbError> {
+        let n = data.len();
+        let dir_in = matches!(data, Data::In(_));
+        if let Data::Out(out) = &data {
+            self.mem.sync.buf.write(0, out);
         }
-        let total = data.len();
-        let mut done = 0;
-        let mut toggle = toggle;
-        let mut data = data;
-        loop {
-            let n = (total - done).min(PIECE);
-            let dir_in = matches!(data, Data::In(_));
-            if let Data::Out(out) = &data {
-                self.mem.sync.buf.write(0, &out[done..done + n]);
-            }
-            let plan = Self::build_bulk(&self.mem.sync, toggle, n, dir_in, ED_SYNC_BULK, Some(CMD_BLF));
-            let moved = self.run_sync(plan, pipe, BULK_TIMEOUT_NS)?;
-            if let Data::In(buf) = &mut data {
-                self.mem.sync.buf.read(0, &mut buf[done..done + moved.min(n)]);
-            }
-            done += moved;
-            toggle = usbhc::toggle_after(toggle, moved, pipe.mps);
-            // A short packet ends an IN transfer; an empty OUT is one packet.
-            if done >= total || moved < n {
-                return Ok(done);
-            }
+        let plan = Self::build_bulk(&self.mem.sync, toggle, n, dir_in, ED_SYNC_BULK, Some(CMD_BLF));
+        let moved = self.run_sync(plan, pipe, BULK_TIMEOUT_NS)?;
+        if let Data::In(buf) = data {
+            self.mem.sync.buf.read(0, &mut buf[..moved.min(n)]);
         }
+        Ok(moved)
     }
 
     fn submit(&mut self, pipe: &Pipe, toggle: bool, len: usize) -> Result<usize, UsbError> {
@@ -600,7 +601,7 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
             return None;
         }
         // Read the result again now its frame has passed (see `progress`).
-        self.disarm(p.plan.ed);
+        let quiet = self.disarm(p.plan.ed);
         let result = match self.progress(&p.xfer, &p.plan) {
             Progress::Running => unreachable!("a retired descriptor went back to running"),
             Progress::Done(bytes) => {
@@ -610,13 +611,21 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
             }
             Progress::Failed(e) => Err(e),
         };
-        self.mem.pending[slot] = None;
+        // If the controller may still be using the memory, leak it.
+        if let Some(p) = self.mem.pending[slot].take()
+            && !quiet
+        {
+            core::mem::forget(p);
+        }
         Some(result)
     }
 
     fn cancel(&mut self, slot: usize) {
-        if let Some(p) = self.mem.pending.get_mut(slot).and_then(Option::take) {
-            self.disarm(p.plan.ed);
+        // If the controller may still be using the memory, leak it.
+        if let Some(p) = self.mem.pending.get_mut(slot).and_then(Option::take)
+            && !self.disarm(p.plan.ed)
+        {
+            core::mem::forget(p);
         }
     }
 }

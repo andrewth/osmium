@@ -45,6 +45,11 @@ enum Kind {
 
 const PORTS: usize = 2;
 
+std::thread_local! {
+    /// Whether the simulated controller is 64-bit capable and acts on it.
+    static EXT64: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Plays the controller once per call: reset, the doorbell, the root
 /// ports, the frame index and one pass over both schedules.
 fn controller(win: Win, dev: Rc<RefCell<Device>>, kind: Kind, seen: Rc<Seen>) -> impl FnMut() {
@@ -136,6 +141,7 @@ fn controller(win: Win, dev: Rc<RefCell<Device>>, kind: Kind, seen: Rc<Seen>) ->
 
 /// Advances one queue head as far as it will go. True if a transaction ran.
 fn run_qh(qh: u64, dev: &RefCell<Device>, uframe: u32) -> bool {
+    let ext = EXT64.with(Cell::get);
     let chars = mem32(qh + 4);
     let caps = mem32(qh + 8);
     // A periodic queue head runs in the microframes its S-mask names.
@@ -165,6 +171,15 @@ fn run_qh(qh: u64, dev: &RefCell<Device>, uframe: u32) -> bool {
             put32(qh + 24, mem32(qtd + 8));
             for k in 0..5 {
                 put32(qh + 28 + 4 * k, mem32(qtd + 12 + 4 * k));
+            }
+            if ext {
+                // A 64-bit controller also loads the buffer pointers' high halves,
+                // and they are the first dwords after the qTD's and the overlay's
+                // 32-bit part.
+                for k in 0..5 {
+                    assert_eq!(mem32(qtd + 32 + 4 * k), 0, "high half of buffer pointer {k}");
+                    put32(qh + 48 + 4 * k, mem32(qtd + 32 + 4 * k));
+                }
             }
             if mem32(qtd + 8) & QTD_ACTIVE == 0 {
                 return ran;
@@ -286,6 +301,7 @@ impl Rig {
         w.w(CAPLENGTH, OP as u32 | 0x0100 << 16);
         w.w(HCSPARAMS, hcsparams);
         w.w(HCCPARAMS, hccparams);
+        EXT64.with(|e| e.set(hccparams & HCC_64BIT != 0));
         w.w(OP + USBSTS, STS_HALTED);
         let line = if kind == Kind::Low { PORT_LINE_K } else { 0 };
         let power = if hcsparams & HCS_PORT_POWER_CONTROL == 0 { PORT_POWER } else { 0 };
@@ -544,4 +560,45 @@ fn memory_above_4g_is_refused() {
     let (dma, clock) = (crate::virtio::testing::HostDma::default(), TickClock::default());
     assert_eq!(Ehci::new(rig.io(), &dma, &clock).err(), Some(EhciError::HighMemory));
     assert_eq!(dma.live.get(), 0, "nothing leaks");
+}
+
+#[test]
+fn a_64_bit_controller_finds_its_extended_dwords_inside_the_structures() {
+    let mut rig = Rig::with(Kind::High, HCS_PORT_POWER_CONTROL | PORTS as u32, HCC_64BIT);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ehci::new(rig.io(), &dma, &clock).unwrap();
+    assert_eq!(rig.win().r(OP + CTRLDSSEGMENT), 0);
+    const { assert!(QTD_SIZE >= QTD_EXT_OFFSET + 20 && QH_SIZE >= 4 * QH_EXT_WORD + 20) };
+    fakedev::exercise(&mut hc, &rig.dev, 1);
+    drop(hc);
+    assert_eq!(dma.live.get(), 0);
+}
+
+#[test]
+fn a_bulk_in_ended_by_a_zero_length_packet_keeps_the_toggles_in_step() {
+    let mut rig = Rig::new(Kind::High);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ehci::new(rig.io(), &dma, &clock).unwrap();
+    fakedev::zlp_terminated_in(&mut hc, &rig.dev, 1);
+}
+
+#[test]
+fn a_rejected_endpoint_table_leaves_a_started_transfer_alone() {
+    let mut rig = Rig::new(Kind::High);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ehci::new(rig.io(), &dma, &clock).unwrap();
+    let mut cfg = [0u8; 128];
+    let dev = osmium_hal::usb::enumerate(&mut hc, 1, &mut cfg).unwrap();
+    hc.submit_in(dev.id, 0x83, 8).unwrap();
+    // An endpoint without a packet size is refused before anything is cancelled.
+    let bad = [EndpointDescriptor { address: 0x85, attributes: 3, max_packet_size_raw: 0, interval: 1 }];
+    assert_eq!(hc.configure_endpoints(dev.id, &bad), Err(UsbError::BadDescriptor));
+    rig.dev.borrow_mut().report = Some(std::vec![7; 8]);
+    let mut report = [0u8; 8];
+    let got = (0..1000).find_map(|_| {
+        sim::run();
+        hc.poll_in(dev.id, 0x83, &mut report)
+    });
+    assert_eq!(got, Some(Ok(8)));
+    assert_eq!(report, [7; 8]);
 }

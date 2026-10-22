@@ -100,6 +100,11 @@ impl DmaBuffer {
 /// Allocates DMA-capable memory.
 pub trait DmaAllocator {
     /// Allocates a zeroed, cache-coherent buffer of at least `len` bytes.
+    ///
+    /// The buffer's device address must be aligned to at least 4096 bytes
+    /// (a page). Drivers lay out hardware structures that need 16- to
+    /// 4096-byte alignment (descriptors, rings, page lists) at offsets within
+    /// a buffer and rely on that.
     fn alloc_coherent(&self, len: usize) -> Option<DmaBuffer>;
 
     /// Frees a buffer from `alloc_coherent`.

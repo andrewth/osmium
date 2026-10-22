@@ -208,6 +208,8 @@ pub struct NtbReader {
     /// Index of the next pointer in the current NDP.
     entry: usize,
     ndps: u8,
+    /// Offsets of the NDPs already walked, the first `ndps` of them.
+    seen: [u16; MAX_NDPS as usize],
 }
 
 impl NtbReader {
@@ -221,7 +223,7 @@ impl NtbReader {
         if !(NTH16_LEN..=ntb.len()).contains(&block_len) {
             return Err(BadNtb);
         }
-        Ok(Self { block_len, ndp: u16_at(10), entry: 0, ndps: 0 })
+        Ok(Self { block_len, ndp: u16_at(10), entry: 0, ndps: 0, seen: [0; MAX_NDPS as usize] })
     }
 
     /// The range of `ntb` holding the next datagram, `None` after the last.
@@ -240,6 +242,10 @@ impl NtbReader {
         let u16_at = |at: usize| u16::from_le_bytes([ntb[at], ntb[at + 1]]) as usize;
         while self.ndp != 0 {
             let ndp = self.ndp;
+            // A chain that comes back to an NDP would deliver its datagrams again.
+            if self.seen[..self.ndps as usize].contains(&(ndp as u16)) {
+                return Err(BadNtb);
+            }
             if ndp < NTH16_LEN || ndp + NDP16_ONE_LEN > ntb.len() || ntb[ndp..ndp + 4] != NDP16_SIGNATURE {
                 return Err(BadNtb);
             }
@@ -259,6 +265,7 @@ impl NtbReader {
                 }
             }
             // A null entry (or the end of the table) ends this NDP.
+            self.seen[self.ndps as usize] = ndp as u16;
             self.ndps += 1;
             if self.ndps >= MAX_NDPS {
                 return Err(BadNtb);
@@ -724,6 +731,23 @@ mod tests {
         assert_eq!(r.next(&b).map(|d| d.map(|d| d.len())), Ok(Some(60)));
         assert_eq!(r.next(&b), Err(BadNtb));
         assert_eq!(r.next(&b), Ok(None), "and nothing after");
+    }
+
+    #[test]
+    fn an_ndp_chain_that_revisits_an_ndp_delivers_nothing_twice() {
+        let mut b = ntb(&[&[1; 60], &[2; 60]]);
+        let ndp = u16::from_le_bytes([b[10], b[11]]);
+        b[ndp as usize + 6..ndp as usize + 8].copy_from_slice(&ndp.to_le_bytes());
+        let mut r = NtbReader::new(&b).unwrap();
+        let mut delivered = 0;
+        loop {
+            match r.next(&b) {
+                Ok(Some(_)) => delivered += 1,
+                Ok(None) => panic!("a looping chain must be rejected"),
+                Err(BadNtb) => break,
+            }
+        }
+        assert_eq!(delivered, 2);
     }
 
     fn utf16(s: &str) -> Vec<u8> {

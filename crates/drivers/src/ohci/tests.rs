@@ -391,3 +391,42 @@ fn a_hub_port_device_is_addressed_without_a_port_reset() {
     hc.detach(hub.id);
     assert_eq!(hc.attach_hub_port(hub.id, 1, Speed::Full), Err(UsbError::NoDevice));
 }
+
+#[test]
+fn a_frame_interval_too_small_for_the_largest_packet_is_replaced() {
+    let mut rig = Rig::new(false);
+    rig.win().w(FM_INTERVAL, 100);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let hc = Ohci::new(rig.io(), &dma, &clock).unwrap();
+    assert_eq!(rig.win().r(FM_INTERVAL) & 0x3fff, DEFAULT_FRAME_INTERVAL);
+    drop(hc);
+}
+
+#[test]
+fn a_bulk_in_ended_by_a_zero_length_packet_keeps_the_toggles_in_step() {
+    let mut rig = Rig::new(false);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ohci::new(rig.io(), &dma, &clock).unwrap();
+    fakedev::zlp_terminated_in(&mut hc, &rig.dev, 1);
+}
+
+#[test]
+fn a_rejected_endpoint_table_leaves_a_started_transfer_alone() {
+    let mut rig = Rig::new(false);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ohci::new(rig.io(), &dma, &clock).unwrap();
+    let mut cfg = [0u8; 128];
+    let dev = osmium_hal::usb::enumerate(&mut hc, 1, &mut cfg).unwrap();
+    hc.submit_in(dev.id, 0x83, 8).unwrap();
+    // An endpoint without a packet size is refused before anything is cancelled.
+    let bad = [EndpointDescriptor { address: 0x85, attributes: 3, max_packet_size_raw: 0, interval: 1 }];
+    assert_eq!(hc.configure_endpoints(dev.id, &bad), Err(UsbError::BadDescriptor));
+    rig.dev.borrow_mut().report = Some(std::vec![7; 8]);
+    let mut report = [0u8; 8];
+    let got = (0..1000).find_map(|_| {
+        sim::run();
+        hc.poll_in(dev.id, 0x83, &mut report)
+    });
+    assert_eq!(got, Some(Ok(8)));
+    assert_eq!(report, [7; 8]);
+}

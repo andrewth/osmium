@@ -34,8 +34,18 @@
 //! their `bInterval`. A data stage is one qTD of at most 16 KiB, so longer
 //! transfers run in pieces.
 //!
-//! Not supported: isochronous and split transactions, hubs, 64-bit
-//! descriptors above 4 GiB and interrupt-driven completion.
+//! # 64-bit controllers
+//!
+//! A controller with HCCPARAMS.64BIT reads and writes five more dwords of
+//! buffer-pointer high halves at the end of every qTD (offsets 0x20..0x34,
+//! 52 bytes in all) and of every queue head's overlay (offsets 0x30..0x44).
+//! Whether the controller is 64-bit capable or not, the structures are laid
+//! out for that case: qTDs in 64-byte slots, queue heads in 96-byte slots, the
+//! extended dwords zero. A 32-bit controller ignores them. CTRLDSSEGMENT is
+//! set to 0, so everything must still lie below 4 GiB.
+//!
+//! Not supported: isochronous and split transactions, hubs, memory above
+//! 4 GiB and interrupt-driven completion.
 
 use core::mem::ManuallyDrop;
 
@@ -104,16 +114,20 @@ const LEGACY_OS_OWNED: u32 = 1 << 24;
 const LINK_TERMINATE: u32 = 1 << 0;
 const LINK_QH: u32 = 1 << 1;
 
-// Queue head.
-const QH_SIZE: usize = 64;
+// Queue head: 17 dwords in the 64-bit layout, in a slot that keeps 32-byte alignment.
+const QH_SIZE: usize = 96;
+/// First of the five extended (high half) buffer pointers of the overlay.
+const QH_EXT_WORD: usize = 12;
 const QH_HEAD: u32 = 1 << 15;
 const QH_DATA_TOGGLE_FROM_QTD: u32 = 1 << 14;
 const QH_SPEED_HIGH: u32 = 2 << 12;
 const QH_MULT_ONE: u32 = 1 << 30;
 const QH_SMASK_UFRAME0: u32 = 0x01;
 
-// Queue element transfer descriptor.
-const QTD_SIZE: usize = 32;
+// Queue element transfer descriptor: 13 dwords in the 64-bit layout, in a 64-byte slot.
+const QTD_SIZE: usize = 64;
+/// Offset of the five extended (high half) buffer pointers.
+const QTD_EXT_OFFSET: usize = 32;
 const QTD_ACTIVE: u32 = 1 << 7;
 const QTD_HALTED: u32 = 1 << 6;
 const QTD_DATA_BUFFER_ERROR: u32 = 1 << 5;
@@ -225,6 +239,8 @@ pub struct Ehci<'d, D: DmaAllocator + ?Sized> {
     op: usize,
     ports: u8,
     devs: DevTable,
+    /// An abort of the synchronous transfer was not confirmed: its memory may still be in use.
+    wedged: bool,
     mem: ManuallyDrop<Mem<'d, D>>,
 }
 
@@ -285,6 +301,7 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
             op: caplength,
             ports: ports as u8,
             devs: DevTable::new(),
+            wedged: false,
             mem: ManuallyDrop::new(Mem { frames, qhs, sync, pending: [const { None }; MAX_PENDING] }),
         };
         hc.build_schedule();
@@ -336,6 +353,9 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
             self.set_qh_word(qh, 4, LINK_TERMINATE);
             self.set_qh_word(qh, 5, LINK_TERMINATE);
             self.set_qh_word(qh, 6, QTD_HALTED);
+            for k in 0..5 {
+                self.set_qh_word(qh, QH_EXT_WORD + k, 0);
+            }
         };
         let link = |qh: usize| self.qh_addr(qh) | LINK_QH;
         let async_order: [usize; 2 + MAX_PENDING] = core::array::from_fn(|i| QH_ASYNC_HEAD + i);
@@ -402,9 +422,9 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
     }
 
     /// Waits for the controller to finish the frame it is in.
-    fn next_frame(&self) {
+    fn next_frame(&self) -> bool {
         let start = self.op_read(FRINDEX) >> 3;
-        usbhc::wait(self.clock, 3_000_000, || self.op_read(FRINDEX) >> 3 != start);
+        usbhc::wait(self.clock, 3_000_000, || self.op_read(FRINDEX) >> 3 != start)
     }
 
     /// Writes qTD `i` of `x`, linked to `i + 1` unless `last`, with the
@@ -421,6 +441,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
             let page = (buffer & !0xfff) + 0x1000 * k as u64;
             let ptr = if k == 0 { buffer } else { page };
             x.mem.store(off + 12 + 4 * k, (ptr as u32).to_le());
+            // Everything is below 4 GiB, so the high halves are zero.
+            x.mem.store(off + QTD_EXT_OFFSET + 4 * k, 0u32);
         }
     }
 
@@ -471,6 +493,9 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
         self.set_qh_word(qh, 2, caps);
         self.set_qh_word(qh, 3, 0);
         self.set_qh_word(qh, 5, LINK_TERMINATE);
+        for k in 0..5 {
+            self.set_qh_word(qh, QH_EXT_WORD + k, 0);
+        }
         self.set_qh_word(qh, 4, x.qtd_addr(0));
         osmium_arch::barrier::dma_wmb();
         self.set_qh_word(qh, 6, 0);
@@ -498,8 +523,11 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
     }
 
     /// Takes the queue head `qh` off its list, waits until the controller
-    /// cannot be reading it or its qTDs, and puts it back idle.
-    fn abort(&self, qh: usize) {
+    /// cannot be reading it or its qTDs, and puts it back idle. If the
+    /// controller does not confirm that, it may still be using the memory: the
+    /// queue head stays unlinked and false is returned, and the caller must not
+    /// free or reuse the transfer's memory.
+    fn abort(&self, qh: usize) -> bool {
         let periodic = qh >= QH_PERIODIC;
         // Each list is in index order, so the one before is the previous queue head.
         let (prev, next) = (qh - 1, self.qh_word(qh, 0));
@@ -509,22 +537,31 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
         if periodic {
             // Two frames: one for a traversal in progress, one for any the
             // controller started from a cached frame list entry.
-            self.next_frame();
-            self.next_frame();
+            let first = self.next_frame();
+            if !(self.next_frame() && first) {
+                return false;
+            }
         } else {
             // The status bit is clear: it is acknowledged after every use.
             self.op_write(USBCMD, self.op_read(USBCMD) | CMD_DOORBELL);
-            usbhc::wait(self.clock, 20_000_000, || self.op_read(USBSTS) & STS_ASYNC_ADVANCE != 0);
+            let rang = usbhc::wait(self.clock, 20_000_000, || self.op_read(USBSTS) & STS_ASYNC_ADVANCE != 0);
             self.op_write(USBSTS, STS_ASYNC_ADVANCE);
+            if !rang {
+                return false;
+            }
         }
         self.set_qh_word(qh, 6, QTD_HALTED);
         self.set_qh_word(qh, 4, LINK_TERMINATE);
         osmium_arch::barrier::dma_wmb();
         self.set_qh_word(prev, 0, own);
+        true
     }
 
     /// Runs the transfer built into the synchronous `Xfer`.
     fn run_sync(&mut self, plan: Plan, pipe: &Pipe, timeout_ns: u64) -> Result<usize, UsbError> {
+        if self.wedged {
+            return Err(UsbError::Timeout);
+        }
         self.start_transfer(&self.mem.sync, &plan, pipe);
         let mut outcome = Progress::Running;
         let done = usbhc::wait(self.clock, timeout_ns, || {
@@ -533,7 +570,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
         });
         match outcome {
             _ if !done => {
-                self.abort(plan.qh);
+                // The synchronous memory is not reused if the controller may still use it.
+                self.wedged |= !self.abort(plan.qh);
                 Err(UsbError::Timeout)
             }
             Progress::Done(bytes) => Ok(bytes),
@@ -627,32 +665,22 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
         Ok(moved)
     }
 
-    fn bulk(&mut self, pipe: &Pipe, toggle: bool, data: Data<'_>) -> Result<usize, UsbError> {
-        if pipe.mps == 0 {
-            return Err(UsbError::BadEndpoint);
+    fn chunk_max(&self, _pipe: &Pipe) -> usize {
+        PIECE
+    }
+
+    fn bulk_chunk(&mut self, pipe: &Pipe, toggle: bool, data: Data<'_>) -> Result<usize, UsbError> {
+        let n = data.len();
+        let dir_in = matches!(data, Data::In(_));
+        if let Data::Out(out) = &data {
+            self.mem.sync.buf.write(0, out);
         }
-        let total = data.len();
-        let mut done = 0;
-        let mut toggle = toggle;
-        let mut data = data;
-        loop {
-            let n = (total - done).min(PIECE);
-            let dir_in = matches!(data, Data::In(_));
-            if let Data::Out(out) = &data {
-                self.mem.sync.buf.write(0, &out[done..done + n]);
-            }
-            let plan = Self::build_bulk(&self.mem.sync, toggle, n, dir_in, QH_SYNC);
-            let moved = self.run_sync(plan, pipe, BULK_TIMEOUT_NS)?;
-            if let Data::In(buf) = &mut data {
-                self.mem.sync.buf.read(0, &mut buf[done..done + moved.min(n)]);
-            }
-            done += moved;
-            toggle = usbhc::toggle_after(toggle, moved, pipe.mps);
-            // A short packet ends an IN transfer; an empty OUT is one packet.
-            if done >= total || moved < n {
-                return Ok(done);
-            }
+        let plan = Self::build_bulk(&self.mem.sync, toggle, n, dir_in, QH_SYNC);
+        let moved = self.run_sync(plan, pipe, BULK_TIMEOUT_NS)?;
+        if let Data::In(buf) = data {
+            self.mem.sync.buf.read(0, &mut buf[..moved.min(n)]);
         }
+        Ok(moved)
     }
 
     fn submit(&mut self, pipe: &Pipe, toggle: bool, len: usize) -> Result<usize, UsbError> {
@@ -660,6 +688,9 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
             return Err(UsbError::NoResources);
         }
         let slot = self.mem.pending.iter().position(Option::is_none).ok_or(UsbError::NoResources)?;
+        if self.wedged {
+            return Err(UsbError::Timeout);
+        }
         let xfer = Xfer::new(self.dma, MAX_SUBMIT_LEN)?;
         let qh = if pipe.ttype == TransferType::Interrupt { QH_PERIODIC + slot } else { QH_ASYNC + slot };
         let plan = Self::build_bulk(&xfer, toggle, len, true, qh);
@@ -685,8 +716,11 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
     }
 
     fn cancel(&mut self, slot: usize) {
-        if let Some(p) = self.mem.pending.get_mut(slot).and_then(Option::take) {
-            self.abort(p.plan.qh);
+        // If the controller may still be using the memory, leak it.
+        if let Some(p) = self.mem.pending.get_mut(slot).and_then(Option::take)
+            && !self.abort(p.plan.qh)
+        {
+            core::mem::forget(p);
         }
     }
 }

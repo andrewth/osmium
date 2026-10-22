@@ -14,6 +14,8 @@
 //! Nothing here waits on a clock: the driver has no timer, so the caller
 //! sleeps [`Hub::power_on_delay_ms`] after [`Hub::power_ports`], and port
 //! resets are polled with a bounded number of status reads.
+//! The 10 ms a device needs to recover from its port reset before the first
+//! request is given by [`UsbHost::attach_hub_port`], which has a clock.
 
 use osmium_hal::usb::{
     DeviceId, Direction, Recipient, RequestKind, SetupPacket, Speed, TransferType, UsbError, UsbHost, descriptor_type,
