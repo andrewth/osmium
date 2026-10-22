@@ -355,11 +355,13 @@ where
             }
         };
         let d = dev.device;
+        // Read again: an EHCI port knows its speed only once reset enabled it.
+        let speed = host.port_status(port).speed.or(status.speed);
         println!(
             "[usb]   port {port}: {:04x}:{:04x} {:?}-speed, {} interface(s)",
             d.vendor_id,
             d.product_id,
-            status.speed.expect("an attached port reports a speed"),
+            speed.expect("an attached port reports a speed"),
             dev.config.num_interfaces
         );
         for desc in Descriptors::new(&config[..dev.config_len]).flatten() {

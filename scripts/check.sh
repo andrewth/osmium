@@ -124,8 +124,8 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -device usb-ehci,id=ehci -drive if=none,id=stick-ehci,format=raw,file="$stick_ehci" -device usb-storage,bus=ehci.0,drive=stick-ehci \
     -device pci-ohci,id=ohci -drive if=none,id=stick-ohci,format=raw,file="$stick_ohci" -device usb-storage,bus=ohci.0,drive=stick-ohci \
     -drive if=none,id=vd0,format=raw,file="$vdisk" -device virtio-blk-device,drive=vd0 \
-    -netdev user,id=n1 -device usb-net,netdev=n1 \
-    -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,drive=stick \
+    -netdev user,id=n1 -device usb-net,netdev=n1,bus=xhci.0 \
+    -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,bus=xhci.0,drive=stick \
     -device ahci,id=ahci0 -drive if=none,id=sd0,format=raw,file="$sata" -device ide-hd,drive=sd0,bus=ahci0.0 \
     -drive if=none,id=nv0,format=raw,file="$nvdisk" -device nvme,serial=osmium0,drive=nv0 \
     -device virtio-gpu-device -device virtio-gpu-pci,id=gpu -device bochs-display -qmp "unix:$qmp,server=on,wait=off"

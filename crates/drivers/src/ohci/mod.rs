@@ -429,6 +429,14 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
         }
     }
 
+    /// How far the transfer has got, from its descriptors' condition codes.
+    ///
+    /// The condition code and the current buffer pointer are separate words,
+    /// and the controller need not write them back together: QEMU's copies
+    /// the descriptor while this CPU may be reading it, so a new condition
+    /// code can come with the old buffer pointer and count nothing moved.
+    /// The byte count is only trusted once [`Self::disarm`] has waited out
+    /// the frame the descriptor retired in.
     fn progress(&self, x: &Xfer<'d, D>, plan: &Plan) -> Progress {
         let mut bytes = 0;
         for i in 0..plan.count {
@@ -464,6 +472,10 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
             !matches!(outcome, Progress::Running)
         });
         self.disarm(plan.ed);
+        if done {
+            // Read the result again now its frame has passed (see `progress`).
+            outcome = self.progress(&self.mem.sync, &plan);
+        }
         match outcome {
             _ if !done => Err(UsbError::Timeout),
             Progress::Done(bytes) => Ok(bytes),
@@ -584,8 +596,13 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
 
     fn poll(&mut self, slot: usize, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
         let p = self.mem.pending.get(slot)?.as_ref()?;
+        if matches!(self.progress(&p.xfer, &p.plan), Progress::Running) {
+            return None;
+        }
+        // Read the result again now its frame has passed (see `progress`).
+        self.disarm(p.plan.ed);
         let result = match self.progress(&p.xfer, &p.plan) {
-            Progress::Running => return None,
+            Progress::Running => unreachable!("a retired descriptor went back to running"),
             Progress::Done(bytes) => {
                 let n = bytes.min(buf.len());
                 p.xfer.buf.read(0, &mut buf[..n]);
@@ -593,7 +610,6 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
             }
             Progress::Failed(e) => Err(e),
         };
-        self.disarm(p.plan.ed);
         self.mem.pending[slot] = None;
         Some(result)
     }
