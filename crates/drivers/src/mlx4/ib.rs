@@ -668,8 +668,8 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
     /// pairs' packets.
     fn refresh_sl2vl(&mut self) {
         if let Ok(m) = self.ud.hca.query_mad(self.ud.port, mad::ATTR_SL_TO_VL_TABLE, 0) {
-            let words = [m.dword(MAD_DATA), m.dword(MAD_DATA + 1)];
-            self.sl2vl = [words[0].to_be_bytes(), words[1].to_be_bytes()].concat().try_into().expect("8 bytes");
+            self.sl2vl[..4].copy_from_slice(&m.dword(MAD_DATA).to_be_bytes());
+            self.sl2vl[4..].copy_from_slice(&m.dword(MAD_DATA + 1).to_be_bytes());
         }
     }
 

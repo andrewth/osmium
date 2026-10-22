@@ -13,11 +13,18 @@
 //!
 //! [`Function::msi`] and [`Function::msix`] program message-signalled
 //! interrupts ([`MsiMessage`]).
+//!
+//! [`Function::extended_capabilities`] walks PCIe extended configuration
+//! space, and [`Function::sriov`] turns a function's virtual functions on and
+//! off.
 
 use crate::mmio::IoMem;
 
 mod msi;
 pub use msi::{Msi, MsiError, MsiMessage, Msix, MsixPba, MsixTable};
+
+mod sriov;
+pub use sriov::{ExtCapabilities, SrIov, SrIovError, ext_cap};
 
 /// Bus, device and function numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

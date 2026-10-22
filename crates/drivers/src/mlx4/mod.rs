@@ -39,20 +39,30 @@
 //!
 //! [`Mlx4::open_ib`] turns a port whose cable carries InfiniBand into an
 //! [`IbPort`]: queue pair 0 (subnet management) and 1 (general services),
-//! and an unreliable datagram (UD) queue pair for sending and receiving
+//! an unreliable datagram (UD) queue pair for sending and receiving
 //! datagrams addressed by LID and queue pair number, with hardware multicast
-//! attach. The firmware's management agent only answers questions put to
-//! it (MAD_IFC); the subnet manager's packets arrive on queue pair 0 and
+//! attach, and up to four reliable connections (send, RDMA write and read).
+//! The firmware's management agent only answers questions put to it
+//! (MAD_IFC); the subnet manager's packets arrive on queue pair 0 and
 //! [`IbPort::service`] has to pass them to the agent and send the answers
-//! back, or the port never gets a LID. Dual-protocol ports (VPI) take
-//! either [`open_eth`](Mlx4::open_eth) or [`open_ib`](Mlx4::open_ib), by what
-//! the cable senses (if nothing is sensed, by which one the caller asks
-//! for). The InfiniBand path follows Linux's `mlx4_ib` and the PRM as it
-//! uses them, and has only run against the simulated HCA.
+//! back, or the port never gets a LID. [`Mlx4::open_ipoib`] goes on to join
+//! the IPoIB broadcast group and presents the port as a
+//! [`NetDevice`](osmium_hal::net::NetDevice). Remote access to memory is
+//! confined to a window per reliable connection; the adapter's all-memory
+//! region has none. Dual-protocol ports (VPI) take either
+//! [`open_eth`](Mlx4::open_eth) or [`open_ib`](Mlx4::open_ib), by what the
+//! cable senses (if nothing is sensed, by which one the caller asks for).
+//! The InfiniBand path follows Linux's `mlx4_ib` and the PRM as it uses
+//! them, and has only run against the simulated HCA.
 //!
-//! Not yet supported: receive-side scaling, one completion vector per CPU,
-//! MAC/VLAN steering, VLAN tag offload, tunnel offloads, and for InfiniBand
-//! subnet administration, reliable connections and SR-IOV.
+//! Not supported: receive-side scaling, one completion vector per CPU,
+//! MAC/VLAN steering, VLAN tag offload, tunnel offloads; for InfiniBand,
+//! atomics, shared receive queues, alternate paths, path record queries
+//! (IPoIB sends every unicast datagram on the broadcast group's service
+//! level) and connection management; and SR-IOV: virtual functions
+//! ([`VIRTUAL_FUNCTION_IDS`]) are refused, and a physical function is
+//! driven as the only function (the PCI side of enabling virtual functions
+//! is in [`osmium_hal::pci`]).
 
 mod cmd;
 mod eth;
@@ -91,17 +101,31 @@ pub use sa::{Group, JoinError};
 /// Mellanox's PCI vendor ID.
 pub const VENDOR_ID: u16 = 0x15b3;
 
-/// PCI device IDs of the physical functions this driver handles:
-/// ConnectX (MT25408 family), ConnectX-2 and ConnectX-3 (Pro).
+/// PCI device IDs of the physical functions this driver handles, as Linux's
+/// `mlx4_core` lists them: ConnectX and ConnectX-2 (the "Hermon" family),
+/// then ConnectX-3 and -3 Pro.
 pub const DEVICE_IDS: &[u16] = &[
-    0x6340, 0x634a, 0x6732, 0x673c, 0x6368, 0x6750, 0x6372, 0x675a, 0x6764, 0x6746, 0x676e,
+    0x6340, 0x634a, 0x6354, 0x6368, 0x6372, 0x6732, 0x673c, 0x6746, 0x6750, 0x675a, 0x6764, 0x676e,
     0x6778, // ConnectX, -2
-    0x1003, 0x1005, 0x1006, 0x1007, 0x1008, 0x1009, 0x100a, // ConnectX-3, -3 Pro
+    0x1003, 0x1005, 0x1006, 0x1007, 0x1008, 0x1009, 0x100a, 0x100b, 0x100c, 0x100d, 0x100e, 0x100f,
+    0x1010, // ConnectX-3, -3 Pro
 ];
+
+/// PCI device IDs of the SR-IOV virtual functions of these adapters
+/// (ConnectX-2 and ConnectX-3). A virtual function has no command register
+/// of its own: it talks to the physical function's driver through a
+/// communication channel, so this driver cannot run on one.
+pub const VIRTUAL_FUNCTION_IDS: &[u16] = &[0x1002, 0x1004];
 
 /// Returns true if this driver handles PCI function `vendor:device`.
 pub fn supports(vendor: u16, device: u16) -> bool {
     vendor == VENDOR_ID && DEVICE_IDS.contains(&device)
+}
+
+/// Returns true if `vendor:device` is a virtual function of one of these
+/// adapters, which this driver does not handle ([`supports`] says false).
+pub fn is_virtual_function(vendor: u16, device: u16) -> bool {
+    vendor == VENDOR_ID && VIRTUAL_FUNCTION_IDS.contains(&device)
 }
 
 /// BAR holding the configuration registers and the HCR.
@@ -1097,7 +1121,12 @@ mod tests {
     #[test]
     fn supported_ids() {
         assert!(supports(0x15b3, 0x1003) && supports(0x15b3, 0x1007) && supports(0x15b3, 0x6750));
+        assert!(supports(0x15b3, 0x6354) && supports(0x15b3, 0x1010), "listed by Linux");
         assert!(!supports(0x15b3, 0x1013), "ConnectX-4 is mlx5");
+        for id in VIRTUAL_FUNCTION_IDS {
+            assert!(is_virtual_function(0x15b3, *id) && !supports(0x15b3, *id), "{id:#x}: a virtual function");
+        }
+        assert!(!is_virtual_function(0x15b3, 0x1003) && !is_virtual_function(0x8086, 0x1004));
         assert!(!supports(0x8086, 0x1003));
     }
 
