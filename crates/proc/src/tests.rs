@@ -33,9 +33,13 @@ unsafe impl PhysMapper for HeapFrames {
 // SAFETY: every frame is a fresh, exclusively owned, page-aligned allocation.
 unsafe impl TableAlloc for HeapFrames {
     fn alloc_table(&self) -> Option<PhysAddr> {
-        *self.live.lock().unwrap() += 1;
         // SAFETY: non-zero size.
-        Some(PhysAddr(unsafe { alloc(PAGE_LAYOUT) } as u64))
+        let frame = unsafe { alloc(PAGE_LAYOUT) };
+        if frame.is_null() {
+            return None;
+        }
+        *self.live.lock().unwrap() += 1;
+        Some(PhysAddr(frame as u64))
     }
     unsafe fn free_table(&self, pa: PhysAddr) {
         *self.live.lock().unwrap() -= 1;
@@ -104,8 +108,9 @@ impl File for Console {
     }
     fn read(&self, _off: u64, buf: &mut [u8]) -> Result<usize, Errno> {
         let line = b"typed\n";
-        buf[..line.len()].copy_from_slice(line);
-        Ok(line.len())
+        let n = line.len().min(buf.len());
+        buf[..n].copy_from_slice(&line[..n]);
+        Ok(n)
     }
     fn stat(&self) -> Stat {
         Stat { kind: FileKind::CharDevice, mode: 0o620, ..Stat::default() }
@@ -443,6 +448,7 @@ static ACTIVATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 const STACK_TOP: u64 = 0x7000_0000;
 
+#[allow(clippy::unreachable)] // test-only: host tests never resume user mode.
 fn platform() {
     static P: OnceLock<()> = OnceLock::new();
     P.get_or_init(|| {
@@ -737,4 +743,6 @@ fn a_child_that_never_got_a_task_can_be_forgotten() {
 }
 
 mod blocked;
+mod hostile;
+mod oom;
 mod sigthread;

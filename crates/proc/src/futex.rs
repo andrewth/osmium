@@ -19,12 +19,15 @@
 //! Robust lists (`set_robust_list`): when a thread exits, each futex it
 //! still owns is marked `FUTEX_OWNER_DIED` and one waiter is woken.
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use core::marker::PhantomPinned;
+use core::mem::offset_of;
+use core::pin::Pin;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use osmium_fs::Errno;
 use osmium_sched::WaitQueue;
+use osmium_sync::intrusive::{Adapter, Link, List};
 use osmium_sync::{IrqSpinLock, Once};
 
 use crate::process::{Pid, Process};
@@ -53,14 +56,74 @@ const ROBUST_HEAD_LEN: u64 = 24;
 /// Most entries walked, so a corrupt (circular) list ends.
 const ROBUST_LIMIT: usize = 2048;
 
+/// A thread waiting on a futex. It is linked into [`WAITERS`] through its own
+/// `link`, so waiting never allocates: the waiting thread keeps the `Waiter`
+/// on its stack, pinned, and it unlinks itself when dropped.
 pub(crate) struct Waiter {
+    link: Link,
     pid: Pid,
     addr: AtomicU64,
     bitset: u32,
     pub(crate) woken: AtomicBool,
+    _pinned: PhantomPinned,
 }
 
-static WAITERS: IrqSpinLock<Vec<Arc<Waiter>>> = IrqSpinLock::new(Vec::new());
+struct ByLink;
+
+// SAFETY: `offset_of!` of the `Link` field of `Waiter`.
+unsafe impl Adapter<Link> for ByLink {
+    type Value = Waiter;
+    const OFFSET: usize = offset_of!(Waiter, link);
+}
+
+/// The waiters in the order they arrived. Linked waiters are alive: `Waiter`
+/// unlinks itself before it goes away, under the same lock.
+struct WaiterList(List<ByLink>);
+
+// SAFETY: the list is only used under the lock around it, and the waiters it
+// links are `Sync` (atomics and an intrusive link used only under that lock).
+unsafe impl Send for WaiterList {}
+
+impl Waiter {
+    pub(crate) fn new(pid: Pid, addr: u64, bitset: u32) -> Self {
+        Self {
+            link: Link::new(),
+            pid,
+            addr: AtomicU64::new(addr),
+            bitset,
+            woken: AtomicBool::new(false),
+            _pinned: PhantomPinned,
+        }
+    }
+
+    /// Queues the waiter at its address if the word there still holds `val`:
+    /// the check and the queueing cannot be separated by a wake.
+    pub(crate) fn enqueue(self: Pin<&Self>, p: &Process, val: u32) -> Result<(), Errno> {
+        let mut waiters = WAITERS.lock();
+        if read_u32(p, self.addr.load(Ordering::SeqCst))? != val {
+            return Err(Errno::EAGAIN);
+        }
+        // SAFETY: the waiter is pinned, and its `Drop` unlinks it (under this
+        // lock) before its memory can be reused.
+        unsafe { waiters.0.push_back(NonNull::from(self.get_ref())) };
+        Ok(())
+    }
+
+    /// Takes the waiter out of the queue, if a wake has not already.
+    fn dequeue(&self) {
+        let mut waiters = WAITERS.lock();
+        // SAFETY: if the waiter is linked, it is in `WAITERS`.
+        unsafe { waiters.0.remove(NonNull::from(self)) };
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.dequeue();
+    }
+}
+
+static WAITERS: IrqSpinLock<WaiterList> = IrqSpinLock::new(WaiterList(List::new()));
 /// Every sleeping thread waits here and checks its own waiter; wakes are
 /// rare enough that waking the lot is simpler than a queue per address.
 static SLEEPERS: WaitQueue = WaitQueue::new();
@@ -86,9 +149,9 @@ pub(crate) fn interrupt() {
 
 /// Wakes up to `n` threads of `pid` waiting at `addr` whose bitset meets
 /// `mask`, oldest first, with the waiter list already locked.
-fn wake_locked(waiters: &mut Vec<Arc<Waiter>>, pid: Pid, addr: u64, n: u32, mask: u32) -> u32 {
+fn wake_locked(waiters: &mut WaiterList, pid: Pid, addr: u64, n: u32, mask: u32) -> u32 {
     let mut woken = 0;
-    waiters.retain(|w| {
+    waiters.0.retain(|w| {
         if woken < n && w.pid == pid && w.addr.load(Ordering::SeqCst) == addr && w.bitset & mask != 0 {
             w.woken.store(true, Ordering::SeqCst);
             woken += 1;
@@ -120,26 +183,28 @@ fn read_u32(p: &Process, addr: u64) -> Result<u32, Errno> {
     Ok(u32::from_ne_bytes(cur))
 }
 
-/// Registers a waiter at `addr` if it still holds `val`: the check and the
-/// registration cannot be separated by a wake.
+/// A waiter at `addr`, queued if it still holds `val`, for a test to wake.
 #[cfg(test)]
-pub(crate) fn enqueue(p: &Process, addr: u64, val: u32) -> Result<Arc<Waiter>, Errno> {
+pub(crate) fn enqueue(p: &Process, addr: u64, val: u32) -> Result<Pin<alloc::boxed::Box<Waiter>>, Errno> {
     enqueue_bits(p, addr, val, BITSET_ANY)
 }
 
-pub(crate) fn enqueue_bits(p: &Process, addr: u64, val: u32, bitset: u32) -> Result<Arc<Waiter>, Errno> {
-    let mut waiters = WAITERS.lock();
-    if read_u32(p, addr)? != val {
-        return Err(Errno::EAGAIN);
-    }
-    let w = Arc::new(Waiter { pid: p.pid(), addr: AtomicU64::new(addr), bitset, woken: AtomicBool::new(false) });
-    waiters.push(w.clone());
+/// [`enqueue`] with a bitset.
+#[cfg(test)]
+pub(crate) fn enqueue_bits(
+    p: &Process,
+    addr: u64,
+    val: u32,
+    bitset: u32,
+) -> Result<Pin<alloc::boxed::Box<Waiter>>, Errno> {
+    let w = alloc::boxed::Box::pin(Waiter::new(p.pid(), addr, bitset));
+    w.as_ref().enqueue(p, val)?;
     Ok(w)
 }
 
 /// Blocks until `w` is woken, the thread is interrupted, or the clock
 /// reaches `deadline` (`ETIMEDOUT`).
-fn sleep_until(p: &Process, th: &Thread, w: &Arc<Waiter>, deadline: Option<u64>) -> Result<(), Errno> {
+fn sleep_until(p: &Process, th: &Thread, w: &Waiter, deadline: Option<u64>) -> Result<(), Errno> {
     let now = CLOCK.get().copied();
     let r = SLEEPERS.wait_until(|| {
         if w.woken.load(Ordering::SeqCst) {
@@ -153,7 +218,7 @@ fn sleep_until(p: &Process, th: &Thread, w: &Arc<Waiter>, deadline: Option<u64>)
         }
     });
     if r.is_err() {
-        WAITERS.lock().retain(|x| !Arc::ptr_eq(x, w));
+        w.dequeue();
         // A wake that raced with the interruption still counts.
         if w.woken.load(Ordering::SeqCst) {
             return Ok(());
@@ -166,8 +231,8 @@ fn sleep_until(p: &Process, th: &Thread, w: &Arc<Waiter>, deadline: Option<u64>)
 fn read_timespec(p: &Process, addr: u64) -> Result<u64, Errno> {
     let mut b = [0; 16];
     p.memory().read(addr, &mut b)?;
-    let sec = i64::from_ne_bytes(b[..8].try_into().expect("8 bytes"));
-    let nsec = i64::from_ne_bytes(b[8..].try_into().expect("8 bytes"));
+    let sec = crate::bytes::i64_at(&b, 0)?;
+    let nsec = crate::bytes::i64_at(&b, 8)?;
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return Err(Errno::EINVAL);
     }
@@ -206,7 +271,7 @@ fn requeue(
     }
     let woken = wake_locked(&mut waiters, pid, uaddr, nr_wake, BITSET_ANY);
     let mut moved = 0;
-    for w in waiters.iter() {
+    for w in waiters.0.iter() {
         if moved == nr_requeue {
             break;
         }
@@ -288,7 +353,8 @@ pub(crate) fn futex(p: &Process, th: &Thread, a: [u64; 6]) -> Result<u64, Errno>
                 return Err(Errno::EINVAL);
             }
             let deadline = deadline(p, timeout, cmd == WAIT_BITSET)?;
-            let w = enqueue_bits(p, uaddr, val as u32, bitset)?;
+            let w = core::pin::pin!(Waiter::new(p.pid(), uaddr, bitset));
+            w.as_ref().enqueue(p, val as u32)?;
             sleep_until(p, th, &w, deadline).map(|()| 0)
         }
         WAKE | WAKE_BITSET => {

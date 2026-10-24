@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Blocking calls give up when the thread is interrupted or the process is
 //! killed. These run on the real scheduler: each test thread is one CPU, and
 //! the process's task blocks in a system call until the test interrupts it.
@@ -16,7 +17,7 @@ const PENDING: i64 = i64::MIN;
 const EINTR: i64 = -(Errno::EINTR.0 as i64);
 
 /// Makes the calling test thread a fresh CPU with a unique id.
-fn become_cpu() {
+pub(super) fn become_cpu() {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| osmium_sched::inject_scheduler(&SCHED));

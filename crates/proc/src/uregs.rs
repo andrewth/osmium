@@ -18,6 +18,11 @@ pub(crate) trait UserRegs {
     /// link register.
     const RET_ON_STACK: bool;
 
+    /// The program counter user mode resumes at.
+    fn user_pc(&self) -> u64;
+    /// Whether the CPU can resume user mode at `pc` without faulting in the
+    /// kernel: x86_64 refuses non-canonical addresses at `iretq`.
+    fn valid_pc(pc: u64) -> bool;
     fn user_sp(&self) -> u64;
     fn set_user_sp(&mut self, sp: u64);
     /// Sets the system-call return value register.
@@ -37,6 +42,12 @@ impl UserRegs for osmium_arch::trap::TrapFrame {
     const RED_ZONE: u64 = 0;
     const RET_ON_STACK: bool = false;
 
+    fn user_pc(&self) -> u64 {
+        self.epc
+    }
+    fn valid_pc(_pc: u64) -> bool {
+        true
+    }
     fn user_sp(&self) -> u64 {
         self.x[2]
     }
@@ -73,6 +84,12 @@ impl UserRegs for osmium_arch::trap::TrapFrame {
     const RED_ZONE: u64 = 0;
     const RET_ON_STACK: bool = false;
 
+    fn user_pc(&self) -> u64 {
+        self.elr
+    }
+    fn valid_pc(_pc: u64) -> bool {
+        true
+    }
     fn user_sp(&self) -> u64 {
         self.sp
     }
@@ -111,6 +128,13 @@ impl UserRegs for osmium_arch::trap::TrapFrame {
     const RED_ZONE: u64 = 128;
     const RET_ON_STACK: bool = true;
 
+    fn user_pc(&self) -> u64 {
+        self.rip
+    }
+    fn valid_pc(pc: u64) -> bool {
+        // Canonical, user half: the high bits are all clear.
+        pc >> 47 == 0
+    }
     fn user_sp(&self) -> u64 {
         self.rsp
     }
@@ -130,7 +154,9 @@ impl UserRegs for osmium_arch::trap::TrapFrame {
             f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.rbp, f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15,
             f.rip, f.rsp, f.rflags,
         ];
-        s[..regs.len()].copy_from_slice(&regs);
+        for (d, r) in s.iter_mut().zip(regs) {
+            *d = r;
+        }
         s
     }
     fn restore_user(&mut self, s: &[u64; NREGS]) {

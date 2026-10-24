@@ -2,7 +2,6 @@
 //! and the kernel hooks that `fork` and `execve` need.
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -16,7 +15,8 @@ use osmium_mm::paging::MapFlags;
 use osmium_sync::Once;
 
 use crate::memory::UserMemory;
-use crate::process::Process;
+use crate::mmap::MmapArea;
+use crate::process::{Process, intern};
 
 /// What `fork` and `execve` need from the kernel: how to make address
 /// spaces and switch to them, how to start a forked child, and where a new
@@ -116,7 +116,7 @@ impl Process {
     /// other threads, alone.
     pub(crate) fn exec_prepare(&self, path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Result<Prepared, Errno> {
         let platform = platform()?;
-        let size = argv.iter().chain(envp).map(|a| a.len() + 1 + 8).sum::<usize>();
+        let size = argv.iter().chain(envp).fold(0usize, |n, a| n.saturating_add(a.len()).saturating_add(1 + 8));
         if size > ARG_MAX {
             return Err(Errno::E2BIG);
         }
@@ -129,7 +129,7 @@ impl Process {
         // Build the new image completely before touching the process.
         let memory = (platform.new_memory)()?;
         let brk = memory.load_elf(&elf)?;
-        let stack_lo = platform.stack_top - platform.stack_size;
+        let stack_lo = platform.stack_top.checked_sub(platform.stack_size).ok_or(Errno::ENOEXEC)?;
         memory.map_anon(stack_lo, platform.stack_size, MapFlags::RW)?;
         let aux = [
             (at::PHDR, phdr_address(&image, &elf)),
@@ -148,17 +148,28 @@ impl Process {
 
         let name = path.rsplit('/').next().unwrap_or(path);
         let memory: Arc<dyn UserMemory> = memory.into();
-        Ok(Prepared { name: String::from(name), memory, brk, brk_limit, entry: UserEntry { pc: elf.entry(), sp } })
+        // Everything the commit needs is made here, where memory running out
+        // is an error.
+        let name = intern(name).map_err(|_| Errno::ENOMEM)?;
+        let mmap = MmapArea::new(platform.mmap_area.clone()).map_err(|_| Errno::ENOMEM)?;
+        Ok(Prepared {
+            name,
+            memory,
+            mmap,
+            brk,
+            brk_limit,
+            activate: platform.activate,
+            entry: UserEntry { pc: elf.entry(), sp },
+        })
     }
 
     /// The second half of [`exec`](Self::exec): switches the process to the
     /// image built by [`exec_prepare`](Self::exec_prepare). Cannot fail.
     pub(crate) fn exec_commit(&self, prepared: Prepared) -> UserEntry {
-        let platform = platform().expect("the image was built for a platform");
-        let Prepared { name, memory, brk, brk_limit, entry } = prepared;
+        let Prepared { name, memory, mmap, brk, brk_limit, activate, entry } = prepared;
         let root = memory.root();
-        let old = self.replace_image(&name, memory, brk, brk_limit, platform.mmap_area.clone());
-        (platform.activate)(root);
+        let old = self.replace_image(name, memory, brk, brk_limit, mmap);
+        activate(root);
         drop(old);
         if osmium_arch::fp::enabled() {
             // The new program starts with cleared FP/SIMD registers.
@@ -172,10 +183,13 @@ impl Process {
 
 /// A new program image built by [`Process::exec_prepare`], not yet in use.
 pub(crate) struct Prepared {
-    name: String,
+    name: &'static str,
     memory: Arc<dyn UserMemory>,
+    mmap: MmapArea,
     brk: u64,
     brk_limit: u64,
+    /// The platform's `activate`, kept so that committing cannot fail.
+    activate: fn(PhysAddr),
     entry: UserEntry,
 }
 
@@ -188,7 +202,7 @@ fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
 /// (`ENOEXEC` if not), and returns where the program break must stop: at
 /// its usual limit above the image, or at the next of those that is in the
 /// way.
-fn brk_limit(elf: &Elf<'_>, platform: &Platform) -> Result<u64, Errno> {
+pub(crate) fn brk_limit(elf: &Elf<'_>, platform: &Platform) -> Result<u64, Errno> {
     let loaded = || elf.segments().filter(|s| s.mem_size != 0);
     let lo = loaded().map(|s| s.vaddr).min().unwrap_or(0) & !0xfff;
     let hi = loaded().map(|s| s.vaddr.saturating_add(s.mem_size)).max().unwrap_or(0);
@@ -223,7 +237,7 @@ fn hwcap() -> u64 {
 fn read_executable(path: &str) -> Result<Vec<u8>, Errno> {
     let vfs = crate::vfs().ok_or(Errno::ENOENT)?;
     let file = vfs.open(path, OpenFlags::READ, 0)?;
-    let st = file.stat();
+    let st = file.try_stat()?;
     if st.kind != FileKind::Regular || st.mode & 0o111 == 0 {
         return Err(Errno::EACCES);
     }
@@ -235,27 +249,27 @@ fn read_executable(path: &str) -> Result<Vec<u8>, Errno> {
     image.try_reserve_exact(st.size as usize).map_err(|_| Errno::ENOMEM)?;
     image.resize(st.size as usize, 0);
     let mut done = 0;
-    while done < image.len() {
-        match file.read(done as u64, &mut image[done..])? {
+    while let Some(rest) = image.get_mut(done..).filter(|r| !r.is_empty()) {
+        match file.read(done as u64, rest)? {
             0 => return Err(Errno::ENOEXEC),
-            n => done += n,
+            n => done = done.saturating_add(n),
         }
     }
     Ok(image)
 }
 
 fn le16(b: &[u8], off: usize) -> u16 {
-    b.get(off..off + 2).map_or(0, |s| u16::from_le_bytes([s[0], s[1]]))
+    crate::bytes::slice(b, off, 2).ok().and_then(|s| s.first_chunk::<2>()).map_or(0, |&s| u16::from_le_bytes(s))
 }
 
 /// Where the program headers appear in memory (`AT_PHDR`): inside whichever
 /// segment loads the bytes at their file offset, or 0 if none does.
-fn phdr_address(image: &[u8], elf: &Elf<'_>) -> u64 {
-    let phoff = image.get(32..40).map_or(0, |b| u64::from_le_bytes(b.try_into().expect("fixed-width slice")));
+pub(crate) fn phdr_address(image: &[u8], elf: &Elf<'_>) -> u64 {
+    let phoff = crate::bytes::array::<8>(image, 32).map_or(0, u64::from_le_bytes);
     elf.segments()
         .find_map(|s| {
-            let off = s.data.as_ptr() as u64 - image.as_ptr() as u64;
-            (off..off + s.data.len() as u64).contains(&phoff).then(|| s.vaddr + (phoff - off))
+            let off = (s.data.as_ptr() as u64).wrapping_sub(image.as_ptr() as u64);
+            (off..off.saturating_add(s.data.len() as u64)).contains(&phoff).then(|| s.vaddr.wrapping_add(phoff - off))
         })
         .unwrap_or(0)
 }
@@ -283,12 +297,21 @@ fn build_stack(
         mem.write(sp + bytes.len() as u64, &[0])?;
         Ok(sp)
     };
-    let argp = argv.iter().map(|a| push(a)).collect::<Result<Vec<_>, _>>()?;
-    let envp = envp.iter().map(|e| push(e)).collect::<Result<Vec<_>, _>>()?;
+    let mut pointers = |strings: &[&[u8]]| -> Result<Vec<u64>, Errno> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(strings.len()).map_err(|_| Errno::ENOMEM)?;
+        for s in strings {
+            out.push(push(s)?);
+        }
+        Ok(out)
+    };
+    let argp = pointers(argv)?;
+    let envp = pointers(envp)?;
     let random = (sp & !15).checked_sub(16).filter(|&s| s >= lo).ok_or(Errno::E2BIG)?;
     mem.write(random, &random_bytes(seed))?;
 
-    let mut words = Vec::with_capacity(argp.len() + envp.len() + aux.len() * 2 + 6);
+    let mut words = Vec::new();
+    words.try_reserve_exact(argp.len() + envp.len() + aux.len() * 2 + 6).map_err(|_| Errno::ENOMEM)?;
     words.push(argp.len() as u64);
     words.extend(&argp);
     words.push(0);
@@ -297,9 +320,10 @@ fn build_stack(
     for &(key, value) in aux.iter().chain(&[(at::RANDOM, random), (at::NULL, 0)]) {
         words.extend([key, value]);
     }
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-    let sp = random.checked_sub(bytes.len() as u64).map(|s| s & !15).filter(|&s| s >= lo).ok_or(Errno::E2BIG)?;
-    mem.write(sp, &bytes)?;
+    let sp = random.checked_sub(words.len() as u64 * 8).map(|s| s & !15).filter(|&s| s >= lo).ok_or(Errno::E2BIG)?;
+    for (i, w) in words.iter().enumerate() {
+        mem.write(sp + i as u64 * 8, &w.to_ne_bytes())?;
+    }
     Ok(sp)
 }
 

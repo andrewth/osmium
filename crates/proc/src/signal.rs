@@ -35,6 +35,7 @@ use osmium_mm::addr::PAGE_SIZE;
 use osmium_mm::paging::MapFlags;
 use osmium_sync::IrqSpinLock;
 
+use crate::bytes::{put, slice};
 use crate::process::{ExitStatus, Pid, Process};
 use crate::thread::Thread;
 use crate::uregs::{NREGS, UserRegs};
@@ -92,8 +93,14 @@ const SI_USER: i32 = 0;
 const SI_KERNEL: i32 = 0x80;
 const SEGV_MAPERR: i32 = 1;
 
+/// The mask bit of signal `sig`; 0 for a number outside `1..=NSIG`.
 fn bit(sig: u8) -> u64 {
-    1 << (sig - 1)
+    1u64.checked_shl(u32::from(sig).wrapping_sub(1)).unwrap_or(0)
+}
+
+/// The index of signal `sig` in the per-signal tables, if it is `1..=NSIG`.
+fn index(sig: u8) -> Option<usize> {
+    usize::from(sig).checked_sub(1).filter(|&i| i < NSIG)
 }
 
 /// Signals that cannot be blocked, caught or ignored.
@@ -146,12 +153,25 @@ impl Signals {
     }
 
     fn action(&self, sig: u8) -> SigAction {
-        self.actions.lock()[sig as usize - 1]
+        index(sig).and_then(|i| self.actions.lock().get(i).copied()).unwrap_or_default()
+    }
+
+    fn set_sender(&self, sig: u8, from: Pid) {
+        if let Some(s) = index(sig).and_then(|i| self.senders.get(i)) {
+            s.store(from.0, Ordering::SeqCst);
+        }
+    }
+
+    fn sender(&self, sig: u8) -> u32 {
+        index(sig).and_then(|i| self.senders.get(i)).map_or(0, |s| s.load(Ordering::SeqCst))
     }
 
     fn set_action(&self, sig: u8, act: SigAction) {
         let discards = act.handler == SIG_IGN || act.handler == SIG_DFL && default_ignored(sig);
-        self.actions.lock()[sig as usize - 1] = act;
+        let Some(i) = index(sig) else { return };
+        if let Some(slot) = self.actions.lock().get_mut(i) {
+            *slot = act;
+        }
         if discards {
             self.ignored.fetch_or(bit(sig), Ordering::SeqCst);
             // Setting a signal to be ignored discards it from the pending set.
@@ -220,7 +240,7 @@ pub fn send(p: &Process, sig: u8, from: Pid) -> Result<(), Errno> {
     if p.signals.ignored.load(Ordering::SeqCst) & bit(sig) != 0 {
         return Ok(());
     }
-    p.signals.senders[sig as usize - 1].store(from.0, Ordering::SeqCst);
+    p.signals.set_sender(sig, from);
     p.signals.pending.fetch_or(bit(sig), Ordering::SeqCst);
     poke(p);
     Ok(())
@@ -239,7 +259,7 @@ pub fn send_to_thread(p: &Process, th: &Thread, sig: u8, from: Pid) -> Result<()
     if p.signals.ignored.load(Ordering::SeqCst) & bit(sig) != 0 {
         return Ok(());
     }
-    p.signals.senders[sig as usize - 1].store(from.0, Ordering::SeqCst);
+    p.signals.set_sender(sig, from);
     th.pending.fetch_or(bit(sig), Ordering::SeqCst);
     poke(p);
     Ok(())
@@ -349,23 +369,24 @@ fn push_frame<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R, sig: u8, act:
     } else {
         p.signals.trampoline.load(Ordering::SeqCst)
     };
-    if ra == 0 {
+    // A handler the CPU cannot return to would fault the kernel instead of the program.
+    if ra == 0 || !R::valid_pc(act.handler) {
         return Err(Errno::EFAULT);
     }
     let (code, value) = match th.take_fault(sig) {
         Some(addr) => (SEGV_MAPERR, addr),
         None => {
-            let from = p.signals.senders[sig as usize - 1].load(Ordering::SeqCst);
+            let from = p.signals.sender(sig);
             if from == 0 { (SI_KERNEL, 0) } else { (SI_USER, from as u64) }
         }
     };
     let mut buf = [0u8; FRAME_SIZE];
-    buf[0..4].copy_from_slice(&(sig as i32).to_ne_bytes());
-    buf[8..12].copy_from_slice(&code.to_ne_bytes());
-    buf[16..24].copy_from_slice(&value.to_ne_bytes());
-    buf[FRAME_MASK..FRAME_MASK + 8].copy_from_slice(&th.mask.load(Ordering::SeqCst).to_ne_bytes());
+    put(&mut buf, 0, &i32::from(sig).to_ne_bytes())?;
+    put(&mut buf, 8, &code.to_ne_bytes())?;
+    put(&mut buf, 16, &value.to_ne_bytes())?;
+    put(&mut buf, FRAME_MASK, &th.mask.load(Ordering::SeqCst).to_ne_bytes())?;
     for (i, w) in regs.save_user().iter().enumerate() {
-        buf[FRAME_REGS + i * 8..FRAME_REGS + i * 8 + 8].copy_from_slice(&w.to_ne_bytes());
+        put(&mut buf, FRAME_REGS + i * 8, &w.to_ne_bytes())?;
     }
     let base = regs
         .user_sp()
@@ -403,13 +424,19 @@ pub(crate) fn sigreturn<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) -> 
         kill_group(p, status);
         return Some(status);
     }
-    let word = |off: usize| u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap());
+    let word = |off: usize| crate::bytes::u64_at(&buf, off).unwrap_or(0);
     th.mask.store(word(FRAME_MASK) & !UNBLOCKABLE, Ordering::SeqCst);
     let mut saved = [0; NREGS];
     for (i, w) in saved.iter_mut().enumerate() {
         *w = word(FRAME_REGS + i * 8);
     }
     regs.restore_user(&saved);
+    if !R::valid_pc(regs.user_pc()) {
+        // A forged frame: the program cannot continue.
+        let status = ExitStatus::Signal(SIGSEGV);
+        kill_group(p, status);
+        return Some(status);
+    }
     None
 }
 
@@ -461,7 +488,7 @@ const ACTION_WORDS: usize = 3;
 fn read_action(p: &Process, va: u64) -> Result<SigAction, Errno> {
     let mut b = [0u8; ACTION_WORDS * 8];
     p.memory().read(va, &mut b)?;
-    let w = |i: usize| u64::from_ne_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    let w = |i: usize| crate::bytes::u64_at(&b, i * 8).unwrap_or(0);
     Ok(if cfg!(target_arch = "x86_64") {
         SigAction { handler: w(0), flags: w(1), restorer: w(2), mask: w(3) }
     } else {
@@ -477,9 +504,9 @@ fn write_action(p: &Process, va: u64, a: &SigAction) -> Result<(), Errno> {
     };
     let mut b = [0u8; 32];
     for (i, w) in words.iter().enumerate() {
-        b[i * 8..i * 8 + 8].copy_from_slice(&w.to_ne_bytes());
+        put(&mut b, i * 8, &w.to_ne_bytes())?;
     }
-    p.memory().write(va, &b[..ACTION_WORDS * 8])
+    p.memory().write(va, slice(&b, 0, ACTION_WORDS * 8)?)
 }
 
 /// `rt_sigreturn` as code: load the number, make the call.

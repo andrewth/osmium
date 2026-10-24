@@ -2,14 +2,17 @@
 //! architecture, decoded once and handled by portable code.
 
 use alloc::string::String;
-use alloc::vec;
 
 #[cfg(any(target_arch = "riscv64", target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64")))]
 use osmium_arch::trap::TrapFrame;
 use osmium_fs::{Errno, FileKind, OpenFlags, PATH_MAX, Stat};
 use osmium_mm::paging::MapFlags;
 
+use osmium_sync::fallible::{try_extend_from_slice, try_push, try_string, try_zeroed};
+
+use crate::bytes;
 use crate::fd::{Access, OpenFile};
+use crate::oom;
 use crate::poll::user_add;
 use crate::process::{ExitStatus, Pid, Process};
 use crate::thread::Thread;
@@ -103,7 +106,7 @@ pub enum Sys {
 
 /// Linux system-call numbers for x86_64.
 #[cfg(target_arch = "x86_64")]
-const NUMBERS: &[(u64, Sys)] = &[
+pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (0, Sys::Read),
     (1, Sys::Write),
     (32, Sys::Dup),
@@ -181,7 +184,7 @@ const NUMBERS: &[(u64, Sys)] = &[
 
 /// Linux system-call numbers for RISC-V and AArch64 (asm-generic).
 #[cfg(not(target_arch = "x86_64"))]
-const NUMBERS: &[(u64, Sys)] = &[
+pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (17, Sys::Getcwd),
     (23, Sys::Dup),
     (24, Sys::Dup3),
@@ -256,7 +259,8 @@ impl Sys {
 
     /// This architecture's Linux number for the call.
     pub fn number(self) -> u64 {
-        NUMBERS.iter().find(|(_, s)| *s == self).map(|&(n, _)| n).expect("every call has a number")
+        // Every call has a number; `u64::MAX` (which decodes to nothing) is only for totality.
+        NUMBERS.iter().find(|(_, s)| *s == self).map_or(u64::MAX, |&(n, _)| n)
     }
 }
 
@@ -350,7 +354,7 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Openat => openat(p, fd, a[1], a[2], a[3] as u32),
         Sys::Close => p.files().lock().close(fd).map(|()| 0),
         Sys::Lseek => lseek(p, fd, a[1] as i64, a[2]),
-        Sys::Fstat => open_file(p, fd).and_then(|f| put_stat(p, a[1], &f.file().stat())),
+        Sys::Fstat => open_file(p, fd).and_then(|f| put_stat(p, a[1], &f.file().try_stat()?)),
         Sys::Newfstatat => newfstatat(p, fd, a[1], a[2], a[3]),
         Sys::Getdents64 => getdents64(p, fd, a[1], a[2]),
         // The argument is forwarded as an opaque integer: nothing here
@@ -457,19 +461,19 @@ fn open_file(p: &Process, fd: i32) -> Result<alloc::sync::Arc<OpenFile>, Errno> 
 /// call with the partial count instead of failing or blocking.
 fn read(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
     let f = open_file(p, fd)?;
-    let mut kbuf = vec![0u8; (len as usize).min(CHUNK)];
+    let mut kbuf = try_zeroed((len as usize).min(CHUNK)).map_err(oom)?;
     let mut done = 0;
     while done < len {
         if done > 0 && f.file().poll() & osmium_fs::POLLIN == 0 {
             break;
         }
         let want = ((len - done) as usize).min(CHUNK);
-        let n = match f.read(&mut kbuf[..want]) {
+        let n = match bytes::slice_mut(&mut kbuf, 0, want).and_then(|k| f.read(k)) {
             Ok(n) => n,
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         };
-        if let Err(e) = user_add(buf, done).and_then(|va| p.memory().write(va, &kbuf[..n])) {
+        if let Err(e) = user_add(buf, done).and_then(|va| p.memory().write(va, bytes::slice(&kbuf, 0, n)?)) {
             if done > 0 {
                 break;
             }
@@ -489,20 +493,20 @@ fn read(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
 /// partial count.
 fn write(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
     let f = open_file(p, fd)?;
-    let mut kbuf = vec![0u8; (len as usize).min(CHUNK)];
+    let mut kbuf = try_zeroed((len as usize).min(CHUNK)).map_err(oom)?;
     let mut done = 0;
     while done < len {
         if done > 0 && f.file().poll() & osmium_fs::POLLOUT == 0 {
             break;
         }
         let want = ((len - done) as usize).min(CHUNK);
-        if let Err(e) = user_add(buf, done).and_then(|va| p.memory().read(va, &mut kbuf[..want])) {
+        if let Err(e) = user_add(buf, done).and_then(|va| p.memory().read(va, bytes::slice_mut(&mut kbuf, 0, want)?)) {
             if done > 0 {
                 break;
             }
             return Err(e);
         }
-        let n = match f.write(&kbuf[..want]) {
+        let n = match bytes::slice(&kbuf, 0, want).and_then(|k| f.write(k)) {
             Ok(n) => n,
             Err(_) if done > 0 => break,
             Err(e) => {
@@ -532,14 +536,15 @@ fn iovecs(p: &Process, iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64
         return Err(Errno::EINVAL);
     }
     let mut total = 0u64;
-    (0..count)
-        .map(|i| {
-            let at = user_add(iov, i * 16)?;
-            let (base, len) = (user_u64(p, at)?, user_u64(p, user_add(at, 8)?)?);
-            total = total.checked_add(len).filter(|&t| t <= isize::MAX as u64).ok_or(Errno::EINVAL)?;
-            Ok((base, len))
-        })
-        .collect()
+    let mut out = alloc::vec::Vec::new();
+    out.try_reserve_exact(count as usize).map_err(|_| Errno::ENOMEM)?;
+    for i in 0..count {
+        let at = user_add(iov, i * 16)?;
+        let (base, len) = (user_u64(p, at)?, user_u64(p, user_add(at, 8)?)?);
+        total = total.checked_add(len).filter(|&t| t <= isize::MAX as u64).ok_or(Errno::EINVAL)?;
+        out.push((base, len));
+    }
+    Ok(out)
 }
 
 fn readv(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
@@ -574,8 +579,9 @@ fn writev(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
         while done < len {
             let n = ((len - done) as usize).min(GATHER - pending.len());
             let start = pending.len();
+            pending.try_reserve(n).map_err(|_| Errno::ENOMEM)?;
             pending.resize(start + n, 0);
-            p.memory().read(user_add(base, done)?, &mut pending[start..])?;
+            p.memory().read(user_add(base, done)?, bytes::slice_mut(&mut pending, start, n)?)?;
             done += n as u64;
             if pending.len() == GATHER && !flush(&mut pending)? {
                 return Ok(total);
@@ -600,24 +606,25 @@ fn user_path(p: &Process, va: u64) -> Result<String, Errno> {
 /// Reads a NUL-terminated string from user memory, failing with `too_long`
 /// once it reaches `max` bytes.
 fn user_cstr(p: &Process, va: u64, max: usize, too_long: Errno) -> Result<alloc::vec::Vec<u8>, Errno> {
-    let mut bytes = alloc::vec::Vec::new();
+    let mut out = alloc::vec::Vec::new();
     let mut addr = va;
     loop {
         // Never read past a page boundary before checking for the NUL.
         let n = 4096 - (addr % 4096) as usize;
         let mut chunk = [0u8; 4096];
-        p.memory().read(addr, &mut chunk[..n])?;
-        if let Some(end) = chunk[..n].iter().position(|&b| b == 0) {
-            bytes.extend_from_slice(&chunk[..end]);
+        let piece = bytes::slice_mut(&mut chunk, 0, n)?;
+        p.memory().read(addr, piece)?;
+        if let Some(end) = piece.iter().position(|&b| b == 0) {
+            try_extend_from_slice(&mut out, bytes::slice(piece, 0, end)?).map_err(oom)?;
             break;
         }
-        bytes.extend_from_slice(&chunk[..n]);
-        if bytes.len() >= max {
+        try_extend_from_slice(&mut out, piece).map_err(oom)?;
+        if out.len() >= max {
             return Err(too_long);
         }
-        addr += n as u64;
+        addr = user_add(addr, n as u64)?;
     }
-    Ok(bytes)
+    Ok(out)
 }
 
 fn vfs() -> Result<&'static osmium_fs::Vfs, Errno> {
@@ -633,16 +640,23 @@ fn path_at(p: &Process, dirfd: i32, path: u64) -> Result<String, Errno> {
     if path.starts_with('/') {
         return Ok(path);
     }
-    let base =
-        if dirfd == AT_FDCWD { p.cwd() } else { p.files().lock().get(dirfd)?.path().ok_or(Errno::ENOTDIR)?.into() };
-    Ok(join(&base, &path))
+    let base = if dirfd == AT_FDCWD {
+        p.try_cwd()?
+    } else {
+        let file = p.files().lock().get(dirfd)?;
+        try_string(file.path().ok_or(Errno::ENOTDIR)?).map_err(oom)?
+    };
+    join(&base, &path)
 }
 
-fn join(base: &str, rel: &str) -> String {
-    let mut s = String::from(base.trim_end_matches('/'));
+fn join(base: &str, rel: &str) -> Result<String, Errno> {
+    let mut s = String::new();
+    let base = base.trim_end_matches('/');
+    s.try_reserve_exact(base.len() + 1 + rel.len()).map_err(|_| Errno::ENOMEM)?;
+    s.push_str(base);
     s.push('/');
     s.push_str(rel);
-    s
+    Ok(s)
 }
 
 fn openat(p: &Process, dirfd: i32, path: u64, flags: u64, mode: u32) -> SysResult {
@@ -674,16 +688,16 @@ fn openat(p: &Process, dirfd: i32, path: u64, flags: u64, mode: u32) -> SysResul
         of |= OpenFlags::WRITE;
     }
     let file = vfs()?.open(&path, of, mode & 0o7777 & !p.umask())?;
-    if access.write && file.stat().kind == FileKind::Directory {
+    if access.write && file.try_stat()?.kind == FileKind::Directory {
         return Err(Errno::EISDIR);
     }
-    let open = OpenFile::with_path(file, access, path);
+    let open = OpenFile::try_with_path(file, access, path)?;
     p.files().lock().insert_from(0, open, flags & oflag::CLOEXEC != 0).map(|fd| fd as u64)
 }
 
 fn lseek(p: &Process, fd: i32, off: i64, whence: u64) -> SysResult {
     let f = p.files().lock().get(fd)?;
-    let st = f.file().stat();
+    let st = f.file().try_stat()?;
     if matches!(st.kind, FileKind::CharDevice | FileKind::Fifo | FileKind::Socket) {
         return Err(Errno::ESPIPE);
     }
@@ -702,7 +716,7 @@ fn newfstatat(p: &Process, dirfd: i32, path: u64, buf: u64, flags: u64) -> SysRe
     let st = if flags & AT_EMPTY_PATH != 0 && user_path(p, path)?.is_empty() {
         let f = if dirfd == AT_FDCWD { None } else { Some(p.files().lock().get(dirfd)?) };
         match f {
-            Some(f) => f.file().stat(),
+            Some(f) => f.file().try_stat()?,
             None => vfs()?.stat(&p.cwd(), true)?,
         }
     } else {
@@ -716,7 +730,10 @@ fn put_stat(p: &Process, buf: u64, st: &Stat) -> SysResult {
     let mode = st.kind.mode_bits() | (st.mode & 0o7777);
     let blocks = st.size.div_ceil(512);
     let mut b = [0u8; 144];
-    let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
+    // The offsets are constants within the buffer, so a put cannot fail.
+    let mut put = |off: usize, src: &[u8]| {
+        let _ = bytes::put(&mut b, off, src);
+    };
     put(0, &st.dev.to_ne_bytes());
     put(8, &st.ino.to_ne_bytes());
     #[cfg(target_arch = "x86_64")]
@@ -739,20 +756,20 @@ fn put_stat(p: &Process, buf: u64, st: &Stat) -> SysResult {
         put(64, &blocks.to_ne_bytes());
         128
     };
-    p.memory().write(buf, &b[..len])?;
+    p.memory().write(buf, bytes::slice(&b, 0, len)?)?;
     Ok(0)
 }
 
 fn getdents64(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
     let f = p.files().lock().get(fd)?;
-    let st = f.file().stat();
+    let st = f.file().try_stat()?;
     let mut out = alloc::vec::Vec::new();
     // Position 0 is ".", 1 is "..", and n + 2 is the file system's entry n.
     let mut pos = f.offset();
     loop {
         let (ino, kind, name) = match pos {
-            0 => (st.ino, FileKind::Directory, String::from(".")),
-            1 => (st.ino, FileKind::Directory, String::from("..")),
+            0 => (st.ino, FileKind::Directory, try_string(".").map_err(oom)?),
+            1 => (st.ino, FileKind::Directory, try_string("..").map_err(oom)?),
             n => match f.file().readdir(n as usize - 2)? {
                 Some(e) => (e.ino, e.kind, e.name),
                 None => break,
@@ -767,6 +784,7 @@ fn getdents64(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
             break;
         }
         let start = out.len();
+        out.try_reserve(reclen).map_err(|_| Errno::ENOMEM)?;
         out.extend_from_slice(&ino.to_ne_bytes());
         out.extend_from_slice(&(pos + 1).to_ne_bytes());
         out.extend_from_slice(&(reclen as u16).to_ne_bytes());
@@ -781,8 +799,8 @@ fn getdents64(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
 }
 
 fn getcwd(p: &Process, buf: u64, size: u64) -> SysResult {
-    let mut cwd = p.cwd().into_bytes();
-    cwd.push(0);
+    let mut cwd = p.try_cwd()?.into_bytes();
+    try_push(&mut cwd, 0).map_err(oom)?;
     if cwd.len() as u64 > size {
         return Err(Errno::ERANGE);
     }
@@ -830,8 +848,10 @@ fn munmap(p: &Process, addr: u64, len: u64) -> SysResult {
     if !addr.is_multiple_of(4096) || len == 0 {
         return Err(Errno::EINVAL);
     }
+    // Made first: once the pages are gone there is no going back.
+    let spare = crate::mmap::FreeRange::spare().map_err(|_| Errno::ENOMEM)?;
     p.memory().unmap(addr, len);
-    p.mmap_release(addr, len);
+    p.mmap_release(addr, len, spare);
     Ok(0)
 }
 
@@ -905,7 +925,7 @@ fn user_strings(p: &Process, va: u64, total: &mut usize) -> Result<alloc::vec::V
         return Ok(out);
     }
     loop {
-        let ptr = user_u64(p, va + out.len() as u64 * 8)?;
+        let ptr = user_u64(p, user_add(va, out.len() as u64 * 8)?)?;
         if ptr == 0 {
             return Ok(out);
         }
@@ -914,8 +934,16 @@ fn user_strings(p: &Process, va: u64, total: &mut usize) -> Result<alloc::vec::V
         if *total > crate::exec::ARG_MAX {
             return Err(Errno::E2BIG);
         }
-        out.push(s);
+        try_push(&mut out, s).map_err(oom)?;
     }
+}
+
+/// `strings` as slices.
+fn slices(strings: &[alloc::vec::Vec<u8>]) -> Result<alloc::vec::Vec<&[u8]>, Errno> {
+    let mut out = alloc::vec::Vec::new();
+    out.try_reserve_exact(strings.len()).map_err(|_| Errno::ENOMEM)?;
+    out.extend(strings.iter().map(|s| s.as_slice()));
+    Ok(out)
 }
 
 fn execve(p: &Process, th: &Thread, path: u64, argv: u64, envp: u64) -> Result<Outcome, Errno> {
@@ -924,8 +952,8 @@ fn execve(p: &Process, th: &Thread, path: u64, argv: u64, envp: u64) -> Result<O
     let mut total = 0;
     let argv = user_strings(p, argv, &mut total)?;
     let envp = user_strings(p, envp, &mut total)?;
-    let argv: alloc::vec::Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
-    let envp: alloc::vec::Vec<&[u8]> = envp.iter().map(|e| e.as_slice()).collect();
+    let argv = slices(&argv)?;
+    let envp = slices(&envp)?;
     // Everything that can fail for want of a good executable happens before
     // the other threads are ended: a failed execve leaves them running.
     let prepared = p.exec_prepare(&path, &argv, &envp)?;
@@ -997,7 +1025,10 @@ fn fcntl(p: &Process, fd: i32, cmd: u64, arg: u64) -> SysResult {
                 (false, true) => oflag::WRONLY,
                 _ => 0,
             };
-            Ok(mode | if a.append { oflag::APPEND } else { 0 } | crate::socket::status_flags(f.file()) | crate::pipe::status_flags(f.file()))
+            Ok(mode
+                | if a.append { oflag::APPEND } else { 0 }
+                | crate::socket::status_flags(f.file())
+                | crate::pipe::status_flags(f.file()))
         }
         // Only a socket's or pipe's O_NONBLOCK can be changed so far.
         F_SETFL => {
@@ -1021,7 +1052,7 @@ fn uname(p: &Process, buf: u64) -> SysResult {
     // domainname, 65 bytes each.
     let mut b = [0u8; 65 * 6];
     for (i, s) in ["Osmium", "osmium", env!("CARGO_PKG_VERSION"), "", machine, ""].iter().enumerate() {
-        b[i * 65..i * 65 + s.len()].copy_from_slice(s.as_bytes());
+        bytes::put(&mut b, i * 65, s.as_bytes())?;
     }
     p.memory().write(buf, &b)?;
     Ok(0)
@@ -1057,8 +1088,11 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
             }
             // `fork` checked both: the parent holds the child, and the
             // platform is set.
-            let child = Process::find(child).expect("the parent holds its child");
-            let resume = crate::exec::platform().expect("fork needs a platform").resume;
+            let (Some(child), Ok(platform)) = (Process::find(child), crate::exec::platform()) else {
+                frame.set_return(-(Errno::ENOSYS.0 as i64) as u64);
+                return crate::signal::deliver_to(&p, &th, frame);
+            };
+            let resume = platform.resume;
             // The child continues with the parent's FP registers, which are
             // still live: the kernel never uses them.
             let fp = if osmium_arch::fp::enabled() {
@@ -1067,11 +1101,22 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
             } else {
                 osmium_arch::fp::FpState::new()
             };
-            child.spawn_with_fp(osmium_sched::TaskBuilder::new(child.name()), fp, move || resume(regs));
-            frame.set_return(child.pid().0 as u64);
+            let spawned =
+                child.try_spawn_with_fp(osmium_sched::TaskBuilder::new(child.name()), fp, move || resume(regs));
+            if spawned.is_err() {
+                // `fork` registered the child, but it will never run.
+                p.forget_child(child.pid());
+                frame.set_return(-(Errno::ENOMEM.0 as i64) as u64);
+            } else {
+                frame.set_return(child.pid().0 as u64);
+            }
         }
         Outcome::Exec { pc, sp } => start(frame, pc, sp),
-        Outcome::Thread { tid, stack, tls } => crate::thread::start(&p, tid, frame, stack, tls),
+        Outcome::Thread { tid, stack, tls } => {
+            if let Err(e) = crate::thread::start(&p, tid, frame, stack, tls) {
+                frame.set_return(-(e.0 as i64) as u64);
+            }
+        }
     }
     crate::signal::deliver_to(&p, &th, frame)
 }
@@ -1128,7 +1173,7 @@ fn set_sp(frame: &mut TrapFrame, sp: u64) {
 #[cfg(target_arch = "riscv64")]
 fn decode(frame: &mut TrapFrame) -> (u64, [u64; 6]) {
     let a = frame.syscall_args();
-    frame.set_pc(frame.pc() + 4);
+    frame.set_pc(frame.pc().wrapping_add(4));
     (a[7], [a[0], a[1], a[2], a[3], a[4], a[5]])
 }
 

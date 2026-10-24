@@ -9,11 +9,10 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use osmium_fs::Errno;
 use osmium_hal::net::NetDevice;
-use osmium_net::{Instant, Interface, SocketHandle, SocketSet, TcpSocket};
+use osmium_net::{Instant, Interface, Socket, SocketHandle, SocketSet, TcpSocket};
 use osmium_sched::WaitQueue;
 use osmium_sync::{IrqSpinLock, Once};
 
@@ -29,8 +28,6 @@ struct Inner {
     iface: Interface,
     dev: Box<dyn NetDevice + Send>,
     sockets: SocketSet,
-    /// Closed sockets' TCP connections, removed once they finish closing.
-    reap: Vec<SocketHandle>,
 }
 
 impl NetStack {
@@ -38,11 +35,7 @@ impl NetStack {
     /// `sockets` may already hold sockets of the kernel's own, such as a
     /// DHCP client.
     pub fn new(iface: Interface, dev: Box<dyn NetDevice + Send>, sockets: SocketSet, now_ns: fn() -> u64) -> Self {
-        Self {
-            inner: IrqSpinLock::new(Inner { iface, dev, sockets, reap: Vec::new() }),
-            events: WaitQueue::new(),
-            now_ns,
-        }
+        Self { inner: IrqSpinLock::new(Inner { iface, dev, sockets }), events: WaitQueue::new(), now_ns }
     }
 
     fn now(&self) -> Instant {
@@ -76,13 +69,15 @@ impl NetStack {
                 }
                 active |= inner.iface.poll(now, &mut *inner.dev, &mut inner.sockets);
             }
-            inner.reap.retain(|&h| {
-                let done = !inner.sockets.get::<TcpSocket>(h).is_open();
-                if done {
-                    inner.sockets.remove(h);
-                }
-                !done
-            });
+            // Connections their files let go of, once they finish closing.
+            loop {
+                let done = inner.sockets.iter().find_map(|(h, s)| match s {
+                    Socket::Tcp(t) if t.released() && !t.is_open() => Some(h),
+                    _ => None,
+                });
+                let Some(h) = done else { break };
+                inner.sockets.try_remove(h);
+            }
             (r, active)
         };
         self.events.wake_all();
@@ -109,7 +104,7 @@ impl NetStack {
             } else {
                 t.close();
             }
-            inner.reap.push(h);
+            t.release();
         }
         self.poll();
     }

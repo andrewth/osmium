@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use osmium_sync::Once;
+use osmium_sync::fallible::{OutOfMemory, try_arc};
 
 use osmium_fs::{Errno, File};
 
@@ -48,13 +49,31 @@ pub struct OpenFile {
 
 impl OpenFile {
     /// Opens `file` at offset 0.
+    ///
+    /// # Panics
+    /// If memory runs out: [`OpenFile::try_new`] reports that instead.
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM; `try_new` is the fallible form.
     pub fn new(file: Arc<dyn File>, access: Access) -> Arc<Self> {
-        Arc::new(Self { file, access, offset: AtomicU64::new(0), path: None })
+        Self::try_new(file, access).expect("out of memory for an open file")
+    }
+
+    /// [`OpenFile::new`], failing with `ENOMEM` instead of panicking.
+    pub fn try_new(file: Arc<dyn File>, access: Access) -> Result<Arc<Self>, Errno> {
+        try_arc(Self { file, access, offset: AtomicU64::new(0), path: None }).map_err(crate::oom)
     }
 
     /// Opens `file`, found at the absolute `path`, at offset 0.
+    ///
+    /// # Panics
+    /// If memory runs out: [`OpenFile::try_with_path`] reports that instead.
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM; `try_with_path` is the fallible form.
     pub fn with_path(file: Arc<dyn File>, access: Access, path: String) -> Arc<Self> {
-        Arc::new(Self { file, access, offset: AtomicU64::new(0), path: Some(path) })
+        Self::try_with_path(file, access, path).expect("out of memory for an open file")
+    }
+
+    /// [`OpenFile::with_path`], failing with `ENOMEM` instead of panicking.
+    pub fn try_with_path(file: Arc<dyn File>, access: Access, path: String) -> Result<Arc<Self>, Errno> {
+        try_arc(Self { file, access, offset: AtomicU64::new(0), path: Some(path) }).map_err(crate::oom)
     }
 
     /// The path it was opened by, if any.
@@ -112,7 +131,7 @@ impl OpenFile {
         }
         if self.access.append {
             // An append lands at the end and leaves the position just past it.
-            let off = self.file.stat().size;
+            let off = self.file.try_stat()?.size;
             let n = self.file.write(off, buf)?;
             self.set_offset(off.checked_add(n as u64).ok_or(Errno::EOVERFLOW)?);
             return Ok(n);
@@ -146,6 +165,14 @@ pub fn set_console(console: Arc<dyn File>) {
 }
 
 impl FdTable {
+    /// [`Clone::clone`], failing instead of panicking if memory runs out.
+    pub fn try_clone(&self) -> Result<Self, OutOfMemory> {
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(self.slots.len())?;
+        slots.extend(self.slots.iter().cloned());
+        Ok(Self { slots })
+    }
+
     /// An empty table.
     pub const fn new() -> Self {
         Self { slots: Vec::new() }
@@ -155,8 +182,7 @@ impl FdTable {
     /// empty one if there is no console.
     pub fn with_console() -> Self {
         let mut t = Self::new();
-        if let Some(c) = CONSOLE.get() {
-            let open = OpenFile::new(c.clone(), Access::RW);
+        if let Some(Ok(open)) = CONSOLE.get().map(|c| OpenFile::try_new(c.clone(), Access::RW)) {
             let slot = Slot { file: open, cloexec: false };
             t.slots = alloc::vec![Some(slot.clone()), Some(slot.clone()), Some(slot)];
         }
@@ -172,6 +198,13 @@ impl FdTable {
         usize::try_from(fd).ok().and_then(|i| self.slots.get(i)?.as_ref()).ok_or(Errno::EBADF)
     }
 
+    /// Makes room for `len` descriptors.
+    fn grow(&mut self, len: usize) -> Result<(), Errno> {
+        self.slots.try_reserve(len.saturating_sub(self.slots.len())).map_err(|_| Errno::ENOMEM)?;
+        self.slots.resize(len, None);
+        Ok(())
+    }
+
     /// Installs `file` at the lowest free descriptor and returns it.
     pub fn insert(&mut self, file: Arc<OpenFile>) -> Result<i32, Errno> {
         self.insert_from(0, file, false)
@@ -184,12 +217,12 @@ impl FdTable {
             Some(i) => min + i,
             None if self.slots.len().max(min) < MAX_FDS => {
                 let fd = self.slots.len().max(min);
-                self.slots.resize(fd + 1, None);
+                self.grow(fd + 1)?;
                 fd
             }
             None => return Err(if min >= MAX_FDS { Errno::EINVAL } else { Errno::EMFILE }),
         };
-        self.slots[fd] = Some(Slot { file, cloexec });
+        *self.slots.get_mut(fd).ok_or(Errno::EBADF)? = Some(Slot { file, cloexec });
         Ok(fd as i32)
     }
 
@@ -198,9 +231,9 @@ impl FdTable {
     pub fn insert_at(&mut self, new: i32, file: Arc<OpenFile>, cloexec: bool) -> Result<(), Errno> {
         let i = usize::try_from(new).ok().filter(|&i| i < MAX_FDS).ok_or(Errno::EBADF)?;
         if i >= self.slots.len() {
-            self.slots.resize(i + 1, None);
+            self.grow(i + 1)?;
         }
-        self.slots[i] = Some(Slot { file, cloexec });
+        *self.slots.get_mut(i).ok_or(Errno::EBADF)? = Some(Slot { file, cloexec });
         Ok(())
     }
 

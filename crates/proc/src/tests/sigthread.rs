@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Signals, threads and futexes, driven without a scheduler: threads are
 //! registered by `clone` and exited by hand.
 
@@ -43,6 +44,13 @@ impl<const S: bool> UserRegs for Regs<S> {
     const RED_ZONE: u64 = if S { 128 } else { 0 };
     const RET_ON_STACK: bool = S;
 
+    fn user_pc(&self) -> u64 {
+        self.pc
+    }
+    fn valid_pc(pc: u64) -> bool {
+        // Like x86_64, the register files that return through the stack refuse non-canonical addresses.
+        !S || pc >> 47 == 0
+    }
     fn user_sp(&self) -> u64 {
         self.sp
     }
@@ -245,6 +253,29 @@ fn a_handler_without_a_stack_ends_the_process() {
     assert_eq!(sigaction(&p, SIGUSR1, handler(0, 0)), 0);
     call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
     assert_eq!(signal::deliver_to(&p, &th, &mut regs), Some(ExitStatus::Signal(11)));
+}
+
+#[test]
+fn a_handler_the_cpu_cannot_return_to_ends_the_process() {
+    let (p, _) = process("sig-badhandler");
+    let th = p.leader();
+    let mut regs = Regs::<true>::new();
+    let bad = SigAction { handler: 0x8000_0000_0000_0000, ..handler(0, 0) };
+    assert_eq!(sigaction(&p, SIGUSR1, bad), 0);
+    call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
+    assert_eq!(signal::deliver_to(&p, &th, &mut regs), Some(ExitStatus::Signal(11)));
+    // A forged frame that restores a non-canonical pc ends it too.
+    let (p, _) = process("sig-forged");
+    let th = p.leader();
+    let mut regs = Regs::<true>::new();
+    assert_eq!(sigaction(&p, SIGUSR1, handler(0, 0)), 0);
+    call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
+    assert_eq!(signal::deliver_to(&p, &th, &mut regs), None);
+    let frame = regs.sp + 8;
+    // The saved pc is the first register word after the mask.
+    put(&p, frame + 136, &0xffff_8000_0000_0000u64.to_ne_bytes());
+    regs.sp = frame;
+    assert_eq!(signal::sigreturn(&p, &th, &mut regs), Some(ExitStatus::Signal(11)));
 }
 
 #[test]

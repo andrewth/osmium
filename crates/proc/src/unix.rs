@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::collections::VecDeque;
 use osmium_fs::{Errno, File, FileKind, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, Stat};
 use osmium_sync::IrqSpinLock;
+use osmium_sync::fallible::{try_arc, try_to_vec};
 
 use crate::poll::{notify, wait};
 
@@ -36,6 +37,25 @@ struct Pair {
     ends: [End; 2],
 }
 
+impl Pair {
+    /// The end of `side` (0 or 1; any other value names end 1).
+    fn end(&self, side: usize) -> &End {
+        let [a, b] = &self.ends;
+        if side == 0 { a } else { b }
+    }
+
+    /// The end opposite `side`.
+    fn peer(&self, side: usize) -> &End {
+        self.end(usize::from(side == 0))
+    }
+
+    /// The end of `side` and the end opposite it.
+    fn both_mut(&mut self, side: usize) -> (&mut End, &mut End) {
+        let [a, b] = &mut self.ends;
+        if side == 0 { (a, b) } else { (b, a) }
+    }
+}
+
 /// One end of a socket pair.
 pub struct UnixSocket {
     pair: Arc<IrqSpinLock<Pair>>,
@@ -45,10 +65,10 @@ pub struct UnixSocket {
 }
 
 /// A connected pair of stream (`dgram` false) or datagram sockets.
-pub fn socketpair(dgram: bool, nonblock: bool) -> (UnixSocket, UnixSocket) {
-    let pair = Arc::new(IrqSpinLock::new(Pair::default()));
+pub fn socketpair(dgram: bool, nonblock: bool) -> Result<(UnixSocket, UnixSocket), Errno> {
+    let pair = try_arc(IrqSpinLock::new(Pair::default())).map_err(crate::oom)?;
     let end = |side| UnixSocket { pair: pair.clone(), side, dgram, nonblock: AtomicBool::new(nonblock) };
-    (end(0), end(1))
+    Ok((end(0), end(1)))
 }
 
 /// What a receive took.
@@ -77,14 +97,14 @@ impl UnixSocket {
 
     /// Reading would return data or end of file.
     fn readable(p: &Pair, side: usize, dgram: bool) -> bool {
-        let (me, peer) = (&p.ends[side], &p.ends[1 - side]);
+        let (me, peer) = (p.end(side), p.peer(side));
         let data = if dgram { !me.dgrams.is_empty() } else { !me.stream.is_empty() };
         data || me.shut_rd || peer.closed || peer.shut_wr
     }
 
     /// Writing would complete or fail at once.
     fn writable(p: &Pair, side: usize, dgram: bool) -> bool {
-        let (me, peer) = (&p.ends[side], &p.ends[1 - side]);
+        let (me, peer) = (p.end(side), p.peer(side));
         let room = if dgram { peer.dgrams.len() < DGRAM_QUEUE } else { peer.stream.len() < STREAM_CAP };
         room || peer.closed || peer.shut_rd || me.shut_wr
     }
@@ -96,10 +116,12 @@ impl UnixSocket {
             {
                 let mut g = self.pair.lock();
                 let (side, dgram) = (self.side, self.dgram);
-                let me = &mut g.ends[side];
+                let me = g.both_mut(side).0;
                 if dgram && let Some(d) = me.dgrams.front() {
                     let copied = d.len().min(buf.len());
-                    buf[..copied].copy_from_slice(&d[..copied]);
+                    for (b, x) in buf.iter_mut().zip(d.iter().take(copied)) {
+                        *b = *x;
+                    }
                     let truncated = d.len() > copied;
                     if !peek {
                         me.dgrams.pop_front();
@@ -140,26 +162,35 @@ impl UnixSocket {
         if self.dgram && data.len() > DGRAM_MAX {
             return Err(Errno::EMSGSIZE);
         }
+        // The datagram is copied before the lock is taken, where memory
+        // running out is an error that leaves nothing queued.
+        let mut datagram = if self.dgram { Some(try_to_vec(data).map_err(crate::oom)?) } else { None };
         let mut done = 0;
         loop {
             {
                 let mut g = self.pair.lock();
                 let (side, dgram) = (self.side, self.dgram);
-                if g.ends[side].shut_wr || g.ends[1 - side].closed || g.ends[1 - side].shut_rd {
+                if g.end(side).shut_wr || g.peer(side).closed || g.peer(side).shut_rd {
                     return if done > 0 { Ok(done) } else { Err(Errno::EPIPE) };
                 }
-                let peer = &mut g.ends[1 - side];
+                let peer = g.both_mut(side).1;
                 if dgram {
                     if peer.dgrams.len() < DGRAM_QUEUE {
-                        peer.dgrams.push_back(data.to_vec());
+                        peer.dgrams.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+                        // Made above for datagrams.
+                        let Some(d) = datagram.take() else { return Err(Errno::EINVAL) };
+                        peer.dgrams.push_back(d);
                         drop(g);
                         notify();
                         return Ok(data.len());
                     }
                 } else {
-                    let n = (data.len() - done).min(STREAM_CAP - peer.stream.len());
+                    let n = data.len().saturating_sub(done).min(STREAM_CAP.saturating_sub(peer.stream.len()));
                     if n > 0 || data.is_empty() {
-                        peer.stream.extend(&data[done..done + n]);
+                        if peer.stream.try_reserve(n).is_err() {
+                            return if done > 0 { Ok(done) } else { Err(Errno::ENOMEM) };
+                        }
+                        peer.stream.extend(data.get(done..done + n).unwrap_or_default());
                         done += n;
                         drop(g);
                         notify();
@@ -187,7 +218,7 @@ impl UnixSocket {
         }
         {
             let mut g = self.pair.lock();
-            let me = &mut g.ends[self.side];
+            let me = g.both_mut(self.side).0;
             me.shut_rd |= how != 1;
             me.shut_wr |= how != 0;
         }
@@ -198,7 +229,7 @@ impl UnixSocket {
 
 impl Drop for UnixSocket {
     fn drop(&mut self) {
-        self.pair.lock().ends[self.side].closed = true;
+        self.pair.lock().both_mut(self.side).0.closed = true;
         notify();
     }
 }
@@ -218,7 +249,7 @@ impl File for UnixSocket {
 
     fn poll(&self) -> u32 {
         let g = self.pair.lock();
-        let (me, peer) = (&g.ends[self.side], &g.ends[1 - self.side]);
+        let (me, peer) = (g.end(self.side), g.peer(self.side));
         let mut m = 0;
         if Self::readable(&g, self.side, self.dgram) {
             m |= POLLIN;

@@ -6,13 +6,18 @@
 //! was checked, and `EPOLLONESHOT` disarms an entry after one report. An
 //! epoll descriptor may be watched by another, to one level of nesting.
 
-use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::mem::offset_of;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, Stat};
 use osmium_sync::IrqSpinLock;
+use osmium_sync::arc::ArcTree;
+use osmium_sync::fallible::{try_arc, try_zeroed};
+use osmium_sync::intrusive::{Adapter, KeyAdapter, Shared, TreeLink};
 
+use crate::bytes;
 use crate::fd::{Access, OpenFile};
 use crate::poll::{check_sigmask, notify, user_add, wait};
 use crate::process::Process;
@@ -54,58 +59,106 @@ struct Ready {
     prev_last: u32,
 }
 
+/// One entry of the interest list, linked into its instance by descriptor.
+/// The fields change only under the lock around the instance's list.
 struct Watch {
+    fd: i32,
     file: Weak<OpenFile>,
-    events: u32,
-    data: u64,
+    events: AtomicU32,
+    data: AtomicU64,
     /// Conditions seen at the last check, for edge triggering.
-    last: u32,
+    last: AtomicU32,
     /// A one-shot entry that has reported.
-    disarmed: bool,
+    disarmed: AtomicBool,
+    link: Shared<TreeLink>,
+}
+
+impl Watch {
+    fn new(fd: i32, file: Weak<OpenFile>, events: u32, data: u64) -> Result<Arc<Self>, Errno> {
+        try_arc(Self {
+            fd,
+            file,
+            events: AtomicU32::new(events),
+            data: AtomicU64::new(data),
+            last: AtomicU32::new(0),
+            disarmed: AtomicBool::new(false),
+            link: Shared::new(TreeLink::new()),
+        })
+        .map_err(crate::oom)
+    }
+
+    /// `MOD`: new interest, new data, and a fresh edge and one-shot state.
+    fn rearm(&self, events: u32, data: u64) {
+        self.events.store(events, Ordering::Relaxed);
+        self.data.store(data, Ordering::Relaxed);
+        self.last.store(0, Ordering::Relaxed);
+        self.disarmed.store(false, Ordering::Relaxed);
+    }
+}
+
+struct ByFd;
+
+// SAFETY: `offset_of!` of a `Shared<TreeLink>`, which is a `TreeLink`.
+unsafe impl Adapter<TreeLink> for ByFd {
+    type Value = Watch;
+    const OFFSET: usize = offset_of!(Watch, link);
+}
+
+impl KeyAdapter<TreeLink> for ByFd {
+    type Key = i32;
+
+    fn key(w: &Watch) -> &i32 {
+        &w.fd
+    }
 }
 
 /// An epoll instance, as a file in the descriptor table.
 #[derive(Default)]
 pub struct EpollFile {
-    watches: IrqSpinLock<BTreeMap<i32, Watch>>,
+    watches: IrqSpinLock<ArcTree<ByFd>>,
 }
 
 impl EpollFile {
     /// The ready events, at most `max`. Each carries what it changed, so
     /// [`Self::restore`] can undo it if the events cannot be delivered.
-    fn collect(&self, max: usize) -> Vec<Ready> {
-        let mut out = Vec::new();
+    ///
+    /// Appends to `out`, which has room for `max` more: nothing here
+    /// allocates.
+    fn collect_into(&self, out: &mut Vec<Ready>, max: usize) {
         let mut watches = self.watches.lock();
-        watches.retain(|_, w| w.file.strong_count() > 0);
-        for (&fd, w) in watches.iter_mut() {
+        while let Some(dead) = watches.remove_first_where(|w| w.file.strong_count() == 0) {
+            drop(dead);
+        }
+        for w in watches.iter() {
             if out.len() == max {
                 break;
             }
             let Some(f) = w.file.upgrade() else { continue };
-            if w.disarmed {
+            if w.disarmed.load(Ordering::Relaxed) {
                 continue;
             }
-            let ready = Self::bits(&f, false) & (w.events | POLLERR | POLLHUP);
-            let fire = if w.events & EPOLLET != 0 { ready & !w.last } else { ready };
-            let prev_last = w.last;
-            w.last = ready;
+            let events = w.events.load(Ordering::Relaxed);
+            let last = w.last.load(Ordering::Relaxed);
+            let ready = Self::bits(&f, false) & (events | POLLERR | POLLHUP);
+            let fire = if events & EPOLLET != 0 { ready & !last } else { ready };
+            w.last.store(ready, Ordering::Relaxed);
             if fire != 0 {
-                if w.events & EPOLLONESHOT != 0 {
-                    w.disarmed = true;
+                if events & EPOLLONESHOT != 0 {
+                    w.disarmed.store(true, Ordering::Relaxed);
                 }
-                out.push(Ready { fd, mask: fire, data: w.data, prev_last });
+                debug_assert!(out.len() < out.capacity());
+                out.push(Ready { fd: w.fd, mask: fire, data: w.data.load(Ordering::Relaxed), prev_last: last });
             }
         }
-        out
     }
 
     /// Undoes the edge and one-shot state that `collect` consumed for `ready`.
     fn restore(&self, ready: &[Ready]) {
-        let mut watches = self.watches.lock();
+        let watches = self.watches.lock();
         for r in ready {
-            if let Some(w) = watches.get_mut(&r.fd).filter(|w| w.data == r.data) {
-                w.last = r.prev_last;
-                w.disarmed = false;
+            if let Some(w) = watches.find(&r.fd).filter(|w| w.data.load(Ordering::Relaxed) == r.data) {
+                w.last.store(r.prev_last, Ordering::Relaxed);
+                w.disarmed.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -119,10 +172,20 @@ impl EpollFile {
         if depth >= MAX_NEST {
             return true;
         }
-        let files: Vec<Arc<OpenFile>> = self.watches.lock().values().filter_map(|w| w.file.upgrade()).collect();
-        files.iter().any(|f| {
-            f.file().as_any().and_then(|a| a.downcast_ref::<EpollFile>()).is_some_and(|e| e.reaches(goal, depth + 1))
-        })
+        // One watch at a time, so the lock is not held while recursing.
+        let mut next = 0;
+        loop {
+            let file = {
+                let watches = self.watches.lock();
+                let Some(w) = watches.lower_bound(&next) else { return false };
+                next = w.fd + 1;
+                w.file.upgrade()
+            };
+            let nested = file.as_ref().and_then(|f| f.file().as_any()?.downcast_ref::<EpollFile>());
+            if nested.is_some_and(|e| e.reaches(goal, depth + 1)) {
+                return true;
+            }
+        }
     }
 
     /// `f`'s readiness; a nested epoll is looked into only when `shallow`
@@ -137,8 +200,11 @@ impl EpollFile {
 
     fn any_ready(&self) -> u32 {
         let watches = self.watches.lock();
-        let ready = watches.values().any(|w| {
-            !w.disarmed && w.file.upgrade().is_some_and(|f| Self::bits(&f, true) & (w.events | POLLERR | POLLHUP) != 0)
+        let ready = watches.iter().any(|w| {
+            !w.disarmed.load(Ordering::Relaxed)
+                && w.file
+                    .upgrade()
+                    .is_some_and(|f| Self::bits(&f, true) & (w.events.load(Ordering::Relaxed) | POLLERR | POLLHUP) != 0)
         });
         if ready { POLLIN } else { 0 }
     }
@@ -162,7 +228,8 @@ pub(crate) fn create1(p: &Process, flags: u64) -> SysResult {
     if flags & !EPOLL_CLOEXEC != 0 {
         return Err(Errno::EINVAL);
     }
-    let open = OpenFile::new(Arc::new(EpollFile::default()), Access::RW);
+    let file = try_arc(EpollFile::default()).map_err(crate::oom)?;
+    let open = OpenFile::try_new(file, Access::RW)?;
     p.files().lock().insert_from(0, open, flags & EPOLL_CLOEXEC != 0).map(|fd| fd as u64)
 }
 
@@ -189,8 +256,8 @@ pub(crate) fn ctl(p: &Process, epfd: i32, op: u64, fd: i32, event: u64) -> SysRe
     } else {
         let mut b = [0u8; EVENT_LEN];
         p.memory().read(event, &mut b)?;
-        let events = u32::from_ne_bytes(b[..4].try_into().expect("4 bytes"));
-        let data = u64::from_ne_bytes(b[DATA_OFF..DATA_OFF + 8].try_into().expect("8 bytes"));
+        let events = bytes::u32_at(&b, 0)?;
+        let data = bytes::u64_at(&b, DATA_OFF)?;
         (events, data)
     };
     // Adding an instance to another must not close a loop (collecting would
@@ -198,33 +265,36 @@ pub(crate) fn ctl(p: &Process, epfd: i32, op: u64, fd: i32, event: u64) -> SysRe
     let nest_guard =
         (op == EPOLL_CTL_ADD && target.file().as_any().is_some_and(|a| a.is::<EpollFile>())).then(|| NEST.lock());
     if nest_guard.is_some() {
-        let inner = target.file().as_any().and_then(|a| a.downcast_ref::<EpollFile>()).expect("checked above");
+        let inner = target.file().as_any().and_then(|a| a.downcast_ref::<EpollFile>()).ok_or(Errno::EINVAL)?;
         if inner.reaches(ep, 0) {
             return Err(Errno::ELOOP);
         }
     }
+    // Made before the lock is taken, where memory running out is an error.
+    let node = if op == EPOLL_CTL_ADD { Some(Watch::new(fd, Arc::downgrade(&target), events, data)?) } else { None };
     let mut watches = ep.watches.lock();
     match op {
         EPOLL_CTL_ADD => {
             // Like Linux, refuse files that are always ready.
-            if matches!(target.file().stat().kind, FileKind::Regular | FileKind::Directory | FileKind::Symlink) {
+            if matches!(target.file().try_stat()?.kind, FileKind::Regular | FileKind::Directory | FileKind::Symlink) {
                 return Err(Errno::EPERM);
             }
-            if watches.get(&fd).is_some_and(|w| w.file.strong_count() > 0) {
+            if watches.find(&fd).is_some_and(|w| w.file.strong_count() > 0) {
                 return Err(Errno::EEXIST);
             }
+            // A watch whose file is gone is replaced.
+            drop(watches.take_key(&fd));
             if watches.len() >= MAX_WATCHES {
                 return Err(Errno::ENOSPC);
             }
-            watches.insert(fd, Watch { file: Arc::downgrade(&target), events, data, last: 0, disarmed: false });
+            // `node` was made above for ADD, and the descriptor's slot was just emptied.
+            let node = node.ok_or(Errno::EINVAL)?;
+            if watches.insert(node).is_err() {
+                return Err(Errno::EEXIST);
+            }
         }
-        EPOLL_CTL_MOD => {
-            let w = watches.get_mut(&fd).ok_or(Errno::ENOENT)?;
-            *w = Watch { file: w.file.clone(), events, data, last: 0, disarmed: false };
-        }
-        EPOLL_CTL_DEL => {
-            watches.remove(&fd).ok_or(Errno::ENOENT)?;
-        }
+        EPOLL_CTL_MOD => watches.find(&fd).ok_or(Errno::ENOENT)?.rearm(events, data),
+        EPOLL_CTL_DEL => drop(watches.take_key(&fd).ok_or(Errno::ENOENT)?),
         _ => return Err(Errno::EINVAL),
     }
     drop(watches);
@@ -245,17 +315,21 @@ pub(crate) fn wait_events(p: &Process, epfd: i32, events: u64, max: u64, timeout
     user_add(events, (max * EVENT_LEN) as u64)?;
     let ms = timeout_ms as i32;
     let timeout = (ms >= 0).then(|| u64::from(ms as u32) * 1_000_000);
-    let ready = wait(timeout, || {
-        let v = ep.collect(max);
-        (!v.is_empty()).then_some(v)
-    })?
-    .unwrap_or_default();
-    let mut out = alloc::vec![0u8; ready.len() * EVENT_LEN];
-    for (c, r) in out.as_chunks_mut::<EVENT_LEN>().0.iter_mut().zip(&ready) {
-        c[..4].copy_from_slice(&r.mask.to_ne_bytes());
-        c[DATA_OFF..DATA_OFF + 8].copy_from_slice(&r.data.to_ne_bytes());
-    }
-    if let Err(e) = p.memory().write(events, &out) {
+    // Everything the wait needs is made first, where memory running out is an
+    // error: it cannot be once events have been consumed.
+    let mut ready: Vec<Ready> = Vec::new();
+    ready.try_reserve_exact(max).map_err(|_| Errno::ENOMEM)?;
+    let mut out = try_zeroed(max * EVENT_LEN).map_err(crate::oom)?;
+    wait(timeout, || {
+        ep.collect_into(&mut ready, max);
+        (!ready.is_empty()).then_some(())
+    })?;
+    let filled = out.as_chunks_mut::<EVENT_LEN>().0.iter_mut().zip(&ready).try_for_each(|(c, r)| {
+        bytes::put(c, 0, &r.mask.to_ne_bytes())?;
+        bytes::put(c, DATA_OFF, &r.data.to_ne_bytes())
+    });
+    let delivered = filled.and_then(|()| out.get(..ready.len() * EVENT_LEN).ok_or(Errno::EINVAL));
+    if let Err(e) = delivered.and_then(|d| p.memory().write(events, d)) {
         // Nothing was delivered, so the events must stay pending.
         ep.restore(&ready);
         return Err(e);

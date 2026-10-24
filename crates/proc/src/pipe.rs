@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, POLLOUT, Stat};
 use osmium_sync::IrqSpinLock;
+use osmium_sync::fallible::try_arc;
 
 use crate::fd::{Access, OpenFile};
 use crate::poll::{notify, wait};
@@ -45,13 +46,14 @@ pub struct PipeWriter {
     nonblock: AtomicBool,
 }
 
-/// A new pipe: its read end and its write end.
-pub fn pipe(nonblock: bool) -> (PipeReader, PipeWriter) {
-    let pipe = Shared::new(IrqSpinLock::new(State::default()));
-    (
+/// A new pipe: its read end and its write end. `ENOMEM` if there is no
+/// memory for it.
+pub fn try_pipe(nonblock: bool) -> Result<(PipeReader, PipeWriter), Errno> {
+    let pipe = try_arc(IrqSpinLock::new(State::default())).map_err(crate::oom)?;
+    Ok((
         PipeReader { pipe: pipe.clone(), nonblock: AtomicBool::new(nonblock) },
         PipeWriter { pipe, nonblock: AtomicBool::new(nonblock) },
-    )
+    ))
 }
 
 impl PipeReader {
@@ -156,7 +158,10 @@ impl File for PipeWriter {
                     room.min(buf.len() - done)
                 };
                 if n > 0 {
-                    s.data.extend(&buf[done..done + n]);
+                    if s.data.try_reserve(n).is_err() {
+                        return if done > 0 { Ok(done) } else { Err(Errno::ENOMEM) };
+                    }
+                    s.data.extend(buf.get(done..done + n).unwrap_or_default());
                     done += n;
                     drop(s);
                     notify();
@@ -238,13 +243,15 @@ pub(crate) fn pipe2(p: &Process, fds: u64, flags: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let cloexec = flags & O_CLOEXEC != 0;
-    let (r, w) = pipe(flags & O_NONBLOCK != 0);
+    let (r, w) = try_pipe(flags & O_NONBLOCK != 0)?;
     let (fr, fw) = {
         let mut files = p.files().lock();
         let read = Access { read: true, write: false, append: false };
         let write = Access { read: false, write: true, append: false };
-        let fr = files.insert_from(0, OpenFile::new(Arc::new(r), read), cloexec)?;
-        match files.insert_from(0, OpenFile::new(Arc::new(w), write), cloexec) {
+        let (r, w) = (try_arc(r).map_err(crate::oom)?, try_arc(w).map_err(crate::oom)?);
+        let (r, w) = (OpenFile::try_new(r, read)?, OpenFile::try_new(w, write)?);
+        let fr = files.insert_from(0, r, cloexec)?;
+        match files.insert_from(0, w, cloexec) {
             Ok(fw) => (fr, fw),
             Err(e) => {
                 let _ = files.close(fr);

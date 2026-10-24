@@ -2,22 +2,26 @@
 //! the task that runs them.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::mem::offset_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use osmium_arch::fp::FpState;
 use osmium_mm::addr::{PAGE_SIZE, PhysAddr};
 use osmium_mm::paging::MapFlags;
 use osmium_sched::{Mutex, Task, TaskBuilder, WaitQueue};
+use osmium_sync::arc::ArcList;
+use osmium_sync::fallible::{OutOfMemory, try_arc, try_string};
+use osmium_sync::intrusive::{Adapter, KeyAdapter, Link, Registry, Shared, TreeLink};
 use osmium_sync::{IrqSpinLock, Once};
 
 use osmium_fs::Errno;
 
 use crate::fd::FdTable;
 use crate::memory::UserMemory;
+use crate::mmap::{FreeRange, MmapArea};
 
 const PAGE: u64 = PAGE_SIZE as u64;
 
@@ -78,7 +82,14 @@ pub struct Process {
     status: Once<ExitStatus>,
     exited: WaitQueue,
     /// Forked children not yet reaped.
-    children: IrqSpinLock<Vec<Arc<Process>>>,
+    children: IrqSpinLock<ArcList<BySibling>>,
+    /// Links this process into its parent's `children`.
+    sibling: Shared<Link>,
+    /// Links this process into [`TABLE`], keyed by `pid`.
+    table: Shared<TreeLink>,
+    /// This process's own `Arc`, as a `Weak`: how [`TABLE`], which does not
+    /// own its entries, hands out a reference without allocating.
+    me: Once<Weak<Process>>,
     /// Woken whenever one of `children` exits.
     pub(crate) child_exited: WaitQueue,
     pub(crate) group: crate::thread::ThreadGroup,
@@ -97,68 +108,30 @@ static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 pub(crate) fn alloc_id() -> u32 {
     NEXT_PID.fetch_add(1, Ordering::Relaxed)
 }
-static TABLE: IrqSpinLock<BTreeMap<Pid, Weak<Process>>> = IrqSpinLock::new(BTreeMap::new());
+static TABLE: IrqSpinLock<Registry<ByPid>> = IrqSpinLock::new(Registry::new());
 
-/// The `mmap` area: a range of addresses and the free parts of it, as
-/// non-adjacent `start -> end` ranges. Allocation is first fit; freeing
-/// merges neighbours, so mapping and unmapping can go on for ever.
-#[derive(Clone)]
-struct MmapArea {
-    start: u64,
-    end: u64,
-    free: BTreeMap<u64, u64>,
-    /// Most bytes of the area that may be in use at once.
-    limit: u64,
+/// Where [`Process::sibling`] sits in a [`Process`].
+struct BySibling;
+
+// SAFETY: `offset_of!` of a `Link` field of `Process`.
+unsafe impl Adapter<Link> for BySibling {
+    type Value = Process;
+    const OFFSET: usize = offset_of!(Process, sibling);
 }
 
-impl MmapArea {
-    fn new(range: core::ops::Range<u64>) -> Self {
-        let mut free = BTreeMap::new();
-        if range.start < range.end {
-            free.insert(range.start, range.end);
-        }
-        Self { start: range.start, end: range.end, free, limit: u64::MAX }
-    }
+/// Where [`Process::table`] sits in a [`Process`], and the key: the pid.
+struct ByPid;
 
-    /// Bytes of the area in use.
-    fn used(&self) -> u64 {
-        (self.end - self.start) - self.free.iter().map(|(s, e)| e - s).sum::<u64>()
-    }
+// SAFETY: `offset_of!` of a `TreeLink` field of `Process`.
+unsafe impl Adapter<TreeLink> for ByPid {
+    type Value = Process;
+    const OFFSET: usize = offset_of!(Process, table);
+}
 
-    /// Takes the first free range that holds `len` bytes.
-    fn alloc(&mut self, len: u64) -> Result<u64, Errno> {
-        if self.used().checked_add(len).is_none_or(|u| u > self.limit) {
-            return Err(Errno::ENOMEM);
-        }
-        let (&s, &e) = self.free.iter().find(|&(s, e)| e - s >= len).ok_or(Errno::ENOMEM)?;
-        self.free.remove(&s);
-        if s + len < e {
-            self.free.insert(s + len, e);
-        }
-        Ok(s)
-    }
-
-    /// Returns `from..to` (clipped to the area) to the free ranges. Parts
-    /// that are already free stay so.
-    fn release(&mut self, from: u64, to: u64) {
-        let (mut from, mut to) = (from.max(self.start), to.min(self.end));
-        if from >= to {
-            return;
-        }
-        // Merge with a free range that touches or overlaps on the left...
-        if let Some((&s, &e)) = self.free.range(..=from).next_back()
-            && e >= from
-        {
-            self.free.remove(&s);
-            from = s;
-            to = to.max(e);
-        }
-        // ...and with every one that starts inside or right at the end.
-        while let Some((&s, &e)) = self.free.range(from..=to).next() {
-            self.free.remove(&s);
-            to = to.max(e);
-        }
-        self.free.insert(from, to);
+impl KeyAdapter<TreeLink> for ByPid {
+    type Key = Pid;
+    fn key(p: &Process) -> &Pid {
+        &p.pid
     }
 }
 
@@ -177,10 +150,22 @@ impl Process {
     /// [`Process::new`] for memory that is already boxed, such as an empty
     /// space from [`crate::Platform::new_memory`] that [`Process::exec`]
     /// will fill.
+    ///
+    /// # Panics
+    /// If memory runs out: [`Process::try_new_boxed`] reports that instead.
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM at boot; `try_new_boxed` is the fallible form.
     pub fn new_boxed(name: &'static str, memory: Box<dyn UserMemory>, brk_start: u64) -> Arc<Self> {
+        Self::try_new_boxed(name, memory, brk_start).expect("out of memory for the first process")
+    }
+
+    /// [`Process::new_boxed`], failing with `ENOMEM` instead of panicking.
+    pub fn try_new_boxed(name: &'static str, memory: Box<dyn UserMemory>, brk_start: u64) -> Result<Arc<Self>, Errno> {
         let brk = Brk { start: brk_start, end: brk_start, limit: brk_start.saturating_add(BRK_MAX) };
         let files = FdTable::with_console();
-        Self::register(Self::with(None, name, memory.into(), brk, MmapArea::new(0..0), files, String::from("/")))
+        let cwd = try_string("/").map_err(crate::oom)?;
+        let mmap = MmapArea::new(0..0).map_err(crate::oom)?;
+        let p = Self::with(None, name, memory.into(), brk, mmap, files, cwd).map_err(crate::oom)?;
+        Self::register(p)
     }
 
     fn with(
@@ -191,9 +176,9 @@ impl Process {
         mmap: MmapArea,
         files: FdTable,
         cwd: String,
-    ) -> Self {
+    ) -> Result<Self, OutOfMemory> {
         let pid = Pid(alloc_id());
-        Self {
+        Ok(Self {
             pid,
             parent,
             name: IrqSpinLock::new(name),
@@ -205,17 +190,28 @@ impl Process {
             umask: 0o022,
             status: Once::new(),
             exited: WaitQueue::new(),
-            children: IrqSpinLock::new(Vec::new()),
+            children: IrqSpinLock::new(ArcList::new()),
+            sibling: Shared::new(Link::new()),
+            table: Shared::new(TreeLink::new()),
+            me: Once::new(),
             child_exited: WaitQueue::new(),
-            group: crate::thread::ThreadGroup::new(pid),
+            group: crate::thread::ThreadGroup::try_new(pid)?,
             signals: crate::signal::Signals::new(),
-        }
+        })
     }
 
-    fn register(p: Self) -> Arc<Self> {
-        let p = Arc::new(p);
-        TABLE.lock().insert(p.pid, Arc::downgrade(&p));
-        p
+    fn register(p: Self) -> Result<Arc<Self>, Errno> {
+        let p = try_arc(p).map_err(crate::oom)?;
+        let _ = p.me.set(Arc::downgrade(&p));
+        // SAFETY: `Drop` takes the process out again before it is freed, and
+        // the pid never changes.
+        let fresh = unsafe { TABLE.lock().insert(&p) };
+        // The id counter wrapped onto a live process: refuse rather than alias it.
+        // (`Drop` takes `p` out of the table again.)
+        if !fresh {
+            return Err(Errno::EAGAIN);
+        }
+        Ok(p)
     }
 
     /// `fork`: a new process with a copy of this one's memory, sharing its
@@ -224,18 +220,23 @@ impl Process {
     /// task yet: spawn one that resumes user mode where the parent called
     /// `fork`, with a return value of 0 (see `syscall::handle`).
     pub fn fork(&self) -> Result<Arc<Process>, Errno> {
-        let memory: Arc<dyn UserMemory> = self.memory().fork()?.into();
-        let files = self.files.lock().clone();
-        let child = Self::register(Self::with(
+        let oom = |_| Errno::ENOMEM;
+        let memory = self.memory().fork()?;
+        let files = self.files.lock().try_clone().map_err(oom)?;
+        let cwd = try_string(&self.cwd.lock()).map_err(oom)?;
+        let child = Self::with(
             Some(self.pid),
             self.name(),
             memory,
             *self.brk.lock(),
-            self.mmap.lock().clone(),
+            self.mmap.lock().try_clone().map_err(oom)?,
             files,
-            self.cwd(),
-        ));
-        self.children.lock().push(child.clone());
+            cwd,
+        )
+        .map_err(oom)
+        .and_then(Self::register)?;
+        // On failure the child is dropped here, which frees its memory.
+        self.children.lock().push_back(child.clone());
         Ok(child)
     }
 
@@ -244,28 +245,31 @@ impl Process {
     /// returns `Ok(None)` instead. Fails with `ECHILD` if there is no such
     /// child.
     pub fn wait_child(&self, pid: Option<Pid>, nohang: bool) -> Result<Option<(Pid, ExitStatus)>, Errno> {
-        let matches = |c: &Arc<Process>| pid.is_none_or(|pid| c.pid == pid);
+        let matches = |c: &Process| pid.is_none_or(|pid| c.pid == pid);
         let reaped = self.child_exited.wait_until(|| {
             let mut children = self.children.lock();
             if !children.iter().any(matches) {
                 return Some(Err(Errno::ECHILD));
             }
-            match children.iter().position(|c| matches(c) && c.exit_status().is_some()) {
+            match children.remove_first_where(|c| matches(c) && c.exit_status().is_some()) {
                 // Hand the child out: dropping it may free its memory, which
                 // must not happen here, under the queue's lock.
-                Some(i) => Some(Ok(Some(children.swap_remove(i)))),
+                Some(child) => Some(Ok(Some(child))),
                 None if nohang => Some(Ok(None)),
                 None if crate::signal::current_interrupted() => Some(Err(Errno::EINTR)),
                 None => None,
             }
         })?;
-        Ok(reaped.map(|c| (c.pid, c.exit_status().expect("reaped children have exited"))))
+        // A reaped child has exited, so it has a status.
+        Ok(reaped.and_then(|c| c.exit_status().map(|status| (c.pid, status))))
     }
 
     /// Drops the child `pid` that [`fork`](Self::fork) made but that never
     /// got a task, so `wait4` does not wait for it.
     pub(crate) fn forget_child(&self, pid: Pid) {
-        self.children.lock().retain(|c| c.pid != pid);
+        // Dropped after the lock is released: it may free the child.
+        let forgotten = self.children.lock().remove_first_where(|c| c.pid == pid);
+        drop(forgotten);
     }
 
     /// Forked children that have not been reaped, exited or not.
@@ -275,8 +279,12 @@ impl Process {
 
     /// Lets `mmap` place anonymous mappings in `range` (page-aligned).
     /// Without it, `mmap` fails with `ENOMEM`.
+    ///
+    /// # Panics
+    /// If memory runs out (a setup call, made before the program runs).
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM at setup.
     pub fn set_mmap_area(&self, range: core::ops::Range<u64>) {
-        *self.mmap.lock() = MmapArea::new(range);
+        *self.mmap.lock() = MmapArea::new(range).expect("out of memory for the mmap area");
     }
 
     /// Caps the bytes of the `mmap` area that may be in use at once (rounded
@@ -292,8 +300,11 @@ impl Process {
     /// Returns `addr..addr + len` to the `mmap` area for reuse, after the
     /// memory there was unmapped. Parts outside the area, or already free,
     /// are ignored.
-    pub(crate) fn mmap_release(&self, addr: u64, len: u64) {
-        self.mmap.lock().release(addr, addr.saturating_add(len));
+    ///
+    /// `spare` is a range for the area to use if the freed part leaves a new
+    /// gap: made first by the caller, so this cannot fail.
+    pub(crate) fn mmap_release(&self, addr: u64, len: u64, spare: alloc::sync::Arc<FreeRange>) {
+        self.mmap.lock().release(addr, addr.saturating_add(len), spare);
     }
 
     /// Creates the process's task from `builder` and makes it runnable.
@@ -315,9 +326,23 @@ impl Process {
         builder.data(self.clone()).spawn(entry)
     }
 
+    /// [`Process::spawn`], failing with [`OutOfMemory`] (and creating no
+    /// task) instead of panicking, for a task made on behalf of a system
+    /// call, with the FP/SIMD registers starting as `fp`.
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64")))]
+    pub(crate) fn try_spawn_with_fp(
+        self: &Arc<Self>,
+        builder: TaskBuilder,
+        fp: FpState,
+        entry: impl FnOnce() + Send + 'static,
+    ) -> Result<Arc<Task>, OutOfMemory> {
+        let builder = if osmium_arch::fp::enabled() { builder.fp_state(fp) } else { builder };
+        builder.try_data(self.clone())?.try_spawn(entry)
+    }
+
     /// Finds a live process by id.
     pub fn find(pid: Pid) -> Option<Arc<Process>> {
-        TABLE.lock().get(&pid)?.upgrade()
+        TABLE.lock().find(&pid)?.me.get()?.upgrade()
     }
 
     /// The process id.
@@ -360,15 +385,15 @@ impl Process {
     /// memory, which must stay alive until its table is no longer active.
     pub(crate) fn replace_image(
         &self,
-        name: &str,
+        name: &'static str,
         memory: Arc<dyn UserMemory>,
         brk_start: u64,
         brk_limit: u64,
-        mmap: core::ops::Range<u64>,
+        mmap: MmapArea,
     ) -> Arc<dyn UserMemory> {
         *self.brk.lock() = Brk { start: brk_start, end: brk_start, limit: brk_limit };
-        *self.mmap.lock() = MmapArea::new(mmap);
-        *self.name.lock() = intern(name);
+        *self.mmap.lock() = mmap;
+        *self.name.lock() = name;
         self.files.lock().close_on_exec();
         core::mem::replace(&mut *self.memory.lock(), memory)
     }
@@ -381,6 +406,11 @@ impl Process {
     /// The working directory, an absolute path.
     pub fn cwd(&self) -> String {
         self.cwd.lock().clone()
+    }
+
+    /// [`cwd`](Self::cwd), failing with `ENOMEM` instead of panicking.
+    pub(crate) fn try_cwd(&self) -> Result<String, Errno> {
+        try_string(&self.cwd.lock()).map_err(crate::oom)
     }
 
     /// Changes the working directory to `path`, which must be absolute.
@@ -425,7 +455,10 @@ impl Process {
         if addr < brk.start || addr > brk.limit {
             return brk.end;
         }
-        let (old, new) = (brk.end.next_multiple_of(PAGE), addr.next_multiple_of(PAGE));
+        let (Some(old), Some(new)) = (brk.end.checked_next_multiple_of(PAGE), addr.checked_next_multiple_of(PAGE))
+        else {
+            return brk.end;
+        };
         let memory = self.memory();
         if new > old {
             if memory.map_anon(old, new - old, MapFlags::RW).is_err() {
@@ -444,6 +477,8 @@ impl Process {
     /// the range is only reserved: left unmapped, any access faults.
     pub fn mmap_anon(&self, len: u64, flags: MapFlags) -> Result<u64, Errno> {
         let len = len.checked_next_multiple_of(PAGE).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        // For giving the range back if the mapping fails.
+        let spare = FreeRange::spare().map_err(|_| Errno::ENOMEM)?;
         let mut area = self.mmap.lock();
         let va = area.alloc(len)?;
         if flags != MapFlags::NONE {
@@ -451,7 +486,7 @@ impl Process {
             if let Err(e) = memory.map_anon(va, len, flags) {
                 // Give back what was mapped before it ran out.
                 memory.unmap(va, len);
-                area.release(va, va + len);
+                area.release(va, va + len, spare);
                 return Err(e);
             }
         }
@@ -461,22 +496,33 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        TABLE.lock().remove(&self.pid);
+        // SAFETY: linked, if at all, in `TABLE` by `register`.
+        unsafe { TABLE.lock().remove(self) };
     }
 }
 
+/// The names [`intern`] has handed out.
+static NAMES: IrqSpinLock<[Option<&'static str>; 256]> = IrqSpinLock::new([None; 256]);
+
+/// The name of a process whose real one did not fit in [`NAMES`].
+const UNNAMED: &str = "?";
+
 /// A `'static` copy of `name`, shared by every process with that name: one
 /// small leak per distinct program name, so [`Process::name`] can stay
-/// `&'static str`.
-fn intern(name: &str) -> &'static str {
-    static NAMES: IrqSpinLock<BTreeSet<&'static str>> = IrqSpinLock::new(BTreeSet::new());
-    let mut names = NAMES.lock();
-    if let Some(&n) = names.get(name) {
-        return n;
+/// `&'static str`. The leaks are bounded, because the programs a user can
+/// run are not: after 256 distinct names, new ones get a placeholder.
+pub(crate) fn intern(name: &str) -> Result<&'static str, OutOfMemory> {
+    intern_in(&mut *NAMES.lock(), name)
+}
+
+fn intern_in(names: &mut [Option<&'static str>], name: &str) -> Result<&'static str, OutOfMemory> {
+    if let Some(&n) = names.iter().flatten().find(|&&n| n == name) {
+        return Ok(n);
     }
-    let n: &'static str = String::from(name).leak();
-    names.insert(n);
-    n
+    let Some(slot) = names.iter_mut().find(|s| s.is_none()) else { return Ok(UNNAMED) };
+    let n: &'static str = try_string(name)?.leak();
+    *slot = Some(n);
+    Ok(n)
 }
 
 /// The process the running task belongs to, if it is a user task.
@@ -509,4 +555,20 @@ pub fn exit(status: ExitStatus) -> ! {
         crate::thread::exiting(&p, status);
     }
     osmium_sched::exit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interning_shares_names_and_stops_at_a_bound() {
+        let mut table = [None; 3];
+        let a = intern_in(&mut table, "ls").unwrap();
+        assert!(core::ptr::eq(a, intern_in(&mut table, "ls").unwrap()), "one copy per name");
+        intern_in(&mut table, "cat").unwrap();
+        assert_eq!(intern_in(&mut table, "sh").unwrap(), "sh");
+        assert_eq!(intern_in(&mut table, "a-fourth").unwrap(), UNNAMED, "the table is full");
+        assert_eq!(intern_in(&mut table, "cat").unwrap(), "cat", "known names still resolve");
+    }
 }

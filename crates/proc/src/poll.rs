@@ -19,12 +19,12 @@
 //! validated and ignored, and the remaining time is not written back.
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use osmium_fs::{Errno, POLLERR, POLLHUP, POLLIN, POLLOUT};
 use osmium_sched::WaitQueue;
 use osmium_sync::Once;
+use osmium_sync::fallible::try_zeroed;
 
 use crate::fd::{MAX_FDS, OpenFile};
 use crate::net::stack;
@@ -102,8 +102,8 @@ fn user_timeout(p: &Process, va: u64, usec: bool) -> Result<Option<u64>, Errno> 
     }
     let mut b = [0u8; 16];
     p.memory().read(va, &mut b)?;
-    let sec = i64::from_ne_bytes(b[..8].try_into().expect("8 bytes"));
-    let frac = i64::from_ne_bytes(b[8..].try_into().expect("8 bytes"));
+    let sec = crate::bytes::i64_at(&b, 0)?;
+    let frac = crate::bytes::i64_at(&b, 8)?;
     let (unit, limit) = if usec { (1_000, 1_000_000) } else { (1, 1_000_000_000) };
     if sec < 0 || !(0..limit).contains(&frac) {
         return Err(Errno::EINVAL);
@@ -137,38 +137,43 @@ fn do_poll(p: &Process, fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult 
         return Err(Errno::EINVAL);
     }
     let n = nfds as usize;
-    let mut raw = vec![0u8; n * POLLFD_LEN];
+    // Everything the wait needs is made first, so waiting allocates nothing.
+    let mut raw = try_zeroed(n * POLLFD_LEN).map_err(crate::oom)?;
+    let mut watches: Vec<Watch> = Vec::new();
+    watches.try_reserve_exact(n).map_err(|_| Errno::ENOMEM)?;
+    let mut revents: Vec<u32> = Vec::new();
+    revents.try_reserve_exact(n).map_err(|_| Errno::ENOMEM)?;
+    revents.resize(n, 0);
     p.memory().read(fds, &mut raw)?;
-    let watches: Vec<Watch> = {
+    {
         let files = p.files().lock();
-        raw.as_chunks::<POLLFD_LEN>().0.iter()
-            .map(|c| {
-                let fd = i32::from_ne_bytes(c[..4].try_into().expect("4 bytes"));
-                let events = u32::from(u16::from_ne_bytes([c[4], c[5]]));
-                match files.get(fd) {
-                    _ if fd < 0 => Watch { events, file: None, invalid: false },
-                    Ok(f) => Watch { events, file: Some(f), invalid: false },
-                    Err(_) => Watch { events, file: None, invalid: true },
-                }
-            })
-            .collect()
-    };
+        for c in raw.as_chunks::<POLLFD_LEN>().0 {
+            let fd = crate::bytes::i32_at(c, 0)?;
+            let events = u32::from(crate::bytes::u16_at(c, 4)?);
+            watches.push(match files.get(fd) {
+                _ if fd < 0 => Watch { events, file: None, invalid: false },
+                Ok(f) => Watch { events, file: Some(f), invalid: false },
+                Err(_) => Watch { events, file: None, invalid: true },
+            });
+        }
+    }
     let scan = || {
-        let revents: Vec<u32> = watches
-            .iter()
-            .map(|w| match &w.file {
+        let mut any = false;
+        for (w, r) in watches.iter().zip(revents.iter_mut()) {
+            *r = match &w.file {
                 Some(f) => f.file().poll() & (w.events | POLLERR | POLLHUP),
                 None if w.invalid => POLLNVAL,
                 None => 0,
-            })
-            .collect();
-        revents.iter().any(|&r| r != 0).then_some(revents)
+            };
+            any |= *r != 0;
+        }
+        any.then_some(())
     };
-    let revents = wait(timeout, scan)?;
-    let ready = revents.as_ref().map_or(0, |r| r.iter().filter(|&&r| r != 0).count());
-    for (i, c) in raw.as_chunks_mut::<POLLFD_LEN>().0.iter_mut().enumerate() {
-        let r = revents.as_ref().map_or(0, |r| r[i]) as u16;
-        c[6..8].copy_from_slice(&r.to_ne_bytes());
+    // On a timeout the last scan found nothing, so every revent is 0.
+    wait(timeout, scan)?;
+    let ready = revents.iter().filter(|&&r| r != 0).count();
+    for (c, &r) in raw.as_chunks_mut::<POLLFD_LEN>().0.iter_mut().zip(&revents) {
+        crate::bytes::put(c, 6, &(r as u16).to_ne_bytes())?;
     }
     p.memory().write(fds, &raw)?;
     Ok(ready as u64)
@@ -197,6 +202,12 @@ fn bit(set: &[u8], fd: usize) -> bool {
     set.get(fd / 8).is_some_and(|b| b & (1 << (fd % 8)) != 0)
 }
 
+/// Three bit sets of `len` bytes.
+fn three_sets(len: usize) -> Result<[Vec<u8>; 3], Errno> {
+    let one = || try_zeroed(len).map_err(crate::oom);
+    Ok([one()?, one()?, one()?])
+}
+
 fn do_select(p: &Process, nfds: u64, sets: [u64; 3], timeout: Option<u64>) -> SysResult {
     if nfds > FD_SETSIZE {
         return Err(Errno::EINVAL);
@@ -204,36 +215,44 @@ fn do_select(p: &Process, nfds: u64, sets: [u64; 3], timeout: Option<u64>) -> Sy
     let n = nfds as usize;
     // fd_set is an array of longs, so Linux transfers whole 8-byte words.
     let len = n.div_ceil(64) * 8;
-    let mut s = Sets { user: sets, bits: [vec![0; len], vec![0; len], vec![0; len]] };
+    // Everything the wait needs is made first, so waiting allocates nothing.
+    let mut s = Sets { user: sets, bits: three_sets(len)? };
+    let mut out = three_sets(len)?;
+    let mut watched: Vec<(usize, Arc<OpenFile>)> = Vec::new();
+    watched.try_reserve_exact(n).map_err(|_| Errno::ENOMEM)?;
     for (va, bits) in s.user.iter().zip(s.bits.iter_mut()) {
         if *va != 0 {
             p.memory().read(*va, bits)?;
         }
     }
-    let watched: Vec<(usize, Arc<OpenFile>)> = {
+    {
         let files = p.files().lock();
-        let mut v = Vec::new();
         for fd in (0..n).filter(|&fd| s.bits.iter().any(|b| bit(b, fd))) {
-            v.push((fd, files.get(fd as i32)?));
+            watched.push((fd, files.get(fd as i32)?));
         }
-        v
-    };
+    }
+    let mut count = 0u64;
     let scan = || {
-        let mut out = [vec![0u8; len], vec![0u8; len], vec![0u8; len]];
-        let mut count = 0u64;
+        for set in out.iter_mut() {
+            set.fill(0);
+        }
+        count = 0;
         for (fd, f) in &watched {
             let ready = f.file().poll();
             let hit = [ready & (POLLIN | POLLHUP | POLLERR) != 0, ready & (POLLOUT | POLLERR) != 0, false];
-            for (k, &h) in hit.iter().enumerate() {
-                if h && bit(&s.bits[k], *fd) {
-                    out[k][fd / 8] |= 1 << (fd % 8);
+            for ((&h, want), got) in hit.iter().zip(&s.bits).zip(out.iter_mut()) {
+                if h && bit(want, *fd) {
+                    if let Some(byte) = got.get_mut(fd / 8) {
+                        *byte |= 1 << (fd % 8);
+                    }
                     count += 1;
                 }
             }
         }
-        (count > 0).then_some((out, count))
+        (count > 0).then_some(())
     };
-    let (out, count) = wait(timeout, scan)?.unwrap_or(([vec![0; len], vec![0; len], vec![0; len]], 0));
+    // On a timeout the last scan found nothing, so the sets are all clear.
+    wait(timeout, scan)?;
     for (va, bits) in s.user.iter().zip(out.iter()) {
         if *va != 0 {
             p.memory().write(*va, bits)?;
@@ -253,8 +272,8 @@ pub(crate) fn pselect6(p: &Process, nfds: u64, r: u64, w: u64, e: u64, ts: u64, 
         // struct { const sigset_t *mask; size_t size; }
         let mut b = [0u8; 16];
         p.memory().read(sig, &mut b)?;
-        let mask = u64::from_ne_bytes(b[..8].try_into().expect("8 bytes"));
-        let size = u64::from_ne_bytes(b[8..].try_into().expect("8 bytes"));
+        let mask = crate::bytes::u64_at(&b, 0)?;
+        let size = crate::bytes::u64_at(&b, 8)?;
         check_sigmask(p, mask, size)?;
     }
     do_select(p, nfds, [r, w, e], timeout)

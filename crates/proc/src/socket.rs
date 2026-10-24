@@ -2,7 +2,6 @@
 //! [`NetStack`], as files in the descriptor table.
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,9 +9,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, Stat};
 use osmium_net::{Error, Socket, SocketAddr, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket};
 use osmium_sync::IrqSpinLock;
+use osmium_sync::fallible::{try_arc, try_zeroed};
 
+use crate::bytes;
 use crate::fd::{Access, OpenFile};
 use crate::net::{NetStack, stack};
+use crate::oom;
 use crate::process::Process;
 use crate::unix::{self, UnixSocket};
 
@@ -67,16 +69,23 @@ const MSGHDR_LEN: usize = 56;
 /// Most `iovec`s of one `sendmsg` or `recvmsg` (`UIO_MAXIOV`).
 const IOV_MAX: u64 = 1024;
 
+/// The sockets that wait to be accepted: one per slot, up to [`MAX_BACKLOG`].
+type Backlog = [Option<SocketHandle>; MAX_BACKLOG];
+
+// The backlog is inline, not boxed: a listening socket made by `accept` or
+// `listen` must not need memory it cannot report the lack of.
+#[allow(clippy::large_enum_variant)]
 enum Tcp {
     /// Not connected or listening, possibly bound to an address.
     Unconnected(Option<SocketAddrV4>),
     /// Waiting for connections on `port`: one listening socket per slot of
     /// backlog.
-    Listening { port: u16, backlog: Vec<SocketHandle> },
+    Listening { port: u16, backlog: Backlog },
     /// Connecting or connected.
     Connected(SocketHandle),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Kind {
     Tcp(Tcp),
     Udp { handle: SocketHandle, peer: Option<SocketAddrV4> },
@@ -109,6 +118,7 @@ fn net_errno(e: Error) -> Errno {
         Error::ConnectionRefused => Errno::ECONNREFUSED,
         Error::ConnectionReset => Errno::ECONNRESET,
         Error::TimedOut => Errno::ETIMEDOUT,
+        Error::OutOfMemory => Errno::ENOMEM,
     }
 }
 
@@ -148,9 +158,9 @@ impl SocketFile {
     }
 
     /// A new, unbound datagram socket on `net`.
-    pub fn datagram(net: Arc<NetStack>) -> Self {
-        let handle = net.op(|_, s| s.add(UdpSocket::new(UDP_QUEUE, UDP_QUEUE)));
-        Self::new(net, Kind::Udp { handle, peer: None }, false)
+    pub fn datagram(net: Arc<NetStack>) -> Result<Self, Errno> {
+        let handle = net.op(|_, s| s.try_add(UdpSocket::new(UDP_QUEUE, UDP_QUEUE))).map_err(net_errno)?;
+        Ok(Self::new(net, Kind::Udp { handle, peer: None }, false))
     }
 
     /// Whether calls fail with `EAGAIN` instead of waiting.
@@ -230,14 +240,28 @@ impl SocketFile {
         let port = a.port();
         let n = backlog.clamp(1, MAX_BACKLOG);
         let backlog = self.net.op(|_, s| {
-            (0..n)
-                .map(|_| {
-                    let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
-                    t.listen(port).expect("a fresh socket can listen");
-                    s.add(t)
-                })
-                .collect()
-        });
+            let mut backlog: Backlog = [None; MAX_BACKLOG];
+            for slot in backlog.iter_mut().take(n) {
+                let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
+                if let Err(e) = t.listen(port) {
+                    for h in backlog.iter().flatten() {
+                        drop(s.remove(*h));
+                    }
+                    return Err(net_errno(e));
+                }
+                match s.try_add(t) {
+                    Ok(h) => *slot = Some(h),
+                    Err(e) => {
+                        // Give back the sockets made so far.
+                        for h in backlog.iter().flatten() {
+                            drop(s.remove(*h));
+                        }
+                        return Err(net_errno(e));
+                    }
+                }
+            }
+            Ok(backlog)
+        })?;
         *kind = Kind::Tcp(Tcp::Listening { port, backlog });
         Ok(())
     }
@@ -258,25 +282,35 @@ impl SocketFile {
                 let Kind::Tcp(Tcp::Listening { port, backlog }) = &mut *kind else { return Err(Errno::EINVAL) };
                 let port = *port;
                 let taken = self.net.op(|_, s| {
-                    let i = backlog.iter().position(|&h| ready(s, h))?;
-                    let h = backlog[i];
-                    let peer = v4(s.get::<TcpSocket>(h).remote_endpoint());
+                    let i = backlog.iter().position(|h| h.is_some_and(|h| ready(s, h)))?;
+                    let h = backlog.get(i).copied().flatten()?;
                     let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
-                    t.listen(port).expect("a fresh socket can listen");
-                    let fresh = s.add(t);
-                    backlog[i] = fresh;
-                    Some((h, peer))
+                    if let Err(e) = t.listen(port) {
+                        return Some(Err(net_errno(e)));
+                    }
+                    // Without a socket to replace it, the connection stays
+                    // in the backlog for a later accept.
+                    let fresh = match s.try_add(t) {
+                        Ok(fresh) => fresh,
+                        Err(e) => return Some(Err(net_errno(e))),
+                    };
+                    let peer = v4(s.get::<TcpSocket>(h).remote_endpoint());
+                    if let Some(slot) = backlog.get_mut(i) {
+                        *slot = Some(fresh);
+                    }
+                    Some(Ok((h, peer)))
                 });
-                (taken, backlog.clone())
+                (taken, *backlog)
             };
-            if let Some((h, peer)) = taken {
+            if let Some(taken) = taken {
+                let (h, peer) = taken?;
                 return Ok((Self::new(self.net.clone(), Kind::Tcp(Tcp::Connected(h)), nonblock), peer));
             }
             if !wait {
                 return Err(Errno::EAGAIN);
             }
             // The snapshot only decides when to wake; the claim above rechecks.
-            if !self.net.wait(deadline, |s| snapshot.iter().any(|&h| ready(s, h)))? {
+            if !self.net.wait(deadline, |s| snapshot.iter().flatten().any(|&h| ready(s, h)))? {
                 return Err(Errno::EAGAIN);
             }
         }
@@ -369,7 +403,7 @@ impl SocketFile {
         let deadline = self.net.deadline(self.snd_timeout.load(Ordering::Relaxed));
         let mut done = 0;
         loop {
-            let r = self.net.op(|_, s| s.get_mut::<TcpSocket>(h).send(&data[done..]));
+            let r = self.net.op(|_, s| s.get_mut::<TcpSocket>(h).send(data.get(done..).unwrap_or_default()));
             match r {
                 Ok(n) => done += n,
                 Err(Error::WouldBlock) if done > 0 => return Ok(done),
@@ -480,6 +514,7 @@ impl SocketFile {
             Kind::Tcp(Tcp::Listening { backlog, .. }) => {
                 let up = backlog
                     .iter()
+                    .flatten()
                     .any(|&h| !matches!(s.get::<TcpSocket>(h).state(), TcpState::Listen | TcpState::SynReceived));
                 if up { POLLIN } else { 0 }
             }
@@ -577,11 +612,11 @@ impl Drop for SocketFile {
     fn drop(&mut self) {
         match core::mem::replace(self.kind.get_mut(), Kind::Tcp(Tcp::Unconnected(None))) {
             Kind::Udp { handle, .. } => {
-                self.net.op(|_, s| drop(s.remove(handle)));
+                self.net.op(|_, s| drop(s.try_remove(handle)));
             }
             Kind::Tcp(Tcp::Connected(h)) => self.net.release_tcp(h, false),
             Kind::Tcp(Tcp::Listening { backlog, .. }) => {
-                for h in backlog {
+                for h in backlog.into_iter().flatten() {
                     self.net.release_tcp(h, true);
                 }
             }
@@ -696,10 +731,11 @@ fn get_addr(p: &Process, va: u64, len: u64) -> Result<SocketAddrV4, Errno> {
     }
     let mut b = [0u8; SOCKADDR_LEN];
     p.memory().read(va, &mut b)?;
-    if u16::from_ne_bytes([b[0], b[1]]) as u64 != AF_INET {
+    if u64::from(bytes::u16_at(&b, 0)?) != AF_INET {
         return Err(Errno::EAFNOSUPPORT);
     }
-    Ok(SocketAddrV4::new(Ipv4Addr::new(b[4], b[5], b[6], b[7]), u16::from_be_bytes([b[2], b[3]])))
+    let [_, _, p0, p1, a0, a1, a2, a3, ..] = b;
+    Ok(SocketAddrV4::new(Ipv4Addr::new(a0, a1, a2, a3), u16::from_be_bytes([p0, p1])))
 }
 
 /// Writes `a` as a `struct sockaddr_in` at `va`, truncated to the `u32`
@@ -711,11 +747,11 @@ fn put_addr(p: &Process, va: u64, lenp: u64, a: SocketAddrV4) -> Result<(), Errn
     let mut cap = [0u8; 4];
     p.memory().read(lenp, &mut cap)?;
     let mut b = [0u8; SOCKADDR_LEN];
-    b[..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
-    b[2..4].copy_from_slice(&a.port().to_be_bytes());
-    b[4..8].copy_from_slice(&a.ip().octets());
+    bytes::put(&mut b, 0, &(AF_INET as u16).to_ne_bytes())?;
+    bytes::put(&mut b, 2, &a.port().to_be_bytes())?;
+    bytes::put(&mut b, 4, &a.ip().octets())?;
     let n = (u32::from_ne_bytes(cap) as usize).min(SOCKADDR_LEN);
-    p.memory().write(va, &b[..n])?;
+    p.memory().write(va, bytes::slice(&b, 0, n)?)?;
     p.memory().write(lenp, &(SOCKADDR_LEN as u32).to_ne_bytes())
 }
 
@@ -726,12 +762,13 @@ pub(crate) fn socket(p: &Process, domain: u64, ty: u64, protocol: u64) -> SysRes
     let net = stack().ok_or(Errno::EAFNOSUPPORT)?.clone();
     let file = match (ty & 0xf, protocol) {
         (SOCK_STREAM, 0 | IPPROTO_TCP) => SocketFile::stream(net),
-        (SOCK_DGRAM, 0 | IPPROTO_UDP) => SocketFile::datagram(net),
+        (SOCK_DGRAM, 0 | IPPROTO_UDP) => SocketFile::datagram(net)?,
         (SOCK_STREAM | SOCK_DGRAM, _) => return Err(Errno::EPROTONOSUPPORT),
         _ => return Err(Errno::EPROTOTYPE),
     };
     file.set_nonblocking(ty & SOCK_NONBLOCK != 0);
-    let open = OpenFile::new(Arc::new(file), Access::RW);
+    let file = try_arc(file).map_err(oom)?;
+    let open = OpenFile::try_new(file, Access::RW)?;
     p.files().lock().insert_from(0, open, ty & SOCK_CLOEXEC != 0).map(|fd| fd as u64)
 }
 
@@ -754,7 +791,8 @@ pub(crate) fn accept(p: &Process, fd: i32, addr: u64, lenp: u64, flags: u64) -> 
     let s = sock(&of)?;
     let (conn, peer) = s.accept(flags & SOCK_NONBLOCK != 0, !s.is_nonblocking())?;
     put_addr(p, addr, lenp, peer)?;
-    let open = OpenFile::new(Arc::new(conn), Access::RW);
+    let conn = try_arc(conn).map_err(oom)?;
+    let open = OpenFile::try_new(conn, Access::RW)?;
     p.files().lock().insert_from(0, open, flags & SOCK_CLOEXEC != 0).map(|fd| fd as u64)
 }
 
@@ -778,7 +816,7 @@ pub(crate) fn sendto(p: &Process, fd: i32, buf: u64, len: u64, flags: u64, addr:
     if n > IO_MAX && s.is_dgram() {
         return Err(Errno::EMSGSIZE);
     }
-    let mut data = vec![0u8; n.min(IO_MAX)];
+    let mut data = try_zeroed(n.min(IO_MAX)).map_err(oom)?;
     p.memory().read(buf, &mut data)?;
     s.send(&data, to, flags).map(|n| n as u64)
 }
@@ -799,9 +837,9 @@ pub(crate) fn recvfrom(p: &Process, fd: i32, buf: u64, len: u64, flags: u64, add
     if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    let mut data = vec![0u8; (len as usize).min(IO_MAX)];
+    let mut data = try_zeroed((len as usize).min(IO_MAX)).map_err(oom)?;
     let r = s.recv(&mut data, flags)?;
-    p.memory().write(buf, &data[..r.copied])?;
+    p.memory().write(buf, bytes::slice(&data, 0, r.copied)?)?;
     put_from(p, addr, lenp, r.from)?;
     Ok(r.copied as u64)
 }
@@ -812,14 +850,15 @@ fn read_iov(p: &Process, iov: u64, count: u64) -> Result<(Vec<(u64, usize)>, usi
     if count > IOV_MAX {
         return Err(Errno::EMSGSIZE);
     }
-    let mut v = Vec::with_capacity(count as usize);
+    let mut v = Vec::new();
+    v.try_reserve_exact(count as usize).map_err(|_| Errno::ENOMEM)?;
     let mut total = 0usize;
     for i in 0..count {
         let at = i.checked_mul(16).and_then(|o| iov.checked_add(o)).ok_or(Errno::EFAULT)?;
         let mut b = [0u8; 16];
         p.memory().read(at, &mut b)?;
-        let base = u64::from_ne_bytes(b[..8].try_into().expect("8 bytes"));
-        let len = u64::from_ne_bytes(b[8..].try_into().expect("8 bytes"));
+        let base = bytes::u64_at(&b, 0)?;
+        let len = bytes::u64_at(&b, 8)?;
         let len = usize::try_from(len).map_err(|_| Errno::EINVAL)?;
         total = total.checked_add(len).filter(|&t| t <= isize::MAX as usize).ok_or(Errno::EINVAL)?;
         v.push((base, len));
@@ -838,8 +877,12 @@ struct MsgHdr {
 fn read_msghdr(p: &Process, msg: u64) -> Result<MsgHdr, Errno> {
     let mut b = [0u8; MSGHDR_LEN];
     p.memory().read(msg, &mut b)?;
-    let word = |at: usize| u64::from_ne_bytes(b[at..at + 8].try_into().expect("8 bytes"));
-    Ok(MsgHdr { name: word(0), iov: word(16), iovlen: word(24), controllen: word(40) })
+    Ok(MsgHdr {
+        name: bytes::u64_at(&b, 0)?,
+        iov: bytes::u64_at(&b, 16)?,
+        iovlen: bytes::u64_at(&b, 24)?,
+        controllen: bytes::u64_at(&b, 40)?,
+    })
 }
 
 pub(crate) fn sendmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
@@ -864,12 +907,12 @@ pub(crate) fn sendmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
         return Err(Errno::EMSGSIZE);
     }
     // Gather the pieces into one buffer, so a datagram goes out whole.
-    let mut data = vec![0u8; total.min(IO_MAX)];
+    let mut data = try_zeroed(total.min(IO_MAX)).map_err(oom)?;
     let mut at = 0;
     for (base, len) in iov {
-        let take = len.min(data.len() - at);
+        let take = len.min(data.len().saturating_sub(at));
         if take > 0 {
-            p.memory().read(base, &mut data[at..at + take])?;
+            p.memory().read(base, bytes::slice_mut(&mut data, at, take)?)?;
             at += take;
         }
     }
@@ -884,14 +927,14 @@ pub(crate) fn recvmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
         return Err(Errno::EOPNOTSUPP);
     }
     let (iov, total) = read_iov(p, h.iov, h.iovlen)?;
-    let mut data = vec![0u8; total.min(IO_MAX)];
+    let mut data = try_zeroed(total.min(IO_MAX)).map_err(oom)?;
     let r = s.recv(&mut data, flags)?;
     // Scatter what arrived over the buffers, in order.
     let mut at = 0;
     for (base, len) in iov {
-        let take = len.min(r.copied - at);
+        let take = len.min(r.copied.saturating_sub(at));
         if take > 0 {
-            p.memory().write(base, &data[at..at + take])?;
+            p.memory().write(base, bytes::slice(&data, at, take)?)?;
             at += take;
         }
     }
@@ -919,12 +962,14 @@ pub(crate) fn socketpair(p: &Process, domain: u64, ty: u64, protocol: u64, sv: u
     if protocol != 0 {
         return Err(Errno::EPROTONOSUPPORT);
     }
-    let (a, b) = unix::socketpair(dgram, ty & SOCK_NONBLOCK != 0);
+    let (a, b) = unix::socketpair(dgram, ty & SOCK_NONBLOCK != 0)?;
+    let (a, b) = (try_arc(a).map_err(oom)?, try_arc(b).map_err(oom)?);
+    let (a, b) = (OpenFile::try_new(a, Access::RW)?, OpenFile::try_new(b, Access::RW)?);
     let cloexec = ty & SOCK_CLOEXEC != 0;
     let (fa, fb) = {
         let mut files = p.files().lock();
-        let fa = files.insert_from(0, OpenFile::new(Arc::new(a), Access::RW), cloexec)?;
-        match files.insert_from(0, OpenFile::new(Arc::new(b), Access::RW), cloexec) {
+        let fa = files.insert_from(0, a, cloexec)?;
+        match files.insert_from(0, b, cloexec) {
             Ok(fb) => (fa, fb),
             Err(e) => {
                 let _ = files.close(fa);
@@ -933,9 +978,8 @@ pub(crate) fn socketpair(p: &Process, domain: u64, ty: u64, protocol: u64, sv: u
         }
     };
     let mut out = [0u8; 8];
-    out[..4].copy_from_slice(&fa.to_ne_bytes());
-    out[4..].copy_from_slice(&fb.to_ne_bytes());
-    if let Err(e) = p.memory().write(sv, &out) {
+    let filled = bytes::put(&mut out, 0, &fa.to_ne_bytes()).and_then(|()| bytes::put(&mut out, 4, &fb.to_ne_bytes()));
+    if let Err(e) = filled.and_then(|()| p.memory().write(sv, &out)) {
         let mut files = p.files().lock();
         let _ = files.close(fa);
         let _ = files.close(fb);
@@ -962,7 +1006,7 @@ fn put_unix_addr(p: &Process, va: u64, lenp: u64) -> Result<(), Errno> {
     let mut cap = [0u8; 4];
     p.memory().read(lenp, &mut cap)?;
     let n = (u32::from_ne_bytes(cap) as usize).min(2);
-    p.memory().write(va, &(AF_UNIX as u16).to_ne_bytes()[..n])?;
+    p.memory().write(va, bytes::slice(&(AF_UNIX as u16).to_ne_bytes(), 0, n)?)?;
     p.memory().write(lenp, &2u32.to_ne_bytes())
 }
 
@@ -1003,8 +1047,8 @@ pub(crate) fn setsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, 
         }
         let mut tv = [0u8; 16];
         p.memory().read(val, &mut tv)?;
-        let sec = u64::from_ne_bytes(tv[..8].try_into().unwrap());
-        let usec = u64::from_ne_bytes(tv[8..].try_into().unwrap());
+        let sec = bytes::u64_at(&tv, 0)?;
+        let usec = bytes::u64_at(&tv, 8)?;
         if usec >= 1_000_000 || sec > u64::MAX / 2_000_000_000 {
             return Err(Errno::EINVAL);
         }
@@ -1042,7 +1086,7 @@ pub(crate) fn getsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, 
     let mut cap = [0u8; 4];
     p.memory().read(lenp, &mut cap)?;
     let n = (u32::from_ne_bytes(cap) as usize).min(4);
-    p.memory().write(val, &v.to_ne_bytes()[..n])?;
+    p.memory().write(val, bytes::slice(&v.to_ne_bytes(), 0, n)?)?;
     p.memory().write(lenp, &4u32.to_ne_bytes())?;
     Ok(0)
 }

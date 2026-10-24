@@ -85,7 +85,7 @@ impl UserMemory for Flat {
         Err(Errno::ENOEXEC)
     }
 
-    fn fork(&self) -> Result<Box<dyn UserMemory>, Errno> {
+    fn fork(&self) -> Result<Arc<dyn UserMemory>, Errno> {
         Err(Errno::ENOMEM)
     }
 

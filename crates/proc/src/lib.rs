@@ -63,20 +63,22 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod bytes;
+mod epoll;
 mod exec;
 pub mod fd;
 pub mod futex;
 mod memory;
-mod process;
-pub mod signal;
-pub mod syscall;
+mod mmap;
 pub mod net;
-pub mod socket;
-mod epoll;
 mod pipe;
 pub mod poll;
-mod unix;
+mod process;
+pub mod signal;
+pub mod socket;
+pub mod syscall;
 pub mod thread;
+mod unix;
 mod uregs;
 
 pub use exec::{ARG_MAX, Platform, UserEntry, set_platform};
@@ -97,9 +99,20 @@ pub fn set_vfs(vfs: &'static Vfs) {
     assert!(VFS.set(vfs).is_ok(), "VFS already set");
 }
 
+/// Out of memory, as the error a system call reports.
+pub(crate) fn oom(_: osmium_sync::fallible::OutOfMemory) -> osmium_fs::Errno {
+    osmium_fs::Errno::ENOMEM
+}
+
 pub(crate) fn vfs() -> Option<&'static Vfs> {
     VFS.get().copied()
 }
+
+#[cfg(test)]
+mod failing;
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: failing::Failing = failing::Failing;
 
 #[cfg(test)]
 mod tests;

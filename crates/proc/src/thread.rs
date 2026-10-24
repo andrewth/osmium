@@ -17,13 +17,16 @@
     allow(dead_code)
 )]
 
-use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use osmium_fs::Errno;
 use osmium_sched::WaitQueue;
+use osmium_sync::arc::ArcList;
+use osmium_sync::fallible::{OutOfMemory, try_arc};
+use osmium_sync::intrusive::{Adapter, KeyAdapter, Link, Registry, Shared, TreeLink};
 use osmium_sync::{IrqSpinLock, Once};
 
 use crate::process::{ExitStatus, Pid, Process};
@@ -51,6 +54,48 @@ pub struct Thread {
     tls: AtomicU64,
     fault: IrqSpinLock<Option<(u8, u64)>>,
     alive: AtomicBool,
+    /// Links the thread into its group's list.
+    group_link: Shared<Link>,
+    /// Links a non-leader thread into [`TIDS`], keyed by `key`.
+    tid_link: Shared<TreeLink>,
+    /// The thread id it was created with, which [`TIDS`] orders by. Unlike
+    /// `tid`, it never changes: `execve` takes the thread out of [`TIDS`]
+    /// before it takes the process id.
+    key: u32,
+    /// The thread's process, for [`TIDS`] to hand out without allocating.
+    owner: Once<Weak<Process>>,
+}
+
+/// Where [`Thread::group_link`] sits in a [`Thread`].
+struct ByGroup;
+
+// SAFETY: `offset_of!` of a `Shared<Link>`, which is a `Link`.
+unsafe impl Adapter<Link> for ByGroup {
+    type Value = Thread;
+    const OFFSET: usize = offset_of!(Thread, group_link);
+}
+
+/// Where [`Thread::tid_link`] sits in a [`Thread`], and its key.
+struct ByTid;
+
+// SAFETY: `offset_of!` of a `Shared<TreeLink>`, which is a `TreeLink`.
+unsafe impl Adapter<TreeLink> for ByTid {
+    type Value = Thread;
+    const OFFSET: usize = offset_of!(Thread, tid_link);
+}
+
+impl KeyAdapter<TreeLink> for ByTid {
+    type Key = u32;
+    fn key(t: &Thread) -> &u32 {
+        &t.key
+    }
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        // SAFETY: linked, if at all, in `TIDS`.
+        unsafe { TIDS.lock().remove(self) };
+    }
 }
 
 impl Thread {
@@ -67,6 +112,10 @@ impl Thread {
             tls: AtomicU64::new(0),
             fault: IrqSpinLock::new(None),
             alive: AtomicBool::new(true),
+            group_link: Shared::new(Link::new()),
+            tid_link: Shared::new(TreeLink::new()),
+            key: tid,
+            owner: Once::new(),
         }
     }
 
@@ -112,7 +161,7 @@ impl Thread {
 
 /// The threads of a process, and how it is ending.
 pub(crate) struct ThreadGroup {
-    threads: IrqSpinLock<Vec<Arc<Thread>>>,
+    threads: IrqSpinLock<ArcList<ByGroup>>,
     /// Set once the whole process is ending: by `exit_group` or a fatal
     /// signal. Every thread then stops with this status.
     pub(crate) exiting: Once<ExitStatus>,
@@ -121,25 +170,37 @@ pub(crate) struct ThreadGroup {
 }
 
 impl ThreadGroup {
-    pub(crate) fn new(pid: Pid) -> Self {
-        Self {
-            threads: IrqSpinLock::new(alloc::vec![Arc::new(Thread::new(pid.0, true))]),
-            exiting: Once::new(),
-            ended: WaitQueue::new(),
-        }
+    pub(crate) fn try_new(pid: Pid) -> Result<Self, OutOfMemory> {
+        let mut threads = ArcList::new();
+        threads.push_back(try_arc(Thread::new(pid.0, true))?);
+        Ok(Self { threads: IrqSpinLock::new(threads), exiting: Once::new(), ended: WaitQueue::new() })
+    }
+
+    /// Takes thread `tid` out of the group again, for a `clone` whose task
+    /// could not be created.
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64")))]
+    fn unregister(&self, th: &Arc<Thread>) {
+        // Dropped after the lock is released.
+        // SAFETY: a thread is only ever in its own group's list.
+        let removed = unsafe { self.threads.lock().remove(th) };
+        drop(removed);
+        // SAFETY: linked, if at all, in `TIDS`.
+        unsafe { TIDS.lock().remove(th) };
     }
 
     pub(crate) fn leader(&self) -> Arc<Thread> {
-        self.threads
-            .lock()
-            .iter()
-            .find(|t| t.leader.load(Ordering::SeqCst))
-            .expect("the leader is never removed")
-            .clone()
+        Self::leader_in(&self.threads.lock())
+    }
+
+    /// The leader among `threads`, the group's list. `promote` swaps leaders
+    /// inside one critical section, so every observer finds exactly one.
+    #[allow(clippy::expect_used)] // invariant: the leader is never removed from the list except by `promote`, which names the next one in the same critical section.
+    fn leader_in(threads: &ArcList<ByGroup>) -> Arc<Thread> {
+        threads.clone_first_where(|t| t.leader.load(Ordering::SeqCst)).expect("the leader is never removed")
     }
 
     pub(crate) fn find(&self, tid: u32) -> Option<Arc<Thread>> {
-        self.threads.lock().iter().find(|t| t.tid() == tid).cloned()
+        self.threads.lock().clone_first_where(|t| t.tid() == tid)
     }
 
     /// Threads that have not exited.
@@ -169,11 +230,11 @@ impl Process {
 }
 
 /// Non-leader threads by thread id; leaders are found by process id.
-static TIDS: IrqSpinLock<BTreeMap<u32, Weak<Process>>> = IrqSpinLock::new(BTreeMap::new());
+static TIDS: IrqSpinLock<Registry<ByTid>> = IrqSpinLock::new(Registry::new());
 
 /// The live thread with id `tid` and its process.
 pub(crate) fn find(tid: u32) -> Option<(Arc<Process>, Arc<Thread>)> {
-    let p = Process::find(Pid(tid)).or_else(|| TIDS.lock().get(&tid)?.upgrade())?;
+    let p = Process::find(Pid(tid)).or_else(|| TIDS.lock().find(&tid)?.owner.get()?.upgrade())?;
     let th = p.group.find(tid).filter(|t| t.alive.load(Ordering::SeqCst))?;
     Some((p, th))
 }
@@ -184,14 +245,14 @@ pub(crate) fn find(tid: u32) -> Option<(Arc<Process>, Arc<Thread>)> {
 pub(crate) fn current_thread(p: &Process) -> Arc<Thread> {
     let id = osmium_sched::current().id().0 + 1;
     let threads = p.group.threads.lock();
-    if let Some(t) = threads.iter().find(|t| t.task.load(Ordering::SeqCst) == id) {
-        return t.clone();
+    if let Some(t) = threads.clone_first_where(|t| t.task.load(Ordering::SeqCst) == id) {
+        return t;
     }
-    let leader = threads.iter().find(|t| t.leader.load(Ordering::SeqCst)).expect("the leader is never removed");
+    let leader = ThreadGroup::leader_in(&threads);
     // The first thread's task is spawned before it can run and cannot be
     // named until then, so it is recognised by being the first to ask.
     let _ = leader.task.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst);
-    leader.clone()
+    leader
 }
 
 /// The thread pointer for the thread running `task`, if it is one of a
@@ -256,6 +317,10 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
         return Err(Errno::EINVAL);
     }
     crate::exec::platform()?;
+    // A non-canonical thread pointer would fault the kernel when it loads `FS.base`.
+    if flags & SETTLS != 0 && cfg!(target_arch = "x86_64") && tls >> 47 != 0 {
+        return Err(Errno::EPERM);
+    }
     // Fail before the thread exists, as `fork` does.
     for (f, va) in [(PARENT_SETTID, ptid), (CHILD_SETTID, ctid)] {
         if flags & f != 0 {
@@ -266,7 +331,7 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
     }
     let me = Process::find(p.pid()).ok_or(ESRCH)?;
     let tid = crate::process::alloc_id();
-    let th = Arc::new(Thread::new(tid, false));
+    let th = try_arc(Thread::new(tid, false)).map_err(|_| Errno::ENOMEM)?;
     th.mask.store(caller.signal_mask(), Ordering::SeqCst);
     if flags & SETTLS != 0 {
         th.tls.store(tls, Ordering::SeqCst);
@@ -287,9 +352,11 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
         if threads.len() >= THREADS_MAX {
             return Err(Errno::EAGAIN);
         }
-        threads.push(th);
+        threads.push_back(th.clone());
     }
-    TIDS.lock().insert(tid, Arc::downgrade(&me));
+    let _ = th.owner.set(Arc::downgrade(&me));
+    // SAFETY: `Thread`'s `Drop` takes it out again; the key never changes.
+    unsafe { TIDS.lock().insert(&th) };
     let bytes = tid.to_ne_bytes();
     if flags & PARENT_SETTID != 0 {
         p.memory().write(ptid, &bytes)?;
@@ -310,16 +377,20 @@ pub(crate) fn start(
     frame: &mut osmium_arch::trap::TrapFrame,
     stack: u64,
     tls: u64,
-) {
+) -> Result<(), Errno> {
     use crate::uregs::UserRegs;
-    let th = p.group.find(tid).expect("clone registered the thread");
+    let th = p.group.find(tid).ok_or(ESRCH)?;
     let mut regs = frame.clone();
     UserRegs::set_ret(&mut regs, 0);
     UserRegs::set_user_sp(&mut regs, stack);
     if tls != 0 {
         UserRegs::set_tls(&mut regs, tls);
     }
-    let resume = crate::exec::platform().expect("clone needs a platform").resume;
+    let Ok(platform) = crate::exec::platform() else {
+        p.group.unregister(&th);
+        return Err(Errno::ENOSYS);
+    };
+    let resume = platform.resume;
     let fp = if osmium_arch::fp::enabled() {
         // SAFETY: a kernel that enables FP enables it on every CPU; the
         // registers are the caller's, still live.
@@ -333,7 +404,7 @@ pub(crate) fn start(
     me.pin(cpu);
     drop(me);
     let t = th.clone();
-    let task = p.spawn_with_fp(osmium_sched::TaskBuilder::new(p.name()).cpu(cpu), fp, move || {
+    let spawned = p.try_spawn_with_fp(osmium_sched::TaskBuilder::new(p.name()).cpu(cpu), fp, move || {
         // The spawner records the task's id as soon as it has it.
         while t.task.load(Ordering::SeqCst) == 0 {
             osmium_sched::yield_now();
@@ -341,8 +412,15 @@ pub(crate) fn start(
         drop(t);
         resume(regs)
     });
+    let Ok(task) = spawned else {
+        // `clone` registered the thread, but it will never run: take it
+        // back, so the group does not count or wait for it.
+        p.group.unregister(&th);
+        return Err(Errno::ENOMEM);
+    };
     th.task.store(task.id().0 + 1, Ordering::SeqCst);
     UserRegs::set_ret(frame, tid as u64);
+    Ok(())
 }
 
 /// Ends the current thread of the current process, as [`crate::exit`] does.
@@ -370,11 +448,14 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
         let mut threads = p.group.threads.lock();
         th.alive.store(false, Ordering::SeqCst);
         if !th.leader.load(Ordering::SeqCst) {
-            threads.retain(|t| !Arc::ptr_eq(t, th));
+            // SAFETY: a thread is only ever in its own group's list. The
+            // caller's reference keeps it alive past this.
+            drop(unsafe { threads.remove(th) });
         }
         threads.iter().filter(|t| t.alive.load(Ordering::SeqCst)).count()
     };
-    TIDS.lock().remove(&th.tid());
+    // SAFETY: linked, if at all, in `TIDS`.
+    unsafe { TIDS.lock().remove(th) };
     p.group.ended.wake_all();
     if live == 0 {
         p.set_exited(status);
@@ -413,7 +494,7 @@ pub(crate) fn doom_others(p: &Process, th: &Thread) -> bool {
     if th.doomed.load(Ordering::SeqCst) {
         return false;
     }
-    for t in threads.iter().filter(|t| !core::ptr::eq(&***t, th)) {
+    for t in threads.iter().filter(|t| !core::ptr::eq(*t, th)) {
         t.doomed.store(true, Ordering::SeqCst);
     }
     true
@@ -421,16 +502,19 @@ pub(crate) fn doom_others(p: &Process, th: &Thread) -> bool {
 
 /// Makes `th`, the only live thread, the leader.
 pub(crate) fn promote(p: &Process, th: &Thread) {
-    let old = th.tid();
     let mut threads = p.group.threads.lock();
     if th.leader.load(Ordering::SeqCst) {
         return;
     }
-    threads.retain(|t| core::ptr::eq(&**t, th));
+    // The others have all ended; the group keeps only the caller.
+    while let Some(other) = threads.remove_first_where(|t| !core::ptr::eq(t, th)) {
+        drop(other);
+    }
     th.tid.store(p.pid().0, Ordering::SeqCst);
     th.leader.store(true, Ordering::SeqCst);
     drop(threads);
-    TIDS.lock().remove(&old);
+    // SAFETY: linked, if at all, in `TIDS`; `old` was its key.
+    unsafe { TIDS.lock().remove(th) };
 }
 
 /// `exit_group`: ends every thread of `p`.
