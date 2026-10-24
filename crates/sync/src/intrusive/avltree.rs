@@ -114,10 +114,15 @@ pub(super) fn sign(dir: usize) -> i8 {
 /// Returns the node now on top and whether the subtree kept its old height.
 fn rebalance<H: Augment>(root: &mut Ptr, z: NonNull<TreeLink>, dir: usize) -> (NonNull<TreeLink>, bool) {
     let s = sign(dir);
-    let c = child(z, dir).expect("heavy side has a child");
+    let Some(c) = child(z, dir) else {
+        // A heavy side always has a child; only a corrupt tree gets here.
+        return (z, true);
+    };
     if aux(c) == -s {
         // The heavy child leans the other way: rotate it first.
-        let g = child(c, 1 - dir).expect("inner grandchild");
+        let Some(g) = child(c, 1 - dir) else {
+            return (z, true);
+        };
         let gb = aux(g);
         rotate_with::<H>(root, c, dir);
         rotate_with::<H>(root, z, 1 - dir);

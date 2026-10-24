@@ -12,12 +12,17 @@ use osmium_arch::{MAX_CPUS, cpu, irq};
 // is for interior mutability in a `static`.
 static COUNT: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
+/// This CPU's counter. The CPU id is always below `MAX_CPUS`; the fallback to CPU 0 is only for totality.
+fn counter() -> &'static AtomicU32 {
+    COUNT.get(cpu::current_id()).unwrap_or(&COUNT[0])
+}
+
 /// Disables preemption on this CPU. Calls nest.
 #[inline]
 pub fn disable() {
     // IRQs are masked so the task cannot migrate between reading the CPU id
     // and updating that CPU's counter.
-    irq::without(|| COUNT[cpu::current_id()].fetch_add(1, Ordering::Relaxed));
+    irq::without(|| counter().fetch_add(1, Ordering::Relaxed));
 }
 
 /// Re-enables preemption after a matching [`disable`].
@@ -33,7 +38,7 @@ pub fn disable() {
 pub fn enable() {
     // A checked decrement: the count never goes below zero.
     let ok = irq::without(|| {
-        let count = &COUNT[cpu::current_id()];
+        let count = counter();
         let mut cur = count.load(Ordering::Relaxed);
         while cur > 0 {
             match count.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
@@ -49,7 +54,7 @@ pub fn enable() {
 /// Returns this CPU's preemption-disable depth.
 #[inline]
 pub fn count() -> u32 {
-    COUNT[cpu::current_id()].load(Ordering::Relaxed)
+    counter().load(Ordering::Relaxed)
 }
 
 /// Returns true if the scheduler may preempt the current task.

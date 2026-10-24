@@ -11,16 +11,26 @@
 //! - [`PerCpu`] and [`PerCpuCell`]: per-CPU storage indexed by
 //!   `osmium_arch::cpu::current_id`.
 //! - [`SpscRing`]: a lock-free single-producer, single-consumer ring.
+//! - `arc` (feature `alloc`): intrusive lists and trees that own their `Arc` elements.
+//! - `fallible` (feature `alloc`): allocation that returns an error instead of panicking.
 //! - [`intrusive`]: allocation-free linked lists and red-black / AVL trees whose
 //!   links live inside the elements.
 //!
 //! Sleeping locks (`Mutex`, `WaitQueue`) need a scheduler and live in
 //! `osmium-sched`.
 #![no_std]
+#![cfg_attr(feature = "alloc", feature(allocator_ext))]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
 
 #[cfg(test)]
 extern crate std;
 
+#[cfg(feature = "alloc")]
+pub mod arc;
+#[cfg(feature = "alloc")]
+pub mod fallible;
 mod guard;
 pub mod intrusive;
 mod once;

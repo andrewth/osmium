@@ -58,11 +58,13 @@ impl<T> Once<T> {
 
     /// Stores `value` if the cell is empty; otherwise hands it back.
     pub fn set(&self, value: T) -> Result<(), T> {
-        let mut value = Some(value);
-        self.call_once(|| value.take().expect("call_once runs its closure at most once"));
-        match value {
-            None => Ok(()),
-            Some(v) => Err(v),
+        if self.state.compare_exchange(EMPTY, RUNNING, Ordering::Acquire, Ordering::Acquire).is_ok() {
+            // SAFETY: winning the EMPTY -> RUNNING transition gives exclusive access.
+            unsafe { (*self.value.get()).write(value) };
+            self.state.store(READY, Ordering::Release);
+            Ok(())
+        } else {
+            Err(value)
         }
     }
 
@@ -115,6 +117,7 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
 
     /// Forces initialization and returns the value.
     pub fn force(this: &Self) -> &T {
+        #[allow(clippy::expect_used)] // invariant: only the one winning `call_once` runs the closure, and it runs once.
         this.once.call_once(|| (this.init.take().expect("Lazy initializer already used"))())
     }
 }

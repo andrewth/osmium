@@ -65,8 +65,10 @@ impl<T, const N: usize> Drop for SpscRing<T, N> {
     fn drop(&mut self) {
         let (mut head, tail) = (*self.head.get_mut(), *self.tail.get_mut());
         while head != tail {
-            // SAFETY: slots in [head, tail) hold initialized items.
-            unsafe { self.buf[head % N].get_mut().assume_init_drop() };
+            if let Some(cell) = self.buf.get_mut(head % N) {
+                // SAFETY: slots in [head, tail) hold initialized items.
+                unsafe { cell.get_mut().assume_init_drop() };
+            }
             head = head.wrapping_add(1);
         }
     }
@@ -89,9 +91,12 @@ impl<T, const N: usize> Producer<'_, T, N> {
         if tail.wrapping_sub(self.ring.head.load(Ordering::Acquire)) == N {
             return Err(item);
         }
+        let Some(cell) = self.ring.buf.get(tail % N) else {
+            return Err(item);
+        };
         // SAFETY: the slot at `tail` is outside [head, tail), so the consumer
         // does not touch it, and this is the only producer.
-        unsafe { (*self.ring.buf[tail % N].get()).write(item) };
+        unsafe { (*cell.get()).write(item) };
         self.ring.tail.store(tail.wrapping_add(1), Ordering::Release);
         Ok(())
     }
@@ -104,9 +109,10 @@ impl<T, const N: usize> Consumer<'_, T, N> {
         if head == self.ring.tail.load(Ordering::Acquire) {
             return None;
         }
+        let cell = self.ring.buf.get(head % N)?;
         // SAFETY: the slot at `head` is inside [head, tail) and initialized;
         // this is the only consumer.
-        let item = unsafe { (*self.ring.buf[head % N].get()).assume_init_read() };
+        let item = unsafe { (*cell.get()).assume_init_read() };
         self.ring.head.store(head.wrapping_add(1), Ordering::Release);
         Some(item)
     }

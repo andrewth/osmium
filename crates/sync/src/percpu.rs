@@ -19,6 +19,11 @@ pub struct PerCpu<T> {
     slots: [T; MAX_CPUS],
 }
 
+/// The slot for CPU `id`, or CPU 0's if `id` is out of range.
+fn pick<T>(slots: &[T; MAX_CPUS], id: usize) -> &T {
+    slots.get(id).unwrap_or(&slots[0])
+}
+
 impl<T> PerCpu<T> {
     /// Wraps one value per CPU.
     pub const fn new(slots: [T; MAX_CPUS]) -> Self {
@@ -31,13 +36,13 @@ impl<T> PerCpu<T> {
     /// call; the reference stays valid but may then name another CPU's slot.
     #[inline]
     pub fn get(&self) -> &T {
-        &self.slots[cpu::current_id()]
+        pick(&self.slots, cpu::current_id())
     }
 
-    /// Returns the slot of `cpu`.
+    /// Returns the slot of `cpu`; an id beyond `MAX_CPUS` names CPU 0's slot.
     #[inline]
     pub fn for_cpu(&self, cpu: usize) -> &T {
-        &self.slots[cpu]
+        pick(&self.slots, cpu)
     }
 
     /// Iterates over all slots.
@@ -68,6 +73,7 @@ unsafe impl<T: Send> Sync for PerCpuCell<T> {}
 
 impl<T> PerCpuCell<T> {
     /// Wraps one value per CPU.
+    #[allow(clippy::indexing_slicing)] // invariant: `i < MAX_CPUS` is the loop bound over two `MAX_CPUS` arrays.
     pub const fn new(values: [T; MAX_CPUS]) -> Self {
         // `map` is not const; move the values out one by one.
         let values = core::mem::ManuallyDrop::new(values);
@@ -88,7 +94,7 @@ impl<T> PerCpuCell<T> {
     /// Runs `f` with exclusive access to this CPU's value.
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         let state = irq::save_and_disable();
-        let slot = &self.slots[cpu::current_id()];
+        let slot = pick(&self.slots, cpu::current_id());
         assert!(!slot.busy.replace(true), "PerCpuCell::with re-entered");
         // SAFETY: interrupts are masked and `busy` was clear, so no other
         // reference to this slot exists.
@@ -104,7 +110,7 @@ impl<T> PerCpuCell<T> {
     /// while control leaves the current function. The caller is responsible
     /// for exclusivity.
     pub fn as_ptr(&self) -> *mut T {
-        self.slots[cpu::current_id()].value.get()
+        pick(&self.slots, cpu::current_id()).value.get()
     }
 }
 

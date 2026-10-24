@@ -116,7 +116,10 @@ fn insert_fixup(root: &mut Ptr, mut z: NonNull<TreeLink>) {
         if aux(p) == BLACK {
             break;
         }
-        let g = parent(p).expect("a red node is never the root");
+        let Some(g) = parent(p) else {
+            // A red node is never the root: only a corrupt tree gets here.
+            break;
+        };
         let d = dir_of(p, g);
         let uncle = child(g, 1 - d);
         if let Some(u) = uncle.filter(|&u| aux(u) == RED) {
@@ -130,7 +133,8 @@ fn insert_fixup(root: &mut Ptr, mut z: NonNull<TreeLink>) {
             // Inner grandchild: rotate it outward first.
             rotate(root, p, d);
             z = p;
-            p = parent(z).expect("rotated node has a parent");
+            let Some(np) = parent(z) else { break };
+            p = np;
         }
         set_aux(p, BLACK);
         set_aux(g, RED);
@@ -149,12 +153,14 @@ fn remove_fixup(root: &mut Ptr, mut x: Ptr, mut p: Ptr, mut d: usize) {
         if !is_black(x) {
             break;
         }
-        let mut w = child(par, 1 - d).expect("a doubly black node has a sibling");
+        // A doubly black node has a sibling; only a corrupt tree lacks one.
+        let Some(mut w) = child(par, 1 - d) else { break };
         if aux(w) == RED {
             set_aux(w, BLACK);
             set_aux(par, RED);
             rotate(root, par, d);
-            w = child(par, 1 - d).expect("red sibling has black children");
+            let Some(nw) = child(par, 1 - d) else { break };
+            w = nw;
         }
         if is_black(child(w, 0)) && is_black(child(w, 1)) {
             set_aux(w, RED);
@@ -164,14 +170,18 @@ fn remove_fixup(root: &mut Ptr, mut x: Ptr, mut p: Ptr, mut d: usize) {
             continue;
         }
         if is_black(child(w, 1 - d)) {
-            set_aux(child(w, d).expect("near nephew is red"), BLACK);
+            let Some(near) = child(w, d) else { break };
+            set_aux(near, BLACK);
             set_aux(w, RED);
             rotate(root, w, 1 - d);
-            w = child(par, 1 - d).expect("rotated sibling");
+            let Some(nw) = child(par, 1 - d) else { break };
+            w = nw;
         }
         set_aux(w, aux(par));
         set_aux(par, BLACK);
-        set_aux(child(w, 1 - d).expect("far nephew is red"), BLACK);
+        if let Some(far) = child(w, 1 - d) {
+            set_aux(far, BLACK);
+        }
         rotate(root, par, d);
         x = *root;
         break;
@@ -227,6 +237,24 @@ mod tests {
     #[test]
     fn matches_btreeset_under_random_ops() {
         fuzz(RbTree::<ByKey>::new());
+    }
+
+    #[test]
+    fn find_ptr_walks_in_key_order_and_can_remove() {
+        let ns = nodes([5, 1, 4, 2, 3].into_iter());
+        let mut t = RbTree::<ByKey>::new();
+        for n in &ns {
+            // SAFETY: `ns` outlives `t` and is not moved.
+            assert!(unsafe { t.insert(NonNull::from(n)) });
+        }
+        assert_eq!(key_at(t.first_ptr().unwrap()), 1);
+        let p = t.find_ptr(|n| n.key > 2).unwrap();
+        assert_eq!(key_at(p), 3);
+        // SAFETY: linked in `t`.
+        assert!(unsafe { t.remove(p) });
+        assert_eq!(t.find_ptr(|n| n.key > 2).map(key_at), Some(4));
+        assert!(t.find_ptr(|n| n.key > 9).is_none());
+        t.check();
     }
 
     #[test]

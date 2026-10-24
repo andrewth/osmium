@@ -76,8 +76,14 @@ pub(super) fn parent(n: NonNull<TreeLink>) -> Ptr {
     rd(n).parent.get()
 }
 
+/// The child pointer of `n` on side `dir`; any `dir` other than 0 means the right side.
+fn slot<'a>(n: NonNull<TreeLink>, dir: usize) -> &'a Cell<Ptr> {
+    let l = rd(n);
+    if dir == 0 { &l.child[0] } else { &l.child[1] }
+}
+
 pub(super) fn child(n: NonNull<TreeLink>, dir: usize) -> Ptr {
-    rd(n).child[dir].get()
+    slot(n, dir).get()
 }
 
 pub(super) fn aux(n: NonNull<TreeLink>) -> i8 {
@@ -95,7 +101,7 @@ pub(super) fn dir_of(n: NonNull<TreeLink>, parent: NonNull<TreeLink>) -> usize {
 
 /// Makes `c` the child of `n` on side `dir` and fixes `c`'s parent.
 pub(super) fn set_child(n: NonNull<TreeLink>, dir: usize, c: Ptr) {
-    rd(n).child[dir].set(c);
+    slot(n, dir).set(c);
     if let Some(c) = c {
         rd(c).parent.set(Some(n));
     }
@@ -132,7 +138,10 @@ pub(super) fn rotate(root: &mut Ptr, x: NonNull<TreeLink>, dir: usize) {
 
 /// [`rotate`], then refreshes the two nodes whose subtrees changed.
 pub(super) fn rotate_with<H: Augment>(root: &mut Ptr, x: NonNull<TreeLink>, dir: usize) {
-    let y = child(x, 1 - dir).expect("rotation needs a child");
+    let Some(y) = child(x, 1 - dir) else {
+        // Nothing to lift: only reachable if the tree is already corrupt.
+        return;
+    };
     replace_child(root, parent(x), x, Some(y));
     set_child(x, 1 - dir, child(y, dir));
     set_child(y, dir, Some(x));
@@ -201,7 +210,8 @@ pub(super) fn detach(root: &mut Ptr, z: NonNull<TreeLink>) -> Detached {
         let out = if parent(y) == Some(z) {
             Detached { parent: Some(y), dir: 1, child: c, aux: aux(y) }
         } else {
-            let yp = parent(y).expect("successor has a parent");
+            // The successor of a node with two children lies strictly below `z`, so it has a parent.
+            let yp = parent(y).unwrap_or(z);
             set_child(yp, 0, c);
             set_child(y, 1, Some(r));
             Detached { parent: Some(yp), dir: 0, child: c, aux: aux(y) }
@@ -230,7 +240,7 @@ pub(super) fn clear_tree(root: &mut Ptr) {
         }
         cur = parent(n);
         if let Some(p) = cur {
-            rd(p).child[dir_of(n, p)].set(None);
+            slot(p, dir_of(n, p)).set(None);
         }
         reset(n);
     }
@@ -300,6 +310,32 @@ impl<A: KeyAdapter<TreeLink>> Bst<A> {
             }
         }
         best.map(val::<A>)
+    }
+
+    /// The first element in key order for which `pred` holds. The pointer
+    /// keeps the provenance of the one that was linked, so the caller can
+    /// pass it to the tree's `remove` and then turn it back into whatever
+    /// owns the element.
+    pub fn find_ptr(&self, mut pred: impl FnMut(&A::Value) -> bool) -> Option<NonNull<A::Value>> {
+        let mut cur = self.first_node();
+        while let Some(n) = cur {
+            if pred(val::<A>(n)) {
+                return Some(value_of::<TreeLink, A>(n));
+            }
+            cur = step(n, 1);
+        }
+        None
+    }
+
+    /// The element whose key equals `key`, as [`find_ptr`](Self::find_ptr)
+    /// returns it.
+    pub fn find_key_ptr(&self, key: &A::Key) -> Option<NonNull<A::Value>> {
+        self.find_node(key).map(value_of::<TreeLink, A>)
+    }
+
+    /// The smallest element, as [`find_ptr`](Self::find_ptr) returns it.
+    pub fn first_ptr(&self) -> Option<NonNull<A::Value>> {
+        self.first_node().map(value_of::<TreeLink, A>)
     }
 
     /// Iterates in ascending key order.

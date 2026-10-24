@@ -17,8 +17,10 @@ pub mod avltree;
 mod bst;
 pub mod interval;
 pub mod rbtree;
+mod registry;
 
 pub use bst::{Bst, KeyAdapter, TreeIter, TreeLink};
+pub use registry::Registry;
 
 use core::cell::Cell;
 use core::marker::PhantomData;
@@ -46,6 +48,37 @@ fn value_of<L, A: Adapter<L>>(link: NonNull<L>) -> NonNull<A::Value> {
     // SAFETY: inverse of `link_of`; the link was derived from a value.
     unsafe { link.byte_sub(A::OFFSET).cast() }
 }
+
+/// Lets an element that is shared between threads embed a link.
+///
+/// [`Link`] and [`TreeLink`] are not `Sync`, because they change when the
+/// element is linked or unlinked. Wrapping one in `Shared` asserts that this
+/// only happens under the lock around the collection that links it, which is
+/// how these collections are used (see the module documentation). The wrapper
+/// is transparent, so an [`Adapter`] can use the wrapper's offset.
+#[repr(transparent)]
+pub struct Shared<L>(L);
+
+impl<L> Shared<L> {
+    /// Wraps `link`.
+    pub const fn new(link: L) -> Self {
+        Self(link)
+    }
+}
+
+impl<L> core::ops::Deref for Shared<L> {
+    type Target = L;
+
+    fn deref(&self) -> &L {
+        &self.0
+    }
+}
+
+// SAFETY: by the contract above, the link is only changed under the lock
+// around the collection that links it, so no two threads touch it at once.
+unsafe impl<L> Sync for Shared<L> {}
+// SAFETY: as above; a link moves with its element, which is not linked then.
+unsafe impl<L> Send for Shared<L> {}
 
 /// Doubly linked list hook. Embed one in each element of a [`List`].
 pub struct Link {
@@ -207,6 +240,55 @@ impl<A: Adapter<Link>> List<A> {
     /// Unlinks every element.
     pub fn clear(&mut self) {
         while self.pop_front().is_some() {}
+    }
+
+    /// Unlinks every element for which `keep` returns false, front to back.
+    /// Unlinked elements are not touched again.
+    pub fn retain(&mut self, mut keep: impl FnMut(&A::Value) -> bool) {
+        let mut cur = self.head;
+        while let Some(link) = cur {
+            // SAFETY: linked elements are valid; read before a removal clears it.
+            cur = unsafe { link.as_ref() }.next.get();
+            let value = value_of::<Link, A>(link);
+            // SAFETY: as above.
+            if !keep(unsafe { value.as_ref() }) {
+                // SAFETY: linked in `self`.
+                unsafe { self.remove(value) };
+            }
+        }
+    }
+
+    /// The first element, from the front, for which `pred` holds. The
+    /// pointer keeps the provenance of the one that was linked, so the
+    /// caller can pass it to [`remove`](Self::remove) and then turn it back
+    /// into whatever owns the element.
+    pub fn find_ptr(&self, mut pred: impl FnMut(&A::Value) -> bool) -> Option<NonNull<A::Value>> {
+        let mut cur = self.head;
+        while let Some(link) = cur {
+            let value = value_of::<Link, A>(link);
+            // SAFETY: linked elements are valid.
+            if pred(unsafe { value.as_ref() }) {
+                return Some(value);
+            }
+            // SAFETY: as above.
+            cur = unsafe { link.as_ref() }.next.get();
+        }
+        None
+    }
+
+    /// [`find_ptr`](Self::find_ptr), searching from the back.
+    pub fn rfind_ptr(&self, mut pred: impl FnMut(&A::Value) -> bool) -> Option<NonNull<A::Value>> {
+        let mut cur = self.tail;
+        while let Some(link) = cur {
+            let value = value_of::<Link, A>(link);
+            // SAFETY: linked elements are valid.
+            if pred(unsafe { value.as_ref() }) {
+                return Some(value);
+            }
+            // SAFETY: as above.
+            cur = unsafe { link.as_ref() }.prev.get();
+        }
+        None
     }
 
     /// Iterates from front to back.
@@ -451,6 +533,28 @@ mod tests {
         }
         assert_eq!(ids(l.iter()), [1, 2]);
         assert!(!ns[0].link.is_linked());
+    }
+
+    #[test]
+    fn list_find_ptr_searches_both_ways_and_can_remove() {
+        let ns = nodes(5);
+        let mut l = List::<ByLink>::new();
+        for n in &ns {
+            // SAFETY: `ns` outlives the list and does not move.
+            unsafe { l.push_back(NonNull::from(n)) };
+        }
+        // SAFETY: the pointers are to elements of `ns`.
+        let id = |p: Option<NonNull<Node>>| p.map(|p| unsafe { p.as_ref() }.id);
+        assert_eq!(id(l.find_ptr(|n| n.id % 2 == 1)), Some(1));
+        assert_eq!(id(l.rfind_ptr(|n| n.id % 2 == 1)), Some(3));
+        assert_eq!(id(l.find_ptr(|n| n.id > 9)), None);
+        let p = l.rfind_ptr(|n| n.id == 2).unwrap();
+        // SAFETY: linked in `l`.
+        assert!(unsafe { l.remove(p) });
+        assert_eq!(ids(l.iter()), [0, 1, 3, 4]);
+        l.retain(|n| n.id % 2 == 0);
+        assert_eq!(ids(l.iter()), [0, 4]);
+        assert!(!ns[1].link.is_linked() && ns[4].link.is_linked());
     }
 
     #[test]

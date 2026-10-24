@@ -11,3 +11,8 @@ workspace = true
 
 [dependencies]
 osmium-arch.workspace = true
+
+[features]
+# The `fallible` module, which needs the `alloc` crate (and so a global
+# allocator in every binary that links it).
+alloc = []
