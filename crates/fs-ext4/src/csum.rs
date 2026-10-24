@@ -2,6 +2,9 @@
 //! CRC16 (ANSI) for group descriptors under `uninit_bg`. Both are Linux's
 //! raw forms, with no inversion on the way in or out; callers pass the seed.
 
+// invariant: `i` is bounded by the 256-entry table in a const evaluation, which
+// fails the build rather than panicking at run time.
+#[allow(clippy::indexing_slicing)]
 const fn table(poly: u32) -> [u32; 256] {
     let mut table = [0; 256];
     let mut i = 0;
@@ -23,7 +26,7 @@ static CRC16: [u32; 256] = table(0xa001);
 
 pub fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
-        crc = CRC32C[((crc ^ b as u32) & 0xff) as usize] ^ crc >> 8;
+        crc = CRC32C.get(((crc ^ b as u32) & 0xff) as usize).copied().unwrap_or(0) ^ crc >> 8;
     }
     crc
 }
@@ -31,7 +34,7 @@ pub fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
 pub fn crc16(crc: u16, data: &[u8]) -> u16 {
     let mut crc = crc as u32;
     for &b in data {
-        crc = CRC16[((crc ^ b as u32) & 0xff) as usize] ^ crc >> 8;
+        crc = CRC16.get(((crc ^ b as u32) & 0xff) as usize).copied().unwrap_or(0) ^ crc >> 8;
     }
     crc as u16
 }

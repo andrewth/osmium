@@ -12,4 +12,4 @@ workspace = true
 [dependencies]
 osmium-fs.workspace = true
 osmium-hal.workspace = true
-osmium-sync.workspace = true
+osmium-sync = { workspace = true, features = ["alloc"] }

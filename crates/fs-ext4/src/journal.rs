@@ -22,14 +22,14 @@
 //! and a log that wraps. Journals with other features (external journals,
 //! `csum_v2`, `async_commit`, fast commits) are not understood.
 
-use alloc::collections::BTreeMap;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use osmium_fs::{Errno, FileKind};
 use osmium_hal::block::BlockDevice;
+use osmium_sync::arc::ArcTree;
+use osmium_sync::fallible::{try_push, try_zeroed};
 
-use super::{COMPAT_HAS_JOURNAL, Fs, SUPERBLOCK_LEN, SUPERBLOCK_OFFSET, crc32c, get32, sb};
+use super::{ByBlock, COMPAT_HAS_JOURNAL, Fs, SUPERBLOCK_OFFSET, byte, crc32c, get32, or_byte, put_bytes, sb, sub};
 
 const MAGIC: u32 = 0xc03b_3998;
 
@@ -71,20 +71,28 @@ const FLAG_LAST_TAG: u16 = 8;
 /// Linux refuses journals smaller than this many blocks.
 const MIN_BLOCKS: u64 = 1024;
 
+/// Big-endian fields. As in the file system proper, a field past the end of
+/// its block reads as zero and ignores writes.
 fn be32(buf: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes(buf[off..off + 4].try_into().expect("four bytes"))
+    off.checked_add(4)
+        .and_then(|end| buf.get(off..end))
+        .and_then(|b| b.first_chunk::<4>())
+        .map_or(0, |b| u32::from_be_bytes(*b))
 }
 
 fn be16(buf: &[u8], off: usize) -> u16 {
-    u16::from_be_bytes([buf[off], buf[off + 1]])
+    off.checked_add(2)
+        .and_then(|end| buf.get(off..end))
+        .and_then(|b| b.first_chunk::<2>())
+        .map_or(0, |b| u16::from_be_bytes(*b))
 }
 
 fn put_be32(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
+    let _ = put_bytes(buf, off, &val.to_be_bytes());
 }
 
 fn put_be16(buf: &mut [u8], off: usize, val: u16) {
-    buf[off..off + 2].copy_from_slice(&val.to_be_bytes());
+    let _ = put_bytes(buf, off, &val.to_be_bytes());
 }
 
 /// Starts a descriptor, commit or revoke block.
@@ -121,7 +129,11 @@ pub(super) struct Journal {
     /// A transaction failed to reach the disk. The log may hold a committed
     /// transaction that was not checkpointed, so it must stay for the next
     /// mount to replay.
-    failed: bool,
+    pub(super) failed: bool,
+    /// Room for a transaction's descriptor block, commit block and an
+    /// escaped copy of a data block, reserved here so that committing never
+    /// has to allocate.
+    scratch: Vec<u8>,
 }
 
 impl Journal {
@@ -167,12 +179,12 @@ impl Journal {
         if incompat & !INCOMPAT_SUPPORTED != 0
             || ro_compat != 0
             || (be32(&block, 4) == SUPER_V2 && be32(&block, jsb::NR_USERS) > 1)
-            || (incompat & INCOMPAT_CSUM_V3 != 0 && block[jsb::CHECKSUM_TYPE] != CRC32C_TYPE)
+            || (incompat & INCOMPAT_CSUM_V3 != 0 && byte(&block, jsb::CHECKSUM_TYPE) != CRC32C_TYPE)
         {
             return Ok(None);
         }
         let csum = incompat & INCOMPAT_CSUM_V3 != 0;
-        let seed = crc32c(!0, &block[jsb::UUID..jsb::UUID + 16]);
+        let seed = crc32c(!0, sub(&block, jsb::UUID..jsb::UUID + 16));
         let mut journal = Journal {
             runs: Vec::new(),
             sb: block,
@@ -184,6 +196,7 @@ impl Journal {
             seed,
             dirty: false,
             failed: false,
+            scratch: try_zeroed(3 * fs.block_size)?,
         };
         if csum && journal.super_csum() != be32(&journal.sb, jsb::CHECKSUM) {
             return Err(Errno::EINVAL);
@@ -195,7 +208,7 @@ impl Journal {
             }
             match journal.runs.last_mut() {
                 Some((lstart, pstart, n)) if *lstart + *n == l && *pstart + *n == p => *n += 1,
-                _ => journal.runs.push((l, p, 1)),
+                _ => try_push(&mut journal.runs, (l, p, 1))?,
             }
         }
         journal.sequence = be32(&journal.sb, jsb::SEQUENCE).wrapping_add(1);
@@ -204,31 +217,35 @@ impl Journal {
 
     /// The checksum of the journal superblock.
     fn super_csum(&self) -> u32 {
-        let mut copy = self.sb[..jsb::LEN].to_vec();
-        copy[jsb::CHECKSUM..jsb::CHECKSUM + 4].fill(0);
-        crc32c(!0, &copy)
+        // Over the superblock with its checksum field read as zero.
+        let (at, end) = (jsb::CHECKSUM, jsb::CHECKSUM + 4);
+        crc32c(crc32c(crc32c(!0, sub(&self.sb, 0..at)), &[0; 4]), sub(&self.sb, end..jsb::LEN))
     }
 
     /// The file system block holding journal block `l`.
-    fn phys(&self, l: u32) -> u64 {
+    fn phys(&self, l: u32) -> Result<u64, Errno> {
         let l = l as u64;
         let i = self.runs.partition_point(|&(start, _, _)| start <= l);
-        let (start, p, _) = self.runs[i - 1];
-        p + (l - start)
+        let &(start, p, n) = i.checked_sub(1).and_then(|i| self.runs.get(i)).ok_or(Errno::EIO)?;
+        if l - start >= n {
+            return Err(Errno::EIO);
+        }
+        p.checked_add(l - start).ok_or(Errno::EIO)
     }
 
     fn read_log<D: BlockDevice + Send + 'static>(&self, fs: &mut Fs<D>, l: u32) -> Result<Vec<u8>, Errno> {
-        fs.dev_read_block(self.phys(l))
+        fs.dev_read_block(self.phys(l)?)
     }
 
     fn write_log<D: BlockDevice + Send + 'static>(&self, fs: &mut Fs<D>, l: u32, buf: &[u8]) -> Result<(), Errno> {
-        fs.dev_write_block(self.phys(l), buf)
+        fs.dev_write_block(self.phys(l)?, buf)
     }
 
     /// The log position `n` blocks after `pos`, wrapping past the end.
     fn advance(&self, pos: u32, n: u64) -> u32 {
-        let span = (self.len - self.first) as u64;
-        self.first + (((pos - self.first) as u64 + n) % span) as u32
+        let span = u64::from(self.len.saturating_sub(self.first)).max(1);
+        let from = u64::from(pos.saturating_sub(self.first));
+        self.first.wrapping_add((from.wrapping_add(n) % span) as u32)
     }
 
     /// Rewrites the journal superblock to say the log starts at `start`
@@ -272,29 +289,26 @@ impl Journal {
         if !self.csum {
             return true;
         }
-        let end = block.len() - 4;
-        let mut copy = block.to_vec();
-        copy[end..].fill(0);
-        crc32c(self.seed, &copy) == be32(block, end)
+        let end = block.len().saturating_sub(4);
+        crc32c(crc32c(self.seed, sub(block, 0..end)), &[0; 4]) == be32(block, end)
     }
 
     fn commit_csum(&self, block: &[u8]) -> u32 {
-        let mut copy = block.to_vec();
-        copy[16..20].fill(0);
-        crc32c(self.seed, &copy)
+        // Over the block with the checksum field read as zero.
+        crc32c(crc32c(crc32c(self.seed, sub(block, 0..16)), &[0; 4]), block.get(20..).unwrap_or(&[]))
     }
 
     /// The tags in a descriptor block.
-    fn tags(&self, block: &[u8]) -> Vec<Tag> {
+    fn tags(&self, block: &[u8]) -> Result<Vec<Tag>, Errno> {
         let tag_bytes = self.tag_bytes();
-        let end = block.len() - self.tail_bytes();
+        let end = block.len().saturating_sub(self.tail_bytes());
         let mut tags = Vec::new();
         let mut off = 12;
         while off + tag_bytes <= end {
             let flags = be16(block, off + 6);
             let high = if self.wide { (be32(block, off + 8) as u64) << 32 } else { 0 };
             let csum = if self.csum { be32(block, off + 12) } else { 0 };
-            tags.push(Tag { block: be32(block, off) as u64 | high, flags, csum });
+            try_push(&mut tags, Tag { block: be32(block, off) as u64 | high, flags, csum })?;
             off += tag_bytes;
             if flags & FLAG_SAME_UUID == 0 {
                 off += 16;
@@ -303,7 +317,7 @@ impl Journal {
                 break;
             }
         }
-        tags
+        Ok(tags)
     }
 
     /// The checksum of a data block as the log holds it.
@@ -332,7 +346,7 @@ impl Journal {
                     break;
                 }
                 let blocks = match be32(&block, 4) {
-                    DESCRIPTOR if self.tail_ok(&block) => 1 + self.tags(&block).len() as u64,
+                    DESCRIPTOR if self.tail_ok(&block) => 1 + self.tags(&block)?.len() as u64,
                     REVOKE if self.tail_ok(&block) => 1,
                     COMMIT if self.csum_ok_commit(&block) => {
                         id = id.wrapping_add(1);
@@ -370,25 +384,36 @@ impl Journal {
         start: u32,
         first_id: u32,
         end_id: u32,
-    ) -> Result<BTreeMap<u64, u32>, Errno> {
-        let mut revoked = BTreeMap::new();
+    ) -> Result<Vec<(u64, u32)>, Errno> {
+        // Sorted by block.
+        let mut revoked: Vec<(u64, u32)> = Vec::new();
         let record = if self.wide { 8 } else { 4 };
         let (mut id, mut pos) = (first_id, start);
         while id != end_id {
             let block = self.read_log(fs, pos)?;
             let mut blocks = 1;
             match be32(&block, 4) {
-                DESCRIPTOR => blocks += self.tags(&block).len() as u64,
+                DESCRIPTOR => blocks += self.tags(&block)?.len() as u64,
                 COMMIT => id = id.wrapping_add(1),
                 REVOKE => {
-                    let used = (be32(&block, 12) as usize).min(block.len() - self.tail_bytes());
+                    let used = (be32(&block, 12) as usize).min(block.len().saturating_sub(self.tail_bytes()));
                     for off in (16..used.saturating_sub(record - 1)).step_by(record) {
                         let b = if self.wide {
-                            u64::from_be_bytes(block[off..off + 8].try_into().expect("eight bytes"))
+                            (be32(&block, off) as u64) << 32 | be32(&block, off + 4) as u64
                         } else {
                             be32(&block, off) as u64
                         };
-                        revoked.insert(b, id);
+                        match revoked.binary_search_by_key(&b, |&(block, _)| block) {
+                            Ok(i) => {
+                                if let Some(slot) = revoked.get_mut(i) {
+                                    slot.1 = id;
+                                }
+                            }
+                            Err(i) => {
+                                revoked.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+                                revoked.insert(i, (b, id));
+                            }
+                        }
                     }
                 }
                 _ => return Err(Errno::EINVAL),
@@ -406,7 +431,7 @@ impl Journal {
         start: u32,
         first_id: u32,
         end_id: u32,
-        revoked: &BTreeMap<u64, u32>,
+        revoked: &[(u64, u32)],
     ) -> Result<(), Errno> {
         let (mut id, mut pos) = (first_id, start);
         while id != end_id {
@@ -414,14 +439,15 @@ impl Journal {
             let mut blocks = 1;
             match be32(&block, 4) {
                 DESCRIPTOR => {
-                    let tags = self.tags(&block);
+                    let tags = self.tags(&block)?;
                     blocks += tags.len() as u64;
                     for (i, tag) in tags.iter().enumerate() {
                         // Block 0 holds the superblock when blocks are over 1 KiB.
                         if tag.block >= fs.blocks_count() {
                             return Err(Errno::EINVAL);
                         }
-                        if revoked.get(&tag.block).is_some_and(|&r| r.wrapping_sub(id) as i32 >= 0) {
+                        let revoked_at = revoked.binary_search_by_key(&tag.block, |&(block, _)| block).ok();
+                        if revoked_at.and_then(|i| revoked.get(i)).is_some_and(|r| r.1.wrapping_sub(id) as i32 >= 0) {
                             continue;
                         }
                         let mut data = self.read_log(fs, self.advance(pos, 1 + i as u64))?;
@@ -447,7 +473,7 @@ impl Journal {
     /// How many of `n` blocks fit in the log with their descriptors and a
     /// commit block.
     fn fit(&self, n: usize, block_size: usize) -> usize {
-        let per_descriptor = (block_size - 12 - self.tail_bytes() - 16) / self.tag_bytes();
+        let per_descriptor = (block_size.saturating_sub(12 + self.tail_bytes() + 16) / self.tag_bytes()).max(1);
         let space = (self.len - self.first) as usize;
         let cost = |k: usize| k + k.div_ceil(per_descriptor) + 1;
         let mut k = n.min(space);
@@ -457,30 +483,65 @@ impl Journal {
         k
     }
 
-    /// Logs and checkpoints `blocks`, as one transaction if they fit the
-    /// log and as several in turn if they do not.
+    /// Logs and checkpoints the blocks of `tx`, as one transaction if they
+    /// fit the log and as several in turn if they do not. Allocates nothing.
     pub(super) fn commit<D: BlockDevice + Send + 'static>(
         &mut self,
         fs: &mut Fs<D>,
-        mut blocks: &[(u64, Vec<u8>)],
+        tx: &ArcTree<ByBlock>,
     ) -> Result<(), Errno> {
-        while !blocks.is_empty() {
-            let n = self.fit(blocks.len(), fs.block_size);
-            self.transaction(fs, &blocks[..n])?;
-            blocks = &blocks[n..];
+        let total = tx.len();
+        let mut done = 0;
+        while done < total {
+            let n = self.fit(total - done, fs.block_size);
+            self.transaction(fs, tx, done, n)?;
+            done += n;
         }
         Ok(())
     }
 
+    /// `data` as the log holds it: escaped, in `scratch`, if it starts like a
+    /// journal block (replay must not mistake it for one); and whether it was.
+    fn escape<'a>(data: &'a [u8], scratch: &'a mut [u8]) -> Result<(&'a [u8], bool), Errno> {
+        if be32(data, 0) != MAGIC {
+            return Ok((data, false));
+        }
+        let copy = scratch.get_mut(..data.len()).ok_or(Errno::EIO)?;
+        copy.copy_from_slice(data);
+        put_bytes(copy, 0, &[0; 4])?;
+        Ok((copy, true))
+    }
+
+    /// Logs the `count` blocks of `tx` after the first `skip`, as one
+    /// transaction.
     fn transaction<D: BlockDevice + Send + 'static>(
         &mut self,
         fs: &mut Fs<D>,
-        blocks: &[(u64, Vec<u8>)],
+        tx: &ArcTree<ByBlock>,
+        skip: usize,
+        count: usize,
+    ) -> Result<(), Errno> {
+        // Out of `self` while it is used, so the journal can still be read.
+        let mut scratch = core::mem::take(&mut self.scratch);
+        let result = self.log_transaction(fs, tx, skip, count, &mut scratch);
+        self.scratch = scratch;
+        result
+    }
+
+    fn log_transaction<D: BlockDevice + Send + 'static>(
+        &mut self,
+        fs: &mut Fs<D>,
+        tx: &ArcTree<ByBlock>,
+        skip: usize,
+        count: usize,
+        scratch: &mut [u8],
     ) -> Result<(), Errno> {
         let bs = fs.block_size;
         let id = self.sequence;
         let tag_bytes = self.tag_bytes();
         let limit = bs - self.tail_bytes();
+        let (descriptor, rest) = scratch.split_at_mut_checked(bs).ok_or(Errno::EIO)?;
+        let (commit, escaped) = rest.split_at_mut_checked(bs).ok_or(Errno::EIO)?;
         if !self.dirty {
             fs.set_disk_needs_recovery(true)?;
             self.dirty = true;
@@ -488,68 +549,75 @@ impl Journal {
         self.update_super(fs, self.first, id)?;
         let mut pos = self.first;
         let mut next = 0;
-        while next < blocks.len() {
-            let mut descriptor = vec![0; bs];
-            put_header(&mut descriptor, DESCRIPTOR, id);
-            let mut logged: Vec<Vec<u8>> = Vec::new();
+        while next < count {
+            descriptor.fill(0);
+            put_header(descriptor, DESCRIPTOR, id);
             let (mut off, mut last) = (12, 12);
-            while next < blocks.len() && off + tag_bytes + if logged.is_empty() { 16 } else { 0 } <= limit {
-                let (b, data) = &blocks[next];
-                if !self.wide && *b > u32::MAX as u64 {
+            // The blocks this descriptor names.
+            let mut batch = 0;
+            for t in tx.iter().skip(skip + next).take(count - next) {
+                if off + tag_bytes + if batch == 0 { 16 } else { 0 } > limit {
+                    break;
+                }
+                let b = t.blk;
+                if !self.wide && b > u32::MAX as u64 {
                     return Err(Errno::EIO);
                 }
-                let mut data = data.clone();
-                let mut flags = if logged.is_empty() { 0 } else { FLAG_SAME_UUID };
-                if be32(&data, 0) == MAGIC {
-                    // Replay must not mistake the block for a journal block.
-                    data[..4].fill(0);
+                let (data, escape) = Self::escape(t.bytes(), escaped)?;
+                let mut flags = if batch == 0 { 0 } else { FLAG_SAME_UUID };
+                if escape {
                     flags |= FLAG_ESCAPE;
                 }
-                put_be32(&mut descriptor, off, *b as u32);
+                put_be32(descriptor, off, b as u32);
                 if self.csum {
-                    put_be32(&mut descriptor, off + 4, flags as u32);
-                    put_be32(&mut descriptor, off + 8, (*b >> 32) as u32);
-                    put_be32(&mut descriptor, off + 12, self.data_csum(id, &data));
+                    put_be32(descriptor, off + 4, flags as u32);
+                    put_be32(descriptor, off + 8, (b >> 32) as u32);
+                    put_be32(descriptor, off + 12, self.data_csum(id, data));
                 } else {
-                    put_be16(&mut descriptor, off + 6, flags);
+                    put_be16(descriptor, off + 6, flags);
                     if self.wide {
-                        put_be32(&mut descriptor, off + 8, (*b >> 32) as u32);
+                        put_be32(descriptor, off + 8, (b >> 32) as u32);
                     }
                 }
                 last = off;
                 off += tag_bytes;
-                if logged.is_empty() {
-                    descriptor[off..off + 16].copy_from_slice(&self.sb[jsb::UUID..jsb::UUID + 16]);
+                if batch == 0 {
+                    put_bytes(descriptor, off, sub(&self.sb, jsb::UUID..jsb::UUID + 16))?;
                     off += 16;
                 }
-                logged.push(data);
-                next += 1;
+                batch += 1;
             }
-            descriptor[last + 7] |= FLAG_LAST_TAG as u8;
+            if batch == 0 {
+                // The transaction names fewer blocks than it was sized for.
+                return Err(Errno::EIO);
+            }
+            or_byte(descriptor, last + 7, FLAG_LAST_TAG as u8)?;
             if self.csum {
-                let sum = crc32c(self.seed, &descriptor);
-                put_be32(&mut descriptor, bs - 4, sum);
+                let sum = crc32c(self.seed, descriptor);
+                put_be32(descriptor, bs - 4, sum);
             }
-            self.write_log(fs, pos, &descriptor)?;
+            self.write_log(fs, pos, descriptor)?;
             pos = self.advance(pos, 1);
-            for data in &logged {
+            for t in tx.iter().skip(skip + next).take(batch) {
+                let (data, _) = Self::escape(t.bytes(), escaped)?;
                 self.write_log(fs, pos, data)?;
                 pos = self.advance(pos, 1);
             }
+            next += batch;
         }
         // The commit block must not reach the disk before what it commits.
         fs.flush()?;
-        let mut commit = vec![0; bs];
-        put_header(&mut commit, COMMIT, id);
-        commit[48..56].copy_from_slice(&(fs.now() as u64).to_be_bytes());
+        commit.fill(0);
+        put_header(commit, COMMIT, id);
+        put_bytes(commit, 48, &(fs.now() as u64).to_be_bytes())?;
         if self.csum {
-            let sum = self.commit_csum(&commit);
-            put_be32(&mut commit, 16, sum);
+            let sum = self.commit_csum(commit);
+            put_be32(commit, 16, sum);
         }
-        self.write_log(fs, pos, &commit)?;
+        self.write_log(fs, pos, commit)?;
         fs.flush()?;
-        for (b, data) in blocks {
-            fs.dev_write_block(*b, data)?;
+        for t in tx.iter().skip(skip).take(count) {
+            fs.dev_write_block(t.blk, t.bytes())?;
         }
         fs.flush()?;
         self.sequence = id.wrapping_add(1);
@@ -574,16 +642,23 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     /// Sets or clears the `needs_recovery` flag in the superblock on disk,
     /// leaving the rest of it as the last checkpoint wrote it.
     pub(super) fn set_disk_needs_recovery(&mut self, on: bool) -> Result<(), Errno> {
-        let mut disk = vec![0; SUPERBLOCK_LEN];
-        self.dev_read_bytes(SUPERBLOCK_OFFSET, &mut disk)?;
-        let flags = get32(&disk, sb::FEATURE_INCOMPAT);
+        // The buffer is out of `self` while it is used.
+        let mut disk = core::mem::take(&mut self.sb_copy);
+        let result = self.set_disk_flag(&mut disk, on);
+        self.sb_copy = disk;
+        result
+    }
+
+    fn set_disk_flag(&mut self, disk: &mut [u8], on: bool) -> Result<(), Errno> {
+        self.dev_read_bytes(SUPERBLOCK_OFFSET, disk)?;
+        let flags = get32(disk, sb::FEATURE_INCOMPAT);
         let flags = if on { flags | super::INCOMPAT_RECOVER } else { flags & !super::INCOMPAT_RECOVER };
-        super::put32(&mut disk, sb::FEATURE_INCOMPAT, flags);
+        super::put32(disk, sb::FEATURE_INCOMPAT, flags);
         if self.csum == super::Csum::Crc32c {
-            let sum = crc32c(!0, &disk[..sb::CHECKSUM]);
-            super::put32(&mut disk, sb::CHECKSUM, sum);
+            let sum = crc32c(!0, sub(disk, 0..sb::CHECKSUM));
+            super::put32(disk, sb::CHECKSUM, sum);
         }
-        self.dev_write_bytes(SUPERBLOCK_OFFSET, &disk)?;
+        self.dev_write_bytes(SUPERBLOCK_OFFSET, disk)?;
         self.flush()
     }
 
@@ -596,9 +671,15 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     /// memory may then be ahead of the disk.
     pub(super) fn commit(&mut self) -> Result<(), Errno> {
         self.tx_freed.clear();
-        let Some(mut journal) = self.journal.take() else { return Ok(()) };
-        let blocks: Vec<(u64, Vec<u8>)> = core::mem::take(&mut self.tx).into_iter().collect();
-        let result = if journal.failed { Err(Errno::EIO) } else { journal.commit(self, &blocks) };
+        let tx = core::mem::take(&mut self.tx);
+        let Some(mut journal) = self.journal.take() else {
+            // No journal: the blocks go straight to their places.
+            for t in tx.iter() {
+                self.dev_write_block(t.blk, t.bytes())?;
+            }
+            return Ok(());
+        };
+        let result = if journal.failed { Err(Errno::EIO) } else { journal.commit(self, &tx) };
         if result.is_err() {
             journal.failed = true;
             self.read_only = true;
@@ -612,6 +693,13 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     /// block, as it was when changes went straight to the disk.
     pub(super) fn transact<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Errno>) -> Result<T, Errno> {
         let result = f(self);
+        if matches!(result, Err(Errno::ENOMEM)) {
+            // Out of memory part way: the operation had half-done effects
+            // that nothing can finish. Undo them all, so it is as if it never
+            // began.
+            self.abort();
+            return result;
+        }
         let committed = self.commit();
         let value = result?;
         committed.map(|()| value)

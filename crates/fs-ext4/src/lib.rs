@@ -44,14 +44,17 @@ mod csum;
 mod extent;
 mod journal;
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::mem::{MaybeUninit, offset_of};
 
 use osmium_hal::block::{BlockDevice, BlockError};
-use osmium_sync::SpinLock;
+use osmium_sync::arc::ArcTree;
+use osmium_sync::fallible::{OutOfMemory, init_arc, try_arc, try_arc_uninit, try_to_vec, try_zeroed};
+use osmium_sync::intrusive::{Adapter, KeyAdapter, Registry, Shared as SharedLink, TreeLink};
+use osmium_sync::{Once, SpinLock};
 
 use csum::{crc16, crc32c};
 use journal::Journal;
@@ -185,20 +188,63 @@ mod ino {
     pub const CHECKSUM_HI: usize = 0x82;
 }
 
+/// Little-endian field readers and writers. A field past the end of its
+/// buffer reads as zero and ignores writes: callers size buffers from
+/// validated geometry, and a hostile image must not turn a short buffer into
+/// a panic.
 fn get16(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
+    off.checked_add(2)
+        .and_then(|end| buf.get(off..end))
+        .and_then(|b| b.first_chunk::<2>())
+        .map_or(0, |b| u16::from_le_bytes(*b))
 }
 
 fn get32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    off.checked_add(4)
+        .and_then(|end| buf.get(off..end))
+        .and_then(|b| b.first_chunk::<4>())
+        .map_or(0, |b| u32::from_le_bytes(*b))
 }
 
 fn put16(buf: &mut [u8], off: usize, val: u16) {
-    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
+    if let Some(dst) = off.checked_add(2).and_then(|end| buf.get_mut(off..end)) {
+        dst.copy_from_slice(&val.to_le_bytes());
+    }
 }
 
 fn put32(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+    if let Some(dst) = off.checked_add(4).and_then(|end| buf.get_mut(off..end)) {
+        dst.copy_from_slice(&val.to_le_bytes());
+    }
+}
+
+/// `buf[range]`, or nothing if the range is not inside it.
+fn sub(buf: &[u8], range: core::ops::Range<usize>) -> &[u8] {
+    buf.get(range).unwrap_or(&[])
+}
+
+/// The byte at `off`, or zero past the end.
+fn byte(buf: &[u8], off: usize) -> u8 {
+    buf.get(off).copied().unwrap_or(0)
+}
+
+/// Copies `src` to `dst[at..]`; `EIO` if it does not fit.
+fn put_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Result<(), Errno> {
+    let end = at.checked_add(src.len()).ok_or(Errno::EIO)?;
+    dst.get_mut(at..end).ok_or(Errno::EIO)?.copy_from_slice(src);
+    Ok(())
+}
+
+/// Sets `buf[range]` to `value`; `EIO` if the range is not inside it.
+fn fill_range(buf: &mut [u8], range: core::ops::Range<usize>, value: u8) -> Result<(), Errno> {
+    buf.get_mut(range).ok_or(Errno::EIO)?.fill(value);
+    Ok(())
+}
+
+/// ORs `mask` into `buf[at]`; `EIO` past the end.
+fn or_byte(buf: &mut [u8], at: usize, mask: u8) -> Result<(), Errno> {
+    *buf.get_mut(at).ok_or(Errno::EIO)? |= mask;
+    Ok(())
 }
 
 fn io_error(e: BlockError) -> Errno {
@@ -240,8 +286,11 @@ fn rec_len_for(len: usize) -> usize {
 
 /// Sets `count` bits from `start` in a bitmap.
 fn set_bits(bits: &mut [u8], start: usize, count: usize) {
-    for i in start..start + count {
-        bits[i / 8] |= 1 << (i % 8);
+    for i in start..start.saturating_add(count) {
+        match bits.get_mut(i / 8) {
+            Some(b) => *b |= 1 << (i % 8),
+            None => break,
+        }
     }
 }
 
@@ -307,7 +356,7 @@ impl Inode {
     }
 
     fn add_sectors(&mut self, delta: i64) {
-        let v = (self.sectors() as i64 + delta).max(0) as u64;
+        let v = (self.sectors() as i64).saturating_add(delta).max(0) as u64;
         put32(&mut self.raw, ino::BLOCKS, v as u32);
         put16(&mut self.raw, ino::BLOCKS_HIGH, (v >> 32) as u16);
     }
@@ -351,6 +400,14 @@ struct Fs<D: BlockDevice + Send + 'static> {
     block_size: usize,
     /// The primary superblock's bytes.
     sb: Vec<u8>,
+    /// A device block of scratch for `dev_read_bytes`, reserved at mount so
+    /// that undoing an operation (see `Fs::abort`) cannot run out of memory.
+    bounce: Vec<u8>,
+    /// Buffers for rewriting the superblock on disk, which committing the
+    /// first transaction does: reserved at mount, since a commit must not
+    /// allocate.
+    sb_copy: Vec<u8>,
+    write_scratch: Vec<u8>,
     /// Every group descriptor's bytes, back to back.
     groups: Vec<u8>,
     group_count: u32,
@@ -373,8 +430,9 @@ struct Fs<D: BlockDevice + Send + 'static> {
     read_only: bool,
     clock: fn() -> u32,
     /// One node per in-use inode, so an unlinked file is freed when its
-    /// last reference goes.
-    nodes: BTreeMap<u32, Weak<Node<D>>>,
+    /// last reference goes. It does not own them: each leaves it when it is
+    /// dropped.
+    nodes: Registry<ByIno<D>>,
     st_dev: u64,
     /// Sorted, disjoint block ranges `[start, end)` holding superblock
     /// backups, descriptors, bitmaps and inode tables, which file data and
@@ -384,11 +442,96 @@ struct Fs<D: BlockDevice + Send + 'static> {
     /// writes then collect in `tx` until the operation ends.
     journal: Option<journal::Journal>,
     /// The metadata blocks the operation in progress has changed, by block.
-    tx: BTreeMap<u64, Vec<u8>>,
+    tx: ArcTree<ByBlock>,
     /// Block ranges `[start, end)` the operation has freed, which it must
     /// not allocate again: until the transaction commits, a crash brings
     /// them back as they were.
-    tx_freed: BTreeMap<u64, u64>,
+    tx_freed: ArcTree<ByStart>,
+}
+
+/// A metadata block the operation in progress has changed.
+struct TxBlock {
+    blk: u64,
+    /// The new contents, a whole block; only touched with the file system's
+    /// lock held (see [`Fs::tx_block_mut`]).
+    data: UnsafeCell<Vec<u8>>,
+    link: SharedLink<TreeLink>,
+}
+
+// SAFETY: the data is only accessed with the file system's lock held.
+unsafe impl Sync for TxBlock {}
+
+impl TxBlock {
+    /// A block over a copy of `data`, made before it is needed.
+    fn new(blk: u64, data: &[u8]) -> Result<Arc<Self>, OutOfMemory> {
+        try_arc(TxBlock { blk, data: UnsafeCell::new(try_to_vec(data)?), link: SharedLink::new(TreeLink::new()) })
+    }
+
+    /// A block over `data`, which it keeps.
+    fn from_vec(blk: u64, data: Vec<u8>) -> Result<Arc<Self>, OutOfMemory> {
+        try_arc(TxBlock { blk, data: UnsafeCell::new(data), link: SharedLink::new(TreeLink::new()) })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: see the type's documentation; no `&mut` is out while the
+        // caller has `&self` of the file system.
+        unsafe { &*self.data.get() }
+    }
+}
+
+struct ByBlock;
+
+// SAFETY: `offset_of!` of a `SharedLink<TreeLink>`, which is a `TreeLink`.
+unsafe impl Adapter<TreeLink> for ByBlock {
+    type Value = TxBlock;
+    const OFFSET: usize = offset_of!(TxBlock, link);
+}
+
+impl KeyAdapter<TreeLink> for ByBlock {
+    type Key = u64;
+
+    fn key(t: &TxBlock) -> &u64 {
+        &t.blk
+    }
+}
+
+/// A block range the operation in progress has freed.
+struct Freed {
+    start: u64,
+    end: u64,
+    link: SharedLink<TreeLink>,
+}
+
+struct ByStart;
+
+// SAFETY: as for `ByBlock`.
+unsafe impl Adapter<TreeLink> for ByStart {
+    type Value = Freed;
+    const OFFSET: usize = offset_of!(Freed, link);
+}
+
+impl KeyAdapter<TreeLink> for ByStart {
+    type Key = u64;
+
+    fn key(f: &Freed) -> &u64 {
+        &f.start
+    }
+}
+
+struct ByIno<D>(core::marker::PhantomData<D>);
+
+// SAFETY: as for `ByBlock`.
+unsafe impl<D: BlockDevice + Send + 'static> Adapter<TreeLink> for ByIno<D> {
+    type Value = Node<D>;
+    const OFFSET: usize = offset_of!(Node<D>, link);
+}
+
+impl<D: BlockDevice + Send + 'static> KeyAdapter<TreeLink> for ByIno<D> {
+    type Key = u32;
+
+    fn key(n: &Node<D>) -> &u32 {
+        &n.ino
+    }
 }
 
 /// An ext2, ext3 or ext4 file system on a block device.
@@ -404,6 +547,31 @@ struct Shared<D: BlockDevice + Send + 'static> {
 struct Node<D: BlockDevice + Send + 'static> {
     shared: Arc<Shared<D>>,
     ino: u32,
+    /// Itself, for [`Fs::nodes`] to hand out references without allocating.
+    me: Once<Weak<Node<D>>>,
+    link: SharedLink<TreeLink>,
+}
+
+/// `raw` as text, with anything that is not UTF-8 replaced (like
+/// `String::from_utf8_lossy`), failing instead of panicking if memory runs out.
+fn lossy(raw: &[u8]) -> Result<String, OutOfMemory> {
+    let mut s = String::new();
+    // An invalid byte becomes a three-byte replacement character.
+    s.try_reserve_exact(raw.len().saturating_mul(3))?;
+    for chunk in raw.utf8_chunks() {
+        s.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            s.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    Ok(s)
+}
+
+/// Bytes of device blocks that hold the superblock.
+fn super_span(dev_bs: usize) -> usize {
+    let bs = dev_bs.max(1);
+    let (first, last) = (SUPERBLOCK_OFFSET as usize / bs, (SUPERBLOCK_OFFSET as usize + SUPERBLOCK_LEN - 1) / bs);
+    (last - first + 1) * bs
 }
 
 fn no_clock() -> u32 {
@@ -419,11 +587,17 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
     /// recovery is replayed, so mounting writes to the device.
     pub fn mount(dev: D, devno: u64) -> Result<Self, Errno> {
         let dev_bs = dev.block_size();
+        if dev_bs == 0 {
+            return Err(Errno::EINVAL);
+        }
         let mut fs = Fs {
             dev,
             dev_per_block: 1,
             block_size: dev_bs,
-            sb: vec![0; SUPERBLOCK_LEN],
+            sb: try_zeroed(SUPERBLOCK_LEN)?,
+            bounce: try_zeroed(dev_bs)?,
+            sb_copy: try_zeroed(SUPERBLOCK_LEN)?,
+            write_scratch: try_zeroed(super_span(dev_bs))?,
             groups: Vec::new(),
             group_count: 0,
             desc_size: 32,
@@ -439,12 +613,12 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
             csum_seed: 0,
             read_only: false,
             clock: no_clock,
-            nodes: BTreeMap::new(),
+            nodes: Registry::new(),
             st_dev: devno,
             meta_zones: Vec::new(),
             journal: None,
-            tx: BTreeMap::new(),
-            tx_freed: BTreeMap::new(),
+            tx: ArcTree::new(),
+            tx_freed: ArcTree::new(),
         };
         fs.load()?;
         let mut journal = Journal::open(&mut fs)?;
@@ -466,7 +640,7 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
             put32(&mut fs.sb, sb::FEATURE_INCOMPAT, flags);
             fs.journal = Some(journal);
         }
-        let shared = Arc::new(Shared { fs: SpinLock::new(fs) });
+        let shared = try_arc(Shared { fs: SpinLock::new(fs) })?;
         Ok(Ext2 { shared })
     }
 
@@ -488,9 +662,11 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
     }
 
     /// The root directory, to pass to [`Vfs::mount`](osmium_fs::Vfs::mount).
-    pub fn root(&self) -> Arc<dyn File> {
+    ///
+    /// Fails with `ENOMEM` if memory runs out.
+    pub fn root(&self) -> Result<Arc<dyn File>, Errno> {
         let mut fs = self.shared.fs.lock();
-        fs.node(&self.shared, ROOT_INO)
+        fs.node(&self.shared, ROOT_INO, None)
     }
 
     /// Unmounts, returning the device once no node is in use; otherwise
@@ -526,7 +702,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         self.inode_size = 128;
         self.first_ino = 11;
         self.groups.clear();
-        let mut sbuf = vec![0; SUPERBLOCK_LEN];
+        let mut sbuf = try_zeroed(SUPERBLOCK_LEN)?;
         self.read_bytes(SUPERBLOCK_OFFSET, &mut sbuf)?;
         self.sb = sbuf;
         if get16(&self.sb, sb::MAGIC) != MAGIC {
@@ -566,17 +742,17 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             self.dir_nlink = ro & RO_COMPAT_DIR_NLINK != 0;
             if ro & RO_COMPAT_METADATA_CSUM != 0 {
                 // 1 is CRC32C, the only type there is.
-                if self.sb[sb::CHECKSUM_TYPE] != 1 {
+                if byte(&self.sb, sb::CHECKSUM_TYPE) != 1 {
                     return Err(Errno::ENOSYS);
                 }
-                if get32(&self.sb, sb::CHECKSUM) != crc32c(!0, &self.sb[..sb::CHECKSUM]) {
+                if get32(&self.sb, sb::CHECKSUM) != crc32c(!0, sub(&self.sb, 0..sb::CHECKSUM)) {
                     return Err(Errno::EINVAL);
                 }
                 self.csum = Csum::Crc32c;
                 self.csum_seed = if incompat & INCOMPAT_CSUM_SEED != 0 {
                     get32(&self.sb, sb::CHECKSUM_SEED)
                 } else {
-                    crc32c(!0, &self.sb[sb::UUID..sb::UUID + 16])
+                    crc32c(!0, sub(&self.sb, sb::UUID..sb::UUID + 16))
                 };
             } else if ro & RO_COMPAT_GDT_CSUM != 0 {
                 self.csum = Csum::Crc16;
@@ -616,10 +792,10 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let per_block = (self.block_size / self.desc_size) as u32;
         for first in (0..self.group_count).step_by(per_block as usize) {
             let n = per_block.min(self.group_count - first) as usize * self.desc_size;
-            let mut descs = vec![0; n];
+            let mut descs = try_zeroed(n)?;
             self.read_bytes(self.desc_offset(first), &mut descs)?;
             let start = first as usize * self.desc_size;
-            self.groups[start..start + n].copy_from_slice(&descs);
+            put_bytes(&mut self.groups, start, &descs)?;
         }
         if self.csum != Csum::None
             && (0..self.group_count).any(|g| self.group_csum(g) != get16(self.desc(g), gd::CHECKSUM))
@@ -627,17 +803,84 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             return Err(Errno::EINVAL);
         }
         self.check_layout()?;
-        self.meta_zones = self.compute_meta_zones();
+        self.meta_zones = self.compute_meta_zones()?;
         Ok(())
     }
 
-    fn node(&mut self, shared: &Arc<Shared<D>>, ino: u32) -> Arc<dyn File> {
-        if let Some(node) = self.nodes.get(&ino).and_then(Weak::upgrade) {
-            return node;
+    /// The node for `ino`. `spare` is the memory for a new one, if the caller
+    /// reserved it first (so that nothing can fail once an inode exists).
+    fn node(
+        &mut self,
+        shared: &Arc<Shared<D>>,
+        ino: u32,
+        spare: Option<Arc<MaybeUninit<Node<D>>>>,
+    ) -> Result<Arc<dyn File>, Errno> {
+        if let Some(node) = self.nodes.find(&ino).and_then(|n| n.me.get()?.upgrade()) {
+            return Ok(node);
         }
-        let node = Arc::new(Node { shared: shared.clone(), ino });
-        self.nodes.insert(ino, Arc::downgrade(&node));
-        node
+        let slot = match spare {
+            Some(slot) => slot,
+            None => try_arc_uninit()?,
+        };
+        let node = init_arc(
+            slot,
+            Node { shared: shared.clone(), ino, me: Once::new(), link: SharedLink::new(TreeLink::new()) },
+        );
+        let _ = node.me.set(Arc::downgrade(&node));
+        // One whose last reference is going (its `Drop` waits for this lock)
+        // may still be indexed: this node replaces it.
+        self.nodes.take(&ino);
+        // SAFETY: the node takes itself out when dropped, and its inode
+        // number never changes.
+        let indexed = unsafe { self.nodes.insert(&node) };
+        // The key was just freed, so this holds.
+        if !indexed {
+            return Err(Errno::EIO);
+        }
+        Ok(node)
+    }
+
+    /// Undoes what the operation in progress changed: drops its transaction
+    /// and re-reads the superblock and descriptors, which memory holds ahead
+    /// of the disk. Allocates nothing, so it works when memory has run out.
+    fn abort(&mut self) {
+        self.tx.clear();
+        self.tx_freed.clear();
+        if self.reload_metadata().is_err() {
+            // Memory is ahead of the disk and cannot be put right.
+            self.read_only = true;
+            if let Some(journal) = &mut self.journal {
+                journal.failed = true;
+            }
+        }
+    }
+
+    fn reload_metadata(&mut self) -> Result<(), Errno> {
+        let mut sbuf = core::mem::take(&mut self.sb);
+        let result = self.dev_read_bytes(SUPERBLOCK_OFFSET, &mut sbuf);
+        self.sb = sbuf;
+        result?;
+        if self.journal.is_some() {
+            // As at mount: the superblock the journal logs says it is in use.
+            let flags = get32(&self.sb, sb::FEATURE_INCOMPAT) | INCOMPAT_RECOVER;
+            put32(&mut self.sb, sb::FEATURE_INCOMPAT, flags);
+        }
+        let mut groups = core::mem::take(&mut self.groups);
+        let per_block = (self.block_size / self.desc_size) as u32;
+        let mut result = Ok(());
+        for first in (0..self.group_count).step_by(per_block as usize) {
+            let n = per_block.min(self.group_count - first) as usize * self.desc_size;
+            let start = first as usize * self.desc_size;
+            result = match groups.get_mut(start..start + n) {
+                Some(dst) => self.read_bytes(self.desc_offset(first), dst),
+                None => Err(Errno::EIO),
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+        self.groups = groups;
+        result
     }
 
     fn writable(&self) -> Result<(), Errno> {
@@ -659,57 +902,77 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let bs = self.block_size as u64;
         let mut done = 0;
         while done < buf.len() {
-            let pos = off + done as u64;
+            let pos = off.checked_add(done as u64).ok_or(Errno::EIO)?;
             let (b, skip) = (pos / bs, (pos % bs) as usize);
             let n = (bs as usize - skip).min(buf.len() - done);
-            match self.tx.get(&b) {
-                Some(block) => buf[done..done + n].copy_from_slice(&block[skip..skip + n]),
-                None => self.dev_read_bytes(pos, &mut buf[done..done + n])?,
+            let dst = buf.get_mut(done..done + n).ok_or(Errno::EIO)?;
+            match self.tx.find(&b) {
+                Some(block) => dst.copy_from_slice(block.bytes().get(skip..skip + n).ok_or(Errno::EIO)?),
+                None => self.dev_read_bytes(pos, dst)?,
             }
             done += n;
         }
         Ok(())
     }
 
-    /// Writes metadata bytes at any offset: into the operation's
-    /// transaction if the file system is journaled, else to the disk.
+    /// Writes metadata bytes at any offset, into the operation's
+    /// transaction: they reach the disk when the operation ends.
     fn write_bytes(&mut self, off: u64, buf: &[u8]) -> Result<(), Errno> {
-        if self.journal.is_none() {
-            return self.dev_write_bytes(off, buf);
-        }
         let bs = self.block_size as u64;
         let mut done = 0;
         while done < buf.len() {
-            let pos = off + done as u64;
+            let pos = off.checked_add(done as u64).ok_or(Errno::EIO)?;
             let (b, skip) = (pos / bs, (pos % bs) as usize);
             let n = (bs as usize - skip).min(buf.len() - done);
-            if !self.tx.contains_key(&b) {
+            if self.tx.find(&b).is_none() {
                 let block = self.dev_read_block(b)?;
-                self.tx.insert(b, block);
+                let node = TxBlock::from_vec(b, block)?;
+                // Not logged until now, so the insert cannot collide.
+                self.tx.insert(node).map_err(|_| Errno::EIO)?;
             }
-            if let Some(block) = self.tx.get_mut(&b) {
-                block[skip..skip + n].copy_from_slice(&buf[done..done + n]);
+            if let Some(block) = self.tx_block_mut(b) {
+                put_bytes(block, skip, buf.get(done..done + n).ok_or(Errno::EIO)?)?;
             }
             done += n;
         }
         Ok(())
+    }
+
+    /// The contents of the block the operation has logged, to change.
+    fn tx_block_mut(&mut self, b: u64) -> Option<&mut [u8]> {
+        let node = self.tx.find(&b)?;
+        // SAFETY: the data is only reachable through the file system, which
+        // the caller has exclusively (`&mut self`) while the result lives.
+        Some(unsafe { &mut *node.data.get() })
     }
 
     /// Reads bytes at any offset straight from the device, a device block
     /// at a time.
     fn dev_read_bytes(&mut self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         let bs = self.dev.block_size() as u64;
-        let mut tmp = vec![0; bs as usize];
-        let mut done = 0;
-        while done < buf.len() {
-            let pos = off + done as u64;
-            let (lba, skip) = (pos / bs, (pos % bs) as usize);
-            let n = (bs as usize - skip).min(buf.len() - done);
-            self.dev.read_blocks(lba, &mut tmp).map_err(io_error)?;
-            buf[done..done + n].copy_from_slice(&tmp[skip..skip + n]);
-            done += n;
+        if bs == 0 {
+            return Err(Errno::EIO);
         }
-        Ok(())
+        // The scratch block is out of `self` while it is used.
+        let mut tmp = core::mem::take(&mut self.bounce);
+        if tmp.len() != bs as usize {
+            tmp = try_zeroed(bs as usize)?;
+        }
+        let result = (|| {
+            let mut done = 0;
+            while done < buf.len() {
+                let pos = off.checked_add(done as u64).ok_or(Errno::EIO)?;
+                let (lba, skip) = (pos / bs, (pos % bs) as usize);
+                let n = (bs as usize - skip).min(buf.len() - done);
+                self.dev.read_blocks(lba, &mut tmp).map_err(io_error)?;
+                let src = tmp.get(skip..skip + n).ok_or(Errno::EIO)?;
+                buf.get_mut(done..done + n).ok_or(Errno::EIO)?.copy_from_slice(src);
+                done += n;
+            }
+            Ok(())
+        })();
+        self.bounce = tmp;
+        result
     }
 
     /// Writes bytes at any offset straight to the device, as one request so
@@ -720,33 +983,49 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             return Ok(());
         }
         let bs = self.dev.block_size() as u64;
-        let (first, last) = (off / bs, (off + buf.len() as u64 - 1) / bs);
-        let mut tmp = vec![0; ((last - first + 1) * bs) as usize];
-        let skip = (off % bs) as usize;
-        if skip != 0 || buf.len() < tmp.len() {
-            self.dev.read_blocks(first, &mut tmp[..bs as usize]).map_err(io_error)?;
-            let tail = tmp.len() - bs as usize;
-            self.dev.read_blocks(last, &mut tmp[tail..]).map_err(io_error)?;
+        if bs == 0 {
+            return Err(Errno::EIO);
         }
-        tmp[skip..skip + buf.len()].copy_from_slice(buf);
-        self.dev.write_blocks(first, &tmp).map_err(io_error)
+        let end = off.checked_add(buf.len() as u64).ok_or(Errno::EIO)?;
+        let (first, last) = (off / bs, (end - 1) / bs);
+        let len = usize::try_from((last - first + 1).checked_mul(bs).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
+        // The scratch reserved for the superblock does for that; anything
+        // bigger needs memory of its own.
+        let mut tmp = core::mem::take(&mut self.write_scratch);
+        if tmp.len() < len {
+            tmp = try_zeroed(len)?;
+        }
+        let result = (|| {
+            let tmp = tmp.get_mut(..len).ok_or(Errno::EIO)?;
+            let skip = (off % bs) as usize;
+            if skip != 0 || buf.len() < len {
+                self.dev.read_blocks(first, tmp.get_mut(..bs as usize).ok_or(Errno::EIO)?).map_err(io_error)?;
+                let tail = len - bs as usize;
+                self.dev.read_blocks(last, tmp.get_mut(tail..).ok_or(Errno::EIO)?).map_err(io_error)?;
+            }
+            put_bytes(tmp, skip, buf)?;
+            self.dev.write_blocks(first, tmp).map_err(io_error)
+        })();
+        self.write_scratch = tmp;
+        result
     }
 
     /// Whether block `b` lies in a metadata zone found by `check_layout`.
     fn in_meta_zone(&self, b: u64) -> bool {
         let i = self.meta_zones.partition_point(|&(start, _)| start <= b);
-        i > 0 && b < self.meta_zones[i - 1].1
+        i > 0 && self.meta_zones.get(i - 1).is_some_and(|&(_, end)| b < end)
     }
 
     /// The merged metadata zones: every group's superblock backup and
     /// descriptors, bitmaps and inode table.
-    fn compute_meta_zones(&self) -> Vec<(u64, u64)> {
+    fn compute_meta_zones(&self) -> Result<Vec<(u64, u64)>, Errno> {
         let itable =
             (get32(&self.sb, sb::INODES_PER_GROUP) as u64 * self.inode_size as u64).div_ceil(self.block_size as u64);
-        let mut zones = Vec::with_capacity(self.group_count as usize * 3);
+        let mut zones = Vec::new();
+        zones.try_reserve_exact(self.group_count as usize * 4).map_err(|_| Errno::ENOMEM)?;
         for g in 0..self.group_count {
             let start = self.group_start(g);
-            zones.push((start, start + self.base_meta_blocks(g)));
+            zones.push((start, start.saturating_add(self.base_meta_blocks(g))));
             for (field, len) in [(gd::BLOCK_BITMAP, 1), (gd::INODE_BITMAP, 1), (gd::INODE_TABLE, itable)] {
                 let loc = self.group_get(g, field);
                 zones.push((loc, loc.saturating_add(len)));
@@ -754,14 +1033,23 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         }
         zones.retain(|&(start, end)| start < end);
         zones.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(zones.len());
-        for (start, end) in zones {
-            match merged.last_mut() {
-                Some(last) if start <= last.1 => last.1 = last.1.max(end),
-                _ => merged.push((start, end)),
+        // Merged in place: the merged list is never longer.
+        let mut merged = 0usize;
+        for i in 0..zones.len() {
+            let Some(&(start, end)) = zones.get(i) else { break };
+            if let Some(last) = merged.checked_sub(1).and_then(|m| zones.get_mut(m))
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                if let Some(slot) = zones.get_mut(merged) {
+                    *slot = (start, end);
+                }
+                merged += 1;
             }
         }
-        merged
+        zones.truncate(merged);
+        Ok(zones)
     }
 
     /// Reads a data, directory, indirect or extent block; refuses metadata
@@ -777,20 +1065,20 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
         }
-        match self.tx.get(&b) {
-            Some(block) => Ok(block.clone()),
+        match self.tx.find(&b) {
+            Some(block) => Ok(try_to_vec(block.bytes())?),
             None => self.dev_read_block(b),
         }
     }
 
     fn dev_read_block(&mut self, b: u64) -> Result<Vec<u8>, Errno> {
-        let mut buf = vec![0; self.block_size];
-        self.dev.read_blocks(b * self.dev_per_block, &mut buf).map_err(io_error)?;
+        let mut buf = try_zeroed(self.block_size)?;
+        self.dev.read_blocks(b.checked_mul(self.dev_per_block).ok_or(Errno::EIO)?, &mut buf).map_err(io_error)?;
         Ok(buf)
     }
 
     fn dev_write_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
-        self.dev.write_blocks(b * self.dev_per_block, buf).map_err(io_error)
+        self.dev.write_blocks(b.checked_mul(self.dev_per_block).ok_or(Errno::EIO)?, buf).map_err(io_error)
     }
 
     /// Writes a directory, indirect or extent block; refuses metadata
@@ -811,18 +1099,23 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         self.dev_write_block(b, buf)
     }
 
-    /// Writes a metadata block: into the operation's transaction if the file
-    /// system is journaled, else to the disk.
+    /// Writes a metadata block, into the operation's transaction.
     fn write_raw_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
         if b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
         }
-        if self.journal.is_some() {
-            debug_assert_eq!(buf.len(), self.block_size);
-            self.tx.insert(b, buf.to_vec());
-            return Ok(());
+        if buf.len() != self.block_size {
+            return Err(Errno::EIO);
         }
-        self.dev_write_block(b, buf)
+        match self.tx_block_mut(b) {
+            Some(logged) => put_bytes(logged, 0, buf)?,
+            None => {
+                let node = TxBlock::new(b, buf)?;
+                // Not logged, as just seen, so the insert cannot collide.
+                self.tx.insert(node).map_err(|_| Errno::EIO)?;
+            }
+        }
+        Ok(())
     }
 
     // ---- Superblock and group descriptors ----
@@ -842,7 +1135,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     fn adjust_free_blocks(&mut self, delta: i64) {
-        let v = (self.free_blocks() as i64 + delta) as u64;
+        let v = (self.free_blocks() as i64).wrapping_add(delta) as u64;
         put32(&mut self.sb, sb::FREE_BLOCKS, v as u32);
         if self.wide {
             put32(&mut self.sb, sb::FREE_BLOCKS_HI, (v >> 32) as u32);
@@ -850,7 +1143,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     fn adjust_super(&mut self, field: usize, delta: i32) {
-        let v = get32(&self.sb, field) as i64 + delta as i64;
+        let v = (get32(&self.sb, field) as i64).wrapping_add(delta as i64);
         put32(&mut self.sb, field, v as u32);
     }
 
@@ -858,7 +1151,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let now = self.now();
         put32(&mut self.sb, sb::WTIME, now);
         if self.csum == Csum::Crc32c {
-            let sum = crc32c(!0, &self.sb[..sb::CHECKSUM]);
+            let sum = crc32c(!0, sub(&self.sb, 0..sb::CHECKSUM));
             put32(&mut self.sb, sb::CHECKSUM, sum);
         }
         let sbuf = core::mem::take(&mut self.sb);
@@ -869,23 +1162,23 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     fn desc(&self, g: u32) -> &[u8] {
         let start = g as usize * self.desc_size;
-        &self.groups[start..start + self.desc_size]
+        sub(&self.groups, start..start + self.desc_size)
     }
 
     fn group_csum(&self, g: u32) -> u16 {
         let d = self.desc(g);
-        let rest = &d[gd::CHECKSUM + 2..];
+        let rest = d.get(gd::CHECKSUM + 2..).unwrap_or(&[]);
         match self.csum {
             Csum::None => 0,
             Csum::Crc16 => {
-                let mut crc = crc16(!0, &self.sb[sb::UUID..sb::UUID + 16]);
+                let mut crc = crc16(!0, sub(&self.sb, sb::UUID..sb::UUID + 16));
                 crc = crc16(crc, &g.to_le_bytes());
-                crc = crc16(crc, &d[..gd::CHECKSUM]);
+                crc = crc16(crc, sub(d, 0..gd::CHECKSUM));
                 crc16(crc, rest)
             }
             Csum::Crc32c => {
                 let mut crc = crc32c(self.csum_seed, &g.to_le_bytes());
-                crc = crc32c(crc, &d[..gd::CHECKSUM]);
+                crc = crc32c(crc, sub(d, 0..gd::CHECKSUM));
                 crc = crc32c(crc, &[0, 0]);
                 crc32c(crc, rest) as u16
             }
@@ -898,7 +1191,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             let sum = self.group_csum(g);
             put16(&mut self.groups, start + gd::CHECKSUM, sum);
         }
-        let desc: Vec<u8> = self.desc(g).to_vec();
+        let desc = try_to_vec(self.desc(g))?;
         self.write_bytes(self.desc_offset(g), &desc)
     }
 
@@ -915,7 +1208,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             }
             _ => self.gdt_block + k as u64,
         };
-        block * self.block_size as u64 + (i as usize * self.desc_size) as u64
+        block.saturating_mul(self.block_size as u64).saturating_add((i as usize * self.desc_size) as u64)
     }
 
     /// Checks that the primary superblock and descriptors fit in group 0,
@@ -967,7 +1260,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     fn group_set(&mut self, g: u32, (lo, hi, width): gd::Field, v: u64) {
         let start = g as usize * self.desc_size;
-        let d = &mut self.groups[start..start + self.desc_size];
+        let Some(d) = self.groups.get_mut(start..start + self.desc_size) else { return };
         let mut put = |off, v: u64| if width == 4 { put32(d, off, v as u32) } else { put16(d, off, v as u16) };
         put(lo, v);
         if hi + width <= self.desc_size {
@@ -976,7 +1269,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     fn adjust_group(&mut self, g: u32, field: gd::Field, delta: i64) {
-        let v = (self.group_get(g, field) as i64 + delta) as u64;
+        let v = (self.group_get(g, field) as i64).wrapping_add(delta) as u64;
         self.group_set(g, field, v);
     }
 
@@ -994,7 +1287,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     /// Blocks in group `g`: all but the last group are full.
     fn group_blocks(&self, g: u32) -> u64 {
-        (get32(&self.sb, sb::BLOCKS_PER_GROUP) as u64).min(self.blocks_count() - self.group_start(g))
+        (get32(&self.sb, sb::BLOCKS_PER_GROUP) as u64).min(self.blocks_count().saturating_sub(self.group_start(g)))
     }
 
     /// Whether group `g` holds a superblock backup and descriptor table.
@@ -1008,12 +1301,12 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if get32(&self.sb, sb::FEATURE_RO_COMPAT) & RO_COMPAT_SPARSE_SUPER == 0 {
             return true;
         }
-        let power_of = |base: u32| {
-            let mut n = 1;
-            while n < g {
+        let power_of = |base: u64| {
+            let mut n = 1u64;
+            while n < g as u64 {
                 n *= base;
             }
-            n == g
+            n == g as u64
         };
         g == 1 || power_of(3) || power_of(5) || power_of(7)
     }
@@ -1026,13 +1319,13 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         crc32c(crc32c(self.csum_seed, &ino.to_le_bytes()), &inode.generation().to_le_bytes())
     }
 
-    fn inode_csum(&self, ino: u32, inode: &Inode) -> u32 {
-        let mut raw = inode.raw.clone();
+    fn inode_csum(&self, ino: u32, inode: &Inode) -> Result<u32, Errno> {
+        let mut raw = try_to_vec(&inode.raw)?;
         put16(&mut raw, ino::CHECKSUM_LO, 0);
         if inode.has_checksum_hi() {
             put16(&mut raw, ino::CHECKSUM_HI, 0);
         }
-        crc32c(self.inode_seed(ino, inode), &raw)
+        Ok(crc32c(self.inode_seed(ino, inode), &raw))
     }
 
     fn bitmap_csum(&self, kind: Bitmap, bits: &[u8]) -> u32 {
@@ -1040,17 +1333,18 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             Bitmap::Block => get32(&self.sb, sb::BLOCKS_PER_GROUP),
             Bitmap::Inode => get32(&self.sb, sb::INODES_PER_GROUP),
         };
-        crc32c(self.csum_seed, &bits[..per_group as usize / 8])
+        crc32c(self.csum_seed, sub(bits, 0..per_group as usize / 8))
     }
 
     /// Whether a directory block ends in a checksum tail.
     fn has_dir_tail(&self, data: &[u8]) -> bool {
-        let t = data.len() - DIR_TAIL_LEN;
+        let t = data.len().saturating_sub(DIR_TAIL_LEN);
         self.csum == Csum::Crc32c
+            && data.len() >= DIR_TAIL_LEN
             && get32(data, t) == 0
             && get16(data, t + 4) as usize == DIR_TAIL_LEN
-            && data[t + 6] == 0
-            && data[t + 7] == DIR_TAIL_TYPE
+            && byte(data, t + 6) == 0
+            && byte(data, t + 7) == DIR_TAIL_TYPE
     }
 
     /// The bytes of a directory block that hold records.
@@ -1059,15 +1353,15 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     /// A new, empty directory block and the bytes free for records in it.
-    fn new_dir_block(&self) -> (Vec<u8>, usize) {
-        let mut data = vec![0; self.block_size];
+    fn new_dir_block(&self) -> Result<(Vec<u8>, usize), Errno> {
+        let mut data = try_zeroed(self.block_size)?;
         if self.csum != Csum::Crc32c {
-            return (data, self.block_size);
+            return Ok((data, self.block_size));
         }
         let t = self.block_size - DIR_TAIL_LEN;
         put16(&mut data, t + 4, DIR_TAIL_LEN as u16);
-        data[t + 7] = DIR_TAIL_TYPE;
-        (data, t)
+        put_bytes(&mut data, t + 7, &[DIR_TAIL_TYPE])?;
+        Ok((data, t))
     }
 
     /// Writes a block of directory `dir`, checksumming its tail.
@@ -1076,7 +1370,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             let inode = self.read_inode(dir)?;
             let seed = self.inode_seed(dir, &inode);
             let t = data.len() - DIR_TAIL_LEN;
-            let sum = crc32c(seed, &data[..t]);
+            let sum = crc32c(seed, sub(data, 0..t));
             put32(data, t + 8, sum);
         }
         self.write_block(b, data)
@@ -1091,16 +1385,19 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let per_group = get32(&self.sb, sb::INODES_PER_GROUP);
         let (g, i) = ((ino - 1) / per_group, (ino - 1) % per_group);
         let table = self.group_get(g, gd::INODE_TABLE);
-        Ok(table * self.block_size as u64 + i as u64 * self.inode_size as u64)
+        table
+            .checked_mul(self.block_size as u64)
+            .and_then(|at| at.checked_add(i as u64 * self.inode_size as u64))
+            .ok_or(Errno::EIO)
     }
 
     fn read_inode(&mut self, ino: u32) -> Result<Inode, Errno> {
         let off = self.inode_offset(ino)?;
-        let mut raw = vec![0; self.inode_size];
+        let mut raw = try_zeroed(self.inode_size)?;
         self.read_bytes(off, &mut raw)?;
         let inode = Inode { raw };
         if self.csum == Csum::Crc32c {
-            let sum = self.inode_csum(ino, &inode);
+            let sum = self.inode_csum(ino, &inode)?;
             let lo = get16(&inode.raw, ino::CHECKSUM_LO) as u32;
             let stored =
                 if inode.has_checksum_hi() { (get16(&inode.raw, ino::CHECKSUM_HI) as u32) << 16 | lo } else { lo };
@@ -1117,8 +1414,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if self.csum != Csum::Crc32c {
             return self.write_bytes(off, &inode.raw);
         }
-        let sum = self.inode_csum(ino, inode);
-        let mut raw = inode.raw.clone();
+        let sum = self.inode_csum(ino, inode)?;
+        let mut raw = try_to_vec(&inode.raw)?;
         put16(&mut raw, ino::CHECKSUM_LO, sum as u16);
         if inode.has_checksum_hi() {
             put16(&mut raw, ino::CHECKSUM_HI, (sum >> 16) as u16);
@@ -1136,7 +1433,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             Bitmap::Inode => (gd::INODE_BITMAP, gd::INODE_BITMAP_CSUM, BG_INODE_UNINIT),
         };
         if self.csum != Csum::None && self.group_flags(g) & flag != 0 {
-            return Ok(self.init_bitmap(g, kind));
+            return self.init_bitmap(g, kind);
         }
         let bits = self.read_raw_block(self.group_get(g, loc))?;
         if self.csum == Csum::Crc32c {
@@ -1149,15 +1446,15 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok(bits)
     }
 
-    fn init_bitmap(&self, g: u32, kind: Bitmap) -> Vec<u8> {
-        let mut bits = vec![0; self.block_size];
+    fn init_bitmap(&self, g: u32, kind: Bitmap) -> Result<Vec<u8>, Errno> {
+        let mut bits = try_zeroed(self.block_size)?;
         let used = match kind {
             Bitmap::Block => self.group_blocks(g) as usize,
             Bitmap::Inode => get32(&self.sb, sb::INODES_PER_GROUP) as usize,
         };
         set_bits(&mut bits, used, 8 * self.block_size - used);
         if kind == Bitmap::Inode {
-            return bits;
+            return Ok(bits);
         }
         let start = self.group_start(g);
         set_bits(&mut bits, 0, (self.base_meta_blocks(g) as usize).min(used));
@@ -1172,7 +1469,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 }
             }
         }
-        bits
+        Ok(bits)
     }
 
     /// Writes a group's bitmap back, marking it initialized and updating
@@ -1200,11 +1497,11 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let mut bits = self.load_bitmap(g, kind)?;
         let start = self.group_start(g);
         let reusable = |i: u32| kind == Bitmap::Inode || !self.freed_in_tx(start + i as u64);
-        let clear = |i: u32| bits[i as usize / 8] & (1 << (i % 8)) == 0 && reusable(i);
+        let clear = |i: u32| bits.get(i as usize / 8).is_some_and(|b| b & (1 << (i % 8)) == 0) && reusable(i);
         let Some(index) = (from.min(limit)..limit).chain(0..from.min(limit)).find(|&i| clear(i)) else {
             return Ok(None);
         };
-        bits[index as usize / 8] |= 1 << (index % 8);
+        or_byte(&mut bits, index as usize / 8, 1 << (index % 8))?;
         self.store_bitmap(g, kind, &bits)?;
         Ok(Some(index))
     }
@@ -1217,7 +1514,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let per_group = get32(&self.sb, sb::BLOCKS_PER_GROUP) as u64;
         let first = get32(&self.sb, sb::FIRST_DATA_BLOCK) as u64;
         let goal = if goal >= first && goal < self.blocks_count() { goal - first } else { 0 };
-        let (goal_g, goal_i) = ((goal / per_group) as u32, (goal % per_group) as u32);
+        // `per_group` was checked at mount, but never divide by a field of the image unchecked.
+        let (goal_g, goal_i) =
+            (goal.checked_div(per_group).unwrap_or(0) as u32, goal.checked_rem(per_group).unwrap_or(0) as u32);
         for k in 0..self.group_count {
             let g = ((goal_g as u64 + k as u64) % self.group_count as u64) as u32;
             if self.group_get(g, gd::FREE_BLOCKS) == 0 {
@@ -1230,8 +1529,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 self.adjust_free_blocks(-1);
                 self.write_group(g)?;
                 self.write_super()?;
-                let b = self.group_start(g) + i as u64;
-                let zero = vec![0; self.block_size];
+                let b = self.group_start(g).saturating_add(i as u64);
+                let zero = try_zeroed(self.block_size)?;
                 self.write_data_block(b, &zero)?;
                 return Ok(b);
             }
@@ -1247,14 +1546,16 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if start < first || end > self.blocks_count() {
             return Err(Errno::EIO);
         }
-        if self.journal.is_some() {
+        {
             // What the operation had logged for these blocks must not
             // overwrite them if they are allocated again.
-            let logged: Vec<u64> = self.tx.range(start..end).map(|(&b, _)| b).collect();
-            for b in logged {
-                self.tx.remove(&b);
+            let freed = try_arc(Freed { start, end, link: SharedLink::new(TreeLink::new()) })?;
+            while let Some(b) = self.tx.lower_bound(&start).map(|t| t.blk).filter(|&b| b < end) {
+                drop(self.tx.take_key(&b));
             }
-            self.tx_freed.insert(start, end);
+            drop(self.tx_freed.take_key(&start));
+            // The start was just freed, so the insert cannot collide.
+            self.tx_freed.insert(freed).map_err(|_| Errno::EIO)?;
         }
         let mut b = start;
         while b < end {
@@ -1262,7 +1563,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             let n = (per_group - i).min(end - b);
             let mut bits = self.load_bitmap(g, Bitmap::Block)?;
             for j in i..i + n {
-                let byte = &mut bits[j as usize / 8];
+                let byte = bits.get_mut(j as usize / 8).ok_or(Errno::EIO)?;
                 if *byte & (1 << (j % 8)) == 0 {
                     return Err(Errno::EIO);
                 }
@@ -1279,7 +1580,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     /// Whether the operation in progress has freed block `b`.
     fn freed_in_tx(&self, b: u64) -> bool {
-        self.tx_freed.range(..=b).next_back().is_some_and(|(_, &end)| b < end)
+        self.tx_freed.floor(&b).is_some_and(|f| b < f.end)
     }
 
     fn free_block(&mut self, b: u64) -> Result<(), Errno> {
@@ -1299,12 +1600,12 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 continue;
             }
             let Some(i) = self.take_bit(g, Bitmap::Inode, 0, per_group)? else { continue };
-            let ino = g * per_group + i + 1;
+            let ino = g.saturating_mul(per_group).saturating_add(i).saturating_add(1);
             if ino < self.first_ino {
                 // A reserved inode marked free: the bitmap is corrupt. Put
                 // the bit back as it was; no counter has changed yet.
                 let mut bits = self.load_bitmap(g, Bitmap::Inode)?;
-                bits[i as usize / 8] &= !(1 << (i % 8));
+                *bits.get_mut(i as usize / 8).ok_or(Errno::EIO)? &= !(1 << (i % 8));
                 self.store_bitmap(g, Bitmap::Inode, &bits)?;
                 return Err(Errno::EIO);
             }
@@ -1321,7 +1622,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             }
             self.write_group(g)?;
             self.write_super()?;
-            let mut inode = Inode { raw: vec![0; self.inode_size] };
+            let mut inode = Inode { raw: try_zeroed(self.inode_size)? };
             put16(&mut inode.raw, ino::MODE, mode);
             inode.set_links(1);
             let now = self.now();
@@ -1378,7 +1679,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let per_group = get32(&self.sb, sb::INODES_PER_GROUP);
         let (g, i) = ((ino - 1) / per_group, (ino - 1) % per_group);
         let mut bits = self.load_bitmap(g, Bitmap::Inode)?;
-        let byte = &mut bits[i as usize / 8];
+        let byte = bits.get_mut(i as usize / 8).ok_or(Errno::EIO)?;
         if *byte & (1 << (i % 8)) == 0 {
             return Err(Errno::EIO);
         }
@@ -1394,7 +1695,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     fn group_of(&self, ino: u32) -> u32 {
-        (ino - 1) / get32(&self.sb, sb::INODES_PER_GROUP)
+        ino.saturating_sub(1).checked_div(get32(&self.sb, sb::INODES_PER_GROUP)).unwrap_or(0)
     }
 
     // ---- Block maps ----
@@ -1439,8 +1740,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let goal = self.group_start(self.group_of(ino));
         let sectors = (self.block_size / 512) as i64;
         // The slot in the inode, then indexes in each indirect level.
-        let (slot, path): (usize, Vec<u64>) = if lblk < NDIR_BLOCKS as u64 {
-            (lblk as usize, Vec::new())
+        let (slot, path, depth): (usize, [u64; 3], usize) = if lblk < NDIR_BLOCKS as u64 {
+            (lblk as usize, [0; 3], 0)
         } else {
             let mut rest = lblk - NDIR_BLOCKS as u64;
             let mut found = None;
@@ -1454,12 +1755,12 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 span = span.saturating_mul(per);
             }
             let depth = found.ok_or(Errno::EFBIG)?;
-            let mut path = vec![0; depth as usize];
-            for level in (0..depth as usize).rev() {
-                path[level] = rest % per;
+            let mut path = [0u64; 3];
+            for slot in path.iter_mut().take(depth as usize).rev() {
+                *slot = rest % per;
                 rest /= per;
             }
-            (NDIR_BLOCKS + depth as usize - 1, path)
+            (NDIR_BLOCKS + depth as usize - 1, path, depth as usize)
         };
         // Block map pointers are 32 bits.
         let alloc32 = |fs: &mut Self| {
@@ -1479,7 +1780,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             inode.set_block(slot, b);
             inode.add_sectors(sectors);
         }
-        for &index in &path {
+        for &index in path.iter().take(depth) {
             let mut table = self.read_block(b as u64)?;
             let mut next = get32(&table, index as usize * 4);
             if next == 0 {
@@ -1522,7 +1823,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             start = start.saturating_add(span);
             span = span.saturating_mul(per);
         }
-        inode.add_sectors(-((freed * (self.block_size / 512) as u64) as i64));
+        inode.add_sectors(-((freed.saturating_mul((self.block_size / 512) as u64)).min(i64::MAX as u64) as i64));
         Ok(())
     }
 
@@ -1586,21 +1887,23 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 return Err(Errno::EIO);
             }
             let start = ino::BLOCK + off as usize;
-            buf[..len].copy_from_slice(&inode.raw[start..start + len]);
+            let src = inode.raw.get(start..start + len).ok_or(Errno::EIO)?;
+            buf.get_mut(..len).ok_or(Errno::EIO)?.copy_from_slice(src);
             return Ok(len);
         }
         let bs = self.block_size as u64;
         let mut done = 0;
         while done < len {
-            let pos = off + done as u64;
+            let pos = off.checked_add(done as u64).ok_or(Errno::EIO)?;
             let skip = (pos % bs) as usize;
             let n = (bs as usize - skip).min(len - done);
             let b = self.bmap(ino, &mut inode, pos / bs, false)?;
+            let dst = buf.get_mut(done..done + n).ok_or(Errno::EIO)?;
             if b == 0 {
-                buf[done..done + n].fill(0);
+                dst.fill(0);
             } else {
                 let block = self.read_block(b)?;
-                buf[done..done + n].copy_from_slice(&block[skip..skip + n]);
+                dst.copy_from_slice(block.get(skip..skip + n).ok_or(Errno::EIO)?);
             }
             done += n;
         }
@@ -1622,8 +1925,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             // A fast symbolic link: the target lives in the block map, in
             // place of any extent tree.
             inode.set_flags(inode.flags() & !EXTENTS_FL);
-            inode.raw[ino::BLOCK..ino::BLOCK + 60].fill(0);
-            inode.raw[ino::BLOCK..ino::BLOCK + buf.len()].copy_from_slice(buf);
+            fill_range(&mut inode.raw, ino::BLOCK..ino::BLOCK + 60, 0)?;
+            put_bytes(&mut inode.raw, ino::BLOCK, buf)?;
             inode.set_size(buf.len() as u64);
             self.write_inode(ino, &inode)?;
             return Ok(buf.len());
@@ -1637,18 +1940,19 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             if done == buf.len() {
                 break Ok(());
             }
-            let pos = off + done as u64;
+            let pos = off.saturating_add(done as u64);
             let skip = (pos % bs) as usize;
             let n = (bs as usize - skip).min(buf.len() - done);
             let b = match self.bmap(ino, &mut inode, pos / bs, true) {
                 Ok(b) => b,
                 Err(e) => break Err(e),
             };
+            let Some(chunk) = buf.get(done..done + n) else { break Err(Errno::EIO) };
             let step = if n == bs as usize {
-                self.write_data_block(b, &buf[done..done + n])
+                self.write_data_block(b, chunk)
             } else {
                 self.read_block(b).and_then(|mut block| {
-                    block[skip..skip + n].copy_from_slice(&buf[done..done + n]);
+                    put_bytes(&mut block, skip, chunk)?;
                     self.write_data_block(b, &block)
                 })
             };
@@ -1657,7 +1961,13 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             }
             done += n;
         };
-        let new_end = off + done as u64;
+        // Out of memory part way may have left a block allocated but not
+        // mapped: report it, so that the operation is undone as a whole (see
+        // `Fs::transact`), rather than recording a short write over that.
+        if result == Err(Errno::ENOMEM) {
+            return Err(Errno::ENOMEM);
+        }
+        let new_end = off.saturating_add(done as u64);
         if new_end > inode.size() {
             inode.set_size(new_end);
             self.note_file_size(new_end)?;
@@ -1703,7 +2013,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 let b = self.bmap(ino, &mut inode, len / bs, false)?;
                 if b != 0 {
                     let mut block = self.read_block(b)?;
-                    block[(len % bs) as usize..].fill(0);
+                    let tail = (len % bs) as usize;
+                    fill_range(&mut block, tail..self.block_size, 0)?;
                     self.write_data_block(b, &block)?;
                 }
             }
@@ -1742,7 +2053,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             let mut data = self.read_block(b)?;
             if self.has_dir_tail(&data) {
                 let t = data.len() - DIR_TAIL_LEN;
-                if get32(&data, t + 8) != crc32c(seed, &data[..t]) {
+                if get32(&data, t + 8) != crc32c(seed, sub(&data, 0..t)) {
                     return Err(Errno::EIO);
                 }
             }
@@ -1755,16 +2066,17 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     /// Parses the record at `off`: (inode, rec_len, name).
     fn record<'b>(&self, data: &'b [u8], off: usize) -> Result<(u32, usize, &'b [u8]), Errno> {
-        if off + 8 > data.len() {
+        if off.checked_add(8).is_none_or(|end| end > data.len()) {
             return Err(Errno::EIO);
         }
         let ino = get32(data, off);
         let rec_len = get16(data, off + 4) as usize;
-        let name_len = if self.filetype { data[off + 6] as usize } else { get16(data, off + 6) as usize };
+        let name_len = if self.filetype { byte(data, off + 6) as usize } else { get16(data, off + 6) as usize };
         if rec_len % 4 != 0 || rec_len < rec_len_for(name_len) || off + rec_len > data.len() {
             return Err(Errno::EIO);
         }
-        Ok((ino, rec_len, &data[off + 8..off + 8 + name_len]))
+        let name = data.get(off + 8..off + 8 + name_len).ok_or(Errno::EIO)?;
+        Ok((ino, rec_len, name))
     }
 
     fn find_entry(&mut self, dir: u32, name: &str) -> Result<Option<u32>, Errno> {
@@ -1800,8 +2112,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                     continue;
                 }
                 if seen == index {
-                    let name = String::from_utf8_lossy(name).into_owned();
-                    let ftype = if fs.filetype { data[off - rec_len + 7] } else { 0 };
+                    let name = lossy(name)?;
+                    let ftype = if fs.filetype { byte(data, off - rec_len + 7) } else { 0 };
                     return Ok(Some((ino, name, ftype)));
                 }
                 seen += 1;
@@ -1826,12 +2138,12 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         put32(data, off, ino);
         put16(data, off + 4, rec_len as u16);
         if self.filetype {
-            data[off + 6] = name.len() as u8;
-            data[off + 7] = dirent_type(kind);
+            let _ = put_bytes(data, off + 6, &[name.len() as u8, dirent_type(kind)]);
         } else {
             put16(data, off + 6, name.len() as u16);
         }
-        data[off + 8..off + 8 + name.len()].copy_from_slice(name.as_bytes());
+        // The caller sized the record for the name; a record that does not fit is left unwritten.
+        let _ = put_bytes(data, off + 8, name.as_bytes());
     }
 
     /// Clears a directory's hash index flag before changing it. Under
@@ -1867,9 +2179,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             }
             put16(data, last + 4, (rec_len - DIR_TAIL_LEN) as u16);
             let t = data.len() - DIR_TAIL_LEN;
-            data[last + used..].fill(0);
+            fill_range(data, last + used..t + DIR_TAIL_LEN, 0)?;
             put16(data, t + 4, DIR_TAIL_LEN as u16);
-            data[t + 7] = DIR_TAIL_TYPE;
+            put_bytes(data, t + 7, &[DIR_TAIL_TYPE])?;
             fs.write_dir_block(dir, b, data)?;
             Ok(None)
         })?;
@@ -1906,9 +2218,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         // A size that is not a block multiple still ends in a partial block.
         let next = inode.size().div_ceil(self.block_size as u64);
         let b = self.bmap(dir, &mut inode, next, true)?;
-        inode.set_size((next + 1) * self.block_size as u64);
+        inode.set_size(next.saturating_add(1).saturating_mul(self.block_size as u64));
         self.write_inode(dir, &inode)?;
-        let (mut data, space) = self.new_dir_block();
+        let (mut data, space) = self.new_dir_block()?;
         self.write_record(&mut data, 0, ino, space, name, kind);
         self.write_dir_block(dir, b, &mut data)
     }
@@ -1979,7 +2291,11 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if kind == FileKind::Directory && !self.dir_nlink && parent.links() >= LINK_MAX {
             return Err(Errno::EMLINK);
         }
-        let goal = if kind == FileKind::Directory { (dir + 1) % self.group_count } else { self.group_of(dir) };
+        let goal = if kind == FileKind::Directory {
+            dir.wrapping_add(1) % self.group_count.max(1)
+        } else {
+            self.group_of(dir)
+        };
         let (ino, mut inode) = self.alloc_inode(goal, kind.mode_bits() as u16 | (mode & 0o7777) as u16)?;
         if kind == FileKind::Directory {
             let b = match self.bmap(ino, &mut inode, 0, true) {
@@ -1994,7 +2310,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             inode.set_size(self.block_size as u64);
             inode.set_links(2);
             self.write_inode(ino, &inode)?;
-            let (mut data, space) = self.new_dir_block();
+            let (mut data, space) = self.new_dir_block()?;
             self.write_record(&mut data, 0, ino, 12, ".", FileKind::Directory);
             self.write_record(&mut data, 12, dir, space - 12, "..", FileKind::Directory);
             self.write_dir_block(ino, b, &mut data)?;
@@ -2009,7 +2325,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         // Adding the entry may have grown the directory.
         let mut parent = self.read_inode(dir)?;
         if kind == FileKind::Directory && !uncounted {
-            let links = parent.links() + 1;
+            let links = parent.links().saturating_add(1);
             parent.set_links(if links >= LINK_MAX && self.dir_nlink { 1 } else { links });
         }
         let now = self.now();
@@ -2049,7 +2365,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         inode.set_times(now, &[ino::CTIME]);
         self.write_inode(ino, &inode)?;
         // An open file is freed when its last reference goes.
-        let open = self.nodes.get(&ino).is_some_and(|w| w.strong_count() > 0);
+        let open = self.nodes.find(&ino).is_some_and(|n| n.me.get().is_some_and(|w| w.strong_count() > 0));
         if inode.links() == 0 && !open {
             self.free_inode(ino)?;
         }
@@ -2103,7 +2419,11 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 
     fn stat(&self) -> Stat {
         // An I/O error leaves only what is known without the disk.
-        self.with(|fs| fs.stat(self.ino)).unwrap_or(Stat { ino: self.ino as u64, ..Stat::default() })
+        self.try_stat().unwrap_or(Stat { ino: self.ino as u64, ..Stat::default() })
+    }
+
+    fn try_stat(&self) -> Result<Stat, Errno> {
+        self.with(|fs| fs.stat(self.ino))
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {
@@ -2121,13 +2441,15 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
         let mut fs = self.shared.fs.lock();
         let ino = fs.find_entry(self.ino, name)?.ok_or(Errno::ENOENT)?;
-        Ok(fs.node(&self.shared, ino))
+        fs.node(&self.shared, ino, None)
     }
 
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
         let mut fs = self.shared.fs.lock();
+        // Reserved first: once the inode is on disk, nothing may fail.
+        let slot = try_arc_uninit()?;
         let ino = fs.transact(|fs| fs.create(self.ino, name, kind, mode))?;
-        Ok(fs.node(&self.shared, ino))
+        fs.node(&self.shared, ino, Some(slot))
     }
 
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
@@ -2144,7 +2466,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             if inode.size() > fs.block_size.min(PATH_MAX) as u64 {
                 return Err(Errno::EIO);
             }
-            let mut target = vec![0; inode.size() as usize];
+            let mut target = try_zeroed(inode.size() as usize)?;
             let n = fs.read_data(self.ino, 0, &mut target)?;
             target.truncate(n);
             String::from_utf8(target).map_err(|_| Errno::EINVAL)
@@ -2155,12 +2477,13 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 impl<D: BlockDevice + Send + 'static> Drop for Node<D> {
     fn drop(&mut self) {
         let mut fs = self.shared.fs.lock();
-        // Another lookup may have replaced the map entry with a live node.
-        if fs.nodes.get(&self.ino).is_some_and(|w| w.strong_count() == 0) {
-            fs.nodes.remove(&self.ino);
-        } else {
+        // Another lookup may have replaced this node in the index with a live
+        // one, which then owns the inode.
+        if !self.link.is_linked() {
             return;
         }
+        // SAFETY: linked, as just checked, in `nodes`.
+        unsafe { fs.nodes.remove(self) };
         if fs.read_only {
             return;
         }
@@ -2178,6 +2501,7 @@ impl<D: BlockDevice + Send + 'static> Drop for Node<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use osmium_fs::{OpenFlags, RamFs, Vfs};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -2324,7 +2648,7 @@ mod tests {
                 let Some(image) = mkfs(&scratch, kind, block, 8 << 20, Some(&tree)) else { return };
                 let ext2 = Ext2::mount(VecDisk(image), 7).unwrap();
                 assert!(!ext2.is_read_only());
-                let root = ext2.root();
+                let root = ext2.root().unwrap();
                 let mut top = names(&*root);
                 top.sort();
                 assert_eq!(top, ["empty", "fast", "lost+found", "slow", "small", "sub"]);
@@ -2358,7 +2682,7 @@ mod tests {
             for block in [1024, 4096] {
                 let Some(image) = mkfs(&scratch, kind, block, 8 << 20, None) else { return };
                 let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-                let vfs = Vfs::new(ext2.root());
+                let vfs = Vfs::new(ext2.root().unwrap());
                 let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
 
                 // Big enough for double-indirect blocks with 1 KiB blocks.
@@ -2425,7 +2749,7 @@ mod tests {
 
                 // Everything is still there after mounting again.
                 let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-                let vfs = Vfs::new(ext2.root());
+                let vfs = Vfs::new(ext2.root().unwrap());
                 assert_eq!(read_all(&*vfs.lookup("/sparse").unwrap())[10..14], *b"head");
                 assert!(vfs.lookup("/many/entry-with-a-longish-name-0001").is_ok());
                 assert_eq!(vfs.lookup("/many/entry-with-a-longish-name-0000").err(), Some(Errno::ENOENT));
@@ -2451,7 +2775,7 @@ mod tests {
                 image = fs::read(&img).unwrap();
             }
             let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-            let vfs = Vfs::new(ext2.root());
+            let vfs = Vfs::new(ext2.root().unwrap());
             let big = vfs.lookup("/big").unwrap();
             let ino = big.stat().ino as u32;
             let indexed = ext2.shared.fs.lock().read_inode(ino).unwrap().flags() & INDEX_FL != 0;
@@ -2480,7 +2804,7 @@ mod tests {
                 (fs.free_blocks(), get32(&fs.sb, sb::FREE_INODES))
             };
             let before = free(&ext2);
-            let vfs = Vfs::new(ext2.root());
+            let vfs = Vfs::new(ext2.root().unwrap());
             let f = vfs.open("/orphan", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
             f.write(0, &pattern(50_000, 2)).unwrap();
             vfs.unlink("/orphan").unwrap();
@@ -2500,7 +2824,7 @@ mod tests {
         for kind in [EXT2, Kind("ext4", &["-g", "256"])] {
             let Some(image) = mkfs(&scratch, kind, 1024, 1 << 20, None) else { return };
             let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-            let vfs = Vfs::new(ext2.root());
+            let vfs = Vfs::new(ext2.root().unwrap());
             let f = vfs.open("/fill", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
             let chunk = vec![0xa5; 64 * 1024];
             let mut total = 0;
@@ -2531,7 +2855,7 @@ mod tests {
         for block in [1024, 4096] {
             let Some(image) = mkfs(&scratch, EXT4, block, 16 << 20, None) else { return };
             let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-            let vfs = Vfs::new(ext2.root());
+            let vfs = Vfs::new(ext2.root().unwrap());
             let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
             let bs = block as u64;
             // Every other block, so that no two extents merge: forwards,
@@ -2572,7 +2896,7 @@ mod tests {
             assert_eq!(cats[0], expect(full));
 
             let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-            let vfs = Vfs::new(ext2.root());
+            let vfs = Vfs::new(ext2.root().unwrap());
             let fwd = vfs.lookup("/forwards").unwrap();
             let back = vfs.lookup("/backwards").unwrap();
             let half = n * bs + 50;
@@ -2596,7 +2920,7 @@ mod tests {
         // 300 blocks of uninitialized extents, and a size to cover them.
         let image = debugfs(&scratch, image, &["write /dev/null pre", "fallocate /pre 0 299", "sif /pre size 307200"]);
         let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-        let vfs = Vfs::new(ext2.root());
+        let vfs = Vfs::new(ext2.root().unwrap());
         let pre = vfs.open("/pre", OpenFlags::READ | OpenFlags::WRITE, 0).unwrap();
         assert!(read_all(&*pre).iter().all(|&b| b == 0));
         let mut want = vec![0; 307_200];
@@ -2616,7 +2940,7 @@ mod tests {
         let Some(image) = mkfs(&scratch, Kind("ext4", &["-O", "^large_file"]), 1024, 4 << 20, None) else { return };
         assert_eq!(get32(&image[1024..2048], sb::FEATURE_RO_COMPAT) & RO_COMPAT_LARGE_FILE, 0);
         let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-        let vfs = Vfs::new(ext2.root());
+        let vfs = Vfs::new(ext2.root().unwrap());
         let f = vfs.open("/big", OpenFlags::CREATE | OpenFlags::WRITE, 0o644).unwrap();
         f.truncate(3 << 30).unwrap();
         drop((f, vfs));
@@ -2642,9 +2966,9 @@ mod tests {
         // The same journal when clean is left alone.
         let ext2 = Ext2::mount(VecDisk(odd), 1).unwrap();
         assert!(!ext2.is_journaled());
-        ext2.root().create("unjournaled", FileKind::Regular, 0o644).unwrap();
+        ext2.root().unwrap().create("unjournaled", FileKind::Regular, 0o644).unwrap();
         let ext2 = Ext2::mount(VecDisk(unmount(ext2)), 1).unwrap();
-        assert!(names(&*ext2.root()).contains(&"unjournaled".to_string()));
+        assert!(names(&*ext2.root().unwrap()).contains(&"unjournaled".to_string()));
         let mut bad = image.clone();
         bad[1024 + sb::WTIME] ^= 1;
         assert_eq!(Ext2::mount(VecDisk(bad), 1).err(), Some(Errno::EINVAL));
@@ -2656,7 +2980,7 @@ mod tests {
         let Some(quota) = mkfs(&scratch, Kind("ext4", &["-O", "quota"]), 1024, 4 << 20, None) else { return };
         let ext2 = Ext2::mount(VecDisk(quota), 1).unwrap();
         assert!(ext2.is_read_only());
-        assert_eq!(ext2.root().create("x", FileKind::Regular, 0o644).err(), Some(Errno::EROFS));
+        assert_eq!(ext2.root().unwrap().create("x", FileKind::Regular, 0o644).err(), Some(Errno::EROFS));
     }
 
     /// Edits the primary superblock of an image, keeping its checksum.
@@ -2701,11 +3025,11 @@ mod tests {
         // Inodes and directory records corrupted after mounting, with their
         // checksums kept valid so that only the values are wrong.
         let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-        let vfs = Vfs::new(ext2.root());
+        let vfs = Vfs::new(ext2.root().unwrap());
         vfs.symlink("x", "/fast").unwrap();
         vfs.open("/file", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, b"data").unwrap();
         vfs.mkdir("/dir", 0o755).unwrap();
-        let ino_of = |name: &str| ext2.root().lookup(name).unwrap().stat().ino as u32;
+        let ino_of = |name: &str| ext2.root().unwrap().lookup(name).unwrap().stat().ino as u32;
         let (fast, file, dir) = (ino_of("fast"), ino_of("file"), ino_of("dir"));
         let edit_inode = |ino: u32, f: &dyn Fn(&mut Inode)| {
             let mut fs = ext2.shared.fs.lock();
@@ -2737,7 +3061,7 @@ mod tests {
         let scratch = Scratch::new("split-full");
         let Some(image) = mkfs(&scratch, Kind("ext4", &["-g", "256"]), 1024, 1 << 20, None) else { return };
         let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-        let vfs = Vfs::new(ext2.root());
+        let vfs = Vfs::new(ext2.root().unwrap());
         let f = vfs.open("/holes", OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
         // One block in every two: each write is a new extent, so the tree
         // keeps splitting until a split finds the disk full.
@@ -2760,7 +3084,7 @@ mod tests {
         fsck(&scratch, &image, &[]);
 
         let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-        ext2.root().lookup("holes").unwrap().truncate(0).unwrap();
+        ext2.root().unwrap().lookup("holes").unwrap().truncate(0).unwrap();
         fsck(&scratch, &unmount(ext2), &[]);
     }
 
@@ -2781,7 +3105,7 @@ mod tests {
             let image = debugfs(&scratch, image, &["mknod null c 1 3", "mknod fifo p"]);
             let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
             let before = free_counts(&ext2);
-            let vfs = Vfs::new(ext2.root());
+            let vfs = Vfs::new(ext2.root().unwrap());
             assert_eq!(vfs.stat("/null", true).unwrap().rdev, makedev(1, 3));
             vfs.unlink("/null").unwrap();
             vfs.unlink("/fifo").unwrap();
@@ -2796,9 +3120,9 @@ mod tests {
         let scratch = Scratch::new("metazone");
         let Some(image) = mkfs(&scratch, EXT2, 1024, 4 << 20, None) else { return };
         let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-        let vfs = Vfs::new(ext2.root());
+        let vfs = Vfs::new(ext2.root().unwrap());
         vfs.open("/f", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, b"data").unwrap();
-        let ino = ext2.root().lookup("f").unwrap().stat().ino as u32;
+        let ino = ext2.root().unwrap().lookup("f").unwrap().stat().ino as u32;
         {
             let mut fs = ext2.shared.fs.lock();
             let table = fs.group_get(0, gd::INODE_TABLE);
@@ -2818,9 +3142,9 @@ mod tests {
         let scratch = Scratch::new("emptydir");
         let Some(image) = mkfs(&scratch, EXT2, 1024, 4 << 20, None) else { return };
         let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-        let vfs = Vfs::new(ext2.root());
+        let vfs = Vfs::new(ext2.root().unwrap());
         vfs.mkdir("/d", 0o755).unwrap();
-        let d = ext2.root().lookup("d").unwrap().stat().ino as u32;
+        let d = ext2.root().unwrap().lookup("d").unwrap().stat().ino as u32;
         {
             let mut fs = ext2.shared.fs.lock();
             assert!(fs.is_empty_dir(d).unwrap());
@@ -2897,7 +3221,7 @@ mod tests {
                 assert!(unmount(ext2) == image);
 
                 let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
-                let root = ext2.root();
+                let root = ext2.root().unwrap();
                 let d = root.create("d", FileKind::Directory, 0o755).unwrap();
                 let f = d.create("f", FileKind::Regular, 0o644).unwrap();
                 f.write(0, &pattern(100_000, 4)).unwrap();
@@ -3173,7 +3497,7 @@ mod tests {
             let Some(image) = mkfs(&scratch, kind, block, 8 << 20, None) else { return };
             let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let ext2 = Ext2::mount(CrashDisk { data: image.clone(), events: events.clone() }, 1).unwrap();
-            let root = ext2.root();
+            let root = ext2.root().unwrap();
 
             // Each step is one call, which is one transaction.
             let mut steps: Vec<Step> = Vec::new();
@@ -3254,7 +3578,7 @@ mod tests {
                             || events.get(crash).is_some_and(|e| matches!(e, Event::Flush)));
                     let recovered = Ext2::mount(VecDisk(disk.clone()), 1)
                         .unwrap_or_else(|e| panic!("mount after crash {crash} variant {variant}: {e:?}"));
-                    let state = snapshot(&*recovered.root());
+                    let state = snapshot(&*recovered.root().unwrap());
                     assert!(
                         state == states[step - 1] || state == states[step],
                         "crash {crash} variant {variant} in step {step} (block size {block}): neither before nor after"
@@ -3268,7 +3592,7 @@ mod tests {
                         if variant == 0 && incompat(&disk) & INCOMPAT_RECOVER != 0 {
                             let theirs = fsck_repair(&scratch, &disk);
                             let theirs = Ext2::mount(VecDisk(theirs), 1).unwrap();
-                            assert!(snapshot(&*theirs.root()) == state, "crash {crash}: e2fsck disagrees");
+                            assert!(snapshot(&*theirs.root().unwrap()) == state, "crash {crash}: e2fsck disagrees");
                         }
                         checked += 1;
                     }
