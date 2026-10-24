@@ -11,4 +11,4 @@ workspace = true
 
 [dependencies]
 osmium-arch.workspace = true
-osmium-sync.workspace = true
+osmium-sync = { workspace = true, features = ["alloc"] }

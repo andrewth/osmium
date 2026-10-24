@@ -1,7 +1,5 @@
 //! Blocking synchronization built on the scheduler.
 
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,7 +7,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use osmium_sync::IrqSpinLock;
 
 use crate::core_sched::{block_current, current, wake};
-use crate::task::{Task, TaskState};
+use crate::queue::TaskList;
+use crate::task::TaskState;
 
 /// A queue of tasks waiting for a condition.
 ///
@@ -17,13 +16,13 @@ use crate::task::{Task, TaskState};
 /// and wakers lock the queue after making the condition true, so a wake-up
 /// can never fall between the check and going to sleep.
 pub struct WaitQueue {
-    waiters: IrqSpinLock<VecDeque<Arc<Task>>>,
+    waiters: IrqSpinLock<TaskList>,
 }
 
 impl WaitQueue {
     /// Creates an empty queue.
     pub const fn new() -> Self {
-        Self { waiters: IrqSpinLock::new(VecDeque::new()) }
+        Self { waiters: IrqSpinLock::new(TaskList::new()) }
     }
 
     /// Blocks until `cond` returns `Some`, and returns that value.
@@ -57,8 +56,12 @@ impl WaitQueue {
 
     /// Wakes every waiting task; returns how many were woken.
     pub fn wake_all(&self) -> usize {
-        let waiters = core::mem::take(&mut *self.waiters.lock());
-        waiters.into_iter().filter(|t| wake(t.clone())).count()
+        let mut waiters = self.waiters.lock().take();
+        let mut woken = 0;
+        while let Some(t) = waiters.pop_front() {
+            woken += usize::from(wake(t));
+        }
+        woken
     }
 
     /// Number of queued waiters (some may already have been woken elsewhere).

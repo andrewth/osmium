@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Real context switches on the host: each test thread acts as one CPU.
 
 use std::sync::Arc;

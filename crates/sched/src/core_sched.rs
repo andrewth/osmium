@@ -63,8 +63,16 @@ pub fn inject_scheduler(scheduler: &'static dyn Scheduler) {
     assert!(SCHEDULER.set(scheduler).is_ok(), "scheduler already injected");
 }
 
+/// Unwraps state that `init_cpu` or `inject_scheduler` set up.
+///
+/// Panics if the integrator skipped that call; no input from outside can do so.
+#[allow(clippy::expect_used)] // invariant: integrator calls `init_cpu` / `inject_scheduler` before scheduling.
+fn initialized<T>(value: Option<T>) -> T {
+    value.expect("init_cpu has not run on this CPU, or no scheduler was injected")
+}
+
 fn scheduler() -> &'static dyn Scheduler {
-    *SCHEDULER.get().expect("no scheduler injected")
+    *initialized(SCHEDULER.get())
 }
 
 /// Registers `hook`, called with a CPU id whenever a task is queued on a CPU
@@ -131,7 +139,7 @@ pub fn init_cpu() {
 
 /// Returns the running task.
 pub fn current() -> Arc<Task> {
-    CPUS.with(|st| st.current.clone().expect("init_cpu has not run on this CPU"))
+    CPUS.with(|st| initialized(st.current.clone()))
 }
 
 /// Makes a task built with [`crate::TaskBuilder::build`] runnable.
@@ -156,7 +164,8 @@ pub fn exit() -> ! {
     cur.state.store(TaskState::Exited as u8, Ordering::Release);
     cur.exit_waiters.wake_all();
     schedule(None);
-    unreachable!("an exited task was resumed");
+    // An exited task is never resumed.
+    cpu::halt_forever()
 }
 
 /// Accounts a timer tick to the running task. Call from the timer interrupt.
@@ -202,7 +211,7 @@ pub(crate) fn block_current() {
 fn current_ptr() -> *const Task {
     // SAFETY: the caller has IRQs disabled; we only read the pointer.
     let st = unsafe { &*CPUS.as_ptr() };
-    Arc::as_ptr(st.current.as_ref().expect("init_cpu has not run on this CPU"))
+    Arc::as_ptr(initialized(st.current.as_ref()))
 }
 
 /// The core of the scheduler: optionally requeue the current task, pick the
@@ -227,8 +236,9 @@ fn schedule(requeue: Option<EnqueueReason>) {
                 .is_ok()
             {
                 // SAFETY: as above.
-                let me = unsafe { (*st).current.clone() }.expect("a running task is the current task");
-                enqueue(me, reason);
+                if let Some(me) = unsafe { (*st).current.clone() } {
+                    enqueue(me, reason);
+                }
             }
         }
         None if !cur.is_idle && cur.state() == TaskState::Running => {
@@ -242,7 +252,7 @@ fn schedule(requeue: Option<EnqueueReason>) {
     let mut retries = 0;
     let next = loop {
         // SAFETY: as above.
-        let next = sched.pick_next(cpu).unwrap_or_else(|| unsafe { (*st).idle.clone() }.expect("init_cpu has not run"));
+        let next = sched.pick_next(cpu).unwrap_or_else(|| initialized(unsafe { (*st).idle.clone() }));
         if ptr::eq(Arc::as_ptr(&next), cur) {
             IDLE_CPUS.fetch_and(!(1 << cpu), Ordering::Relaxed);
             if cur.is_idle {
@@ -277,7 +287,7 @@ fn schedule(requeue: Option<EnqueueReason>) {
         }
         if retries >= 3 || idle {
             // SAFETY: as above.
-            break unsafe { (*st).idle.clone() }.expect("init_cpu has not run");
+            break initialized(unsafe { (*st).idle.clone() });
         }
     };
     if next.is_idle {

@@ -47,6 +47,7 @@ extern crate std;
 pub mod context;
 mod core_sched;
 mod policy;
+mod queue;
 mod sync;
 mod task;
 pub mod timer;
@@ -57,4 +58,4 @@ pub use core_sched::{
 };
 pub use policy::{EdfScheduler, FifoScheduler, PriorityScheduler};
 pub use sync::{Mutex, MutexGuard, Semaphore, WaitQueue};
-pub use task::{ALL_CPUS, StackAllocator, Task, TaskBuilder, TaskId, TaskState, set_stack_allocator};
+pub use task::{ALL_CPUS, OutOfMemory, StackAllocator, Task, TaskBuilder, TaskId, TaskState, set_stack_allocator};

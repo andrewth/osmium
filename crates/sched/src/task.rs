@@ -8,8 +8,13 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use osmium_arch::fp::FpState;
+pub use osmium_sync::fallible::OutOfMemory;
+use osmium_sync::fallible::{try_arc, try_box, try_uninit_slice};
+
+use osmium_sync::intrusive::{Link, TreeLink};
 
 use crate::context::Context;
+use crate::queue::EdfKey;
 use crate::sync::WaitQueue;
 
 /// Affinity mask allowing every CPU.
@@ -78,13 +83,13 @@ enum Stack {
 }
 
 impl Stack {
-    fn new(size: usize) -> Self {
+    fn try_new(size: usize) -> Result<Self, OutOfMemory> {
         match STACK_ALLOCATOR.get() {
             Some(a) => {
-                let (base, len) = a.alloc(size).expect("out of memory for a task stack");
-                Stack::Custom { base, len, alloc: *a }
+                let (base, len) = a.alloc(size).ok_or(OutOfMemory)?;
+                Ok(Stack::Custom { base, len, alloc: *a })
             }
-            None => Stack::Heap(Box::new_uninit_slice(size.div_ceil(16))),
+            None => Ok(Stack::Heap(try_uninit_slice(size.div_ceil(16))?)),
         }
     }
 
@@ -141,6 +146,12 @@ pub struct Task {
     pub(crate) abs_deadline: AtomicU64,
     pub(crate) release: AtomicU64,
     pub(crate) entry: UnsafeCell<Option<Entry>>,
+    /// Links the task into a wait queue or (except under EDF) a run queue.
+    /// Used by one at a time: see [`crate::queue`].
+    pub(crate) link: Link,
+    /// Links the task into an EDF run queue, ordered by `edf_key`.
+    pub(crate) tree: TreeLink,
+    pub(crate) edf_key: EdfKey,
     _stack: Option<Stack>,
     pub(crate) exit_waiters: WaitQueue,
     data: osmium_sync::Once<Box<dyn Any + Send + Sync>>,
@@ -156,6 +167,11 @@ unsafe impl Sync for Task {}
 unsafe impl Send for Task {}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The affinity-mask bit of `cpu`, or 0 for a CPU number beyond the mask.
+fn cpu_bit(cpu: usize) -> u64 {
+    u32::try_from(cpu).ok().and_then(|c| 1u64.checked_shl(c)).unwrap_or(0)
+}
 
 impl Task {
     /// The task's id.
@@ -212,18 +228,15 @@ impl Task {
     /// Moves the task to `cpu`'s run queue the next time it is queued. A
     /// task pinned to one CPU stays pinned, to the new one.
     ///
-    /// # Panics
-    ///
-    /// If `cpu` is not below [`osmium_arch::MAX_CPUS`], or the task's affinity
-    /// does not allow it (the scheduler could never run it there).
+    /// Does nothing if `cpu` is not below [`osmium_arch::MAX_CPUS`], or the
+    /// task's affinity does not allow it (the scheduler could never run it
+    /// there).
     pub fn set_cpu(&self, cpu: usize) {
-        assert!(cpu < osmium_arch::MAX_CPUS);
-        assert!(
-            self.affinity().count_ones() == 1 || self.can_run_on(cpu),
-            "set_cpu: CPU {cpu} is outside the affinity"
-        );
+        if cpu >= osmium_arch::MAX_CPUS || (self.affinity().count_ones() != 1 && !self.can_run_on(cpu)) {
+            return;
+        }
         if self.affinity().count_ones() == 1 {
-            self.affinity.store(1 << cpu, Ordering::Relaxed);
+            self.affinity.store(cpu_bit(cpu), Ordering::Relaxed);
         }
         self.cpu.store(cpu, Ordering::Relaxed);
     }
@@ -231,12 +244,12 @@ impl Task {
     /// Pins the task to `cpu`: it moves there the next time it is queued
     /// and no policy moves it elsewhere.
     ///
-    /// # Panics
-    ///
-    /// If `cpu` is not below [`osmium_arch::MAX_CPUS`].
+    /// Does nothing if `cpu` is not below [`osmium_arch::MAX_CPUS`].
     pub fn pin(&self, cpu: usize) {
-        assert!(cpu < osmium_arch::MAX_CPUS);
-        self.affinity.store(1 << cpu, Ordering::Relaxed);
+        if cpu >= osmium_arch::MAX_CPUS {
+            return;
+        }
+        self.affinity.store(cpu_bit(cpu), Ordering::Relaxed);
         self.cpu.store(cpu, Ordering::Relaxed);
     }
 
@@ -248,9 +261,6 @@ impl Task {
 
     /// The CPUs the task may run on (bit `n` = CPU `n`).
     ///
-    /// # Panics
-    ///
-    /// If `mask` is empty.
     pub fn affinity(&self) -> u64 {
         self.affinity.load(Ordering::Relaxed)
     }
@@ -258,20 +268,20 @@ impl Task {
     /// Restricts the task to the CPUs in `mask`. If its current CPU is not
     /// among them, it moves to the lowest one the next time it is queued.
     ///
-    /// # Panics
-    ///
-    /// If `mask` is empty.
+    /// An empty `mask` is ignored: a task must be allowed on some CPU.
     pub fn set_affinity(&self, mask: u64) {
-        assert!(mask != 0, "a task must be allowed on some CPU");
+        if mask == 0 {
+            return;
+        }
         self.affinity.store(mask, Ordering::Relaxed);
-        if mask & (1 << self.cpu()) == 0 {
+        if mask & cpu_bit(self.cpu()) == 0 {
             self.cpu.store(mask.trailing_zeros() as usize, Ordering::Relaxed);
         }
     }
 
     /// Returns true if the task may run on `cpu`.
     pub fn can_run_on(&self, cpu: usize) -> bool {
-        self.affinity() & (1 << cpu) != 0
+        self.affinity() & cpu_bit(cpu) != 0
     }
 
     /// Returns true if `cpu` may take the task from another CPU's queue now.
@@ -299,7 +309,14 @@ impl Task {
     /// one is already set.
     pub fn set_data<T: Any + Send + Sync>(&self, value: T) -> Result<(), T> {
         let mut value = Some(value);
-        self.data.call_once(|| Box::new(value.take().expect("call_once runs its closure at most once")));
+        // The closure runs at most once; if it somehow did not, `value` stays `Some` and is handed back.
+        self.data.call_once(|| {
+            let boxed: Box<dyn Any + Send + Sync> = match value.take() {
+                Some(v) => Box::new(v),
+                None => Box::new(()),
+            };
+            boxed
+        });
         match value {
             None => Ok(()),
             Some(v) => Err(v),
@@ -322,21 +339,29 @@ impl Task {
         self.exit_waiters.wait_until(|| (self.state() == TaskState::Exited).then_some(()));
     }
 
+    #[allow(clippy::expect_used)] // invariant: with no stack to allocate, `raw` cannot fail.
     pub(crate) fn bootstrap(cpu: usize) -> Self {
-        let t = Self::raw("boot", None, None, cpu, false);
+        let t = Self::raw("boot", None, None, cpu, false).expect("no stack to allocate");
         // It runs on this CPU's boot stack (on hosted builds, a thread's own
         // stack): never let another CPU steal it.
-        t.affinity.store(1 << cpu, Ordering::Relaxed);
+        t.affinity.store(cpu_bit(cpu), Ordering::Relaxed);
         t
     }
 
+    #[allow(clippy::expect_used)] // boot-time integrator path (`init_cpu`); the `try_` APIs are for runtime.
     pub(crate) fn idle(cpu: usize, stack_size: usize) -> Arc<Self> {
-        let t = Self::raw("idle", Some(stack_size), None, cpu, true);
+        let t = Self::raw("idle", Some(stack_size), None, cpu, true).expect("out of memory for an idle task");
         Arc::new(t)
     }
 
-    fn raw(name: &'static str, stack_size: Option<usize>, entry: Option<Entry>, cpu: usize, is_idle: bool) -> Self {
-        let stack = stack_size.map(Stack::new);
+    fn raw(
+        name: &'static str,
+        stack_size: Option<usize>,
+        entry: Option<Entry>,
+        cpu: usize,
+        is_idle: bool,
+    ) -> Result<Self, OutOfMemory> {
+        let stack = stack_size.map(Stack::try_new).transpose()?;
         let ctx = match &stack {
             Some(s) => {
                 let top = s.top();
@@ -346,7 +371,7 @@ impl Task {
             }
             None => Context::default(),
         };
-        Self {
+        Ok(Self {
             id: TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             name,
             ctx: UnsafeCell::new(ctx),
@@ -362,11 +387,14 @@ impl Task {
             abs_deadline: AtomicU64::new(u64::MAX),
             release: AtomicU64::new(u64::MAX),
             entry: UnsafeCell::new(entry),
+            link: Link::new(),
+            tree: TreeLink::new(),
+            edf_key: UnsafeCell::new((0, 0)),
             _stack: stack,
             exit_waiters: WaitQueue::new(),
             data: osmium_sync::Once::new(),
             fp: None,
-        }
+        })
     }
 }
 
@@ -428,16 +456,23 @@ impl TaskBuilder {
 
     /// Pins the task to `cpu`. By default it starts on the spawning CPU and
     /// load-balancing policies may move it.
+    ///
+    /// A `cpu` that is not below [`osmium_arch::MAX_CPUS`] is ignored.
     pub fn cpu(mut self, cpu: usize) -> Self {
-        self.cpu = Some(cpu);
-        self.affinity = 1 << cpu;
+        if cpu < osmium_arch::MAX_CPUS {
+            self.cpu = Some(cpu);
+            self.affinity = cpu_bit(cpu);
+        }
         self
     }
 
     /// Restricts the task to the CPUs in `mask` (bit `n` = CPU `n`).
+    ///
+    /// An empty `mask` is ignored: a task must be allowed on some CPU.
     pub fn affinity(mut self, mask: u64) -> Self {
-        assert!(mask != 0, "a task must be allowed on some CPU");
-        self.affinity = mask;
+        if mask != 0 {
+            self.affinity = mask;
+        }
         self
     }
 
@@ -455,9 +490,19 @@ impl TaskBuilder {
 
     /// Attaches data before the task first runs, so a switch hook sees it
     /// on the very first switch; see [`Task::data`].
-    pub fn data<T: Any + Send + Sync>(mut self, value: T) -> Self {
-        self.data = Some(Box::new(value));
-        self
+    ///
+    /// # Panics
+    /// If memory runs out: [`TaskBuilder::try_data`] reports that instead.
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM; `try_data` is the fallible form.
+    pub fn data<T: Any + Send + Sync>(self, value: T) -> Self {
+        self.try_data(value).expect("out of memory for task data")
+    }
+
+    /// [`TaskBuilder::data`], failing instead of panicking if memory runs out.
+    pub fn try_data<T: Any + Send + Sync>(mut self, value: T) -> Result<Self, OutOfMemory> {
+        let data: Box<dyn Any + Send + Sync> = try_box(value)?;
+        self.data = Some(data);
+        Ok(self)
     }
 
     /// Gives the task its own FP/SIMD registers, starting as `state`: the
@@ -471,13 +516,25 @@ impl TaskBuilder {
     }
 
     /// Creates the task without making it runnable; see [`crate::spawn`].
+    ///
+    /// # Panics
+    /// If memory runs out: [`TaskBuilder::try_build`] reports that instead.
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM; `try_build` is the fallible form.
     pub fn build(self, f: impl FnOnce() + Send + 'static) -> Arc<Task> {
+        self.try_build(f).expect("out of memory for a task")
+    }
+
+    /// [`TaskBuilder::build`], failing instead of panicking if memory runs
+    /// out (for the stack, the entry closure, the FP registers or the task
+    /// itself). Nothing is left allocated on failure.
+    pub fn try_build(self, f: impl FnOnce() + Send + 'static) -> Result<Arc<Task>, OutOfMemory> {
         let mut cpu = self.cpu.unwrap_or_else(osmium_arch::cpu::current_id);
-        if self.affinity & (1 << cpu) == 0 {
+        if self.affinity & cpu_bit(cpu) == 0 {
             cpu = self.affinity.trailing_zeros() as usize;
         }
-        let mut t = Task::raw(self.name, Some(self.stack_size), Some(Box::new(f)), cpu, false);
-        t.fp = self.fp.map(|s| Box::new(UnsafeCell::new(s)));
+        let entry: Entry = try_box(f)?;
+        let mut t = Task::raw(self.name, Some(self.stack_size), Some(entry), cpu, false)?;
+        t.fp = self.fp.map(|s| try_box(UnsafeCell::new(s))).transpose()?;
         t.priority.store(self.priority, Ordering::Relaxed);
         t.affinity.store(self.affinity, Ordering::Relaxed);
         t.rel_deadline.store(self.deadline, Ordering::Relaxed);
@@ -485,14 +542,24 @@ impl TaskBuilder {
         if let Some(d) = self.data {
             t.data.call_once(|| d);
         }
-        Arc::new(t)
+        try_arc(t)
     }
 
     /// Creates the task and makes it runnable.
+    ///
+    /// # Panics
+    /// If memory runs out: [`TaskBuilder::try_spawn`] reports that instead.
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM; `try_spawn` is the fallible form.
     pub fn spawn(self, f: impl FnOnce() + Send + 'static) -> Arc<Task> {
-        let t = self.build(f);
+        self.try_spawn(f).expect("out of memory for a task")
+    }
+
+    /// [`TaskBuilder::spawn`], failing instead of panicking if memory runs
+    /// out. The task exists and is queued only on success.
+    pub fn try_spawn(self, f: impl FnOnce() + Send + 'static) -> Result<Arc<Task>, OutOfMemory> {
+        let t = self.try_build(f)?;
         crate::spawn(t.clone());
-        t
+        Ok(t)
     }
 }
 
@@ -501,10 +568,16 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "outside the affinity")]
-    fn set_cpu_outside_affinity_panics() {
-        let t = TaskBuilder::new("t").affinity(1 << 2 | 1 << 3).build(|| {});
+    fn hostile_cpu_and_affinity_are_ignored() {
+        let t = TaskBuilder::new("t").affinity(1 << 2 | 1 << 3).cpu(usize::MAX).affinity(0).build(|| {});
+        let before = (t.cpu(), t.affinity());
         t.set_cpu(5);
+        t.set_cpu(usize::MAX);
+        t.pin(64);
+        t.pin(usize::MAX);
+        t.set_affinity(0);
+        assert_eq!((t.cpu(), t.affinity()), before);
+        assert!(!t.can_run_on(usize::MAX));
     }
 
     #[test]

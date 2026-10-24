@@ -6,8 +6,11 @@
 //! holds two of them at once: `pick_next` releases the local queue before
 //! `steal_for` locks a victim's, and `steal_for` locks one victim at a time.
 //! Run-queue locks are leaves, so no other lock is taken while one is held.
+//!
+//! The queues are intrusive (see [`crate::queue`]): queueing a task, which a
+//! wake-up or a preemption does where no error can be reported, never
+//! allocates.
 
-use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -15,6 +18,7 @@ use osmium_arch::MAX_CPUS;
 use osmium_sync::{IrqSpinLock, PerCpu};
 
 use crate::core_sched::{EnqueueReason, Scheduler};
+use crate::queue::{TaskList, TaskTree};
 use crate::task::Task;
 
 /// Round-robin with a fixed time slice and one run queue per CPU.
@@ -23,7 +27,7 @@ use crate::task::Task;
 /// work from other CPUs: the most recently queued task it is allowed to run
 /// (see [`Task::can_run_on`]). Pinned tasks are never moved.
 pub struct FifoScheduler {
-    queues: PerCpu<IrqSpinLock<VecDeque<Arc<Task>>>>,
+    queues: PerCpu<IrqSpinLock<TaskList>>,
     slice: u32,
     steal: bool,
     steals: AtomicUsize,
@@ -34,7 +38,7 @@ impl FifoScheduler {
     /// others wait.
     pub const fn new(slice_ticks: u32) -> Self {
         Self {
-            queues: PerCpu::new([const { IrqSpinLock::new(VecDeque::new()) }; MAX_CPUS]),
+            queues: PerCpu::new([const { IrqSpinLock::new(TaskList::new()) }; MAX_CPUS]),
             slice: slice_ticks,
             steal: false,
             steals: AtomicUsize::new(0),
@@ -57,10 +61,9 @@ impl FifoScheduler {
         for off in 1..MAX_CPUS {
             let victim = (cpu + off) % MAX_CPUS;
             let mut q = self.queues.for_cpu(victim).lock();
-            if let Some(i) = q.iter().rposition(|t| t.stealable_by(cpu)) {
-                let t = q.remove(i);
+            if let Some(t) = q.remove_last_where(|t| t.stealable_by(cpu)) {
                 self.steals.fetch_add(1, Ordering::Relaxed);
-                return t;
+                return Some(t);
             }
         }
         None
@@ -99,12 +102,21 @@ const LEVELS: usize = 64;
 struct PrioQueue {
     /// Bit `p` set = level `p` is non-empty.
     bitmap: u64,
-    levels: [VecDeque<Arc<Task>>; LEVELS],
+    levels: [TaskList; LEVELS],
 }
 
 impl PrioQueue {
     const fn new() -> Self {
-        Self { bitmap: 0, levels: [const { VecDeque::new() }; LEVELS] }
+        Self { bitmap: 0, levels: [const { TaskList::new() }; LEVELS] }
+    }
+
+    /// The list for level `p`; a level past the last names level 0 (priorities are clamped to 63, so none is).
+    fn level(&mut self, p: usize) -> &mut TaskList {
+        let [first, rest @ ..] = &mut self.levels;
+        match p.checked_sub(1) {
+            Some(i) => rest.get_mut(i).unwrap_or(first),
+            None => first,
+        }
     }
 
     fn highest(&self) -> Option<u8> {
@@ -155,13 +167,12 @@ impl PriorityScheduler {
             while bits != 0 {
                 let p = 63 - bits.leading_zeros() as usize;
                 bits &= !(1 << p);
-                if let Some(i) = q.levels[p].iter().rposition(|t| t.stealable_by(cpu)) {
-                    let t = q.levels[p].remove(i);
-                    if q.levels[p].is_empty() {
+                if let Some(t) = q.level(p).remove_last_where(|t| t.stealable_by(cpu)) {
+                    if q.level(p).is_empty() {
                         q.bitmap &= !(1 << p);
                     }
                     self.steals.fetch_add(1, Ordering::Relaxed);
-                    return t;
+                    return Some(t);
                 }
             }
         }
@@ -174,7 +185,7 @@ impl Scheduler for PriorityScheduler {
         task.slice_left.store(self.slice, Ordering::Relaxed);
         let p = task.priority() as usize;
         let mut q = self.queues.for_cpu(task.cpu()).lock();
-        q.levels[p].push_back(task);
+        q.level(p).push_back(task);
         q.bitmap |= 1 << p;
     }
 
@@ -183,8 +194,8 @@ impl Scheduler for PriorityScheduler {
             let mut q = self.queues.for_cpu(cpu).lock();
             q.highest().and_then(|p| {
                 let p = p as usize;
-                let t = q.levels[p].pop_front();
-                if q.levels[p].is_empty() {
+                let t = q.level(p).pop_front();
+                if q.level(p).is_empty() {
                     q.bitmap &= !(1 << p);
                 }
                 t
@@ -211,7 +222,7 @@ impl Scheduler for PriorityScheduler {
 /// Run queue ordered by absolute deadline, then arrival.
 struct EdfQueue {
     seq: u64,
-    tasks: BTreeMap<(u64, u64), Arc<Task>>,
+    tasks: TaskTree,
 }
 
 /// Earliest-deadline-first scheduling.
@@ -247,7 +258,7 @@ impl EdfScheduler {
     /// of `slice_ticks` ticks.
     pub const fn new(slice_ticks: u32) -> Self {
         Self {
-            queues: PerCpu::new([const { IrqSpinLock::new(EdfQueue { seq: 0, tasks: BTreeMap::new() }) }; MAX_CPUS]),
+            queues: PerCpu::new([const { IrqSpinLock::new(EdfQueue { seq: 0, tasks: TaskTree::new() }) }; MAX_CPUS]),
             slice: slice_ticks,
             steal: false,
             steals: AtomicUsize::new(0),
@@ -307,9 +318,9 @@ impl EdfScheduler {
         for off in 1..MAX_CPUS {
             let victim = (cpu + off) % MAX_CPUS;
             let mut q = self.queues.for_cpu(victim).lock();
-            if let Some(key) = q.tasks.iter().find(|(_, t)| t.stealable_by(cpu)).map(|(k, _)| *k) {
+            if let Some(t) = q.tasks.remove_first_where(|t| t.stealable_by(cpu)) {
                 self.steals.fetch_add(1, Ordering::Relaxed);
-                return q.tasks.remove(&key);
+                return Some(t);
             }
         }
         None
@@ -326,11 +337,11 @@ impl Scheduler for EdfScheduler {
         let mut q = self.queues.for_cpu(task.cpu()).lock();
         q.seq += 1;
         let seq = q.seq;
-        q.tasks.insert((abs, seq), task);
+        q.tasks.insert(task, (abs, seq));
     }
 
     fn pick_next(&self, cpu: usize) -> Option<Arc<Task>> {
-        let local = self.queues.for_cpu(cpu).lock().tasks.pop_first().map(|(_, t)| t);
+        let local = self.queues.for_cpu(cpu).lock().tasks.pop_first();
         if local.is_none() && self.steal { self.steal_for(cpu) } else { local }
     }
 
@@ -346,8 +357,8 @@ impl Scheduler for EdfScheduler {
         let left = current.slice_left.load(Ordering::Relaxed).saturating_sub(1);
         current.slice_left.store(left, Ordering::Relaxed);
         let mine = current.abs_deadline.load(Ordering::Relaxed);
-        match self.queues.for_cpu(cpu).lock().tasks.first_key_value() {
-            Some((&(abs, _), _)) => abs < mine || (abs == mine && left == 0),
+        match self.queues.for_cpu(cpu).lock().tasks.first_key() {
+            Some((abs, _)) => abs < mine || (abs == mine && left == 0),
             None => false,
         }
     }
