@@ -264,7 +264,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 }
                 self.ext_convert(seed, inode, path, lblk)?;
                 let zero = vec![0; self.block_size];
-                self.write_block(p, &zero)?;
+                self.write_data_block(p, &zero)?;
                 return Ok(p);
             }
             goal = p;

@@ -10,19 +10,30 @@
 //! (preallocated) extents read as zeroes and are split as they are written.
 //! Every checksum is verified on read and kept current on write.
 //!
-//! A journal is left alone. A clean one is fine, since each change is
-//! written in place, but one that needs recovery is refused, as are the
-//! other incompatible features (`inline_data`, `largedir`,
-//! `ea_inode`, encryption, casefolding, compression). A file system with an
-//! unknown read-only feature (`quota`, `bigalloc`, ...) mounts read-only.
+//! A JBD2 journal inside the file system (ext3's or ext4's) is used. Each
+//! operation writes its metadata changes to the log and commits them before
+//! they go to their places, and file data is written first (`data=ordered`),
+//! so a crash leaves the file system as it was before the operation or after
+//! it. Mounting replays what a crash left in the log, including logs written
+//! by Linux (revoke records, `64bit` tags, `csum_v3` checksums). Without a
+//! journal, or with one of a kind this driver does not understand (on
+//! another device, `csum_v2`, `async_commit`, fast commits), changes are
+//! written in place and are not crash safe; if such a journal needs
+//! recovery the mount fails with `ENOSYS`. An operation too large for the
+//! journal is logged as several transactions. The other incompatible
+//! features (`inline_data`, `largedir`, `ea_inode`, encryption, casefolding,
+//! compression) are refused. A file system with an unknown read-only
+//! feature (`quota`, `bigalloc`, ...) mounts read-only.
 //! Hashed directory indexes are ignored for lookup and dropped (the flag is
 //! cleared) when a directory changes, as Linux's ext2 driver does; with
 //! `metadata_csum` the index blocks become empty, checksummed directory
 //! blocks.
 //!
 //! All state lives behind one spin lock held across device I/O, and there is
-//! no block cache: simple and correct, not fast. Nothing is journaled; call
-//! [`File::sync`] to flush the device.
+//! no block cache: simple and correct, not fast. A journaled operation
+//! flushes the device three times. Call [`Ext2::into_device`] to unmount:
+//! it marks the journal empty and the file system clean. Dropping an
+//! [`Ext2`] instead leaves the journal for the next mount to replay.
 #![no_std]
 
 extern crate alloc;
@@ -31,6 +42,7 @@ extern crate std;
 
 mod csum;
 mod extent;
+mod journal;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -42,6 +54,7 @@ use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_sync::SpinLock;
 
 use csum::{crc16, crc32c};
+use journal::Journal;
 use osmium_fs::dev::makedev;
 use osmium_fs::{DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat};
 
@@ -54,8 +67,11 @@ const NDIR_BLOCKS: usize = 12;
 /// `dir_nlink`, the count stays at 1.
 const LINK_MAX: u16 = 65000;
 
+const COMPAT_HAS_JOURNAL: u32 = 0x0004;
 const COMPAT_SPARSE_SUPER2: u32 = 0x0200;
 const INCOMPAT_FILETYPE: u32 = 0x0002;
+/// The journal holds transactions to replay.
+const INCOMPAT_RECOVER: u32 = 0x0004;
 const INCOMPAT_META_BG: u32 = 0x0010;
 const INCOMPAT_EXTENTS: u32 = 0x0040;
 const INCOMPAT_64BIT: u32 = 0x0080;
@@ -117,6 +133,7 @@ mod sb {
     pub const FEATURE_RO_COMPAT: usize = 100;
     pub const UUID: usize = 0x68;
     pub const RESERVED_GDT_BLOCKS: usize = 0xce;
+    pub const JOURNAL_INUM: usize = 0xe0;
     pub const DESC_SIZE: usize = 0xfe;
     pub const FIRST_META_BG: usize = 0x104;
     pub const BLOCKS_COUNT_HI: usize = 0x150;
@@ -363,6 +380,15 @@ struct Fs<D: BlockDevice + Send + 'static> {
     /// backups, descriptors, bitmaps and inode tables, which file data and
     /// block maps must never name.
     meta_zones: Vec<(u64, u64)>,
+    /// The journal, when there is one this driver can write. Metadata
+    /// writes then collect in `tx` until the operation ends.
+    journal: Option<journal::Journal>,
+    /// The metadata blocks the operation in progress has changed, by block.
+    tx: BTreeMap<u64, Vec<u8>>,
+    /// Block ranges `[start, end)` the operation has freed, which it must
+    /// not allocate again: until the transaction commits, a crash brings
+    /// them back as they were.
+    tx_freed: BTreeMap<u64, u64>,
 }
 
 /// An ext2, ext3 or ext4 file system on a block device.
@@ -389,7 +415,8 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
     /// `st_dev` as `devno`. Fails with `EINVAL` if `dev` holds no such file
     /// system (or its superblock or group descriptors fail their checksums)
     /// and `ENOSYS` for unsupported features, including a journal that needs
-    /// recovery.
+    /// recovery but that this driver cannot read. A journal that needs
+    /// recovery is replayed, so mounting writes to the device.
     pub fn mount(dev: D, devno: u64) -> Result<Self, Errno> {
         let dev_bs = dev.block_size();
         let mut fs = Fs {
@@ -415,107 +442,30 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
             nodes: BTreeMap::new(),
             st_dev: devno,
             meta_zones: Vec::new(),
+            journal: None,
+            tx: BTreeMap::new(),
+            tx_freed: BTreeMap::new(),
         };
-        let mut sbuf = vec![0; SUPERBLOCK_LEN];
-        fs.read_bytes(SUPERBLOCK_OFFSET, &mut sbuf)?;
-        fs.sb = sbuf;
-        if get16(&fs.sb, sb::MAGIC) != MAGIC {
-            return Err(Errno::EINVAL);
+        fs.load()?;
+        let mut journal = Journal::open(&mut fs)?;
+        if get32(&fs.sb, sb::FEATURE_INCOMPAT) & INCOMPAT_RECOVER != 0 {
+            let mut replaying = journal.ok_or(Errno::ENOSYS)?;
+            replaying.replay(&mut fs)?;
+            fs.set_disk_needs_recovery(false)?;
+            // Replay may have rewritten the superblock and descriptors.
+            fs.load()?;
+            journal = Journal::open(&mut fs)?;
         }
-        let log = get32(&fs.sb, sb::LOG_BLOCK_SIZE);
-        // Record lengths are 16 bits, so a block holds at most 32 KiB.
-        if log > 5 {
-            return Err(Errno::EINVAL);
+        if !fs.read_only
+            && let Some(journal) = journal
+        {
+            // The superblock the journal logs says the journal is in use;
+            // the one on disk says so once the first transaction is in the
+            // log.
+            let flags = get32(&fs.sb, sb::FEATURE_INCOMPAT) | INCOMPAT_RECOVER;
+            put32(&mut fs.sb, sb::FEATURE_INCOMPAT, flags);
+            fs.journal = Some(journal);
         }
-        fs.block_size = 1024 << log;
-        if dev_bs == 0 || fs.block_size % dev_bs != 0 {
-            return Err(Errno::EINVAL);
-        }
-        fs.dev_per_block = (fs.block_size / dev_bs) as u64;
-        if get32(&fs.sb, sb::REV_LEVEL) >= 1 {
-            fs.first_ino = get32(&fs.sb, sb::FIRST_INO);
-            fs.inode_size = get16(&fs.sb, sb::INODE_SIZE) as usize;
-            let incompat = get32(&fs.sb, sb::FEATURE_INCOMPAT);
-            if incompat & !INCOMPAT_SUPPORTED != 0 {
-                return Err(Errno::ENOSYS);
-            }
-            fs.filetype = incompat & INCOMPAT_FILETYPE != 0;
-            if incompat & INCOMPAT_META_BG != 0 {
-                fs.first_meta_bg = Some(get32(&fs.sb, sb::FIRST_META_BG));
-            }
-            fs.extents = incompat & INCOMPAT_EXTENTS != 0;
-            fs.wide = incompat & INCOMPAT_64BIT != 0;
-            if fs.wide {
-                fs.desc_size = get16(&fs.sb, sb::DESC_SIZE) as usize;
-                if fs.desc_size < 64 || !fs.desc_size.is_power_of_two() || fs.desc_size > fs.block_size {
-                    return Err(Errno::EINVAL);
-                }
-            }
-            let ro = get32(&fs.sb, sb::FEATURE_RO_COMPAT);
-            fs.read_only = ro & !RO_COMPAT_SUPPORTED != 0;
-            fs.dir_nlink = ro & RO_COMPAT_DIR_NLINK != 0;
-            if ro & RO_COMPAT_METADATA_CSUM != 0 {
-                // 1 is CRC32C, the only type there is.
-                if fs.sb[sb::CHECKSUM_TYPE] != 1 {
-                    return Err(Errno::ENOSYS);
-                }
-                if get32(&fs.sb, sb::CHECKSUM) != crc32c(!0, &fs.sb[..sb::CHECKSUM]) {
-                    return Err(Errno::EINVAL);
-                }
-                fs.csum = Csum::Crc32c;
-                fs.csum_seed = if incompat & INCOMPAT_CSUM_SEED != 0 {
-                    get32(&fs.sb, sb::CHECKSUM_SEED)
-                } else {
-                    crc32c(!0, &fs.sb[sb::UUID..sb::UUID + 16])
-                };
-            } else if ro & RO_COMPAT_GDT_CSUM != 0 {
-                fs.csum = Csum::Crc16;
-            }
-        }
-        let per_group = get32(&fs.sb, sb::BLOCKS_PER_GROUP);
-        let inodes_per_group = get32(&fs.sb, sb::INODES_PER_GROUP);
-        let blocks = fs.blocks_count();
-        let first = get32(&fs.sb, sb::FIRST_DATA_BLOCK) as u64;
-        if fs.inode_size < 128 || !fs.inode_size.is_power_of_two() || fs.inode_size > fs.block_size {
-            return Err(Errno::EINVAL);
-        }
-        // Each group's bitmaps are one block, and every count a whole
-        // number of bitmap bytes.
-        let bits = 8 * fs.block_size as u32;
-        if per_group == 0 || per_group > bits || per_group % 8 != 0 {
-            return Err(Errno::EINVAL);
-        }
-        if inodes_per_group == 0 || inodes_per_group > bits || inodes_per_group % 8 != 0 {
-            return Err(Errno::EINVAL);
-        }
-        // Bounding the size by the device bounds the descriptor table too.
-        let dev_blocks = fs.dev.num_blocks().saturating_mul(dev_bs as u64) / fs.block_size as u64;
-        if blocks <= first || blocks > dev_blocks {
-            return Err(Errno::EINVAL);
-        }
-        let groups = (blocks - first).div_ceil(per_group as u64);
-        if groups > u32::MAX as u64 || get32(&fs.sb, sb::INODES_COUNT) as u64 != groups * inodes_per_group as u64 {
-            return Err(Errno::EINVAL);
-        }
-        fs.group_count = groups as u32;
-        fs.gdt_block = first + 1;
-        let len = fs.group_count as usize * fs.desc_size;
-        fs.groups.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
-        fs.groups.resize(len, 0);
-        // A descriptor block at a time, since `meta_bg` scatters them.
-        let per_block = (fs.block_size / fs.desc_size) as u32;
-        for first in (0..fs.group_count).step_by(per_block as usize) {
-            let n = per_block.min(fs.group_count - first) as usize * fs.desc_size;
-            let mut descs = vec![0; n];
-            fs.read_bytes(fs.desc_offset(first), &mut descs)?;
-            let start = first as usize * fs.desc_size;
-            fs.groups[start..start + n].copy_from_slice(&descs);
-        }
-        if fs.csum != Csum::None && (0..fs.group_count).any(|g| fs.group_csum(g) != get16(fs.desc(g), gd::CHECKSUM)) {
-            return Err(Errno::EINVAL);
-        }
-        fs.check_layout()?;
-        fs.meta_zones = fs.compute_meta_zones();
         let shared = Arc::new(Shared { fs: SpinLock::new(fs) });
         Ok(Ext2 { shared })
     }
@@ -524,6 +474,12 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
     /// seconds since 1970. Without one, new times are 0.
     pub fn set_clock(&self, clock: fn() -> u32) {
         self.shared.fs.lock().clock = clock;
+    }
+
+    /// Whether changes are journaled: the file system has an internal JBD2
+    /// journal this driver understands, and is writable.
+    pub fn is_journaled(&self) -> bool {
+        self.shared.fs.lock().journal.is_some()
     }
 
     /// Whether writes fail with `EROFS` (an unknown read-only feature).
@@ -543,6 +499,7 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
         match Arc::try_unwrap(self.shared) {
             Ok(shared) => {
                 let mut fs = shared.fs.into_inner();
+                fs.close_journal();
                 let _ = fs.dev.flush();
                 Ok(fs.dev)
             }
@@ -552,6 +509,128 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
 }
 
 impl<D: BlockDevice + Send + 'static> Fs<D> {
+    /// Reads the superblock and group descriptors and checks them, setting
+    /// every field derived from them. Safe to call again after the journal
+    /// has been replayed.
+    fn load(&mut self) -> Result<(), Errno> {
+        let dev_bs = self.dev.block_size();
+        self.filetype = false;
+        self.wide = false;
+        self.extents = false;
+        self.dir_nlink = false;
+        self.csum = Csum::None;
+        self.csum_seed = 0;
+        self.read_only = false;
+        self.desc_size = 32;
+        self.first_meta_bg = None;
+        self.inode_size = 128;
+        self.first_ino = 11;
+        self.groups.clear();
+        let mut sbuf = vec![0; SUPERBLOCK_LEN];
+        self.read_bytes(SUPERBLOCK_OFFSET, &mut sbuf)?;
+        self.sb = sbuf;
+        if get16(&self.sb, sb::MAGIC) != MAGIC {
+            return Err(Errno::EINVAL);
+        }
+        let log = get32(&self.sb, sb::LOG_BLOCK_SIZE);
+        // Record lengths are 16 bits, so a block holds at most 32 KiB.
+        if log > 5 {
+            return Err(Errno::EINVAL);
+        }
+        self.block_size = 1024 << log;
+        if dev_bs == 0 || !self.block_size.is_multiple_of(dev_bs) {
+            return Err(Errno::EINVAL);
+        }
+        self.dev_per_block = (self.block_size / dev_bs) as u64;
+        if get32(&self.sb, sb::REV_LEVEL) >= 1 {
+            self.first_ino = get32(&self.sb, sb::FIRST_INO);
+            self.inode_size = get16(&self.sb, sb::INODE_SIZE) as usize;
+            let incompat = get32(&self.sb, sb::FEATURE_INCOMPAT);
+            if incompat & !(INCOMPAT_SUPPORTED | INCOMPAT_RECOVER) != 0 {
+                return Err(Errno::ENOSYS);
+            }
+            self.filetype = incompat & INCOMPAT_FILETYPE != 0;
+            if incompat & INCOMPAT_META_BG != 0 {
+                self.first_meta_bg = Some(get32(&self.sb, sb::FIRST_META_BG));
+            }
+            self.extents = incompat & INCOMPAT_EXTENTS != 0;
+            self.wide = incompat & INCOMPAT_64BIT != 0;
+            if self.wide {
+                self.desc_size = get16(&self.sb, sb::DESC_SIZE) as usize;
+                if self.desc_size < 64 || !self.desc_size.is_power_of_two() || self.desc_size > self.block_size {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            let ro = get32(&self.sb, sb::FEATURE_RO_COMPAT);
+            self.read_only = ro & !RO_COMPAT_SUPPORTED != 0;
+            self.dir_nlink = ro & RO_COMPAT_DIR_NLINK != 0;
+            if ro & RO_COMPAT_METADATA_CSUM != 0 {
+                // 1 is CRC32C, the only type there is.
+                if self.sb[sb::CHECKSUM_TYPE] != 1 {
+                    return Err(Errno::ENOSYS);
+                }
+                if get32(&self.sb, sb::CHECKSUM) != crc32c(!0, &self.sb[..sb::CHECKSUM]) {
+                    return Err(Errno::EINVAL);
+                }
+                self.csum = Csum::Crc32c;
+                self.csum_seed = if incompat & INCOMPAT_CSUM_SEED != 0 {
+                    get32(&self.sb, sb::CHECKSUM_SEED)
+                } else {
+                    crc32c(!0, &self.sb[sb::UUID..sb::UUID + 16])
+                };
+            } else if ro & RO_COMPAT_GDT_CSUM != 0 {
+                self.csum = Csum::Crc16;
+            }
+        }
+        let per_group = get32(&self.sb, sb::BLOCKS_PER_GROUP);
+        let inodes_per_group = get32(&self.sb, sb::INODES_PER_GROUP);
+        let blocks = self.blocks_count();
+        let first = get32(&self.sb, sb::FIRST_DATA_BLOCK) as u64;
+        if self.inode_size < 128 || !self.inode_size.is_power_of_two() || self.inode_size > self.block_size {
+            return Err(Errno::EINVAL);
+        }
+        // Each group's bitmaps are one block, and every count a whole
+        // number of bitmap bytes.
+        let bits = 8 * self.block_size as u32;
+        if per_group == 0 || per_group > bits || per_group % 8 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if inodes_per_group == 0 || inodes_per_group > bits || inodes_per_group % 8 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // Bounding the size by the device bounds the descriptor table too.
+        let dev_blocks = self.dev.num_blocks().saturating_mul(dev_bs as u64) / self.block_size as u64;
+        if blocks <= first || blocks > dev_blocks {
+            return Err(Errno::EINVAL);
+        }
+        let groups = (blocks - first).div_ceil(per_group as u64);
+        if groups > u32::MAX as u64 || get32(&self.sb, sb::INODES_COUNT) as u64 != groups * inodes_per_group as u64 {
+            return Err(Errno::EINVAL);
+        }
+        self.group_count = groups as u32;
+        self.gdt_block = first + 1;
+        let len = self.group_count as usize * self.desc_size;
+        self.groups.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
+        self.groups.resize(len, 0);
+        // A descriptor block at a time, since `meta_bg` scatters them.
+        let per_block = (self.block_size / self.desc_size) as u32;
+        for first in (0..self.group_count).step_by(per_block as usize) {
+            let n = per_block.min(self.group_count - first) as usize * self.desc_size;
+            let mut descs = vec![0; n];
+            self.read_bytes(self.desc_offset(first), &mut descs)?;
+            let start = first as usize * self.desc_size;
+            self.groups[start..start + n].copy_from_slice(&descs);
+        }
+        if self.csum != Csum::None
+            && (0..self.group_count).any(|g| self.group_csum(g) != get16(self.desc(g), gd::CHECKSUM))
+        {
+            return Err(Errno::EINVAL);
+        }
+        self.check_layout()?;
+        self.meta_zones = self.compute_meta_zones();
+        Ok(())
+    }
+
     fn node(&mut self, shared: &Arc<Shared<D>>, ino: u32) -> Arc<dyn File> {
         if let Some(node) = self.nodes.get(&ino).and_then(Weak::upgrade) {
             return node;
@@ -571,8 +650,54 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     // ---- Raw I/O ----
 
-    /// Reads bytes at any offset, a device block at a time.
+    /// Reads bytes at any offset, seeing what the operation in progress has
+    /// changed.
     fn read_bytes(&mut self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        if self.tx.is_empty() {
+            return self.dev_read_bytes(off, buf);
+        }
+        let bs = self.block_size as u64;
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = off + done as u64;
+            let (b, skip) = (pos / bs, (pos % bs) as usize);
+            let n = (bs as usize - skip).min(buf.len() - done);
+            match self.tx.get(&b) {
+                Some(block) => buf[done..done + n].copy_from_slice(&block[skip..skip + n]),
+                None => self.dev_read_bytes(pos, &mut buf[done..done + n])?,
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Writes metadata bytes at any offset: into the operation's
+    /// transaction if the file system is journaled, else to the disk.
+    fn write_bytes(&mut self, off: u64, buf: &[u8]) -> Result<(), Errno> {
+        if self.journal.is_none() {
+            return self.dev_write_bytes(off, buf);
+        }
+        let bs = self.block_size as u64;
+        let mut done = 0;
+        while done < buf.len() {
+            let pos = off + done as u64;
+            let (b, skip) = (pos / bs, (pos % bs) as usize);
+            let n = (bs as usize - skip).min(buf.len() - done);
+            if !self.tx.contains_key(&b) {
+                let block = self.dev_read_block(b)?;
+                self.tx.insert(b, block);
+            }
+            if let Some(block) = self.tx.get_mut(&b) {
+                block[skip..skip + n].copy_from_slice(&buf[done..done + n]);
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Reads bytes at any offset straight from the device, a device block
+    /// at a time.
+    fn dev_read_bytes(&mut self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         let bs = self.dev.block_size() as u64;
         let mut tmp = vec![0; bs as usize];
         let mut done = 0;
@@ -587,23 +712,24 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok(())
     }
 
-    /// Writes bytes at any offset, reading back partial device blocks.
-    fn write_bytes(&mut self, off: u64, buf: &[u8]) -> Result<(), Errno> {
-        let bs = self.dev.block_size() as u64;
-        let mut tmp = vec![0; bs as usize];
-        let mut done = 0;
-        while done < buf.len() {
-            let pos = off + done as u64;
-            let (lba, skip) = (pos / bs, (pos % bs) as usize);
-            let n = (bs as usize - skip).min(buf.len() - done);
-            if n < bs as usize {
-                self.dev.read_blocks(lba, &mut tmp).map_err(io_error)?;
-            }
-            tmp[skip..skip + n].copy_from_slice(&buf[done..done + n]);
-            self.dev.write_blocks(lba, &tmp).map_err(io_error)?;
-            done += n;
+    /// Writes bytes at any offset straight to the device, as one request so
+    /// that a crash does not leave half of them, reading back the device
+    /// blocks at its ends that the bytes only partly cover.
+    fn dev_write_bytes(&mut self, off: u64, buf: &[u8]) -> Result<(), Errno> {
+        if buf.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let bs = self.dev.block_size() as u64;
+        let (first, last) = (off / bs, (off + buf.len() as u64 - 1) / bs);
+        let mut tmp = vec![0; ((last - first + 1) * bs) as usize];
+        let skip = (off % bs) as usize;
+        if skip != 0 || buf.len() < tmp.len() {
+            self.dev.read_blocks(first, &mut tmp[..bs as usize]).map_err(io_error)?;
+            let tail = tmp.len() - bs as usize;
+            self.dev.read_blocks(last, &mut tmp[tail..]).map_err(io_error)?;
+        }
+        tmp[skip..skip + buf.len()].copy_from_slice(buf);
+        self.dev.write_blocks(first, &tmp).map_err(io_error)
     }
 
     /// Whether block `b` lies in a metadata zone found by `check_layout`.
@@ -651,12 +777,23 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
         }
+        match self.tx.get(&b) {
+            Some(block) => Ok(block.clone()),
+            None => self.dev_read_block(b),
+        }
+    }
+
+    fn dev_read_block(&mut self, b: u64) -> Result<Vec<u8>, Errno> {
         let mut buf = vec![0; self.block_size];
         self.dev.read_blocks(b * self.dev_per_block, &mut buf).map_err(io_error)?;
         Ok(buf)
     }
 
-    /// Writes a data, directory, indirect or extent block; refuses metadata
+    fn dev_write_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
+        self.dev.write_blocks(b * self.dev_per_block, buf).map_err(io_error)
+    }
+
+    /// Writes a directory, indirect or extent block; refuses metadata
     /// zones, so a crafted image cannot make a write clobber them.
     fn write_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
         if self.in_meta_zone(b) {
@@ -665,11 +802,27 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         self.write_raw_block(b, buf)
     }
 
+    /// Writes a block of file data, in place even when journaled: the
+    /// transaction that makes it reachable commits after it.
+    fn write_data_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
+        if self.in_meta_zone(b) || b == 0 || b >= self.blocks_count() {
+            return Err(Errno::EIO);
+        }
+        self.dev_write_block(b, buf)
+    }
+
+    /// Writes a metadata block: into the operation's transaction if the file
+    /// system is journaled, else to the disk.
     fn write_raw_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
         if b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
         }
-        self.dev.write_blocks(b * self.dev_per_block, buf).map_err(io_error)
+        if self.journal.is_some() {
+            debug_assert_eq!(buf.len(), self.block_size);
+            self.tx.insert(b, buf.to_vec());
+            return Ok(());
+        }
+        self.dev_write_block(b, buf)
     }
 
     // ---- Superblock and group descriptors ----
@@ -1045,7 +1198,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     /// searching from `from`; returns its index.
     fn take_bit(&mut self, g: u32, kind: Bitmap, from: u32, limit: u32) -> Result<Option<u32>, Errno> {
         let mut bits = self.load_bitmap(g, kind)?;
-        let clear = |i: u32| bits[i as usize / 8] & (1 << (i % 8)) == 0;
+        let start = self.group_start(g);
+        let reusable = |i: u32| kind == Bitmap::Inode || !self.freed_in_tx(start + i as u64);
+        let clear = |i: u32| bits[i as usize / 8] & (1 << (i % 8)) == 0 && reusable(i);
         let Some(index) = (from.min(limit)..limit).chain(0..from.min(limit)).find(|&i| clear(i)) else {
             return Ok(None);
         };
@@ -1077,7 +1232,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 self.write_super()?;
                 let b = self.group_start(g) + i as u64;
                 let zero = vec![0; self.block_size];
-                self.write_block(b, &zero)?;
+                self.write_data_block(b, &zero)?;
                 return Ok(b);
             }
         }
@@ -1091,6 +1246,15 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let end = start.checked_add(count).ok_or(Errno::EIO)?;
         if start < first || end > self.blocks_count() {
             return Err(Errno::EIO);
+        }
+        if self.journal.is_some() {
+            // What the operation had logged for these blocks must not
+            // overwrite them if they are allocated again.
+            let logged: Vec<u64> = self.tx.range(start..end).map(|(&b, _)| b).collect();
+            for b in logged {
+                self.tx.remove(&b);
+            }
+            self.tx_freed.insert(start, end);
         }
         let mut b = start;
         while b < end {
@@ -1111,6 +1275,11 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             b += n;
         }
         self.write_super()
+    }
+
+    /// Whether the operation in progress has freed block `b`.
+    fn freed_in_tx(&self, b: u64) -> bool {
+        self.tx_freed.range(..=b).next_back().is_some_and(|(_, &end)| b < end)
     }
 
     fn free_block(&mut self, b: u64) -> Result<(), Errno> {
@@ -1476,11 +1645,11 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 Err(e) => break Err(e),
             };
             let step = if n == bs as usize {
-                self.write_block(b, &buf[done..done + n])
+                self.write_data_block(b, &buf[done..done + n])
             } else {
                 self.read_block(b).and_then(|mut block| {
                     block[skip..skip + n].copy_from_slice(&buf[done..done + n]);
-                    self.write_block(b, &block)
+                    self.write_data_block(b, &block)
                 })
             };
             if let Err(e) = step {
@@ -1535,7 +1704,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 if b != 0 {
                     let mut block = self.read_block(b)?;
                     block[(len % bs) as usize..].fill(0);
-                    self.write_block(b, &block)?;
+                    self.write_data_block(b, &block)?;
                 }
             }
         } else if len > 0 && (len - 1) / bs >= self.max_blocks(&inode) {
@@ -1929,7 +2098,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn write(&self, off: u64, buf: &[u8]) -> Result<usize, Errno> {
-        self.with(|fs| fs.write_data(self.ino, off, buf))
+        self.with(|fs| fs.transact(|fs| fs.write_data(self.ino, off, buf)))
     }
 
     fn stat(&self) -> Stat {
@@ -1938,7 +2107,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {
-        self.with(|fs| fs.truncate(self.ino, len))
+        self.with(|fs| fs.transact(|fs| fs.truncate(self.ino, len)))
     }
 
     fn sync(&self) -> Result<(), Errno> {
@@ -1957,12 +2126,12 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
         let mut fs = self.shared.fs.lock();
-        let ino = fs.create(self.ino, name, kind, mode)?;
+        let ino = fs.transact(|fs| fs.create(self.ino, name, kind, mode))?;
         Ok(fs.node(&self.shared, ino))
     }
 
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
-        self.with(|fs| fs.remove(self.ino, name, dir))
+        self.with(|fs| fs.transact(|fs| fs.remove(self.ino, name, dir)))
     }
 
     fn readlink(&self) -> Result<String, Errno> {
@@ -2001,7 +2170,7 @@ impl<D: BlockDevice + Send + 'static> Drop for Node<D> {
             && get32(&inode.raw, ino::DTIME) == 0
         {
             // Nowhere to report an error from a drop.
-            let _ = fs.free_inode(self.ino);
+            let _ = fs.transact(|fs| fs.free_inode(self.ino));
         }
     }
 }
@@ -2012,7 +2181,7 @@ mod tests {
     use osmium_fs::{OpenFlags, RamFs, Vfs};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::{format, fs, string::ToString};
+    use std::{boxed::Box, format, fs, string::ToString};
 
     struct VecDisk(Vec<u8>);
 
@@ -2460,8 +2629,22 @@ mod tests {
     fn refuses_unsupported_and_garbage() {
         let scratch = Scratch::new("refuse");
         let Some(image) = mkfs(&scratch, EXT4, 1024, 4 << 20, None) else { return };
+        // The flag with nothing in the journal: mounting clears it.
         let dirty = debugfs(&scratch, image.clone(), &["feature needs_recovery"]);
-        assert_eq!(Ext2::mount(VecDisk(dirty), 1).err(), Some(Errno::ENOSYS));
+        let image_after = unmount(Ext2::mount(VecDisk(dirty), 1).unwrap());
+        assert_eq!(get32(&image_after[1024..2048], sb::FEATURE_INCOMPAT) & INCOMPAT_RECOVER, 0);
+        // A journal this driver cannot read, which needs recovery.
+        let journal0 = journal_block(&journal_map(&scratch, &image), 0);
+        let mut odd = image.clone();
+        put_be32(&mut odd[journal0 as usize * 1024..], 0x28, 0x20);
+        let odd_dirty = debugfs(&scratch, odd.clone(), &["feature needs_recovery"]);
+        assert_eq!(Ext2::mount(VecDisk(odd_dirty), 1).err(), Some(Errno::ENOSYS));
+        // The same journal when clean is left alone.
+        let ext2 = Ext2::mount(VecDisk(odd), 1).unwrap();
+        assert!(!ext2.is_journaled());
+        ext2.root().create("unjournaled", FileKind::Regular, 0o644).unwrap();
+        let ext2 = Ext2::mount(VecDisk(unmount(ext2)), 1).unwrap();
+        assert!(names(&*ext2.root()).contains(&"unjournaled".to_string()));
         let mut bad = image.clone();
         bad[1024 + sb::WTIME] ^= 1;
         assert_eq!(Ext2::mount(VecDisk(bad), 1).err(), Some(Errno::EINVAL));
@@ -2646,5 +2829,452 @@ mod tests {
             assert!(!fs.is_empty_dir(d).unwrap());
         }
         assert_eq!(vfs.rmdir("/d").err(), Some(Errno::ENOTEMPTY));
+    }
+    fn put_be32(buf: &mut [u8], off: usize, val: u32) {
+        buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
+    }
+
+    fn be32(buf: &[u8], off: usize) -> u32 {
+        u32::from_be_bytes(buf[off..off + 4].try_into().unwrap())
+    }
+
+    /// Where the journal's blocks are: `(first journal block, last, file
+    /// system block of the first)` for each extent of its inode.
+    fn journal_map(scratch: &Scratch, image: &[u8]) -> Vec<(u32, u32, u64)> {
+        let img = scratch.0.join("locate");
+        fs::write(&img, image).unwrap();
+        let out = Command::new("debugfs").arg("-R").arg("stat <8>").arg(&img).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let list = text.split("EXTENTS:").nth(1).expect("an extent list").trim();
+        list.split(", ")
+            .map(|extent| {
+                let (logical, physical) = extent.trim().split_once(':').unwrap();
+                let (l0, l1) = logical.trim_matches(['(', ')']).split_once('-').unwrap();
+                let p0 = physical.split('-').next().unwrap();
+                (l0.parse().unwrap(), l1.parse().unwrap(), p0.parse().unwrap())
+            })
+            .collect()
+    }
+
+    /// The file system block of journal block `l`.
+    fn journal_block(map: &[(u32, u32, u64)], l: u32) -> u64 {
+        let &(l0, _, p0) = map.iter().find(|&&(l0, l1, _)| (l0..=l1).contains(&l)).unwrap();
+        p0 + (l - l0) as u64
+    }
+
+    /// Writes `blocks` to a transaction in the journal with debugfs, leaving
+    /// the file system needing recovery.
+    fn journal_write(scratch: &Scratch, image: Vec<u8>, csum: bool, blocks: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut script = String::from(if csum { "jo -c\n" } else { "jo\n" });
+        for (i, (b, data)) in blocks.iter().enumerate() {
+            let path = scratch.0.join(format!("block{i}"));
+            fs::write(&path, data).unwrap();
+            script.push_str(&format!("jw -b {b} {}\n", path.display()));
+        }
+        script.push_str("jc\n");
+        let cmds = scratch.0.join("journal-script");
+        fs::write(&cmds, script).unwrap();
+        let img = scratch.0.join("journal");
+        fs::write(&img, image).unwrap();
+        let out = Command::new("debugfs").arg("-w").arg("-f").arg(&cmds).arg(&img).output().unwrap();
+        assert!(out.status.success(), "debugfs: {}", String::from_utf8_lossy(&out.stderr));
+        fs::read(&img).unwrap()
+    }
+
+    fn incompat(image: &[u8]) -> u32 {
+        get32(&image[1024..2048], sb::FEATURE_INCOMPAT)
+    }
+
+    #[test]
+    fn journals_changes_and_unmounts_clean() {
+        let scratch = Scratch::new("journaled");
+        for kind in [EXT3, EXT4, EXT4_GROUPS] {
+            for block in [1024, 4096] {
+                let Some(image) = mkfs(&scratch, kind, block, 8 << 20, None) else { return };
+                let ext2 = Ext2::mount(VecDisk(image.clone()), 1).unwrap();
+                assert!(ext2.is_journaled());
+                // Mounting and unmounting alone changes nothing.
+                assert!(unmount(ext2) == image);
+
+                let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+                let root = ext2.root();
+                let d = root.create("d", FileKind::Directory, 0o755).unwrap();
+                let f = d.create("f", FileKind::Regular, 0o644).unwrap();
+                f.write(0, &pattern(100_000, 4)).unwrap();
+                for i in 0..50 {
+                    d.create(&format!("file-{i}"), FileKind::Regular, 0o644).unwrap();
+                }
+                f.truncate(30_000).unwrap();
+                d.remove("file-3", false).unwrap();
+                drop((f, d, root));
+                let image = unmount(ext2);
+                assert_eq!(incompat(&image) & INCOMPAT_RECOVER, 0);
+                let cats = fsck(&scratch, &image, &["/d/f"]);
+                assert_eq!(cats[0], pattern(100_000, 4)[..30_000]);
+
+                // The journal is empty: debugfs finds nothing to replay.
+                let img = scratch.0.join("empty");
+                fs::write(&img, &image).unwrap();
+                let out = Command::new("debugfs").arg("-R").arg("logdump").arg(&img).output().unwrap();
+                assert!(String::from_utf8_lossy(&out.stdout).contains("Journal starts at block 0"));
+            }
+        }
+    }
+
+    #[test]
+    fn replays_journals_written_by_debugfs() {
+        let scratch = Scratch::new("replay");
+        for csum in [true, false] {
+            for block in [1024, 4096] {
+                let Some(image) = mkfs(&scratch, EXT4, block, 8 << 20, None) else { return };
+                let end = (8 << 20) / block as u64;
+                // Free blocks at the end of the file system, one of which
+                // looks like a journal block and so is escaped in the log.
+                let mut magic = pattern(block, 9);
+                magic[..4].copy_from_slice(&0xc03b_3998u32.to_be_bytes());
+                let blocks = [(end - 20, pattern(block, 7)), (end - 19, magic), (end - 18, pattern(block, 8))];
+                let dirty = journal_write(&scratch, image, csum, &blocks);
+                assert_ne!(incompat(&dirty) & INCOMPAT_RECOVER, 0);
+                let ext2 = Ext2::mount(VecDisk(dirty), 1).unwrap();
+                assert!(ext2.is_journaled());
+                let image = unmount(ext2);
+                for (b, data) in &blocks {
+                    let at = *b as usize * block;
+                    assert!(image[at..at + block] == data[..], "block {b} (checksums: {csum}, block size {block})");
+                }
+                assert_eq!(incompat(&image) & INCOMPAT_RECOVER, 0);
+                fsck(&scratch, &image, &[]);
+            }
+        }
+    }
+
+    /// A log built by hand: transactions with revoke records, started near
+    /// the end of the journal so that it wraps.
+    #[test]
+    fn replays_revokes_and_wraps() {
+        let scratch = Scratch::new("revoke");
+        let block = 1024;
+        let Some(image) = mkfs(&scratch, EXT4, block, 8 << 20, None) else { return };
+        let map = journal_map(&scratch, &image);
+        let jsb = journal_block(&map, 0) as usize * block;
+        let (first, len) = (be32(&image[jsb..], 0x14), be32(&image[jsb..], 0x10));
+        let end = (8 << 20) / block as u64;
+        let (x, y, z) = (end - 30, end - 29, end - 28);
+        let fill = |b: u8| vec![b; block];
+
+        let mut log: Vec<Vec<u8>> = Vec::new();
+        let header = |kind: u32, id: u32| {
+            let mut b = vec![0; block];
+            put_be32(&mut b, 0, 0xc03b_3998);
+            put_be32(&mut b, 4, kind);
+            put_be32(&mut b, 8, id);
+            b
+        };
+        let mut txn = |id: u32, writes: &[(u64, u8)], revokes: &[u64]| {
+            if !writes.is_empty() {
+                // Tags are 8 bytes; the first is followed by a UUID, and the
+                // others say it is the same.
+                let mut packed = header(1, id);
+                let mut off = 12;
+                for (i, (b, _)) in writes.iter().enumerate() {
+                    put_be32(&mut packed, off, *b as u32);
+                    let flags = if i == 0 { 0 } else { 2 } | if i + 1 == writes.len() { 8 } else { 0 };
+                    packed[off + 6..off + 8].copy_from_slice(&(flags as u16).to_be_bytes());
+                    off += 8;
+                    if i == 0 {
+                        off += 16;
+                    }
+                }
+                log.push(packed);
+                log.extend(writes.iter().map(|&(_, v)| fill(v)));
+            }
+            if !revokes.is_empty() {
+                let mut r = header(5, id);
+                put_be32(&mut r, 12, 16 + 4 * revokes.len() as u32);
+                for (i, b) in revokes.iter().enumerate() {
+                    put_be32(&mut r, 16 + 4 * i, *b as u32);
+                }
+                log.push(r);
+            }
+            log.push(header(2, id));
+        };
+        // 10 writes x and y. 11 revokes x, which undoes 10's write of it, and
+        // revokes w too early to matter to 12's write of it, and rewrites y.
+        // 13 revokes z, which undoes the write in 12.
+        let w = end - 27;
+        txn(10, &[(x, 0xa1), (y, 0xa2)], &[]);
+        txn(11, &[(y, 0xb2)], &[x, w]);
+        txn(12, &[(z, 0xc3), (w, 0xc4)], &[]);
+        txn(13, &[], &[z]);
+
+        let mut dirty = image.clone();
+        let span = (len - first) as usize;
+        let start = len - 3;
+        for (i, b) in log.iter().enumerate() {
+            let l = first as usize + ((start - first) as usize + i) % span;
+            let at = journal_block(&map, l as u32) as usize * block;
+            dirty[at..at + block].copy_from_slice(b);
+        }
+        // The journal superblock: the log starts at `start` with transaction 10.
+        put_be32(&mut dirty[jsb..], 0x1c, start);
+        put_be32(&mut dirty[jsb..], 0x18, 10);
+        let dirty = debugfs(&scratch, dirty, &["feature needs_recovery"]);
+
+        let ext2 = Ext2::mount(VecDisk(dirty), 1).unwrap();
+        let after = unmount(ext2);
+        let blk = |b: u64| after[b as usize * block..(b as usize + 1) * block].to_vec();
+        let was = |b: u64| image[b as usize * block..(b as usize + 1) * block].to_vec();
+        assert!(blk(x) == was(x), "x was revoked");
+        assert!(blk(y) == fill(0xb2), "y was rewritten by transaction 11");
+        assert!(blk(w) == fill(0xc4), "w was written after it was revoked");
+        assert!(blk(z) == was(z), "z was revoked by a later transaction");
+        fsck(&scratch, &after, &[]);
+    }
+
+    #[test]
+    fn transactions_larger_than_the_journal_are_split() {
+        let scratch = Scratch::new("split");
+        let Some(image) = mkfs(&scratch, EXT4, 1024, 16 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        // Free blocks at the end, well away from the journal.
+        let blocks: Vec<u64> = (13_000..15_500).collect();
+        {
+            let mut fs = ext2.shared.fs.lock();
+            for &b in &blocks {
+                fs.write_raw_block(b, &pattern(1024, b as u8)).unwrap();
+            }
+            fs.commit().unwrap();
+        }
+        let after = unmount(ext2);
+        for &b in &blocks {
+            let at = b as usize * 1024;
+            assert!(after[at..at + 1024] == pattern(1024, b as u8)[..], "block {b}");
+        }
+        fsck(&scratch, &after, &[]);
+    }
+
+    #[test]
+    fn blocks_freed_by_an_operation_are_not_reused_by_it() {
+        let scratch = Scratch::new("freed");
+        let Some(image) = mkfs(&scratch, EXT4, 1024, 8 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        {
+            let mut fs = ext2.shared.fs.lock();
+            let b = fs.transact(|fs| fs.alloc_block(0)).unwrap();
+            let (freed, again, other) = fs
+                .transact(|fs| {
+                    fs.free_block(b)?;
+                    let again = fs.alloc_block(b)?;
+                    Ok((b, again, fs.alloc_block(b)?))
+                })
+                .unwrap();
+            assert!(again != freed && other != freed);
+            // The next operation may have it.
+            assert_eq!(fs.transact(|fs| fs.alloc_block(b)).unwrap(), freed);
+            fs.transact(|fs| {
+                fs.free_run(freed, 1).and_then(|()| fs.free_run(again, 1)).and_then(|()| fs.free_run(other, 1))
+            })
+            .unwrap();
+        }
+        fsck(&scratch, &unmount(ext2), &[]);
+    }
+
+    /// A disk that logs every write and flush, so that what a crash would
+    /// leave behind can be rebuilt.
+    enum Event {
+        Write(usize, Vec<u8>),
+        Flush,
+    }
+
+    struct CrashDisk {
+        data: Vec<u8>,
+        events: std::sync::Arc<std::sync::Mutex<Vec<Event>>>,
+    }
+
+    impl BlockDevice for CrashDisk {
+        fn block_size(&self) -> usize {
+            512
+        }
+
+        fn num_blocks(&self) -> u64 {
+            (self.data.len() / 512) as u64
+        }
+
+        fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+            self.check_range(lba, buf.len())?;
+            let off = lba as usize * 512;
+            buf.copy_from_slice(&self.data[off..off + buf.len()]);
+            Ok(())
+        }
+
+        fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+            self.check_range(lba, buf.len())?;
+            let off = lba as usize * 512;
+            self.data[off..off + buf.len()].copy_from_slice(buf);
+            self.events.lock().unwrap().push(Event::Write(off, buf.to_vec()));
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), BlockError> {
+            self.events.lock().unwrap().push(Event::Flush);
+            Ok(())
+        }
+    }
+
+    /// Every file, directory and symbolic link below `dir`, with contents.
+    fn snapshot(dir: &dyn File) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fn walk(dir: &dyn File, path: &str, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+            for name in names(dir) {
+                let child = dir.lookup(&name).unwrap();
+                let path = format!("{path}/{name}");
+                match child.stat().kind {
+                    FileKind::Directory => {
+                        out.insert(path.clone(), Vec::new());
+                        walk(&*child, &path, out);
+                    }
+                    FileKind::Symlink => {
+                        out.insert(path, child.readlink().unwrap().into_bytes());
+                    }
+                    _ => {
+                        out.insert(path, read_all(&*child));
+                    }
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(dir, "", &mut out);
+        out
+    }
+
+    /// One call on the root directory.
+    type Step = Box<dyn Fn(&Arc<dyn File>)>;
+
+    /// Runs `e2fsck -fy` on an image, which replays a journal that needs it.
+    fn fsck_repair(scratch: &Scratch, image: &[u8]) -> Vec<u8> {
+        let img = scratch.0.join("repair");
+        fs::write(&img, image).unwrap();
+        let out = Command::new("e2fsck").arg("-fy").arg(&img).output().unwrap();
+        assert!(
+            out.status.code().is_some_and(|c| c <= 1),
+            "e2fsck failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fs::read(&img).unwrap()
+    }
+
+    /// Crashes the disk after every write of a series of operations, in
+    /// several ways, and checks that recovery finds the file system as it
+    /// was before the operation or after it, and that e2fsprogs agrees.
+    #[test]
+    fn crashes_leave_the_file_system_consistent() {
+        let scratch = Scratch::new("crash");
+        for (kind, block) in [(EXT4, 1024), (EXT3, 4096), (EXT4_GROUPS, 1024)] {
+            let Some(image) = mkfs(&scratch, kind, block, 8 << 20, None) else { return };
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ext2 = Ext2::mount(CrashDisk { data: image.clone(), events: events.clone() }, 1).unwrap();
+            let root = ext2.root();
+
+            // Each step is one call, which is one transaction.
+            let mut steps: Vec<Step> = Vec::new();
+            steps.push(Box::new(|r| drop(r.create("d", FileKind::Directory, 0o755).unwrap())));
+            steps.push(Box::new(|r| drop(r.lookup("d").unwrap().create("a", FileKind::Regular, 0o644).unwrap())));
+            steps.push(Box::new(move |r| {
+                r.lookup("d").unwrap().lookup("a").unwrap().write(0, &pattern(20 * block, 1)).unwrap();
+            }));
+            for i in 0..24 {
+                steps.push(Box::new(move |r| {
+                    drop(
+                        r.lookup("d")
+                            .unwrap()
+                            .create(&format!("entry-with-a-longish-name-{i}"), FileKind::Regular, 0o644)
+                            .unwrap(),
+                    )
+                }));
+            }
+            for i in (0..24).step_by(3) {
+                steps.push(Box::new(move |r| {
+                    r.lookup("d").unwrap().remove(&format!("entry-with-a-longish-name-{i}"), false).unwrap()
+                }));
+            }
+            steps.push(Box::new(move |r| {
+                r.lookup("d")
+                    .unwrap()
+                    .lookup("a")
+                    .unwrap()
+                    .write(20 * block as u64, &pattern(5 * block + 100, 2))
+                    .unwrap();
+            }));
+            steps.push(Box::new(move |r| {
+                r.lookup("d").unwrap().lookup("a").unwrap().truncate(4 * block as u64).unwrap()
+            }));
+            steps.push(Box::new(|r| drop(r.create("link", FileKind::Symlink, 0o777).unwrap())));
+            steps.push(Box::new(|r| {
+                r.lookup("link").unwrap().write(0, LONG_TARGET.as_bytes()).unwrap();
+            }));
+            steps.push(Box::new(|r| r.lookup("d").unwrap().remove("a", false).unwrap()));
+
+            let mut states = vec![snapshot(&*root)];
+            let mut ends = vec![0];
+            for step in &steps {
+                step(&root);
+                states.push(snapshot(&*root));
+                ends.push(events.lock().unwrap().len());
+            }
+            drop(root);
+            let events = events.lock().unwrap();
+
+            let mut checked = 0;
+            for crash in 0..=events.len() {
+                // The step the crash fell in.
+                let step = (1..ends.len()).find(|&i| crash <= ends[i]).unwrap();
+                let flushed = events[..crash].iter().rposition(|e| matches!(e, Event::Flush)).map_or(0, |i| i + 1);
+                // Variants: everything written; only what was flushed; and,
+                // where the most writes are in flight (just before a flush),
+                // everything but one of them.
+                let before_flush = events.get(crash).is_none_or(|e| matches!(e, Event::Flush));
+                let unflushed: Vec<usize> =
+                    (flushed..crash).filter(|&i| matches!(events[i], Event::Write(..))).collect();
+                let variants = if before_flush { 2 + unflushed.len() } else { 2 };
+                for variant in 0..variants {
+                    let mut disk = image.clone();
+                    for (i, event) in events[..crash].iter().enumerate() {
+                        let keep = match variant {
+                            0 => true,
+                            1 => i < flushed,
+                            v => i != unflushed[v - 2],
+                        };
+                        if let (true, Event::Write(off, data)) = (keep, event) {
+                            disk[*off..*off + data.len()].copy_from_slice(data);
+                        }
+                    }
+                    let interesting = variant < 2
+                        && (crash == 0
+                            || matches!(events[crash - 1], Event::Flush)
+                            || events.get(crash).is_some_and(|e| matches!(e, Event::Flush)));
+                    let recovered = Ext2::mount(VecDisk(disk.clone()), 1)
+                        .unwrap_or_else(|e| panic!("mount after crash {crash} variant {variant}: {e:?}"));
+                    let state = snapshot(&*recovered.root());
+                    assert!(
+                        state == states[step - 1] || state == states[step],
+                        "crash {crash} variant {variant} in step {step} (block size {block}): neither before nor after"
+                    );
+                    // A symbolic link is made empty, and then given its target.
+                    let empty_link = state.get("/link").is_some_and(|target| target.is_empty());
+                    if interesting && !empty_link {
+                        let clean = unmount(recovered);
+                        fsck(&scratch, &clean, &[]);
+                        // e2fsprogs replays the same log to the same result.
+                        if variant == 0 && incompat(&disk) & INCOMPAT_RECOVER != 0 {
+                            let theirs = fsck_repair(&scratch, &disk);
+                            let theirs = Ext2::mount(VecDisk(theirs), 1).unwrap();
+                            assert!(snapshot(&*theirs.root()) == state, "crash {crash}: e2fsck disagrees");
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+            assert!(checked > 100, "{checked}");
+        }
     }
 }
