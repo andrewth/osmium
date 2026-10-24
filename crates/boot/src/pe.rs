@@ -29,14 +29,16 @@ pub enum PeError {
     BufferTooSmall,
 }
 
-fn le16(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes(b[o..o + 2].try_into().unwrap())
+fn u16_at(d: &[u8], o: usize) -> Result<u16, PeError> {
+    d.get(o..).and_then(|b| b.first_chunk::<2>()).map(|b| u16::from_le_bytes(*b)).ok_or(PeError::Malformed)
 }
-fn le32(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+
+fn u32_at(d: &[u8], o: usize) -> Result<u32, PeError> {
+    d.get(o..).and_then(|b| b.first_chunk::<4>()).map(|b| u32::from_le_bytes(*b)).ok_or(PeError::Malformed)
 }
-fn le64(b: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+
+fn u64_at(d: &[u8], o: usize) -> Result<u64, PeError> {
+    d.get(o..).and_then(|b| b.first_chunk::<8>()).map(|b| u64::from_le_bytes(*b)).ok_or(PeError::Malformed)
 }
 
 const DOS_MAGIC: u16 = 0x5A4D;
@@ -79,18 +81,6 @@ pub struct PeInfo {
     num_sections: usize,
 }
 
-fn u16_at(d: &[u8], o: usize) -> Result<u16, PeError> {
-    d.get(o..o.checked_add(2).ok_or(PeError::Malformed)?).map(|b| le16(b, 0)).ok_or(PeError::Malformed)
-}
-
-fn u32_at(d: &[u8], o: usize) -> Result<u32, PeError> {
-    d.get(o..o.checked_add(4).ok_or(PeError::Malformed)?).map(|b| le32(b, 0)).ok_or(PeError::Malformed)
-}
-
-fn u64_at(d: &[u8], o: usize) -> Result<u64, PeError> {
-    d.get(o..o.checked_add(8).ok_or(PeError::Malformed)?).map(|b| le64(b, 0)).ok_or(PeError::Malformed)
-}
-
 /// Validates the headers of `file` for `machine` (a `MACHINE_*` value).
 pub fn parse(file: &[u8], machine: u16) -> Result<PeInfo, PeError> {
     if u16_at(file, 0)? != DOS_MAGIC {
@@ -100,7 +90,7 @@ pub fn parse(file: &[u8], machine: u16) -> Result<PeInfo, PeError> {
     if u32_at(file, pe)? != PE_MAGIC {
         return Err(PeError::Unsupported);
     }
-    let coff = pe + 4;
+    let coff = pe.checked_add(4).ok_or(PeError::Malformed)?;
     if u16_at(file, coff)? != machine {
         return Err(PeError::Unsupported);
     }
@@ -156,11 +146,13 @@ pub fn load(file: &[u8], info: &PeInfo, dest: &mut [u8], load_addr: u64) -> Resu
     if dest.len() < size {
         return Err(PeError::BufferTooSmall);
     }
-    dest[..size].fill(0);
-    dest[..info.size_of_headers as usize].copy_from_slice(&file[..info.size_of_headers as usize]);
+    let dest = dest.get_mut(..size).ok_or(PeError::BufferTooSmall)?;
+    dest.fill(0);
+    let headers = info.size_of_headers as usize;
+    dest.get_mut(..headers).ok_or(PeError::Malformed)?.copy_from_slice(file.get(..headers).ok_or(PeError::Malformed)?);
 
     for i in 0..info.num_sections {
-        let s = info.section_table + i * 40;
+        let s = i.checked_mul(40).and_then(|o| info.section_table.checked_add(o)).ok_or(PeError::Malformed)?;
         let virtual_size = u32_at(file, s + 8)? as usize;
         let va = u32_at(file, s + 12)? as usize;
         let raw_size = u32_at(file, s + 16)? as usize;
@@ -172,7 +164,7 @@ pub fn load(file: &[u8], info: &PeInfo, dest: &mut [u8], load_addr: u64) -> Resu
         let src = file.get(raw_ptr..raw_ptr.checked_add(n).ok_or(PeError::Malformed)?).ok_or(PeError::Malformed)?;
         let dst = dest
             .get_mut(va..va.checked_add(n).ok_or(PeError::Malformed)?)
-            .filter(|_| va + n <= size)
+            .filter(|_| va.saturating_add(n) <= size)
             .ok_or(PeError::Malformed)?;
         dst.copy_from_slice(src);
     }
@@ -189,15 +181,16 @@ pub fn load(file: &[u8], info: &PeInfo, dest: &mut [u8], load_addr: u64) -> Resu
     let (start, len) = (info.reloc_rva as usize, info.reloc_size as usize);
     let end = start.checked_add(len).filter(|&e| e <= size).ok_or(PeError::Malformed)?;
     let mut off = start;
-    while off + 8 <= end {
+    while off.saturating_add(8) <= end {
         let page = u32_at(dest, off)? as usize;
         let block = u32_at(dest, off + 4)? as usize;
-        if block < 8 || off + block > end {
+        let block_end = off.checked_add(block).filter(|&e| e <= end).ok_or(PeError::Malformed)?;
+        if block < 8 {
             return Err(PeError::Malformed);
         }
-        for e in (off + 8..off + block).step_by(2) {
+        for e in (off + 8..block_end).step_by(2) {
             let entry = u16_at(dest, e)?;
-            let at = page + (entry & 0x0FFF) as usize;
+            let at = page.saturating_add((entry & 0x0FFF) as usize);
             match entry >> 12 {
                 REL_ABSOLUTE => {}
                 REL_DIR64 => {
@@ -205,12 +198,12 @@ pub fn load(file: &[u8], info: &PeInfo, dest: &mut [u8], load_addr: u64) -> Resu
                         return Err(PeError::Malformed);
                     }
                     let v = u64_at(dest, at)?.wrapping_add(delta);
-                    dest[at..at + 8].copy_from_slice(&v.to_le_bytes());
+                    dest.get_mut(at..at + 8).ok_or(PeError::Malformed)?.copy_from_slice(&v.to_le_bytes());
                 }
                 _ => return Err(PeError::Unsupported),
             }
         }
-        off += block;
+        off = block_end;
     }
     Ok(())
 }
@@ -241,15 +234,16 @@ fn for_each_fixup(image: &[u8], info: &PeInfo, mut f: impl FnMut(usize)) -> Resu
     let (start, len) = (info.reloc_rva as usize, info.reloc_size as usize);
     let end = start.checked_add(len).filter(|&e| e <= size).ok_or(PeError::Malformed)?;
     let mut off = start;
-    while off + 8 <= end {
+    while off.saturating_add(8) <= end {
         let page = u32_at(image, off)? as usize;
         let block = u32_at(image, off + 4)? as usize;
-        if block < 8 || off + block > end {
+        let block_end = off.checked_add(block).filter(|&e| e <= end).ok_or(PeError::Malformed)?;
+        if block < 8 {
             return Err(PeError::Malformed);
         }
-        for e in (off + 8..off + block).step_by(2) {
+        for e in (off + 8..block_end).step_by(2) {
             let entry = u16_at(image, e)?;
-            let at = page + (entry & 0x0FFF) as usize;
+            let at = page.saturating_add((entry & 0x0FFF) as usize);
             match entry >> 12 {
                 REL_ABSOLUTE => {}
                 REL_DIR64 => {
@@ -261,7 +255,7 @@ fn for_each_fixup(image: &[u8], info: &PeInfo, mut f: impl FnMut(usize)) -> Resu
                 _ => return Err(PeError::Unsupported),
             }
         }
-        off += block;
+        off = block_end;
     }
     Ok(())
 }
@@ -283,7 +277,10 @@ pub fn collect_fixups(image: &[u8], info: &PeInfo, out: &mut [Fixup]) -> Result<
             full = true;
             return;
         };
-        let value = le64(image, at);
+        let Ok(value) = u64_at(image, at) else {
+            full = true;
+            return;
+        };
         *slot = Fixup { rva: at as u32, reserved: 0, value };
         n += 1;
     })?;
@@ -298,7 +295,7 @@ pub fn rebase(image: &mut [u8], fixups: &[Fixup], delta: u64) {
     for f in fixups {
         let at = f.rva as usize;
         let Some(site) = at.checked_add(8).and_then(|e| image.get_mut(at..e)) else { continue };
-        if le64(site, 0) == f.value {
+        if u64_at(site, 0) == Ok(f.value) {
             site.copy_from_slice(&f.value.wrapping_add(delta).to_le_bytes());
         }
     }

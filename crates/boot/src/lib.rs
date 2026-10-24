@@ -32,26 +32,26 @@ pub mod uefi;
 
 /// Reads a big-endian `u32` at `off`.
 pub(crate) fn be32(data: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(data.get(off..off.checked_add(4)?)?.try_into().ok()?))
+    Some(u32::from_be_bytes(*data.get(off..)?.first_chunk::<4>()?))
 }
 
 /// Reads a big-endian `u64` at `off`.
 pub(crate) fn be64(data: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_be_bytes(data.get(off..off.checked_add(8)?)?.try_into().ok()?))
+    Some(u64::from_be_bytes(*data.get(off..)?.first_chunk::<8>()?))
 }
 
 /// Reads a little-endian `u32` at `off`.
 pub(crate) fn le32(data: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(data.get(off..off.checked_add(4)?)?.try_into().ok()?))
+    Some(u32::from_le_bytes(*data.get(off..)?.first_chunk::<4>()?))
 }
 
 /// Reads a little-endian `u64` at `off`.
 pub(crate) fn le64(data: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(data.get(off..off.checked_add(8)?)?.try_into().ok()?))
+    Some(u64::from_le_bytes(*data.get(off..)?.first_chunk::<8>()?))
 }
 
 /// Returns the string before the first NUL in `bytes`.
 pub(crate) fn cstr(bytes: &[u8]) -> Option<&str> {
     let end = bytes.iter().position(|&b| b == 0)?;
-    core::str::from_utf8(&bytes[..end]).ok()
+    core::str::from_utf8(bytes.get(..end)?).ok()
 }

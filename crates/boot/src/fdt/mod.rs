@@ -64,7 +64,7 @@ impl<'src> Fdt<'src> {
         if h(6)? > 17 || version < 16 {
             return Err(FdtError::BadVersion);
         }
-        let data = &data[..total];
+        let data = data.get(..total).ok_or(FdtError::Truncated)?;
         let (s_off, st_off, rsv) = (h(2)? as usize, h(3)? as usize, h(4)? as usize);
         let st_size = h(8)? as usize;
         // `size_dt_struct` only exists from version 17 (in a version 16
@@ -239,7 +239,7 @@ impl<'src> Fdt<'src> {
     }
 
     fn string(&self, nameoff: usize) -> Option<&'src str> {
-        cstr(self.data.get(self.strings.start + nameoff..self.strings.end)?)
+        cstr(self.data.get(self.strings.start.checked_add(nameoff)?..self.strings.end)?)
     }
 
     /// Parses the property at `off`; returns it and the offset after it.
@@ -261,10 +261,12 @@ impl<'src> Fdt<'src> {
             match self.token(off)? {
                 BEGIN_NODE => {
                     depth += 1;
-                    off = align4(off + 4 + cstr(self.data.get(off + 4..)?)?.len() + 1);
+                    off = align4(
+                        off.checked_add(4)?.checked_add(cstr(self.data.get(off + 4..)?)?.len())?.checked_add(1)?,
+                    );
                 }
                 END_NODE => {
-                    depth -= 1;
+                    depth = depth.checked_sub(1)?;
                     off += 4;
                     if depth == 0 {
                         return Some(off);
@@ -416,9 +418,8 @@ impl<'src> Node<'src> {
         let stride = if usable { (address + size) as usize * 4 } else { 1 };
         let chunks = if usable { value.chunks_exact(stride) } else { [].chunks_exact(1) };
         chunks.map(move |c| {
-            let a = read_cells(&c[..address as usize * 4]);
-            let s = (size > 0).then(|| read_cells(&c[address as usize * 4..]));
-            (a, s)
+            let (a, s) = c.split_at_checked(address as usize * 4).unwrap_or_default();
+            (read_cells(a), (size > 0).then(|| read_cells(s)))
         })
     }
 
@@ -455,12 +456,10 @@ impl<'src> Iterator for AllNodes<'src> {
         loop {
             match self.fdt.token(self.off)? {
                 BEGIN_NODE => {
-                    let parent_cells = if self.depth == 0 { Cells::ROOT } else { self.stack[self.depth - 1] };
+                    let parent_cells =
+                        self.depth.checked_sub(1).and_then(|d| self.stack.get(d)).copied().unwrap_or(Cells::ROOT);
                     let node = Node { fdt: self.fdt, begin: self.off, parent_cells };
-                    if self.depth == MAX_DEPTH {
-                        return None;
-                    }
-                    self.stack[self.depth] = node.child_cells();
+                    *self.stack.get_mut(self.depth)? = node.child_cells();
                     self.depth += 1;
                     self.off = node.props_start();
                     return Some(node);

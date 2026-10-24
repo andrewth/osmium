@@ -68,10 +68,10 @@ impl<'src, F: Fn(u64, usize) -> Option<&'src [u8]>> Acpi<'src, F> {
     /// other length counts as unreadable.
     pub fn new(rsdp: u64, read: F) -> Result<Self, AcpiError> {
         let r = Self::read_exact(&read, rsdp, 20).ok_or(AcpiError::Unreadable)?;
-        if &r[..8] != b"RSD PTR " || !checksum_ok(r) {
+        if r.get(..8) != Some(b"RSD PTR ") || !checksum_ok(r) {
             return Err(AcpiError::BadRsdp);
         }
-        let (root_pa, wide) = if r[15] >= 2 {
+        let (root_pa, wide) = if r.get(15).is_some_and(|&rev| rev >= 2) {
             let r2 = Self::read_exact(&read, rsdp, 36).ok_or(AcpiError::Unreadable)?;
             if !checksum_ok(r2) {
                 return Err(AcpiError::BadRsdp);
@@ -266,13 +266,14 @@ impl<'src> Mcfg<'src> {
 
     /// The ECAM windows.
     pub fn entries(&self) -> impl Iterator<Item = EcamWindow> + 'src {
-        self.entries.as_chunks::<16>().0.iter().filter_map(|e| {
-            Some(EcamWindow {
-                base: le64(e, 0)?,
-                segment: u16::from_le_bytes([e[8], e[9]]),
-                start_bus: e[10],
-                end_bus: e[11],
-            })
+        self.entries.as_chunks::<16>().0.iter().map(|e| {
+            let [b0, b1, b2, b3, b4, b5, b6, b7, s0, s1, start_bus, end_bus, ..] = *e;
+            EcamWindow {
+                base: u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, b7]),
+                segment: u16::from_le_bytes([s0, s1]),
+                start_bus,
+                end_bus,
+            }
         })
     }
 }
@@ -309,8 +310,8 @@ impl<'src> Dmar<'src> {
             loop {
                 let kind = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?);
                 let len = u16::from_le_bytes(rest.get(2..4)?.try_into().ok()?) as usize;
-                let entry = rest.get(..len).filter(|_| len >= 4)?;
-                rest = &rest[len..];
+                let (entry, tail) = rest.split_at_checked(len).filter(|_| len >= 4)?;
+                rest = tail;
                 if kind == 0 {
                     return Some(DmaRemapUnit {
                         segment: u16::from_le_bytes(entry.get(6..8)?.try_into().ok()?),
@@ -354,8 +355,8 @@ impl<'src> Ivrs<'src> {
             loop {
                 let kind = *rest.first()?;
                 let len = u16::from_le_bytes(rest.get(2..4)?.try_into().ok()?) as usize;
-                let block = rest.get(..len).filter(|_| len >= 4)?;
-                rest = &rest[len..];
+                let (block, tail) = rest.split_at_checked(len).filter(|_| len >= 4)?;
+                rest = tail;
                 if matches!(kind, 0x10 | 0x11 | 0x40) {
                     return Some(AmdIommuUnit {
                         device_id: u16::from_le_bytes(block.get(4..6)?.try_into().ok()?),

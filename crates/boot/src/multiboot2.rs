@@ -80,7 +80,7 @@ impl<'src> BootInfo<'src> {
         if total < 16 || total > data.len() {
             return Err(InvalidInfo);
         }
-        Ok(Self { data: &data[..total] })
+        Ok(Self { data: data.get(..total).ok_or(InvalidInfo)? })
     }
 
     /// Parses the structure at physical address `addr`, as passed in EBX.
@@ -179,7 +179,7 @@ impl<'src> BootInfo<'src> {
                 lost += map.add_lossy(PhysAddr::new(base), PhysAddr::new(base.saturating_add(len)), kind)?;
             }
         }
-        for m in self.modules() {
+        for m in self.modules().filter(|m| m.start <= m.end) {
             lost += map.add_lossy(m.start, m.end, RegionKind::Bootloader)?;
         }
         if let Some(at) = info_at {
@@ -206,7 +206,8 @@ impl<'src> BootInfo<'src> {
             kind: *p.get(21)?,
             // Direct RGB colour info: position and size of red, green and
             // blue, a byte each.
-            format: p.get(24..30).filter(|_| p[21] == 1).and_then(|c| {
+            format: p.get(24..30).filter(|_| p.get(21) == Some(&1)).and_then(|c| {
+                let &[rp, rs, gp, gs, bp, bs] = c else { return None };
                 let mask = |pos: u8, size: u8| {
                     // An empty, wide or out-of-range field makes the format unusable.
                     if !(1..=8).contains(&size) || pos as u32 + size as u32 > 32 {
@@ -215,7 +216,7 @@ impl<'src> BootInfo<'src> {
                         ((1u32 << size) - 1) << pos
                     }
                 };
-                PixelFormat::from_masks(p[20], mask(c[0], c[1]), mask(c[2], c[3]), mask(c[4], c[5]))
+                PixelFormat::from_masks(*p.get(20)?, mask(rp, rs), mask(gp, gs), mask(bp, bs))
             }),
         })
     }

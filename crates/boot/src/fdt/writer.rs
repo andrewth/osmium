@@ -164,7 +164,7 @@ impl FdtWriter {
         // Reuse an existing copy (a suffix match also works, as in dtc).
         let needle: Vec<u8> = name.bytes().chain([0]).collect();
         if let Some(pos) = self.strings.windows(needle.len()).position(|w| w == needle.as_slice())
-            && (pos == 0 || self.strings[pos - 1] == 0 || name.is_empty())
+            && (pos == 0 || pos.checked_sub(1).and_then(|p| self.strings.get(p)) == Some(&0) || name.is_empty())
         {
             return pos as u32;
         }

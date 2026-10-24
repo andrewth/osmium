@@ -82,7 +82,7 @@ impl<'src> Elf<'src> {
         let elf = Self { data };
         // Validate the program header table up front.
         let (off, size, n) = elf.ph_table()?;
-        if size < 56 || off.checked_add(size * n).is_none_or(|end| end > data.len()) {
+        if size < 56 || size.checked_mul(n).and_then(|len| off.checked_add(len)).is_none_or(|end| end > data.len()) {
             return Err(ElfError::Truncated);
         }
         for s in elf.raw_segments() {
@@ -92,7 +92,7 @@ impl<'src> Elf<'src> {
     }
 
     fn u16_at(&self, off: usize) -> Option<u16> {
-        Some(u16::from_le_bytes([*self.data.get(off)?, *self.data.get(off + 1)?]))
+        Some(u16::from_le_bytes(*self.data.get(off..)?.first_chunk::<2>()?))
     }
 
     fn ph_table(&self) -> Result<(usize, usize, usize), ElfError> {
@@ -122,7 +122,7 @@ impl<'src> Elf<'src> {
         let data = self.data;
         let (off, size, n) = self.ph_table().unwrap_or((0, 0, 0));
         (0..n).filter_map(move |i| {
-            let ph = off + i * size;
+            let ph = off.checked_add(i.checked_mul(size)?)?;
             if le32(data, ph)? != PT_LOAD {
                 return None;
             }
@@ -183,7 +183,7 @@ impl<'src> Elf<'src> {
             }
             let span = pages(&seg).ok_or(MapError::InvalidAddress)?;
             // `new` checked filesz <= memsz, and `span` fits in a u64.
-            let file_end = seg.vaddr + seg.data.len() as u64;
+            let file_end = seg.vaddr.checked_add(seg.data.len() as u64).ok_or(MapError::InvalidAddress)?;
             for va in span.step_by(PAGE_SIZE) {
                 let pa = match pt.translate(VirtAddr::new(va)) {
                     // A page this segment shares with an earlier one of this
@@ -204,9 +204,12 @@ impl<'src> Elf<'src> {
                 };
                 // `va` is below the page-aligned end of `span`, so this
                 // cannot overflow.
-                let (lo, hi) = (va.max(seg.vaddr), (va + page).min(file_end));
+                let (lo, hi) = (va.max(seg.vaddr), va.saturating_add(page).min(file_end));
                 if lo < hi {
-                    let src = &seg.data[(lo - seg.vaddr) as usize..(hi - seg.vaddr) as usize];
+                    let src = seg
+                        .data
+                        .get((lo - seg.vaddr) as usize..(hi - seg.vaddr) as usize)
+                        .ok_or(MapError::InvalidAddress)?;
                     // SAFETY: the destination lies within the page's frame,
                     // which this call mapped.
                     unsafe {

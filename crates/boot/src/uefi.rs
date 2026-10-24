@@ -284,22 +284,29 @@ impl Uefi {
         let mut buf = [0u16; 65];
         let mut n = 0;
         let flush = |buf: &mut [u16; 65], n: &mut usize| {
-            buf[*n] = 0;
+            if let Some(slot) = buf.get_mut(*n) {
+                *slot = 0;
+            }
             // SAFETY: ConOut is valid while boot services last; the string
             // is NUL-terminated.
             unsafe { ((*out).output_string)(out, buf.as_ptr()) };
             *n = 0;
+        };
+        // The flush below keeps two slots free, so the slot always exists.
+        let push = |buf: &mut [u16; 65], n: &mut usize, v: u16| {
+            if let Some(slot) = buf.get_mut(*n) {
+                *slot = v;
+                *n += 1;
+            }
         };
         for c in s.chars() {
             if n + 2 >= buf.len() - 1 {
                 flush(&mut buf, &mut n);
             }
             if c == '\n' {
-                buf[n] = b'\r' as u16;
-                n += 1;
+                push(&mut buf, &mut n, b'\r' as u16);
             }
-            buf[n] = u16::try_from(c as u32).unwrap_or(b'?' as u16);
-            n += 1;
+            push(&mut buf, &mut n, u16::try_from(c as u32).unwrap_or(b'?' as u16));
         }
         flush(&mut buf, &mut n);
     }
