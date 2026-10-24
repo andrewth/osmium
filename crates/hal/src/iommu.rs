@@ -23,7 +23,6 @@
 
 use core::mem::ManuallyDrop;
 use core::ops::Range;
-use core::ptr::NonNull;
 
 use osmium_mm::paging::{MapError, MapFlags, PageSize, PageTable, PageTableFormat, TableAlloc, UnmapError};
 use osmium_mm::{PAGE_SIZE, PhysAddr, VirtAddr};
@@ -186,19 +185,19 @@ impl<'iommu, I: Iommu, A: TableAlloc> IoDomain<'iommu, I, A> {
         if self.attached.contains(&Some(device)) {
             return Err(IommuError::Busy);
         }
-        let slot = self.attached.iter().position(Option::is_none).ok_or(IommuError::OutOfMemory)?;
+        let slot = self.attached.iter_mut().find(|s| s.is_none()).ok_or(IommuError::OutOfMemory)?;
         // SAFETY: the table lives as long as the domain, which detaches the
         // device before freeing it, and changes entries only by whole stores.
         unsafe { self.iommu.attach(device, self.id, self.table.root())? };
-        self.attached[slot] = Some(device);
+        *slot = Some(device);
         Ok(())
     }
 
     /// Blocks `device`'s DMA.
     pub fn detach(&mut self, device: DeviceId) -> Result<(), IommuError> {
-        let slot = self.attached.iter().position(|d| *d == Some(device)).ok_or(IommuError::NotAttached)?;
+        let slot = self.attached.iter_mut().find(|d| **d == Some(device)).ok_or(IommuError::NotAttached)?;
         self.iommu.detach(device)?;
-        self.attached[slot] = None;
+        *slot = None;
         Ok(())
     }
 
@@ -283,64 +282,93 @@ pub struct IovaAllocator {
 }
 
 impl IovaAllocator {
-    /// An allocator over the page-aligned `window`.
+    /// An allocator over `window`, trimmed to whole pages.
     pub fn new(window: Range<u64>) -> Self {
         let page = PAGE_SIZE as u64;
-        assert!(window.start.is_multiple_of(page) && window.end.is_multiple_of(page));
+        // Round inwards to whole pages (a no-op for aligned windows).
+        let window = window.start.checked_next_multiple_of(page).unwrap_or(u64::MAX)..window.end / page * page;
         let mut free = [(0, 0); FREE_EXTENTS];
         let len = usize::from(window.start < window.end);
         free[0] = (window.start, window.end);
         Self { free, len }
     }
 
+    /// The used extents.
+    fn live(&self) -> &[(u64, u64)] {
+        self.free.get(..self.len).unwrap_or(&self.free)
+    }
+
+    /// Drops extent `i`, shifting the later ones down.
+    fn remove(&mut self, i: usize) {
+        if i < self.len {
+            self.free.copy_within(i + 1..self.len, i);
+            self.len -= 1;
+        }
+    }
+
     /// Allocates `pages` contiguous pages, returning the first IOVA.
     pub fn alloc(&mut self, pages: usize) -> Option<u64> {
         let bytes = (pages as u64).checked_mul(PAGE_SIZE as u64).filter(|&b| b != 0)?;
-        let i = self.free[..self.len].iter().position(|&(s, e)| e - s >= bytes)?;
-        let (start, end) = self.free[i];
-        if start + bytes == end {
-            self.free.copy_within(i + 1..self.len, i);
-            self.len -= 1;
+        let i = self.live().iter().position(|&(s, e)| e.saturating_sub(s) >= bytes)?;
+        let (start, end) = *self.free.get(i)?;
+        let next = start.checked_add(bytes)?;
+        if next == end {
+            self.remove(i);
         } else {
-            self.free[i].0 = start + bytes;
+            self.free.get_mut(i)?.0 = next;
         }
         Some(start)
     }
 
     /// Returns `pages` pages at `iova`, from [`alloc`](Self::alloc).
     pub fn free(&mut self, iova: u64, pages: usize) {
-        let end = iova + pages as u64 * PAGE_SIZE as u64;
-        let i = self.free[..self.len].partition_point(|&(s, _)| s < iova);
-        let joins_prev = i > 0 && self.free[i - 1].1 == iova;
-        let joins_next = i < self.len && self.free[i].0 == end;
-        match (joins_prev, joins_next) {
-            (true, true) => {
-                self.free[i - 1].1 = self.free[i].1;
-                self.free.copy_within(i + 1..self.len, i);
-                self.len -= 1;
+        let end = (pages as u64).saturating_mul(PAGE_SIZE as u64).saturating_add(iova);
+        let i = self.live().partition_point(|&(s, _)| s < iova);
+        let prev = i.checked_sub(1).filter(|&p| self.free.get(p).is_some_and(|e| e.1 == iova));
+        let next = Some(i).filter(|&n| n < self.len && self.free.get(n).is_some_and(|e| e.0 == end));
+        match (prev, next) {
+            (Some(p), Some(n)) => {
+                let after = self.free.get(n).map_or(end, |e| e.1);
+                if let Some(e) = self.free.get_mut(p) {
+                    e.1 = after;
+                }
+                self.remove(n);
             }
-            (true, false) => self.free[i - 1].1 = end,
-            (false, true) => self.free[i].0 = iova,
-            (false, false) => {
+            (Some(p), None) => {
+                if let Some(e) = self.free.get_mut(p) {
+                    e.1 = end;
+                }
+            }
+            (None, Some(n)) => {
+                if let Some(e) = self.free.get_mut(n) {
+                    e.0 = iova;
+                }
+            }
+            (None, None) => {
                 if self.len == FREE_EXTENTS {
                     // Forget the smallest extent, or this one if it is.
-                    let (small, size) = self
+                    let Some((small, size)) = self
                         .free
                         .iter()
                         .enumerate()
-                        .map(|(j, &(s, e))| (j, e - s))
+                        .map(|(j, &(s, e))| (j, e.saturating_sub(s)))
                         .min_by_key(|&(_, n)| n)
-                        .expect("the table is full, so not empty");
-                    if size >= end - iova {
+                    else {
+                        return;
+                    };
+                    if size >= end.saturating_sub(iova) {
                         return;
                     }
-                    self.free.copy_within(small + 1..self.len, small);
-                    self.len -= 1;
+                    self.remove(small);
                     return self.free(iova, pages);
                 }
-                self.free.copy_within(i..self.len, i + 1);
-                self.free[i] = (iova, end);
-                self.len += 1;
+                if i < self.len {
+                    self.free.copy_within(i..self.len, i + 1);
+                }
+                if let Some(e) = self.free.get_mut(i) {
+                    *e = (iova, end);
+                    self.len += 1;
+                }
             }
         }
     }
@@ -418,7 +446,8 @@ impl<I: Iommu, A: TableAlloc, B: DmaAllocator> DmaAllocator for IommuDma<'_, I, 
         let iova = buf.device_addr().as_u64();
         let bytes = buf.len().max(1).next_multiple_of(PAGE_SIZE);
         let mut st = self.state.lock();
-        let pa = st.domain.translate(iova).expect("freeing an unmapped DMA buffer");
+        // A buffer we did not map has nothing to release.
+        let Some(pa) = st.domain.translate(iova) else { return };
         // A failed flush means a device might still reach the memory: keep
         // the IOVA and the memory out of circulation instead of reusing them.
         let flushed = st.domain.unmap(iova, bytes as u64).is_ok();
@@ -427,7 +456,7 @@ impl<I: Iommu, A: TableAlloc, B: DmaAllocator> DmaAllocator for IommuDma<'_, I, 
         }
         drop(st);
         if flushed {
-            let cpu = NonNull::new(buf.cpu_ptr().as_ptr()).expect("non-null");
+            let cpu = buf.cpu_ptr();
             // SAFETY: the original buffer's memory, no longer reachable by
             // any device now the mapping is gone and the IOTLB flushed.
             unsafe { self.backing.free_coherent(DmaBuffer::new(cpu, pa, buf.len())) };
@@ -447,6 +476,7 @@ mod tests {
     use osmium_mm::paging::formats::Ept;
 
     use super::*;
+    use core::ptr::NonNull;
 
     /// Page-table memory from the host heap; physical = host address.
     #[derive(Default)]

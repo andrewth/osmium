@@ -44,6 +44,11 @@ pub struct Channel {
     pub bits: u8,
 }
 
+/// `v << by`, or 0 when `by` is past the width of `u32`.
+const fn shl(v: u32, by: u32) -> u32 {
+    if by >= 32 { 0 } else { v << by }
+}
+
 impl Channel {
     const fn new(shift: u8, bits: u8) -> Self {
         Self { shift, bits }
@@ -65,7 +70,7 @@ impl Channel {
 
     /// The channel's bits within a pixel value.
     pub const fn mask(&self) -> u32 {
-        ((1u32 << self.bits) - 1) << self.shift
+        shl(if self.bits >= 32 { u32::MAX } else { shl(1, self.bits as u32) - 1 }, self.shift as u32)
     }
 
     /// True if 1–8 bits wide and inside a `bpp`-bit pixel.
@@ -77,7 +82,7 @@ impl Channel {
         if self.bits == 0 || self.bits > 8 {
             return 0;
         }
-        (v as u32 >> (8 - self.bits)) << self.shift
+        shl(v as u32 >> (8 - self.bits), self.shift as u32)
     }
 
     fn decode(&self, pixel: u32) -> u8 {
@@ -85,7 +90,7 @@ impl Channel {
         if self.bits == 0 || self.bits > 8 {
             return 0;
         }
-        let v = (pixel >> self.shift) & ((1 << self.bits) - 1);
+        let v = if self.shift >= 32 { 0 } else { pixel >> self.shift } & ((1 << self.bits) - 1);
         // Replicate the high bits into the low ones, so full scale stays
         // full scale (0x1f in 5 bits reads back as 0xff).
         let mut out = v << (8 - self.bits);
@@ -230,7 +235,7 @@ impl FramebufferInfo {
 
     /// Bytes the framebuffer covers.
     pub const fn size(&self) -> usize {
-        self.stride as usize * self.height as usize
+        (self.stride as usize).saturating_mul(self.height as usize)
     }
 
     /// The whole visible area.
@@ -274,7 +279,7 @@ impl Framebuffer {
     /// a valid format and a base and stride aligned for its pixels.
     pub fn new(mem: IoMem, info: FramebufferInfo) -> Result<Self, DisplayError> {
         let bpp = info.format.bytes_per_pixel();
-        let row = info.width as usize * bpp;
+        let row = (info.width as usize).saturating_mul(bpp);
         let align = if bpp == 3 { 1 } else { bpp };
         if !info.format.is_valid()
             || row > info.stride as usize
@@ -361,7 +366,8 @@ impl Framebuffer {
         let (fg, bg) = (self.info.format.encode(fg), bg.map(|c| self.info.format.encode(c)));
         self.for_each_pixel(Rect::new(x, y, width, height), |off, px, py| {
             let (col, row) = ((px - x) as usize, (py - y) as usize);
-            match (bits[row * row_bytes + col / 8] & (0x80 >> (col % 8)) != 0, bg) {
+            let set = bits.get(row * row_bytes + col / 8).is_some_and(|b| b & (0x80 >> (col % 8)) != 0);
+            match (set, bg) {
                 (true, _) => self.store(off, fg),
                 (false, Some(bg)) => self.store(off, bg),
                 (false, None) => {}

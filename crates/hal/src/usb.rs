@@ -192,12 +192,17 @@ impl Speed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadDescriptor;
 
+/// Byte `at` of `b`, or 0 past the end (callers check lengths first).
+fn byte(b: &[u8], at: usize) -> u8 {
+    b.get(at).copied().unwrap_or(0)
+}
+
 fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
+    u16::from_le_bytes([byte(b, at), byte(b, at + 1)])
 }
 
 fn check(bytes: &[u8], ty: u8, len: usize) -> Result<(), BadDescriptor> {
-    if bytes.len() < len || (bytes[0] as usize) < len || bytes[1] != ty {
+    if bytes.len() < len || (byte(bytes, 0) as usize) < len || byte(bytes, 1) != ty {
         return Err(BadDescriptor);
     }
     Ok(())
@@ -242,17 +247,17 @@ impl DeviceDescriptor {
         check(b, descriptor_type::DEVICE, Self::LEN)?;
         Ok(Self {
             usb_version: le16(b, 2),
-            class: b[4],
-            subclass: b[5],
-            protocol: b[6],
-            max_packet_size0_raw: b[7],
+            class: byte(b, 4),
+            subclass: byte(b, 5),
+            protocol: byte(b, 6),
+            max_packet_size0_raw: byte(b, 7),
             vendor_id: le16(b, 8),
             product_id: le16(b, 10),
             device_version: le16(b, 12),
-            manufacturer_index: b[14],
-            product_index: b[15],
-            serial_index: b[16],
-            num_configurations: b[17],
+            manufacturer_index: byte(b, 14),
+            product_index: byte(b, 15),
+            serial_index: byte(b, 16),
+            num_configurations: byte(b, 17),
         })
     }
 
@@ -293,11 +298,11 @@ impl ConfigurationDescriptor {
         check(b, descriptor_type::CONFIGURATION, Self::LEN)?;
         Ok(Self {
             total_length: le16(b, 2),
-            num_interfaces: b[4],
-            value: b[5],
-            string_index: b[6],
-            attributes: b[7],
-            max_power: b[8],
+            num_interfaces: byte(b, 4),
+            value: byte(b, 5),
+            string_index: byte(b, 6),
+            attributes: byte(b, 7),
+            max_power: byte(b, 8),
         })
     }
 }
@@ -329,13 +334,13 @@ impl InterfaceDescriptor {
     pub fn parse(b: &[u8]) -> Result<Self, BadDescriptor> {
         check(b, descriptor_type::INTERFACE, Self::LEN)?;
         Ok(Self {
-            number: b[2],
-            alternate: b[3],
-            num_endpoints: b[4],
-            class: b[5],
-            subclass: b[6],
-            protocol: b[7],
-            string_index: b[8],
+            number: byte(b, 2),
+            alternate: byte(b, 3),
+            num_endpoints: byte(b, 4),
+            class: byte(b, 5),
+            subclass: byte(b, 6),
+            protocol: byte(b, 7),
+            string_index: byte(b, 8),
         })
     }
 }
@@ -373,7 +378,7 @@ impl EndpointDescriptor {
     /// Parses an endpoint descriptor.
     pub fn parse(b: &[u8]) -> Result<Self, BadDescriptor> {
         check(b, descriptor_type::ENDPOINT, Self::LEN)?;
-        Ok(Self { address: b[2], attributes: b[3], max_packet_size_raw: le16(b, 4), interval: b[6] })
+        Ok(Self { address: byte(b, 2), attributes: byte(b, 3), max_packet_size_raw: le16(b, 4), interval: byte(b, 6) })
     }
 
     /// Endpoint number, 1–15.
@@ -446,14 +451,13 @@ impl<'src> Iterator for Descriptors<'src> {
         if self.rest.is_empty() {
             return None;
         }
-        let len = self.rest[0] as usize;
-        if len < 2 || len > self.rest.len() {
+        let len = byte(self.rest, 0) as usize;
+        let Some((d, rest)) = self.rest.split_at_checked(len).filter(|_| len >= 2) else {
             self.rest = &[];
             return Some(Err(BadDescriptor));
-        }
-        let (d, rest) = self.rest.split_at(len);
+        };
         self.rest = rest;
-        Some(match d[1] {
+        Some(match byte(d, 1) {
             descriptor_type::CONFIGURATION => ConfigurationDescriptor::parse(d).map(Descriptor::Configuration),
             descriptor_type::INTERFACE => InterfaceDescriptor::parse(d).map(Descriptor::Interface),
             descriptor_type::ENDPOINT => EndpointDescriptor::parse(d).map(Descriptor::Endpoint),
@@ -852,10 +856,10 @@ pub fn read_configuration<H: UsbHost + ?Sized>(
     let mut header = [0u8; ConfigurationDescriptor::LEN];
     let setup = SetupPacket::get_descriptor(descriptor_type::CONFIGURATION, index, header.len() as u16);
     let n = host.control_in(dev, setup, &mut header)?;
-    let config = ConfigurationDescriptor::parse(&header[..n])?;
+    let config = ConfigurationDescriptor::parse(header.get(..n).ok_or(UsbError::BadDescriptor)?)?;
     let want = (config.total_length as usize).min(config_buf.len());
     let setup = SetupPacket::get_descriptor(descriptor_type::CONFIGURATION, index, want as u16);
-    host.control_in(dev, setup, &mut config_buf[..want])
+    host.control_in(dev, setup, config_buf.get_mut(..want).ok_or(UsbError::BadDescriptor)?)
 }
 
 /// Selects the configuration whose descriptor set is `config` (as returned
@@ -891,7 +895,7 @@ pub fn set_configuration<H: UsbHost + ?Sized>(
     }
     host.control_out(dev, SetupPacket::set_configuration(header.value), &[])?;
     if count > 0 {
-        host.configure_endpoints(dev, &endpoints[..count])?;
+        host.configure_endpoints(dev, endpoints.get(..count).ok_or(UsbError::NoResources)?)?;
     }
     Ok(header)
 }
@@ -900,10 +904,10 @@ fn configure<H: UsbHost + ?Sized>(host: &mut H, id: DeviceId, config_buf: &mut [
     let mut buf = [0u8; DeviceDescriptor::LEN];
     let setup = SetupPacket::get_descriptor(descriptor_type::DEVICE, 0, buf.len() as u16);
     let n = host.control_in(id, setup, &mut buf)?;
-    let device = DeviceDescriptor::parse(&buf[..n])?;
+    let device = DeviceDescriptor::parse(buf.get(..n).ok_or(UsbError::BadDescriptor)?)?;
 
     let config_len = read_configuration(host, id, 0, config_buf)?;
-    let config = set_configuration(host, id, &config_buf[..config_len])?;
+    let config = set_configuration(host, id, config_buf.get(..config_len).ok_or(UsbError::BadDescriptor)?)?;
     Ok(Enumerated { id, device, config, config_len })
 }
 
@@ -1006,16 +1010,16 @@ mod tests {
             Ok(())
         }
         fn transfer_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Result<usize, UsbError> {
-            unimplemented!()
+            Err(UsbError::Unsupported)
         }
         fn transfer_out(&mut self, _: DeviceId, _: u8, _: &[u8]) -> Result<(), UsbError> {
-            unimplemented!()
+            Err(UsbError::Unsupported)
         }
         fn submit_in(&mut self, _: DeviceId, _: u8, _: usize) -> Result<(), UsbError> {
-            unimplemented!()
+            Err(UsbError::Unsupported)
         }
         fn poll_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Option<Result<usize, UsbError>> {
-            unimplemented!()
+            None
         }
     }
 

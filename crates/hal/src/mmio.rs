@@ -25,7 +25,7 @@ use core::cell::UnsafeCell;
 use core::fmt;
 
 /// Integer types that registers can hold.
-pub trait RegValue: Copy + sealed::Sealed {}
+pub trait RegValue: Copy + Default + sealed::Sealed {}
 impl RegValue for u8 {}
 impl RegValue for u16 {}
 impl RegValue for u32 {}

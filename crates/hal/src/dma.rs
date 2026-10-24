@@ -54,42 +54,55 @@ impl DmaBuffer {
         self.len == 0
     }
 
-    fn typed<T: RegValue>(&self, offset: usize) -> *mut T {
+    /// The address of a `T` at `offset`, or `None` if it is out of bounds or misaligned.
+    fn typed<T: RegValue>(&self, offset: usize) -> Option<*mut T> {
         let size = core::mem::size_of::<T>();
-        assert!(offset.checked_add(size).is_some_and(|e| e <= self.len), "DMA access out of bounds");
+        if !offset.checked_add(size).is_some_and(|e| e <= self.len) {
+            return None;
+        }
         let p = self.cpu.as_ptr().wrapping_add(offset);
-        assert!((p as usize).is_multiple_of(size), "misaligned DMA access");
-        p.cast()
+        (p as usize).is_multiple_of(size).then_some(p.cast())
     }
 
     /// Volatile load of the little-endian integer at `offset`, which must be
-    /// in bounds and naturally aligned (else this panics).
+    /// in bounds and naturally aligned (else this reads as zero, like a bus
+    /// with nothing there).
     #[inline]
     pub fn load<T: RegValue>(&self, offset: usize) -> T {
-        // SAFETY: in bounds and aligned (checked).
-        unsafe { self.typed::<T>(offset).read_volatile() }
+        match self.typed::<T>(offset) {
+            // SAFETY: in bounds and aligned (checked).
+            Some(p) => unsafe { p.read_volatile() },
+            None => T::default(),
+        }
     }
 
     /// Volatile store of an integer at `offset`, under the same conditions
     /// as [`load`](Self::load).
     #[inline]
     pub fn store<T: RegValue>(&self, offset: usize, value: T) {
-        // SAFETY: in bounds and aligned (checked).
-        unsafe { self.typed::<T>(offset).write_volatile(value) }
+        if let Some(p) = self.typed::<T>(offset) {
+            // SAFETY: in bounds and aligned (checked).
+            unsafe { p.write_volatile(value) }
+        }
     }
 
-    /// Copies `src` into the buffer at `offset`. Panics if out of bounds.
+    /// Copies `src` into the buffer at `offset`. Does nothing if it does not fit.
     pub fn write(&self, offset: usize, src: &[u8]) {
-        assert!(offset.checked_add(src.len()).is_some_and(|e| e <= self.len));
+        if !offset.checked_add(src.len()).is_some_and(|e| e <= self.len) {
+            return;
+        }
         for (i, &b) in src.iter().enumerate() {
             // SAFETY: in bounds (checked above).
             unsafe { self.cpu.as_ptr().add(offset + i).write_volatile(b) };
         }
     }
 
-    /// Copies from the buffer at `offset` into `dst`. Panics if out of bounds.
+    /// Copies from the buffer at `offset` into `dst`. Zero-fills `dst` if the range is out of bounds.
     pub fn read(&self, offset: usize, dst: &mut [u8]) {
-        assert!(offset.checked_add(dst.len()).is_some_and(|e| e <= self.len));
+        if !offset.checked_add(dst.len()).is_some_and(|e| e <= self.len) {
+            dst.fill(0);
+            return;
+        }
         for (i, b) in dst.iter_mut().enumerate() {
             // SAFETY: in bounds (checked above).
             *b = unsafe { self.cpu.as_ptr().add(offset + i).read_volatile() };
