@@ -33,3 +33,13 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
+# Nothing reachable from user space, the network, a disk image, a device or a guest may panic.
+# Where a panic is a genuine internal invariant, allow it at that item with a comment saying why.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
