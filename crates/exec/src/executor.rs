@@ -134,6 +134,7 @@ impl<const N: usize> Executor<N> {
     /// Panics must abort (`panic = "abort"`): an unwinding panic, from this
     /// call or from a task, would free the caller's frame while the slots
     /// still point into it, and a later poll would use freed memory.
+    #[allow(clippy::expect_used)] // integrator misuse at construction: the executor is sized for its fixed task set.
     pub unsafe fn run_with(&'static self, tasks: &mut [Pin<&mut (dyn Future<Output = ()> + Send)>]) -> ! {
         for task in tasks.iter_mut() {
             // SAFETY: this function never returns, so the caller's frame
@@ -155,6 +156,7 @@ impl<const N: usize> Executor<N> {
     /// Panics must abort (`panic = "abort"`): unwinding out of this call (a
     /// full executor, a panicking task) would free the caller's frame while
     /// unfinished slots still point into it.
+    #[allow(clippy::expect_used)] // integrator misuse at construction: the executor is sized for its fixed task set.
     pub unsafe fn run_to_completion(&'static self, tasks: &mut [Pin<&mut (dyn Future<Output = ()> + Send)>]) {
         for task in tasks.iter_mut() {
             // SAFETY: we return only when all slots are empty (every task
@@ -168,8 +170,10 @@ impl<const N: usize> Executor<N> {
 
     /// Runs tasks forever, waiting for an interrupt whenever none is ready.
     pub fn run(&'static self) -> ! {
-        self.run_until(|| false);
-        unreachable!()
+        loop {
+            // `run_until` with an always-false condition never returns; the loop is only for the type.
+            self.run_until(|| false);
+        }
     }
 
     /// Runs tasks, waiting for interrupts when none is ready, until `done`
