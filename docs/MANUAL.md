@@ -675,11 +675,16 @@ vfs.mount("/cdrom", iso.root())?;
 |---|---|---|---|
 | Read/write | yes, or read-only if the volume has an unknown read-only feature (`quota`, `bigalloc`, …) | yes | read-only |
 | Names | ext directories; hashed indexes are scanned linearly and dropped on change | VFAT long names, generated 8.3 aliases | Rock Ridge if present, else Joliet, else lower-cased ISO names (`names()` says which) |
-| Extras | extents, `64bit`, `flex_bg`, `metadata_csum` (verified and kept); `set_clock` for timestamps; `into_device` to unmount | `free_bytes` from FSInfo | Symlinks and device nodes via Rock Ridge; files over 4 GiB; any device block size |
-| Not supported | journal replay (a clean journal is left alone; a dirty one fails with `ENOSYS`), `inline_data`, encryption, casefolding, rename, hard links | exFAT, timestamps, rename; a FAT12/16 root directory cannot grow (`ENOSPC` when full); device block sizes that are not a power of two up to 4 KiB; directories over 65536 entries | timestamps, multi-session beyond the first, UDF |
+| Extras | extents, `64bit`, `flex_bg`, `metadata_csum` (verified and kept); the JBD2 journal (metadata logged, data ordered, replayed at mount); `set_clock` for timestamps; `into_device` to unmount and mark the journal clean | `free_bytes` from FSInfo | Symlinks and device nodes via Rock Ridge; files over 4 GiB; any device block size |
+| Not supported | external journals, `csum_v2`, `async_commit` and fast-commit journals (a clean one is left alone and changes go in place; one needing recovery fails with `ENOSYS`), `inline_data`, encryption, casefolding, rename, hard links | exFAT, timestamps, rename; a FAT12/16 root directory cannot grow (`ENOSPC` when full); device block sizes that are not a power of two up to 4 KiB; directories over 65536 entries | timestamps, multi-session beyond the first, UDF |
 
-The ext driver writes changes in place and journals nothing, and there is
-no block cache. Call `sync()` before removing the device. A corrupt layout
+The ext driver journals metadata when the volume has an internal JBD2
+journal (`Ext2::is_journaled`): a crash leaves each operation done or not
+done, and the next mount replays the log, which means that mounting can write
+to the device. It flushes the device several times per operation and has no
+block cache. Unmount with `into_device`, which marks the journal clean;
+`sync()` is not needed for the journal's sake. Without a journal changes go
+in place, so call `sync()` before removing the device. A corrupt layout
 (including a bad superblock or group-descriptor checksum) fails the mount
 with `EINVAL`. Corrupt metadata found later (a bad checksum, a
 damaged inode or directory record) returns `EIO` for that access.
