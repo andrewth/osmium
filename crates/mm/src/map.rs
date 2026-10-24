@@ -44,7 +44,7 @@ impl Region {
 
     /// Size in bytes.
     pub const fn len(&self) -> u64 {
-        self.end.0 - self.start.0
+        self.end.0.saturating_sub(self.start.0)
     }
 
     /// Returns true if the region is empty.
@@ -88,7 +88,7 @@ impl<const N: usize> MemoryMap<N> {
 
     /// Returns the regions in address order.
     pub fn regions(&self) -> &[Region] {
-        &self.regions[..self.len]
+        self.regions.get(..self.len).unwrap_or(&self.regions)
     }
 
     /// Iterates over usable regions.
@@ -167,12 +167,16 @@ impl<const N: usize> MemoryMap<N> {
             if self.merge_touching_reserved() {
                 continue;
             }
-            let smallest = (0..self.len)
-                .filter(|&i| self.regions[i].kind == RegionKind::Usable)
-                .min_by_key(|&i| self.regions[i].len());
+            let smallest = self
+                .regions()
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.kind == RegionKind::Usable)
+                .min_by_key(|(_, r)| r.len())
+                .map(|(i, r)| (i, r.len()));
             match smallest {
-                Some(i) if !usable || self.regions[i].len() < len => {
-                    lost += self.regions[i].len();
+                Some((i, size)) if !usable || size < len => {
+                    lost += size;
                     self.remove(i);
                 }
                 _ if usable => return Ok(lost + len),
@@ -188,12 +192,17 @@ impl<const N: usize> MemoryMap<N> {
     /// `Reserved` region. Returns false if there are none.
     fn merge_touching_reserved(&mut self) -> bool {
         let unusable = |r: &Region| r.kind != RegionKind::Usable;
-        let Some(i) =
-            self.regions().windows(2).position(|w| unusable(&w[0]) && unusable(&w[1]) && w[0].end == w[1].start)
-        else {
+        let Some((i, merged)) = self.regions().windows(2).enumerate().find_map(|(i, w)| match w {
+            [a, b] if unusable(a) && unusable(b) && a.end == b.start => {
+                Some((i, Region::new(a.start, b.end, RegionKind::Reserved)))
+            }
+            _ => None,
+        }) else {
             return false;
         };
-        self.regions[i] = Region::new(self.regions[i].start, self.regions[i + 1].end, RegionKind::Reserved);
+        if let Some(slot) = self.regions.get_mut(i) {
+            *slot = merged;
+        }
         self.remove(i + 1);
         true
     }
@@ -204,7 +213,7 @@ impl<const N: usize> MemoryMap<N> {
     pub fn page_align_usable(&mut self) {
         let mut i = 0;
         while i < self.len {
-            let r = &mut self.regions[i];
+            let Some(r) = self.regions.get_mut(i) else { break };
             if r.kind == RegionKind::Usable {
                 r.start = r.start.checked_align_up(PAGE_SIZE as u64).unwrap_or(r.end);
                 r.end = r.end.align_down(PAGE_SIZE as u64);
@@ -221,6 +230,9 @@ impl<const N: usize> MemoryMap<N> {
     /// it [`RegionKind::Allocated`] and returns its start. For allocating
     /// early boot structures before a real allocator exists.
     pub fn allocate(&mut self, size: u64, align: u64) -> Option<PhysAddr> {
+        if !align.is_power_of_two() {
+            return None;
+        }
         let start = self.usable().find_map(|r| {
             let s = r.start.checked_align_up(align)?;
             (s.0.checked_add(size)? <= r.end.0).then_some(s)
@@ -236,19 +248,18 @@ impl<const N: usize> MemoryMap<N> {
         // Build into a scratch array so that running out of room leaves the
         // map unchanged.
         let mut out = [Region::new(PhysAddr::ZERO, PhysAddr::ZERO, kind); N];
-        let mut n = 0;
+        let mut n: usize = 0;
         let mut push = |r: Region, out: &mut [Region; N]| -> Result<(), MapFull> {
             if r.is_empty() {
                 return Ok(());
             }
-            if n > 0 && out[n - 1].kind == r.kind && out[n - 1].end == r.start {
-                out[n - 1].end = r.end;
+            if let Some(last) =
+                n.checked_sub(1).and_then(|l| out.get_mut(l)).filter(|l| l.kind == r.kind && l.end == r.start)
+            {
+                last.end = r.end;
                 return Ok(());
             }
-            if n == N {
-                return Err(MapFull);
-            }
-            out[n] = r;
+            *out.get_mut(n).ok_or(MapFull)? = r;
             n += 1;
             Ok(())
         };
@@ -275,6 +286,9 @@ impl<const N: usize> MemoryMap<N> {
     }
 
     fn remove(&mut self, i: usize) {
+        if i >= self.len {
+            return;
+        }
         self.regions.copy_within(i + 1..self.len, i);
         self.len -= 1;
     }
@@ -299,6 +313,15 @@ mod tests {
 
     fn pa(x: u64) -> PhysAddr {
         PhysAddr::new(x)
+    }
+
+    #[test]
+    fn allocate_rejects_bad_alignment() {
+        let mut m = MemoryMap::<4>::new();
+        m.add(pa(0x1000), pa(0x10000), Usable).unwrap();
+        assert_eq!(m.allocate(0x1000, 0), None);
+        assert_eq!(m.allocate(0x1000, 3), None);
+        assert_eq!(m.allocate(u64::MAX, 0x1000), None);
     }
 
     #[test]

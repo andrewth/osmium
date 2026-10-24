@@ -119,8 +119,8 @@ impl PageSize {
         match level {
             0 => Self::Size4K,
             1 => Self::Size2M,
-            2 => Self::Size1G,
-            _ => panic!("no leaf size above 1 GiB"), // find_leaf filters larger foreign leaves
+            // `find_leaf` filters larger foreign leaves, so this is 2 in practice.
+            _ => Self::Size1G,
         }
     }
 }
@@ -335,28 +335,30 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     /// # Safety
     /// `kernel` (its subtables, at least) must outlive this table.
     ///
-    /// # Panics
-    ///
-    /// If the format has a multi-page root (G-stage tables), or `indices` runs past the root table.
+    /// Does nothing if the format has a multi-page root (G-stage tables);
+    /// indices past the root table are ignored.
     pub unsafe fn share_root_entries<B: TableAlloc>(
         &mut self,
         kernel: &PageTable<F, B>,
         indices: core::ops::Range<usize>,
     ) {
-        assert!(F::ROOT_PAGES == 1, "multi-page roots (G-stage) cannot share entries");
-        assert!(indices.end <= ENTRIES, "root index out of range");
+        if F::ROOT_PAGES != 1 {
+            return;
+        }
         let top = F::LEVELS - 1;
-        for i in indices {
+        for i in indices.start..indices.end.min(ENTRIES) {
             let va = VirtAddr::new((i as u64) << (12 + 9 * top));
             let pte = kernel.entry(kernel.root, va, top).load(Ordering::Acquire);
             self.entry(self.root, va, top).store(pte, Ordering::Release);
-            self.shared[i / 64] |= 1 << (i % 64);
+            if let Some(w) = self.shared.get_mut(i / 64) {
+                *w |= 1 << (i % 64);
+            }
         }
     }
 
     fn is_shared(&self, va: VirtAddr) -> bool {
         let i = (va.0 >> (12 + 9 * (F::LEVELS - 1))) as usize % ENTRIES;
-        self.shared[i / 64] & (1 << (i % 64)) != 0
+        self.shared.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
     }
 
     /// Maps the page at `va` to `pa`.

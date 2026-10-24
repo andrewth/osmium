@@ -73,10 +73,14 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
         if frames <= meta_frames {
             return false;
         }
-        let zone = Zone { first: start_pfn + meta_frames, end: end_pfn, meta: PhysAddr::new(start_pfn * PAGE_SIZE as u64) };
+        let zone =
+            Zone { first: start_pfn + meta_frames, end: end_pfn, meta: PhysAddr::new(start_pfn * PAGE_SIZE as u64) };
         // SAFETY: the metadata frames are part of the caller-provided free range.
-        unsafe { core::ptr::write_bytes(self.mapper.phys_to_virt(zone.meta), NOT_HEAD, (zone.end - zone.first) as usize) };
-        self.zones[self.nzones] = zone;
+        unsafe {
+            core::ptr::write_bytes(self.mapper.phys_to_virt(zone.meta), NOT_HEAD, (zone.end - zone.first) as usize)
+        };
+        let Some(slot) = self.zones.get_mut(self.nzones) else { return false };
+        *slot = zone;
         self.nzones += 1;
 
         // Carve the range into maximal aligned blocks.
@@ -93,30 +97,49 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
         true
     }
 
-    fn zone_of(&self, pfn: u64) -> Zone {
-        *self.zones[..self.nzones]
-            .iter()
-            .find(|z| (z.first..z.end).contains(&pfn))
-            .expect("frame not managed by this allocator")
+    fn zone_of(&self, pfn: u64) -> Option<Zone> {
+        self.zones.iter().take(self.nzones).find(|z| (z.first..z.end).contains(&pfn)).copied()
     }
 
-    fn meta(&self, pfn: u64) -> *mut u8 {
-        let z = self.zone_of(pfn);
-        self.mapper.phys_to_virt(z.meta + (pfn - z.first))
+    /// The metadata byte of `pfn`, or `None` if the frame is not managed.
+    fn meta(&self, pfn: u64) -> Option<*mut u8> {
+        let z = self.zone_of(pfn)?;
+        Some(self.mapper.phys_to_virt(z.meta + (pfn - z.first)))
+    }
+
+    /// Reads the metadata byte of `pfn`; `NOT_HEAD` for an unmanaged frame.
+    fn meta_get(&self, pfn: u64) -> u8 {
+        // SAFETY: `meta` only returns pointers to the metadata of managed frames.
+        self.meta(pfn).map_or(NOT_HEAD, |m| unsafe { *m })
+    }
+
+    fn meta_set(&mut self, pfn: u64, v: u8) {
+        if let Some(m) = self.meta(pfn) {
+            // SAFETY: `meta` only returns pointers to the metadata of managed frames.
+            unsafe { *m = v };
+        }
+    }
+
+    fn head(&self, k: u32) -> u64 {
+        self.heads.get(k as usize).copied().unwrap_or(NIL)
+    }
+
+    fn set_head(&mut self, k: u32, pfn: u64) {
+        if let Some(h) = self.heads.get_mut(k as usize) {
+            *h = pfn;
+        }
     }
 
     /// Whether the block of order `k` at `pfn` is already free, in full or
     /// in part: its first frame heads a free block of any order, or a larger
     /// free block contains it.
     fn is_free(&self, zone: Zone, pfn: u64, k: u32) -> bool {
-        // SAFETY: `pfn` lies in `zone`, so its metadata byte exists.
-        if unsafe { *self.meta(pfn) } != NOT_HEAD {
+        if self.meta_get(pfn) != NOT_HEAD {
             return true;
         }
         (k + 1..ORDERS as u32).any(|j| {
             let head = pfn & !((1 << j) - 1);
-            // SAFETY: checked to lie in `zone`, between its first frame and `pfn`.
-            head >= zone.first && unsafe { *self.meta(head) } == j as u8
+            head >= zone.first && self.meta_get(head) == j as u8
         })
     }
 
@@ -125,16 +148,16 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
     }
 
     fn push(&mut self, pfn: u64, k: u32) {
-        let head = self.heads[k as usize];
+        let head = self.head(k);
         // SAFETY: `pfn` heads a free block we own; `head`, if any, too.
         unsafe {
             self.node(pfn).write(FreeNode { next: head, prev: NIL });
             if head != NIL {
                 (*self.node(head)).prev = pfn;
             }
-            *self.meta(pfn) = k as u8;
         }
-        self.heads[k as usize] = pfn;
+        self.meta_set(pfn, k as u8);
+        self.set_head(k, pfn);
     }
 
     fn remove(&mut self, pfn: u64, k: u32) {
@@ -143,15 +166,15 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
         unsafe {
             let FreeNode { next, prev } = self.node(pfn).read();
             if prev == NIL {
-                self.heads[k as usize] = next;
+                self.set_head(k, next);
             } else {
                 (*self.node(prev)).next = next;
             }
             if next != NIL {
                 (*self.node(next)).prev = prev;
             }
-            *self.meta(pfn) = NOT_HEAD;
         }
+        self.meta_set(pfn, NOT_HEAD);
     }
 }
 
@@ -160,8 +183,8 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
 // and `dealloc` panics rather than list a block that is already free.
 unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocator<M, ORDERS> {
     fn alloc(&mut self, order: u32) -> Option<PhysAddr> {
-        let mut k = (order as usize..ORDERS).find(|&k| self.heads[k] != NIL)? as u32;
-        let pfn = self.heads[k as usize];
+        let mut k = (order as usize..ORDERS).find(|&k| self.head(k as u32) != NIL)? as u32;
+        let pfn = self.head(k);
         self.remove(pfn, k);
         while k > order {
             k -= 1;
@@ -171,9 +194,10 @@ unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocato
         Some(PhysAddr::new(pfn * PAGE_SIZE as u64))
     }
 
-    /// Panics, in release builds too, on a double free (the block, or a
-    /// larger free block around it, is already free), on a block misaligned
-    /// for `order`, and on frames this allocator does not manage. Listing a
+    /// Ignores frames this allocator does not manage. Panics, in release
+    /// builds too, on a double free (the block, or a larger free block
+    /// around it, is already free) and on a block misaligned for `order`
+    /// (kernel bugs, never reachable from outside input). Listing a
     /// free block a second time would hand the same frames out twice, so
     /// stopping is the safer choice: the caller's ownership tracking is
     /// already broken, and something may still be using the memory. A block
@@ -181,7 +205,11 @@ unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocato
     /// start) is not detected.
     unsafe fn dealloc(&mut self, pa: PhysAddr, order: u32) {
         let mut pfn = pa.0 / PAGE_SIZE as u64;
-        let zone = self.zone_of(pfn);
+        let Some(zone) = self.zone_of(pfn) else {
+            // Not ours: nothing to give back.
+            return;
+        };
+        assert!((order as usize) < ORDERS, "free of {pa:?} with the wrong order {order}");
         assert!(
             pa.is_aligned(PAGE_SIZE as u64) && pfn.is_multiple_of(1 << order) && pfn + (1 << order) <= zone.end,
             "free of {pa:?} with the wrong order {order}"
@@ -193,8 +221,7 @@ unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocato
             if buddy < zone.first || buddy + (1 << k) > zone.end {
                 break;
             }
-            // SAFETY: the buddy lies inside the zone, so its metadata byte exists.
-            if unsafe { *self.meta(buddy) } != k as u8 {
+            if self.meta_get(buddy) != k as u8 {
                 break;
             }
             self.remove(buddy, k);

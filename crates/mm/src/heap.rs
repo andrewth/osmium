@@ -97,7 +97,10 @@ unsafe impl<const PAGES: usize> Sync for StaticArena<PAGES> {}
 impl<const PAGES: usize> StaticArena<PAGES> {
     /// Creates an arena with all pages free.
     pub const fn new() -> Self {
-        Self { pages: UnsafeCell::new([const { MaybeUninit::uninit() }; PAGES]), used: IrqSpinLock::new([false; PAGES]) }
+        Self {
+            pages: UnsafeCell::new([const { MaybeUninit::uninit() }; PAGES]),
+            used: IrqSpinLock::new([false; PAGES]),
+        }
     }
 
     fn base(&self) -> *mut u8 {
@@ -116,17 +119,20 @@ impl<const PAGES: usize> Default for StaticArena<PAGES> {
 // address is too.
 unsafe impl<const PAGES: usize> PageSource for StaticArena<PAGES> {
     fn alloc_pages(&self, count: usize, align: usize) -> Option<NonNull<u8>> {
+        if align == 0 || !align.is_power_of_two() || count == 0 {
+            return None;
+        }
         let step = (align / PAGE_SIZE).max(1);
         let base_addr = self.base() as usize;
         let mut used = self.used.lock();
         // The first page whose address is aligned; the arena itself is only
         // page aligned.
-        let first = (base_addr.next_multiple_of(align) - base_addr) / PAGE_SIZE;
+        let first = (base_addr.checked_next_multiple_of(align)? - base_addr) / PAGE_SIZE;
         let mut i = first;
-        while i + count <= PAGES {
-            match used[i..i + count].iter().rposition(|&u| u) {
+        while let Some(end) = i.checked_add(count).filter(|&end| end <= PAGES) {
+            match used.get(i..end)?.iter().rposition(|&u| u) {
                 None => {
-                    used[i..i + count].fill(true);
+                    used.get_mut(i..end)?.fill(true);
                     // SAFETY: in bounds of the arena.
                     return NonNull::new(unsafe { self.base().add(i * PAGE_SIZE) });
                 }
@@ -138,8 +144,24 @@ unsafe impl<const PAGES: usize> PageSource for StaticArena<PAGES> {
     }
 
     unsafe fn free_pages(&self, ptr: NonNull<u8>, count: usize) {
-        let i = (ptr.as_ptr() as usize - self.base() as usize) / PAGE_SIZE;
-        self.used.lock()[i..i + count].fill(false);
+        let Some(off) = (ptr.as_ptr() as usize).checked_sub(self.base() as usize) else { return };
+        let i = off / PAGE_SIZE;
+        let Some(end) = i.checked_add(count) else { return };
+        if let Some(run) = self.used.lock().get_mut(i..end) {
+            run.fill(false);
+        }
+    }
+}
+
+impl State {
+    fn head(&self, c: usize) -> usize {
+        self.free.get(c).copied().unwrap_or(0)
+    }
+
+    fn set_head(&mut self, c: usize, block: usize) {
+        if let Some(h) = self.free.get_mut(c) {
+            *h = block;
+        }
     }
 }
 
@@ -172,12 +194,18 @@ pub struct LockedHeap<S> {
 impl<S: PageSource> LockedHeap<S> {
     /// Creates an uninitialized heap.
     pub const fn new() -> Self {
-        Self { source: Once::new(), state: IrqSpinLock::new(State { free: [0; CLASSES], stats: HeapStats { allocated: 0, reserved: 0, allocs: 0, failures: 0 } }) }
+        Self {
+            source: Once::new(),
+            state: IrqSpinLock::new(State {
+                free: [0; CLASSES],
+                stats: HeapStats { allocated: 0, reserved: 0, allocs: 0, failures: 0 },
+            }),
+        }
     }
 
-    /// Supplies the page source. Panics if called twice.
+    /// Supplies the page source. A second call is ignored: the first source stays.
     pub fn init(&self, source: S) {
-        assert!(self.source.set(source).is_ok(), "heap initialized twice");
+        let _ = self.source.set(source);
     }
 
     /// Returns usage counters.
@@ -215,22 +243,23 @@ unsafe impl<S: PageSource + Sync + Send> GlobalAlloc for LockedHeap<S> {
         let result = match Self::class_of(&layout) {
             Some(c) => {
                 let size = 1 << (c + MIN_CLASS_SHIFT);
-                if st.free[c] == 0 {
+                if st.head(c) == 0 {
                     // Carve a fresh page into blocks of this class.
                     if let Some(page) = source.alloc_pages(1, PAGE_SIZE) {
                         st.stats.reserved += PAGE_SIZE;
                         let base = page.as_ptr();
                         for off in (0..PAGE_SIZE).step_by(size).rev() {
                             // SAFETY: the page is ours; each block can hold a pointer.
-                            unsafe { base.add(off).cast::<usize>().write(st.free[c]) };
-                            st.free[c] = base as usize + off;
+                            unsafe { base.add(off).cast::<usize>().write(st.head(c)) };
+                            st.set_head(c, base as usize + off);
                         }
                     }
                 }
-                let block = st.free[c];
+                let block = st.head(c);
                 if block != 0 {
                     // SAFETY: free blocks store the next pointer in their first word.
-                    st.free[c] = unsafe { (block as *const usize).read() };
+                    let next = unsafe { (block as *const usize).read() };
+                    st.set_head(c, next);
                     st.stats.allocated += size;
                 }
                 block as *mut u8
@@ -260,18 +289,18 @@ unsafe impl<S: PageSource + Sync + Send> GlobalAlloc for LockedHeap<S> {
         match Self::class_of(&layout) {
             Some(c) => {
                 // SAFETY: the block belongs to class `c` and is no longer used.
-                unsafe { ptr.cast::<usize>().write(st.free[c]) };
-                st.free[c] = ptr as usize;
-                st.stats.allocated -= 1 << (c + MIN_CLASS_SHIFT);
+                unsafe { ptr.cast::<usize>().write(st.head(c)) };
+                st.set_head(c, ptr as usize);
+                st.stats.allocated = st.stats.allocated.saturating_sub(1 << (c + MIN_CLASS_SHIFT));
             }
             None => {
                 let pages = Self::large_pages(&layout);
-                st.stats.allocated -= pages * PAGE_SIZE;
-                st.stats.reserved -= pages * PAGE_SIZE;
+                st.stats.allocated = st.stats.allocated.saturating_sub(pages * PAGE_SIZE);
+                st.stats.reserved = st.stats.reserved.saturating_sub(pages * PAGE_SIZE);
                 drop(st);
-                let source = self.source.get().expect("dealloc before init");
+                let (Some(source), Some(ptr)) = (self.source.get(), NonNull::new(ptr)) else { return };
                 // SAFETY: the block came from `alloc_pages(pages, ..)`.
-                unsafe { source.free_pages(NonNull::new_unchecked(ptr), pages) };
+                unsafe { source.free_pages(ptr, pages) };
             }
         }
     }
@@ -281,6 +310,16 @@ unsafe impl<S: PageSource + Sync + Send> GlobalAlloc for LockedHeap<S> {
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn arena_rejects_hostile_requests() {
+        static ARENA: StaticArena<8> = StaticArena::new();
+        assert!(ARENA.alloc_pages(1, 0).is_none());
+        assert!(ARENA.alloc_pages(1, 3).is_none());
+        assert!(ARENA.alloc_pages(0, PAGE_SIZE).is_none());
+        assert!(ARENA.alloc_pages(usize::MAX, PAGE_SIZE).is_none());
+        assert!(ARENA.alloc_pages(1, usize::MAX / 2 + 1).is_none());
+    }
 
     #[test]
     fn arena_alignment_and_reuse() {
