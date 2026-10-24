@@ -1102,7 +1102,9 @@ fn platform() -> osmium::proc::Platform {
         new_memory: || {
             // SAFETY: the kernel table lives for the whole run.
             let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..64) };
-            Ok(alloc::boxed::Box::new(space.map_err(|_| osmium::fs::Errno::ENOMEM)?))
+            osmium::sync::fallible::try_box(space.map_err(|_| osmium::fs::Errno::ENOMEM)?)
+                .map(|space| space as alloc::boxed::Box<dyn osmium::proc::UserMemory>)
+                .map_err(|_| osmium::fs::Errno::ENOMEM)
         },
         activate: |root| {
             // SAFETY: the table shares the kernel's root entries; fence.i

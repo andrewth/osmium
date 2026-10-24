@@ -862,7 +862,9 @@ fn platform() -> osmium::proc::Platform {
         new_memory: || {
             // SAFETY: the kernel table lives for the whole run.
             let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..1) };
-            Ok(alloc::boxed::Box::new(space.map_err(|_| osmium::fs::Errno::ENOMEM)?))
+            osmium::sync::fallible::try_box(space.map_err(|_| osmium::fs::Errno::ENOMEM)?)
+                .map(|space| space as alloc::boxed::Box<dyn osmium::proc::UserMemory>)
+                .map_err(|_| osmium::fs::Errno::ENOMEM)
         },
         // SAFETY: the table shares the kernel's root entry 0. Instruction
         // fetch is coherent with stores on x86, so nothing else is needed.

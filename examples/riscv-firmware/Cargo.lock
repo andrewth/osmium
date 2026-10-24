@@ -10,6 +10,7 @@ dependencies = [
  "osmium-drivers",
  "osmium-exec",
  "osmium-hal",
+ "osmium-mm",
  "osmium-sync",
 ]
 
