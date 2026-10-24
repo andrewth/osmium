@@ -38,24 +38,28 @@ pub struct Record<'src> {
 impl<'src> Record<'src> {
     /// Parses a record of exactly `r.len()` bytes.
     pub fn parse(r: &'src [u8]) -> Result<Self, Errno> {
-        if r.len() < MIN_LEN || r[0] as usize != r.len() {
+        let [len, xattr, ..] = *r else { return Err(Errno::EIO) };
+        if r.len() < MIN_LEN || len as usize != r.len() {
             return Err(Errno::EIO);
         }
-        let name_len = r[32] as usize;
+        let byte = |at: usize| r.get(at).copied().ok_or(Errno::EIO);
+        let name_len = byte(32)? as usize;
         let name_end = 33 + name_len;
         if name_len == 0 || name_end > r.len() {
             return Err(Errno::EIO);
         }
         // A padding byte keeps the system use area at an even offset.
         let su = (name_end + (name_len + 1) % 2).min(r.len());
-        let le32 = |at: usize| u32::from_le_bytes(r[at..at + 4].try_into().expect("fixed-width slice"));
+        let le32 = |at: usize| {
+            r.get(at..).and_then(|t| t.first_chunk::<4>()).map(|c| u32::from_le_bytes(*c)).ok_or(Errno::EIO)
+        };
         Ok(Record {
-            extent: le32(2).wrapping_add(r[1] as u32),
-            size: le32(10),
-            flags: r[25],
-            interleave: (r[26], r[27]),
-            name: &r[33..name_end],
-            system_use: &r[su..],
+            extent: le32(2)?.wrapping_add(xattr as u32),
+            size: le32(10)?,
+            flags: byte(25)?,
+            interleave: (byte(26)?, byte(27)?),
+            name: r.get(33..name_end).ok_or(Errno::EIO)?,
+            system_use: r.get(su..).ok_or(Errno::EIO)?,
         })
     }
 
@@ -95,10 +99,10 @@ impl<'src> Iterator for Records<'src> {
             let at = self.pos;
             let len = *self.data.get(at)? as usize;
             if len == 0 {
-                self.pos = (at / self.block + 1) * self.block;
+                self.pos = (at / self.block.max(1) + 1) * self.block.max(1);
                 continue;
             }
-            let Some(r) = self.data.get(at..at + len) else {
+            let Some(r) = self.data.get(at..at.saturating_add(len)) else {
                 self.pos = self.data.len();
                 return Some(Err(Errno::EIO));
             };

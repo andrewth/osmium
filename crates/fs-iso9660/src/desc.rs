@@ -37,32 +37,43 @@ pub struct Volume {
 impl Descriptor {
     /// Parses one descriptor; `EINVAL` if it has no `CD001` signature.
     pub fn parse(d: &[u8]) -> Result<Self, Errno> {
-        if d.len() < SIZE || &d[1..6] != b"CD001" || d[6] != 1 {
+        if d.len() < SIZE {
             return Err(Errno::EINVAL);
         }
-        Ok(match d[0] {
+        let (Some(&kind), Some(sig), Some(&version)) = (d.first(), field::<5>(d, 1), d.get(6)) else {
+            return Err(Errno::EINVAL);
+        };
+        if &sig != b"CD001" || version != 1 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(match kind {
             255 => Descriptor::Terminator,
             1 => Descriptor::Primary(Volume::parse(d, false)?),
-            2 if is_joliet(&d[88..91]) => Descriptor::Joliet(Volume::parse(d, true)?),
+            2 if field::<3>(d, 88).is_some_and(|esc| is_joliet(&esc)) => Descriptor::Joliet(Volume::parse(d, true)?),
             _ => Descriptor::Other,
         })
     }
 }
 
 /// Whether `esc` is one of the UCS-2 level 1-3 escape sequences.
-fn is_joliet(esc: &[u8]) -> bool {
-    esc[0] == 0x25 && esc[1] == 0x2f && matches!(esc[2], 0x40 | 0x43 | 0x45)
+fn is_joliet(esc: &[u8; 3]) -> bool {
+    matches!(esc, [0x25, 0x2f, 0x40 | 0x43 | 0x45])
+}
+
+/// The `N` bytes of `d` at `at`, if `d` is long enough.
+fn field<const N: usize>(d: &[u8], at: usize) -> Option<[u8; N]> {
+    d.get(at..)?.first_chunk::<N>().copied()
 }
 
 impl Volume {
     fn parse(d: &[u8], joliet: bool) -> Result<Self, Errno> {
-        let block_size = u16::from_le_bytes([d[128], d[129]]) as u32;
+        let block_size = u16::from_le_bytes(field::<2>(d, 128).ok_or(Errno::EINVAL)?) as u32;
         if !block_size.is_power_of_two() || !(512..=2048).contains(&block_size) {
             return Err(Errno::EINVAL);
         }
-        let id = &d[40..72];
-        let mut volume_id = if joliet { name::ucs2(id) } else { String::from_utf8_lossy(id).into_owned() };
+        let id = d.get(40..72).ok_or(Errno::EINVAL)?;
+        let mut volume_id = if joliet { name::ucs2(id)? } else { name::lossy(id)? };
         volume_id.truncate(volume_id.trim_end_matches([' ', '\0']).len());
-        Ok(Volume { block_size, volume_id, root: d[156..190].try_into().expect("fixed-width slice") })
+        Ok(Volume { block_size, volume_id, root: field::<34>(d, 156).ok_or(Errno::EINVAL)? })
     }
 }

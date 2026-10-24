@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! End-to-end tests against images made by `xorriso` and `genisoimage`.
 //! Each test is skipped, with a note, if its tool is missing.
 

@@ -32,14 +32,15 @@ mod name;
 mod record;
 mod rrip;
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::offset_of;
 
 use osmium_fs::{DirEntry, Errno, File, FileKind, Stat};
 use osmium_hal::block::BlockDevice;
+use osmium_sync::fallible::{OutOfMemory, try_arc, try_push, try_string, try_to_vec, try_zeroed};
+use osmium_sync::intrusive::{Adapter, KeyAdapter, Registry, Shared as SharedLink, TreeLink};
 use osmium_sync::{Once, SpinLock};
 
 use desc::Descriptor;
@@ -62,10 +63,6 @@ const MAX_DIR: u64 = 16 << 20;
 /// fetch beyond the directory itself, so a crafted image cannot turn each
 /// record into many reads.
 const SUSP_BUDGET: u64 = 64 * 1024;
-
-/// Size of the directory cache at which dead entries are first swept; later
-/// sweeps happen each time it reaches a power of two.
-const DIR_CACHE_SWEEP: usize = 64;
 
 /// Where a mounted volume's names come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,7 +119,6 @@ impl Extent {
 }
 
 /// Everything known about one node, from its directory record.
-#[derive(Clone)]
 struct Entry {
     name: String,
     kind: FileKind,
@@ -145,21 +141,80 @@ struct Shared<D: BlockDevice + Send + 'static> {
     /// Bytes skipped at the start of each system use area (from `SP`).
     susp_skip: usize,
     volume_id: String,
-    /// Parsed directories by inode number, shared by every node of each.
-    dirs: SpinLock<BTreeMap<u64, Weak<Vec<Entry>>>>,
+    /// Parsed directories by inode number, shared by every node of each. It
+    /// does not own them: each [`DirBlock`] leaves it when dropped.
+    dirs: SpinLock<Registry<ByIno<D>>>,
+}
+
+/// A directory's parsed entries, shared by every node of it.
+struct DirBlock<D: BlockDevice + Send + 'static> {
+    shared: Arc<Shared<D>>,
+    ino: u64,
+    entries: Vec<Entry>,
+    /// Itself, for the cache to hand out references without allocating.
+    me: Once<Weak<DirBlock<D>>>,
+    link: SharedLink<TreeLink>,
+}
+
+struct ByIno<D>(core::marker::PhantomData<D>);
+
+// SAFETY: `offset_of!` of a `SharedLink<TreeLink>`, which is a `TreeLink`.
+unsafe impl<D: BlockDevice + Send + 'static> Adapter<TreeLink> for ByIno<D> {
+    type Value = DirBlock<D>;
+    const OFFSET: usize = offset_of!(DirBlock<D>, link);
+}
+
+impl<D: BlockDevice + Send + 'static> KeyAdapter<TreeLink> for ByIno<D> {
+    type Key = u64;
+
+    fn key(b: &DirBlock<D>) -> &u64 {
+        &b.ino
+    }
+}
+
+impl<D: BlockDevice + Send + 'static> Drop for DirBlock<D> {
+    fn drop(&mut self) {
+        // SAFETY: linked, if at all, in `dirs`.
+        unsafe { self.shared.dirs.lock().remove(self) };
+    }
 }
 
 /// A mounted ISO 9660 volume.
 pub struct IsoFs<D: BlockDevice + Send + 'static> {
     shared: Arc<Shared<D>>,
-    root: Entry,
+    /// The root directory's node, made at mount so that handing it out cannot fail.
+    root: Arc<dyn File>,
 }
 
 /// One file or directory of an [`IsoFs`].
 pub struct Node<D: BlockDevice + Send + 'static> {
     shared: Arc<Shared<D>>,
     entry: Entry,
-    children: Once<Arc<Vec<Entry>>>,
+    children: Once<Arc<DirBlock<D>>>,
+}
+
+impl Entry {
+    /// A copy, failing instead of panicking if memory runs out.
+    fn try_clone(&self) -> Result<Self, OutOfMemory> {
+        Ok(Entry {
+            name: try_string(&self.name)?,
+            kind: self.kind,
+            ino: self.ino,
+            mode: self.mode,
+            nlink: self.nlink,
+            rdev: self.rdev,
+            size: self.size,
+            extents: try_to_vec(&self.extents)?,
+            link: self.link.as_deref().map(try_string).transpose()?,
+        })
+    }
+}
+
+/// One extent, as the list a new entry starts with.
+fn one_extent(e: Extent) -> Result<Vec<Extent>, OutOfMemory> {
+    let mut v = Vec::new();
+    try_push(&mut v, e)?;
+    Ok(v)
 }
 
 fn kind_of(mode: u32) -> Option<FileKind> {
@@ -194,11 +249,11 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
             names: Names::Iso,
             susp_skip: 0,
             volume_id: String::new(),
-            dirs: SpinLock::new(BTreeMap::new()),
+            dirs: SpinLock::new(Registry::new()),
         };
 
         let (mut primary, mut joliet) = (None, None);
-        let mut d = vec![0u8; desc::SIZE];
+        let mut d = try_zeroed(desc::SIZE)?;
         for i in 0..MAX_DESCRIPTORS {
             shared.read_at(desc::FIRST + i * desc::SIZE as u64, &mut d).map_err(|_| Errno::EINVAL)?;
             match Descriptor::parse(&d)? {
@@ -213,7 +268,7 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
         // Rock Ridge announces itself with an SP entry in the root's `.`.
         shared.lbs = primary.block_size as u64;
         let root = Record::parse(&primary.root)?;
-        let mut first = vec![0u8; shared.lbs as usize];
+        let mut first = try_zeroed(shared.lbs as usize)?;
         shared.read_at(root.extent as u64 * shared.lbs, &mut first)?;
         let dot = Records::new(&first, first.len()).next().ok_or(Errno::EIO)??.1;
         let volume = match rrip::sp_skip(dot.system_use) {
@@ -246,7 +301,7 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
             nlink: 2,
             rdev: 0,
             size: root.size as u64,
-            extents: vec![Extent::contiguous(start, root.size as u64)],
+            extents: one_extent(Extent::contiguous(start, root.size as u64))?,
             link: None,
         };
         if shared.names == Names::RockRidge {
@@ -257,12 +312,14 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
             }
             root.nlink = rr.nlink.unwrap_or(root.nlink);
         }
-        Ok(IsoFs { shared: Arc::new(shared), root })
+        let shared = try_arc(shared)?;
+        let root = try_arc(Node { shared: shared.clone(), entry: root, children: Once::new() })?;
+        Ok(IsoFs { shared, root })
     }
 
     /// The root directory, to mount in a `Vfs`.
     pub fn root(&self) -> Arc<dyn File> {
-        Arc::new(Node { shared: self.shared.clone(), entry: self.root.clone(), children: Once::new() })
+        self.root.clone()
     }
 
     /// The volume identifier (the disc's label).
@@ -287,17 +344,20 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             let skip = (off % bs as u64) as usize;
             let n = if skip == 0 && buf.len() >= bs {
                 let n = (buf.len() / bs * bs).min(MAX_RUN / bs * bs);
-                dev.read_blocks(lba, &mut buf[..n]).map_err(|_| Errno::EIO)?;
+                dev.read_blocks(lba, buf.get_mut(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
                 n
             } else {
-                bounce.resize(bs, 0);
+                if bounce.is_empty() {
+                    bounce = try_zeroed(bs)?;
+                }
                 dev.read_blocks(lba, &mut bounce).map_err(|_| Errno::EIO)?;
                 let n = (bs - skip).min(buf.len());
-                buf[..n].copy_from_slice(&bounce[skip..skip + n]);
+                let (dst, src) = (buf.get_mut(..n), bounce.get(skip..skip + n));
+                dst.zip(src).ok_or(Errno::EIO)?.0.copy_from_slice(src.ok_or(Errno::EIO)?);
                 n
             };
-            off += n as u64;
-            buf = &mut buf[n..];
+            off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
+            buf = buf.get_mut(n..).ok_or(Errno::EIO)?;
         }
         Ok(())
     }
@@ -306,7 +366,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     /// continuations as far as `budget` bytes allow.
     fn rock_ridge(&self, system_use: &[u8], budget: &mut u64) -> Result<RockRidge, Errno> {
         let mut rr = RockRidge::default();
-        let mut more = rr.parse(system_use.get(self.susp_skip..).unwrap_or(&[]));
+        let mut more = rr.parse(system_use.get(self.susp_skip..).unwrap_or(&[]))?;
         let mut hops = 0;
         while let Some(ce) = more {
             hops += 1;
@@ -314,9 +374,9 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
                 return Err(Errno::EIO);
             }
             *budget -= ce.len as u64;
-            let mut area = vec![0u8; ce.len as usize];
+            let mut area = try_zeroed(ce.len as usize)?;
             self.read_at(ce.block as u64 * self.lbs + ce.offset as u64, &mut area)?;
-            more = rr.parse(&area);
+            more = rr.parse(&area)?;
         }
         Ok(rr)
     }
@@ -328,8 +388,8 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         let dir = rec.flags & flag::DIRECTORY != 0;
         let mut e = Entry {
             name: match self.names {
-                Names::Joliet => name::joliet(rec.name),
-                _ => name::iso(rec.name),
+                Names::Joliet => name::joliet(rec.name)?,
+                _ => name::iso(rec.name)?,
             },
             kind: if dir { FileKind::Directory } else { FileKind::Regular },
             ino: pos,
@@ -337,7 +397,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             nlink: if dir { 2 } else { 1 },
             rdev: 0,
             size: rec.size as u64,
-            extents: vec![Extent::of(rec, self.lbs)],
+            extents: one_extent(Extent::of(rec, self.lbs))?,
             link: None,
         };
         if self.names == Names::RockRidge {
@@ -345,7 +405,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             if rr.relocated {
                 return Ok(None);
             }
-            if let Some(name) = rr.name() {
+            if let Some(name) = rr.name()? {
                 e.name = name;
             }
             if let Some(mode) = rr.mode {
@@ -358,7 +418,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
                 // The directory itself lives elsewhere; its `.` has the size.
                 let start = block as u64 * self.lbs;
                 *budget = budget.checked_sub(self.lbs).ok_or(Errno::EIO)?;
-                let mut first = vec![0u8; self.lbs as usize];
+                let mut first = try_zeroed(self.lbs as usize)?;
                 self.read_at(start, &mut first)?;
                 let dot = Records::new(&first, first.len()).next().ok_or(Errno::EIO)??.1;
                 if !dot.is_dot() {
@@ -366,7 +426,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
                 }
                 e.kind = FileKind::Directory;
                 e.size = dot.size as u64;
-                e.extents = vec![Extent::contiguous(start, e.size)];
+                e.extents = one_extent(Extent::contiguous(start, e.size))?;
             }
             if e.kind == FileKind::Symlink {
                 e.link = rr.take_link();
@@ -374,7 +434,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             }
         }
         if e.kind == FileKind::Directory {
-            e.ino = e.extents[0].start;
+            e.ino = e.extents.first().ok_or(Errno::EIO)?.start;
         }
         if e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains(['/', '\0']) {
             return Ok(None);
@@ -384,11 +444,11 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
 
     /// Reads and parses the directory `dir`.
     fn read_dir(&self, dir: &Entry) -> Result<Vec<Entry>, Errno> {
-        let ext = dir.extents[0];
+        let ext = *dir.extents.first().ok_or(Errno::EIO)?;
         if ext.len > MAX_DIR {
             return Err(Errno::EIO);
         }
-        let mut data = vec![0u8; ext.len as usize];
+        let mut data = try_zeroed(ext.len as usize)?;
         self.read_at(ext.start, &mut data)?;
         let mut budget = SUSP_BUDGET + ext.len;
         let mut out = Vec::new();
@@ -401,20 +461,22 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             }
             let last = rec.flags & flag::MULTI_EXTENT == 0;
             if let Some(p) = &mut partial {
-                p.extents.push(Extent::of(&rec, self.lbs));
+                try_push(&mut p.extents, Extent::of(&rec, self.lbs))?;
                 p.size += rec.size as u64;
-                if last {
-                    out.extend(partial.take());
+                if last && let Some(done) = partial.take() {
+                    try_push(&mut out, done)?;
                 }
                 continue;
             }
             match self.entry(ext.start + at as u64, &rec, &mut budget)? {
                 Some(e) if !last && e.kind == FileKind::Regular => partial = Some(e),
-                Some(e) => out.push(e),
+                Some(e) => try_push(&mut out, e)?,
                 None => {}
             }
         }
-        out.extend(partial);
+        if let Some(done) = partial {
+            try_push(&mut out, done)?;
+        }
         Ok(out)
     }
 }
@@ -425,24 +487,40 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
             return Err(Errno::ENOTDIR);
         }
         if let Some(c) = self.children.get() {
-            return Ok(c);
+            return Ok(&c.entries);
         }
         let ino = self.entry.ino;
-        let cached = self.shared.dirs.lock().get(&ino).and_then(Weak::upgrade);
+        let cached = self.shared.dirs.lock().find(&ino).and_then(|b| b.me.get()?.upgrade());
         let c = match cached {
             Some(c) => c,
             None => {
                 // Parsed without the lock; a racing reader's copy is as good.
-                let c = Arc::new(self.shared.read_dir(&self.entry)?);
+                let entries = self.shared.read_dir(&self.entry)?;
+                let block = try_arc(DirBlock {
+                    shared: self.shared.clone(),
+                    ino,
+                    entries,
+                    me: Once::new(),
+                    link: SharedLink::new(TreeLink::new()),
+                })?;
+                let _ = block.me.set(Arc::downgrade(&block));
                 let mut dirs = self.shared.dirs.lock();
-                if dirs.len() >= DIR_CACHE_SWEEP && dirs.len().is_power_of_two() {
-                    dirs.retain(|_, d| d.strong_count() > 0);
+                // A racing reader may have cached it meanwhile; or a block
+                // being dropped, which waits for this lock, still has the key.
+                match dirs.find(&ino).and_then(|b| b.me.get()?.upgrade()) {
+                    Some(existing) => existing,
+                    None => {
+                        dirs.take(&ino);
+                        // SAFETY: the block takes itself out when dropped, and
+                        // its key never changes.
+                        let fresh = unsafe { dirs.insert(&block) };
+                        assert!(fresh, "the key was just freed");
+                        block
+                    }
                 }
-                dirs.insert(ino, Arc::downgrade(&c));
-                c
             }
         };
-        Ok(self.children.call_once(|| c))
+        Ok(&self.children.call_once(|| c).entries)
     }
 }
 
@@ -470,7 +548,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             while skip < ext.len && done < want {
                 let (at, run) = ext.locate(skip)?;
                 let n = run.min((want - done) as u64) as usize;
-                self.shared.read_at(at, &mut buf[done..done + n])?;
+                self.shared.read_at(at, buf.get_mut(done..done + n).ok_or(Errno::EIO)?)?;
                 done += n;
                 skip += n as u64;
             }
@@ -504,7 +582,8 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn readdir(&self, index: usize) -> Result<Option<DirEntry>, Errno> {
-        Ok(self.children()?.get(index).map(|e| DirEntry { ino: e.ino, kind: e.kind, name: e.name.clone() }))
+        let Some(e) = self.children()?.get(index) else { return Ok(None) };
+        Ok(Some(DirEntry { ino: e.ino, kind: e.kind, name: try_string(&e.name)? }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
@@ -514,8 +593,8 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             Names::Iso => children.iter().find(|e| e.name.eq_ignore_ascii_case(name)),
             _ => children.iter().find(|e| e.name == name),
         };
-        let entry = found.ok_or(Errno::ENOENT)?.clone();
-        Ok(Arc::new(Node { shared: self.shared.clone(), entry, children: Once::new() }))
+        let entry = found.ok_or(Errno::ENOENT)?.try_clone()?;
+        Ok(try_arc(Node { shared: self.shared.clone(), entry, children: Once::new() })?)
     }
 
     fn create(&self, _name: &str, _kind: FileKind, _mode: u32) -> Result<Arc<dyn File>, Errno> {
@@ -529,6 +608,6 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn readlink(&self) -> Result<String, Errno> {
-        self.entry.link.clone().ok_or(Errno::EINVAL)
+        Ok(try_string(self.entry.link.as_deref().ok_or(Errno::EINVAL)?)?)
     }
 }
