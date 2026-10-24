@@ -5,6 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use osmium_fs::Errno;
+use osmium_sync::fallible::OutOfMemory;
 
 /// Longest long name, in UTF-16 code units.
 pub const MAX_NAME: usize = 255;
@@ -43,8 +44,10 @@ pub fn checksum(short: &[u8; 11]) -> u8 {
 }
 
 /// How a short name is shown: `NAME.EXT`, with the NTRes case bits applied.
-pub fn short_to_string(short: &[u8; 11], ntres: u8) -> String {
+pub fn short_to_string(short: &[u8; 11], ntres: u8) -> Result<String, OutOfMemory> {
     let mut out = String::new();
+    // At most 8 + 1 + 3 characters, all ASCII.
+    out.try_reserve_exact(12)?;
     let part = |bytes: &[u8], lower: bool, out: &mut String| {
         for &b in bytes.iter().take_while(|&&b| b != b' ') {
             // 0x05 stands for a leading 0xE5 (which marks a free entry).
@@ -59,17 +62,14 @@ pub fn short_to_string(short: &[u8; 11], ntres: u8) -> String {
         out.push('.');
         part(&short[8..], ntres & LOWER_EXT != 0, &mut out);
     }
-    out
+    Ok(out)
 }
 
 /// If `name` can be stored as a short name alone (8.3, short-name
 /// characters, and each part either all lower or all upper case), returns
 /// the short name and its NTRes case bits.
 pub fn exact_short(name: &str) -> Option<([u8; 11], u8)> {
-    let (base, ext) = match name.rfind('.') {
-        Some(i) => (&name[..i], &name[i + 1..]),
-        None => (name, ""),
-    };
+    let (base, ext) = name.rsplit_once('.').unwrap_or((name, ""));
     if base.is_empty() || base.len() > 8 || ext.len() > 3 || (name.contains('.') && ext.is_empty()) {
         return None;
     }
@@ -85,12 +85,12 @@ pub fn exact_short(name: &str) -> Option<([u8; 11], u8)> {
         if lower {
             ntres |= flag;
         }
-        for (i, b) in part.bytes().enumerate() {
+        for (slot, b) in field.iter_mut().zip(part.bytes()) {
             let b = b.to_ascii_uppercase();
             if !short_char_ok(b) {
                 return None;
             }
-            field[i] = b;
+            *slot = b;
         }
     }
     if short[0] == 0xe5 {
@@ -102,40 +102,43 @@ pub fn exact_short(name: &str) -> Option<([u8; 11], u8)> {
 /// Generates the short name for a long name (§6.1's "numeric-tail"
 /// algorithm), choosing the first `~N` not in `taken`.
 pub fn generate_short(name: &str, taken: &[[u8; 11]]) -> Result<[u8; 11], Errno> {
-    let clean = |s: &str| -> Vec<u8> {
-        s.chars()
-            .filter(|&c| c != ' ' && c != '.')
-            .map(|c| {
-                let u = c.to_ascii_uppercase();
-                if u.is_ascii() && short_char_ok(u as u8) { u as u8 } else { b'_' }
-            })
-            .collect()
+    // Only the first 8 characters of the base and 3 of the extension count.
+    let clean = |s: &str, out: &mut [u8]| -> usize {
+        let cleaned = s.chars().filter(|&c| c != ' ' && c != '.').map(|c| {
+            let u = c.to_ascii_uppercase();
+            if u.is_ascii() && short_char_ok(u as u8) { u as u8 } else { b'_' }
+        });
+        let mut n = 0;
+        for (slot, b) in out.iter_mut().zip(cleaned) {
+            *slot = b;
+            n += 1;
+        }
+        n
     };
     let trimmed = name.trim_start_matches('.');
-    let (base, ext) = match trimmed.rfind('.') {
-        Some(i) => (clean(&trimmed[..i]), clean(&trimmed[i + 1..])),
-        None => (clean(trimmed), Vec::new()),
+    let (mut base_buf, mut ext_buf) = ([0u8; 8], [0u8; 3]);
+    let (base_len, ext_len) = match trimmed.rsplit_once('.') {
+        Some((b, e)) => (clean(b, &mut base_buf), clean(e, &mut ext_buf)),
+        None => (clean(trimmed, &mut base_buf), 0),
     };
-    let base: &[u8] = if base.is_empty() { b"_" } else { &base };
+    let base: &[u8] = if base_len == 0 { b"_" } else { base_buf.get(..base_len).unwrap_or(b"_") };
     let mut short = [b' '; 11];
-    for (i, &b) in ext.iter().take(3).enumerate() {
-        short[8 + i] = b;
+    for (slot, &b) in short.iter_mut().skip(8).zip(ext_buf.iter().take(ext_len)) {
+        *slot = b;
     }
     for n in 1..1_000_000u32 {
-        let mut tail = [0u8; 8];
-        let mut t = n;
-        let mut len = 0;
-        while t > 0 {
-            tail[7 - len] = b'0' + (t % 10) as u8;
-            t /= 10;
-            len += 1;
+        // `n` has at most six digits.
+        let len = n.ilog10() as usize + 1;
+        let mut tail = [0u8; 7];
+        for (i, slot) in tail.iter_mut().enumerate().take(len) {
+            *slot = b'0' + (n / 10u32.pow((len - 1 - i) as u32) % 10) as u8;
         }
-        let tail = &tail[8 - len..];
         let keep = base.len().min(8 - 1 - len);
         short[..8].fill(b' ');
-        short[..keep].copy_from_slice(&base[..keep]);
-        short[keep] = b'~';
-        short[keep + 1..keep + 1 + len].copy_from_slice(tail);
+        let stem = base.iter().take(keep).copied().chain(core::iter::once(b'~')).chain(tail.iter().take(len).copied());
+        for (slot, b) in short.iter_mut().take(8).zip(stem) {
+            *slot = b;
+        }
         if !taken.contains(&short) {
             return Ok(short);
         }
@@ -145,29 +148,34 @@ pub fn generate_short(name: &str, taken: &[[u8; 11]]) -> Result<[u8; 11], Errno>
 
 /// The long-name entries for `name` with short-name checksum `sum`, in
 /// on-disk order (last part first).
-pub fn lfn_entries(name: &str, sum: u8) -> Vec<[u8; 32]> {
-    let units: Vec<u16> = name.encode_utf16().collect();
-    let count = units.len().div_ceil(LFN_CHARS);
-    let mut out = Vec::with_capacity(count);
+pub fn lfn_entries(name: &str, sum: u8) -> Result<Vec<[u8; 32]>, OutOfMemory> {
+    let count = name.encode_utf16().count().div_ceil(LFN_CHARS);
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)?;
     for seq in (1..=count).rev() {
         let mut e = [0u8; 32];
         e[0] = seq as u8 | if seq == count { 0x40 } else { 0 };
         e[11] = 0x0f;
         e[13] = sum;
-        let chunk = &units[(seq - 1) * LFN_CHARS..];
-        for i in 0..LFN_CHARS {
+        let mut chunk = name.encode_utf16().skip((seq - 1) * LFN_CHARS);
+        let mut ended = false;
+        for at in LFN_OFFSETS {
             // The name ends with a NUL, then 0xFFFF padding.
-            let u = match i.cmp(&chunk.len()) {
-                core::cmp::Ordering::Less => chunk[i],
-                core::cmp::Ordering::Equal => 0,
-                core::cmp::Ordering::Greater => 0xffff,
+            let u = match chunk.next() {
+                Some(u) => u,
+                None if !ended => {
+                    ended = true;
+                    0
+                }
+                None => 0xffff,
             };
-            let at = LFN_OFFSETS[i];
-            e[at..at + 2].copy_from_slice(&u.to_le_bytes());
+            if let Some(d) = e.get_mut(at..at + 2) {
+                d.copy_from_slice(&u.to_le_bytes());
+            }
         }
         out.push(e);
     }
-    out
+    Ok(out)
 }
 
 /// Byte offsets of the 13 UTF-16 units in a long-name entry.
@@ -175,7 +183,10 @@ pub const LFN_OFFSETS: [usize; LFN_CHARS] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 
 
 /// The UTF-16 units of one long-name entry, up to the terminating NUL.
 pub fn lfn_units(e: &[u8]) -> impl Iterator<Item = u16> + '_ {
-    LFN_OFFSETS.iter().map(|&at| u16::from_le_bytes([e[at], e[at + 1]])).take_while(|&u| u != 0 && u != 0xffff)
+    LFN_OFFSETS
+        .iter()
+        .map_while(|&at| e.get(at..)?.first_chunk::<2>().map(|c| u16::from_le_bytes(*c)))
+        .take_while(|&u| u != 0 && u != 0xffff)
 }
 
 /// Case-insensitive name comparison, as FAT requires (ASCII folding only).
@@ -209,8 +220,8 @@ mod tests {
         assert_eq!(exact_short("toolongname"), None);
         assert_eq!(exact_short("with space"), None);
         let (n, f) = exact_short("boot").unwrap();
-        assert_eq!(short_to_string(&n, f), "boot");
-        assert_eq!(short_to_string(b"README  TXT", 0), "README.TXT");
+        assert_eq!(short_to_string(&n, f).unwrap(), "boot");
+        assert_eq!(short_to_string(b"README  TXT", 0).unwrap(), "README.TXT");
     }
 
     #[test]
@@ -238,7 +249,7 @@ mod tests {
     fn long_name_entries() {
         let short = *b"LONGFI~1HTM";
         let sum = checksum(&short);
-        let es = lfn_entries("Long File Name.html", sum);
+        let es = lfn_entries("Long File Name.html", sum).unwrap();
         assert_eq!(es.len(), 2);
         assert_eq!(es[0][0], 0x42, "last part first, with the 0x40 flag");
         assert_eq!(es[1][0], 0x01);
@@ -247,7 +258,7 @@ mod tests {
         name.clear();
         assert!(es.iter().all(|e| e[11] == 0x0f && e[13] == sum));
         // Exactly 13 units: no terminator, no padding.
-        let one = lfn_entries("abcdefghijklm", 0);
+        let one = lfn_entries("abcdefghijklm", 0).unwrap();
         assert_eq!((one.len(), lfn_units(&one[0]).count()), (1, 13));
     }
 

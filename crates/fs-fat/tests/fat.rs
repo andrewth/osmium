@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! End-to-end tests against FAT12, FAT16 and FAT32 volumes made by
 //! `mkfs.fat` and checked with `fsck.fat` (dosfstools), and against
 //! hand-made ones. The dosfstools tests are skipped, with a note, if the

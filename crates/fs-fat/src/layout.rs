@@ -51,12 +51,14 @@ pub struct Geometry {
 /// 0x0ffffff7 up mean bad cluster and end of chain.
 const MAX_CLUSTERS: u32 = 0x0fff_fff5;
 
+/// Little-endian `u16` at `at`, or 0 past the end of `b`.
 fn le16(b: &[u8], at: usize) -> u32 {
-    u16::from_le_bytes([b[at], b[at + 1]]) as u32
+    b.get(at..).and_then(|t| t.first_chunk::<2>()).map_or(0, |c| u16::from_le_bytes(*c) as u32)
 }
 
+/// Little-endian `u32` at `at`, or 0 past the end of `b`.
 fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().expect("fixed-width slice"))
+    b.get(at..).and_then(|t| t.first_chunk::<4>()).map_or(0, |c| u32::from_le_bytes(*c))
 }
 
 impl FatKind {
@@ -96,13 +98,13 @@ impl Geometry {
     /// are told apart by the cluster count; anything inconsistent returns
     /// `EINVAL`.
     pub fn parse(b: &[u8]) -> Result<Self, Errno> {
-        if b.len() < 512 || b[510] != 0x55 || b[511] != 0xaa {
+        if b.len() < 512 || le16(b, 510) != 0xaa55 {
             return Err(Errno::EINVAL);
         }
         let sector_size = le16(b, 11);
-        let sectors_per_cluster = b[13] as u32;
+        let sectors_per_cluster = b.get(13).copied().unwrap_or(0) as u32;
         let reserved = le16(b, 14);
-        let fats = b[16] as u32;
+        let fats = b.get(16).copied().unwrap_or(0) as u32;
         let root_entries = le16(b, 17);
         let total = match le16(b, 19) {
             0 => le32(b, 32),
@@ -149,7 +151,7 @@ impl Geometry {
         }
         let (root_cluster, fsinfo_sector) = if kind == FatKind::Fat32 {
             let root_cluster = le32(b, 44);
-            if root_cluster < 2 || root_cluster >= cluster_count + 2 {
+            if root_cluster < 2 || root_cluster - 2 >= cluster_count {
                 return Err(Errno::EINVAL);
             }
             let fsinfo = match le16(b, 48) {
@@ -189,12 +191,12 @@ impl Geometry {
 
     /// First sector of data cluster `c`.
     pub fn cluster_sector(&self, c: u32) -> u32 {
-        self.data_start + (c - 2) * self.sectors_per_cluster
+        self.data_start.wrapping_add(c.wrapping_sub(2).wrapping_mul(self.sectors_per_cluster))
     }
 
     /// True if `c` names a data cluster.
     pub fn is_data_cluster(&self, c: u32) -> bool {
-        c >= 2 && c < self.cluster_count + 2
+        c >= 2 && c - 2 < self.cluster_count
     }
 }
 
@@ -230,8 +232,12 @@ impl FsInfo {
 
     /// Writes the counters into FSInfo sector `b`, leaving the rest alone.
     pub fn store(&self, b: &mut [u8]) {
-        b[488..492].copy_from_slice(&self.free.unwrap_or(UNKNOWN).to_le_bytes());
-        b[492..496].copy_from_slice(&self.next_free.to_le_bytes());
+        if let Some(t) = b.get_mut(488..492) {
+            t.copy_from_slice(&self.free.unwrap_or(UNKNOWN).to_le_bytes());
+        }
+        if let Some(t) = b.get_mut(492..496) {
+            t.copy_from_slice(&self.next_free.to_le_bytes());
+        }
     }
 }
 

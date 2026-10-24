@@ -29,14 +29,18 @@ mod dir;
 mod layout;
 mod name;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
-use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::mem::offset_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use osmium_fs::{DirEntry, Errno, File, FileKind, Stat};
 use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_sync::SpinLock;
+use osmium_sync::arc::ArcTree;
+use osmium_sync::fallible::{try_arc, try_string, try_zeroed};
+use osmium_sync::intrusive::{Adapter, KeyAdapter, Registry, Shared as SharedLink, TreeLink};
 
 use dir::{ENTRY_SIZE, Entry, attr};
 use layout::{FatKind, FsInfo, Geometry, ROOT_FIXED};
@@ -74,6 +78,60 @@ struct NodeState<D: BlockDevice + Send + 'static> {
     orphan: bool,
 }
 
+/// A node in use, as the volume keeps it: its state, linked into the volume's
+/// tables by id and (while it is still in a directory) by inode number.
+struct NodeEntry<D: BlockDevice + Send + 'static> {
+    id: u64,
+    /// The state; only touched with the volume locked (see [`Volume::state`]).
+    state: UnsafeCell<NodeState<D>>,
+    /// The inode number `Volume::by_ino` orders by; set before it is linked.
+    ino_key: UnsafeCell<u64>,
+    by_id: SharedLink<TreeLink>,
+    by_ino: SharedLink<TreeLink>,
+}
+
+// SAFETY: the state and key are only accessed with the volume's lock held.
+unsafe impl<D: BlockDevice + Send + 'static> Sync for NodeEntry<D> {}
+
+struct ById<D>(core::marker::PhantomData<D>);
+
+// SAFETY: `offset_of!` of a `SharedLink<TreeLink>`, which is a `TreeLink`.
+unsafe impl<D: BlockDevice + Send + 'static> Adapter<TreeLink> for ById<D> {
+    type Value = NodeEntry<D>;
+    const OFFSET: usize = offset_of!(NodeEntry<D>, by_id);
+}
+
+impl<D: BlockDevice + Send + 'static> KeyAdapter<TreeLink> for ById<D> {
+    type Key = u64;
+
+    fn key(e: &NodeEntry<D>) -> &u64 {
+        &e.id
+    }
+}
+
+struct ByIno<D>(core::marker::PhantomData<D>);
+
+// SAFETY: as for `ById`.
+unsafe impl<D: BlockDevice + Send + 'static> Adapter<TreeLink> for ByIno<D> {
+    type Value = NodeEntry<D>;
+    const OFFSET: usize = offset_of!(NodeEntry<D>, by_ino);
+}
+
+impl<D: BlockDevice + Send + 'static> KeyAdapter<TreeLink> for ByIno<D> {
+    type Key = u64;
+
+    fn key(e: &NodeEntry<D>) -> &u64 {
+        // SAFETY: see `NodeEntry`; only used to compare, with the volume locked.
+        unsafe { &*e.ino_key.get() }
+    }
+}
+
+/// The memory a new node needs, made before anything is committed.
+struct Prepared<D: BlockDevice + Send + 'static> {
+    node: Arc<Node<D>>,
+    entry: Arc<NodeEntry<D>>,
+}
+
 struct Volume<D: BlockDevice + Send + 'static> {
     dev: D,
     geo: Geometry,
@@ -86,11 +144,12 @@ struct Volume<D: BlockDevice + Send + 'static> {
     /// walking it by index parses it once; any write clears it.
     dir_cache: Option<(u32, Vec<dir::Entry>)>,
     /// Nodes in use, by node id.
-    nodes: BTreeMap<u64, NodeState<D>>,
-    /// Node id by inode number, for nodes still linked into a directory.
-    /// A removed but open node leaves this index, so a new entry in the
-    /// same slot (same inode number) gets a node of its own.
-    by_ino: BTreeMap<u64, u64>,
+    nodes: ArcTree<ById<D>>,
+    /// The nodes still linked into a directory, by inode number. A removed
+    /// but open node leaves this index, so a new entry in the same slot
+    /// (same inode number) gets a node of its own. It does not own the
+    /// entries: `nodes` does, and an entry leaves this index first.
+    by_ino: Registry<ByIno<D>>,
     next_id: u64,
 }
 
@@ -102,12 +161,18 @@ struct Shared<D: BlockDevice + Send + 'static> {
 /// A mounted FAT12, FAT16 or FAT32 volume.
 pub struct FatFs<D: BlockDevice + Send + 'static> {
     shared: Arc<Shared<D>>,
+    /// The root directory's node, made at mount so that handing it out cannot fail.
+    root: Arc<dyn File>,
 }
 
 /// One file or directory of a [`FatFs`].
 pub struct Node<D: BlockDevice + Send + 'static> {
     shared: Arc<Shared<D>>,
     id: u64,
+    /// Whether the volume knows this node: not for one made ahead of time
+    /// (see `Volume::prepare`) and dropped unused, which must not take the
+    /// lock its owner may be holding.
+    armed: AtomicBool,
 }
 
 impl<D: BlockDevice + Send + 'static> FatFs<D> {
@@ -120,7 +185,7 @@ impl<D: BlockDevice + Send + 'static> FatFs<D> {
         if !bs.is_power_of_two() || bs > 4096 {
             return Err(Errno::EINVAL);
         }
-        let mut boot = vec![0u8; 512.max(bs)];
+        let mut boot = try_zeroed(512.max(bs))?;
         dev.read_blocks(0, &mut boot).map_err(io_error)?;
         let geo = Geometry::parse(&boot)?;
         if !(geo.sector_size as usize).is_multiple_of(bs) {
@@ -133,8 +198,8 @@ impl<D: BlockDevice + Send + 'static> FatFs<D> {
             info: None,
             fat_cache: None,
             dir_cache: None,
-            nodes: BTreeMap::new(),
-            by_ino: BTreeMap::new(),
+            nodes: ArcTree::new(),
+            by_ino: Registry::new(),
             next_id: 0,
         };
         let end = geo.data_start as u64 + geo.cluster_count as u64 * geo.sectors_per_cluster as u64;
@@ -142,7 +207,7 @@ impl<D: BlockDevice + Send + 'static> FatFs<D> {
             return Err(Errno::EINVAL);
         }
         if geo.fsinfo_sector != 0 {
-            let mut s = vol.sector_buf();
+            let mut s = vol.sector_buf()?;
             vol.read_sector(geo.fsinfo_sector, &mut s)?;
             vol.info = FsInfo::parse(&s, &geo);
         } else if geo.kind != FatKind::Fat32 {
@@ -155,15 +220,18 @@ impl<D: BlockDevice + Send + 'static> FatFs<D> {
             }
             vol.info = Some(FsInfo { free: Some(free), next_free: 2 });
         }
-        Ok(Self { shared: Arc::new(Shared { vol: SpinLock::new(vol), dev_id }) })
+        let shared = try_arc(Shared { vol: SpinLock::new(vol), dev_id })?;
+        let root = {
+            let mut vol = shared.vol.lock();
+            let state = Probe { kind: FileKind::Directory, read_only: false, first: vol.geo.root_cluster, size: 0 };
+            vol.node(&shared, ROOT_INO, state, None)?
+        };
+        Ok(Self { shared, root })
     }
 
     /// The root directory, to mount in a `Vfs`.
     pub fn root(&self) -> Arc<dyn File> {
-        let mut vol = self.shared.vol.lock();
-        let root = vol.geo.root_cluster;
-        let state = Probe { kind: FileKind::Directory, read_only: false, first: root, size: 0 };
-        vol.node(&self.shared, ROOT_INO, state)
+        self.root.clone()
     }
 
     /// Free space in bytes, if the volume's FSInfo records it.
@@ -193,8 +261,41 @@ impl Probe {
 }
 
 impl<D: BlockDevice + Send + 'static> Volume<D> {
-    fn sector_buf(&self) -> Vec<u8> {
-        vec![0u8; self.geo.sector_size as usize]
+    fn sector_buf(&self) -> Result<Vec<u8>, Errno> {
+        Ok(try_zeroed(self.geo.sector_size as usize)?)
+    }
+
+    /// The state of node `id`, if it is in use. The volume is borrowed for as
+    /// long as the state is, so only one is out at a time.
+    fn state(&mut self, id: u64) -> Option<&mut NodeState<D>> {
+        let entry = self.nodes.find(&id)?;
+        // SAFETY: the state is only reachable through this volume, which the
+        // caller has exclusively (`&mut self`) for as long as the result lives.
+        Some(unsafe { &mut *entry.state.get() })
+    }
+
+    /// The memory for a node, made before anything is committed.
+    fn prepare(&mut self, shared: &Arc<Shared<D>>) -> Result<Prepared<D>, Errno> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let node = try_arc(Node { shared: shared.clone(), id, armed: AtomicBool::new(false) })?;
+        let placeholder = NodeState {
+            node: Weak::new(),
+            ino: 0,
+            kind: FileKind::Regular,
+            read_only: false,
+            first: 0,
+            size: 0,
+            orphan: false,
+        };
+        let entry = try_arc(NodeEntry {
+            id,
+            state: UnsafeCell::new(placeholder),
+            ino_key: UnsafeCell::new(0),
+            by_id: SharedLink::new(TreeLink::new()),
+            by_ino: SharedLink::new(TreeLink::new()),
+        })?;
+        Ok(Prepared { node, entry })
     }
 
     fn read_sector(&mut self, sector: u32, buf: &mut [u8]) -> Result<(), Errno> {
@@ -206,51 +307,98 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         self.dev.write_blocks(sector as u64 * self.blocks_per_sector, buf).map_err(io_error)
     }
 
-    /// The node for `ino`, shared with any existing reference.
+    /// The node for `ino`, shared with any existing reference. `spare` is
+    /// the memory for a new one, if the caller made it first.
     ///
     /// Called with the lock held; it only ever creates `Arc`s, never drops
     /// one, so a node's `Drop` (which takes the lock) cannot run here.
-    fn node(&mut self, shared: &Arc<Shared<D>>, ino: u64, probe: Probe) -> Arc<dyn File> {
-        if let Some(&id) = self.by_ino.get(&ino) {
-            let state = self.nodes.get_mut(&id).expect("indexed node without state");
+    fn node(
+        &mut self,
+        shared: &Arc<Shared<D>>,
+        ino: u64,
+        probe: Probe,
+        spare: Option<Prepared<D>>,
+    ) -> Result<Arc<dyn File>, Errno> {
+        if let Some(id) = self.by_ino.find(&ino).map(|e| e.id) {
+            let state = self.state(id).ok_or(Errno::EIO)?;
             if let Some(existing) = state.node.upgrade() {
-                return existing;
+                return Ok(existing);
             }
             // Its last reference is being dropped right now, and its Drop
             // waits for this lock. The state is still current, so a new
             // node takes it over (that Drop then sees it is not the owner).
-            let node = Arc::new(Node { shared: shared.clone(), id });
-            state.node = Arc::downgrade(&node);
-            return node;
+            let node = try_arc(Node { shared: shared.clone(), id, armed: AtomicBool::new(true) })?;
+            self.state(id).ok_or(Errno::EIO)?.node = Arc::downgrade(&node);
+            return Ok(node);
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        let node = Arc::new(Node { shared: shared.clone(), id });
+        let Prepared { node, entry } = match spare {
+            Some(p) => p,
+            None => self.prepare(shared)?,
+        };
         let Probe { kind, read_only, first, size } = probe;
-        let state = NodeState { node: Arc::downgrade(&node), ino, kind, read_only, first, size, orphan: false };
-        self.nodes.insert(id, state);
-        self.by_ino.insert(ino, id);
-        node
+        node.armed.store(true, Ordering::Relaxed);
+        // SAFETY: the entry is not in any table yet, so nothing else sees it.
+        unsafe {
+            *entry.state.get() =
+                NodeState { node: Arc::downgrade(&node), ino, kind, read_only, first, size, orphan: false };
+            *entry.ino_key.get() = ino;
+        }
+        // SAFETY: the entry is owned by `nodes`, which outlives its place in
+        // `by_ino`: it leaves `by_ino` first (see `Volume::forget`).
+        let indexed = unsafe { self.by_ino.insert(&entry) };
+        assert!(indexed, "inode numbers are indexed once");
+        assert!(self.nodes.insert(entry).is_ok(), "node ids are never reused");
+        Ok(node)
+    }
+
+    /// Takes node `id` out of the inode index, so a new entry in its slot
+    /// gets a node of its own.
+    fn unindex(&mut self, id: u64) {
+        if let Some(entry) = self.nodes.find(&id) {
+            // SAFETY: linked, if at all, in `by_ino`.
+            unsafe { self.by_ino.remove(entry) };
+        }
+    }
+
+    /// Takes node `id` out of both tables and returns its state. Whatever
+    /// owned the entry lets go of it here.
+    fn forget(&mut self, id: u64) -> Option<NodeState<D>> {
+        let entry = self.nodes.take_key(&id)?;
+        // SAFETY: linked, if at all, in `by_ino`.
+        unsafe { self.by_ino.remove(&entry) };
+        // SAFETY: it is out of every table, so nothing else sees the state.
+        Some(core::mem::replace(
+            unsafe { &mut *entry.state.get() },
+            NodeState {
+                node: Weak::new(),
+                ino: 0,
+                kind: FileKind::Regular,
+                read_only: false,
+                first: 0,
+                size: 0,
+                orphan: false,
+            },
+        ))
     }
 
     // --- The FAT ---------------------------------------------------------
 
     /// Loads FAT sector `sector` (relative to the first FAT) into the cache.
-    fn load_fat(&mut self, sector: u32) -> Result<(), Errno> {
+    fn load_fat(&mut self, sector: u32) -> Result<&[u8], Errno> {
         if self.fat_cache.as_ref().is_none_or(|(s, _)| *s != sector) {
-            let mut buf = self.sector_buf();
+            let mut buf = self.sector_buf()?;
             let at = self.geo.fat_start.checked_add(sector).ok_or(Errno::EIO)?;
             self.read_sector(at, &mut buf)?;
             self.fat_cache = Some((sector, buf));
         }
-        Ok(())
+        self.fat_cache.as_ref().map(|(_, b)| b.as_slice()).ok_or(Errno::EIO)
     }
 
     /// Reads `N` bytes of the first FAT at byte offset `off`; they may
     /// straddle a sector boundary.
     fn fat_bytes<const N: usize>(&mut self, off: u64) -> Result<[u8; N], Errno> {
         let ss = self.geo.sector_size as u64;
-        if off + N as u64 > self.geo.fat_sectors as u64 * ss {
+        if off.checked_add(N as u64).is_none_or(|end| end > self.geo.fat_sectors as u64 * ss) {
             return Err(Errno::EIO);
         }
         let mut out = [0u8; N];
@@ -258,10 +406,10 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         while done < N {
             let pos = off + done as u64;
             let (sector, within) = ((pos / ss) as u32, (pos % ss) as usize);
-            self.load_fat(sector)?;
-            let (_, buf) = self.fat_cache.as_ref().expect("sector just loaded");
+            let buf = self.load_fat(sector)?;
             let n = (ss as usize - within).min(N - done);
-            out[done..done + n].copy_from_slice(&buf[within..within + n]);
+            let (dst, src) = (out.get_mut(done..done + n), buf.get(within..within + n));
+            dst.zip(src).ok_or(Errno::EIO)?.0.copy_from_slice(src.ok_or(Errno::EIO)?);
             done += n;
         }
         Ok(out)
@@ -276,13 +424,17 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
             let (sector, within) = ((pos / ss) as u32, (pos % ss) as usize);
             self.load_fat(sector)?;
             let n = (ss as usize - within).min(data.len() - done);
-            let (_, mut buf) = self.fat_cache.take().expect("sector just loaded");
-            buf[within..within + n].copy_from_slice(&data[done..done + n]);
+            let (_, mut buf) = self.fat_cache.take().ok_or(Errno::EIO)?;
+            let dst = buf.get_mut(within..within + n).ok_or(Errno::EIO)?;
+            dst.copy_from_slice(data.get(done..done + n).ok_or(Errno::EIO)?);
             let mut result = Ok(());
             for copy in 0..self.geo.fats {
                 if result.is_ok() {
-                    let at = self.geo.fat_start + sector + copy * self.geo.fat_sectors;
-                    result = self.write_sector(at, &buf);
+                    let at = copy
+                        .checked_mul(self.geo.fat_sectors)
+                        .and_then(|o| o.checked_add(sector))
+                        .and_then(|o| o.checked_add(self.geo.fat_start));
+                    result = at.ok_or(Errno::EIO).and_then(|at| self.write_sector(at, &buf));
                 }
             }
             // A sector whose writes failed is not what the disk holds.
@@ -357,14 +509,14 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         let start = self.info.map_or(2, |i| i.next_free);
         let mut found = None;
         for i in 0..count {
-            let c = 2 + ((start as u64 - 2 + i as u64) % count as u64) as u32;
+            let c = 2 + ((start.saturating_sub(2) as u64 + i as u64) % count as u64) as u32;
             if self.fat_entry(c)? == FAT_FREE {
                 found = Some(c);
                 break;
             }
         }
         let c = found.ok_or(Errno::ENOSPC)?;
-        let zero = self.sector_buf();
+        let zero = self.sector_buf()?;
         let first = self.geo.cluster_sector(c);
         for s in 0..self.geo.sectors_per_cluster {
             self.write_sector(first + s, &zero)?;
@@ -454,7 +606,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         }
         let mut done = 0;
         let mut cluster = self.nth(first, off / cs)?;
-        let mut sector = self.sector_buf();
+        let mut sector = self.sector_buf()?;
         while done < want {
             let Some(c) = cluster else { break };
             let pos = off + done as u64;
@@ -462,11 +614,12 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
             let s = self.geo.cluster_sector(c) + (in_cluster / ss) as u32;
             let in_sector = (in_cluster % ss) as usize;
             let n = (ss as usize - in_sector).min(want - done);
+            let dst = buf.get_mut(done..done + n).ok_or(Errno::EIO)?;
             if in_sector == 0 && n == ss as usize {
-                self.read_sector(s, &mut buf[done..done + n])?;
+                self.read_sector(s, dst)?;
             } else {
                 self.read_sector(s, &mut sector)?;
-                buf[done..done + n].copy_from_slice(&sector[in_sector..in_sector + n]);
+                dst.copy_from_slice(sector.get(in_sector..in_sector + n).ok_or(Errno::EIO)?);
             }
             done += n;
             if (off + done as u64).is_multiple_of(cs) {
@@ -482,14 +635,15 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         let limit = limit.min(self.geo.root_bytes());
         let want = (buf.len() as u64).min(limit.saturating_sub(off)) as usize;
         let mut done = 0;
-        let mut sector = self.sector_buf();
+        let mut sector = self.sector_buf()?;
         while done < want {
             let pos = off + done as u64;
             let s = self.geo.root_start + (pos / ss) as u32;
             let in_sector = (pos % ss) as usize;
             let n = (ss as usize - in_sector).min(want - done);
             self.read_sector(s, &mut sector)?;
-            buf[done..done + n].copy_from_slice(&sector[in_sector..in_sector + n]);
+            let dst = buf.get_mut(done..done + n).ok_or(Errno::EIO)?;
+            dst.copy_from_slice(sector.get(in_sector..in_sector + n).ok_or(Errno::EIO)?);
             done += n;
         }
         Ok(done)
@@ -502,14 +656,15 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
             return Err(Errno::ENOSPC);
         }
         let mut done = 0;
-        let mut sector = self.sector_buf();
+        let mut sector = self.sector_buf()?;
         while done < data.len() {
             let pos = off + done as u64;
             let s = self.geo.root_start + (pos / ss) as u32;
             let in_sector = (pos % ss) as usize;
             let n = (ss as usize - in_sector).min(data.len() - done);
             self.read_sector(s, &mut sector)?;
-            sector[in_sector..in_sector + n].copy_from_slice(&data[done..done + n]);
+            let dst = sector.get_mut(in_sector..in_sector + n).ok_or(Errno::EIO)?;
+            dst.copy_from_slice(data.get(done..done + n).ok_or(Errno::EIO)?);
             self.write_sector(s, &sector)?;
             done += n;
         }
@@ -542,18 +697,19 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
             };
         }
         let mut done = 0;
-        let mut sector = self.sector_buf();
+        let mut sector = self.sector_buf()?;
         loop {
             let pos = off + done as u64;
             let in_cluster = pos % cs;
             let s = self.geo.cluster_sector(c) + (in_cluster / ss) as u32;
             let in_sector = (in_cluster % ss) as usize;
             let n = (ss as usize - in_sector).min(data.len() - done);
+            let src = data.get(done..done + n).ok_or(Errno::EIO)?;
             if in_sector == 0 && n == ss as usize {
-                self.write_sector(s, &data[done..done + n])?;
+                self.write_sector(s, src)?;
             } else {
                 self.read_sector(s, &mut sector)?;
-                sector[in_sector..in_sector + n].copy_from_slice(&data[done..done + n]);
+                sector.get_mut(in_sector..in_sector + n).ok_or(Errno::EIO)?.copy_from_slice(src);
                 self.write_sector(s, &sector)?;
             }
             done += n;
@@ -576,11 +732,11 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         let cs = self.geo.cluster_size() as u64;
         let allocated = self.chain_len(*first, u64::MAX)? * cs;
         let end = to.min(allocated);
-        let zeros = vec![0u8; cs as usize];
+        let zeros = try_zeroed(cs as usize)?;
         let mut pos = from;
         while pos < end {
             let n = (end - pos).min(cs - pos % cs);
-            self.write_chain(first, pos, &zeros[..n as usize])?;
+            self.write_chain(first, pos, zeros.get(..n as usize).ok_or(Errno::EIO)?)?;
             pos += n;
         }
         Ok(())
@@ -590,11 +746,11 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     /// as needed.
     fn write_zeros(&mut self, first: &mut u32, from: u64, to: u64) -> Result<(), Errno> {
         let cs = self.geo.cluster_size() as u64;
-        let zeros = vec![0u8; cs as usize];
+        let zeros = try_zeroed(cs as usize)?;
         let mut pos = from;
         while pos < to {
             let n = (to - pos).min(cs - pos % cs);
-            self.write_chain(first, pos, &zeros[..n as usize])?;
+            self.write_chain(first, pos, zeros.get(..n as usize).ok_or(Errno::EIO)?)?;
             pos += n;
         }
         Ok(())
@@ -622,14 +778,14 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
     /// A directory's whole contents; `EIO` if it is larger than FAT allows.
     fn dir_bytes(&mut self, first: u32) -> Result<Vec<u8>, Errno> {
         if first == ROOT_FIXED {
-            let mut buf = vec![0u8; self.geo.root_bytes() as usize];
+            let mut buf = try_zeroed(self.geo.root_bytes() as usize)?;
             let n = self.read_root(0, &mut buf, u64::MAX)?;
             buf.truncate(n);
             return Ok(buf);
         }
         let cs = self.geo.cluster_size() as u64;
         let len = self.chain_len(first, MAX_DIR.div_ceil(cs))? * cs;
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = try_zeroed(len as usize)?;
         let n = self.read_chain(first, 0, &mut buf, len)?;
         buf.truncate(n);
         Ok(buf)
@@ -651,7 +807,7 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
 
     /// Rewrites the first cluster and size in node `id`'s directory entry.
     fn update_entry(&mut self, id: u64) -> Result<(), Errno> {
-        let Some(state) = self.nodes.get(&id) else { return Ok(()) };
+        let Some(state) = self.state(id) else { return Ok(()) };
         if state.ino == ROOT_INO || state.orphan {
             return Ok(());
         }
@@ -659,18 +815,19 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         let ss = self.geo.sector_size as u64;
         let sector = (ino / ss) as u32;
         let at = (ino % ss) as usize;
-        let mut buf = self.sector_buf();
+        let mut buf = self.sector_buf()?;
         self.read_sector(sector, &mut buf)?;
-        dir::set_first_cluster(&mut buf[at..at + ENTRY_SIZE], first);
+        let entry = buf.get_mut(at..at + ENTRY_SIZE).ok_or(Errno::EIO)?;
+        dir::set_first_cluster(entry, first);
         let size = if is_dir { 0 } else { size };
-        buf[at + 28..at + 32].copy_from_slice(&size.to_le_bytes());
+        entry.get_mut(28..32).ok_or(Errno::EIO)?.copy_from_slice(&size.to_le_bytes());
         self.write_sector(sector, &buf)
     }
 
     /// Writes the FSInfo hints and flushes the device.
     fn sync(&mut self) -> Result<(), Errno> {
         if let Some(info) = self.info.filter(|_| self.geo.fsinfo_sector != 0) {
-            let mut s = self.sector_buf();
+            let mut s = self.sector_buf()?;
             self.read_sector(self.geo.fsinfo_sector, &mut s)?;
             info.store(&mut s);
             self.write_sector(self.geo.fsinfo_sector, &s)?;
@@ -680,13 +837,13 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
 }
 
 impl<D: BlockDevice + Send + 'static> Node<D> {
-    fn state<'v>(&self, vol: &'v mut Volume<D>) -> &'v mut NodeState<D> {
-        vol.nodes.get_mut(&self.id).expect("live node without state")
+    fn state<'v>(&self, vol: &'v mut Volume<D>) -> Result<&'v mut NodeState<D>, Errno> {
+        vol.state(self.id).ok_or(Errno::EIO)
     }
 
     /// This directory's first cluster, or `ENOTDIR`.
     fn dir_cluster(&self, vol: &mut Volume<D>) -> Result<u32, Errno> {
-        let s = self.state(vol);
+        let s = self.state(vol)?;
         if s.kind != FileKind::Directory {
             return Err(Errno::ENOTDIR);
         }
@@ -695,7 +852,14 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
 
     fn find(vol: &mut Volume<D>, dir: u32, name: &str) -> Result<Option<Entry>, Errno> {
         let bytes = vol.dir_bytes(dir)?;
-        let mut found = dir::parse(&bytes).into_iter().find(|e| name::same(&e.name, name));
+        let mut found = None;
+        for e in dir::entries(&bytes) {
+            let e = e?;
+            if name::same(&e.name, name) {
+                found = Some(e);
+                break;
+            }
+        }
         if vol.geo.kind != FatKind::Fat32 {
             // The high word of the cluster is not part of the entry here.
             if let Some(e) = &mut found {
@@ -709,7 +873,7 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
 impl<D: BlockDevice + Send + 'static> File for Node<D> {
     fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, Errno> {
         let mut vol = self.shared.vol.lock();
-        let s = self.state(&mut vol);
+        let s = self.state(&mut vol)?;
         if s.kind == FileKind::Directory {
             return Err(Errno::EISDIR);
         }
@@ -719,7 +883,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 
     fn write(&self, off: u64, buf: &[u8]) -> Result<usize, Errno> {
         let mut vol = self.shared.vol.lock();
-        let s = self.state(&mut vol);
+        let s = self.state(&mut vol)?;
         if s.kind == FileKind::Directory {
             return Err(Errno::EISDIR);
         }
@@ -736,7 +900,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             vol.write_chain(&mut first, off, buf)
         })();
         // Record whatever was allocated even if the write failed part way.
-        let s = self.state(&mut vol);
+        let s = self.state(&mut vol)?;
         s.first = first;
         if result.is_ok() && end > size {
             s.size = end as u32;
@@ -746,13 +910,24 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn stat(&self) -> Stat {
+        // An I/O error leaves only what is known without the disk.
+        self.try_stat().unwrap_or_else(|_| {
+            let mut vol = self.shared.vol.lock();
+            match self.state(&mut vol) {
+                Ok(s) => Stat { dev: self.shared.dev_id, ino: s.ino, kind: s.kind, ..Stat::default() },
+                Err(_) => Stat { dev: self.shared.dev_id, ..Stat::default() },
+            }
+        })
+    }
+
+    fn try_stat(&self) -> Result<Stat, Errno> {
         let mut vol = self.shared.vol.lock();
-        let s = self.state(&mut vol);
+        let s = self.state(&mut vol)?;
         let (ino, kind, first, read_only, size) = (s.ino, s.kind, s.first, s.read_only, s.size);
         let size = match kind {
             // A directory's size is the space its chain occupies.
             FileKind::Directory if first == ROOT_FIXED => vol.geo.root_bytes(),
-            FileKind::Directory => vol.chain_len(first, u64::MAX).unwrap_or(0) * vol.geo.cluster_size() as u64,
+            FileKind::Directory => vol.chain_len(first, u64::MAX)? * vol.geo.cluster_size() as u64,
             _ => size as u64,
         };
         let mode = match (kind, read_only) {
@@ -760,7 +935,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             (_, true) => 0o444,
             _ => 0o644,
         };
-        Stat {
+        Ok(Stat {
             dev: self.shared.dev_id,
             ino,
             kind,
@@ -768,12 +943,12 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             nlink: if kind == FileKind::Directory { 2 } else { 1 },
             size,
             rdev: 0,
-        }
+        })
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let mut vol = self.shared.vol.lock();
-        let s = self.state(&mut vol);
+        let s = self.state(&mut vol)?;
         if s.kind == FileKind::Directory {
             return Err(Errno::EISDIR);
         }
@@ -784,13 +959,15 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             return Err(Errno::EFBIG);
         }
         let (mut first, size) = (s.first, s.size as u64);
-        let result = if len < size {
+        // Also when `len == size`: a write that failed part way may have left
+        // clusters past the size, which this gives back.
+        let result = if len <= size {
             vol.shrink_chain(&mut first, len)
         } else {
             // FAT has no holes: growing writes the zeroes out.
             vol.write_zeros(&mut first, size, len)
         };
-        let s = self.state(&mut vol);
+        let s = self.state(&mut vol)?;
         s.first = first;
         if result.is_ok() {
             s.size = len as u32;
@@ -808,14 +985,18 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         let first = self.dir_cluster(&mut vol)?;
         if vol.dir_cache.as_ref().is_none_or(|(f, _)| *f != first) {
             let bytes = vol.dir_bytes(first)?;
-            vol.dir_cache = Some((first, dir::parse(&bytes)));
+            vol.dir_cache = Some((first, dir::parse(&bytes)?));
         }
-        let Some(e) = vol.dir_cache.as_ref().and_then(|(_, entries)| entries.get(index)).cloned() else {
+        let Some((offset, is_dir, name)) = vol
+            .dir_cache
+            .as_ref()
+            .and_then(|(_, entries)| entries.get(index).map(|e| (e.offset, e.is_dir(), try_string(&e.name))))
+        else {
             return Ok(None);
         };
-        let ino = vol.entry_ino(first, e.offset)?;
-        let kind = if e.is_dir() { FileKind::Directory } else { FileKind::Regular };
-        Ok(Some(DirEntry { ino, kind, name: e.name }))
+        let ino = vol.entry_ino(first, offset)?;
+        let kind = if is_dir { FileKind::Directory } else { FileKind::Regular };
+        Ok(Some(DirEntry { ino, kind, name: name? }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
@@ -823,7 +1004,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         let first = self.dir_cluster(&mut vol)?;
         let e = Self::find(&mut vol, first, name)?.ok_or(Errno::ENOENT)?;
         let ino = vol.entry_ino(first, e.offset)?;
-        Ok(vol.node(&self.shared, ino, Probe::of(&e)))
+        vol.node(&self.shared, ino, Probe::of(&e), None)
     }
 
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
@@ -839,17 +1020,22 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         if dir_first != ROOT_FIXED && !vol.geo.is_data_cluster(dir_first) {
             return Err(Errno::EIO);
         }
+        // The memory for the new node, before the disk is touched.
+        let spare = vol.prepare(&self.shared)?;
         let bytes = vol.dir_bytes(dir_first)?;
-        if dir::parse(&bytes).iter().any(|e| name::same(&e.name, name)) {
-            return Err(Errno::EEXIST);
+        for e in dir::entries(&bytes) {
+            if name::same(&e?.name, name) {
+                return Err(Errno::EEXIST);
+            }
         }
 
         // The short name, and long-name entries unless it fits 8.3 exactly.
+        let taken = dir::short_names(&bytes)?;
         let (short, ntres, mut slots) = match name::exact_short(name) {
-            Some((short, ntres)) if !dir::short_names(&bytes).contains(&short) => (short, ntres, Vec::new()),
+            Some((short, ntres)) if !taken.contains(&short) => (short, ntres, Vec::new()),
             _ => {
-                let short = name::generate_short(name, &dir::short_names(&bytes))?;
-                (short, 0, name::lfn_entries(name, name::checksum(&short)))
+                let short = name::generate_short(name, &taken)?;
+                (short, 0, name::lfn_entries(name, name::checksum(&short))?)
             }
         };
 
@@ -860,10 +1046,16 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             return Err(Errno::ENOSPC);
         }
 
+        // The memory for the entries, before a cluster is taken that a failure
+        // here would have to give back.
+        slots.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        let mut flat = Vec::new();
+        flat.try_reserve_exact((slots.len() + 1) * ENTRY_SIZE).map_err(|_| Errno::ENOMEM)?;
+
         // A directory gets its first cluster, with `.` and `..`, up front.
         let mut first = 0;
         if kind == FileKind::Directory {
-            let parent = if self.state(&mut vol).ino == ROOT_INO { 0 } else { dir_first };
+            let parent = if self.state(&mut vol)?.ino == ROOT_INO { 0 } else { dir_first };
             let made = vol.write_chain(&mut first, 0, &dir::dot_entries(0, parent)).and_then(|()| {
                 // Now that the cluster is known, record it in `.`.
                 let dot = dir::short_entry(b".          ", 0, attr::DIRECTORY, first, 0);
@@ -876,7 +1068,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         }
         let attr_bits = if kind == FileKind::Directory { attr::DIRECTORY } else { attr::ARCHIVE };
         slots.push(dir::short_entry(&short, ntres, attr_bits, first, 0));
-        let flat: Vec<u8> = slots.iter().flatten().copied().collect();
+        flat.extend(slots.iter().flatten().copied());
         let mut dir_first_mut = dir_first;
         if let Err(e) = vol.write_chain(&mut dir_first_mut, at as u64, &flat) {
             let _ = vol.free_chain(first);
@@ -886,7 +1078,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             Ok(ino) => ino,
             Err(e) => {
                 // Take the entries back out before freeing what they name.
-                let mut freed = flat.clone();
+                let mut freed = flat;
                 for slot in freed.as_chunks_mut::<ENTRY_SIZE>().0 {
                     slot[0] = dir::FREE;
                 }
@@ -896,7 +1088,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             }
         };
         let probe = Probe { kind, read_only: false, first, size: 0 };
-        Ok(vol.node(&self.shared, ino, probe))
+        vol.node(&self.shared, ino, probe, Some(spare))
     }
 
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
@@ -915,8 +1107,8 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             }
         }
         // Mark every slot (long-name parts and the short entry) free.
-        let mut freed = vec![0u8; e.slots() * ENTRY_SIZE];
-        let mut current = vec![0u8; freed.len()];
+        let mut freed = try_zeroed(e.slots() * ENTRY_SIZE)?;
+        let mut current = try_zeroed(freed.len())?;
         vol.read_chain(dir_first, e.start as u64, &mut current, u64::MAX)?;
         for (slot, old) in freed.as_chunks_mut::<ENTRY_SIZE>().0.iter_mut().zip(current.as_chunks::<ENTRY_SIZE>().0) {
             slot.copy_from_slice(old);
@@ -927,14 +1119,20 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 
         // An open node keeps its clusters until its last reference drops.
         let ino = vol.entry_ino(dir_first, e.offset)?;
-        match vol.by_ino.remove(&ino) {
-            Some(id) if vol.nodes[&id].node.strong_count() > 0 => {
-                vol.nodes.get_mut(&id).unwrap().orphan = true;
+        let open = vol.by_ino.find(&ino).map(|e| e.id);
+        match open {
+            Some(id) if vol.state(id).is_some_and(|s| s.node.strong_count() > 0) => {
+                // Out of the index, so a new entry in the slot gets a node
+                // of its own; the node keeps its clusters until it is dropped.
+                vol.unindex(id);
+                if let Some(s) = vol.state(id) {
+                    s.orphan = true;
+                }
                 Ok(())
             }
             other => {
                 if let Some(id) = other {
-                    vol.nodes.remove(&id);
+                    drop(vol.forget(id));
                 }
                 vol.free_chain(e.first)
             }
@@ -944,15 +1142,15 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 
 impl<D: BlockDevice + Send + 'static> Drop for Node<D> {
     fn drop(&mut self) {
+        if !self.armed.load(Ordering::Relaxed) {
+            return;
+        }
         let mut vol = self.shared.vol.lock();
-        let ours = vol.nodes.get(&self.id).is_some_and(|s| core::ptr::eq(s.node.as_ptr(), self));
+        let ours = vol.state(self.id).is_some_and(|s| core::ptr::eq(s.node.as_ptr(), self));
         if !ours {
             return; // another node took over this state (see `Volume::node`)
         }
-        let state = vol.nodes.remove(&self.id).unwrap();
-        if vol.by_ino.get(&state.ino) == Some(&self.id) {
-            vol.by_ino.remove(&state.ino);
-        }
+        let Some(state) = vol.forget(self.id) else { return };
         if state.orphan {
             let _ = vol.free_chain(state.first);
         }
