@@ -41,6 +41,11 @@ pub const GIC_WINDOW: u64 = 0x1000;
 /// Interrupts banked per CPU: SGIs 0-15 and PPIs 16-31.
 const PRIVATE: usize = 32;
 
+/// The bit for `cpu` in a target mask (0 for an out-of-range CPU).
+fn cpu_bit(cpu: usize) -> u32 {
+    u32::try_from(cpu).ok().and_then(|c| 1u32.checked_shl(c)).unwrap_or(0)
+}
+
 type Output = Box<dyn Fn(usize, bool) + Send + Sync>;
 
 /// One interrupt's state.
@@ -83,11 +88,11 @@ struct State {
 
 impl State {
     fn irq(&self, cpu: usize, i: usize) -> Option<&Irq> {
-        if i < PRIVATE { self.cpus[cpu].private.get(i) } else { self.spis.get(i - PRIVATE) }
+        if i < PRIVATE { self.cpus.get(cpu)?.private.get(i) } else { self.spis.get(i - PRIVATE) }
     }
 
     fn irq_mut(&mut self, cpu: usize, i: usize) -> Option<&mut Irq> {
-        if i < PRIVATE { self.cpus[cpu].private.get_mut(i) } else { self.spis.get_mut(i - PRIVATE) }
+        if i < PRIVATE { self.cpus.get_mut(cpu)?.private.get_mut(i) } else { self.spis.get_mut(i - PRIVATE) }
     }
 
     fn lines(&self) -> usize {
@@ -95,22 +100,24 @@ impl State {
     }
 
     fn running_priority(&self, cpu: usize) -> u8 {
-        self.cpus[cpu].running.last().map_or(0xff, |&(_, p)| p)
+        self.cpus.get(cpu).and_then(|c| c.running.last()).map_or(0xff, |&(_, p)| p)
     }
 
     /// The highest-priority (lowest value) interrupt `cpu` may take now;
     /// ties go to the lowest INTID.
     fn best(&self, cpu: usize) -> Option<usize> {
-        let c = &self.cpus[cpu];
+        let c = self.cpus.get(cpu)?;
         if !self.dist_enable || !c.enable {
             return None;
         }
         let rp = self.running_priority(cpu);
         let mut best: Option<(u8, usize)> = None;
         for i in 0..self.lines() {
-            let irq = self.irq(cpu, i).expect("i < lines()");
+            let Some(irq) = self.irq(cpu, i) else { continue };
             // A uniprocessor GIC routes every SPI to its one CPU.
-            let targeted = i < PRIVATE || self.cpus.len() == 1 || self.targets[i - PRIVATE] & (1 << cpu) != 0;
+            let targeted = i < PRIVATE
+                || self.cpus.len() == 1
+                || self.targets.get(i - PRIVATE).is_some_and(|&t| u32::from(t) & cpu_bit(cpu) != 0);
             let p = irq.priority;
             if targeted && irq.enabled && irq.pending() && p < c.pmr && p < rp && best.is_none_or(|(bp, _)| p < bp) {
                 best = Some((p, i));
@@ -162,8 +169,8 @@ impl State {
                 let i = byte_at(GICD_ITARGETSR);
                 (0..4).fold(0, |w, k| {
                     let t = match i + k {
-                        n if n < PRIVATE => 1 << cpu,   // reads as the reading CPU
-                        _ if self.cpus.len() == 1 => 0, // RAZ/WI on a uniprocessor
+                        n if n < PRIVATE => cpu_bit(cpu) as u8, // reads as the reading CPU
+                        _ if self.cpus.len() == 1 => 0,         // RAZ/WI on a uniprocessor
                         n => self.targets.get(n - PRIVATE).copied().unwrap_or(0),
                     };
                     w | (t as u32) << (8 * k)
@@ -219,14 +226,16 @@ impl State {
                 let sgi = (v & 0xf) as usize;
                 let targets: u32 = match (v >> 24) & 3 {
                     0 => (v >> 16) & 0xff,
-                    1 => !(1 << cpu),
-                    2 => 1 << cpu,
+                    1 => !cpu_bit(cpu),
+                    2 => cpu_bit(cpu),
                     _ => 0,
                 };
                 for (t, c) in self.cpus.iter_mut().enumerate() {
-                    if targets & (1 << t) != 0 {
-                        c.private[sgi].latched = true;
-                        c.private[sgi].source = cpu as u8;
+                    if targets & cpu_bit(t) != 0
+                        && let Some(irq) = c.private.get_mut(sgi)
+                    {
+                        irq.latched = true;
+                        irq.source = cpu as u8;
                     }
                 }
             }
@@ -251,17 +260,20 @@ impl State {
     }
 
     fn cpu_read(&mut self, cpu: usize, off: u64) -> u32 {
+        let Some(c) = self.cpus.get(cpu) else { return 0 };
         match off {
-            GICC_CTLR => self.cpus[cpu].enable as u32,
-            GICC_PMR => self.cpus[cpu].pmr as u32,
-            GICC_BPR => self.cpus[cpu].bpr as u32,
+            GICC_CTLR => c.enable as u32,
+            GICC_PMR => c.pmr as u32,
+            GICC_BPR => c.bpr as u32,
             GICC_IAR => {
                 let Some(i) = self.best(cpu) else { return SPURIOUS };
-                let irq = self.irq_mut(cpu, i).expect("best() returns a valid line");
+                let Some(irq) = self.irq_mut(cpu, i) else { return SPURIOUS };
                 irq.active = true;
                 irq.latched = false;
                 let (prio, source) = (irq.priority, irq.source);
-                self.cpus[cpu].running.push((i as u32, prio));
+                if let Some(c) = self.cpus.get_mut(cpu) {
+                    c.running.push((i as u32, prio));
+                }
                 // SGIs report the sending CPU in bits 12:10.
                 if i < 16 { i as u32 | (source as u32) << 10 } else { i as u32 }
             }
@@ -273,16 +285,18 @@ impl State {
     }
 
     fn cpu_write(&mut self, cpu: usize, off: u64, v: u32) {
+        let Some(c) = self.cpus.get_mut(cpu) else { return };
         match off {
-            GICC_CTLR => self.cpus[cpu].enable = v & 1 != 0,
-            GICC_PMR => self.cpus[cpu].pmr = v as u8,
-            GICC_BPR => self.cpus[cpu].bpr = v as u8 & 7,
+            GICC_CTLR => c.enable = v & 1 != 0,
+            GICC_PMR => c.pmr = v as u8,
+            GICC_BPR => c.bpr = v as u8 & 7,
             GICC_EOIR => {
                 let id = v & 0x3ff;
                 if let Some(irq) = self.irq_mut(cpu, id as usize) {
                     irq.active = false;
                 }
-                let running = &mut self.cpus[cpu].running;
+                let Some(c) = self.cpus.get_mut(cpu) else { return };
+                let running = &mut c.running;
                 if let Some(pos) = running.iter().rposition(|&(r, _)| r == id) {
                     running.remove(pos);
                 }
@@ -321,14 +335,12 @@ impl VirtualGicV2 {
     /// A GIC for `cpus` vCPUs (at most 8). `output(cpu, level)` reports
     /// changes of each CPU's IRQ line.
     ///
-    /// # Panics
-    ///
-    /// If `cpus` is not in `1..=8`.
+    /// `cpus` is clamped to `1..=8`.
     pub fn with_cpus(cpus: usize, lines: usize, output: impl Fn(usize, bool) + Send + Sync + 'static) -> Self {
-        assert!((1..=8).contains(&cpus), "GICv2 supports 1-8 CPUs");
+        let cpus = cpus.clamp(1, 8);
         let lines = lines.max(64).next_multiple_of(32);
         let mut config = vec![0; lines];
-        config[..16].fill(2); // SGIs: edge
+        config.iter_mut().take(16).for_each(|c| *c = 2); // SGIs: edge
         let cpu = || Cpu {
             private: [Irq::default(); PRIVATE],
             enable: false,
@@ -366,14 +378,16 @@ impl VirtualGicV2 {
 
     /// Whether CPU 0's IRQ line is asserted.
     pub fn asserted(&self) -> bool {
-        self.state.lock().cpus[0].asserted
+        self.state.lock().cpus.first().is_some_and(|c| c.asserted)
     }
 
     fn update(&self, s: &mut State) {
         for cpu in 0..s.cpus.len() {
             let now = s.best(cpu).is_some();
-            if now != s.cpus[cpu].asserted {
-                s.cpus[cpu].asserted = now;
+            if let Some(c) = s.cpus.get_mut(cpu)
+                && now != c.asserted
+            {
+                c.asserted = now;
                 (self.output)(cpu, now);
             }
         }
@@ -421,10 +435,15 @@ impl BusDevice for Window {
     fn write(&self, offset: u64, data: &[u8]) {
         let mut s = self.gic.state.lock();
         // Byte writes reach the byte-wide priority and target registers.
-        if !self.interface && data.len() == 1 && (GICD_IPRIORITYR..GICD_ICFGR).contains(&offset) {
-            s.write_byte(self.cpu, offset, data[0]);
-        } else if data.len() == 4 && offset & 3 == 0 {
-            let v = u32::from_le_bytes(data.try_into().expect("length checked above"));
+        if let &[b] = data
+            && !self.interface
+            && (GICD_IPRIORITYR..GICD_ICFGR).contains(&offset)
+        {
+            s.write_byte(self.cpu, offset, b);
+        } else if let &[a, b, c, d] = data
+            && offset & 3 == 0
+        {
+            let v = u32::from_le_bytes([a, b, c, d]);
             if self.interface { s.cpu_write(self.cpu, offset, v) } else { s.dist_write(self.cpu, offset, v) }
         }
         self.gic.update(&mut s);

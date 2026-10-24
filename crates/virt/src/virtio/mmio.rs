@@ -264,10 +264,11 @@ impl<D: VirtioDevice> BusDevice for VirtioMmio<D> {
             return;
         }
         // Registers take aligned 32-bit writes only.
-        if offset & 3 != 0 || data.len() != 4 {
+        let &[a, b, c, d] = data else { return };
+        if offset & 3 != 0 {
             return;
         }
-        let v = u32::from_le_bytes(data.try_into().expect("length checked above"));
+        let v = u32::from_le_bytes([a, b, c, d]);
         self.write_reg(&mut s, offset, v);
     }
 }

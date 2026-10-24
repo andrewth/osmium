@@ -107,7 +107,7 @@ impl Channel {
             return None;
         }
         let n = if self.periodic() { self.interval() } else { self.period() };
-        Some(start + ns((self.fired + 1) * n))
+        Some(start.saturating_add(ns(self.fired.saturating_add(1).saturating_mul(n))))
     }
 
     fn control(&mut self, v: u8, now: u64) {
@@ -203,7 +203,8 @@ impl VirtualPit {
     /// whether it did.
     pub fn poll(&self) -> bool {
         let now = (self.clock)();
-        let mut c = self.channels.lock();
+        let mut guard = self.channels.lock();
+        let c: &mut [Channel; 3] = &mut guard;
         let ch = &mut c[0];
         let n = ch.expiries(now);
         if n <= ch.fired {
@@ -211,7 +212,7 @@ impl VirtualPit {
         }
         ch.fired = n;
         let periodic = ch.periodic();
-        drop(c);
+        drop(guard);
         // A fresh edge each time: the PIC latches rising edges.
         if periodic {
             (self.output)(false);
@@ -231,28 +232,29 @@ impl VirtualPit {
     /// When channel 0 next expires (in the clock's nanoseconds), if it is
     /// counting toward an expiry not yet signalled.
     pub fn next_deadline(&self) -> Option<u64> {
-        self.channels.lock()[0].deadline()
+        self.channels.lock().first().and_then(|c| c.deadline())
     }
 }
 
 impl BusDevice for VirtualPit {
     fn read(&self, offset: u64, data: &mut [u8]) {
         let now = (self.clock)();
-        data.fill(0);
-        if offset < 3 {
-            data[0] = self.channels.lock()[offset as usize].read(now);
-        }
+        let v = usize::try_from(offset).ok().and_then(|i| self.channels.lock().get_mut(i).map(|c| c.read(now)));
+        crate::bus::put_le(data, v.unwrap_or(0) as u64);
         self.poll();
     }
 
     fn write(&self, offset: u64, data: &[u8]) {
         let now = (self.clock)();
         let v = data.first().copied().unwrap_or(0);
-        let mut c = self.channels.lock();
+        let mut guard = self.channels.lock();
+        let c: &mut [Channel; 3] = &mut guard;
         let mut lower = false;
         match offset {
             0..=2 => {
-                c[offset as usize].write(v, now);
+                if let Some(ch) = c.get_mut(offset as usize) {
+                    ch.write(v, now);
+                }
                 lower = offset == 0 && c[0].mode == 0;
             }
             3 if v >> 6 == 3 => {
@@ -273,13 +275,15 @@ impl BusDevice for VirtualPit {
             }
             3 => {
                 let i = (v >> 6) as usize;
-                c[i].control(v, now);
+                if let Some(ch) = c.get_mut(i) {
+                    ch.control(v, now);
+                }
                 // A control word sets OUT low in mode 0, high otherwise.
                 lower = i == 0 && c[0].mode == 0 && v & 0x30 != 0;
             }
             _ => {}
         }
-        drop(c);
+        drop(guard);
         if lower {
             (self.output)(false);
         }
@@ -293,11 +297,9 @@ struct PortB(alloc::sync::Arc<VirtualPit>);
 impl BusDevice for PortB {
     fn read(&self, _offset: u64, data: &mut [u8]) {
         let now = (self.0.clock)();
-        let out2 = self.0.channels.lock()[2].out(now);
-        data.fill(0);
-        if let Some(b) = data.first_mut() {
-            *b = self.0.port_b.load(core::sync::atomic::Ordering::Relaxed) & 3 | (out2 as u8) << 5;
-        }
+        let out2 = self.0.channels.lock().get(2).is_some_and(|c| c.out(now));
+        let v = self.0.port_b.load(core::sync::atomic::Ordering::Relaxed) & 3 | (out2 as u8) << 5;
+        crate::bus::put_le(data, v as u64);
     }
 
     fn write(&self, _offset: u64, data: &[u8]) {
@@ -307,9 +309,11 @@ impl BusDevice for PortB {
             // Gate rising: a loaded count starts (again) from here.
             let now = (self.0.clock)();
             let mut c = self.0.channels.lock();
-            if c[2].start.is_some() {
-                c[2].start = Some(now);
-                c[2].fired = 0;
+            if let Some(ch) = c.get_mut(2)
+                && ch.start.is_some()
+            {
+                ch.start = Some(now);
+                ch.fired = 0;
             }
         }
     }

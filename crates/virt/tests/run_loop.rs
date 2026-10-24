@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Drives `run_vcpu` with a scripted vCPU standing in for a hardware backend.
 
 use std::collections::VecDeque;

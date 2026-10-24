@@ -282,8 +282,10 @@ impl Aarch64Vcpu {
         }
         // ISS: Direction (bit 0, 1 = read), Rt (bits 9:5).
         let rt = ((s.esr >> 5) & 31) as usize;
-        if s.esr & 1 != 0 && rt != 31 {
-            s.x[rt] = 0;
+        if s.esr & 1 != 0
+            && let Some(r) = s.x.get_mut(rt)
+        {
+            *r = 0;
         }
         s.pc = s.pc.wrapping_add(4);
         true
@@ -321,8 +323,8 @@ impl Aarch64Vcpu {
                 let reg = ((esr >> 16) & 31) as u8;
                 let addr = GuestPhysAddr((s.hpfar & 0x0fff_ffff_fff0) << 8 | (s.far & 0xfff));
                 if esr & (1 << 6) != 0 {
-                    let data = if reg == 31 { 0 } else { s.x[reg as usize] };
-                    let data = if size == 8 { data } else { data & ((1 << (8 * size)) - 1) };
+                    let data = s.x.get(reg as usize).copied().unwrap_or(0); // xzr (31) reads as zero
+                    let data = data & crate::x86::size_mask(size);
                     s.pc = s.pc.wrapping_add(insn_len);
                     VmExit::MmioWrite { addr, size, data }
                 } else {
@@ -357,21 +359,22 @@ impl Vcpu for Aarch64Vcpu {
 
     #[cfg(not(all(target_arch = "aarch64", feature = "aarch64-el2")))]
     fn run(&mut self) -> VmExit {
-        unimplemented!("AArch64 guests need an aarch64 build with the aarch64-el2 feature")
+        // AArch64 guests need an aarch64 build with the aarch64-el2 feature; report an exit nothing handles.
+        VmExit::Unhandled { reason: u64::MAX }
     }
 
     fn complete_read(&mut self, value: u64) {
         let Some(l) = self.pending.take() else { return };
-        let bits = 8 * l.size as u32;
-        let mut v = if bits == 64 { value } else { value & ((1 << bits) - 1) };
-        if l.sign && bits < 64 && v >> (bits - 1) & 1 != 0 {
-            v |= !((1 << bits) - 1);
+        let mask = crate::x86::size_mask(l.size);
+        let mut v = value & mask;
+        if l.sign && v & (mask ^ (mask >> 1)) != 0 {
+            v |= !mask;
         }
         if !l.wide {
             v &= 0xffff_ffff;
         }
-        if l.reg != 31 {
-            self.state.x[l.reg as usize] = v;
+        if let Some(r) = self.state.x.get_mut(l.reg as usize) {
+            *r = v; // xzr (31) discards it
         }
         self.state.pc = self.state.pc.wrapping_add(l.len);
     }

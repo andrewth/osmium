@@ -89,8 +89,7 @@ impl BusDevice for Uart16550 {
             7 => s.scr,
             _ => 0xff,
         };
-        data.fill(0);
-        data[0] = v;
+        crate::bus::put_le(data, v as u64);
         self.update_irq(&mut s);
     }
 

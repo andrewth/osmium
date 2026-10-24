@@ -19,12 +19,10 @@ pub struct MemOp {
 impl MemOp {
     /// Sign- or zero-extends a loaded value according to the access.
     pub fn extend(&self, value: u64) -> u64 {
-        let bits = 8 * self.size as u32;
-        if bits == 64 {
-            return value;
-        }
-        let v = value & ((1u64 << bits) - 1);
-        if self.signed && v >> (bits - 1) != 0 { v | !((1u64 << bits) - 1) } else { v }
+        let mask = crate::x86::size_mask(self.size);
+        let v = value & mask;
+        let sign = mask ^ (mask >> 1); // the top bit of the access
+        if self.signed && v & sign != 0 { v | !mask } else { v }
     }
 }
 

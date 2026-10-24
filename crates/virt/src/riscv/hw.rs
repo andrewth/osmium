@@ -417,7 +417,7 @@ pub(super) fn run(v: &mut RiscvVcpu) {
     // A different vCPU than this hart last ran (or a new VM that reuses an
     // old one's VMID and root): install its hgatp and flush.
     let cpu = osmium_arch::cpu::current_id();
-    let last = LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed);
+    let last = LAST_VCPU.get(cpu).map_or(0, |l| l.swap(v.id, core::sync::atomic::Ordering::Relaxed));
     // Also a vCPU that last ran on another hart: its VMID's entries here may
     // predate `hfence.vvma`s it did there (which are local to that hart).
     let last_cpu = core::mem::replace(&mut v.last_cpu, cpu);

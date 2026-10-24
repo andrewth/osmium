@@ -35,14 +35,17 @@ pub struct PcBootBlob {
 }
 
 fn put(buf: &mut [u8], at: usize, v: &[u8]) {
-    buf[at..at + v.len()].copy_from_slice(v);
+    if let Some(dst) = buf.get_mut(at..at.saturating_add(v.len())) {
+        dst.copy_from_slice(v);
+    }
 }
 
-/// Sets byte `at` so that `bytes` sums to zero.
-fn checksum(bytes: &mut [u8], at: usize) {
-    bytes[at] = 0;
+/// Sets byte `at` so that the first `len` bytes sum to zero.
+fn checksum(bytes: &mut [u8], len: usize, at: usize) {
+    let Some(bytes) = bytes.get_mut(..len) else { return };
+    put(bytes, at, &[0]);
     let sum = bytes.iter().fold(0u8, |s, &b| s.wrapping_add(b));
-    bytes[at] = sum.wrapping_neg();
+    put(bytes, at, &[sum.wrapping_neg()]);
 }
 
 /// An ACPI table: the 36-byte header (revision 1, OEM "OSMIUM") and `body`.
@@ -51,14 +54,15 @@ fn table(sig: &[u8; 4], body: &[u8]) -> Vec<u8> {
     put(&mut t, 0, sig);
     let len = t.len() as u32;
     put(&mut t, 4, &len.to_le_bytes());
-    t[8] = 1;
+    put(&mut t, 8, &[1]);
     put(&mut t, 10, b"OSMIUM");
     put(&mut t, 16, b"OSMIUMVM");
     put(&mut t, 24, &1u32.to_le_bytes());
     put(&mut t, 28, b"OSMM");
     put(&mut t, 32, &1u32.to_le_bytes());
     put(&mut t, 36, body);
-    checksum(&mut t, 9);
+    let len = t.len();
+    checksum(&mut t, len, 9);
     t
 }
 
@@ -92,7 +96,7 @@ impl PcBoot<'_> {
         let xsdt_off = rsdp_off + 36;
         let madt_off = (xsdt_off + 36 + 8).next_multiple_of(8);
         let mut b = vec![0u8; madt_off + madt.len()];
-        let gpa = |off: usize| at + off as u64;
+        let gpa = |off: usize| at.wrapping_add(off as u64);
 
         // hvm_start_info, version 1.
         put(&mut b, info_off, &PVH_MAGIC.to_le_bytes());
@@ -118,11 +122,11 @@ impl PcBoot<'_> {
         let mut r = [0u8; 36];
         put(&mut r, 0, b"RSD PTR ");
         put(&mut r, 9, b"OSMIUM");
-        r[15] = 2;
+        put(&mut r, 15, &[2]);
         put(&mut r, 20, &36u32.to_le_bytes());
         put(&mut r, 24, &gpa(xsdt_off).to_le_bytes());
-        checksum(&mut r[..20], 8);
-        checksum(&mut r, 32);
+        checksum(&mut r, 20, 8);
+        checksum(&mut r, 36, 32);
         put(&mut b, rsdp_off, &r);
 
         PcBootBlob { bytes: b, start_info: gpa(info_off), rsdp: gpa(rsdp_off) }
@@ -135,11 +139,13 @@ impl PcBoot<'_> {
 pub fn pvh_entry(image: &[u8]) -> Option<u32> {
     // namesz 4, descsz 4 (or 8), type 18, "Xen\0", then the entry.
     image.windows(16).enumerate().find_map(|(i, w)| {
-        let le = |o: usize| u32::from_le_bytes(w[o..o + 4].try_into().expect("fixed-width slice"));
-        (le(0) == 4 && matches!(le(4), 4 | 8) && le(8) == PHYS32_ENTRY && &w[12..16] == b"Xen\0")
+        let x = u128::from_le_bytes(w.try_into().ok()?);
+        let le = |k: u32| (x >> (32 * k)) as u32;
+        (le(0) == 4 && matches!(le(1), 4 | 8) && le(2) == PHYS32_ENTRY && le(3) == u32::from_le_bytes(*b"Xen\0"))
             .then(|| image.get(i + 16..i + 20))
             .flatten()
-            .map(|e| u32::from_le_bytes(e.try_into().expect("fixed-width slice")))
+            .and_then(|e| e.try_into().ok())
+            .map(u32::from_le_bytes)
     })
 }
 

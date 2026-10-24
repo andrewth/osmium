@@ -192,13 +192,22 @@ unsafe fn invvpid(ty: u64, vpid: u16, linear: u64) {
 /// The VMCS each CPU has current (its physical address), or 0.
 static CURRENT: [AtomicU64; osmium_arch::MAX_CPUS] = [const { AtomicU64::new(0) }; osmium_arch::MAX_CPUS];
 
+/// Records that `cpu` has no current VMCS.
+fn clear_current(cpu: usize) {
+    if let Some(s) = CURRENT.get(cpu) {
+        s.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Makes `pa` this CPU's current VMCS.
 fn make_current(pa: u64) {
-    let slot = &CURRENT[osmium_arch::cpu::current_id()];
-    if slot.load(Ordering::Relaxed) != pa {
+    let slot = CURRENT.get(osmium_arch::cpu::current_id());
+    if slot.is_none_or(|s| s.load(Ordering::Relaxed) != pa) {
         // SAFETY: `pa` is a VMCS page with the right revision identifier.
         unsafe { asm!("vmptrld [{}]", in(reg) &pa, options(nostack)) };
-        slot.store(pa, Ordering::Relaxed);
+        if let Some(s) = slot {
+            s.store(pa, Ordering::Relaxed);
+        }
     }
 }
 
@@ -225,7 +234,7 @@ fn load(v: &mut VmxVcpu) {
     let pa = v.vmcs.pa;
     // SAFETY: `pa` is a VMCS page with the right revision identifier.
     unsafe { asm!("vmclear [{}]", in(reg) &pa, options(nostack)) };
-    CURRENT[cpu].store(0, Ordering::Relaxed);
+    clear_current(cpu);
     make_current(pa);
     v.vmcs.loaded = true;
     v.vmcs.forget_all();
@@ -311,7 +320,9 @@ pub(super) fn unbind(v: &mut VmxVcpu) {
         return;
     }
     let cpu = osmium_arch::cpu::current_id();
-    assert_eq!(v.cpu, Some(cpu), "a VMX vCPU is unbound on the CPU it is bound to");
+    if v.cpu != Some(cpu) {
+        return; // not bound to this CPU: only the CPU that bound it can release it
+    }
     let flags: u64;
     // SAFETY: reads RFLAGS, then no host code runs between the VMCS reads
     // and the VMCLEAR that could make another VMCS current.
@@ -325,7 +336,7 @@ pub(super) fn unbind(v: &mut VmxVcpu) {
     }
     // SAFETY: `pa` is a VMCS page with the right revision identifier.
     unsafe { asm!("vmclear [{}]", in(reg) &pa, options(nostack)) };
-    CURRENT[cpu].store(0, Ordering::Relaxed);
+    clear_current(cpu);
     v.vmcs.loaded = false;
     v.vmcs.forget_all();
     v.cpu = None;
@@ -346,7 +357,7 @@ pub(super) fn release(v: &mut VmxVcpu) {
         let pa = v.vmcs.pa;
         // SAFETY: `pa` is a VMCS page with the right revision identifier.
         unsafe { asm!("vmclear [{}]", in(reg) &pa, options(nostack)) };
-        CURRENT[cpu].store(0, Ordering::Relaxed);
+        clear_current(cpu);
         v.vmcs.loaded = false;
         v.vmcs.forget_all();
     }
@@ -449,9 +460,12 @@ fn write_host_state(v: &mut VmxVcpu) -> (DescTable, DescTable) {
     let mut cache = v.host_cache.take().unwrap_or([0; HOST_FIELDS]);
     let mut n = 0;
     let mut w = |f, x: u64| {
-        if fresh || cache[n] != x {
+        let slot = cache.get_mut(n);
+        if fresh || slot.as_deref().is_none_or(|c| *c != x) {
             vmwrite(pa, f, x);
-            cache[n] = x;
+            if let Some(c) = slot {
+                *c = x;
+            }
         }
         n += 1;
     };
@@ -508,11 +522,10 @@ pub(super) fn run(v: &mut VmxVcpu) -> Result<(), ()> {
     if !v.vmcs.loaded {
         load(v);
     }
-    assert_eq!(
-        v.cpu,
-        Some(cpu),
-        "a VMX vCPU runs only on the CPU it is bound to; unbind it first or use with_migration"
-    );
+    if v.cpu != Some(cpu) {
+        // A VMX vCPU runs only on the CPU it is bound to; unbind it first or use with_migration.
+        return Err(());
+    }
     let flags: u64;
     // SAFETY: reads RFLAGS.
     unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };

@@ -50,8 +50,9 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
             // No status byte to report into, or no header: drop it.
             return 0;
         }
-        let ty = u32::from_le_bytes(hdr[0..4].try_into().expect("fixed-width slice"));
-        let sector = u64::from_le_bytes(hdr[8..16].try_into().expect("fixed-width slice"));
+        // struct { le32 type; le32 reserved; le64 sector }
+        let hdr = u128::from_le_bytes(hdr);
+        let (ty, sector) = (hdr as u32, (hdr >> 64) as u64);
         let status_at = wlen - 1;
 
         let (status, data) = match ty {
@@ -61,13 +62,13 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
             },
             T_OUT if self.read_only => (S_IOERR, 0),
             T_OUT => {
-                let r = self.transfer(mem, chain, sector, chain.readable_len() - HEADER, true);
+                let r = self.transfer(mem, chain, sector, chain.readable_len().saturating_sub(HEADER), true);
                 (if r.is_ok() { S_OK } else { S_IOERR }, 0)
             }
             T_FLUSH => (if self.disk.flush().is_ok() { S_OK } else { S_IOERR }, 0),
             T_GET_ID => {
                 let n = status_at.min(ID.len());
-                match chain.write(mem, 0, &ID[..n]) {
+                match chain.write(mem, 0, ID.get(..n).unwrap_or_default()) {
                     Ok(n) => (S_OK, n),
                     Err(_) => (S_IOERR, 0),
                 }
@@ -92,7 +93,7 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
         write: bool,
     ) -> Result<usize, BlockError> {
         let bs = self.disk.block_size();
-        if !len.is_multiple_of(bs) {
+        if bs == 0 || !len.is_multiple_of(bs) {
             return Err(BlockError::BadBuffer);
         }
         let lba = self.lba(sector)?;
@@ -103,13 +104,15 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
             let n = step.min(len - done);
             let at = lba.checked_add((done / bs) as u64).ok_or(BlockError::OutOfRange)?;
             if write {
-                if chain.read(mem, HEADER + done, &mut buf[..n]) != Ok(n) {
+                let Some(part) = buf.get_mut(..n) else { return Err(BlockError::Io) };
+                if chain.read(mem, HEADER.saturating_add(done), part) != Ok(n) {
                     return Err(BlockError::Io);
                 }
-                self.disk.write_blocks(at, &buf[..n])?;
+                self.disk.write_blocks(at, part)?;
             } else {
-                self.disk.read_blocks(at, &mut buf[..n])?;
-                if chain.write(mem, done, &buf[..n]) != Ok(n) {
+                let Some(part) = buf.get_mut(..n) else { return Err(BlockError::Io) };
+                self.disk.read_blocks(at, part)?;
+                if chain.write(mem, done, part) != Ok(n) {
                     return Err(BlockError::Io);
                 }
             }
@@ -121,6 +124,9 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
     /// Converts a 512-byte sector to a disk block, which must be aligned.
     fn lba(&self, sector: u64) -> Result<u64, BlockError> {
         let bs = self.disk.block_size() as u64;
+        if bs == 0 {
+            return Err(BlockError::BadBuffer);
+        }
         let byte = sector.checked_mul(SECTOR).ok_or(BlockError::OutOfRange)?;
         if byte % bs != 0 {
             return Err(BlockError::BadBuffer);
@@ -150,11 +156,16 @@ impl<B: BlockDevice + Send> VirtioDevice for VirtioBlock<B> {
         // capacity (u64, sectors) and blk_size (u32).
         let bs = self.disk.block_size() as u64;
         let mut cfg = [0u8; 24];
-        cfg[CONFIG_CAPACITY..CONFIG_CAPACITY + 8]
-            .copy_from_slice(&(self.disk.num_blocks() * bs / SECTOR).to_le_bytes());
-        cfg[CONFIG_BLK_SIZE..CONFIG_BLK_SIZE + 4].copy_from_slice(&(bs as u32).to_le_bytes());
+        let capacity = (self.disk.num_blocks().saturating_mul(bs) / SECTOR).to_le_bytes();
+        for (d, s) in cfg.iter_mut().skip(CONFIG_CAPACITY).zip(capacity) {
+            *d = s;
+        }
+        for (d, s) in cfg.iter_mut().skip(CONFIG_BLK_SIZE).zip((bs as u32).to_le_bytes()) {
+            *d = s;
+        }
         for (i, d) in data.iter_mut().enumerate() {
-            *d = cfg.get(offset as usize + i).copied().unwrap_or(0);
+            let at = usize::try_from(offset).ok().and_then(|o| o.checked_add(i));
+            *d = at.and_then(|at| cfg.get(at)).copied().unwrap_or(0);
         }
     }
 

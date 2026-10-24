@@ -53,7 +53,7 @@ pub fn decode(code: &[u8], bits: u8) -> Option<Access> {
         i += 1;
     }
     if bits == 64 && code.get(i)? & 0xf0 == 0x40 {
-        rex = code[i];
+        rex = *code.get(i)?;
         i += 1;
     }
     let w = rex & 8 != 0;
@@ -162,7 +162,7 @@ pub fn decode(code: &[u8], bits: u8) -> Option<Access> {
         dest_size: if movzx { full } else { size },
         // ah..bh only name the byte operand itself, never MOVZX's destination.
         high_byte: size == 1 && rex == 0 && imm == 0 && !movzx,
-        len: i as u8,
+        len: u8::try_from(i).ok()?,
         test,
     })
 }

@@ -21,6 +21,12 @@ impl FxArea {
     }
 }
 
+/// A mask of the low `size` bytes of a register (`size` 0 gives 0; 8 or more
+/// gives all ones), for access sizes the hardware or decoder reported.
+pub(crate) fn size_mask(size: u8) -> u64 {
+    1u64.checked_shl((size as u32).saturating_mul(8)).map_or(u64::MAX, |v| v - 1)
+}
+
 /// `IA32_APIC_BASE`: the bootstrap processor, and the APIC enabled.
 pub(crate) const APIC_BASE_BSP: u64 = 1 << 8;
 pub(crate) const APIC_BASE_ENABLE: u64 = 1 << 11;

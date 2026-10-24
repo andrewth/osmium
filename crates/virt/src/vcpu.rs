@@ -119,14 +119,14 @@ pub fn run_vcpu<V: Vcpu + ?Sized>(
                 vcpu.complete_read(v);
             }
             VmExit::MmioWrite { addr, size, data } => {
-                let _ = mmio.write(addr.0, &data.to_le_bytes()[..size.min(8) as usize]);
+                let _ = mmio.write(addr.0, data.to_le_bytes().get(..size.min(8) as usize).unwrap_or_default());
             }
             VmExit::PioIn { port, size } => {
                 let v = read(pio, port as u64, size);
                 vcpu.complete_read(v);
             }
             VmExit::PioOut { port, size, data } => {
-                let _ = pio.write(port as u64, &data.to_le_bytes()[..size.min(4) as usize]);
+                let _ = pio.write(port as u64, data.to_le_bytes().get(..size.min(4) as usize).unwrap_or_default());
             }
             other => {
                 if let ControlFlow::Break(e) = handle(vcpu, other) {
@@ -140,9 +140,11 @@ pub fn run_vcpu<V: Vcpu + ?Sized>(
 fn read(bus: &Bus, addr: u64, size: u8) -> u64 {
     let n = size.clamp(1, 8) as usize;
     let mut buf = [0xffu8; 8];
-    let _ = bus.read(addr, &mut buf[..n]);
+    let _ = bus.read(addr, buf.get_mut(..n).unwrap_or_default());
     let mut out = [0u8; 8];
-    out[..n].copy_from_slice(&buf[..n]);
+    for (o, b) in out.iter_mut().zip(&buf).take(n) {
+        *o = *b;
+    }
     u64::from_le_bytes(out)
 }
 

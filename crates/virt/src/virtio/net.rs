@@ -63,7 +63,7 @@ impl VirtioNetDevice {
         while !self.rx_backlog.is_empty() && ctx.ready(RX) {
             let Some(chain) = ctx.pop(RX) else { break };
             let Ok(chain) = chain else { continue };
-            let frame = self.rx_backlog.pop_front().expect("loop checked the backlog");
+            let Some(frame) = self.rx_backlog.pop_front() else { break };
             let mut hdr = [0u8; HEADER];
             hdr[10] = 1; // num_buffers
             let mem = ctx.mem();
@@ -92,7 +92,7 @@ impl VirtioNetDevice {
                 && n > HEADER
             {
                 let backlog = &mut self.rx_backlog;
-                self.backend.transmit(&buf[HEADER..n], &mut |f| {
+                self.backend.transmit(buf.get(HEADER..n).unwrap_or_default(), &mut |f| {
                     if backlog.len() < RX_BACKLOG {
                         backlog.push_back(f.to_vec());
                     }
@@ -122,7 +122,8 @@ impl VirtioDevice for VirtioNetDevice {
         cfg[CONFIG_MAC..CONFIG_MAC + 6].copy_from_slice(&self.mac);
         cfg[CONFIG_STATUS..CONFIG_STATUS + 2].copy_from_slice(&STATUS_LINK_UP.to_le_bytes());
         for (i, d) in data.iter_mut().enumerate() {
-            *d = cfg.get(offset as usize + i).copied().unwrap_or(0);
+            let at = usize::try_from(offset).ok().and_then(|o| o.checked_add(i));
+            *d = at.and_then(|at| cfg.get(at)).copied().unwrap_or(0);
         }
     }
 

@@ -14,6 +14,25 @@ pub trait BusDevice: Send + Sync {
     fn write(&self, offset: u64, data: &[u8]);
 }
 
+/// Fills a guest read buffer with `value` in little-endian order, zero-extended
+/// (or truncated) to the buffer's length, whatever its size.
+pub(crate) fn put_le(data: &mut [u8], value: u64) {
+    let bytes = value.to_le_bytes();
+    for (i, d) in data.iter_mut().enumerate() {
+        *d = bytes.get(i).copied().unwrap_or(0);
+    }
+}
+
+/// The little-endian value of a guest write buffer, of any length (bytes past
+/// the eighth are ignored).
+pub(crate) fn get_le(data: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    for (d, s) in b.iter_mut().zip(data) {
+        *d = *s;
+    }
+    u64::from_le_bytes(b)
+}
+
 /// Why a bus operation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BusError {

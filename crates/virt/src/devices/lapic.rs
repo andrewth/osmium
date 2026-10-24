@@ -41,13 +41,22 @@ struct Bits([u32; 8]);
 
 impl Bits {
     fn set(&mut self, v: u8) {
-        self.0[v as usize / 32] |= 1 << (v % 32);
+        if let Some(w) = self.0.get_mut(v as usize / 32) {
+            *w |= 1 << (v % 32);
+        }
     }
     fn clear(&mut self, v: u8) {
-        self.0[v as usize / 32] &= !(1 << (v % 32));
+        if let Some(w) = self.0.get_mut(v as usize / 32) {
+            *w &= !(1 << (v % 32));
+        }
     }
     fn highest(&self) -> Option<u8> {
-        (0..8).rev().find(|&i| self.0[i] != 0).map(|i| (i * 32 + 31 - self.0[i].leading_zeros() as usize) as u8)
+        self.0
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(_, &w)| w != 0)
+            .map(|(i, w)| (i * 32 + 31 - w.leading_zeros() as usize) as u8)
     }
 }
 
@@ -102,7 +111,11 @@ impl State {
     fn current(&self, now: u64, hz: u64) -> u32 {
         let Some(t) = self.elapsed(now, hz) else { return 0 };
         let n = self.initial as u64;
-        if self.periodic() { (n - t % n) as u32 } else { n.saturating_sub(t) as u32 }
+        if self.periodic() {
+            n.saturating_sub(t.checked_rem(n).unwrap_or(0)) as u32
+        } else {
+            n.saturating_sub(t) as u32
+        }
     }
 
     fn deadline(&self, hz: u64) -> Option<u64> {
@@ -111,8 +124,9 @@ impl State {
             return None;
         }
         let n = if self.periodic() { self.interval(hz) } else { self.initial as u64 };
-        let ticks = (self.fired + 1) * n * self.divisor();
-        Some(start + (ticks as u128 * 1_000_000_000).div_ceil(hz as u128) as u64)
+        let ticks = (self.fired as u128 + 1) * n as u128 * self.divisor() as u128;
+        let ns = (ticks * 1_000_000_000).div_ceil(hz.max(1) as u128);
+        Some(start.saturating_add(u64::try_from(ns).unwrap_or(u64::MAX)))
     }
 
     /// The processor priority: the higher of the task priority and the
@@ -331,9 +345,9 @@ impl VirtualLapic {
             LDR => s.ldr,
             DFR => s.dfr,
             SVR => s.svr,
-            ISR..0x180 => s.isr.0[((reg - ISR) / 0x10) as usize],
+            ISR..0x180 => s.isr.0.get(((reg - ISR) / 0x10) as usize).copied().unwrap_or(0),
             TMR..0x200 => 0,
-            IRR..0x280 => s.irr.0[((reg - IRR) / 0x10) as usize],
+            IRR..0x280 => s.irr.0.get(((reg - IRR) / 0x10) as usize).copied().unwrap_or(0),
             ESR => s.esr,
             ICR_LOW => s.icr_low,
             ICR_HIGH => s.icr_high,
@@ -356,16 +370,11 @@ impl BusDevice for VirtualLapic {
         let v = self.read_reg(&self.state.lock(), offset & !0xf, now);
         // Registers are 32 bits wide at 16-byte strides.
         let bytes = (v >> (8 * (offset & 3))).to_le_bytes();
-        let n = data.len().min(4);
-        data[..n].copy_from_slice(&bytes[..n]);
-        data[n..].fill(0);
+        crate::bus::put_le(data, u32::from_le_bytes(bytes) as u64);
     }
 
     fn write(&self, offset: u64, data: &[u8]) {
-        let mut b = [0u8; 4];
-        let n = data.len().min(4);
-        b[..n].copy_from_slice(&data[..n]);
-        let v = u32::from_le_bytes(b);
+        let v = crate::bus::get_le(data) as u32;
         let now = (self.clock)();
         let mut s = self.state.lock();
         let (mut ipi, mut eoi) = (None, None);
@@ -408,7 +417,10 @@ impl BusDevice for VirtualLapic {
             LVT_TIMER | LVT_LINT0 | LVT_LINT1 | LVT_ERROR => {
                 let i = ((offset - LVT_TIMER) / 0x10) as usize;
                 let i = if i == 0 { 0 } else { i - 2 };
-                s.lvt[i] = if s.svr & SVR_ENABLE == 0 { v | MASKED } else { v };
+                let v = if s.svr & SVR_ENABLE == 0 { v | MASKED } else { v };
+                if let Some(l) = s.lvt.get_mut(i) {
+                    *l = v;
+                }
             }
             TIMER_INITIAL => {
                 s.initial = v;

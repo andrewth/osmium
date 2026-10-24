@@ -66,7 +66,7 @@ impl DescChain {
     pub fn read(&self, mem: &GuestMemory, offset: usize, buf: &mut [u8]) -> Result<usize, QueueError> {
         let mut done = 0;
         Self::walk(self.descs.iter().filter(|d| !d.write), offset, buf.len(), |gpa, at, n| {
-            mem.read(gpa, &mut buf[at..at + n])?;
+            mem.read(gpa, buf.get_mut(at..at.saturating_add(n)).ok_or(OutOfBounds(gpa))?)?;
             done += n;
             Ok(())
         })?;
@@ -78,7 +78,7 @@ impl DescChain {
     pub fn write(&self, mem: &GuestMemory, offset: usize, buf: &[u8]) -> Result<usize, QueueError> {
         let mut done = 0;
         Self::walk(self.descs.iter().filter(|d| d.write), offset, buf.len(), |gpa, at, n| {
-            mem.write(gpa, &buf[at..at + n])?;
+            mem.write(gpa, buf.get(at..at.saturating_add(n)).ok_or(OutOfBounds(gpa))?)?;
             done += n;
             Ok(())
         })?;
@@ -185,10 +185,9 @@ impl SplitQueue {
             let raw = mem.read_obj::<[u8; DESC_SIZE]>(GuestPhysAddr(
                 self.desc.0.wrapping_add((DESC_SIZE * i as usize) as u64),
             ))?;
-            let addr = u64::from_le_bytes(raw[0..8].try_into().expect("fixed-width slice"));
-            let len = u32::from_le_bytes(raw[8..12].try_into().expect("fixed-width slice"));
-            let flags = u16::from_le_bytes([raw[12], raw[13]]);
-            let next = u16::from_le_bytes([raw[14], raw[15]]);
+            // struct { le64 addr; le32 len; le16 flags; le16 next }
+            let w = u128::from_le_bytes(raw);
+            let (addr, len, flags, next) = (w as u64, (w >> 64) as u32, (w >> 96) as u16, (w >> 112) as u16);
             if flags & DESC_F_INDIRECT != 0 {
                 return Err(QueueError::Indirect);
             }

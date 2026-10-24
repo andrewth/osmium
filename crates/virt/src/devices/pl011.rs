@@ -109,21 +109,15 @@ impl BusDevice for Pl011 {
             IMSC => s.imsc,
             RIS => s.ris(),
             MIS => s.ris() & s.imsc,
-            o @ 0xfe0..0x1000 => ID[((o - 0xfe0) / 4) as usize],
+            o @ 0xfe0..0x1000 => ID.get(((o - 0xfe0) / 4) as usize).copied().unwrap_or(0),
             _ => 0,
         };
         self.update_irq(&mut s);
-        let bytes = (v >> (8 * (offset & 3))).to_le_bytes();
-        let n = data.len().min(4);
-        data[..n].copy_from_slice(&bytes[..n]);
-        data[n..].fill(0);
+        crate::bus::put_le(data, (v >> (8 * (offset & 3))) as u64);
     }
 
     fn write(&self, offset: u64, data: &[u8]) {
-        let mut b = [0u8; 4];
-        let n = data.len().min(4);
-        b[..n].copy_from_slice(&data[..n]);
-        let v = u32::from_le_bytes(b);
+        let v = crate::bus::get_le(data) as u32;
         let mut s = self.state.lock();
         match offset & !3 {
             DR => {

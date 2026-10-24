@@ -319,8 +319,8 @@ impl RiscvVcpu {
                 let op = insn::decode_transformed(s.htinst).or_else(|| fetch(s.pc).and_then(insn::decode));
                 match op {
                     Some(op) if op.store && cause == 23 => {
-                        let data = if op.reg == 0 { 0 } else { s.x[op.reg as usize] };
-                        let data = if op.size == 8 { data } else { data & ((1 << (8 * op.size)) - 1) };
+                        let data = s.x.get(op.reg as usize).copied().unwrap_or(0);
+                        let data = data & crate::x86::size_mask(op.size);
                         s.pc = s.pc.wrapping_add(op.len as u64);
                         VmExit::MmioWrite { addr, size: op.size, data }
                     }
@@ -412,13 +412,16 @@ impl Vcpu for RiscvVcpu {
 
     #[cfg(not(all(target_arch = "riscv64", feature = "riscv64-hs")))]
     fn run(&mut self) -> VmExit {
-        unimplemented!("RISC-V guests need a riscv64 build with the riscv64-hs feature")
+        // RISC-V guests need a riscv64 build with the riscv64-hs feature; report an exit nothing handles.
+        VmExit::Unhandled { reason: u64::MAX }
     }
 
     fn complete_read(&mut self, value: u64) {
         if let Some(op) = self.pending.take() {
-            if op.reg != 0 {
-                self.state.x[op.reg as usize] = op.extend(value);
+            if op.reg != 0
+                && let Some(r) = self.state.x.get_mut(op.reg as usize)
+            {
+                *r = op.extend(value);
             }
             self.state.pc = self.state.pc.wrapping_add(op.len as u64);
         }

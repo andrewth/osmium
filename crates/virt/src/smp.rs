@@ -85,10 +85,12 @@ impl GuestCpus {
 
     /// Connects a RISC-V vCPU as hart `hart`: its IPI line, its remote-fence
     /// line, and the record of which host CPU it runs on (for kicks).
+    /// Does nothing if there is no such hart.
     pub fn attach(&self, hart: usize, vcpu: &mut crate::riscv::RiscvVcpu) {
-        vcpu.connect_ipi(self.slots[hart].ipi.clone());
-        vcpu.running = Some(self.slots[hart].running.clone());
-        vcpu.fence = Some(self.slots[hart].fence.clone());
+        let Some(slot) = self.slots.get(hart) else { return };
+        vcpu.connect_ipi(slot.ipi.clone());
+        vcpu.running = Some(slot.running.clone());
+        vcpu.fence = Some(slot.fence.clone());
     }
 
     /// Number of harts.
@@ -127,17 +129,23 @@ impl GuestCpus {
 
     /// Connects an AArch64 vCPU as CPU `cpu`, so kicks find it.
     pub fn attach_arm(&self, cpu: usize, vcpu: &mut crate::aarch64::Aarch64Vcpu) {
-        vcpu.running = Some(self.slots[cpu].running.clone());
+        if let Some(slot) = self.slots.get(cpu) {
+            vcpu.running = Some(slot.running.clone());
+        }
     }
 
     /// Connects an SVM vCPU as CPU `cpu`, so kicks find it.
     pub fn attach_svm(&self, cpu: usize, vcpu: &mut crate::x86::svm::SvmVcpu) {
-        vcpu.running = Some(self.slots[cpu].running.clone());
+        if let Some(slot) = self.slots.get(cpu) {
+            vcpu.running = Some(slot.running.clone());
+        }
     }
 
     /// Connects a VMX vCPU as CPU `cpu`, so kicks find it.
     pub fn attach_vmx(&self, cpu: usize, vcpu: &mut crate::x86::vmx::VmxVcpu) {
-        vcpu.running = Some(self.slots[cpu].running.clone());
+        if let Some(slot) = self.slots.get(cpu) {
+            vcpu.running = Some(slot.running.clone());
+        }
     }
 
     /// Takes hart `hart`'s pending start request (entry, opaque), marking it
@@ -161,9 +169,10 @@ impl GuestCpus {
         self.slots.get(hart).map(|s| s.state.load(Ordering::Acquire))
     }
 
-    /// `hart`'s software-interrupt line, for its vCPU.
+    /// `hart`'s software-interrupt line, for its vCPU (a detached line if
+    /// there is no such hart).
     pub fn ipi_line(&self, hart: usize) -> Arc<AtomicBool> {
-        self.slots[hart].ipi.clone()
+        self.slots.get(hart).map_or_else(|| Arc::new(AtomicBool::new(false)), |s| s.ipi.clone())
     }
 
     /// Raises the software interrupt of every hart in `mask` (bit `i` =

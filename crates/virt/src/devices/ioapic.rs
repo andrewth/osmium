@@ -74,7 +74,7 @@ impl VirtualIoApic {
         } else {
             s.level &= !bit;
         }
-        let e = s.redir[gsi as usize];
+        let e = s.redir.get(gsi as usize).copied().unwrap_or(MASKED);
         let msg = if e & LEVEL != 0 { high } else { rising };
         let msg = msg.then(|| Self::fire(&mut s, gsi as usize)).flatten();
         drop(s);
@@ -89,9 +89,10 @@ impl VirtualIoApic {
         let mut s = self.state.lock();
         let mut out = alloc::vec::Vec::new();
         for i in 0..24 {
-            let e = s.redir[i];
+            let Some(slot) = s.redir.get_mut(i) else { continue };
+            let e = *slot;
             if e & LEVEL != 0 && e & REMOTE_IRR != 0 && e as u8 == vector {
-                s.redir[i] &= !REMOTE_IRR;
+                *slot &= !REMOTE_IRR;
                 if s.level & (1 << i) != 0
                     && let Some(m) = Self::fire(&mut s, i)
                 {
@@ -108,12 +109,13 @@ impl VirtualIoApic {
     /// The message for entry `i`, if it may send now; marks remote IRR for
     /// level-triggered entries.
     fn fire(s: &mut State, i: usize) -> Option<IoApicMessage> {
-        let e = s.redir[i];
+        let slot = s.redir.get_mut(i)?;
+        let e = *slot;
         if e & MASKED != 0 || (e & LEVEL != 0 && e & REMOTE_IRR != 0) {
             return None;
         }
         if e & LEVEL != 0 {
-            s.redir[i] |= REMOTE_IRR;
+            *slot |= REMOTE_IRR;
         }
         Some(IoApicMessage {
             dest: (e >> 56) as u8,
@@ -129,7 +131,7 @@ impl VirtualIoApic {
             0x01 => 23 << 16 | 0x11, // 24 entries, version 0x11
             0x02 => (s.id as u32 & 0xf) << 24,
             r @ 0x10..=0x3f => {
-                let e = s.redir[((r - 0x10) / 2) as usize];
+                let e = s.redir.get(((r - 0x10) / 2) as usize).copied().unwrap_or(0);
                 if r & 1 == 0 { e as u32 } else { (e >> 32) as u32 }
             }
             _ => 0,
@@ -146,16 +148,11 @@ impl BusDevice for VirtualIoApic {
             _ => 0,
         };
         let bytes = v.to_le_bytes();
-        let n = data.len().min(4);
-        data[..n].copy_from_slice(&bytes[..n]);
-        data[n..].fill(0);
+        crate::bus::put_le(data, u32::from_le_bytes(bytes) as u64);
     }
 
     fn write(&self, offset: u64, data: &[u8]) {
-        let mut b = [0u8; 4];
-        let n = data.len().min(4);
-        b[..n].copy_from_slice(&data[..n]);
-        let v = u32::from_le_bytes(b);
+        let v = crate::bus::get_le(data) as u32;
         let mut s = self.state.lock();
         let mut msg = None;
         match offset & !3 {
@@ -164,7 +161,7 @@ impl BusDevice for VirtualIoApic {
                 0x00 => s.id = (v >> 24) as u8 & 0xf,
                 r @ 0x10..=0x3f => {
                     let i = ((r - 0x10) / 2) as usize;
-                    let old = s.redir[i];
+                    let Some(&old) = s.redir.get(i) else { return };
                     // Remote IRR and delivery status are read-only.
                     let ro = REMOTE_IRR | DELIVERY_STATUS;
                     let new = if r & 1 == 0 {
@@ -172,7 +169,9 @@ impl BusDevice for VirtualIoApic {
                     } else {
                         (old & 0xffff_ffff) | (v as u64) << 32
                     };
-                    s.redir[i] = new;
+                    if let Some(slot) = s.redir.get_mut(i) {
+                        *slot = new;
+                    }
                     // Unmasking a level-triggered input that is high sends.
                     if old & MASKED != 0 && new & MASKED == 0 && new & LEVEL != 0 && s.level & (1 << i) != 0 {
                         msg = Self::fire(&mut s, i);

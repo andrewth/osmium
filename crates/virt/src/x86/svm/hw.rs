@@ -196,7 +196,7 @@ impl HostDr {
 /// Enters the guest and returns at its next `#VMEXIT`.
 pub(super) fn run(v: &mut SvmVcpu) {
     let cpu = osmium_arch::cpu::current_id();
-    let last = LAST_VMCB[cpu].swap(v.vmcb_pa, core::sync::atomic::Ordering::Relaxed);
+    let last = LAST_VMCB.get(cpu).map_or(0, |l| l.swap(v.vmcb_pa, core::sync::atomic::Ordering::Relaxed));
     let last_cpu = core::mem::replace(&mut v.last_cpu, cpu);
     if crate::vcpu::tlb_may_be_stale(last, v.vmcb_pa, last_cpu, cpu) {
         v.write32(super::vmcb::TLB_CONTROL, 1);

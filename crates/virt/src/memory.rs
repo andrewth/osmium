@@ -66,14 +66,16 @@ impl GuestMemory {
     }
 
     /// Adds `len` bytes of host memory at `host` as guest RAM at `gpa`.
-    /// Returns false if it overlaps an existing region.
+    /// Returns false if it overlaps an existing region or wraps the
+    /// address space.
     ///
     /// # Safety
     /// The host memory must stay valid for the life of this object and must
     /// not be accessed as Rust references while the guest can reach it.
     pub unsafe fn add_region(&mut self, gpa: GuestPhysAddr, host: *mut u8, len: u64) -> bool {
-        let end = gpa.0.saturating_add(len);
-        if self.regions.iter().any(|r| gpa.0 < r.gpa.0 + r.len && r.gpa.0 < end) {
+        let Some(end) = gpa.0.checked_add(len) else { return false };
+        // Existing regions never wrap (checked here), so their ends cannot overflow.
+        if self.regions.iter().any(|r| gpa.0 < r.gpa.0.saturating_add(r.len) && r.gpa.0 < end) {
             return false;
         }
         let at = self.regions.partition_point(|r| r.gpa < gpa);
@@ -95,16 +97,17 @@ impl GuestMemory {
     }
 
     fn region_of(&self, gpa: GuestPhysAddr) -> Option<&GuestRegion> {
-        let i = self.regions.partition_point(|r| r.gpa.0 + r.len <= gpa.0);
+        let i = self.regions.partition_point(|r| r.gpa.0.saturating_add(r.len) <= gpa.0);
         self.regions.get(i).filter(|r| r.gpa <= gpa)
     }
 
     /// Copies guest memory at `gpa` into `buf`; the range may span regions.
     pub fn read(&self, gpa: GuestPhysAddr, buf: &mut [u8]) -> Result<(), OutOfBounds> {
         self.for_each_chunk(gpa, buf.len(), |host, done, n| {
-            for i in 0..n {
+            let end = done.saturating_add(n);
+            for (i, d) in buf.get_mut(done..end).unwrap_or_default().iter_mut().enumerate() {
                 // SAFETY: `host..host+n` lies inside a region.
-                buf[done + i] = unsafe { host.add(i).read_volatile() };
+                *d = unsafe { host.add(i).read_volatile() };
             }
         })
     }
@@ -112,9 +115,10 @@ impl GuestMemory {
     /// Copies `buf` into guest memory at `gpa`; the range may span regions.
     pub fn write(&self, gpa: GuestPhysAddr, buf: &[u8]) -> Result<(), OutOfBounds> {
         self.for_each_chunk(gpa, buf.len(), |host, done, n| {
-            for i in 0..n {
+            let end = done.saturating_add(n);
+            for (i, &b) in buf.get(done..end).unwrap_or_default().iter().enumerate() {
                 // SAFETY: `host..host+n` lies inside a region.
-                unsafe { host.add(i).write_volatile(buf[done + i]) };
+                unsafe { host.add(i).write_volatile(b) };
             }
         })
     }
@@ -140,7 +144,7 @@ impl GuestMemory {
             let mut at = filled;
             while at < end {
                 let n = (end - at).min(zeros.len() as u64) as usize;
-                self.write(GuestPhysAddr(at), &zeros[..n])?;
+                self.write(GuestPhysAddr(at), zeros.get(..n).unwrap_or_default())?;
                 at += n as u64;
             }
             (low, high) = (low.min(s.vaddr), high.max(end));
@@ -174,16 +178,17 @@ impl GuestMemory {
         // Validate the whole range first, so a failed access has no effect.
         let mut done = 0usize;
         while done < len {
-            let at = GuestPhysAddr(gpa.0 + done as u64);
+            let at = GuestPhysAddr(gpa.0.checked_add(done as u64).ok_or(OutOfBounds(gpa))?);
             let r = self.region_of(at).ok_or(OutOfBounds(at))?;
-            done += ((r.gpa.0 + r.len - at.0) as usize).min(len - done);
+            let avail = usize::try_from(r.gpa.0.saturating_add(r.len).saturating_sub(at.0)).unwrap_or(usize::MAX);
+            done += avail.min(len - done);
         }
         done = 0;
         while done < len {
-            let at = GuestPhysAddr(gpa.0 + done as u64);
-            let r = self.region_of(at).expect("validated above");
-            let off = (at.0 - r.gpa.0) as usize;
-            let n = (r.len as usize - off).min(len - done);
+            let at = GuestPhysAddr(gpa.0.wrapping_add(done as u64));
+            let r = self.region_of(at).ok_or(OutOfBounds(at))?;
+            let off = at.0.saturating_sub(r.gpa.0) as usize;
+            let n = (r.len as usize).saturating_sub(off).min(len - done);
             // SAFETY: `off` is inside the region.
             f(unsafe { r.host.add(off) }, done, n);
             done += n;

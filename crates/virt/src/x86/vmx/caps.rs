@@ -235,14 +235,20 @@ impl Caps {
 
     /// A CPU that allows everything, for host tests.
     pub fn permissive() -> Self {
-        Self::from_msrs(|m| match m {
-            msr::CR0_FIXED0 => 0x8000_0021,
-            msr::CR0_FIXED1 | msr::CR4_FIXED1 => 0xffff_ffff,
-            msr::CR4_FIXED0 => 1 << 13,
-            msr::EPT_VPID_CAP => 1 << 6 | 1 << 14 | 1 << 20 | 1 << 25 | 1 << 32 | 1 << 41,
-            msr::BASIC => 1,
-            _ => 0xffff_ffff_0000_0000,
-        })
-        .expect("permissive capabilities")
+        Self {
+            revision: 1,
+            pin: Self::PIN,
+            proc: Self::PROC,
+            proc_dr: Self::PROC & !proc::MOV_DR,
+            proc2: Self::PROC2,
+            exit: Self::EXIT,
+            entry: Self::ENTRY,
+            cr0_fixed0: 0x8000_0021,
+            cr0_fixed1: 0xffff_ffff,
+            cr4_fixed0: 1 << 13,
+            cr4_fixed1: 0xffff_ffff,
+            invept: 1,
+            invvpid: 1,
+        }
     }
 }

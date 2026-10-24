@@ -296,7 +296,7 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     // A different vCPU than this CPU last ran (or a new VM that reuses an
     // old one's VMID and root): install its VTTBR and flush.
     let cpu = osmium_arch::cpu::current_id();
-    let last = LAST_VCPU[cpu].swap(v.id, core::sync::atomic::Ordering::Relaxed);
+    let last = LAST_VCPU.get(cpu).map_or(0, |l| l.swap(v.id, core::sync::atomic::Ordering::Relaxed));
     // Also a vCPU that last ran on another CPU: entries of its VMID cached
     // here may predate invalidations done while it ran there.
     let last_cpu = core::mem::replace(&mut v.last_cpu, cpu);

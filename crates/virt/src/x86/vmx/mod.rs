@@ -53,7 +53,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::decode::{self, Access, Operand};
-use super::{APIC_BASE_ADDR, FxArea, apic_base_write_ok, injectable};
+use super::{APIC_BASE_ADDR, FxArea, apic_base_write_ok, injectable, size_mask};
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 
@@ -395,7 +395,8 @@ impl Vmcs {
 
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     fn slot(&self, field: u32) -> &Cell<(u32, u64)> {
-        &self.shadow[((field >> 1) ^ (field >> 7)) as usize % SHADOW]
+        let i = ((field >> 1) ^ (field >> 7)) as usize % SHADOW;
+        self.shadow.get(i).unwrap_or(&self.shadow[0])
     }
 
     fn read(&self, field: u32) -> u64 {
@@ -574,7 +575,7 @@ impl VmxVcpu {
         v.vmcs.write(MSR_BITMAP, pages.msr_bitmap.1);
         v.vmcs.write(ENTRY_MSR_LOAD_ADDR, pages.msr_area.1);
         v.vmcs.write(EXIT_MSR_STORE_ADDR, pages.msr_area.1);
-        v.vmcs.write(EXIT_MSR_LOAD_ADDR, pages.msr_area.1 + HOST_LIST as u64);
+        v.vmcs.write(EXIT_MSR_LOAD_ADDR, pages.msr_area.1.wrapping_add(HOST_LIST as u64));
         for f in [ENTRY_MSR_LOAD_COUNT, EXIT_MSR_STORE_COUNT, EXIT_MSR_LOAD_COUNT] {
             v.vmcs.write(f, n);
         }
@@ -685,14 +686,15 @@ impl VmxVcpu {
     }
 
     fn area(&self, msr: u32) -> u64 {
-        let i = SWITCHED.iter().position(|&m| m == msr).expect("a switched MSR");
+        let Some(i) = SWITCHED.iter().position(|&m| m == msr) else { return 0 };
         // SAFETY: as above.
         unsafe { self.area_entry(0, i).add(8).cast::<u64>().read_volatile() }
     }
 
     fn set_guest_area(&mut self, msr: u32, v: u64) {
-        let i = SWITCHED.iter().position(|&m| m == msr).expect("a switched MSR");
-        self.set_area(0, i, msr, v);
+        if let Some(i) = SWITCHED.iter().position(|&m| m == msr) {
+            self.set_area(0, i, msr, v);
+        }
     }
 
     /// Sets a segment register.
@@ -750,7 +752,7 @@ impl VmxVcpu {
         let mut table = self.vmcs.read(vmcs::GUEST_CR3) & 0x000f_ffff_ffff_f000;
         for level in (0..4).rev() {
             let index = (linear >> (12 + 9 * level)) & 0x1ff;
-            let pte: u64 = mem.read_obj(GuestPhysAddr(table + index * 8)).ok()?;
+            let pte: u64 = mem.read_obj(GuestPhysAddr(table.wrapping_add(index * 8))).ok()?;
             if pte & 1 == 0 {
                 return None;
             }
@@ -845,7 +847,8 @@ impl VmxVcpu {
         let mut n = 0;
         while n < 15 {
             let Some(gpa) = self.translate(linear.wrapping_add(n as u64) & wrap) else { break };
-            if mem.read(GuestPhysAddr(gpa), &mut buf[n..n + 1]).is_err() {
+            let Some(byte) = buf.get_mut(n..n + 1) else { break };
+            if mem.read(GuestPhysAddr(gpa), byte).is_err() {
                 break;
             }
             n += 1;
@@ -1243,7 +1246,7 @@ impl VmxVcpu {
         }
         if read {
             let v = match dr {
-                0..=3 => self.dr[dr as usize],
+                0..=3 => self.dr.get(dr as usize).copied().unwrap_or(0),
                 6 | 4 => self.dr6,
                 _ => self.vmcs.read(vmcs::GUEST_DR7),
             };
@@ -1252,7 +1255,11 @@ impl VmxVcpu {
             let v = self.reg(gpr);
             match dr {
                 0..=3 if !canonical(v) => return self.inject_gp(),
-                0..=3 => self.dr[dr as usize] = v,
+                0..=3 => {
+                    if let Some(d) = self.dr.get_mut(dr as usize) {
+                        *d = v;
+                    }
+                }
                 4..=7 if v >> 32 != 0 => return self.inject_gp(),
                 6 | 4 => self.dr6 = 0xffff_0ff0 | (v & 0xe00f),
                 _ => self.vmcs.write(vmcs::GUEST_DR7, v & !(1 << 11 | 1 << 12 | 1 << 14 | 1 << 15) | 0x400),
@@ -1343,7 +1350,7 @@ impl VmxVcpu {
                     self.pending_in = Some((size, rip.wrapping_add(len)));
                     VmExit::PioIn { port, size }
                 } else {
-                    let data = (self.rax() & (u32::MAX as u64 >> (32 - 8 * size as u32))) as u32;
+                    let data = (self.rax() & size_mask(size.min(4))) as u32;
                     self.skip();
                     VmExit::PioOut { port, size, data }
                 }
@@ -1364,11 +1371,11 @@ impl VmxVcpu {
             // paging structure) is not an access by the instruction.
             exit::EPT_VIOLATION if q & 3 != 0 && q & 0x38 == 0 && q & 0x180 != 0x80 => {
                 let addr = GuestPhysAddr(self.vmcs.read(vmcs::GUEST_PHYS_ADDR));
-                let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(&b[..n], self.code_bits())) else {
+                let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(b.get(..n)?, self.code_bits())) else {
                     return VmExit::Unhandled { reason: reason as u64 };
                 };
                 if a.store {
-                    let data = self.operand_value(&a) & (u64::MAX >> (64 - 8 * a.size as u32));
+                    let data = self.operand_value(&a) & size_mask(a.size);
                     self.skip_to(rip.wrapping_add(a.len as u64));
                     VmExit::MmioWrite { addr, size: a.size, data }
                 } else {
@@ -1387,7 +1394,8 @@ impl VmxVcpu {
 /// The capabilities `enable` found.
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 fn caps() -> Caps {
-    *hw::CAPS.get().expect("vmx::enable ran")
+    // Without `enable` there is no VMX to run on; the entry then fails.
+    hw::CAPS.get().copied().unwrap_or_else(Caps::permissive)
 }
 
 /// A CPU that allows everything.
@@ -1434,16 +1442,17 @@ impl Vcpu for VmxVcpu {
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
     fn run(&mut self) -> VmExit {
-        unimplemented!("VMX guests need a bare-metal x86_64 build")
+        // VMX guests need a bare-metal x86_64 build; report an exit nothing handles.
+        VmExit::Unhandled { reason: u64::MAX }
     }
 
     fn complete_read(&mut self, value: u64) {
         if let Some(a) = self.pending_mmio.take() {
-            let value = value & (u64::MAX >> (64 - 8 * a.size as u32));
+            let value = value & size_mask(a.size);
             if a.test {
                 // TEST: flags from value & operand; CF and OF clear.
                 let bits = 8 * a.size as u32;
-                let r = value & self.operand_value(&a) & (u64::MAX >> (64 - bits));
+                let r = value & self.operand_value(&a) & size_mask(a.size);
                 let (cf, pf, zf, sf, of) = (1 << 0, 1 << 2, 1 << 6, 1 << 7, 1 << 11);
                 let mut f = self.rflags() & !(cf | pf | zf | sf | of);
                 if (r as u8).count_ones() % 2 == 0 {
@@ -1452,7 +1461,7 @@ impl Vcpu for VmxVcpu {
                 if r == 0 {
                     f |= zf;
                 }
-                if r >> (bits - 1) & 1 != 0 {
+                if r.checked_shr(bits.saturating_sub(1)).unwrap_or(0) & 1 != 0 {
                     f |= sf;
                 }
                 self.vmcs.write(vmcs::GUEST_RFLAGS, f);
@@ -1468,7 +1477,7 @@ impl Vcpu for VmxVcpu {
                 // 32-bit destinations zero the upper half.
                 self.set_reg(r, value);
             } else {
-                let mask = u64::MAX >> (64 - 8 * a.dest_size as u32);
+                let mask = size_mask(a.dest_size);
                 let old = self.reg(r);
                 self.set_reg(r, (old & !mask) | value);
             }
@@ -1477,7 +1486,7 @@ impl Vcpu for VmxVcpu {
             return;
         }
         if let Some((size, next)) = self.pending_in.take() {
-            let mask = u64::MAX >> (64 - 8 * size as u32);
+            let mask = size_mask(size);
             // 32-bit results zero the upper half; 8/16-bit ones merge.
             let rax = if size == 4 { value & mask } else { (self.rax() & !mask) | (value & mask) };
             self.regs.rax = rax;

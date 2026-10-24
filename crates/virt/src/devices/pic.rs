@@ -125,13 +125,14 @@ impl VirtualPic {
 
     /// Drives ISA IRQ `irq` (0-15).
     pub fn set_level(&self, irq: u8, high: bool) {
-        let mut s = self.state.lock();
+        let mut guard = self.state.lock();
+        let s: &mut [Chip; 2] = &mut guard;
         if irq < 8 {
             s[0].set_level(irq, high);
         } else if irq < 16 {
             s[1].set_level(irq - 8, high);
         }
-        self.update(&mut s);
+        self.update(s);
     }
 
     /// The pending vector, if any, without acknowledging it.
@@ -148,8 +149,9 @@ impl VirtualPic {
     /// Acknowledges the highest-priority pending interrupt (the INTA
     /// cycle) and returns its vector, or `None` if nothing is pending.
     pub fn acknowledge(&self) -> Option<u8> {
-        let mut s = self.state.lock();
-        let (irq, slave) = Self::pending(&s)?;
+        let mut guard = self.state.lock();
+        let s: &mut [Chip; 2] = &mut guard;
+        let (irq, slave) = Self::pending(s)?;
         s[0].ack(irq);
         let vector = match slave {
             Some(j) => {
@@ -158,7 +160,7 @@ impl VirtualPic {
             }
             None => s[0].base | irq,
         };
-        self.update(&mut s);
+        self.update(s);
         Some(vector)
     }
 
@@ -193,13 +195,15 @@ struct Ports {
 impl BusDevice for Ports {
     fn read(&self, offset: u64, data: &mut [u8]) {
         let s = self.pic.state.lock();
-        data.fill(0);
-        data[0] = s[self.chip].read(offset);
+        let v = s.get(self.chip).map_or(0, |c| c.read(offset));
+        crate::bus::put_le(data, v as u64);
     }
 
     fn write(&self, offset: u64, data: &[u8]) {
         let mut s = self.pic.state.lock();
-        s[self.chip].write(offset, data.first().copied().unwrap_or(0));
+        if let Some(c) = s.get_mut(self.chip) {
+            c.write(offset, data.first().copied().unwrap_or(0));
+        }
         self.pic.update(&mut s);
     }
 }

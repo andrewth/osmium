@@ -37,7 +37,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::decode::{self, Access, Operand};
 #[cfg(any(test, all(target_arch = "x86_64", target_os = "none")))]
 use super::patch_cpuid;
-use super::{APIC_BASE_ADDR, APIC_BASE_BSP, APIC_BASE_ENABLE, FxArea, apic_base_write_ok, injectable};
+use super::{APIC_BASE_ADDR, APIC_BASE_BSP, APIC_BASE_ENABLE, FxArea, apic_base_write_ok, injectable, size_mask};
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 
@@ -182,6 +182,11 @@ pub mod exit {
     pub const NPF: u64 = 0x400;
     /// VMRUN failed its consistency checks.
     pub const INVALID: u64 = u64::MAX;
+}
+
+/// Whether `[off, off + len)` lies inside the 4 KiB VMCB.
+fn in_vmcb(off: usize, len: usize) -> bool {
+    off.checked_add(len).is_some_and(|end| end <= 4096)
 }
 
 /// `EFER.SVME`, which must also be set in the guest's EFER.
@@ -363,23 +368,35 @@ impl SvmVcpu {
 
     /// Reads a 64-bit VMCB field.
     pub fn read64(&self, off: usize) -> u64 {
+        if !in_vmcb(off, 8) {
+            return 0;
+        }
         // SAFETY: an aligned field of the owned VMCB.
         unsafe { self.at(off).cast::<u64>().read_volatile() }
     }
 
     /// Writes a 64-bit VMCB field.
     pub fn write64(&mut self, off: usize, v: u64) {
+        if !in_vmcb(off, 8) {
+            return;
+        }
         // SAFETY: as above.
         unsafe { self.at(off).cast::<u64>().write_volatile(v) }
     }
 
     fn write32(&mut self, off: usize, v: u32) {
+        if !in_vmcb(off, 4) {
+            return;
+        }
         // SAFETY: as above.
         unsafe { self.at(off).cast::<u32>().write_volatile(v) }
     }
 
     /// Sets a segment register: (selector, attributes, limit, base).
     pub fn segment(&mut self, off: usize, (sel, attr, limit, base): (u16, u16, u32, u64)) {
+        if !in_vmcb(off, 16) {
+            return;
+        }
         // SAFETY: a 16-byte segment field of the owned VMCB.
         unsafe {
             self.at(off).cast::<u16>().write_volatile(sel);
@@ -427,7 +444,7 @@ impl SvmVcpu {
         let mut table = self.read64(vmcb::CR3) & 0x000f_ffff_ffff_f000;
         for level in (0..4).rev() {
             let index = (linear >> (12 + 9 * level)) & 0x1ff;
-            let pte: u64 = mem.read_obj(GuestPhysAddr(table + index * 8)).ok()?;
+            let pte: u64 = mem.read_obj(GuestPhysAddr(table.wrapping_add(index * 8))).ok()?;
             if pte & 1 == 0 {
                 return None;
             }
@@ -544,7 +561,8 @@ impl SvmVcpu {
         let mut n = 0;
         while n < 15 {
             let Some(gpa) = self.translate(linear.wrapping_add(n as u64) & wrap) else { break };
-            if mem.read(GuestPhysAddr(gpa), &mut buf[n..n + 1]).is_err() {
+            let Some(byte) = buf.get_mut(n..n + 1) else { break };
+            if mem.read(GuestPhysAddr(gpa), byte).is_err() {
                 break;
             }
             n += 1;
@@ -806,12 +824,16 @@ impl SvmVcpu {
                 // for a DR intercept it is stale: fetch from guest memory.
                 let Some((b, n)) = self.fetch_insn() else { return false };
                 // [REX] 0F 21/23 modrm: the GPR is modrm.rm (+ REX.B).
-                let (rex, i) = if n > 0 && b[0] & 0xf0 == 0x40 { (b[0], 1) } else { (0, 0) };
-                if n < i + 3 || b[i] != 0x0f {
+                let (rex, i) = match b.first() {
+                    Some(&r) if n > 0 && r & 0xf0 == 0x40 => (r, 1),
+                    _ => (0, 0),
+                };
+                let (Some(&op), Some(&modrm)) = (b.get(i), b.get(i + 2)) else { return false };
+                if n < i + 3 || op != 0x0f {
                     return false;
                 }
                 if read {
-                    let r = (b[i + 2] & 7) | (rex & 1) << 3;
+                    let r = (modrm & 7) | (rex & 1) << 3;
                     self.set_reg(r, 0);
                 }
                 let rip = self.rip();
@@ -848,7 +870,7 @@ impl SvmVcpu {
                     self.pending_in = Some(size);
                     VmExit::PioIn { port, size }
                 } else {
-                    let data = (self.rax() & (u32::MAX as u64 >> (32 - 8 * size as u32))) as u32;
+                    let data = (self.rax() & size_mask(size.min(4))) as u32;
                     self.skip_to(next);
                     VmExit::PioOut { port, size, data }
                 }
@@ -867,11 +889,11 @@ impl SvmVcpu {
             // page tables, not an access by the instruction.)
             exit::NPF if info1 & 1 == 0 && info1 & (1 << 33) == 0 => {
                 let addr = GuestPhysAddr(self.read64(vmcb::EXITINFO2));
-                let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(&b[..n], self.code_bits())) else {
+                let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(b.get(..n)?, self.code_bits())) else {
                     return VmExit::Unhandled { reason: code };
                 };
                 if a.store {
-                    let data = self.operand_value(&a) & (u64::MAX >> (64 - 8 * a.size as u32));
+                    let data = self.operand_value(&a) & size_mask(a.size);
                     self.skip_to(rip.wrapping_add(a.len as u64));
                     VmExit::MmioWrite { addr, size: a.size, data }
                 } else {
@@ -917,16 +939,17 @@ impl Vcpu for SvmVcpu {
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
     fn run(&mut self) -> VmExit {
-        unimplemented!("SVM guests need a bare-metal x86_64 build")
+        // SVM guests need a bare-metal x86_64 build; report an exit nothing handles.
+        VmExit::Unhandled { reason: exit::INVALID }
     }
 
     fn complete_read(&mut self, value: u64) {
         if let Some(a) = self.pending_mmio.take() {
-            let value = value & (u64::MAX >> (64 - 8 * a.size as u32));
+            let value = value & size_mask(a.size);
             if a.test {
                 // TEST: flags from value & operand; CF and OF clear.
                 let bits = 8 * a.size as u32;
-                let r = value & self.operand_value(&a) & (u64::MAX >> (64 - bits));
+                let r = value & self.operand_value(&a) & size_mask(a.size);
                 let (cf, pf, zf, sf, of) = (1 << 0, 1 << 2, 1 << 6, 1 << 7, 1 << 11);
                 let mut f = self.read64(vmcb::RFLAGS) & !(cf | pf | zf | sf | of);
                 if (r as u8).count_ones() % 2 == 0 {
@@ -935,7 +958,7 @@ impl Vcpu for SvmVcpu {
                 if r == 0 {
                     f |= zf;
                 }
-                if r >> (bits - 1) & 1 != 0 {
+                if r.checked_shr(bits.saturating_sub(1)).unwrap_or(0) & 1 != 0 {
                     f |= sf;
                 }
                 self.write64(vmcb::RFLAGS, f);
@@ -951,7 +974,7 @@ impl Vcpu for SvmVcpu {
                 // 32-bit destinations zero the upper half.
                 self.set_reg(r, value);
             } else {
-                let mask = u64::MAX >> (64 - 8 * a.dest_size as u32);
+                let mask = size_mask(a.dest_size);
                 let old = self.reg(r);
                 self.set_reg(r, (old & !mask) | value);
             }
@@ -960,7 +983,7 @@ impl Vcpu for SvmVcpu {
             return;
         }
         if let Some(size) = self.pending_in.take() {
-            let mask = u64::MAX >> (64 - 8 * size as u32);
+            let mask = size_mask(size);
             // 32-bit results zero the upper half; 8/16-bit ones merge.
             let rax = if size == 4 { value & mask } else { (self.rax() & !mask) | (value & mask) };
             self.write64(vmcb::RAX, rax);

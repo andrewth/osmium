@@ -43,7 +43,7 @@ impl VirtioConsole {
             let n = chain.writable_len().min(self.input.len());
             let bytes: vec::Vec<u8> = self.input.iter().take(n).copied().collect();
             let written = chain.write(ctx.mem(), 0, &bytes).unwrap_or(0);
-            self.input.drain(..written);
+            self.input.drain(..written.min(self.input.len()));
             let _ = ctx.add_used(RX, chain.head, written as u32);
         }
     }
@@ -58,7 +58,7 @@ impl VirtioConsole {
             while at < 64 * 1024
                 && let Ok(n @ 1..) = chain.read(ctx.mem(), at, &mut buf)
             {
-                (self.output)(&buf[..n]);
+                (self.output)(buf.get(..n).unwrap_or_default());
                 at += n;
             }
             let _ = ctx.add_used(TX, chain.head, 0);
@@ -79,7 +79,8 @@ impl VirtioDevice for VirtioConsole {
         // cols, rows (u16 each), max_nr_ports (u32), emerg_wr (u32): 80x25, 1 port.
         let cfg: [u8; 12] = [80, 0, 25, 0, 1, 0, 0, 0, 0, 0, 0, 0];
         for (i, d) in data.iter_mut().enumerate() {
-            *d = cfg.get(offset as usize + i).copied().unwrap_or(0);
+            let at = usize::try_from(offset).ok().and_then(|o| o.checked_add(i));
+            *d = at.and_then(|at| cfg.get(at)).copied().unwrap_or(0);
         }
     }
 

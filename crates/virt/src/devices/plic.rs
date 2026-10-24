@@ -58,7 +58,7 @@ impl VirtualPlic {
 
     /// Size of the register window for `contexts` contexts.
     pub const fn mmio_size(contexts: usize) -> u64 {
-        CONTEXT + CONTEXT_STRIDE * contexts as u64
+        CONTEXT.saturating_add(CONTEXT_STRIDE.saturating_mul(contexts as u64))
     }
 
     /// Drives source `irq`'s input line.
@@ -68,9 +68,13 @@ impl VirtualPlic {
         if i == 0 || i >= s.level.len() {
             return;
         }
-        s.level[i] = level;
-        if level && !s.in_service[i] {
-            s.pending[i] = true;
+        let Some(l) = s.level.get_mut(i) else { return };
+        *l = level;
+        if level
+            && !s.in_service.get(i).copied().unwrap_or(true)
+            && let Some(p) = s.pending.get_mut(i)
+        {
+            *p = true;
         }
         self.update(&mut s);
     }
@@ -84,8 +88,10 @@ impl VirtualPlic {
     fn update(&self, s: &mut State) {
         for ctx in 0..s.asserted.len() {
             let now = s.best(ctx).is_some();
-            if now != s.asserted[ctx] {
-                s.asserted[ctx] = now;
+            if let Some(a) = s.asserted.get_mut(ctx)
+                && now != *a
+            {
+                *a = now;
                 (self.output)(ctx, now);
             }
         }
@@ -97,10 +103,12 @@ impl State {
     /// ties go to the lowest source number.
     fn best(&self, ctx: usize) -> Option<usize> {
         let mut best: Option<(u32, usize)> = None;
-        for i in 1..self.pending.len() {
-            let enabled = self.enable[ctx][i / 32] & (1 << (i % 32)) != 0;
-            let p = self.priority[i];
-            if self.pending[i] && enabled && p > self.threshold[ctx] && best.is_none_or(|(bp, _)| p > bp) {
+        let enable = self.enable.get(ctx)?;
+        let threshold = self.threshold.get(ctx).copied()?;
+        for (i, &pending) in self.pending.iter().enumerate().skip(1) {
+            let enabled = enable.get(i / 32).is_some_and(|w| w & (1 << (i % 32)) != 0);
+            let p = self.priority.get(i).copied().unwrap_or(0);
+            if pending && enabled && p > threshold && best.is_none_or(|(bp, _)| p > bp) {
                 best = Some((p, i));
             }
         }
@@ -123,12 +131,16 @@ impl State {
             o if (o - CONTEXT) / CONTEXT_STRIDE < contexts => {
                 let ctx = ((o - CONTEXT) / CONTEXT_STRIDE) as usize;
                 match (o - CONTEXT) % CONTEXT_STRIDE {
-                    0 => self.threshold[ctx],
+                    0 => self.threshold.get(ctx).copied().unwrap_or(0),
                     4 => {
                         // Claim: the source stops being pending until completed.
                         let Some(i) = self.best(ctx) else { return 0 };
-                        self.pending[i] = false;
-                        self.in_service[i] = true;
+                        if let Some(p) = self.pending.get_mut(i) {
+                            *p = false;
+                        }
+                        if let Some(s) = self.in_service.get_mut(i) {
+                            *s = true;
+                        }
                         i as u32
                     }
                     _ => 0,
@@ -158,14 +170,23 @@ impl State {
             o if (o - CONTEXT) / CONTEXT_STRIDE < contexts => {
                 let ctx = ((o - CONTEXT) / CONTEXT_STRIDE) as usize;
                 match (o - CONTEXT) % CONTEXT_STRIDE {
-                    0 => self.threshold[ctx] = v & 7,
+                    0 => {
+                        if let Some(t) = self.threshold.get_mut(ctx) {
+                            *t = v & 7;
+                        }
+                    }
                     4 => {
                         // Complete: a level still high pends the source again.
                         let i = v as usize;
-                        if i > 0 && i < self.in_service.len() && self.in_service[i] {
-                            self.in_service[i] = false;
-                            if self.level[i] {
-                                self.pending[i] = true;
+                        if i > 0
+                            && let Some(s) = self.in_service.get_mut(i)
+                            && *s
+                        {
+                            *s = false;
+                            if self.level.get(i).copied().unwrap_or(false)
+                                && let Some(p) = self.pending.get_mut(i)
+                            {
+                                *p = true;
                             }
                         }
                     }
@@ -195,7 +216,8 @@ impl BusDevice for VirtualPlic {
             return;
         }
         let mut s = self.state.lock();
-        s.write(offset, u32::from_le_bytes(data.try_into().expect("length checked above")));
+        let &[a, b, c, d] = data else { return };
+        s.write(offset, u32::from_le_bytes([a, b, c, d]));
         self.update(&mut s);
     }
 }
