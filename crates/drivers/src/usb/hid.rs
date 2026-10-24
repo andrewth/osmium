@@ -70,7 +70,7 @@ pub fn usage_to_ascii(usage: u8, shift: bool, ctrl: bool) -> Option<char> {
         }
         0x1e..=0x38 => {
             let i = (usage - 0x1e) as usize;
-            if shift { SHIFTED[i] } else { PLAIN[i] }
+            *(if shift { SHIFTED.get(i) } else { PLAIN.get(i) })?
         }
         _ => return None,
     };
@@ -82,24 +82,25 @@ pub fn usage_to_ascii(usage: u8, shift: bool, ctrl: bool) -> Option<char> {
 /// `out` should hold that many). Reports signalling rollover (every key
 /// slot 0x01) produce nothing.
 pub fn diff(prev: &Report, cur: &Report, out: &mut [KeyEvent]) -> usize {
-    if cur[2..].iter().all(|&k| k == 1) {
+    let ([_, _, prev_keys @ ..], [mods, _, cur_keys @ ..]) = (prev, cur);
+    if cur_keys.iter().all(|&k| k == 1) {
         return 0;
     }
     let mut n = 0;
-    let mut push = |usage, pressed, modifiers| {
-        if n < out.len() {
-            out[n] = KeyEvent { usage, pressed, modifiers };
+    let mut push = |usage, pressed| {
+        if let Some(slot) = out.get_mut(n) {
+            *slot = KeyEvent { usage, pressed, modifiers: *mods };
             n += 1;
         }
     };
-    for &k in &prev[2..] {
-        if k > 1 && !cur[2..].contains(&k) {
-            push(k, false, cur[0]);
+    for &k in prev_keys {
+        if k > 1 && !cur_keys.contains(&k) {
+            push(k, false);
         }
     }
-    for &k in &cur[2..] {
-        if k > 1 && !prev[2..].contains(&k) {
-            push(k, true, cur[0]);
+    for &k in cur_keys {
+        if k > 1 && !prev_keys.contains(&k) {
+            push(k, true);
         }
     }
     n
@@ -168,7 +169,7 @@ impl<H: UsbHost> BootKeyboard<H> {
         if got? < 8 {
             return Ok(None);
         }
-        Ok(Some(buf[..8].try_into().expect("fixed-width slice")))
+        Ok(buf.first_chunk::<8>().copied())
     }
 
     /// The next key event, if any, without waiting.
@@ -178,7 +179,7 @@ impl<H: UsbHost> BootKeyboard<H> {
         {
             self.queued = diff(&self.last, &report, &mut self.queue);
             self.head = 0;
-            if !report[2..].iter().all(|&k| k == 1) {
+            if !report.iter().skip(2).all(|&k| k == 1) {
                 self.last = report;
             }
         }
@@ -187,7 +188,7 @@ impl<H: UsbHost> BootKeyboard<H> {
         }
         self.queued -= 1;
         self.head += 1;
-        Ok(Some(self.queue[self.head - 1]))
+        Ok(self.queue.get(self.head - 1).copied())
     }
 }
 
@@ -242,27 +243,27 @@ mod tests {
             1
         }
         fn port_status(&self, _: u8) -> PortStatus {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn attach(&mut self, _: u8) -> Result<DeviceId, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn detach(&mut self, _: DeviceId) {}
         fn configure_endpoints(&mut self, _: DeviceId, _: &[EndpointDescriptor]) -> Result<(), UsbError> {
             Ok(())
         }
         fn control_in(&mut self, _: DeviceId, _: SetupPacket, _: &mut [u8]) -> Result<usize, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn control_out(&mut self, _: DeviceId, s: SetupPacket, _: &[u8]) -> Result<(), UsbError> {
             self.requests.push((s.request, s.value));
             Ok(())
         }
         fn transfer_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Result<usize, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn transfer_out(&mut self, _: DeviceId, _: u8, _: &[u8]) -> Result<(), UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn submit_in(&mut self, _: DeviceId, ep: u8, len: usize) -> Result<(), UsbError> {
             assert_eq!((ep, len), (0x81, 8));
@@ -316,5 +317,14 @@ mod tests {
         kb.host.reports.push_back(std::vec![0, 0, 0x05, 0, 0, 0, 0, 0]);
         assert_eq!(kb.poll().unwrap().map(|e| (e.usage, e.pressed)), Some((0x05, true)));
         assert_eq!(kb.poll(), Ok(None));
+    }
+
+    #[test]
+    fn every_usage_translates_without_panicking() {
+        for usage in 0..=255u8 {
+            for (shift, ctrl) in [(false, false), (true, false), (false, true), (true, true)] {
+                let _ = usage_to_ascii(usage, shift, ctrl);
+            }
+        }
     }
 }

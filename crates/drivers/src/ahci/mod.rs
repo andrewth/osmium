@@ -206,10 +206,13 @@ impl<'d, D: DmaAllocator + ?Sized> Ahci<'d, D> {
         let mut hba = Self { version: r32(&io, VS), io, dma, cap, pi, ports: core::array::from_fn(|_| None) };
         for i in 0..MAX_PORTS {
             if pi & 1 << i != 0 {
-                hba.ports[i] = match Port::probe(&hba.io, i as u8, cap, dma, clock) {
+                let probed = match Port::probe(&hba.io, i as u8, cap, dma, clock) {
                     Err(AhciError::Timeout) => None,
                     other => other?,
                 };
+                if let Some(slot) = hba.ports.get_mut(i) {
+                    *slot = probed;
+                }
             }
         }
         w32(&hba.io, HBA_IS, r32(&hba.io, HBA_IS));
@@ -283,7 +286,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ahci<'d, D> {
             Some(DeviceKind::Atapi) => {}
             Some(_) => return Err(AhciError::Unsupported),
         }
-        AhciAtapi::new(slot.take().expect("checked above"), self.dma)
+        let port = slot.take().ok_or(AhciError::NoDevice)?;
+        AhciAtapi::new(port, self.dma)
     }
 
     /// Takes the disk on `port`: identifies it and returns a block device
@@ -296,7 +300,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ahci<'d, D> {
             Some(DeviceKind::Ata) => {}
             Some(_) => return Err(AhciError::Unsupported),
         }
-        AhciDisk::new(slot.take().expect("checked above"), self.dma)
+        let port = slot.take().ok_or(AhciError::NoDevice)?;
+        AhciDisk::new(port, self.dma)
     }
 }
 

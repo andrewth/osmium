@@ -178,7 +178,7 @@ pub struct Hub<H: UsbHost> {
 }
 
 fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
+    b.get(at..).and_then(|s| s.first_chunk::<2>()).map_or(0, |c| u16::from_le_bytes(*c))
 }
 
 impl<H: UsbHost> Hub<H> {
@@ -217,10 +217,10 @@ impl<H: UsbHost> Hub<H> {
         let mut d = [0u8; 16];
         let n = host.control_in(dev, setup, &mut d)?;
         let min = if super_speed { 10 } else { 7 };
-        if n < min || (d[0] as usize) < min || d[1] != ty {
+        let [len, kind, ports, _, _, pwr_on, ..] = d;
+        if n < min || (len as usize) < min || kind != ty {
             return Err(UsbError::BadDescriptor);
         }
-        let ports = d[2];
         if ports == 0 {
             return Err(UsbError::BadDescriptor);
         }
@@ -241,7 +241,7 @@ impl<H: UsbHost> Hub<H> {
             dev,
             ports,
             super_speed,
-            power_on_ms: d[5] as u32 * 2,
+            power_on_ms: pwr_on as u32 * 2,
             status_ep,
             armed: false,
             pending: PortSet(0),
@@ -403,13 +403,13 @@ impl<H: UsbHost> Hub<H> {
     fn service_port(&mut self, port: u8) -> Result<Option<PortEvent>, UsbError> {
         let state = self.port_state(port)?;
         self.clear_changes(port, state)?;
-        let slot = port as usize - 1;
-        let had = self.children[slot];
-        if state.connected() && had.is_some() && !state.connect_changed() {
+        let slot = (port as usize).checked_sub(1).ok_or(UsbError::NoDevice)?;
+        let child = self.children.get_mut(slot).ok_or(UsbError::NoDevice)?;
+        if state.connected() && child.is_some() && !state.connect_changed() {
             return Ok(None);
         }
         // Gone, or gone and back: the old device's resources are released.
-        if let Some(old) = self.children[slot].take() {
+        if let Some(old) = child.take() {
             self.host.detach(old);
             if state.connected() {
                 // Re-attach below; report the departure on the next round.
@@ -423,7 +423,9 @@ impl<H: UsbHost> Hub<H> {
         }
         Ok(Some(match self.attach_port(port) {
             Ok((device, speed)) => {
-                self.children[slot] = Some(device);
+                if let Some(c) = self.children.get_mut(slot) {
+                    *c = Some(device);
+                }
                 PortEvent::Connected { port, device, speed }
             }
             Err(error) => PortEvent::Failed { port, error },
@@ -466,10 +468,10 @@ mod tests {
             1
         }
         fn port_status(&self, _: u8) -> PortStatus {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn attach(&mut self, _: u8) -> Result<DeviceId, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn detach(&mut self, dev: DeviceId) {
             self.detached.push(dev);
@@ -528,10 +530,10 @@ mod tests {
             Ok(())
         }
         fn transfer_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Result<usize, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn transfer_out(&mut self, _: DeviceId, _: u8, _: &[u8]) -> Result<(), UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn submit_in(&mut self, _: DeviceId, ep: u8, len: usize) -> Result<(), UsbError> {
             assert_eq!((ep, len), (0x81, 1));

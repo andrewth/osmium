@@ -36,7 +36,7 @@ fn with_disk(
     drop((disk, ahci));
     assert_eq!(dma.live.get(), 0);
     let hba = fake::uninstall();
-    let FakeDev::Disk { data, .. } = &hba.ports[0].dev.as_ref().unwrap() else { unreachable!() };
+    let FakeDev::Disk { data, .. } = &hba.ports[0].dev.as_ref().unwrap() else { panic!("wrong fake device kind") };
     (hba.log, data.clone())
 }
 
@@ -259,7 +259,7 @@ fn with_cd(dev: FakeDev, body: impl FnOnce(&mut super::AhciAtapi<'_, HostDma>)) 
     drop((cd, ahci));
     assert_eq!(dma.live.get(), 0);
     let hba = fake::uninstall();
-    let FakeDev::Atapi(cd) = hba.ports[0].dev.as_ref().unwrap() else { unreachable!() };
+    let FakeDev::Atapi(cd) = hba.ports[0].dev.as_ref().unwrap() else { panic!("wrong fake device kind") };
     (hba.log, cd.scsi.clone())
 }
 
@@ -308,7 +308,7 @@ fn atapi_without_dma_uses_pio_and_a_drive_can_be_empty_or_change() {
         assert_eq!(cd.read_blocks(0, &mut [0; 2048]), Err(BlockError::OutOfRange));
         // The new disc answers its first command with a unit attention.
         fake::with(|f| {
-            let FakeDev::Atapi(c) = f.ports[0].dev.as_mut().unwrap() else { unreachable!() };
+            let FakeDev::Atapi(c) = f.ports[0].dev.as_mut().unwrap() else { panic!("wrong fake device kind") };
             c.disc = Some(disc(10));
             c.attention = true;
         });
@@ -322,7 +322,7 @@ fn atapi_without_dma_uses_pio_and_a_drive_can_be_empty_or_change() {
 
         // Disc removed again.
         fake::with(|f| {
-            let FakeDev::Atapi(c) = f.ports[0].dev.as_mut().unwrap() else { unreachable!() };
+            let FakeDev::Atapi(c) = f.ports[0].dev.as_mut().unwrap() else { panic!("wrong fake device kind") };
             c.disc = None;
         });
         cd.reload().unwrap();
@@ -338,7 +338,7 @@ fn atapi_without_dma_uses_pio_and_a_drive_can_be_empty_or_change() {
 fn atapi_errors_recover_the_port() {
     let (log, _) = with_cd(FakeDev::atapi(Some(disc(100))), |cd| {
         fake::with(|f| {
-            let FakeDev::Atapi(c) = f.ports[0].dev.as_mut().unwrap() else { unreachable!() };
+            let FakeDev::Atapi(c) = f.ports[0].dev.as_mut().unwrap() else { panic!("wrong fake device kind") };
             c.fail_from = 50;
         });
         let mut buf = vec![0u8; 4 * 2048];
@@ -347,7 +347,7 @@ fn atapi_errors_recover_the_port() {
         fake::with(|f| assert_eq!(f.port_reg(0, SERR), 0));
         // Not ready for a while: loading retries.
         fake::with(|f| {
-            let FakeDev::Atapi(c) = f.ports[0].dev.as_mut().unwrap() else { unreachable!() };
+            let FakeDev::Atapi(c) = f.ports[0].dev.as_mut().unwrap() else { panic!("wrong fake device kind") };
             c.not_ready = 2;
         });
         cd.reload().unwrap();

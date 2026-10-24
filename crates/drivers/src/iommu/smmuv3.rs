@@ -104,7 +104,8 @@ struct Buffers<'d, D: DmaAllocator + ?Sized> {
 }
 
 struct State<'d, D: DmaAllocator + ?Sized> {
-    buffers: Option<Buffers<'d, D>>,
+    /// Freed in `drop` only once the unit has stopped using them.
+    buffers: ManuallyDrop<Buffers<'d, D>>,
     /// Command queue producer index with wrap bit.
     prod: u32,
     enabled: bool,
@@ -183,6 +184,11 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Smmuv3<'d, D> {
             commands: OwnedDma::new(dma, QUEUE_BYTES).ok_or(IommuError::OutOfMemory)?,
             events: OwnedDma::new(dma, QUEUE_BYTES).ok_or(IommuError::OutOfMemory)?,
         };
+        let (strtab_addr, commands_addr, events_addr) = (
+            buffers.strtab.device_addr().as_u64(),
+            buffers.commands.device_addr().as_u64(),
+            buffers.events.device_addr().as_u64(),
+        );
         let unit = Self {
             regs,
             clock,
@@ -195,7 +201,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Smmuv3<'d, D> {
             cmdq_log2,
             evtq_log2,
             timeout_ns: DEFAULT_TIMEOUT_NS,
-            state: IrqSpinLock::new(State { buffers: None, prod: 0, enabled: false }),
+            state: IrqSpinLock::new(State { buffers: ManuallyDrop::new(buffers), prod: 0, enabled: false }),
         };
         // Reconfiguration needs the unit off.
         unit.set_cr0(0)?;
@@ -207,17 +213,14 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Smmuv3<'d, D> {
         unit.wait(|| unit.regs.r32(GBPA) & GBPA_UPDATE == 0)?;
         unit.regs.w32(CR1, CR1_COHERENT);
         unit.regs.w32(CR2, CR2_RECINVSID);
-        unit.regs.w64(STRTAB_BASE, buffers.strtab.device_addr().as_u64() & ADDR_MASK_4 & !0x3f | BASE_RA);
+        unit.regs.w64(STRTAB_BASE, strtab_addr & ADDR_MASK_4 & !0x3f | BASE_RA);
         unit.regs.w32(STRTAB_BASE_CFG, stream_log2);
-        unit.regs
-            .w64(CMDQ_BASE, buffers.commands.device_addr().as_u64() & ADDR_MASK_4 & !0x1f | BASE_RA | cmdq_log2 as u64);
+        unit.regs.w64(CMDQ_BASE, commands_addr & ADDR_MASK_4 & !0x1f | BASE_RA | cmdq_log2 as u64);
         unit.regs.w32(CMDQ_PROD, 0);
         unit.regs.w32(CMDQ_CONS, 0);
-        unit.regs
-            .w64(EVENTQ_BASE, buffers.events.device_addr().as_u64() & ADDR_MASK_4 & !0x1f | BASE_RA | evtq_log2 as u64);
+        unit.regs.w64(EVENTQ_BASE, events_addr & ADDR_MASK_4 & !0x1f | BASE_RA | evtq_log2 as u64);
         unit.regs.w32(EVENTQ_PROD, 0);
         unit.regs.w32(EVENTQ_CONS, 0);
-        unit.state.lock().buffers = Some(buffers);
         unit.set_cr0(CR0_CMDQEN)?;
         {
             let mut st = unit.state.lock();
@@ -254,7 +257,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Smmuv3<'d, D> {
     }
 
     fn buffers<'st>(st: &'st State<'d, D>) -> &'st Buffers<'d, D> {
-        st.buffers.as_ref().expect("buffers exist after new")
+        &st.buffers
     }
 
     fn stream_id(&self, device: DeviceId) -> Result<u32, IommuError> {
@@ -409,7 +412,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Smmuv3<'_, D> {
         // Advance, and acknowledge an overflow the unit flagged (bit 31).
         // The slot is the unit's again once CONS moves: finish reading first.
         barrier::mb();
-        self.regs.w32(EVENTQ_CONS, (prod & 1 << 31) | (cons + 1) & mask);
+        self.regs.w32(EVENTQ_CONS, (prod & 1 << 31) | cons.wrapping_add(1) & mask);
         let sid = ((q0 >> 32) as u32).wrapping_sub(self.stream_offset);
         Some(Fault {
             device: DeviceId::new(self.segment, Address::new((sid >> 8) as u8, (sid >> 3) as u8 & 31, sid as u8 & 7)),
@@ -424,11 +427,11 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Smmuv3<'_, D> {
 impl<D: DmaAllocator + Sync + ?Sized> Drop for Smmuv3<'_, D> {
     fn drop(&mut self) {
         let mut st = self.state.lock();
-        let buffers = ManuallyDrop::new(st.buffers.take());
         let stopped = self.set_cr0(0).is_ok();
         // A unit that will not stop may still read its tables: leak them.
         if stopped {
-            drop(ManuallyDrop::into_inner(buffers));
+            // SAFETY: dropped once, here; the unit no longer uses them.
+            unsafe { ManuallyDrop::drop(&mut st.buffers) };
         }
     }
 }
@@ -570,7 +573,7 @@ mod tests {
                 }
                 table = e & 0x0000_ffff_ffff_f000;
             }
-            unreachable!()
+            panic!("walk did not terminate")
         }
 
         fn vmid_of(&self, sid: u32) -> u64 {

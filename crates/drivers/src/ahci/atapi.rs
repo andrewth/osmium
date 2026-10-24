@@ -64,7 +64,7 @@ impl<'d, D: DmaAllocator + ?Sized> AhciAtapi<'d, D> {
         port.exec(Command { command: IDENTIFY_PACKET_DEVICE, len: IDENTIFY_LEN, ..Command::default() })?;
         let mut id = [0u8; IDENTIFY_LEN];
         port.data()?.read(0, &mut id);
-        let word = |i: usize| u16::from_le_bytes([id[2 * i], id[2 * i + 1]]);
+        let word = |i: usize| id.get(2 * i..).and_then(|b| b.first_chunk::<2>()).map_or(0, |&b| u16::from_le_bytes(b));
 
         let general = word(ID_GENERAL);
         // Only optical drives are handled. Packets are built 16 bytes long,
@@ -74,7 +74,7 @@ impl<'d, D: DmaAllocator + ?Sized> AhciAtapi<'d, D> {
         }
         // ATA strings hold two characters per word, high byte first.
         let string = |first: usize, out: &mut [u8]| {
-            for (i, pair) in out.chunks_mut(2).enumerate() {
+            for (i, pair) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 pair.copy_from_slice(&word(first + i).to_be_bytes());
             }
         };
@@ -107,7 +107,9 @@ impl<'d, D: DmaAllocator + ?Sized> AhciAtapi<'d, D> {
     /// the bounce buffer at 0 (for `len` 0, none).
     fn packet(&mut self, cdb: &[u8], len: usize) -> Result<(), AhciError> {
         let mut packet = [0u8; 16];
-        packet[..cdb.len()].copy_from_slice(cdb);
+        for (dst, src) in packet.iter_mut().zip(cdb) {
+            *dst = *src;
+        }
         let cmd = Command {
             command: PACKET,
             // Features bit 0: the data moves by DMA. The byte count limit

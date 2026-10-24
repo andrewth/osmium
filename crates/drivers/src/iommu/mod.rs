@@ -36,6 +36,7 @@ mod testing;
 
 use core::ptr::NonNull;
 
+use crate::ioext::IoMemExt;
 use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
 use osmium_hal::iommu::IommuError;
 use osmium_hal::mmio::IoMem;
@@ -46,9 +47,9 @@ use osmium_mm::PhysAddr;
 /// a command or state change.
 pub const DEFAULT_TIMEOUT_NS: u64 = 1_000_000_000;
 
-/// A register window with checked, infallible-looking accessors: the window
-/// length is verified once at construction, so reads and writes inside the
-/// registers a driver uses cannot fail.
+/// A register window with infallible accessors: the window length is
+/// verified once at construction; an access outside it reads as all ones and
+/// a write is dropped.
 pub(crate) struct Regs(IoMem);
 
 impl Regs {
@@ -62,19 +63,19 @@ impl Regs {
     }
 
     pub(crate) fn r32(&self, off: usize) -> u32 {
-        self.0.read(off).expect("register inside the checked window")
+        self.0.rd(off)
     }
 
     pub(crate) fn r64(&self, off: usize) -> u64 {
-        self.0.read(off).expect("register inside the checked window")
+        self.0.rd(off)
     }
 
     pub(crate) fn w32(&self, off: usize, v: u32) {
-        self.0.write(off, v).expect("register inside the checked window")
+        self.0.wr(off, v)
     }
 
     pub(crate) fn w64(&self, off: usize, v: u64) {
-        self.0.write(off, v).expect("register inside the checked window")
+        self.0.wr(off, v)
     }
 }
 
@@ -112,13 +113,16 @@ const SLOT_LEN: usize = 16;
 impl<'d, D: DmaAllocator + ?Sized> Pages<'d, D> {
     /// An empty set of `slots` slots.
     pub(crate) fn new(dma: &'d D, slots: usize) -> Result<Self, IommuError> {
-        let index = OwnedDma::new(dma, slots * SLOT_LEN).ok_or(IommuError::OutOfMemory)?;
+        let index = OwnedDma::new(dma, slots.checked_mul(SLOT_LEN).ok_or(IommuError::OutOfMemory)?)
+            .ok_or(IommuError::OutOfMemory)?;
         Ok(Self { dma, index, slots })
     }
 
     /// The page in slot `slot`, if one was allocated.
     pub(crate) fn get(&self, slot: usize) -> Option<DmaBuffer> {
-        assert!(slot < self.slots);
+        if slot >= self.slots {
+            return None;
+        }
         let cpu = NonNull::new(self.index.load::<u64>(slot * SLOT_LEN) as *mut u8)?;
         let device = PhysAddr::new(self.index.load::<u64>(slot * SLOT_LEN + 8));
         // SAFETY: recorded by `get_or_alloc` from a buffer this set owns and
@@ -131,6 +135,9 @@ impl<'d, D: DmaAllocator + ?Sized> Pages<'d, D> {
     pub(crate) fn get_or_alloc(&self, slot: usize) -> Result<(DmaBuffer, bool), IommuError> {
         if let Some(page) = self.get(slot) {
             return Ok((page, false));
+        }
+        if slot >= self.slots {
+            return Err(IommuError::OutOfRange);
         }
         let page = self.dma.alloc_coherent(PAGE_LEN).ok_or(IommuError::OutOfMemory)?;
         self.index.store::<u64>(slot * SLOT_LEN, page.cpu_ptr().as_ptr() as u64);

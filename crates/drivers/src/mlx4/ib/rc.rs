@@ -257,7 +257,7 @@ fn with_setup<R>(params: Option<&RcParams>, port: u32, log_msg: u32, f: impl FnO
             c.set(10, 16, 8, r.sgid_index as u32).set(10, 0, 8, r.hop_limit as u32);
             c.set(11, 0, 32, (r.traffic_class as u32) << 20 | r.flow_label & 0xf_ffff);
             for i in 0..4 {
-                c.set(12 + i, 0, 32, u32::from_be_bytes(r.dgid.0[4 * i..4 * i + 4].try_into().expect("4 bytes")));
+                c.set(12 + i, 0, 32, crate::mlx4::mad::be32(&r.dgid.0, 4 * i));
             }
         }
         c.set(16, 24, 8, (port - 1) << 6 | 0x83 | (p.sl as u32 & 0xf) << 2);
@@ -326,7 +326,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         with_setup(None, port as u32, log_msg, |s| rc.q.qp_init(s))?;
         rc.q.arm_cq();
         let info = RcInfo { qpn: rc.q.qpn, window: RcWindow { addr, rkey, len: WINDOW_LEN } };
-        self.rc[n] = Some(rc);
+        if let Some(entry) = self.rc.get_mut(n) {
+            *entry = Some(rc);
+        }
         Ok((RcId(n as u8), info))
     }
 
@@ -336,7 +338,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         let (hca, port, port_mtu, gids) = (self.ud.hca, self.ud.port, self.mtu, self.gids);
         let p = params;
         let route_ok = p.route.is_none_or(|r| (r.sgid_index as u16) < gids);
-        let fits = |n: u8, log: u32| u32::from(n) <= 1 << log;
+        let fits = |n: u8, log: u32| 1u32.checked_shl(log).is_some_and(|max| u32::from(n) <= max);
         if p.path_mtu == 0
             || p.path_mtu > port_mtu
             || p.sl > 15
@@ -419,7 +421,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         let size = ((at + SEG_LEN - wqe) / SEG_LEN) as u32;
         put32(wq, wqe + 4, size);
         rc.q.finish_send(wqe, opcode);
-        rc.ops[rc.posted as usize % TX_SLOTS as usize] = op;
+        if let Some(entry) = rc.ops.get_mut(rc.posted as usize % TX_SLOTS as usize) {
+            *entry = op;
+        }
         rc.posted = rc.posted.wrapping_add(1);
         Ok(())
     }
@@ -450,12 +454,13 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         if rc.reported != rc.q.tx_done {
             let n = rc.reported;
             rc.reported = n.wrapping_add(1);
-            let syndrome = rc.q.tx_syndrome[n as usize % SQ_ENTRIES as usize];
+            let syndrome = rc.q.tx_syndrome.get(n as usize % SQ_ENTRIES as usize).copied().unwrap_or(0);
             if syndrome != 0 {
                 rc.state = RcState::Failed;
                 return Some(RcEvent::Failed(RcFailure::from_syndrome(syndrome)));
             }
-            return Some(match rc.ops[n as usize % TX_SLOTS as usize] {
+            let op = rc.ops.get(n as usize % TX_SLOTS as usize).copied().unwrap_or(Op::Send);
+            return Some(match op {
                 Op::Send => RcEvent::Sent,
                 Op::Write => RcEvent::Written,
                 Op::Read { len } => match buf.get_mut(..len) {

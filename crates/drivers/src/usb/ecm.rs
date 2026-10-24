@@ -149,12 +149,12 @@ pub(super) fn parse_cdc(config: &[u8], subclass: u8, mut functional: impl FnMut(
                     }
                 }
             }
-            Descriptor::Other(d) if in_control && d[1] == CS_INTERFACE && d.len() >= 3 => {
+            Descriptor::Other(d) if in_control && d.get(1) == Some(&CS_INTERFACE) && d.len() >= 3 => {
                 functional(d);
-                match d[2] {
-                    SUBTYPE_UNION if d.len() >= 5 && union_data.is_none() => union_data = Some(d[4]),
-                    SUBTYPE_ETHERNET if d.len() >= 13 && ethernet.is_none() => {
-                        ethernet = Some((d[3], u16::from_le_bytes([d[8], d[9]])));
+                match *d {
+                    [_, _, SUBTYPE_UNION, _, data_if, ..] if union_data.is_none() => union_data = Some(data_if),
+                    [_, _, SUBTYPE_ETHERNET, mac, _, _, _, _, s0, s1, _, _, _, ..] if ethernet.is_none() => {
+                        ethernet = Some((mac, u16::from_le_bytes([s0, s1])));
                     }
                     _ => {}
                 }
@@ -180,19 +180,19 @@ pub(super) fn parse_cdc(config: &[u8], subclass: u8, mut functional: impl FnMut(
 /// Parses a string descriptor holding a MAC address as 12 hexadecimal
 /// UTF-16 characters (`"525400123456"`, upper or lower case).
 pub fn parse_mac_string(descriptor: &[u8]) -> Option<MacAddress> {
-    if descriptor.len() < 2 + 24 || descriptor[1] != descriptor_type::STRING || descriptor[0] as usize != 2 + 24 {
+    let [len, kind, chars @ ..] = descriptor else { return None };
+    if *kind != descriptor_type::STRING || *len as usize != 2 + 24 || chars.len() < 24 {
         return None;
     }
+    let mut digits = chars.as_chunks::<2>().0.iter().map(|c| match *c {
+        [c, 0] => (c as char).to_digit(16),
+        _ => None,
+    });
     let mut mac = [0u8; 6];
-    for (i, byte) in mac.iter_mut().enumerate() {
-        let digit = |k: usize| {
-            let at = 2 + (i * 2 + k) * 2;
-            match (descriptor[at], descriptor[at + 1]) {
-                (c, 0) => (c as char).to_digit(16),
-                _ => None,
-            }
-        };
-        *byte = (digit(0)? << 4 | digit(1)?) as u8;
+    for byte in mac.iter_mut() {
+        let hi = digits.next()??;
+        let lo = digits.next()??;
+        *byte = (hi << 4 | lo) as u8;
     }
     Some(MacAddress(mac))
 }
@@ -209,11 +209,9 @@ pub enum Notification {
 /// Parses the 8-byte header of a notification.
 pub fn parse_notification(b: &[u8]) -> Option<Notification> {
     // bmRequestType 0xa1 (class, interface, device to host).
-    if b.len() < 8 || b[0] != 0xa1 {
-        return None;
-    }
-    Some(match b[1] {
-        NETWORK_CONNECTION => Notification::NetworkConnection(u16::from_le_bytes([b[2], b[3]]) != 0),
+    let [0xa1, code, v0, v1, _, _, _, _, ..] = *b else { return None };
+    Some(match code {
+        NETWORK_CONNECTION => Notification::NetworkConnection(u16::from_le_bytes([v0, v1]) != 0),
         code => Notification::Other(code),
     })
 }
@@ -255,7 +253,7 @@ impl<H: UsbHost> UsbEthernet<H> {
     pub fn new(mut host: H, dev: DeviceId, config: &[u8]) -> Result<Self, UsbError> {
         let function = EcmFunction::parse(config).ok_or(UsbError::BadDescriptor)?;
         let mps = (function.bulk_in.max_packet_size() as usize).max(1);
-        let rx_len = (function.max_segment as usize).div_ceil(mps).saturating_mul(mps).clamp(mps, RX_BUF_LEN);
+        let rx_len = (function.max_segment as usize).div_ceil(mps).saturating_mul(mps).max(mps).min(RX_BUF_LEN);
         if rx_len < function.max_segment as usize {
             // A frame longer than a transfer would be split, and its tail
             // taken for a frame of its own.
@@ -329,7 +327,7 @@ impl<H: UsbHost> UsbEthernet<H> {
             {
                 self.notify_submitted = false;
                 if let Ok(n) = done
-                    && let Some(Notification::NetworkConnection(up)) = parse_notification(&note[..n.min(16)])
+                    && let Some(Notification::NetworkConnection(up)) = note.get(..n).and_then(parse_notification)
                 {
                     self.link = up;
                 }
@@ -345,7 +343,7 @@ impl<H: UsbHost> UsbEthernet<H> {
         }
         if let Some(done) = self.host.poll_in(self.dev, ep, &mut self.rx) {
             self.rx_submitted = false;
-            let n = done.map_err(bad)?;
+            let n = done.map_err(bad)?.min(self.rx.len());
             // An empty packet terminates a frame that filled its last
             // packet; it carries nothing.
             if n > 0 {
@@ -363,9 +361,12 @@ pub(super) fn read_mac<H: UsbHost>(host: &mut H, dev: DeviceId, index: u8) -> Re
     let get =
         |index, lang| SetupPacket { index: lang, ..SetupPacket::get_descriptor(descriptor_type::STRING, index, 255) };
     let n = host.control_in(dev, get(0, 0), &mut buf)?;
-    let lang = if n >= 4 && buf[1] == descriptor_type::STRING { u16::from_le_bytes([buf[2], buf[3]]) } else { 0x0409 };
+    let lang = match buf.get(..n) {
+        Some(&[_, descriptor_type::STRING, l0, l1, ..]) => u16::from_le_bytes([l0, l1]),
+        _ => 0x0409,
+    };
     let n = host.control_in(dev, get(index, lang), &mut buf)?;
-    parse_mac_string(&buf[..n]).ok_or(UsbError::BadDescriptor)
+    buf.get(..n).and_then(parse_mac_string).ok_or(UsbError::BadDescriptor)
 }
 
 impl<H: UsbHost> NetDevice for UsbEthernet<H> {
@@ -401,10 +402,13 @@ impl<H: UsbHost> NetDevice for UsbEthernet<H> {
     fn receive(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
         self.service()?;
         let n = self.rx_frame.take().ok_or(NetError::WouldBlock)?;
-        let fits = buf.len() >= n;
-        if fits {
-            buf[..n].copy_from_slice(&self.rx[..n]);
-        }
+        let fits = match (buf.get_mut(..n), self.rx.get(..n)) {
+            (Some(dst), Some(src)) => {
+                dst.copy_from_slice(src);
+                true
+            }
+            _ => false,
+        };
         // Start the next transfer before the caller digests this frame (and
         // after the copy: it may complete into the same buffer).
         let next = self.service();
@@ -543,10 +547,10 @@ mod tests {
             1
         }
         fn port_status(&self, _: u8) -> PortStatus {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn attach(&mut self, _: u8) -> Result<DeviceId, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn detach(&mut self, _: DeviceId) {}
         fn configure_endpoints(&mut self, _: DeviceId, eps: &[EndpointDescriptor]) -> Result<(), UsbError> {
@@ -572,7 +576,7 @@ mod tests {
             if s.request == SET_ETHERNET_PACKET_FILTER && self.reject_filter { Err(UsbError::Stall) } else { Ok(()) }
         }
         fn transfer_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Result<usize, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn transfer_out(&mut self, _: DeviceId, ep: u8, data: &[u8]) -> Result<(), UsbError> {
             assert_eq!(ep, 0x02);
@@ -728,5 +732,28 @@ mod tests {
         eth.service().unwrap();
         assert!(eth.link_up());
         eth.transmit(&[0; 60]).unwrap();
+    }
+
+    #[test]
+    fn hostile_descriptors_never_panic() {
+        let mut mac = std::vec![26u8, descriptor_type::STRING];
+        for c in "525400123456".encode_utf16() {
+            mac.extend(c.to_le_bytes());
+        }
+        assert!(parse_mac_string(&mac).is_some());
+        for n in 0..mac.len() {
+            assert_eq!(parse_mac_string(&mac[..n]), None);
+        }
+        for n in 0..8 {
+            assert_eq!(parse_notification(&[0xa1, 0, 1, 0, 0, 0, 0, 0][..n]), None);
+        }
+        // A configuration whose functional descriptors are cut short.
+        let mut cfg = std::vec![9u8, 4, 0, 0, 1, 2, 6, 0, 0];
+        cfg.extend([5, 0x24, 0x06, 0]);
+        cfg.extend([13, 0x24, 0x0f, 4, 0, 0, 0]);
+        cfg.extend([4, 0x24]);
+        for n in 0..=cfg.len() {
+            assert_eq!(EcmFunction::parse(&cfg[..n]), None);
+        }
     }
 }

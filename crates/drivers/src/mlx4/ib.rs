@@ -110,19 +110,25 @@ impl Gid {
     /// The GID made of a subnet prefix and an interface ID.
     pub fn new(prefix: u64, guid: u64) -> Self {
         let mut gid = [0; 16];
-        gid[..8].copy_from_slice(&prefix.to_be_bytes());
-        gid[8..].copy_from_slice(&guid.to_be_bytes());
+        mad::put(&mut gid, 0, &prefix.to_be_bytes());
+        mad::put(&mut gid, 8, &guid.to_be_bytes());
         Self(gid)
     }
 
     /// The subnet prefix.
     pub fn prefix(&self) -> u64 {
-        u64::from_be_bytes(self.0[..8].try_into().expect("8 bytes"))
+        self.0.first_chunk::<8>().map_or(0, |b| u64::from_be_bytes(*b))
     }
 
     /// The interface ID.
     pub fn guid(&self) -> u64 {
-        u64::from_be_bytes(self.0[8..].try_into().expect("8 bytes"))
+        self.0.last_chunk::<8>().map_or(0, |b| u64::from_be_bytes(*b))
+    }
+
+    /// The 16 bytes at `at` of `raw`; all zero if they are not there.
+    fn read(raw: &[u8], at: usize) -> Self {
+        let bytes = at.checked_add(16).and_then(|end| raw.get(at..end));
+        Self(bytes.and_then(|b| b.first_chunk::<16>()).copied().unwrap_or([0; 16]))
     }
 }
 
@@ -403,15 +409,17 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Special<'h, 'd, D> {
         // does not fit up to the next one takes two.
         let inline = wqe + SEG_LEN;
         let room = 64 - ((inline + 4) % 64);
+        let header_bytes = packed.get(..n).unwrap_or_default();
         let seg_len = if n <= room {
             put32(wq, inline, INLINE | n as u32);
-            wq.write(inline + 4, &packed[..n]);
+            wq.write(inline + 4, header_bytes);
             (4 + n).next_multiple_of(16)
         } else {
+            let (head, tail) = header_bytes.split_at_checked(room).unwrap_or_default();
             put32(wq, inline, INLINE | room as u32);
-            wq.write(inline + 4, &packed[..room]);
+            wq.write(inline + 4, head);
             let second = inline + 4 + room;
-            wq.write(second + 4, &packed[room..n]);
+            wq.write(second + 4, tail);
             put32(wq, second, INLINE | (n - room) as u32);
             (8 + n).next_multiple_of(16)
         };
@@ -675,7 +683,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
 
     /// The virtual lane service level `sl` maps to.
     fn vl_for(&self, sl: u8) -> u8 {
-        let both = self.sl2vl[(sl >> 1 & 7) as usize];
+        let both = self.sl2vl.get((sl >> 1 & 7) as usize).copied().unwrap_or(0);
         if sl & 1 != 0 { both & 0xf } else { both >> 4 }
     }
 
@@ -742,9 +750,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
                 GrhFields {
                     traffic_class: (first >> 20) as u8,
                     flow_label: first & 0xf_ffff,
-                    hop_limit: raw[7],
-                    source: raw[24..40].try_into().expect("16 bytes"),
-                    dest: raw[8..24].try_into().expect("16 bytes"),
+                    hop_limit: raw.get(7).copied().unwrap_or(0),
+                    source: Gid::read(&raw, 24).0,
+                    dest: Gid::read(&raw, 8).0,
                 }
             }),
         }
@@ -896,12 +904,11 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
     fn read_grh(&self, slot: u16) -> GlobalHeader {
         let mut raw = [0u8; GRH_LEN];
         self.ud.read_rx(slot, 0, &mut raw);
-        let first = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        let gid = |at: usize| Gid(raw[at..at + 16].try_into().expect("16 bytes"));
+        let first = mad::be32(&raw, 0);
         GlobalHeader {
-            src: gid(8),
-            dst: gid(24),
-            hop_limit: raw[7],
+            src: Gid::read(&raw, 8),
+            dst: Gid::read(&raw, 24),
+            hop_limit: raw.get(7).copied().unwrap_or(0),
             traffic_class: (first >> 20) as u8,
             flow_label: first & 0xf_ffff,
         }
@@ -926,7 +933,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         }
         let slot = self.groups.iter().position(Option::is_none).ok_or(Mlx4Error::Multicast)?;
         self.update_group(mgid, true)?;
-        self.groups[slot] = Some(mgid);
+        if let Some(g) = self.groups.get_mut(slot) {
+            *g = Some(mgid);
+        }
         Ok(())
     }
 
@@ -934,7 +943,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
     pub fn detach_multicast(&mut self, mgid: Gid) -> Result<(), Mlx4Error> {
         let slot = self.groups.iter().position(|g| *g == Some(mgid)).ok_or(Mlx4Error::Multicast)?;
         self.update_group(mgid, false)?;
-        self.groups[slot] = None;
+        if let Some(g) = self.groups.get_mut(slot) {
+            *g = None;
+        }
         Ok(())
     }
 
@@ -944,7 +955,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         let hcr = &self.ud.hca.hcr;
         let mut key = Ctx::new();
         for i in 0..4 {
-            key.set(i, 0, 32, u32::from_be_bytes(mgid.0[4 * i..4 * i + 4].try_into().expect("4 bytes")));
+            key.set(i, 0, 32, mad::be32(&mgid.0, 4 * i));
         }
         let index = (hcr.exec(op::MGID_HASH, 0, 0, Input::Mailbox(&key, 16))? & 0xffff) as u32;
         if index >= 1 << LOG_NUM_MCGS {
@@ -967,7 +978,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         for (i, m) in members.iter_mut().enumerate().take(count) {
             *m = entry.dword(8 + i) & 0xff_ffff;
         }
-        let found = members[..count].iter().position(|&m| m == self.ud.qpn);
+        let found = members.iter().take(count).position(|&m| m == self.ud.qpn);
         if attach {
             if found.is_some() {
                 return Ok(());
@@ -975,13 +986,18 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
             if count == MCG_QPS {
                 return Err(Mlx4Error::Multicast);
             }
-            members[count] = self.ud.qpn;
+            *members.get_mut(count).ok_or(Mlx4Error::Multicast)? = self.ud.qpn;
             count += 1;
         } else {
             let at = found.ok_or(Mlx4Error::Multicast)?;
-            count -= 1;
-            members[at] = members[count];
-            members[count] = 0;
+            count = count.saturating_sub(1);
+            let last = members.get(count).copied().unwrap_or(0);
+            if let Some(m) = members.get_mut(at) {
+                *m = last;
+            }
+            if let Some(m) = members.get_mut(count) {
+                *m = 0;
+            }
         }
 
         // An empty entry is all zeros, so its bucket can be taken by any group.

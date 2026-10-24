@@ -81,26 +81,26 @@ pub fn transaction(counter: u32) -> u64 {
 /// partition `pkey`.
 pub fn join_request(tid: u64, mgid: Gid, port_gid: Gid, pkey: u16) -> [u8; MAD_LEN] {
     let mut m = [0u8; MAD_LEN];
-    m[0] = 1; // base version
-    m[1] = mad::CLASS_SUBN_ADM;
-    m[2] = SA_CLASS_VERSION;
-    m[3] = METHOD_SET;
-    m[8..16].copy_from_slice(&tid.to_be_bytes());
-    m[16..18].copy_from_slice(&ATTR_MC_MEMBER_RECORD.to_be_bytes());
     let mask = MASK_MGID | MASK_PORT_GID | MASK_PKEY | MASK_JOIN_STATE;
-    m[COMP_MASK..COMP_MASK + 8].copy_from_slice(&mask.to_be_bytes());
-    let r = &mut m[DATA..];
-    r[0..16].copy_from_slice(&mgid.0);
-    r[16..32].copy_from_slice(&port_gid.0);
-    r[40..42].copy_from_slice(&pkey.to_be_bytes());
-    r[48] = FULL_MEMBER; // scope 0, join state in the low nibble
+    // base version, class, class version, method
+    mad::put(&mut m, 0, &[1, mad::CLASS_SUBN_ADM, SA_CLASS_VERSION, METHOD_SET]);
+    mad::put(&mut m, 8, &tid.to_be_bytes());
+    mad::put(&mut m, 16, &ATTR_MC_MEMBER_RECORD.to_be_bytes());
+    mad::put(&mut m, COMP_MASK, &mask.to_be_bytes());
+    mad::put(&mut m, DATA, &mgid.0);
+    mad::put(&mut m, DATA + 16, &port_gid.0);
+    mad::put(&mut m, DATA + 40, &pkey.to_be_bytes());
+    mad::put(&mut m, DATA + 48, &[FULL_MEMBER]); // scope 0, join state in the low nibble
     m
 }
 
 /// Reads the answer to a join request with transaction `tid`.
 pub fn join_response(tid: u64, m: &[u8; MAD_LEN]) -> Result<Group, JoinError> {
-    let id = u64::from_be_bytes(m[8..16].try_into().expect("8 bytes"));
-    if m[1] != mad::CLASS_SUBN_ADM || m[3] != METHOD_GET_RESP || id != tid || mad::be16(m, 16) != ATTR_MC_MEMBER_RECORD
+    let id = u64::from(mad::be32(m, 8)) << 32 | u64::from(mad::be32(m, 12));
+    if m.get(1) != Some(&mad::CLASS_SUBN_ADM)
+        || m.get(3) != Some(&METHOD_GET_RESP)
+        || id != tid
+        || mad::be16(m, 16) != ATTR_MC_MEMBER_RECORD
     {
         return Err(JoinError::Malformed);
     }
@@ -108,19 +108,22 @@ pub fn join_response(tid: u64, m: &[u8; MAD_LEN]) -> Result<Group, JoinError> {
         0 => {}
         status => return Err(JoinError::Refused(status)),
     }
-    let r = &m[DATA..];
+    let r = m.get(DATA..).ok_or(JoinError::Malformed)?;
+    let byte = |i: usize| r.get(i).copied().ok_or(JoinError::Malformed);
     let words = mad::be32(r, 44);
+    let mut mgid = [0u8; 16];
+    mgid.copy_from_slice(r.get(0..16).ok_or(JoinError::Malformed)?);
     Ok(Group {
-        mgid: Gid(r[0..16].try_into().expect("16 bytes")),
+        mgid: Gid(mgid),
         qkey: mad::be32(r, 32),
         mlid: mad::be16(r, 36),
-        mtu: r[38] & 0x3f,
-        traffic_class: r[39],
+        mtu: byte(38)? & 0x3f,
+        traffic_class: byte(39)?,
         pkey: mad::be16(r, 40),
-        rate: r[42] & 0x3f,
+        rate: byte(42)? & 0x3f,
         sl: (words >> 28) as u8,
         flow_label: words >> 8 & 0xf_ffff,
-        hop_limit: r[47],
+        hop_limit: byte(47)?,
     })
 }
 
@@ -175,5 +178,16 @@ mod tests {
         assert_eq!(join_response(transaction(9), &m), Err(JoinError::Refused(0x0300)));
         m[3] = METHOD_SET;
         assert_eq!(join_response(transaction(9), &m), Err(JoinError::Malformed), "a request, not a response");
+    }
+
+    #[test]
+    fn hostile_answers_are_errors() {
+        let mut m = [0u8; MAD_LEN];
+        for len_filled in [0u8, 0xff] {
+            m.fill(len_filled);
+            let _ = join_response(0, &m);
+        }
+        m.fill(0);
+        assert_eq!(join_response(transaction(1), &m), Err(JoinError::Malformed));
     }
 }

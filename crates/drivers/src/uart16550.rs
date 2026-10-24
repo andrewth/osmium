@@ -1,5 +1,6 @@
 //! NS16550A-compatible UART.
 
+use crate::ioext::IoMemExt;
 use osmium_hal::mmio::{IoMem, IoMemError};
 use osmium_hal::serial::SerialPort;
 
@@ -38,11 +39,11 @@ pub struct Mmio {
 impl Mmio {
     /// Uses the registers in `io` with the given register spacing.
     ///
-    /// # Panics
-    /// If `io` does not hold all eight registers at that spacing; see
-    /// [`Mmio::try_new`].
+    /// If `io` does not hold all eight registers at that spacing, reads of
+    /// the missing ones return all ones and writes are dropped; see
+    /// [`Mmio::try_new`] to reject such a window.
     pub fn new(io: IoMem, shift: u8) -> Self {
-        Self::try_new(io, shift).expect("UART registers outside window")
+        Self { io, shift }
     }
 
     /// Uses the registers in `io` with the given register spacing, or fails
@@ -56,17 +57,17 @@ impl Mmio {
     }
 
     fn offset(&self, reg: u8) -> usize {
-        // Cannot overflow or leave the window: checked in `try_new`.
-        ((reg & LAST_REG) as usize) << self.shift
+        // A shift that overflows gives an offset outside the window.
+        ((reg & LAST_REG) as usize).checked_shl(self.shift as u32).unwrap_or(usize::MAX)
     }
 }
 
 impl UartIo for Mmio {
     fn read(&self, reg: u8) -> u8 {
-        self.io.read(self.offset(reg)).expect("checked in try_new")
+        self.io.rd(self.offset(reg))
     }
     fn write(&self, reg: u8, value: u8) {
-        self.io.write(self.offset(reg), value).expect("checked in try_new");
+        self.io.wr(self.offset(reg), value);
     }
 }
 
@@ -84,16 +85,13 @@ impl Pio {
     /// # Safety
     /// The caller must own those ports.
     ///
-    /// # Panics
-    /// If the range runs past port 0xffff.
+    /// Registers past port 0xffff stay at port 0xffff.
     pub const unsafe fn new(base: u16) -> Self {
-        assert!(base.checked_add(LAST_REG as u16).is_some(), "UART ports past 0xffff");
         Self { base }
     }
 
     fn port(&self, reg: u8) -> u16 {
-        // Cannot overflow: checked in `new`.
-        self.base + (reg & LAST_REG) as u16
+        self.base.saturating_add((reg & LAST_REG) as u16)
     }
 }
 

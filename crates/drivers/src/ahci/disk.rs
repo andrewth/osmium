@@ -76,7 +76,7 @@ impl<'d, D: DmaAllocator + ?Sized> AhciDisk<'d, D> {
         port.exec(cmd)?;
         let mut id = [0u8; IDENTIFY_LEN];
         port.data()?.read(0, &mut id);
-        let word = |i: usize| u16::from_le_bytes([id[2 * i], id[2 * i + 1]]);
+        let word = |i: usize| id.get(2 * i..).and_then(|b| b.first_chunk::<2>()).map_or(0, |&b| u16::from_le_bytes(b));
 
         let sets = word(ID_COMMAND_SETS);
         if sets & ID_VALID_MASK != ID_VALID || sets & ID_LBA48 == 0 {
@@ -98,7 +98,7 @@ impl<'d, D: DmaAllocator + ?Sized> AhciDisk<'d, D> {
         }
         // ATA strings hold two characters per word, high byte first.
         let string = |first: usize, out: &mut [u8]| {
-            for (i, pair) in out.chunks_mut(2).enumerate() {
+            for (i, pair) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
                 pair.copy_from_slice(&word(first + i).to_be_bytes());
             }
         };
@@ -169,9 +169,9 @@ impl<'d, D: DmaAllocator + ?Sized> AhciDisk<'d, D> {
     fn transfer_queued(&mut self, command: u8, lba: u64, len: usize, write: bool) -> Result<(), BlockError> {
         let mut cmds = [Command::default(); MAX_SLOTS];
         let n = len.div_ceil(self.chunk);
-        for (i, cmd) in cmds[..n].iter_mut().enumerate() {
+        for (i, cmd) in cmds.iter_mut().take(n).enumerate() {
             let off = i * self.chunk;
-            let bytes = self.chunk.min(len - off);
+            let bytes = self.chunk.min(len.saturating_sub(off));
             let sectors = (bytes / self.sector_size) as u16;
             *cmd = Command {
                 command,
@@ -186,7 +186,7 @@ impl<'d, D: DmaAllocator + ?Sized> AhciDisk<'d, D> {
                 packet: None,
             };
         }
-        self.port.exec_queued(&cmds[..n]).map_err(|_| BlockError::Io)
+        self.port.exec_queued(cmds.get(..n).unwrap_or(&[])).map_err(|_| BlockError::Io)
     }
 }
 
@@ -275,7 +275,7 @@ mod tests {
         drop((disk, ahci));
         assert_eq!(dma.live.get(), 0);
         let hba = fake::uninstall();
-        let FakeDev::Disk { data, .. } = &hba.ports[0].dev.as_ref().unwrap() else { unreachable!() };
+        let FakeDev::Disk { data, .. } = &hba.ports[0].dev.as_ref().unwrap() else { panic!("wrong fake device kind") };
         (hba.log, data.clone())
     }
 

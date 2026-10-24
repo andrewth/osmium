@@ -10,6 +10,7 @@
 //! Transitional devices also work, through the same capabilities; the
 //! legacy I/O BAR interface is not supported.
 
+use crate::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::{Bar, BarKind, ConfigAccess, Function, cap};
 use osmium_hal::virtio::pci::*;
@@ -66,20 +67,22 @@ impl PciTransport {
         for (_, cap) in func.capabilities().filter(|&(id, _)| id == cap::VENDOR) {
             let typ = func.read8(cap + CAP_CFG_TYPE);
             let bar = func.read8(cap + CAP_BAR) as usize;
-            if !matches!(typ, CAP_COMMON_CFG..=CAP_DEVICE_CFG) || found[typ as usize].is_some() || bar >= 6 {
+            if !matches!(typ, CAP_COMMON_CFG..=CAP_DEVICE_CFG) {
                 continue;
             }
-            let Some(b) = bars[bar].filter(|b| b.kind != BarKind::Io) else { continue };
-            if !mapped[bar] {
-                mapped[bar] = true;
-                windows[bar] = map(&b);
+            let Some(slot) = found.get_mut(typ as usize).filter(|s| s.is_none()) else { continue };
+            let Some(b) = bars.get(bar).copied().flatten().filter(|b| b.kind != BarKind::Io) else { continue };
+            let (Some(window_slot), Some(tried)) = (windows.get_mut(bar), mapped.get_mut(bar)) else { continue };
+            if !*tried {
+                *tried = true;
+                *window_slot = map(&b);
             }
             let (offset, length) = (func.read32(cap + CAP_OFFSET) as usize, func.read32(cap + CAP_LENGTH) as usize);
-            let Some(window) = windows[bar].as_ref().and_then(|w| w.slice(offset, length).ok()) else { continue };
+            let Some(window) = window_slot.as_ref().and_then(|w| w.slice(offset, length).ok()) else { continue };
             if typ == CAP_NOTIFY_CFG {
                 notify_multiplier = func.read32(cap + CAP_NOTIFY_OFF_MULTIPLIER);
             }
-            found[typ as usize] = Some(window);
+            *slot = Some(window);
         }
         let [_, common, notify, isr, device] = found;
         let (Some(common), Some(notify), Some(isr)) = (common, notify, isr) else {
@@ -100,23 +103,23 @@ impl PciTransport {
     }
 
     fn r16(&self, off: usize) -> u16 {
-        self.common.read(off).expect("virtio-pci common config outside window")
+        self.common.rd(off)
     }
 
     fn r32(&self, off: usize) -> u32 {
-        self.common.read(off).expect("virtio-pci common config outside window")
+        self.common.rd(off)
     }
 
     fn w8(&self, off: usize, v: u8) {
-        self.common.write(off, v).expect("virtio-pci common config outside window")
+        self.common.wr(off, v)
     }
 
     fn w16(&self, off: usize, v: u16) {
-        self.common.write(off, v).expect("virtio-pci common config outside window")
+        self.common.wr(off, v)
     }
 
     fn w32(&self, off: usize, v: u32) {
-        self.common.write(off, v).expect("virtio-pci common config outside window")
+        self.common.wr(off, v)
     }
 
     /// Writes a 64-bit field as two dwords, low first (§4.1.3.1).
@@ -163,7 +166,7 @@ impl Transport for PciTransport {
     }
 
     fn status(&self) -> u8 {
-        self.common.read(DEVICE_STATUS).expect("virtio-pci common config outside window")
+        self.common.rd(DEVICE_STATUS)
     }
 
     fn set_status(&self, status: u8) {

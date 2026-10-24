@@ -147,7 +147,10 @@ mod tests {
         // 10 ms is 11931.82 ticks; the 11931 actually waited are 9.9993 ms.
         assert_eq!(hz, 100_006_872, "1e6 counts in 11931 ticks");
         // 10 ms = 11931 ticks = 0x2e9b; the speaker bit is cleared.
-        assert_eq!(*pit.ports.log.borrow(), [(PORT_B, 0), (COMMAND, 0xb0), (CHANNEL2, 0x9b), (CHANNEL2, 0x2e), (PORT_B, 1), (PORT_B, 0)]);
+        assert_eq!(
+            *pit.ports.log.borrow(),
+            [(PORT_B, 0), (COMMAND, 0xb0), (CHANNEL2, 0x9b), (CHANNEL2, 0x2e), (PORT_B, 1), (PORT_B, 0)]
+        );
     }
 
     #[test]

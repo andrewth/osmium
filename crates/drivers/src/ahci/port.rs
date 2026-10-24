@@ -288,10 +288,9 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
         self.cap & cap::SNCQ != 0
     }
 
-    /// Uses `slots` command slots, at most [`Port::max_slots`].
+    /// Uses `slots` command slots, at most [`Port::max_slots`] and at least 1.
     pub fn set_slots(&mut self, slots: usize) {
-        assert!((1..=self.max_slots()).contains(&slots));
-        self.slots = slots;
+        self.slots = slots.clamp(1, self.max_slots());
     }
 
     /// Waits for completions by calling `idle` with the port's interrupts
@@ -306,12 +305,12 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
     }
 
     /// The data buffer, unless the port is broken (and the HBA may still
-    /// be using it). Panics if there is none.
+    /// be using it), or if there is none.
     pub fn data(&self) -> Result<&DmaBuffer, AhciError> {
         if self.broken {
             return Err(AhciError::Broken);
         }
-        Ok(self.data.as_ref().expect("port has no data buffer"))
+        self.data.as_ref().map(|d| &**d).ok_or(AhciError::NoMemory)
     }
 
     fn r(&self, reg: usize) -> u32 {
@@ -511,7 +510,9 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
         if self.broken {
             return Err(AhciError::Broken);
         }
-        assert!(!cmds.is_empty() && cmds.len() <= self.slots);
+        if cmds.is_empty() || cmds.len() > self.slots {
+            return Err(AhciError::Unsupported);
+        }
         for (slot, cmd) in cmds.iter().enumerate() {
             self.build(slot, cmd)?;
         }

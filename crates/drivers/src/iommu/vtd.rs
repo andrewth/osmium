@@ -188,7 +188,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
             // Firmware may have left translation or queued invalidation on.
             vtd.set_enabled(&mut st, TE, false)?;
             vtd.set_enabled(&mut st, QIE, false)?;
-            let root = st.tables.as_ref().expect("just made").root.device_addr();
+            let root = st.tables.as_ref().ok_or(IommuError::Unsupported)?.root.device_addr();
             vtd.regs.w64(RTADDR, root.as_u64());
             vtd.regs.w32(GCMD, st.gcmd | SRTP);
             vtd.wait(|| vtd.regs.r32(GSTS) & SRTP != 0)?;
@@ -306,12 +306,12 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
             .and_then(|()| self.set_enabled(&mut st, TE, true));
         if result.is_err() {
             // Do not leave a half-attached device pointing at the caller's table.
-            let tables = st.tables.as_mut().expect("checked above");
-            let ctx = tables.context.get(bus).expect("made above");
-            ctx.store::<u64>(off, 0);
-            barrier::dma_wmb();
-            ctx.store::<u64>(off + 8, 0);
-            barrier::mb();
+            if let Some(ctx) = st.tables.as_mut().and_then(|t| t.context.get(bus)) {
+                ctx.store::<u64>(off, 0);
+                barrier::dma_wmb();
+                ctx.store::<u64>(off + 8, 0);
+                barrier::mb();
+            }
             let _ = self.invalidate_device(device, domain.0);
         }
         result
@@ -528,7 +528,7 @@ mod tests {
                 }
                 table = e & 0x000f_ffff_ffff_f000;
             }
-            unreachable!()
+            panic!("walk did not terminate")
         }
 
         fn domain_of(&self, sid: u16) -> u64 {

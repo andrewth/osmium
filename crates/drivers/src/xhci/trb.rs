@@ -223,8 +223,11 @@ impl Trb {
         dir_in: bool,
     ) -> Self {
         let packets = if packets == 0 { 1 } else { packets };
-        let (tbc, tlbpc) =
-            if ss { ((packets - 1) / (burst + 1), (packets - 1) % (burst + 1)) } else { (0, packets - 1) };
+        let (tbc, tlbpc) = if ss {
+            ((packets - 1) / burst.saturating_add(1), (packets - 1) % burst.saturating_add(1))
+        } else {
+            (0, packets - 1)
+        };
         let when = match frame {
             Some(f) => (f as u32 & 0x7ff) << 20,
             None => flag::SIA,

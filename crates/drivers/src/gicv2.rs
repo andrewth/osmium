@@ -47,11 +47,11 @@ impl GicV2 {
     /// Sends software-generated interrupt `sgi` (0–15) to every CPU whose
     /// bit is set in `targets`.
     ///
-    /// # Panics
-    ///
-    /// If `sgi` is 16 or more.
+    /// An `sgi` of 16 or more is ignored.
     pub fn send_sgi(&self, targets: u8, sgi: u32) {
-        assert!(sgi < 16, "SGIs are 0-15");
+        if sgi >= 16 {
+            return;
+        }
         let _ = self.gicd.write(GICD_SGIR, (targets as u32) << 16 | sgi);
     }
 

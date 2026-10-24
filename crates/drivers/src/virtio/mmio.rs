@@ -1,6 +1,7 @@
 //! The virtio-mmio transport (device tree `virtio,mmio`), versions 1
 //! (legacy) and 2.
 
+use crate::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::virtio::mmio::*;
 use osmium_hal::virtio::queue::LEGACY_ALIGN;
@@ -32,11 +33,11 @@ impl MmioTransport {
     }
 
     fn r(&self, off: usize) -> u32 {
-        self.io.read(off).expect("virtio-mmio register outside window")
+        self.io.rd(off)
     }
 
     fn w(&self, off: usize, v: u32) {
-        self.io.write(off, v).expect("virtio-mmio register outside window")
+        self.io.wr(off, v)
     }
 }
 
@@ -87,11 +88,12 @@ impl Transport for MmioTransport {
         if self.legacy {
             // The legacy device derives the ring addresses from the
             // descriptor table's page number and the alignment.
-            assert!(addrs.desc.is_aligned(PAGE as u64));
             self.w(GUEST_PAGE_SIZE, PAGE);
             self.w(QUEUE_ALIGN, PAGE);
-            let pfn = addrs.desc.as_u64() / PAGE as u64;
-            self.w(QUEUE_PFN, u32::try_from(pfn).expect("legacy virtqueue above 16 TiB"));
+            // A misaligned queue or one above 16 TiB cannot be described; a
+            // PFN of 0 leaves the queue unconfigured instead.
+            let pfn = if addrs.desc.is_aligned(PAGE as u64) { addrs.desc.as_u64() / PAGE as u64 } else { 0 };
+            self.w(QUEUE_PFN, u32::try_from(pfn).unwrap_or(0));
         } else {
             let regs = [
                 (QUEUE_DESC_LOW, QUEUE_DESC_HIGH, addrs.desc),

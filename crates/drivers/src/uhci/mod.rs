@@ -160,7 +160,7 @@ impl UhciRegs {
             #[cfg(target_arch = "x86_64")]
             Self::Ports(base) => {
                 // SAFETY: `ports` vouched for the window.
-                unsafe { osmium_hal::port::Port::<u16>::new(base + off as u16) }.read()
+                unsafe { osmium_hal::port::Port::<u16>::new(base.wrapping_add(off as u16)) }.read()
             }
         }
     }
@@ -173,7 +173,7 @@ impl UhciRegs {
             #[cfg(target_arch = "x86_64")]
             Self::Ports(base) => {
                 // SAFETY: `ports` vouched for the window.
-                unsafe { osmium_hal::port::Port::<u16>::new(base + off as u16) }.write(v)
+                unsafe { osmium_hal::port::Port::<u16>::new(base.wrapping_add(off as u16)) }.write(v)
             }
         }
     }
@@ -186,7 +186,7 @@ impl UhciRegs {
             #[cfg(target_arch = "x86_64")]
             Self::Ports(base) => {
                 // SAFETY: `ports` vouched for the window.
-                unsafe { osmium_hal::port::Port::<u32>::new(base + off as u16) }.write(v)
+                unsafe { osmium_hal::port::Port::<u32>::new(base.wrapping_add(off as u16)) }.write(v)
             }
         }
     }
@@ -199,7 +199,7 @@ impl UhciRegs {
             #[cfg(target_arch = "x86_64")]
             Self::Ports(base) => {
                 // SAFETY: `ports` vouched for the window.
-                unsafe { osmium_hal::port::Port::<u8>::new(base + off as u16) }.write(v)
+                unsafe { osmium_hal::port::Port::<u8>::new(base.wrapping_add(off as u16)) }.write(v)
             }
         }
     }
@@ -407,7 +407,7 @@ impl<'d, D: DmaAllocator + ?Sized> Uhci<'d, D> {
     }
 
     fn port_reg(port: u8) -> usize {
-        PORTSC + 2 * (port as usize - 1)
+        PORTSC + 2 * (port as usize).saturating_sub(1)
     }
 
     /// Waits for the controller to finish the frame it is in, so that it no
@@ -574,10 +574,9 @@ impl<'d, D: DmaAllocator + ?Sized> Uhci<'d, D> {
         });
         let x = &self.mem.sync;
         let (result, quiet) = match outcome {
-            _ if !done => (Err(UsbError::Timeout), self.abort(x, qh, &plan)),
-            Progress::Done { bytes, clean } => (Ok(bytes), self.finish(x, qh, &plan, clean)),
-            Progress::Failed(e) => (Err(e), self.abort(x, qh, &plan)),
-            Progress::Running => unreachable!("wait returned with the transfer running"),
+            Progress::Done { bytes, clean } if done => (Ok(bytes), self.finish(x, qh, &plan, clean)),
+            Progress::Failed(e) if done => (Err(e), self.abort(x, qh, &plan)),
+            _ => (Err(UsbError::Timeout), self.abort(x, qh, &plan)),
         };
         // The synchronous memory is not reused if the controller may still use it.
         self.wedged |= !quiet;
@@ -659,8 +658,10 @@ impl<D: DmaAllocator + ?Sized> Hc for Uhci<'_, D> {
         }
         let plan = Self::build_control(&self.mem.sync, pipe, setup, len, dir_in);
         let moved = self.run_sync(plan, CONTROL_TIMEOUT_NS)?;
-        if let Data::In(buf) = data {
-            self.mem.sync.buf.read(0, &mut buf[..moved.min(len)]);
+        if let Data::In(buf) = data
+            && let Some(dst) = buf.get_mut(..moved.min(len))
+        {
+            self.mem.sync.buf.read(0, dst);
         }
         Ok(moved)
     }
@@ -678,8 +679,10 @@ impl<D: DmaAllocator + ?Sized> Hc for Uhci<'_, D> {
         }
         let plan = Self::build_bulk(&self.mem.sync, pipe, toggle, n, dir_in);
         let moved = self.run_sync(plan, BULK_TIMEOUT_NS)?;
-        if let Data::In(buf) = data {
-            self.mem.sync.buf.read(0, &mut buf[..moved.min(n)]);
+        if let Data::In(buf) = data
+            && let Some(dst) = buf.get_mut(..moved.min(n))
+        {
+            self.mem.sync.buf.read(0, dst);
         }
         Ok(moved)
     }
@@ -693,7 +696,7 @@ impl<D: DmaAllocator + ?Sized> Hc for Uhci<'_, D> {
         let plan = Self::build_bulk(&xfer, pipe, toggle, len, true);
         let qh = if pipe.ttype == TransferType::Interrupt { QH_PERIODIC + slot } else { QH_ASYNC + slot };
         let first = xfer.td_addr(0);
-        self.mem.pending[slot] = Some(Pending { xfer, plan, qh, len });
+        *self.mem.pending.get_mut(slot).ok_or(UsbError::NoResources)? = Some(Pending { xfer, plan, qh, len });
         self.set_element(qh, first);
         Ok(slot)
     }
@@ -704,13 +707,17 @@ impl<D: DmaAllocator + ?Sized> Hc for Uhci<'_, D> {
         let quiet;
         let result = match progress {
             Progress::Running => {
-                self.mem.pending[slot] = Some(p);
+                if let Some(entry) = self.mem.pending.get_mut(slot) {
+                    *entry = Some(p);
+                }
                 return None;
             }
             Progress::Done { bytes, clean } => {
                 quiet = self.finish(&p.xfer, p.qh, &p.plan, clean);
                 let n = bytes.min(p.len).min(buf.len());
-                p.xfer.buf.read(0, &mut buf[..n]);
+                if let Some(dst) = buf.get_mut(..n) {
+                    p.xfer.buf.read(0, dst);
+                }
                 Ok(n)
             }
             Progress::Failed(e) => {

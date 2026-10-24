@@ -57,7 +57,7 @@ pub struct DisplayInfo {
 impl DisplayInfo {
     /// The first scanout with a display connected, as `(index, mode)`.
     pub fn first_enabled(&self) -> Option<(u32, Rect)> {
-        self.scanouts[..self.count].iter().position(|s| s.enabled).map(|i| (i as u32, self.scanouts[i].rect))
+        self.scanouts.iter().take(self.count).enumerate().find(|(_, s)| s.enabled).map(|(i, s)| (i as u32, s.rect))
     }
 }
 
@@ -87,14 +87,25 @@ struct Cmd {
 impl Cmd {
     fn new(ty: u32) -> Self {
         let mut c = Self { buf: [0; 64], len: HDR_LEN };
-        c.buf[..4].copy_from_slice(&ty.to_le_bytes());
+        if let Some(dst) = c.buf.first_chunk_mut::<4>() {
+            *dst = ty.to_le_bytes();
+        }
         c
     }
 
     fn u32(mut self, v: u32) -> Self {
-        self.buf[self.len..self.len + 4].copy_from_slice(&v.to_le_bytes());
-        self.len += 4;
+        // Every command is built from fixed fields that fit the buffer; an
+        // overlong one would be truncated, not overrun.
+        if let Some(dst) = self.buf.get_mut(self.len..).and_then(|b| b.first_chunk_mut::<4>()) {
+            *dst = v.to_le_bytes();
+            self.len += 4;
+        }
         self
+    }
+
+    /// The bytes built so far.
+    fn bytes(&self) -> &[u8] {
+        self.buf.get(..self.len).unwrap_or(&[])
     }
 
     fn u64(self, v: u64) -> Self {
@@ -126,17 +137,15 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         let queue = VirtQueue::new(dma, CONTROL_QUEUE, size)?;
         let req = OwnedDma::new(dma, CMD_LEN).ok_or(VirtioError::NoMemory)?;
         let resp = OwnedDma::new(dma, CMD_LEN).ok_or(VirtioError::NoMemory)?;
+        // SAFETY: an empty window touches no memory.
+        let empty = unsafe { IoMem::new(core::ptr::NonNull::<u32>::dangling().as_ptr().cast(), 0) };
+        let fb = Framebuffer::new(empty, FramebufferInfo::packed(0, 0, FORMAT)).map_err(|_| VirtioError::NoMemory)?;
         let gpu = Self {
             queue: ManuallyDrop::new(queue),
             req: ManuallyDrop::new(req),
             resp: ManuallyDrop::new(resp),
             num_scanouts: num_scanouts.min(MAX_SCANOUTS as u32),
-            // SAFETY: an empty window touches no memory.
-            fb: Framebuffer::new(
-                unsafe { IoMem::new(core::ptr::NonNull::<u32>::dangling().as_ptr().cast(), 0) },
-                FramebufferInfo::packed(0, 0, FORMAT),
-            )
-            .expect("empty framebuffer"),
+            fb,
             backing: ManuallyDrop::new(None),
             resource: 0,
             scanout: 0,
@@ -164,7 +173,7 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
     /// waits for a response of up to `resp_len` bytes; returns its type and
     /// how many bytes the device says it wrote.
     fn command(&mut self, cmd: Cmd, extra: &[u8], resp_len: usize) -> Result<(u32, usize), DisplayError> {
-        self.req.write(0, &cmd.buf[..cmd.len]);
+        self.req.write(0, cmd.bytes());
         self.req.write(cmd.len, extra);
         self.resp.write(0, &[0; HDR_LEN]);
         let segments = [
@@ -226,15 +235,17 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         let fb = Framebuffer::new(unsafe { IoMem::new(backing.cpu_ptr().as_ptr(), info.size()) }, info)?;
         fb.clear(osmium_hal::display::Rgb::BLACK);
 
-        let id = self.resource + 1;
+        let id = self.resource.wrapping_add(1).max(1);
         let full = info.bounds();
         self.command_nodata(
             Cmd::new(CMD_RESOURCE_CREATE_2D).u32(id).u32(FORMAT_B8G8R8X8_UNORM).u32(width).u32(height),
             &[],
         )?;
         let mut entry = [0u8; MEM_ENTRY_LEN];
-        entry[..8].copy_from_slice(&backing.device_addr().as_u64().to_le_bytes());
-        entry[8..12].copy_from_slice(&(info.size() as u32).to_le_bytes());
+        let (addr, len) = (backing.device_addr().as_u64().to_le_bytes(), (info.size() as u32).to_le_bytes());
+        for (dst, src) in entry.iter_mut().zip(addr.iter().chain(len.iter())) {
+            *dst = *src;
+        }
         let attached = self
             .command_nodata(Cmd::new(CMD_RESOURCE_ATTACH_BACKING).u32(id).u32(1), &entry)
             .and_then(|()| self.command_nodata(Cmd::new(CMD_SET_SCANOUT).rect(full).u32(scanout).u32(id), &[]));

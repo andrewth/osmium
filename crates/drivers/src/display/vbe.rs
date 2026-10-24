@@ -170,7 +170,13 @@ pub struct ModeInfo {
 impl ModeInfo {
     /// Parses a 256-byte mode information block.
     pub fn parse(mode: u16, b: &[u8]) -> Self {
-        let w = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+        // A short block reads as zero padded.
+        let mut block = [0u8; 256];
+        for (dst, src) in block.iter_mut().zip(b) {
+            *dst = *src;
+        }
+        let b = &block;
+        let w = |at: usize| block.get(at..).and_then(|s| s.first_chunk::<2>()).map_or(0, |&c| u16::from_le_bytes(c));
         let mask = |size: u8, pos: u8| {
             // An empty, wide or out-of-range field makes the format unusable.
             if !(1..=8).contains(&size) || pos as u32 + size as u32 > 32 { 0 } else { ((1u32 << size) - 1) << pos }
@@ -245,7 +251,8 @@ impl<B: VideoBios> Vbe<B> {
         let mut modes = [0u16; MAX_MODES];
         let mut num_modes = 0;
         for m in raw.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).take_while(|&m| m != 0xffff) {
-            modes[num_modes] = m;
+            let Some(slot) = modes.get_mut(num_modes) else { break };
+            *slot = m;
             num_modes += 1;
         }
         Ok(Self { bios, version, memory, modes, num_modes })
@@ -263,7 +270,7 @@ impl<B: VideoBios> Vbe<B> {
 
     /// The mode numbers the BIOS lists.
     pub fn modes(&self) -> &[u16] {
-        &self.modes[..self.num_modes]
+        self.modes.get(..self.num_modes).unwrap_or(&[])
     }
 
     /// Information on `mode` (4F01h).
@@ -272,7 +279,7 @@ impl<B: VideoBios> Vbe<B> {
         let mut regs = BiosRegs { ax: func::MODE_INFO, cx: mode, ..Default::default() };
         self.bios.int10(&mut regs, &mut buf);
         match regs.ax {
-            func::SUCCESS => Ok(ModeInfo::parse(mode, &buf[..256])),
+            func::SUCCESS => Ok(ModeInfo::parse(mode, &buf)),
             ax => Err(VbeError::Failed(ax)),
         }
     }
@@ -281,8 +288,9 @@ impl<B: VideoBios> Vbe<B> {
     /// per pixel up to `max_bpp`, among the usable ones.
     pub fn find_mode(&mut self, width: u16, height: u16, max_bpp: u8) -> Option<ModeInfo> {
         let mut best: Option<ModeInfo> = None;
-        for i in 0..self.num_modes {
-            let Ok(m) = self.mode_info(self.modes[i]) else { continue };
+        let modes = self.modes;
+        for &listed in modes.iter().take(self.num_modes) {
+            let Ok(m) = self.mode_info(listed) else { continue };
             if m.is_usable()
                 && (m.width, m.height) == (width, height)
                 && m.bpp <= max_bpp
@@ -422,5 +430,13 @@ mod tests {
             fn read_far(&self, _: u32, _: &mut [u8]) {}
         }
         assert!(matches!(Vbe::new(Dead), Err(VbeError::NotSupported)));
+    }
+
+    #[test]
+    fn short_mode_block_parses_without_panicking() {
+        let m = ModeInfo::parse(0x112, &[0xff; 10]);
+        assert!(!m.is_usable());
+        let m = ModeInfo::parse(0x112, &[]);
+        assert_eq!((m.width, m.height, m.bpp), (0, 0, 0));
     }
 }

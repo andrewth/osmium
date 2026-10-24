@@ -93,7 +93,17 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
         {
             return Err(VirtioError::NoMemory);
         }
-        let q = Self { mem, index, size, free_head: 0, num_free: size, avail_idx: 0, last_used: 0, in_flight: 0, broken: false };
+        let q = Self {
+            mem,
+            index,
+            size,
+            free_head: 0,
+            num_free: size,
+            avail_idx: 0,
+            last_used: 0,
+            in_flight: 0,
+            broken: false,
+        };
         for i in 0..size {
             q.write_desc(i, PhysAddr::new(0), 0, 0, i.wrapping_add(1));
             q.set_outstanding(i, false);
@@ -436,7 +446,12 @@ pub(crate) mod tests {
     fn untrusted_device() {
         let dma = HostDma::default();
         let seg = Segment { addr: PhysAddr::new(0x1000), len: 1, device_writes: true };
-        for (id, idx, why) in [(4u32, 1u16, "id out of range"), (0x1_0000, 1, "id truncates to a valid head"), (2, 1, "not outstanding"), (0, 2, "index ahead")] {
+        for (id, idx, why) in [
+            (4u32, 1u16, "id out of range"),
+            (0x1_0000, 1, "id truncates to a valid head"),
+            (2, 1, "not outstanding"),
+            (0, 2, "index ahead"),
+        ] {
             let mut q = VirtQueue::new(&dma, 0, 4).unwrap();
             let h = q.add(&[seg]).unwrap();
             assert_eq!(h, 0);

@@ -86,9 +86,7 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioNet<'d, T, D> {
         net.transport.setup_queue(TX, tx_size, net.tx.addrs());
         // Transmit completions are reaped lazily; don't interrupt for them.
         net.tx.set_interrupts(false);
-        while net.rx.next_head().is_some() {
-            net.post_rx();
-        }
+        while net.post_rx() {}
         driver_ok(&net.transport);
         net.transport.notify(RX);
         Ok(net)
@@ -121,11 +119,11 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioNet<'d, T, D> {
     }
 
     /// Hands the next free receive slot to the device (no notification).
-    fn post_rx(&mut self) {
-        let head = self.rx.next_head().expect("receive queue full");
+    /// Returns false if there is no free slot or the queue is broken.
+    fn post_rx(&mut self) -> bool {
+        let Some(head) = self.rx.next_head() else { return false };
         let seg = Segment { device_writes: true, ..Self::slot(&self.rx_slots, head) };
-        let got = self.rx.add(&[seg]).expect("receive queue full");
-        debug_assert_eq!(got, head);
+        self.rx.add(&[seg]).is_ok()
     }
 
     fn reap_tx(&mut self) {
@@ -153,7 +151,7 @@ impl<T: Transport, D: DmaAllocator + ?Sized> NetDevice for VirtioNet<'_, T, D> {
         self.reap_tx();
         let head = self.tx.next_head().ok_or(NetError::WouldBlock)?;
         let off = head as usize * SLOT_LEN;
-        self.tx_slots.write(off, &[0; 12][..self.header_len]);
+        self.tx_slots.write(off, [0u8; 12].get(..self.header_len).unwrap_or(&[]));
         self.tx_slots.write(off + self.header_len, frame);
         let seg = Segment { len: (self.header_len + frame.len()) as u32, ..Self::slot(&self.tx_slots, head) };
         self.tx.add(&[seg]).map_err(|_| NetError::WouldBlock)?;

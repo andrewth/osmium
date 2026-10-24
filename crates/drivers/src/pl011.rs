@@ -47,8 +47,9 @@ impl Pl011 {
         Ok(Self { io })
     }
 
-    fn regs(&self) -> &Regs {
-        self.io.as_regs().expect("checked in new")
+    /// The register block; `None` is unreachable because `new` checked it.
+    fn regs(&self) -> Option<&Regs> {
+        self.io.as_regs().ok()
     }
 
     /// Programs 8N1 with FIFOs. With `Some((clock_hz, baud))` it also sets
@@ -56,7 +57,7 @@ impl Pl011 {
     /// kept if `clock / (16 * baud)` does not fit the divisor registers: a
     /// `baud` of 0, or one too high or too low for the clock.
     pub fn init(&mut self, clock_and_baud: Option<(u32, u32)>) {
-        let r = self.regs();
+        let Some(r) = self.regs() else { return };
         r.cr.write(0);
         while r.fr.read() & FR_BUSY != 0 {
             core::hint::spin_loop();
@@ -72,7 +73,9 @@ impl Pl011 {
 
     /// Raises an interrupt when data is received.
     pub fn enable_rx_interrupt(&mut self) {
-        self.regs().imsc.set_bits(IMSC_RXIM);
+        if let Some(r) = self.regs() {
+            r.imsc.set_bits(IMSC_RXIM);
+        }
     }
 }
 
@@ -87,7 +90,7 @@ fn divisor64(clock: u32, baud: u32) -> Option<u64> {
 
 impl SerialPort for Pl011 {
     fn write_byte(&mut self, byte: u8) {
-        let r = self.regs();
+        let Some(r) = self.regs() else { return };
         while r.fr.read() & FR_TXFF != 0 {
             core::hint::spin_loop();
         }
@@ -95,7 +98,7 @@ impl SerialPort for Pl011 {
     }
 
     fn read_byte(&mut self) -> Option<u8> {
-        let r = self.regs();
+        let r = self.regs()?;
         (r.fr.read() & FR_RXFE == 0).then(|| r.dr.read() as u8)
     }
 }

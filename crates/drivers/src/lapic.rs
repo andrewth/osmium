@@ -1,5 +1,6 @@
 //! x86 local APIC in xAPIC (MMIO) mode.
 
+use crate::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::MsiMessage;
 
@@ -38,11 +39,11 @@ impl LocalApic {
     }
 
     fn read(&self, reg: usize) -> u32 {
-        self.io.read(reg).expect("APIC window too small")
+        self.io.rd(reg)
     }
 
     fn write(&self, reg: usize, v: u32) {
-        self.io.write(reg, v).expect("APIC window too small")
+        self.io.wr(reg, v)
     }
 
     /// Software-enables the APIC with the given spurious-interrupt vector.

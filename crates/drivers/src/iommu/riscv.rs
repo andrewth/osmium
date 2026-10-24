@@ -108,7 +108,8 @@ struct Tables<'d, D: DmaAllocator + ?Sized> {
 }
 
 struct State<'d, D: DmaAllocator + ?Sized> {
-    tables: Option<Tables<'d, D>>,
+    /// Freed in `drop` only once the unit has stopped using them.
+    tables: ManuallyDrop<Tables<'d, D>>,
     cq_tail: u32,
     fence_seq: u32,
     enabled: bool,
@@ -149,13 +150,19 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
             faults: OwnedDma::new(dma, FAULT_BYTES << FQ_LOG2).ok_or(IommuError::OutOfMemory)?,
             fence: OwnedDma::new(dma, 4096).ok_or(IommuError::OutOfMemory)?,
         };
+        let (commands_ppn, faults_ppn) = (ppn(tables.commands.device_addr()), ppn(tables.faults.device_addr()));
         let unit = Self {
             regs,
             clock,
             segment,
             dc_bytes: if caps & CAPS_MSI_FLAT != 0 { 64 } else { 32 },
             timeout_ns: DEFAULT_TIMEOUT_NS,
-            state: IrqSpinLock::new(State { tables: None, cq_tail: 0, fence_seq: 0, enabled: false }),
+            state: IrqSpinLock::new(State {
+                tables: ManuallyDrop::new(tables),
+                cq_tail: 0,
+                fence_seq: 0,
+                enabled: false,
+            }),
         };
         // Quiesce, then configure: queues and the directory only change while off.
         unit.set_ddtp(0)?;
@@ -169,14 +176,13 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
         }
         // The zeroed queue memory must be visible before the unit is pointed at it.
         barrier::mb();
-        unit.regs.w64(CQB, ppn(tables.commands.device_addr()) << PPN_SHIFT | (CQ_LOG2 - 1) as u64);
-        unit.regs.w64(FQB, ppn(tables.faults.device_addr()) << PPN_SHIFT | (FQ_LOG2 - 1) as u64);
-        unit.state.lock().tables = Some(tables);
+        unit.regs.w64(CQB, commands_ppn << PPN_SHIFT | (CQ_LOG2 - 1) as u64);
+        unit.regs.w64(FQB, faults_ppn << PPN_SHIFT | (FQ_LOG2 - 1) as u64);
         unit.set_queue(CQCSR, QCSR_EN)?;
         unit.set_queue(FQCSR, QCSR_EN)?;
         {
             let mut st = unit.state.lock();
-            st.cq_tail = unit.regs.r32(CQT);
+            st.cq_tail = unit.regs.r32(CQT) & ((1u32 << CQ_LOG2) - 1);
         }
         unit.set_ddtp(DDTP_BARE)?;
         Ok(unit)
@@ -225,7 +231,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
     }
 
     fn tables<'st>(st: &'st State<'d, D>) -> &'st Tables<'d, D> {
-        st.tables.as_ref().expect("tables exist after new")
+        &st.tables
     }
 
     fn post(&self, st: &mut State<'d, D>, q0: u64, q1: u64) -> Result<(), IommuError> {
@@ -258,7 +264,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> RiscvIommu<'d, D> {
             // The queue stopped on a bad or slow command. Restart it empty.
             self.set_queue(CQCSR, 0)?;
             self.set_queue(CQCSR, QCSR_EN)?;
-            st.cq_tail = self.regs.r32(CQT);
+            st.cq_tail = self.regs.r32(CQT) & ((1u32 << CQ_LOG2) - 1);
             return Err(IommuError::Hardware);
         }
         waited?;
@@ -302,7 +308,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
             return Err(IommuError::OutOfRange);
         }
         let mut st = self.state.lock();
-        let tables = st.tables.as_mut().ok_or(IommuError::Unsupported)?;
+        let tables = &mut st.tables;
         let (leaf, created) = tables.leaves.get_or_alloc(index)?;
         if created {
             barrier::dma_wmb();
@@ -331,10 +337,11 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
             Ok(())
         });
         if result.is_err() {
-            let leaf = Self::tables(&st).leaves.get(index).expect("made above");
-            leaf.store::<u64>(off, 0);
-            barrier::dma_wmb();
-            leaf.store::<u64>(off + 24, 0);
+            if let Some(leaf) = Self::tables(&st).leaves.get(index) {
+                leaf.store::<u64>(off, 0);
+                barrier::dma_wmb();
+                leaf.store::<u64>(off + 24, 0);
+            }
             let _ = self.flush_device(&mut st, device.bdf(), domain.0);
         }
         result
@@ -400,13 +407,13 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
 impl<D: DmaAllocator + Sync + ?Sized> Drop for RiscvIommu<'_, D> {
     fn drop(&mut self) {
         let mut st = self.state.lock();
-        let tables = ManuallyDrop::new(st.tables.take());
         // Back to pass-through, then stop the queues; if the unit will not
         // stop it may still read the tables, so leak them.
         let stopped =
             self.set_ddtp(DDTP_BARE).is_ok() && self.set_queue(CQCSR, 0).is_ok() && self.set_queue(FQCSR, 0).is_ok();
         if stopped {
-            drop(ManuallyDrop::into_inner(tables));
+            // SAFETY: dropped once, here; the unit no longer uses them.
+            unsafe { ManuallyDrop::drop(&mut st.tables) };
         }
     }
 }

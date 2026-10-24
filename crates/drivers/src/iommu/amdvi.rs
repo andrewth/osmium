@@ -99,7 +99,8 @@ struct Buffers<'d, D: DmaAllocator + ?Sized> {
 }
 
 struct State<'d, D: DmaAllocator + ?Sized> {
-    buffers: Option<Buffers<'d, D>>,
+    /// Freed in `drop` only once the unit has stopped using them.
+    buffers: ManuallyDrop<Buffers<'d, D>>,
     /// Byte offset the next command goes to.
     tail: usize,
     /// Value the next completion-wait stores.
@@ -135,24 +136,33 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
             events: OwnedDma::new(dma, QUEUE_BYTES).ok_or(IommuError::OutOfMemory)?,
             scratch: OwnedDma::new(dma, 4096).ok_or(IommuError::OutOfMemory)?,
         };
+        let (devtab_addr, commands_addr, events_addr) = (
+            buffers.devtab.device_addr().as_u64(),
+            buffers.commands.device_addr().as_u64(),
+            buffers.events.device_addr().as_u64(),
+        );
         let unit = Self {
             regs,
             clock,
             max_bus,
             segment,
             timeout_ns: DEFAULT_TIMEOUT_NS,
-            state: IrqSpinLock::new(State { buffers: None, tail: 0, wait_seq: 0, blocked: false }),
+            state: IrqSpinLock::new(State {
+                buffers: ManuallyDrop::new(buffers),
+                tail: 0,
+                wait_seq: 0,
+                blocked: false,
+            }),
         };
         // Stop whatever firmware left running before pointing it at new tables.
         unit.regs.w64(CONTROL, 0);
         unit.wait(|| unit.regs.r64(STATUS) & (CMD_BUF_RUN | EVENT_LOG_RUN) == 0)?;
-        unit.regs.w64(DEV_TAB_BAR, buffers.devtab.device_addr().as_u64() | (devtab_bytes / 4096 - 1) as u64);
-        unit.regs.w64(CMD_BUF_BAR, buffers.commands.device_addr().as_u64() | QUEUE_LEN_CODE);
-        unit.regs.w64(EVT_LOG_BAR, buffers.events.device_addr().as_u64() | QUEUE_LEN_CODE);
+        unit.regs.w64(DEV_TAB_BAR, devtab_addr | (devtab_bytes / 4096 - 1) as u64);
+        unit.regs.w64(CMD_BUF_BAR, commands_addr | QUEUE_LEN_CODE);
+        unit.regs.w64(EVT_LOG_BAR, events_addr | QUEUE_LEN_CODE);
         for reg in [CMD_HEAD, CMD_TAIL, EVT_HEAD, EVT_TAIL] {
             unit.regs.w64(reg, 0);
         }
-        unit.state.lock().buffers = Some(buffers);
         // The device table is all invalid, which passes DMA through.
         unit.regs.w64(CONTROL, CMD_BUF_EN | EVENT_LOG_EN | IOMMU_EN);
         unit.wait(|| unit.regs.r64(STATUS) & (CMD_BUF_RUN | EVENT_LOG_RUN) == CMD_BUF_RUN | EVENT_LOG_RUN)?;
@@ -174,7 +184,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
     }
 
     fn buffers<'st>(st: &'st State<'d, D>) -> &'st Buffers<'d, D> {
-        st.buffers.as_ref().expect("buffers exist after new")
+        &st.buffers
     }
 
     fn post(&self, st: &mut State<'d, D>, q0: u64, q1: u64) -> Result<(), IommuError> {
@@ -386,12 +396,12 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for AmdVi<'_, D> {
 impl<D: DmaAllocator + Sync + ?Sized> Drop for AmdVi<'_, D> {
     fn drop(&mut self) {
         let mut st = self.state.lock();
-        let buffers = ManuallyDrop::new(st.buffers.take());
         self.regs.w64(CONTROL, 0);
         let stopped = self.wait(|| self.regs.r64(STATUS) & (CMD_BUF_RUN | EVENT_LOG_RUN) == 0).is_ok();
         // A unit that will not stop may still read its tables: leak them.
         if stopped {
-            drop(ManuallyDrop::into_inner(buffers));
+            // SAFETY: dropped once, here; the unit no longer uses them.
+            unsafe { ManuallyDrop::drop(&mut st.buffers) };
         }
     }
 }

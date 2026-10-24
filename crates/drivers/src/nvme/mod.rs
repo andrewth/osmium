@@ -43,6 +43,7 @@ use core::mem::ManuallyDrop;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::ioext::IoMemExt;
 use osmium_arch::barrier;
 use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
@@ -204,8 +205,8 @@ fn set_prps(sqe: &mut Sqe, prp1: u64, prp2: u64) {
 
 /// An identify string: ASCII, space-padded.
 fn ident_string<const N: usize>(page: &[u8], offset: usize) -> [u8; N] {
-    core::array::from_fn(|i| match page[offset + i] {
-        b @ 0x20..=0x7e => b,
+    core::array::from_fn(|i| match page.get(offset.saturating_add(i)) {
+        Some(&b @ 0x20..=0x7e) => b,
         _ => b' ',
     })
 }
@@ -223,11 +224,11 @@ struct Regs {
 
 impl Regs {
     fn read(&self, off: usize) -> u32 {
-        self.io.read(off).expect("NVMe register outside window")
+        self.io.rd(off)
     }
 
     fn write(&self, off: usize, v: u32) {
-        self.io.write(off, v).expect("NVMe register outside window")
+        self.io.wr(off, v)
     }
 
     // 64-bit registers are accessed as two dwords, low first, which every
@@ -653,7 +654,7 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
         loop {
             let mut tail = None;
             while !failed && submitted < pieces {
-                let Some(slot) = slots[..window].iter().position(Option::is_none) else { break };
+                let Some(slot) = slots.iter().take(window).position(Option::is_none) else { break };
                 let start = submitted * chunk;
                 let range = start..len.min(start + chunk);
                 fill(&self.mem.data, slot * DATA_LEN, range.clone());
@@ -661,11 +662,13 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
                 self.next_cid = if cid == MAX_CID { 0 } else { cid + 1 };
                 let at = lba + (start >> self.block_shift) as u64;
                 let blocks = (range.len() >> self.block_shift) as u32;
-                let mut sqe = command(opcode, self.nsid, at as u32, (at >> 32) as u32, blocks - 1);
+                let mut sqe = command(opcode, self.nsid, at as u32, (at >> 32) as u32, blocks.saturating_sub(1));
                 sqe[0] |= (cid as u32) << 16;
                 self.data_prps(&mut sqe, slot, range.len());
                 tail = Some(self.mem.io.push(&sqe));
-                slots[slot] = Some((cid, submitted));
+                if let Some(s) = slots.get_mut(slot) {
+                    *s = Some((cid, submitted));
+                }
                 submitted += 1;
             }
             if let Some(tail) = tail {
@@ -696,8 +699,14 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
                 self.regs.doorbell(qid, true, self.mem.io.head());
                 let found = slots.iter().position(|s| matches!(s, Some((cid, _)) if *cid == done.cid));
                 // Anything else is stray.
-                let Some(slot) = found.filter(|_| done.sqid == qid) else { continue };
-                let (_, index) = slots[slot].take().expect("slot was just matched");
+                let Some(slot) = found.filter(|_| done.sqid == qid) else {
+                    // A controller that keeps posting stray completions must not stall us forever.
+                    if self.clock.now_ns() > deadline {
+                        break Some(Failure::Timeout);
+                    }
+                    continue;
+                };
+                let Some((_, index)) = slots.get_mut(slot).and_then(Option::take) else { continue };
                 match done.status {
                     0 if opcode == op::READ => {
                         let start = index * chunk;
@@ -766,6 +775,9 @@ impl<'d, D: DmaAllocator + ?Sized> Nvme<'d, D> {
                     s => Err(Failure::Status(s)),
                 };
             }
+            if self.clock.now_ns() > deadline {
+                break Failure::Timeout;
+            }
         };
         self.broken = Some(why);
         Err(why)
@@ -815,13 +827,21 @@ impl<D: DmaAllocator + ?Sized> BlockDevice for Nvme<'_, D> {
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         self.check_range(lba, buf.len())?;
         let len = buf.len();
-        let drain = &mut |dma: &OwnedDma<'_, D>, off, range: Range<usize>| dma.read(off, &mut buf[range]);
+        let drain = &mut |dma: &OwnedDma<'_, D>, off, range: Range<usize>| {
+            if let Some(dst) = buf.get_mut(range) {
+                dma.read(off, dst);
+            }
+        };
         self.pipeline(op::READ, lba, len, &mut |_, _, _| {}, drain)
     }
 
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         self.check_range(lba, buf.len())?;
-        let fill = &mut |dma: &OwnedDma<'_, D>, off, range: Range<usize>| dma.write(off, &buf[range]);
+        let fill = &mut |dma: &OwnedDma<'_, D>, off, range: Range<usize>| {
+            if let Some(src) = buf.get(range) {
+                dma.write(off, src);
+            }
+        };
         self.pipeline(op::WRITE, lba, buf.len(), fill, &mut |_, _, _| {})
     }
 

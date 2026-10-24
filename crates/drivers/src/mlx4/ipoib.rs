@@ -20,7 +20,7 @@ use osmium_hal::dma::DmaAllocator;
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
 
 use super::ib::{Datagram, Destination, Gid, IbPort, MadDest, PortState, Route};
-use super::mad::{self, QP1_QKEY};
+use super::mad::{self, QP1_QKEY, put};
 use super::sa::{self, Group, JoinError};
 use super::{Mlx4, Mlx4Error};
 
@@ -93,16 +93,17 @@ pub struct IpoibPort<'h, 'd, D: DmaAllocator + ?Sized> {
 
 /// The invented MAC address of the interface with GID `gid`.
 fn mac_for(gid: &Gid) -> MacAddress {
-    let g = gid.0;
+    let [.., a, b, c, d, e] = gid.0;
     // Locally administered, unicast; the node-specific half of the GUID.
-    MacAddress([0x02, g[11], g[12], g[13], g[14], g[15]])
+    MacAddress([0x02, a, b, c, d, e])
 }
 
 /// The IPoIB hardware address of queue pair `qpn` with GID `gid`.
 fn hardware_address(qpn: u32, gid: &Gid) -> [u8; HW_LEN] {
     let mut hw = [0u8; HW_LEN];
-    hw[1..4].copy_from_slice(&qpn.to_be_bytes()[1..]);
-    hw[4..].copy_from_slice(&gid.0);
+    let [_, q1, q2, q3] = qpn.to_be_bytes();
+    put(&mut hw, 1, &[q1, q2, q3]);
+    put(&mut hw, 4, &gid.0);
     hw
 }
 
@@ -136,7 +137,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IpoibPort<'h, 'd, D> {
     /// The largest IP packet the group carries, once joined.
     pub fn mtu(&self) -> usize {
         match self.group() {
-            Some(g) => g.mtu_bytes().min(self.ib.max_payload()) - HEADER,
+            Some(g) => g.mtu_bytes().min(self.ib.max_payload()).saturating_sub(HEADER),
             None => MTU,
         }
     }
@@ -234,7 +235,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IpoibPort<'h, 'd, D> {
                 self.next_neighbor
             })
         });
-        self.neighbors[slot] = Some(entry);
+        if let Some(s) = self.neighbors.get_mut(slot) {
+            *s = Some(entry);
+        }
         mac
     }
 
@@ -246,34 +249,36 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IpoibPort<'h, 'd, D> {
     /// Rewrites an Ethernet frame into the IPoIB datagram it stands for, in
     /// `out`; returns its length, or `None` if the frame has nowhere to go.
     fn encapsulate(&self, frame: &[u8], out: &mut [u8; HEADER + 4096]) -> Option<(usize, Destination)> {
-        let dst = MacAddress(frame[..6].try_into().ok()?);
+        let dst = MacAddress(*frame.first_chunk::<6>()?);
+        let body = frame.get(ETH_HEADER..)?;
         let ethertype = mad::be16(frame, 12);
-        let body = &frame[ETH_HEADER..];
-        out[..2].copy_from_slice(&ethertype.to_be_bytes());
-        out[2..HEADER].fill(0);
+        put(out, 0, &ethertype.to_be_bytes());
+        put(out, 2, &[0; HEADER - 2]);
         let n = if ethertype == ETHERTYPE_ARP {
             // Ethernet ARP for IPv4: hardware 1, protocol 0x0800, 6 and 4 byte addresses.
             if body.len() < 28 || mad::be16(body, 0) != ARP_HARDWARE_ETHERNET || mad::be16(body, 2) != 0x0800 {
                 return None;
             }
             let op = mad::be16(body, 6);
-            let a = &mut out[HEADER..];
-            a[0..2].copy_from_slice(&ARP_HARDWARE_INFINIBAND.to_be_bytes());
-            a[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
-            a[4] = HW_LEN as u8;
-            a[5] = 4;
-            a[6..8].copy_from_slice(&op.to_be_bytes());
-            a[8..28].copy_from_slice(&hardware_address(self.ib.qpn(), &self.gid));
-            a[28..32].copy_from_slice(&body[14..18]);
             let target = match (op, self.neighbor_by_mac(dst)) {
                 (ARP_REQUEST, _) | (_, None) => [0; HW_LEN],
                 (_, Some(n)) => hardware_address(n.qpn, &n.gid),
             };
-            a[32..52].copy_from_slice(&target);
-            a[52..56].copy_from_slice(&body[24..28]);
+            let mut a = [0u8; 56];
+            put(&mut a, 0, &ARP_HARDWARE_INFINIBAND.to_be_bytes());
+            put(&mut a, 2, &0x0800u16.to_be_bytes());
+            put(&mut a, 4, &[HW_LEN as u8, 4]);
+            put(&mut a, 6, &op.to_be_bytes());
+            put(&mut a, 8, &hardware_address(self.ib.qpn(), &self.gid));
+            put(&mut a, 28, body.get(14..18)?);
+            put(&mut a, 32, &target);
+            put(&mut a, 52, body.get(24..28)?);
+            put(out, HEADER, &a);
             HEADER + 56
         } else {
-            out.get_mut(HEADER..HEADER + body.len())?.copy_from_slice(body);
+            if !put(out, HEADER, body) {
+                return None;
+            }
             HEADER + body.len()
         };
         let g = &self.group;
@@ -300,27 +305,31 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IpoibPort<'h, 'd, D> {
             return None; // too short, or our own multicast coming back
         }
         let ethertype = mad::be16(payload, 0);
-        let body = &payload[HEADER..];
-        let multicast = d.grh.is_some_and(|g| g.dst.0[0] == 0xff);
+        let body = payload.get(HEADER..)?;
+        let multicast = d.grh.is_some_and(|g| g.dst.0.first() == Some(&0xff));
         let dst = if multicast { MacAddress::BROADCAST } else { self.mac };
         let (src, n) = if ethertype == ETHERTYPE_ARP {
-            if body.len() < 56 || mad::be16(body, 0) != ARP_HARDWARE_INFINIBAND || body[4] != HW_LEN as u8 {
+            if body.len() < 56 || mad::be16(body, 0) != ARP_HARDWARE_INFINIBAND || body.get(4) != Some(&(HW_LEN as u8))
+            {
                 return None;
             }
             let op = mad::be16(body, 6);
-            let sender = &body[8..28];
-            let qpn = u32::from_be_bytes([0, sender[1], sender[2], sender[3]]);
-            let src = self.learn(d.src_lid, qpn, Gid(sender[4..].try_into().ok()?));
-            let a = out.get_mut(ETH_HEADER..ETH_HEADER + 28)?;
-            a[0..2].copy_from_slice(&ARP_HARDWARE_ETHERNET.to_be_bytes());
-            a[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
-            a[4] = 6;
-            a[5] = 4;
-            a[6..8].copy_from_slice(&op.to_be_bytes());
-            a[8..14].copy_from_slice(&src.0);
-            a[14..18].copy_from_slice(&body[28..32]);
-            a[18..24].copy_from_slice(&if op == ARP_REQUEST { [0; 6] } else { self.mac.0 });
-            a[24..28].copy_from_slice(&body[52..56]);
+            let sender = body.get(8..28)?;
+            let [_, q1, q2, q3, gid @ ..] = sender else { return None };
+            let qpn = u32::from_be_bytes([0, *q1, *q2, *q3]);
+            let src = self.learn(d.src_lid, qpn, Gid(gid.try_into().ok()?));
+            let mut a = [0u8; 28];
+            put(&mut a, 0, &ARP_HARDWARE_ETHERNET.to_be_bytes());
+            put(&mut a, 2, &0x0800u16.to_be_bytes());
+            put(&mut a, 4, &[6, 4]);
+            put(&mut a, 6, &op.to_be_bytes());
+            put(&mut a, 8, &src.0);
+            put(&mut a, 14, body.get(28..32)?);
+            put(&mut a, 18, &if op == ARP_REQUEST { [0; 6] } else { self.mac.0 });
+            put(&mut a, 24, body.get(52..56)?);
+            if !put(out, ETH_HEADER, &a) {
+                return None;
+            }
             (src, 28)
         } else {
             let known = self.neighbor_by_address(d.src_lid, d.src_qpn).map(|n| n.mac);
@@ -329,12 +338,14 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IpoibPort<'h, 'd, D> {
                 (None, Some(g)) => self.learn(d.src_lid, d.src_qpn, g.src),
                 (None, None) => return None, // never heard of it, and cannot tell who it is
             };
-            out.get_mut(ETH_HEADER..ETH_HEADER + body.len())?.copy_from_slice(body);
+            if !put(out, ETH_HEADER, body) {
+                return None;
+            }
             (src, body.len())
         };
-        out[..6].copy_from_slice(&dst.0);
-        out[6..12].copy_from_slice(&src.0);
-        out[12..14].copy_from_slice(&ethertype.to_be_bytes());
+        if !(put(out, 0, &dst.0) && put(out, 6, &src.0) && put(out, 12, &ethertype.to_be_bytes())) {
+            return None;
+        }
         Some(ETH_HEADER + n)
     }
 }
@@ -365,7 +376,7 @@ impl<D: DmaAllocator + ?Sized> NetDevice for IpoibPort<'_, '_, D> {
         }
         let mut datagram = [0u8; HEADER + 4096];
         match self.encapsulate(frame, &mut datagram) {
-            Some((n, dest)) => self.ib.send(&dest, &datagram[..n]),
+            Some((n, dest)) => self.ib.send(&dest, datagram.get(..n).ok_or(NetError::Io)?),
             None => Ok(()), // nowhere to send it; the stack will ask again
         }
     }
@@ -376,7 +387,7 @@ impl<D: DmaAllocator + ?Sized> NetDevice for IpoibPort<'_, '_, D> {
         loop {
             let d = self.ib.receive(&mut datagram)?;
             // (`ib.receive` reports a datagram too big for the buffer as an error.)
-            let payload = &datagram[..d.len];
+            let Some(payload) = datagram.get(..d.len) else { continue };
             if let Some(n) = self.decapsulate(&d, payload, buf) {
                 return Ok(n);
             }

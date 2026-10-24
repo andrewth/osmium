@@ -879,7 +879,9 @@ fn identify_packet(cd: &Cd) -> [u8; 512] {
 
 /// IDENTIFY DEVICE data for a disk.
 fn identify(dev: &FakeDev) -> [u8; 512] {
-    let FakeDev::Disk { sectors, sector_size, model, serial, lba48, ncq, .. } = dev else { unreachable!() };
+    let FakeDev::Disk { sectors, sector_size, model, serial, lba48, ncq, .. } = dev else {
+        panic!("wrong fake device kind")
+    };
     let mut w = [0u16; 256];
     let string = |w: &mut [u16], s: &str| {
         let mut bytes = s.bytes().chain(core::iter::repeat(b' '));

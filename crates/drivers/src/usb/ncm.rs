@@ -88,13 +88,31 @@ impl NcmFunction {
     pub fn parse(config: &[u8]) -> Option<Self> {
         let mut ncm = None;
         let cdc = ecm::parse_cdc(config, SUBCLASS_NCM, |d| {
-            if d[2] == SUBTYPE_NCM && d.len() >= 6 && ncm.is_none() {
-                ncm = Some((u16::from_le_bytes([d[3], d[4]]), d[5]));
+            if let [_, _, SUBTYPE_NCM, v0, v1, caps, ..] = *d
+                && ncm.is_none()
+            {
+                ncm = Some((u16::from_le_bytes([v0, v1]), caps));
             }
         })?;
         let (version, capabilities) = ncm.unwrap_or((0, 0));
         Some(Self { cdc, version, capabilities })
     }
+}
+
+/// The little-endian `u16` at `at` in `b`, if `b` is long enough.
+fn le16(b: &[u8], at: usize) -> Option<usize> {
+    b.get(at..)?.first_chunk::<2>().map(|c| u16::from_le_bytes(*c) as usize)
+}
+
+/// The little-endian `u32` at `at` in `b`, if `b` is long enough.
+fn le32(b: &[u8], at: usize) -> Option<u32> {
+    b.get(at..)?.first_chunk::<4>().map(|c| u32::from_le_bytes(*c))
+}
+
+/// Copies `v` to offset `at` of `b`, if it fits.
+fn put(b: &mut [u8], at: usize, v: &[u8]) -> Option<()> {
+    b.get_mut(at..at.checked_add(v.len())?)?.copy_from_slice(v);
+    Some(())
 }
 
 /// The function's NTB parameters (`GET_NTB_PARAMETERS`, NCM table 6-3).
@@ -118,18 +136,16 @@ pub struct NtbParameters {
 impl NtbParameters {
     /// Parses the 28-byte reply to `GET_NTB_PARAMETERS`.
     pub fn parse(b: &[u8]) -> Option<Self> {
-        if b.len() < 28 || (u16::from_le_bytes([b[0], b[1]]) as usize) < 28 {
+        if b.len() < 28 || le16(b, 0)? < 28 {
             return None;
         }
-        let u16_at = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
-        let u32_at = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
         Some(Self {
-            formats: u16_at(2),
-            in_max_size: u32_at(4),
-            out_max_size: u32_at(16),
-            out_divisor: u16_at(20),
-            out_remainder: u16_at(22),
-            out_alignment: u16_at(24),
+            formats: le16(b, 2)? as u16,
+            in_max_size: le32(b, 4)?,
+            out_max_size: le32(b, 16)?,
+            out_divisor: le16(b, 20)? as u16,
+            out_remainder: le16(b, 22)? as u16,
+            out_alignment: le16(b, 24)? as u16,
         })
     }
 }
@@ -174,20 +190,20 @@ impl TxLayout {
     pub fn build(&self, buf: &mut [u8], sequence: u16, frame: &[u8]) -> Option<usize> {
         let len = self.datagram.checked_add(frame.len()).filter(|&n| n <= self.max_len && n <= buf.len())?;
         let len16 = |n: usize| (n as u16).to_le_bytes();
-        let ntb = &mut buf[..len];
-        ntb[..self.datagram].fill(0);
-        ntb[0..4].copy_from_slice(&NTH16_SIGNATURE);
-        ntb[4..6].copy_from_slice(&len16(NTH16_LEN));
-        ntb[6..8].copy_from_slice(&sequence.to_le_bytes());
-        ntb[8..10].copy_from_slice(&len16(len));
-        ntb[10..12].copy_from_slice(&len16(self.ndp));
-        let ndp = &mut ntb[self.ndp..self.ndp + NDP16_ONE_LEN];
-        ndp[0..4].copy_from_slice(&NDP16_SIGNATURE);
-        ndp[4..6].copy_from_slice(&len16(NDP16_ONE_LEN));
+        let (head, tail) = buf.get_mut(..len)?.split_at_mut_checked(self.datagram)?;
+        head.fill(0);
+        put(head, 0, &NTH16_SIGNATURE)?;
+        put(head, 4, &len16(NTH16_LEN))?;
+        put(head, 6, &sequence.to_le_bytes())?;
+        put(head, 8, &len16(len))?;
+        put(head, 10, &len16(self.ndp))?;
+        let ndp = head.get_mut(self.ndp..self.ndp.checked_add(NDP16_ONE_LEN)?)?;
+        put(ndp, 0, &NDP16_SIGNATURE)?;
+        put(ndp, 4, &len16(NDP16_ONE_LEN))?;
         // wNextNdpIndex and the terminating entry stay zero.
-        ndp[8..10].copy_from_slice(&len16(self.datagram));
-        ndp[10..12].copy_from_slice(&len16(frame.len()));
-        ntb[self.datagram..].copy_from_slice(frame);
+        put(ndp, 8, &len16(self.datagram))?;
+        put(ndp, 10, &len16(frame.len()))?;
+        tail.copy_from_slice(frame);
         Some(len)
     }
 }
@@ -215,15 +231,16 @@ pub struct NtbReader {
 impl NtbReader {
     /// Checks the NTB header at the start of `ntb`, the bytes received.
     pub fn new(ntb: &[u8]) -> Result<Self, BadNtb> {
-        let u16_at = |at: usize| u16::from_le_bytes([ntb[at], ntb[at + 1]]) as usize;
-        if ntb.len() < NTH16_LEN || ntb[..4] != NTH16_SIGNATURE || u16_at(4) != NTH16_LEN {
+        if ntb.len() < NTH16_LEN || ntb.first_chunk::<4>() != Some(&NTH16_SIGNATURE) || le16(ntb, 4) != Some(NTH16_LEN)
+        {
             return Err(BadNtb);
         }
-        let block_len = u16_at(8);
+        let block_len = le16(ntb, 8).ok_or(BadNtb)?;
         if !(NTH16_LEN..=ntb.len()).contains(&block_len) {
             return Err(BadNtb);
         }
-        Ok(Self { block_len, ndp: u16_at(10), entry: 0, ndps: 0, seen: [0; MAX_NDPS as usize] })
+        let ndp = le16(ntb, 10).ok_or(BadNtb)?;
+        Ok(Self { block_len, ndp, entry: 0, ndps: 0, seen: [0; MAX_NDPS as usize] })
     }
 
     /// The range of `ntb` holding the next datagram, `None` after the last.
@@ -238,24 +255,25 @@ impl NtbReader {
     }
 
     fn step(&mut self, ntb: &[u8]) -> Result<Option<Range<usize>>, BadNtb> {
-        let ntb = &ntb[..self.block_len];
-        let u16_at = |at: usize| u16::from_le_bytes([ntb[at], ntb[at + 1]]) as usize;
+        let ntb = ntb.get(..self.block_len).ok_or(BadNtb)?;
+        let u16_at = |at: usize| le16(ntb, at).ok_or(BadNtb);
         while self.ndp != 0 {
             let ndp = self.ndp;
             // A chain that comes back to an NDP would deliver its datagrams again.
-            if self.seen[..self.ndps as usize].contains(&(ndp as u16)) {
+            if self.seen.get(..usize::from(self.ndps)).is_none_or(|s| s.contains(&(ndp as u16))) {
                 return Err(BadNtb);
             }
-            if ndp < NTH16_LEN || ndp + NDP16_ONE_LEN > ntb.len() || ntb[ndp..ndp + 4] != NDP16_SIGNATURE {
+            if ndp < NTH16_LEN || ndp + NDP16_ONE_LEN > ntb.len() || ntb.get(ndp..ndp + 4) != Some(&NDP16_SIGNATURE[..])
+            {
                 return Err(BadNtb);
             }
-            let ndp_len = u16_at(ndp + 4);
+            let ndp_len = u16_at(ndp + 4)?;
             if ndp_len < NDP16_ONE_LEN || ndp + ndp_len > ntb.len() {
                 return Err(BadNtb);
             }
             let at = ndp + 8 + 4 * self.entry;
             if at + 4 <= ndp + ndp_len {
-                let (index, len) = (u16_at(at), u16_at(at + 2));
+                let (index, len) = (u16_at(at)?, u16_at(at + 2)?);
                 if index != 0 && len != 0 {
                     self.entry += 1;
                     if index < NTH16_LEN || index + len > ntb.len() {
@@ -265,12 +283,12 @@ impl NtbReader {
                 }
             }
             // A null entry (or the end of the table) ends this NDP.
-            self.seen[self.ndps as usize] = ndp as u16;
+            *self.seen.get_mut(usize::from(self.ndps)).ok_or(BadNtb)? = ndp as u16;
             self.ndps += 1;
             if self.ndps >= MAX_NDPS {
                 return Err(BadNtb);
             }
-            self.ndp = u16_at(ndp + 6);
+            self.ndp = u16_at(ndp + 6)?;
             self.entry = 0;
         }
         Ok(None)
@@ -332,7 +350,8 @@ impl<H: UsbHost> UsbNcm<H> {
         // format and input size may be changed.
         let mut reply = [0u8; 28];
         let n = host.control_in(dev, class(Direction::In, GET_NTB_PARAMETERS, 0, 28), &mut reply)?;
-        let params = NtbParameters::parse(&reply[..n]).ok_or(UsbError::BadDescriptor)?;
+        let params =
+            NtbParameters::parse(reply.get(..n).ok_or(UsbError::BadDescriptor)?).ok_or(UsbError::BadDescriptor)?;
         if params.formats & FORMAT_NTB16 == 0 {
             return Err(UsbError::BadDescriptor);
         }
@@ -347,7 +366,8 @@ impl<H: UsbHost> UsbNcm<H> {
             data[..4].copy_from_slice(&size);
             // Some devices take a datagram count too; 0 is "no limit".
             let len = if function.capabilities & capability::NTB_INPUT_SIZE_8 != 0 { 8 } else { 4 };
-            host.control_out(dev, class(Direction::Out, SET_NTB_INPUT_SIZE, 0, len as u16), &data[..len])?;
+            let data = data.get(..len).ok_or(UsbError::BadDescriptor)?;
+            host.control_out(dev, class(Direction::Out, SET_NTB_INPUT_SIZE, 0, len as u16), data)?;
         }
         // Both directions must at least carry a full-sized Ethernet frame.
         let frame = (cdc.max_segment as usize).min(1514);
@@ -428,7 +448,7 @@ impl<H: UsbHost> UsbNcm<H> {
             {
                 self.notify_submitted = false;
                 if let Ok(n) = done
-                    && let Some(Notification::NetworkConnection(up)) = parse_notification(&note[..n.min(16)])
+                    && let Some(Notification::NetworkConnection(up)) = note.get(..n).and_then(parse_notification)
                 {
                     self.link = up;
                 }
@@ -447,7 +467,7 @@ impl<H: UsbHost> UsbNcm<H> {
             let n = done.map_err(bad)?.min(self.rx.len());
             // An empty packet ends an NTB that filled its last packet.
             if n > 0 {
-                match NtbReader::new(&self.rx[..n]) {
+                match self.rx.get(..n).ok_or(BadNtb).and_then(NtbReader::new) {
                     Ok(reader) => {
                         self.rx_reader = reader;
                         self.advance();
@@ -488,7 +508,7 @@ impl<H: UsbHost> NetDevice for UsbNcm<H> {
         let len = self.tx.build(&mut self.tx_buf, self.tx_sequence, frame).ok_or(NetError::TooLarge)?;
         self.tx_sequence = self.tx_sequence.wrapping_add(1);
         let ep = self.function.cdc.bulk_out;
-        self.host.transfer_out(self.dev, ep.address, &self.tx_buf[..len]).map_err(bad)?;
+        self.host.transfer_out(self.dev, ep.address, self.tx_buf.get(..len).ok_or(NetError::TooLarge)?).map_err(bad)?;
         // An NTB of exactly the device's maximum size needs no terminator;
         // a shorter one that fills its last packet does.
         if len < self.tx.max_len && len.is_multiple_of((ep.max_packet_size() as usize).max(1)) {
@@ -501,10 +521,13 @@ impl<H: UsbHost> NetDevice for UsbNcm<H> {
         self.service()?;
         let range = self.rx_next.take().ok_or(NetError::WouldBlock)?;
         let n = range.len();
-        let fits = buf.len() >= n;
-        if fits {
-            buf[..n].copy_from_slice(&self.rx[range]);
-        }
+        let fits = match (buf.get_mut(..n), self.rx.get(range)) {
+            (Some(dst), Some(src)) => {
+                dst.copy_from_slice(src);
+                true
+            }
+            _ => false,
+        };
         self.advance();
         // Once the NTB is used up, start the next transfer before the caller
         // digests this frame.
@@ -797,10 +820,10 @@ mod tests {
             1
         }
         fn port_status(&self, _: u8) -> PortStatus {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn attach(&mut self, _: u8) -> Result<DeviceId, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn detach(&mut self, _: DeviceId) {}
         fn configure_endpoints(&mut self, _: DeviceId, eps: &[EndpointDescriptor]) -> Result<(), UsbError> {
@@ -838,7 +861,7 @@ mod tests {
             Ok(())
         }
         fn transfer_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Result<usize, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn transfer_out(&mut self, _: DeviceId, ep: u8, data: &[u8]) -> Result<(), UsbError> {
             assert_eq!(ep, 0x01);
@@ -1007,5 +1030,32 @@ mod tests {
         eth.service().unwrap();
         assert!(eth.link_up());
         eth.transmit(&[0; 60]).unwrap();
+    }
+
+    #[test]
+    fn hostile_input_never_panics() {
+        // Every prefix of a good NTB, and of the config and parameters, is
+        // handled; corrupting each byte of an NTB in turn is too.
+        let good = ntb(&[&[1; 60], &[2; 61]]);
+        for n in 0..good.len() {
+            let _ = datagrams(&good[..n]);
+        }
+        for at in 0..good.len() {
+            for v in [0u8, 1, 0x7f, 0xff] {
+                let mut b = good.clone();
+                b[at] = v;
+                let _ = datagrams(&b);
+            }
+        }
+        for n in 0..CONFIG.len() {
+            let _ = NcmFunction::parse(&CONFIG[..n]);
+        }
+        let p = params(16384, 16384, 4, 0, 4);
+        for n in 0..p.len() {
+            assert_eq!(NtbParameters::parse(&p[..n]), None);
+        }
+        // A reader used with a buffer shorter than its NTB ends the walk.
+        let mut r = NtbReader::new(&good).unwrap();
+        assert_eq!(r.next(&good[..14]), Err(BadNtb));
     }
 }

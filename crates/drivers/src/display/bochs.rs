@@ -185,8 +185,9 @@ impl BochsVbe {
         let stride = self.read(reg::VIRT_WIDTH) as u32 * format.bytes_per_pixel() as u32;
         let info =
             FramebufferInfo { width: self.read(reg::XRES) as u32, height: self.read(reg::YRES) as u32, stride, format };
-        let off = self.read(reg::Y_OFFSET) as usize * stride as usize
-            + self.read(reg::X_OFFSET) as usize * format.bytes_per_pixel();
+        let off = (self.read(reg::Y_OFFSET) as usize)
+            .saturating_mul(stride as usize)
+            .saturating_add((self.read(reg::X_OFFSET) as usize).saturating_mul(format.bytes_per_pixel()));
         Framebuffer::new(self.vram.slice(off, self.vram_size().saturating_sub(off))?, info)
     }
 
@@ -196,7 +197,7 @@ impl BochsVbe {
         if !matches!(bpp, 16 | 24 | 32) || width == 0 || height == 0 {
             return Err(DisplayError::Unsupported);
         }
-        if width as usize * height as usize * (bpp as usize / 8) > self.vram_size() {
+        if (width as usize).saturating_mul(height as usize).saturating_mul(bpp as usize / 8) > self.vram_size() {
             return Err(DisplayError::NoMemory);
         }
         self.unblank();
@@ -222,11 +223,14 @@ impl BochsVbe {
     /// device has one and the VGA registers still hold it).
     pub fn disable(&mut self) {
         self.write(reg::ENABLE, 0);
-        self.fb = Framebuffer::new(
-            self.vram.slice(0, 0).expect("empty slice"),
-            FramebufferInfo::packed(0, 0, PixelFormat::XRGB8888),
-        )
-        .expect("empty framebuffer");
+        // An empty window always builds; if it somehow did not, the old
+        // framebuffer would stay in place.
+        let empty = self.vram.slice(0, 0).ok();
+        if let Some(fb) =
+            empty.and_then(|m| Framebuffer::new(m, FramebufferInfo::packed(0, 0, PixelFormat::XRGB8888)).ok())
+        {
+            self.fb = fb;
+        }
     }
 }
 

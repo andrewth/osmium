@@ -194,7 +194,7 @@ impl<I: FwCfgIo> FwCfg<I> {
             }
             let name = &e[DIR_ENTRY - NAME_LEN..];
             let len = name.iter().position(|&c| c == 0).unwrap_or(NAME_LEN);
-            let Ok(name) = core::str::from_utf8(&name[..len]) else { continue };
+            let Ok(name) = core::str::from_utf8(name.get(..len).unwrap_or(&[])) else { continue };
             let size = u32::from_be_bytes([e[0], e[1], e[2], e[3]]);
             let select = u16::from_be_bytes([e[4], e[5]]);
             if !f(name, File { select, size }) {

@@ -683,11 +683,11 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     }
 
     fn portsc(&self, port: u8) -> u32 {
-        self.op_read(PORTSC + (port as usize - 1) * PORT_STRIDE)
+        self.op_read(PORTSC + (port as usize).saturating_sub(1) * PORT_STRIDE)
     }
 
     fn set_portsc(&self, port: u8, v: u32) {
-        self.op_write(PORTSC + (port as usize - 1) * PORT_STRIDE, v)
+        self.op_write(PORTSC + (port as usize).saturating_sub(1) * PORT_STRIDE, v)
     }
 
     fn poll(&self, ns: u64, mut done: impl FnMut(&Self) -> bool) -> Result<(), UsbError> {
@@ -768,8 +768,10 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         let i = ev.endpoint_id() as usize;
         if let Some(e) = self.isoch.iter_mut().flatten().find(|e| e.dev == ev.slot_id() && e.dci == i) {
             let (head, count) = (e.head, e.count);
-            if let Some(td) = (0..count).map(|k| (head + k) % ISOCH_DEPTH).find(|&k| e.tds[k].trb == ev.param) {
-                e.tds[td].done = Some(ev);
+            let hit =
+                (0..count).map(|k| (head + k) % ISOCH_DEPTH).find(|&k| e.tds.get(k).is_some_and(|t| t.trb == ev.param));
+            if let Some(td) = hit.and_then(|k| e.tds.get_mut(k)) {
+                td.done = Some(ev);
             }
             return;
         }
@@ -955,8 +957,8 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         let input_addr = input.device_addr().as_u64();
         let mut endpoints = [const { None }; MAX_ENDPOINTS];
         endpoints[0] = Some(Endpoint { dci: 1, ring: ep0, pending: None });
-        self.slots[slot_id as usize - 1] =
-            Some(Slot { output, input, endpoints, speed, topo, hub_ports: 0, dead: false });
+        let entry = self.slots.get_mut(slot_id as usize - 1).ok_or(UsbError::NoResources)?;
+        *entry = Some(Slot { output, input, endpoints, speed, topo, hub_ports: 0, dead: false });
 
         let result = self.command(Trb::address_device(slot_id, input_addr)).and_then(|_| {
             // Learn endpoint 0's real packet size from the first 8 bytes of
@@ -1149,7 +1151,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         }
         // Everything below a hub goes with it.
         for id in 1..=MAX_SLOTS {
-            if self.slots[id as usize - 1].as_ref().is_some_and(|s| s.topo.parent == dev.0) {
+            if self.slots.get(id as usize - 1).and_then(Option::as_ref).is_some_and(|s| s.topo.parent == dev.0) {
                 self.detach(DeviceId(id));
             }
         }
@@ -1157,7 +1159,9 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             // Disabled, or never enabled: the controller is done with the slot's memory.
             Ok(_) | Err(UsbError::NoDevice) => {
                 self.dcbaa.store(dev.0 as usize * 8, 0u64);
-                self.slots[dev.0 as usize - 1] = None;
+                if let Some(entry) = self.slots.get_mut((dev.0 as usize).wrapping_sub(1)) {
+                    *entry = None;
+                }
                 for e in self.isoch.iter_mut().filter(|e| e.as_ref().is_some_and(|e| e.dev == dev.0)) {
                     *e = None;
                 }
@@ -1230,7 +1234,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
                 }
                 let buf = new_dma(dma, ac64, ISOCH_DEPTH * ISOCH_SLOT_LEN).ok_or(UsbError::NoResources)?;
                 let microframes = 1u32 << interval(ep, speed);
-                new_isoch[k] = Some(IsochEp {
+                *new_isoch.get_mut(k).ok_or(UsbError::NoResources)? = Some(IsochEp {
                     dev: dev.0,
                     dci: i,
                     buf,
@@ -1260,7 +1264,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             ctx_set(&slot.input, ctx, 3, (deq >> 32) as u32);
             let avg = if periodic { esit } else { 3072 };
             ctx_set(&slot.input, ctx, 4, (esit & 0xffff) << 16 | avg);
-            new_rings[k] = Some((i, ring));
+            *new_rings.get_mut(k).ok_or(UsbError::NoResources)? = Some((i, ring));
             if slot.endpoints.iter().flatten().any(|e| e.dci == i) {
                 drop |= 1 << i;
             }
@@ -1287,7 +1291,10 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             }
         }
         for new in new_isoch.into_iter().flatten() {
-            *self.isoch.iter_mut().find(|e| e.is_none()).expect("isoch slot checked above") = Some(new);
+            // Room was checked above.
+            if let Some(free) = self.isoch.iter_mut().find(|e| e.is_none()) {
+                *free = Some(new);
+            }
         }
         let slot = self.slot(dev)?;
         for (i, ring) in new_rings.into_iter().flatten() {
@@ -1296,7 +1303,9 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
                 Some(old) => *old = ep,
                 // Room was checked above.
                 None => {
-                    *slot.endpoints.iter_mut().find(|e| e.is_none()).expect("endpoint slot checked above") = Some(ep)
+                    if let Some(free) = slot.endpoints.iter_mut().find(|e| e.is_none()) {
+                        *free = Some(ep);
+                    }
                 }
             }
         }
@@ -1306,7 +1315,9 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
     fn control_in(&mut self, dev: DeviceId, setup: SetupPacket, buf: &mut [u8]) -> Result<usize, UsbError> {
         let len = (setup.length as usize).min(buf.len());
         let n = self.control(dev, SetupPacket { length: len as u16, ..setup })?;
-        self.bounce.read(0, &mut buf[..n]);
+        if let Some(dst) = buf.get_mut(..n) {
+            self.bounce.read(0, dst);
+        }
         Ok(n)
     }
 
@@ -1315,7 +1326,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         if len > BOUNCE_LEN {
             return Err(UsbError::NoResources);
         }
-        self.bounce.write(0, &data[..len]);
+        self.bounce.write(0, data.get(..len).ok_or(UsbError::NoResources)?);
         self.control(dev, SetupPacket { length: len as u16, ..setup }).map(drop)
     }
 
@@ -1324,7 +1335,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         while done < buf.len() {
             let want = (buf.len() - done).min(BOUNCE_LEN);
             let n = self.transfer_chunk(dev, endpoint | 0x80, want)?;
-            self.bounce.read(0, &mut buf[done..done + n]);
+            self.bounce.read(0, buf.get_mut(done..done + n).ok_or(UsbError::Controller)?);
             done += n;
             if n < want {
                 break; // a short packet ends the transfer
@@ -1364,7 +1375,9 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         Some(match ev.completion_code() {
             completion::SUCCESS | completion::SHORT_PACKET => {
                 let n = (p.len - (ev.residual() as usize).min(p.len)).min(buf.len());
-                p.buf.read(0, &mut buf[..n]);
+                if let Some(dst) = buf.get_mut(..n) {
+                    p.buf.read(0, dst);
+                }
                 Ok(n)
             }
             code => {
@@ -1433,7 +1446,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         let ring = &mut self.slot(dev)?.endpoint(i).ok_or(UsbError::BadEndpoint)?.ring;
         let trb_addr = ring.push(trb).as_u64();
         let e = self.isoch_ep(dev, i)?;
-        e.tds[k] = IsochTd { trb: trb_addr, len: len as u32, done: None };
+        *e.tds.get_mut(k).ok_or(UsbError::BadEndpoint)? = IsochTd { trb: trb_addr, len: len as u32, done: None };
         e.count += 1;
         e.last_frame = frame;
         self.ring_doorbell(dev.0, i as u32);
@@ -1471,7 +1484,8 @@ impl<D: DmaAllocator + ?Sized> IsochHost for Xhci<'_, D> {
             Ok(_) => return Some(Err(UsbError::BadEndpoint)),
             Err(err) => return Some(Err(err)),
         };
-        let (k, td) = (e.head, e.tds[e.head]);
+        let k = e.head;
+        let td = *e.tds.get(k)?;
         let ev = td.done?;
         e.head = (k + 1) % ISOCH_DEPTH;
         e.count -= 1;
@@ -1480,7 +1494,9 @@ impl<D: DmaAllocator + ?Sized> IsochHost for Xhci<'_, D> {
                 let n = td.len as usize - (ev.residual() as usize).min(td.len as usize);
                 if e.dir_in {
                     let m = n.min(buf.len());
-                    e.buf.read(k * ISOCH_SLOT_LEN, &mut buf[..m]);
+                    if let Some(dst) = buf.get_mut(..m) {
+                        e.buf.read(k * ISOCH_SLOT_LEN, dst);
+                    }
                     Ok(m)
                 } else {
                     Ok(n)

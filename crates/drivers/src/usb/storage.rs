@@ -82,6 +82,11 @@ impl Inquiry {
     }
 }
 
+/// The `N` bytes at `at` in `d` (zeros if `d` is too short).
+fn field<const N: usize>(d: &[u8], at: usize) -> [u8; N] {
+    d.get(at..).and_then(|s| s.first_chunk::<N>()).copied().unwrap_or([0; N])
+}
+
 fn trimmed(b: &[u8]) -> &str {
     core::str::from_utf8(b).map(str::trim_end).unwrap_or("?")
 }
@@ -153,8 +158,9 @@ impl<H: UsbHost> UsbStorage<H> {
         if s.command(&[READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0], Data::In(&mut cap))? < cap.len() {
             return Err(StorageError::Short);
         }
-        let last = u32::from_be_bytes(cap[0..4].try_into().expect("fixed-width slice"));
-        s.block_size = u32::from_be_bytes(cap[4..8].try_into().expect("fixed-width slice")) as usize;
+        let [l0, l1, l2, l3, b0, b1, b2, b3] = cap;
+        let last = u32::from_be_bytes([l0, l1, l2, l3]);
+        s.block_size = u32::from_be_bytes([b0, b1, b2, b3]) as usize;
         s.blocks = last as u64 + 1;
         // A last LBA of 0xffffffff means "too many to say here".
         if last == u32::MAX || !s.block_size.is_power_of_two() || !(512..=MAX_COMMAND_BYTES).contains(&s.block_size) {
@@ -173,10 +179,10 @@ impl<H: UsbHost> UsbStorage<H> {
         let mut d = [0u8; 36];
         self.command(&[INQUIRY, 0, 0, 0, 36, 0], Data::In(&mut d))?;
         Ok(Inquiry {
-            device_type: d[0] & 0x1f,
-            removable: d[1] & 0x80 != 0,
-            vendor: d[8..16].try_into().expect("fixed-width slice"),
-            product: d[16..32].try_into().expect("fixed-width slice"),
+            device_type: d.first().map_or(0, |b| b & 0x1f),
+            removable: d.get(1).is_some_and(|b| b & 0x80 != 0),
+            vendor: field(&d, 8),
+            product: field(&d, 16),
         })
     }
 
@@ -204,7 +210,7 @@ impl<H: UsbHost> UsbStorage<H> {
     fn sense_key(&mut self) -> u8 {
         let mut sense = [0u8; 18];
         match self.transport(&[REQUEST_SENSE, 0, 0, 0, 18, 0], Data::In(&mut sense)) {
-            Ok((0, n)) if n >= 3 => sense[2] & 0xf,
+            Ok((0, n)) if n >= 3 => sense.get(2).map_or(0, |b| b & 0xf),
             _ => 0,
         }
     }
@@ -241,14 +247,18 @@ impl<H: UsbHost> UsbStorage<H> {
             Data::In(b) => (b.len(), 0x80),
             Data::Out(b) => (b.len(), 0),
         };
+        // The command block is at most 16 bytes; longer is a driver bug, not input.
+        if cb.len() > 16 {
+            return Err(StorageError::Unsupported);
+        }
+        let tag = self.tag.to_le_bytes();
+        let len_bytes = (len as u32).to_le_bytes();
+        let tail = [flags, self.lun, cb.len() as u8];
+        let header = CBW_SIGNATURE.iter().chain(&tag).chain(&len_bytes).chain(&tail).chain(cb);
         let mut cbw = [0u8; 31];
-        cbw[0..4].copy_from_slice(CBW_SIGNATURE);
-        cbw[4..8].copy_from_slice(&self.tag.to_le_bytes());
-        cbw[8..12].copy_from_slice(&(len as u32).to_le_bytes());
-        cbw[12] = flags;
-        cbw[13] = self.lun;
-        cbw[14] = cb.len() as u8;
-        cbw[15..15 + cb.len()].copy_from_slice(cb);
+        for (dst, src) in cbw.iter_mut().zip(header) {
+            *dst = *src;
+        }
         if let Err(e) = self.host.transfer_out(self.dev, self.bulk_out, &cbw) {
             self.reset_recovery();
             return Err(e.into());
@@ -279,13 +289,14 @@ impl<H: UsbHost> UsbStorage<H> {
             self.clear_halt(self.bulk_in);
             got = self.host.transfer_in(self.dev, self.bulk_in, &mut csw);
         }
-        let valid = got == Ok(13) && &csw[0..4] == CSW_SIGNATURE && csw[4..8] == cbw[4..8] && csw[12] <= 1;
+        let [s0, s1, s2, s3, t0, t1, t2, t3, r0, r1, r2, r3, status] = csw;
+        let valid = got == Ok(13) && [s0, s1, s2, s3] == *CSW_SIGNATURE && [t0, t1, t2, t3] == tag && status <= 1;
         if !valid {
             self.reset_recovery();
             return Err(StorageError::Phase);
         }
-        let residue = u32::from_le_bytes(csw[8..12].try_into().expect("fixed-width slice")) as usize;
-        Ok((csw[12], moved.min(len.saturating_sub(residue))))
+        let residue = u32::from_le_bytes([r0, r1, r2, r3]) as usize;
+        Ok((status, moved.min(len.saturating_sub(residue))))
     }
 
     fn rw_command(op: u8, lba: u64, blocks: usize) -> [u8; 10] {
@@ -317,8 +328,8 @@ impl<H: UsbHost> BlockDevice for UsbStorage<H> {
     }
 
     fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        self.check_range(lba, buf.len())?;
-        if lba + (buf.len() / self.block_size) as u64 > u32::MAX as u64 {
+        let n = self.check_range(lba, buf.len())?;
+        if lba.checked_add(n).is_none_or(|end| end > u32::MAX as u64) {
             return Err(BlockError::OutOfRange); // READ(10) addresses 32 bits
         }
         let step = self.chunk_blocks();
@@ -331,8 +342,8 @@ impl<H: UsbHost> BlockDevice for UsbStorage<H> {
     }
 
     fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
-        self.check_range(lba, buf.len())?;
-        if lba + (buf.len() / self.block_size) as u64 > u32::MAX as u64 {
+        let n = self.check_range(lba, buf.len())?;
+        if lba.checked_add(n).is_none_or(|end| end > u32::MAX as u64) {
             return Err(BlockError::OutOfRange);
         }
         let step = self.chunk_blocks();
@@ -478,10 +489,10 @@ mod tests {
             1
         }
         fn port_status(&self, _: u8) -> PortStatus {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn attach(&mut self, _: u8) -> Result<DeviceId, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn detach(&mut self, _: DeviceId) {}
         fn configure_endpoints(&mut self, _: DeviceId, _: &[EndpointDescriptor]) -> Result<(), UsbError> {
@@ -546,10 +557,10 @@ mod tests {
             }
         }
         fn submit_in(&mut self, _: DeviceId, _: u8, _: usize) -> Result<(), UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn poll_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Option<Result<usize, UsbError>> {
-            unimplemented!()
+            panic!("not used by this test")
         }
     }
 

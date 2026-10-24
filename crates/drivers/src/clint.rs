@@ -1,6 +1,7 @@
 //! RISC-V Core-Local Interruptor (CLINT / ACLINT MTIMER + MSWI): the
 //! machine-mode timer and software interrupts, for M-mode firmware.
 
+use crate::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 
 const MSIP: usize = 0x0000;
@@ -27,7 +28,7 @@ impl Clint {
 
     /// The free-running machine timer.
     pub fn mtime(&self) -> u64 {
-        self.io.read(MTIME).expect("CLINT window too small")
+        self.io.rd(MTIME)
     }
 
     /// Raises the machine timer interrupt for `hart` once `mtime` reaches

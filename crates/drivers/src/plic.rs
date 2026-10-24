@@ -1,5 +1,6 @@
 //! RISC-V Platform-Level Interrupt Controller.
 
+use crate::ioext::IoMemExt;
 use osmium_hal::irq::InterruptController;
 use osmium_hal::mmio::IoMem;
 
@@ -67,7 +68,7 @@ impl Plic {
 
     /// Accepts all priorities above `threshold` on the current CPU's context.
     pub fn set_threshold(&self, threshold: u32) {
-        self.io.write(self.context() + THRESHOLD, threshold).expect("PLIC window too small");
+        self.io.wr(self.context() + THRESHOLD, threshold);
     }
 }
 

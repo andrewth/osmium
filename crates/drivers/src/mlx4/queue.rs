@@ -24,6 +24,7 @@
 //! pair numbers follow the special ones, and queue pairs 0 and 1 take the
 //! special numbers.
 
+use core::cell::Cell;
 use core::mem::ManuallyDrop;
 
 use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
@@ -268,7 +269,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
         if self.hca.comp_eqn.is_none() {
             return;
         }
-        let sn = self.hca.arm_sn[self.index()].get();
+        let sn = self.hca.arm_sn.get(self.index()).map_or(0, Cell::get);
         let (word, ci) = ((sn as u32 & 3) << 28 | CQ_DB_REQ_NOT, self.cq_ci & 0xff_ffff);
         // The record first, then the doorbell that makes the device read it.
         put32(&self.mem.doorbells, 4, word | ci);
@@ -281,7 +282,8 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
 
     /// Re-arms the completion queue if an event disarmed it.
     pub fn rearm_if_fired(&mut self) {
-        if self.hca.comp_eqn.is_some() && self.armed_sn != Some(self.hca.arm_sn[self.index()].get()) {
+        if self.hca.comp_eqn.is_some() && self.armed_sn != Some(self.hca.arm_sn.get(self.index()).map_or(0, Cell::get))
+        {
             self.arm_cq();
         }
     }
@@ -419,8 +421,13 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
             // An error completion says why in the low byte of its fourth dword.
             let syndrome = if error { get32(cq, off + 24) as u8 } else { 0 };
             if tail & 0x40 != 0 {
-                self.tx_syndrome[self.tx_done as usize % SQ_ENTRIES as usize] = syndrome;
-                self.tx_done = self.tx_done.wrapping_add(1);
+                // A completion for a send that was never posted is the device's mistake: ignore it.
+                if self.tx_done != self.tx_head {
+                    if let Some(s) = self.tx_syndrome.get_mut(self.tx_done as usize % SQ_ENTRIES as usize) {
+                        *s = syndrome;
+                    }
+                    self.tx_done = self.tx_done.wrapping_add(1);
+                }
             } else {
                 let slot = (get32(cq, off + 24) >> 16) as u16 % RX_SLOTS as u16;
                 let len = get32(cq, off + 20).min(self.rx_slot as u32) as u16;
@@ -431,20 +438,25 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
                 let (source, route) = (get32(cq, off + 8), get32(cq, off + 12));
                 // At most RX_SLOTS receives are outstanding, so this fits.
                 let at = (self.rx_ready_head + self.rx_ready_count) % RX_SLOTS as usize;
-                self.rx_ready[at] = Received {
-                    slot,
-                    len,
-                    error,
-                    checksum,
-                    src_qpn: source & 0xff_ffff,
-                    src_lid: route as u16,
-                    sl: (route >> 28) as u8,
-                    src_path_bits: (source >> 24 & 0x7f) as u8,
-                    pkey_index: (get32(cq, off + 4) & 0x7f) as u8,
-                    grh: source >> 31 != 0,
-                    syndrome,
-                };
-                self.rx_ready_count += 1;
+                // More completions than receive entries posted is the device's mistake: drop the excess.
+                let slot_for_it =
+                    if self.rx_ready_count < RX_SLOTS as usize { self.rx_ready.get_mut(at) } else { None };
+                if let Some(entry) = slot_for_it {
+                    *entry = Received {
+                        slot,
+                        len,
+                        error,
+                        checksum,
+                        src_qpn: source & 0xff_ffff,
+                        src_lid: route as u16,
+                        sl: (route >> 28) as u8,
+                        src_path_bits: (source >> 24 & 0x7f) as u8,
+                        pkey_index: (get32(cq, off + 4) & 0x7f) as u8,
+                        grh: source >> 31 != 0,
+                        syndrome,
+                    };
+                    self.rx_ready_count += 1;
+                }
             }
             self.cq_ci = self.cq_ci.wrapping_add(1);
             reaped = true;
@@ -532,15 +544,20 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
         if self.rx_ready_count == 0 {
             return None;
         }
-        let r = self.rx_ready[self.rx_ready_head];
+        let r = self.rx_ready.get(self.rx_ready_head).copied().unwrap_or_default();
         self.rx_ready_head = (self.rx_ready_head + 1) % RX_SLOTS as usize;
         self.rx_ready_count -= 1;
         Some(r)
     }
 
     /// Copies `dst.len()` bytes from `offset` into receive slot `slot`.
+    /// A range outside the slot reads as zeros.
     pub fn read_rx(&self, slot: u16, offset: usize, dst: &mut [u8]) {
-        self.mem.rx.read(slot as usize * self.rx_slot + offset, dst);
+        if offset.checked_add(dst.len()).is_some_and(|end| end <= self.rx_slot) && (slot as usize) < RX_SLOTS as usize {
+            self.mem.rx.read(slot as usize * self.rx_slot + offset, dst);
+        } else {
+            dst.fill(0);
+        }
     }
 
     /// Hands the receive entry of the packet just taken back to the device.

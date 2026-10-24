@@ -360,7 +360,7 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
         let link = |qh: usize| self.qh_addr(qh) | LINK_QH;
         let async_order: [usize; 2 + MAX_PENDING] = core::array::from_fn(|i| QH_ASYNC_HEAD + i);
         for (k, &qh) in async_order.iter().enumerate() {
-            let next = async_order[(k + 1) % async_order.len()];
+            let next = QH_ASYNC_HEAD + (k + 1) % async_order.len();
             idle(qh, link(next), qh == QH_ASYNC_HEAD);
         }
         idle(QH_PERIODIC_ROOT, link(QH_PERIODIC), false);
@@ -414,11 +414,11 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
     }
 
     fn portsc(&self, port: u8) -> u32 {
-        self.op_read(PORTSC + 4 * (port as usize - 1))
+        self.op_read(PORTSC + 4 * (port as usize).saturating_sub(1))
     }
 
     fn set_portsc(&self, port: u8, v: u32) {
-        self.op_write(PORTSC + 4 * (port as usize - 1), v)
+        self.op_write(PORTSC + 4 * (port as usize).saturating_sub(1), v)
     }
 
     /// Waits for the controller to finish the frame it is in.
@@ -530,7 +530,7 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
     fn abort(&self, qh: usize) -> bool {
         let periodic = qh >= QH_PERIODIC;
         // Each list is in index order, so the one before is the previous queue head.
-        let (prev, next) = (qh - 1, self.qh_word(qh, 0));
+        let (prev, next) = (qh.saturating_sub(1), self.qh_word(qh, 0));
         let own = self.qh_addr(qh) | LINK_QH;
         self.set_qh_word(prev, 0, next);
         osmium_arch::barrier::mb();
@@ -569,17 +569,14 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
             !matches!(outcome, Progress::Running)
         });
         match outcome {
-            _ if !done => {
+            Progress::Done(bytes) if done => Ok(bytes),
+            // The controller halted the queue head on its own.
+            Progress::Failed(e) if done => Err(e),
+            _ => {
                 // The synchronous memory is not reused if the controller may still use it.
                 self.wedged |= !self.abort(plan.qh);
                 Err(UsbError::Timeout)
             }
-            Progress::Done(bytes) => Ok(bytes),
-            Progress::Failed(e) => {
-                // The controller halted the queue head on its own.
-                Err(e)
-            }
-            Progress::Running => unreachable!("wait returned with the transfer running"),
         }
     }
 }
@@ -659,8 +656,10 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
         }
         let plan = Self::build_control(&self.mem.sync, setup, len, dir_in, QH_SYNC);
         let moved = self.run_sync(plan, pipe, CONTROL_TIMEOUT_NS)?;
-        if let Data::In(buf) = data {
-            self.mem.sync.buf.read(0, &mut buf[..moved.min(len)]);
+        if let Data::In(buf) = data
+            && let Some(dst) = buf.get_mut(..moved.min(len))
+        {
+            self.mem.sync.buf.read(0, dst);
         }
         Ok(moved)
     }
@@ -677,8 +676,10 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
         }
         let plan = Self::build_bulk(&self.mem.sync, toggle, n, dir_in, QH_SYNC);
         let moved = self.run_sync(plan, pipe, BULK_TIMEOUT_NS)?;
-        if let Data::In(buf) = data {
-            self.mem.sync.buf.read(0, &mut buf[..moved.min(n)]);
+        if let Data::In(buf) = data
+            && let Some(dst) = buf.get_mut(..moved.min(n))
+        {
+            self.mem.sync.buf.read(0, dst);
         }
         Ok(moved)
     }
@@ -695,7 +696,7 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
         let qh = if pipe.ttype == TransferType::Interrupt { QH_PERIODIC + slot } else { QH_ASYNC + slot };
         let plan = Self::build_bulk(&xfer, toggle, len, true, qh);
         self.start_transfer(&xfer, &plan, pipe);
-        self.mem.pending[slot] = Some(Pending { xfer, plan });
+        *self.mem.pending.get_mut(slot).ok_or(UsbError::NoResources)? = Some(Pending { xfer, plan });
         Ok(slot)
     }
 
@@ -706,12 +707,16 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
             Progress::Running => return None,
             Progress::Done(bytes) => {
                 let n = bytes.min(buf.len());
-                p.xfer.buf.read(0, &mut buf[..n]);
+                if let Some(dst) = buf.get_mut(..n) {
+                    p.xfer.buf.read(0, dst);
+                }
                 Ok(n)
             }
             Progress::Failed(e) => Err(e),
         };
-        self.mem.pending[slot] = None;
+        if let Some(entry) = self.mem.pending.get_mut(slot) {
+            *entry = None;
+        }
         Some(result)
     }
 

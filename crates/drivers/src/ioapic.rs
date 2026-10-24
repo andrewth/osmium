@@ -1,6 +1,7 @@
 //! x86 I/O APIC: routes external interrupt lines (global system interrupts)
 //! to local-APIC vectors.
 
+use crate::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_sync::{IrqDisabled, IrqSpinLock, SpinLockGuard};
 
@@ -50,7 +51,7 @@ impl IoApic {
     // guard as an argument makes that hard to forget.
     fn read_locked(&self, _: &Selected<'_>, reg: u32) -> u32 {
         let _ = self.io.write(IOREGSEL, reg);
-        self.io.read(IOWIN).expect("I/O APIC window too small")
+        self.io.rd(IOWIN)
     }
 
     fn write_locked(&self, _: &Selected<'_>, reg: u32, v: u32) {
@@ -73,15 +74,15 @@ impl IoApic {
         gsi >= self.gsi_base && gsi - self.gsi_base < self.lines()
     }
 
-    fn entry(&self, gsi: u32) -> u32 {
-        assert!(self.handles(gsi), "GSI {gsi} not handled by this I/O APIC");
-        REG_REDIRECTION + 2 * (gsi - self.gsi_base)
+    /// The register of `gsi`'s redirection entry, if this unit handles it.
+    fn entry(&self, gsi: u32) -> Option<u32> {
+        self.handles(gsi).then(|| REG_REDIRECTION + 2 * (gsi - self.gsi_base))
     }
 
     /// Delivers `gsi` as `vector` to the CPU with local APIC id `dest`
     /// (fixed delivery, physical destination) and unmasks it.
     pub fn route(&self, gsi: u32, vector: u8, dest: u8, mode: LineMode) {
-        let reg = self.entry(gsi);
+        let Some(reg) = self.entry(gsi) else { return };
         let mut low = vector as u32;
         if mode.active_low {
             low |= ACTIVE_LOW;
@@ -101,7 +102,7 @@ impl IoApic {
     /// concurrent update is not lost.
     fn modify(&self, gsi: u32, f: impl FnOnce(u32) -> u32) {
         // `entry` reads the version register, so call it before locking.
-        let reg = self.entry(gsi);
+        let Some(reg) = self.entry(gsi) else { return };
         let g = self.lock.lock();
         let v = self.read_locked(&g, reg);
         self.write_locked(&g, reg, f(v));
@@ -147,5 +148,16 @@ mod tests {
         let apic = IoApic::new(unsafe { IoMem::new(regs.as_mut_ptr().cast(), 32) }, 0);
         assert_eq!(apic.lines(), 120);
         assert!(apic.handles(119) && !apic.handles(120));
+    }
+
+    #[test]
+    fn unhandled_gsi_is_ignored() {
+        let mut regs = [0u32; 8];
+        regs[IOWIN / 4] = 23 << 16;
+        // SAFETY: the window covers a local array.
+        let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), 32) };
+        let apic = IoApic::new(io, 0);
+        apic.route(1000, 0x30, 0, LineMode { level: false, active_low: false });
+        assert!(!apic.handles(1000));
     }
 }

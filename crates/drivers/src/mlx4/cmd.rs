@@ -80,43 +80,56 @@ impl Ctx {
         Self { dw: [0; 128] }
     }
 
-    /// Sets the `width`-bit field at bit `shift` of dword `dw`.
+    /// Sets the `width`-bit field at bit `shift` of dword `dw`. A dword outside the
+    /// context is ignored.
     pub fn set(&mut self, dw: usize, shift: u32, width: u32, value: u32) -> &mut Self {
-        let mask = if width == 32 { !0 } else { ((1u32 << width) - 1) << shift };
-        self.dw[dw] = (self.dw[dw] & !mask) | ((value << shift) & mask);
+        let mask = field_mask(shift, width);
+        if let Some(d) = self.dw.get_mut(dw) {
+            *d = (*d & !mask) | (value.checked_shl(shift).unwrap_or(0) & mask);
+        }
         self
     }
 
-    /// Reads the `width`-bit field at bit `shift` of dword `dw`.
+    /// Reads the `width`-bit field at bit `shift` of dword `dw`; zero outside the context.
     pub fn get(&self, dw: usize, shift: u32, width: u32) -> u32 {
-        let v = self.dw[dw] >> shift;
-        if width == 32 { v } else { v & ((1 << width) - 1) }
+        let v = self.dword(dw).checked_shr(shift).unwrap_or(0);
+        if width >= 32 { v } else { v & ((1 << width) - 1) }
     }
 
     /// Stores a 64-bit address as dword `dw` (high half) and `dw + 1` (low
     /// half), ORing the low half into whatever fields share its low bits.
     pub fn set_addr(&mut self, dw: usize, addr: u64) -> &mut Self {
-        self.dw[dw] = (addr >> 32) as u32;
-        self.dw[dw + 1] |= addr as u32;
+        if let Some(d) = self.dw.get_mut(dw) {
+            *d = (addr >> 32) as u32;
+        }
+        if let Some(d) = dw.checked_add(1).and_then(|i| self.dw.get_mut(i)) {
+            *d |= addr as u32;
+        }
         self
     }
 
-    /// The whole dword `dw`.
+    /// The whole dword `dw`; zero outside the context.
     pub fn dword(&self, dw: usize) -> u32 {
-        self.dw[dw]
+        self.dw.get(dw).copied().unwrap_or(0)
     }
 
     fn store(&self, buf: &DmaBuffer, len: usize) {
-        for (i, &v) in self.dw[..len / 4].iter().enumerate() {
+        for (i, &v) in self.dw.iter().take(len / 4).enumerate() {
             buf.store(i * 4, v.to_be());
         }
     }
 
     fn load(&mut self, buf: &DmaBuffer, len: usize) {
-        for (i, v) in self.dw[..len / 4].iter_mut().enumerate() {
+        for (i, v) in self.dw.iter_mut().take(len / 4).enumerate() {
             *v = u32::from_be(buf.load(i * 4));
         }
     }
+}
+
+/// The mask of the `width`-bit field at bit `shift`, clipped to the dword.
+fn field_mask(shift: u32, width: u32) -> u32 {
+    let ones = if width >= 32 { !0 } else { (1u32 << width) - 1 };
+    ones.checked_shl(shift).unwrap_or(0)
 }
 
 /// What a command takes as input.
@@ -217,21 +230,24 @@ impl<'d, D: DmaAllocator + ?Sized> Hcr<'d, D> {
         if self.wedged.get() {
             return Err(Mlx4Error::Timeout);
         }
+        let [input_box, output_box] = &*self.mailboxes;
         self.wait().inspect_err(|_| self.wedge())?;
         let in_param = match input {
             Input::None => 0,
             Input::Imm(v) => v,
             Input::Mailbox(ctx, len) => {
-                assert!(len <= 512 && len.is_multiple_of(4));
-                ctx.store(&self.mailboxes[0], len);
-                self.mailboxes[0].device_addr().as_u64()
+                if len > 512 || !len.is_multiple_of(4) {
+                    return Err(Mlx4Error::BadParameter);
+                }
+                ctx.store(input_box, len);
+                input_box.device_addr().as_u64()
             }
             Input::Raw(fill) => {
-                fill(&self.mailboxes[0]);
-                self.mailboxes[0].device_addr().as_u64()
+                fill(input_box);
+                input_box.device_addr().as_u64()
             }
         };
-        let out_param = if out.is_some() { self.mailboxes[1].device_addr().as_u64() } else { 0 };
+        let out_param = if out.is_some() { output_box.device_addr().as_u64() } else { 0 };
         let toggle = !self.toggle.get();
         self.toggle.set(toggle);
 
@@ -252,7 +268,7 @@ impl<'d, D: DmaAllocator + ?Sized> Hcr<'d, D> {
         }
         if let Some((ctx, len)) = out {
             osmium_arch::barrier::dma_rmb();
-            ctx.load(&self.mailboxes[1], len.min(512));
+            ctx.load(output_box, len.min(512));
             return Ok(0);
         }
         Ok((self.reg(3) as u64) << 32 | self.reg(4) as u64)
@@ -271,3 +287,17 @@ impl<D: DmaAllocator + ?Sized> Drop for Hcr<'_, D> {
 
 /// MTT entries one WRITE_MTT can carry after its 16-byte header.
 pub const MTTS_PER_WRITE: usize = (MAILBOX_LEN - 16) / 8;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_fields_outside_the_context_are_ignored() {
+        let mut c = Ctx::new();
+        c.set(128, 0, 32, 1).set(usize::MAX, 0, 32, 1).set_addr(127, !0).set_addr(usize::MAX, 1);
+        c.set(0, 40, 40, 1).set(0, 0, 64, 1);
+        assert_eq!((c.get(128, 0, 32), c.get(0, 33, 40), c.dword(usize::MAX)), (0, 0, 0));
+        assert_eq!(c.dword(127), u32::MAX);
+    }
+}

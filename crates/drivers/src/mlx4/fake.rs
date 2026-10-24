@@ -8,6 +8,8 @@
 //! [`FakeHca::sent`] plays the send engine and [`FakeHca::deliver`] the
 //! receive engine, through the same MTT translations the hardware uses.
 
+#![allow(clippy::unreachable)] // test-only simulation: an unexpected command is a test failure
+
 use core::cell::RefCell;
 use std::collections::BTreeMap;
 use std::vec;

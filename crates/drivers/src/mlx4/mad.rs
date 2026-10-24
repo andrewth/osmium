@@ -40,22 +40,40 @@ const DR_SLID: usize = 32;
 const DR_DLID: usize = 34;
 const RETURN_PATH: usize = 192;
 
-/// Reads a big-endian `u16` at `at`.
+/// Reads a big-endian `u16` at `at`; zero if the bytes are not there, so callers that
+/// care check the length first.
 pub fn be16(b: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([b[at], b[at + 1]])
+    at.checked_add(2)
+        .and_then(|end| b.get(at..end))
+        .and_then(|s| s.first_chunk::<2>())
+        .map_or(0, |a| u16::from_be_bytes(*a))
 }
 
-/// Reads a big-endian `u32` at `at`.
+/// Reads a big-endian `u32` at `at`; zero if the bytes are not there.
 pub fn be32(b: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+    at.checked_add(4)
+        .and_then(|end| b.get(at..end))
+        .and_then(|s| s.first_chunk::<4>())
+        .map_or(0, |a| u32::from_be_bytes(*a))
+}
+
+/// Writes `bytes` at `at`; returns false (writing nothing) if they do not fit.
+pub(super) fn put(b: &mut [u8], at: usize, bytes: &[u8]) -> bool {
+    match at.checked_add(bytes.len()).and_then(|end| b.get_mut(at..end)) {
+        Some(dst) => {
+            dst.copy_from_slice(bytes);
+            true
+        }
+        None => false,
+    }
 }
 
 fn put16(b: &mut [u8], at: usize, v: u16) {
-    b[at..at + 2].copy_from_slice(&v.to_be_bytes());
+    put(b, at, &v.to_be_bytes());
 }
 
 fn put32(b: &mut [u8], at: usize, v: u32) {
-    b[at..at + 4].copy_from_slice(&v.to_be_bytes());
+    put(b, at, &v.to_be_bytes());
 }
 
 /// The work completion of a received datagram, as MAD_IFC takes it.
@@ -118,10 +136,9 @@ impl UdHeader {
             // The payload length counts from the BTH through the ICRC.
             let paylen = (12 + 8 + self.payload + 4 + 3) & !3;
             put16(out, at + 4, paylen as u16);
-            out[at + 6] = 0x1b; // next header: InfiniBand transport
-            out[at + 7] = g.hop_limit;
-            out[at + 8..at + 24].copy_from_slice(&g.source);
-            out[at + 24..at + 40].copy_from_slice(&g.dest);
+            put(out, at + 6, &[0x1b, g.hop_limit]); // next header: InfiniBand transport, hop limit
+            put(out, at + 8, &g.source);
+            put(out, at + 24, &g.dest);
             at += GRH_LEN;
         }
         let pad = (4 - (self.payload as u32 & 3)) & 3;
@@ -156,7 +173,7 @@ pub fn dr_receive(smp: &mut [u8; MAD_LEN], port: u8) -> bool {
         // At the end of the path: record the way back, then step past it.
         p if p == hop_cnt => {
             if hop_cnt > 0 {
-                smp[RETURN_PATH + p as usize] = port;
+                put(smp, RETURN_PATH + p as usize, &[port]);
             }
             if !dlid_permissive {
                 return false;
@@ -185,7 +202,7 @@ pub fn dr_respond(smp: &mut [u8; MAD_LEN], port: u8) -> bool {
     }
     if hop_cnt > 0 && hop_ptr == hop_cnt + 1 {
         smp[HOP_PTR] = hop_ptr - 1;
-        return smp[RETURN_PATH + (hop_ptr - 1) as usize] == port;
+        return smp.get(RETURN_PATH + (hop_ptr - 1) as usize) == Some(&port);
     }
     match hop_ptr {
         1 => {
@@ -235,6 +252,18 @@ mod tests {
         // A packet whose source is a real LID has nowhere to go back to without a subnet manager's help.
         assert!(!dr_respond(&mut smp(1, 0, 0, LID_PERMISSIVE, 5), 1));
         assert!(dr_respond(&mut smp(1, 0, 0, LID_PERMISSIVE, LID_PERMISSIVE), 1));
+    }
+
+    #[test]
+    fn short_buffers_read_as_zero_and_write_nothing() {
+        assert_eq!((be16(&[1], 0), be16(&[1, 2], usize::MAX), be32(&[1, 2, 3], 0), be32(&[], 7)), (0, 0, 0, 0));
+        assert_eq!(be16(&[0, 0, 1, 2], 2), 0x0102);
+        let mut b = [0u8; 3];
+        assert!(!put(&mut b, 2, &[1, 2]) && !put(&mut b, usize::MAX, &[1, 2]));
+        assert_eq!(b, [0; 3]);
+        // A path as long as the packet allows must not walk off it.
+        let mut m = smp(255, 254, DIRECTION, LID_PERMISSIVE, LID_PERMISSIVE);
+        assert!(!dr_respond(&mut m, 1));
     }
 
     #[test]

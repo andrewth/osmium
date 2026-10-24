@@ -352,7 +352,7 @@ impl Caps {
 
 /// `ceil(log2(n))` for `n >= 1`.
 fn log2_ceil(n: u32) -> u32 {
-    32 - (n - 1).leading_zeros()
+    32 - n.saturating_sub(1).leading_zeros()
 }
 
 /// One stretch of ICM: its address in the device's ICM space and length.
@@ -384,8 +384,8 @@ fn plan_icm(caps: &Caps) -> IcmPlan {
 
     let mut regions = [IcmRegion::default(); 5];
     let cmpt_window = caps.cmpt_entry << 24;
-    for (i, log) in [log_qps, log_srqs, log_cqs, log_eqs].into_iter().enumerate() {
-        regions[i] = IcmRegion { va: i as u64 * cmpt_window, len: page_up(caps.cmpt_entry << log) };
+    for (i, (region, log)) in regions.iter_mut().zip([log_qps, log_srqs, log_cqs, log_eqs]).enumerate() {
+        *region = IcmRegion { va: i as u64 * cmpt_window, len: page_up(caps.cmpt_entry << log) };
     }
 
     let mut c = Ctx::new();
@@ -433,9 +433,10 @@ fn map_blocks(
         let align = (va | pa).trailing_zeros().min(63);
         let log = align.min(63 - left.leading_zeros());
         f(va, pa, log)?;
-        va += 1 << log;
-        pa += 1 << log;
-        left -= 1 << log;
+        let step = 1u64 << log;
+        va = va.checked_add(step).ok_or(Mlx4Error::BadParameter)?;
+        pa = pa.checked_add(step).ok_or(Mlx4Error::BadParameter)?;
+        left = left.saturating_sub(step);
     }
     Ok(())
 }
@@ -596,7 +597,7 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
         map_blocks(va, pa, len, |va, pa, log| {
             let mut m = Ctx::new();
             m.set(0, 0, 32, (va >> 32) as u32).set(1, 0, 32, va as u32 & !0xfff);
-            m.set_addr(2, pa & !0xfff).set(3, 0, 6, log - 12);
+            m.set_addr(2, pa & !0xfff).set(3, 0, 6, log.saturating_sub(12));
             self.hcr.exec(opcode, 0, 1, Input::Mailbox(&m, 16))?;
             *done += 1 << log;
             Ok(())
@@ -630,10 +631,14 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
         for (i, r) in plan.regions.iter().enumerate() {
             let buf = alloc(r.len)?;
             let pa = buf.device_addr().as_u64();
-            self.mem.icm[i] = Some(buf);
+            if let Some(slot) = self.mem.icm.get_mut(i) {
+                *slot = Some(buf);
+            }
             let mut done = 0;
             let mapped = self.map(op::MAP_ICM, r.va, pa, r.len, &mut done);
-            self.stage.icm_mapped[i] = done;
+            if let Some(mapped_bytes) = self.stage.icm_mapped.get_mut(i) {
+                *mapped_bytes = done;
+            }
             mapped?;
         }
         self.hcr.exec(op::INIT_HCA, 0, 0, Input::Mailbox(&plan.init_hca, 512))?;
@@ -669,8 +674,9 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
     /// uses. Each registration of a slot has a key of its own, so a key that
     /// was revoked stays dead.
     fn register_window(&self, slot: u32, addr: u64, len: usize) -> Result<u32, Mlx4Error> {
-        let variant = self.window_variant[slot as usize].get().wrapping_add(1);
-        self.window_variant[slot as usize].set(variant);
+        let counter = self.window_variant.get(slot as usize).ok_or(Mlx4Error::BadParameter)?;
+        let variant = counter.get().wrapping_add(1);
+        counter.set(variant);
         let index = self.caps.reserved_mrws + 1 + slot;
         let key = (variant as u32) << 24 | index;
         let access = MPT_LOCAL_READ | MPT_LOCAL_WRITE | MPT_REMOTE_READ | MPT_REMOTE_WRITE;
@@ -961,7 +967,7 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
         self.hcr.exec_out(op::MAD_IFC, op_mod, in_mod, Input::Mailbox(&input, len), &mut reply, MAD_LEN)?;
         let mut out = [0u8; MAD_LEN];
         for i in 0..MAD_LEN / 4 {
-            out[4 * i..4 * i + 4].copy_from_slice(&reply.dword(i).to_be_bytes());
+            mad::put(&mut out, 4 * i, &reply.dword(i).to_be_bytes());
         }
         Ok(out)
     }
@@ -1078,7 +1084,7 @@ fn reset<C: ConfigAccess + ?Sized>(func: &Function<'_, C>, config: &IoMem, clock
     // command register last.
     if let Some(at) = pcie {
         for reg in [at + 8, at + 0x10] {
-            func.write32(reg, header[reg as usize / 4]);
+            func.write32(reg, header.get(reg as usize / 4).copied().unwrap_or(0));
         }
     }
     for (i, &d) in header[..16].iter().enumerate() {
@@ -1086,7 +1092,7 @@ fn reset<C: ConfigAccess + ?Sized>(func: &Function<'_, C>, config: &IoMem, clock
             func.write32(4 * i as u16, d);
         }
     }
-    func.write32(4, header[1]);
+    func.write32(4, header.get(1).copied().unwrap_or(0));
     Ok(())
 }
 

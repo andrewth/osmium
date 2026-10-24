@@ -97,7 +97,7 @@ impl DevTable {
 
     fn insert(&mut self, dev: Dev) -> Option<u8> {
         let i = self.devs.iter().position(Option::is_none)?;
-        self.devs[i] = Some(dev);
+        *self.devs.get_mut(i)? = Some(dev);
         Some(i as u8 + 1)
     }
 
@@ -238,8 +238,8 @@ pub fn bulk<H: Hc + ?Sized>(
         let n = (total - done).min(chunk_max);
         let piece = match &mut data {
             Data::None => Data::None,
-            Data::In(buf) => Data::In(&mut buf[done..done + n]),
-            Data::Out(buf) => Data::Out(&buf[done..done + n]),
+            Data::In(buf) => Data::In(buf.get_mut(done..done + n).ok_or(UsbError::BadEndpoint)?),
+            Data::Out(buf) => Data::Out(buf.get(done..done + n).ok_or(UsbError::BadEndpoint)?),
         };
         let moved = hc.bulk_chunk(pipe, toggle, piece)?.min(n);
         done += moved;
@@ -255,8 +255,9 @@ pub fn bulk<H: Hc + ?Sized>(
 /// UHCI, OHCI and the EHCI structures here require. Also checks the
 /// alignment `DmaAllocator::alloc_coherent` promises, which they rely on.
 pub fn below_4g(buf: &DmaBuffer) -> bool {
-    assert!(buf.device_addr().as_u64() % 4096 == 0, "DmaAllocator::alloc_coherent returned an unaligned buffer");
-    buf.device_addr().as_u64().checked_add(buf.len() as u64).is_some_and(|end| end <= 1 << 32)
+    // An unaligned buffer (which `alloc_coherent` promises not to return) is as unusable as a high one.
+    buf.device_addr().as_u64() % 4096 == 0
+        && buf.device_addr().as_u64().checked_add(buf.len() as u64).is_some_and(|end| end <= 1 << 32)
 }
 
 /// Gives the controller's simulation a turn in tests; spins otherwise.
@@ -321,7 +322,8 @@ fn address_device<H: Hc + ?Sized>(hc: &mut H, speed: Speed, parent: Option<u8>) 
     let mut head = [0u8; 8];
     let setup = SetupPacket::get_descriptor(descriptor_type::DEVICE, 0, 8);
     let n = hc.control(&default, setup, Data::In(&mut head))?;
-    let mps = head[7] as u16;
+    let [_, _, _, _, _, _, _, mps] = head;
+    let mps = mps as u16;
     let valid = match speed {
         Speed::Low => mps == 8,
         Speed::Full => matches!(mps, 8 | 16 | 32 | 64),
@@ -465,7 +467,10 @@ pub fn control_in<H: Hc + ?Sized>(
     let (pipe, _) = device_pipe(hc, dev)?;
     let len = (setup.length as usize).min(buf.len());
     let setup = SetupPacket { length: len as u16, ..setup };
-    let data = if len == 0 { Data::None } else { Data::In(&mut buf[..len]) };
+    let data = match buf.get_mut(..len) {
+        Some(b) if len != 0 => Data::In(b),
+        _ => Data::None,
+    };
     hc.control(&pipe, setup, data)
 }
 
@@ -474,7 +479,10 @@ pub fn control_out<H: Hc + ?Sized>(hc: &mut H, dev: DeviceId, setup: SetupPacket
     let (pipe, _) = device_pipe(hc, dev)?;
     let len = (setup.length as usize).min(data.len());
     let setup = SetupPacket { length: len as u16, ..setup };
-    let stage = if len == 0 { Data::None } else { Data::Out(&data[..len]) };
+    let stage = match data.get(..len) {
+        Some(b) if len != 0 => Data::Out(b),
+        _ => Data::None,
+    };
     hc.control(&pipe, setup, stage)?;
     after_control(hc, dev, &setup);
     Ok(())

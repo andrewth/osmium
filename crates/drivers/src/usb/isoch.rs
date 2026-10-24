@@ -42,7 +42,7 @@ impl<H: IsochHost> IsochIn<H> {
     pub fn read(&mut self, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
         let result = match self.host.isoch_poll(self.dev, self.endpoint, buf)? {
             Err(UsbError::Transaction) => {
-                self.errors += 1;
+                self.errors = self.errors.saturating_add(1);
                 Ok(0)
             }
             other => other,
@@ -91,7 +91,7 @@ impl<H: IsochHost> IsochOut<H> {
                 }
                 Some(Err(_)) => {
                     self.queued -= 1;
-                    self.errors += 1;
+                    self.errors = self.errors.saturating_add(1);
                 }
             }
         }
@@ -145,32 +145,32 @@ mod tests {
             0
         }
         fn port_status(&self, _: u8) -> PortStatus {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn attach(&mut self, _: u8) -> Result<DeviceId, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn detach(&mut self, _: DeviceId) {}
         fn configure_endpoints(&mut self, _: DeviceId, _: &[EndpointDescriptor]) -> Result<(), UsbError> {
             Ok(())
         }
         fn control_in(&mut self, _: DeviceId, _: SetupPacket, _: &mut [u8]) -> Result<usize, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn control_out(&mut self, _: DeviceId, _: SetupPacket, _: &[u8]) -> Result<(), UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn transfer_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Result<usize, UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn transfer_out(&mut self, _: DeviceId, _: u8, _: &[u8]) -> Result<(), UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn submit_in(&mut self, _: DeviceId, _: u8, _: usize) -> Result<(), UsbError> {
-            unimplemented!()
+            panic!("not used by this test")
         }
         fn poll_in(&mut self, _: DeviceId, _: u8, _: &mut [u8]) -> Option<Result<usize, UsbError>> {
-            unimplemented!()
+            panic!("not used by this test")
         }
     }
 

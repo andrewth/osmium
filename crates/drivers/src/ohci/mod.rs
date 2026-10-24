@@ -348,7 +348,7 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
         // Power the ports and give them time to settle.
         self.w32(RH_STATUS, RH_LOCAL_POWER_SET);
         for port in 1..=self.ports {
-            self.w32(RH_PORT_STATUS + 4 * (port as usize - 1), PORT_SET_POWER);
+            self.w32(Self::port_reg(port), PORT_SET_POWER);
         }
         let settle_ms = (self.r32(RH_DESCRIPTOR_A) >> RH_POWER_ON_TO_GOOD_SHIFT) * 2;
         usbhc::delay(self.clock, settle_ms.min(100) as u64 * 1_000_000);
@@ -356,7 +356,7 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
     }
 
     fn port_reg(port: u8) -> usize {
-        RH_PORT_STATUS + 4 * (port as usize - 1)
+        RH_PORT_STATUS + 4 * (port as usize).saturating_sub(1)
     }
 
     /// Waits for the controller to finish the frame it is in, so that it no
@@ -488,10 +488,9 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
             outcome = self.progress(&self.mem.sync, &plan);
         }
         match outcome {
-            _ if !done => Err(UsbError::Timeout),
-            Progress::Done(bytes) => Ok(bytes),
-            Progress::Failed(e) => Err(e),
-            Progress::Running => unreachable!("wait returned with the transfer running"),
+            Progress::Done(bytes) if done => Ok(bytes),
+            Progress::Failed(e) if done => Err(e),
+            _ => Err(UsbError::Timeout),
         }
     }
 }
@@ -555,8 +554,10 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
         }
         let plan = Self::build_control(&self.mem.sync, setup, len, dir_in);
         let moved = self.run_sync(plan, pipe, CONTROL_TIMEOUT_NS)?;
-        if let Data::In(buf) = data {
-            self.mem.sync.buf.read(0, &mut buf[..moved.min(len)]);
+        if let Data::In(buf) = data
+            && let Some(dst) = buf.get_mut(..moved.min(len))
+        {
+            self.mem.sync.buf.read(0, dst);
         }
         Ok(moved)
     }
@@ -573,8 +574,10 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
         }
         let plan = Self::build_bulk(&self.mem.sync, toggle, n, dir_in, ED_SYNC_BULK, Some(CMD_BLF));
         let moved = self.run_sync(plan, pipe, BULK_TIMEOUT_NS)?;
-        if let Data::In(buf) = data {
-            self.mem.sync.buf.read(0, &mut buf[..moved.min(n)]);
+        if let Data::In(buf) = data
+            && let Some(dst) = buf.get_mut(..moved.min(n))
+        {
+            self.mem.sync.buf.read(0, dst);
         }
         Ok(moved)
     }
@@ -591,7 +594,7 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
         };
         let plan = Self::build_bulk(&xfer, toggle, len, true, ed, list);
         self.arm(&xfer, &plan, pipe);
-        self.mem.pending[slot] = Some(Pending { xfer, plan });
+        *self.mem.pending.get_mut(slot).ok_or(UsbError::NoResources)? = Some(Pending { xfer, plan });
         Ok(slot)
     }
 
@@ -603,16 +606,19 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
         // Read the result again now its frame has passed (see `progress`).
         let quiet = self.disarm(p.plan.ed);
         let result = match self.progress(&p.xfer, &p.plan) {
-            Progress::Running => unreachable!("a retired descriptor went back to running"),
+            // A retired descriptor going back to running means the controller is not to be trusted.
+            Progress::Running => Err(UsbError::Transaction),
             Progress::Done(bytes) => {
                 let n = bytes.min(buf.len());
-                p.xfer.buf.read(0, &mut buf[..n]);
+                if let Some(dst) = buf.get_mut(..n) {
+                    p.xfer.buf.read(0, dst);
+                }
                 Ok(n)
             }
             Progress::Failed(e) => Err(e),
         };
         // If the controller may still be using the memory, leak it.
-        if let Some(p) = self.mem.pending[slot].take()
+        if let Some(p) = self.mem.pending.get_mut(slot).and_then(Option::take)
             && !quiet
         {
             core::mem::forget(p);

@@ -250,8 +250,8 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
                 lso.write(0, frame);
                 let hdr = (LSO_FIXED + h).next_multiple_of(SEG_LEN);
                 put32(wq, wqe + SEG_LEN, (t.mss as u32) << 16 | h as u32);
-                wq.write(wqe + SEG_LEN + LSO_FIXED, &frame[..h]);
-                (OPCODE_LSO, 2 + hdr / SEG_LEN, wqe + SEG_LEN + hdr, lso, h, frame.len() - h)
+                wq.write(wqe + SEG_LEN + LSO_FIXED, frame.get(..h).unwrap_or_default());
+                (OPCODE_LSO, 2 + hdr / SEG_LEN, wqe + SEG_LEN + hdr, lso, h, frame.len().saturating_sub(h))
             }
             _ => {
                 self.q.mem.tx.write(slot, frame);
