@@ -1,11 +1,11 @@
 //! The namespace: absolute path lookup across mounted file systems.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use osmium_sync::RwSpinLock;
+use osmium_sync::fallible::{try_arc, try_push, try_string};
 
 use crate::{Errno, File, FileKind, OpenFlags, Stat};
 
@@ -53,8 +53,31 @@ struct Parent<'path> {
 
 impl Vfs {
     /// A namespace whose `/` is `root`, a directory.
+    ///
+    /// # Panics
+    /// If memory runs out: [`Vfs::try_new`] reports that instead.
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM at boot; `try_new` is the fallible form.
     pub fn new(root: Arc<dyn File>) -> Self {
-        Vfs { mounts: RwSpinLock::new(Arc::new(vec![Mount { path: "/".to_string(), root }])) }
+        Self::try_new(root).expect("out of memory for the namespace")
+    }
+
+    /// [`Vfs::new`], failing with `ENOMEM` instead of panicking.
+    pub fn try_new(root: Arc<dyn File>) -> Result<Self, Errno> {
+        let mut mounts = Vec::new();
+        try_push(&mut mounts, Mount { path: try_string("/")?, root })?;
+        Ok(Vfs { mounts: RwSpinLock::new(try_arc(mounts)?) })
+    }
+
+    /// A copy of the mounts, for `mount` and `unmount` to change, with room
+    /// for `extra` more. Made before anything is changed.
+    fn copy_mounts(mounts: &[Mount], skip: Option<usize>, extra: usize) -> Result<Vec<Mount>, Errno> {
+        let mut new = Vec::new();
+        new.try_reserve_exact(mounts.len() + extra).map_err(|_| Errno::ENOMEM)?;
+        for (i, m) in mounts.iter().enumerate().filter(|&(i, _)| Some(i) != skip) {
+            let _ = i;
+            new.push(Mount { path: try_string(&m.path)?, root: m.root.clone() });
+        }
+        Ok(new)
     }
 
     /// Mounts `root`, a file system's root directory, over the existing
@@ -62,13 +85,13 @@ impl Vfs {
     /// one until [`unmount`](Vfs::unmount).
     pub fn mount(&self, path: &str, root: Arc<dyn File>) -> Result<(), Errno> {
         let at = self.resolve(path, true)?;
-        if at.node.stat().kind != FileKind::Directory || root.stat().kind != FileKind::Directory {
+        if at.node.try_stat()?.kind != FileKind::Directory || root.try_stat()?.kind != FileKind::Directory {
             return Err(Errno::ENOTDIR);
         }
         let mut mounts = self.mounts.write();
-        let mut new: Vec<Mount> = mounts.iter().map(|m| Mount { path: m.path.clone(), root: m.root.clone() }).collect();
+        let mut new = Self::copy_mounts(&mounts, None, 1)?;
         new.push(Mount { path: at.path, root });
-        *mounts = Arc::new(new);
+        *mounts = try_arc(new)?;
         Ok(())
     }
 
@@ -82,16 +105,11 @@ impl Vfs {
         if i == 0 {
             return Err(Errno::EBUSY);
         }
-        if mounts[i + 1..].iter().any(|m| is_inside(&m.path, &at.path)) {
+        if mounts.iter().skip(i + 1).any(|m| is_inside(&m.path, &at.path)) {
             return Err(Errno::EBUSY);
         }
-        let new: Vec<Mount> = mounts
-            .iter()
-            .enumerate()
-            .filter(|&(j, _)| j != i)
-            .map(|(_, m)| Mount { path: m.path.clone(), root: m.root.clone() })
-            .collect();
-        *mounts = Arc::new(new);
+        let new = Self::copy_mounts(&mounts, Some(i), 0)?;
+        *mounts = try_arc(new)?;
         Ok(())
     }
 
@@ -109,7 +127,7 @@ impl Vfs {
         } else {
             self.resolve(path, follow)?.node
         };
-        let stat = node.stat();
+        let stat = node.try_stat()?;
         if stat.kind == FileKind::Symlink {
             return Err(Errno::ELOOP);
         }
@@ -150,7 +168,7 @@ impl Vfs {
             Err(e) => return Err(e),
         };
         // A mount point shows the mounted root, not the covered directory.
-        if let Some(root) = Walker::covering(&self.snapshot(), &join(&parent.path, name)) {
+        if let Some(root) = Walker::covering(&self.snapshot(), &join(&parent.path, name)?) {
             node = root;
         }
         if flags.contains(OpenFlags::EXCL) {
@@ -159,9 +177,9 @@ impl Vfs {
         if parent.trailing_slash {
             // `open("file/", O_CREAT)`: a directory was asked for.
             let node = self.resolve(path, true)?.node;
-            return Err(if node.stat().kind == FileKind::Directory { Errno::EISDIR } else { Errno::ENOTDIR });
+            return Err(if node.try_stat()?.kind == FileKind::Directory { Errno::EISDIR } else { Errno::ENOTDIR });
         }
-        if node.stat().kind == FileKind::Symlink && follow {
+        if node.try_stat()?.kind == FileKind::Symlink && follow {
             return match self.resolve(path, true) {
                 Ok(resolved) => Ok(resolved.node),
                 Err(Errno::ENOENT) => {
@@ -173,7 +191,7 @@ impl Vfs {
                     if target.is_empty() {
                         return Err(Errno::ENOENT);
                     }
-                    let target = if target.starts_with('/') { target } else { join(&parent.path, &target) };
+                    let target = if target.starts_with('/') { target } else { join(&parent.path, &target)? };
                     self.open_create(&target, flags, mode, depth + 1)
                 }
                 Err(e) => Err(e),
@@ -190,7 +208,7 @@ impl Vfs {
     /// `stat` of `path`; with `follow` false, a final symbolic link is
     /// described itself (`lstat`).
     pub fn stat(&self, path: &str, follow: bool) -> Result<Stat, Errno> {
-        Ok(self.resolve(path, follow)?.node.stat())
+        self.resolve(path, follow)?.node.try_stat()
     }
 
     /// Creates the directory `path` with permission bits `mode`.
@@ -223,7 +241,12 @@ impl Vfs {
         match parent.name {
             Some(name) if name != "." && name != ".." && !parent.trailing_slash => {
                 let link = parent.dir.create(name, FileKind::Symlink, 0o777)?;
-                link.write(0, target.as_bytes()).map(drop)
+                // Two steps: a link without its target must not stay behind.
+                if let Err(e) = link.write(0, target.as_bytes()) {
+                    let _ = parent.dir.remove(name, false);
+                    return Err(e);
+                }
+                Ok(())
             }
             _ => Err(Errno::EEXIST),
         }
@@ -236,7 +259,7 @@ impl Vfs {
             Some(name) if name != "." && name != ".." => {
                 if parent.trailing_slash {
                     // `unlink("file/")`: a directory was asked for.
-                    let kind = parent.dir.lookup(name)?.stat().kind;
+                    let kind = parent.dir.lookup(name)?.try_stat()?.kind;
                     return Err(if kind == FileKind::Directory { Errno::EISDIR } else { Errno::ENOTDIR });
                 }
                 parent.dir.remove(name, false)
@@ -253,7 +276,7 @@ impl Vfs {
             Some(".") => Err(Errno::EINVAL),
             Some("..") => Err(Errno::ENOTEMPTY),
             Some(name) => {
-                if self.is_mount_point(&join(&parent.path, name)) {
+                if self.is_mount_point(&join(&parent.path, name)?) {
                     return Err(Errno::EBUSY);
                 }
                 parent.dir.remove(name, true)
@@ -264,7 +287,7 @@ impl Vfs {
     /// The target of the symbolic link `path`.
     pub fn readlink(&self, path: &str) -> Result<String, Errno> {
         let node = self.resolve(path, false)?.node;
-        if node.stat().kind != FileKind::Symlink {
+        if node.try_stat()?.kind != FileKind::Symlink {
             return Err(Errno::EINVAL);
         }
         node.readlink()
@@ -285,34 +308,34 @@ impl Vfs {
     }
 
     fn resolve(&self, path: &str, follow: bool) -> Result<Resolved, Errno> {
-        let (comps, trailing_slash) = split(path)?;
-        let mut walker = Walker::new(self.snapshot());
+        let trailing_slash = check(path)?;
+        let mut walker = Walker::new(self.snapshot())?;
         // With a trailing slash the final component must be a directory, so
         // a final symlink is followed regardless.
-        walker.walk(comps, follow || trailing_slash)?;
+        walker.walk(path, follow || trailing_slash)?;
         let (node, path) = walker.finish();
-        if trailing_slash && node.stat().kind != FileKind::Directory {
+        if trailing_slash && node.try_stat()?.kind != FileKind::Directory {
             return Err(Errno::ENOTDIR);
         }
         Ok(Resolved { node, path })
     }
 
     fn parent<'path>(&self, path: &'path str) -> Result<Parent<'path>, Errno> {
-        let (mut comps, trailing_slash) = split(path)?;
-        let name = comps.pop();
-        let mut walker = Walker::new(self.snapshot());
-        walker.walk(comps, true)?;
+        let trailing_slash = check(path)?;
+        let (dirs, name) = split_last(path);
+        let mut walker = Walker::new(self.snapshot())?;
+        walker.walk(dirs, true)?;
         let (dir, path) = walker.finish();
-        if dir.stat().kind != FileKind::Directory {
+        if dir.try_stat()?.kind != FileKind::Directory {
             return Err(Errno::ENOTDIR);
         }
         Ok(Parent { dir, path, name, trailing_slash })
     }
 }
 
-/// Splits an absolute path into its components, dropping empty ones;
-/// also returns whether it ended in `/`.
-fn split(path: &str) -> Result<(Vec<&str>, bool), Errno> {
+/// Checks an absolute path (`ENOENT`, `EINVAL`, `ENAMETOOLONG`); returns
+/// whether it ended in `/`.
+fn check(path: &str) -> Result<bool, Errno> {
     if path.is_empty() {
         return Err(Errno::ENOENT);
     }
@@ -322,43 +345,111 @@ fn split(path: &str) -> Result<(Vec<&str>, bool), Errno> {
     if path.len() >= PATH_MAX {
         return Err(Errno::ENAMETOOLONG);
     }
-    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-    if comps.iter().any(|c| c.len() > NAME_MAX) {
+    if path.split('/').any(|c| c.len() > NAME_MAX) {
         return Err(Errno::ENAMETOOLONG);
     }
-    Ok((comps, path.len() > 1 && path.ends_with('/')))
+    Ok(path.len() > 1 && path.ends_with('/'))
+}
+
+/// An absolute path without its final component, and that component (`None`
+/// for `/`).
+fn split_last(path: &str) -> (&str, Option<&str>) {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((dirs, name)) if !name.is_empty() => (dirs, Some(name)),
+        _ => (trimmed, None),
+    }
 }
 
 /// `dir/name` for a canonical directory path.
-fn join(dir: &str, name: &str) -> String {
-    let mut path = String::with_capacity(dir.len() + 1 + name.len());
+fn join(dir: &str, name: &str) -> Result<String, Errno> {
+    let mut path = String::new();
+    path.try_reserve_exact(dir.len() + 1 + name.len()).map_err(|_| Errno::ENOMEM)?;
     path.push_str(dir);
     if dir != "/" {
         path.push('/');
     }
     path.push_str(name);
-    path
+    Ok(path)
 }
 
 /// Whether canonical `path` is `dir` or below it.
 fn is_inside(path: &str, dir: &str) -> bool {
-    dir == "/" || path == dir || (path.starts_with(dir) && path.as_bytes()[dir.len()] == b'/')
+    dir == "/" || path == dir || (path.starts_with(dir) && path.as_bytes().get(dir.len()) == Some(&b'/'))
+}
+
+/// What is left to walk: the path being resolved, and the targets of the
+/// symbolic links followed so far, the latest first. A target is owned, since
+/// the file system made it; the path is borrowed. Each holds the position of
+/// its next component.
+struct Pending<'path> {
+    path: (&'path str, usize),
+    links: Vec<(String, usize)>,
+}
+
+impl<'path> Pending<'path> {
+    /// The next component, skipping empty ones, and the frame it came from
+    /// (`None` for the path); advances past it.
+    fn next(&mut self) -> Option<(Option<usize>, usize, usize)> {
+        fn scan(text: &str, pos: &mut usize) -> Option<(usize, usize)> {
+            let bytes = text.as_bytes();
+            let rest = bytes.get(*pos..).unwrap_or_default();
+            let start = *pos + rest.iter().take_while(|&&b| b == b'/').count();
+            let tail = bytes.get(start..).unwrap_or_default();
+            let len = tail.iter().position(|&b| b == b'/').unwrap_or(tail.len());
+            if len == 0 {
+                *pos = text.len();
+                return None;
+            }
+            *pos = start + len;
+            Some((start, start + len))
+        }
+        // A link's target comes before what follows the link.
+        while let Some(last) = self.links.len().checked_sub(1) {
+            let Some((text, pos)) = self.links.get_mut(last) else { break };
+            if let Some((s, e)) = scan(text, pos) {
+                return Some((Some(last), s, e));
+            }
+            self.links.pop();
+        }
+        let (text, pos) = &mut self.path;
+        scan(text, pos).map(|(s, e)| (None, s, e))
+    }
+
+    fn component(&self, frame: Option<usize>, start: usize, end: usize) -> &str {
+        match frame {
+            Some(i) => self.links.get(i).map(|l| l.0.as_str()),
+            None => Some(self.path.0),
+        }
+        .and_then(|text| text.get(start..end))
+        .unwrap_or_default()
+    }
+
+    /// Whether any component is left.
+    fn more(&self) -> bool {
+        let has = |text: &str, pos: usize| text.as_bytes().get(pos..).unwrap_or_default().iter().any(|&b| b != b'/');
+        has(self.path.0, self.path.1) || self.links.iter().any(|(t, p)| has(t, *p))
+    }
 }
 
 /// The state of one lookup: the directories walked through from `/`, so that
 /// `..` can step back out, including out of a mount.
 struct Walker {
     mounts: Arc<Vec<Mount>>,
-    /// Each node with the length of its canonical path in `path`.
+    /// The root of `/`, where every walk starts.
+    root: Arc<dyn File>,
+    /// Each node walked into below the root, with the length of its
+    /// canonical path in `path`.
     stack: Vec<(Arc<dyn File>, usize)>,
     path: String,
     symlinks: usize,
 }
 
 impl Walker {
-    fn new(mounts: Arc<Vec<Mount>>) -> Self {
-        let root = Self::covering(&mounts, "/").expect("the root is always mounted");
-        Walker { mounts, stack: vec![(root, 1)], path: "/".to_string(), symlinks: 0 }
+    fn new(mounts: Arc<Vec<Mount>>) -> Result<Self, Errno> {
+        // The original `/` mount is never removed.
+        let root = Self::covering(&mounts, "/").ok_or(Errno::ENOENT)?;
+        Ok(Walker { mounts, root, stack: Vec::new(), path: try_string("/")?, symlinks: 0 })
     }
 
     /// The root of the most recent mount on `path`.
@@ -367,41 +458,41 @@ impl Walker {
     }
 
     fn top(&self) -> &Arc<dyn File> {
-        &self.stack.last().expect("the walk never pops the root").0
+        self.stack.last().map_or(&self.root, |entry| &entry.0)
     }
 
     fn finish(mut self) -> (Arc<dyn File>, String) {
-        let (node, _) = self.stack.pop().expect("the walk never pops the root");
+        let node = self.stack.pop().map_or(self.root, |entry| entry.0);
         (node, self.path)
     }
 
-    /// Walks `comps` from the current node. A symbolic link is followed
-    /// unless it is the final component and `follow_last` is false.
-    fn walk(&mut self, comps: Vec<&str>, follow_last: bool) -> Result<(), Errno> {
-        // Owned, since a symlink's target splices in components of its own.
-        let mut pending: Vec<String> = comps.into_iter().rev().map(String::from).collect();
-        while let Some(comp) = pending.pop() {
-            if self.top().stat().kind != FileKind::Directory {
+    /// Walks the components of `path` from the current node. A symbolic link
+    /// is followed unless it is the final component and `follow_last` is
+    /// false.
+    fn walk(&mut self, path: &str, follow_last: bool) -> Result<(), Errno> {
+        let mut pending = Pending { path: (path, 0), links: Vec::new() };
+        while let Some((frame, s, e)) = pending.next() {
+            if self.top().try_stat()?.kind != FileKind::Directory {
                 return Err(Errno::ENOTDIR);
             }
-            match comp.as_str() {
+            let comp = pending.component(frame, s, e);
+            match comp {
                 "." => continue,
                 ".." => {
-                    if self.stack.len() > 1 {
-                        self.stack.pop();
-                        let len = self.stack.last().expect("the root stays").1;
+                    if self.stack.pop().is_some() {
+                        let len = self.stack.last().map_or(1, |entry| entry.1);
                         self.path.truncate(len);
                     }
                     continue;
                 }
                 _ => {}
             }
-            let mut node = self.top().lookup(&comp)?;
-            let path = join(&self.path, &comp);
+            let mut node = self.top().lookup(comp)?;
+            let path = join(&self.path, comp)?;
             if let Some(root) = Self::covering(&self.mounts, &path) {
                 node = root;
             }
-            if node.stat().kind == FileKind::Symlink && (follow_last || !pending.is_empty()) {
+            if node.try_stat()?.kind == FileKind::Symlink && (follow_last || pending.more()) {
                 self.symlinks += 1;
                 if self.symlinks > MAX_SYMLINKS {
                     return Err(Errno::ELOOP);
@@ -411,12 +502,13 @@ impl Walker {
                     return Err(Errno::ENOENT);
                 }
                 if target.starts_with('/') {
-                    self.stack.truncate(1);
+                    self.stack.clear();
                     self.path.truncate(1);
                 }
-                pending.extend(target.split('/').filter(|c| !c.is_empty()).rev().map(String::from));
+                try_push(&mut pending.links, (target, 0))?;
                 continue;
             }
+            self.stack.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
             self.path = path;
             self.stack.push((node, self.path.len()));
         }

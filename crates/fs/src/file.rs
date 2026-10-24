@@ -119,8 +119,17 @@ pub trait File: Send + Sync {
         Err(Errno::EINVAL)
     }
 
-    /// The node's metadata.
+    /// The node's metadata. A file system that must read the disk for it
+    /// reports an error in [`try_stat`](File::try_stat); here it can say only
+    /// what it knows without one.
     fn stat(&self) -> Stat;
+
+    /// [`stat`](File::stat), failing where the file system could not read
+    /// the metadata (an I/O error, or no memory to read it into). The VFS and
+    /// the system calls use this one.
+    fn try_stat(&self) -> Result<Stat, Errno> {
+        Ok(self.stat())
+    }
 
     /// Sets the size to `len`, dropping data past it or filling with zeroes.
     fn truncate(&self, len: u64) -> Result<(), Errno> {

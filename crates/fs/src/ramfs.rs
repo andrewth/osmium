@@ -1,12 +1,15 @@
 //! A file system kept entirely in memory (tmpfs).
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::offset_of;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use osmium_sync::RwSpinLock;
+use osmium_sync::arc::ArcTree;
+use osmium_sync::fallible::{try_arc, try_string, try_to_vec};
+use osmium_sync::intrusive::{Adapter, KeyAdapter, Shared as SharedLink, TreeLink};
 
 use crate::{DirEntry, Errno, File, FileKind, NAME_MAX, Stat};
 
@@ -33,12 +36,35 @@ struct RamNode {
     /// 1 while linked into a directory, 0 once removed (no hard links).
     linked: AtomicU32,
     body: Body,
+    /// The name it has in its directory (it has no other links).
+    name: String,
+    /// Links it into its directory by `name`.
+    entry: SharedLink<TreeLink>,
 }
+
+/// Where [`RamNode::entry`] sits in a [`RamNode`], and the key: the name.
+struct ByName;
+
+// SAFETY: `offset_of!` of a `SharedLink<TreeLink>`, which is a `TreeLink`.
+unsafe impl Adapter<TreeLink> for ByName {
+    type Value = RamNode;
+    const OFFSET: usize = offset_of!(RamNode, entry);
+}
+
+impl KeyAdapter<TreeLink> for ByName {
+    type Key = str;
+
+    fn key(node: &RamNode) -> &str {
+        &node.name
+    }
+}
+
+type Entries = ArcTree<ByName>;
 
 enum Body {
     /// A regular file's contents or a symbolic link's target.
     Data(RwSpinLock<Vec<u8>>),
-    Dir(RwSpinLock<BTreeMap<String, Arc<RamNode>>>),
+    Dir(RwSpinLock<Entries>),
     /// A device, FIFO or socket node: metadata only.
     Node,
 }
@@ -46,9 +72,18 @@ enum Body {
 impl RamFs {
     /// An empty file system whose root has permission bits `0o755`; `dev`
     /// is reported as every node's `st_dev`.
+    ///
+    /// # Panics
+    /// If memory runs out: [`RamFs::try_new`] reports that instead.
+    #[allow(clippy::expect_used)] // documented `# Panics` on OOM at boot; `try_new` is the fallible form.
     pub fn new(dev: u64) -> Self {
-        let fs = Arc::new(Shared { dev, next_ino: AtomicU64::new(1) });
-        RamFs { root: RamNode::new(&fs, FileKind::Directory, 0o755) }
+        Self::try_new(dev).expect("out of memory for a file system")
+    }
+
+    /// [`RamFs::new`], failing with `ENOMEM` instead of panicking.
+    pub fn try_new(dev: u64) -> Result<Self, Errno> {
+        let fs = try_arc(Shared { dev, next_ino: AtomicU64::new(1) })?;
+        Ok(RamFs { root: RamNode::new(&fs, FileKind::Directory, 0o755, "")? })
     }
 
     /// The root directory, to pass to [`Vfs::new`](crate::Vfs::new) or
@@ -59,23 +94,26 @@ impl RamFs {
 }
 
 impl RamNode {
-    fn new(fs: &Arc<Shared>, kind: FileKind, mode: u32) -> Arc<Self> {
+    fn new(fs: &Arc<Shared>, kind: FileKind, mode: u32, name: &str) -> Result<Arc<Self>, Errno> {
         let body = match kind {
             FileKind::Regular | FileKind::Symlink => Body::Data(RwSpinLock::new(Vec::new())),
-            FileKind::Directory => Body::Dir(RwSpinLock::new(BTreeMap::new())),
+            FileKind::Directory => Body::Dir(RwSpinLock::new(ArcTree::new())),
             _ => Body::Node,
         };
-        Arc::new(RamNode {
+        let name = try_string(name)?;
+        Ok(try_arc(RamNode {
             fs: fs.clone(),
             ino: fs.next_ino.fetch_add(1, Ordering::Relaxed),
             kind,
             mode: AtomicU32::new(mode & 0o7777),
             linked: AtomicU32::new(1),
             body,
-        })
+            name,
+            entry: SharedLink::new(TreeLink::new()),
+        })?)
     }
 
-    fn dir(&self) -> Result<&RwSpinLock<BTreeMap<String, Arc<RamNode>>>, Errno> {
+    fn dir(&self) -> Result<&RwSpinLock<Entries>, Errno> {
         match &self.body {
             Body::Dir(entries) => Ok(entries),
             _ => Err(Errno::ENOTDIR),
@@ -112,7 +150,8 @@ impl File for RamNode {
         let Ok(off) = usize::try_from(off) else { return Ok(0) };
         let Some(src) = data.get(off..) else { return Ok(0) };
         let n = src.len().min(buf.len());
-        buf[..n].copy_from_slice(&src[..n]);
+        let (src, dst) = src.get(..n).zip(buf.get_mut(..n)).ok_or(Errno::EIO)?;
+        dst.copy_from_slice(src);
         Ok(n)
     }
 
@@ -120,12 +159,12 @@ impl File for RamNode {
         let mut guard = self.data()?.write();
         let data = &mut *guard;
         let end = off.checked_add(buf.len() as u64).filter(|&end| end <= MAX_SIZE).ok_or(Errno::EFBIG)?;
-        let (off, end) = (off as usize, end as usize);
+        let (Ok(off), Ok(end)) = (usize::try_from(off), usize::try_from(end)) else { return Err(Errno::EFBIG) };
         if end > data.len() {
             data.try_reserve(end - data.len()).map_err(|_| Errno::ENOMEM)?;
             data.resize(end, 0);
         }
-        data[off..end].copy_from_slice(buf);
+        data.get_mut(off..end).ok_or(Errno::EIO)?.copy_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -136,7 +175,7 @@ impl File for RamNode {
             // subdirectory's `..`.
             Body::Dir(entries) => {
                 let entries = entries.read();
-                let subdirs = entries.values().filter(|n| n.kind == FileKind::Directory).count() as u32;
+                let subdirs = entries.iter().filter(|n| n.kind == FileKind::Directory).count() as u32;
                 (entries.len() as u64, 2 + subdirs)
             }
             Body::Node => (0, self.linked.load(Ordering::Relaxed)),
@@ -171,42 +210,39 @@ impl File for RamNode {
 
     fn readdir(&self, index: usize) -> Result<Option<DirEntry>, Errno> {
         let entries = self.dir()?.read();
-        Ok(entries.iter().nth(index).map(|(name, node)| DirEntry {
-            ino: node.ino,
-            kind: node.kind,
-            name: name.clone(),
-        }))
+        let Some(node) = entries.iter().nth(index) else { return Ok(None) };
+        Ok(Some(DirEntry { ino: node.ino, kind: node.kind, name: try_string(&node.name)? }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
         let entries = self.dir()?.read();
-        match entries.get(name) {
-            Some(node) => Ok(node.clone()),
+        match entries.clone_key(name) {
+            Some(node) => Ok(node),
             None => Err(Errno::ENOENT),
         }
     }
 
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
         check_name(name)?;
+        // Made first: running out of memory then changes nothing.
+        let node = RamNode::new(&self.fs, kind, mode, name)?;
         let mut entries = self.dir()?.write();
-        if entries.contains_key(name) {
+        if entries.insert(node.clone()).is_err() {
             return Err(Errno::EEXIST);
         }
-        let node = RamNode::new(&self.fs, kind, mode);
-        entries.insert(String::from(name), node.clone());
         Ok(node)
     }
 
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
         let mut entries = self.dir()?.write();
-        let node = entries.get(name).ok_or(Errno::ENOENT)?;
+        let node = entries.find(name).ok_or(Errno::ENOENT)?;
         match (dir, node.kind == FileKind::Directory) {
             (true, false) => return Err(Errno::ENOTDIR),
             (false, true) => return Err(Errno::EISDIR),
             (true, true) if !node.is_empty_dir() => return Err(Errno::ENOTEMPTY),
             _ => {}
         }
-        let node = entries.remove(name).expect("checked above");
+        let node = entries.take_key(name).ok_or(Errno::ENOENT)?;
         node.linked.store(0, Ordering::Relaxed);
         Ok(())
     }
@@ -216,7 +252,7 @@ impl File for RamNode {
             return Err(Errno::EINVAL);
         }
         let data = self.data()?.read();
-        String::from_utf8(data.clone()).map_err(|_| Errno::EINVAL)
+        String::from_utf8(try_to_vec(&data)?).map_err(|_| Errno::EINVAL)
     }
 }
 

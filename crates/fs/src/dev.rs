@@ -47,10 +47,9 @@ impl File for DevDir {
 
     fn readdir(&self, index: usize) -> Result<Option<DirEntry>, Errno> {
         let entries = self.entries.read();
-        Ok(entries.iter().nth(index).map(|(name, file)| {
-            let st = file.stat();
-            DirEntry { ino: st.ino, kind: st.kind, name: name.clone() }
-        }))
+        let Some((name, file)) = entries.iter().nth(index) else { return Ok(None) };
+        let st = file.try_stat()?;
+        Ok(Some(DirEntry { ino: st.ino, kind: st.kind, name: osmium_sync::fallible::try_string(name)? }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {

@@ -39,12 +39,13 @@ pub struct Entries<'src> {
 /// Parses one 8-digit hexadecimal header field.
 fn field(header: &[u8], index: usize) -> Result<u32, Errno> {
     let start = 6 + index * 8;
-    let digits = str::from_utf8(&header[start..start + 8]).map_err(|_| Errno::EINVAL)?;
+    let digits = header.get(start..start + 8).ok_or(Errno::EINVAL)?;
+    let digits = str::from_utf8(digits).map_err(|_| Errno::EINVAL)?;
     u32::from_str_radix(digits, 16).map_err(|_| Errno::EINVAL)
 }
 
-fn align4(n: usize) -> usize {
-    n.next_multiple_of(4)
+fn align4(n: usize) -> Option<usize> {
+    n.checked_next_multiple_of(4)
 }
 
 impl<'src> Entries<'src> {
@@ -52,30 +53,30 @@ impl<'src> Entries<'src> {
         // A loop, not recursion: an archive may hold any number of trailers.
         let (name, mode, data) = loop {
             // Several archives may be concatenated, with zero padding between.
-            while self.rest.len() >= 4 && self.rest[..4] == [0; 4] {
-                self.rest = &self.rest[4..];
+            while let Some(([0, 0, 0, 0], tail)) = self.rest.split_first_chunk::<4>() {
+                self.rest = tail;
             }
             if self.rest.is_empty() {
                 return Ok(None);
             }
             let header = self.rest.get(..HEADER_LEN).ok_or(Errno::EINVAL)?;
-            if &header[..6] != b"070701" && &header[..6] != b"070702" {
+            if !matches!(header.get(..6), Some(b"070701" | b"070702")) {
                 return Err(Errno::EINVAL);
             }
             let mode = field(header, 1)?;
             let size = field(header, 6)? as usize;
             let name_size = field(header, 11)? as usize;
             let name_end = HEADER_LEN.checked_add(name_size).ok_or(Errno::EINVAL)?;
-            let data_start = align4(name_end);
+            let data_start = align4(name_end).ok_or(Errno::EINVAL)?;
             let data_end = data_start.checked_add(size).ok_or(Errno::EINVAL)?;
-            if name_size == 0 || data_end > self.rest.len() {
+            if name_size == 0 {
                 return Err(Errno::EINVAL);
             }
             // The name is NUL-terminated.
-            let name = &self.rest[HEADER_LEN..name_end - 1];
+            let name = self.rest.get(HEADER_LEN..name_end - 1).ok_or(Errno::EINVAL)?;
             let name = str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
-            let data = &self.rest[data_start..data_end];
-            self.rest = &self.rest[align4(data_end).min(self.rest.len())..];
+            let data = self.rest.get(data_start..data_end).ok_or(Errno::EINVAL)?;
+            self.rest = self.rest.get(align4(data_end).unwrap_or(usize::MAX)..).unwrap_or(&[]);
             if name == TRAILER {
                 // Another archive may follow (an early microcode cpio, say).
                 continue;
@@ -165,7 +166,7 @@ pub fn unpack(vfs: &Vfs, at: &str, archive: &[u8]) -> Result<usize, Errno> {
 /// `mkdir -p` of everything above `path`'s last component.
 fn mkdir_parents(vfs: &Vfs, path: &str) -> Result<(), Errno> {
     for (i, _) in path.match_indices('/').skip(1) {
-        match vfs.mkdir(&path[..i], 0o755) {
+        match vfs.mkdir(path.get(..i).ok_or(Errno::EINVAL)?, 0o755) {
             Ok(()) | Err(Errno::EEXIST) => {}
             Err(e) => return Err(e),
         }
@@ -209,9 +210,9 @@ mod tests {
         out.extend_from_slice(header.as_bytes());
         out.extend_from_slice(name.as_bytes());
         out.push(0);
-        out.resize(align4(out.len()), 0);
+        out.resize(align4(out.len()).unwrap(), 0);
         out.extend_from_slice(data);
-        out.resize(align4(out.len()), 0);
+        out.resize(align4(out.len()).unwrap(), 0);
     }
 
     fn archive() -> Vec<u8> {
@@ -242,6 +243,27 @@ mod tests {
         assert_eq!((motd.kind, motd.mode, motd.data), (FileKind::Regular, 0o644, &b"hello\n"[..]));
         assert_eq!(entries(&archive[..200]).last().unwrap(), Err(Errno::EINVAL));
         assert_eq!(entries(b"not an archive").next(), Some(Err(Errno::EINVAL)));
+    }
+
+    #[test]
+    fn truncated_and_corrupt_archives_are_errors() {
+        let archive = archive();
+        for cut in 0..archive.len() {
+            let _ = entries(&archive[..cut]).count();
+            let vfs = Vfs::new(RamFs::new(1).root());
+            let _ = unpack(&vfs, "/", &archive[..cut]);
+        }
+        // Every header field at its extremes, and a name that is not UTF-8.
+        for fill in *b"f0z" {
+            let mut bad = archive.clone();
+            for b in bad.iter_mut().skip(6).take(104) {
+                *b = fill;
+            }
+            let _ = entries(&bad).count();
+        }
+        let mut bad = archive;
+        bad[HEADER_LEN] = 0xff;
+        let _ = entries(&bad).count();
     }
 
     #[test]

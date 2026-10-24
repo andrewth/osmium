@@ -96,3 +96,9 @@ impl fmt::Display for Errno {
 }
 
 impl core::error::Error for Errno {}
+
+impl From<osmium_sync::fallible::OutOfMemory> for Errno {
+    fn from(_: osmium_sync::fallible::OutOfMemory) -> Self {
+        Errno::ENOMEM
+    }
+}
