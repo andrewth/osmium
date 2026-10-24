@@ -51,7 +51,8 @@ impl TrapFrame {
 
     /// System-call argument registers `a0`..=`a7`.
     pub fn syscall_args(&self) -> [u64; 8] {
-        self.x[10..18].try_into().expect("fixed-width slice")
+        let [_, _, _, _, _, _, _, _, _, _, a0, a1, a2, a3, a4, a5, a6, a7, ..] = self.x;
+        [a0, a1, a2, a3, a4, a5, a6, a7]
     }
 
     /// Sets the return value register `a0`.

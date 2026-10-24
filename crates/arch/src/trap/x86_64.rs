@@ -189,10 +189,10 @@ pub unsafe fn install() {
         let stubs = unsafe { &osmium_trap_stub_table };
         // SAFETY: exclusive while building, guarded by `BUILT`.
         let idt = unsafe { &mut *IDT.0.get() };
-        for (v, &stub) in stubs.iter().enumerate() {
+        for ([lo, hi], &stub) in idt.as_chunks_mut::<2>().0.iter_mut().zip(stubs.iter()) {
             // Present, DPL 0, 64-bit interrupt gate.
-            idt[2 * v] = (stub & 0xffff) | (cs as u64) << 16 | 0x8e << 40 | (stub >> 16 & 0xffff) << 48;
-            idt[2 * v + 1] = stub >> 32;
+            *lo = (stub & 0xffff) | (cs as u64) << 16 | 0x8e << 40 | (stub >> 16 & 0xffff) << 48;
+            *hi = stub >> 32;
         }
     });
     let ptr = IdtPointer { limit: (512 * 8 - 1) as u16, base: IDT.0.get() as u64 };

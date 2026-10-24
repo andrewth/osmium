@@ -81,6 +81,7 @@ pub fn set_handler(handler: Handler) {
     HANDLER.store(handler as usize, Ordering::Release);
 }
 
+#[allow(clippy::panic)] // invariant: integrator misuse; a trap with no registered handler cannot be recovered.
 fn dispatch(frame: &mut TrapFrame) {
     match HANDLER.load(Ordering::Acquire) {
         0 => panic!("unhandled trap {:?} at pc {:#x} (no handler registered)", frame.cause(), frame.pc()),
@@ -116,7 +117,12 @@ pub(crate) fn fault_bad_user_return(frame: &mut TrapFrame) {
     if frame.from_user() && !x86_64::is_canonical(frame.rip) {
         (frame.vector, frame.error_code) = (13, 0);
         dispatch(frame);
-        assert!(x86_64::is_canonical(frame.rip), "trap handler returned to non-canonical user rip {:#x}", frame.rip);
+        if !x86_64::is_canonical(frame.rip) {
+            // The handler left the bad address in place. Resume at address 0
+            // instead, which is canonical and unmapped: the program takes a
+            // page fault there, in user mode, which the handler deals with.
+            frame.rip = 0;
+        }
     }
 }
 

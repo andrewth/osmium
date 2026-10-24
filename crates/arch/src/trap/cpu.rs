@@ -73,7 +73,8 @@ static OSMIUM_TRAP_CPUS: [TrapCpu; MAX_CPUS] = [const {
 impl TrapCpu {
     /// The calling CPU's state (by `osmium_arch::cpu::current_id`).
     pub fn current() -> &'static TrapCpu {
-        &OSMIUM_TRAP_CPUS[crate::cpu::current_id()]
+        // The CPU id is below `MAX_CPUS`; the fallback to CPU 0 is only for totality.
+        OSMIUM_TRAP_CPUS.get(crate::cpu::current_id()).unwrap_or(&OSMIUM_TRAP_CPUS[0])
     }
 
     /// Sets the stack (top address) used for traps from U-mode. Update it
