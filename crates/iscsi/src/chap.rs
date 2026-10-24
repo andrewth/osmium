@@ -84,8 +84,10 @@ pub fn decode_binary(value: &str) -> Option<Vec<u8>> {
         }
         return h
             .as_bytes()
-            .chunks(2)
-            .map(|p| Some((char::from(p[0]).to_digit(16)? << 4 | char::from(p[1]).to_digit(16)?) as u8))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[hi, lo]| Some((char::from(hi).to_digit(16)? << 4 | char::from(lo).to_digit(16)?) as u8))
             .collect();
     }
     let b = value.strip_prefix("0b").or_else(|| value.strip_prefix("0B"))?;

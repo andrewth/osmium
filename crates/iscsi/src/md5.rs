@@ -50,9 +50,12 @@ impl Md5 {
         self.len = self.len.wrapping_add(data.len() as u64);
         if self.filled > 0 {
             let n = (64 - self.filled).min(data.len());
-            self.block[self.filled..self.filled + n].copy_from_slice(&data[..n]);
+            let (head, tail) = data.split_at(n);
+            if let Some(dst) = self.block.get_mut(self.filled..self.filled + n) {
+                dst.copy_from_slice(head);
+            }
             self.filled += n;
-            data = &data[n..];
+            data = tail;
             if self.filled < 64 {
                 return;
             }
@@ -64,7 +67,9 @@ impl Md5 {
         for b in blocks {
             self.compress(b);
         }
-        self.block[..rest.len()].copy_from_slice(rest);
+        if let Some(dst) = self.block.get_mut(..rest.len()) {
+            dst.copy_from_slice(rest);
+        }
         self.filled = rest.len();
     }
 
@@ -89,18 +94,18 @@ impl Md5 {
             *w = u32::from_le_bytes(*b);
         }
         let [mut a, mut b, mut c, mut d] = self.state;
-        for i in 0..64 {
+        for (i, (&k, &s)) in K.iter().zip(S.iter()).enumerate() {
             let (f, g) = match i / 16 {
                 0 => ((b & c) | (!b & d), i),
                 1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
                 2 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | !d), (7 * i) % 16),
             };
-            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
+            let f = f.wrapping_add(a).wrapping_add(k).wrapping_add(m.get(g).copied().unwrap_or(0));
             a = d;
             d = c;
             c = b;
-            b = b.wrapping_add(f.rotate_left(S[i]));
+            b = b.wrapping_add(f.rotate_left(s));
         }
         for (s, v) in self.state.iter_mut().zip([a, b, c, d]) {
             *s = s.wrapping_add(v);

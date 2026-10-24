@@ -101,33 +101,57 @@ impl Pdu {
 
     /// The opcode.
     pub fn opcode(&self) -> u8 {
-        self.bhs[0] & 0x3f
+        self.byte(0) & 0x3f
+    }
+
+    /// Byte `at` of the BHS (0 past the end, which no caller reaches).
+    pub fn byte(&self, at: usize) -> u8 {
+        self.bhs.get(at).copied().unwrap_or(0)
+    }
+
+    /// Stores byte `at` of the BHS (ignored past the end).
+    pub fn set_byte(&mut self, at: usize, v: u8) {
+        if let Some(b) = self.bhs.get_mut(at) {
+            *b = v;
+        }
+    }
+
+    /// The `N` bytes at `at` of the BHS (zeros past the end).
+    fn array<const N: usize>(&self, at: usize) -> [u8; N] {
+        self.bhs.get(at..).and_then(|rest| rest.first_chunk::<N>()).copied().unwrap_or([0; N])
+    }
+
+    /// Stores `bytes` at `at` of the BHS (ignored past the end).
+    fn set_bytes(&mut self, at: usize, bytes: &[u8]) {
+        if let Some(dst) = at.checked_add(bytes.len()).and_then(|end| self.bhs.get_mut(at..end)) {
+            dst.copy_from_slice(bytes);
+        }
     }
 
     /// The big-endian word at byte `at` of the BHS.
     pub fn u32_at(&self, at: usize) -> u32 {
-        u32::from_be_bytes(self.bhs[at..at + 4].try_into().expect("fixed-width slice"))
+        u32::from_be_bytes(self.array(at))
     }
 
     /// Stores a big-endian word at byte `at` of the BHS.
     pub fn set_u32(&mut self, at: usize, v: u32) {
-        self.bhs[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        self.set_bytes(at, &v.to_be_bytes());
     }
 
     fn u16_at(&self, at: usize) -> u16 {
-        u16::from_be_bytes([self.bhs[at], self.bhs[at + 1]])
+        u16::from_be_bytes(self.array(at))
     }
 
     fn set_u16(&mut self, at: usize, v: u16) {
-        self.bhs[at..at + 2].copy_from_slice(&v.to_be_bytes());
+        self.set_bytes(at, &v.to_be_bytes());
     }
 
     fn lun(&self) -> [u8; 8] {
-        self.bhs[8..16].try_into().expect("fixed-width slice")
+        self.array(8)
     }
 
     fn set_lun(&mut self, lun: [u8; 8]) {
-        self.bhs[8..16].copy_from_slice(&lun);
+        self.set_bytes(8, &lun);
     }
 
     /// The PDU as it goes on the wire, data segment length set and the data
@@ -141,10 +165,12 @@ impl Pdu {
     /// there is no data), as negotiated for the connection.
     pub fn to_bytes_with(&self, header_digest: bool, data_digest: bool) -> Vec<u8> {
         let mut out = Vec::with_capacity(BHS_LEN + self.data.len().next_multiple_of(4) + 8);
-        out.extend_from_slice(&self.bhs);
-        out[4] = 0; // no AHS
+        let mut bhs = self.bhs;
+        bhs[4] = 0; // no AHS
         let len = (self.data.len() as u32).to_be_bytes();
-        out[5..8].copy_from_slice(&len[1..]);
+        let [_, l1, l2, l3] = len;
+        [bhs[5], bhs[6], bhs[7]] = [l1, l2, l3];
+        out.extend_from_slice(&bhs);
         if header_digest {
             out.extend_from_slice(&crc32c(&out).to_le_bytes());
         }
@@ -152,7 +178,8 @@ impl Pdu {
         out.extend_from_slice(&self.data);
         out.resize(data_at + self.data.len().next_multiple_of(4), 0);
         if data_digest && !self.data.is_empty() {
-            out.extend_from_slice(&crc32c(&out[data_at..]).to_le_bytes());
+            let digest = crc32c(out.get(data_at..).unwrap_or(&[])).to_le_bytes();
+            out.extend_from_slice(&digest);
         }
         out
     }
@@ -199,40 +226,41 @@ impl PduReader {
     /// Segments are skipped. After an error the stream is out of step and
     /// the connection must be dropped.
     pub fn next_pdu(&mut self) -> Result<Option<Pdu>, PduError> {
-        if self.buf.len() < BHS_LEN {
+        let Some((bhs, _)) = self.buf.split_first_chunk::<BHS_LEN>() else {
             return Ok(None);
-        }
-        let ahs = self.buf[4] as usize * 4;
+        };
+        let bhs = *bhs;
+        let ahs = bhs[4] as usize * 4;
         let header_end = BHS_LEN + ahs;
         let data_at = header_end + if self.header_digest { 4 } else { 0 };
         if self.header_digest {
             // Check the header before trusting the lengths in it.
-            let Some(digest) = self.buf.get(header_end..data_at) else {
+            let (Some(header), Some(digest)) = (self.buf.get(..header_end), self.buf.get(header_end..data_at)) else {
                 return Ok(None);
             };
-            if crc32c(&self.buf[..header_end]).to_le_bytes() != digest {
+            if crc32c(header).to_le_bytes() != digest {
                 return Err(PduError::Digest);
             }
         }
-        let len = u32::from_be_bytes([0, self.buf[5], self.buf[6], self.buf[7]]) as usize;
+        let len = u32::from_be_bytes([0, bhs[5], bhs[6], bhs[7]]) as usize;
         if len > self.max_data {
             return Err(PduError::TooLong(len));
         }
         let padded = len.next_multiple_of(4);
-        let total = data_at + padded + if self.data_digest && len > 0 { 4 } else { 0 };
-        if self.buf.len() < total {
+        let with_digest = self.data_digest && len > 0;
+        let end = data_at.checked_add(padded).ok_or(PduError::TooLong(len))?;
+        let total = end.checked_add(if with_digest { 4 } else { 0 }).ok_or(PduError::TooLong(len))?;
+        let Some(frame) = self.buf.get(..total) else {
             return Ok(None);
+        };
+        let body = frame.get(data_at..end).unwrap_or(&[]);
+        if with_digest && frame.get(end..).is_none_or(|d| crc32c(body).to_le_bytes() != d) {
+            return Err(PduError::Digest);
         }
-        if self.data_digest && len > 0 {
-            let end = data_at + padded;
-            if crc32c(&self.buf[data_at..end]).to_le_bytes() != self.buf[end..total] {
-                return Err(PduError::Digest);
-            }
-        }
-        let mut pdu = Pdu { bhs: self.buf[..BHS_LEN].try_into().expect("fixed-width slice"), data: Vec::new() };
-        pdu.data.extend_from_slice(&self.buf[data_at..data_at + len]);
+        let mut data = Vec::new();
+        data.extend_from_slice(body.get(..len).unwrap_or(&[]));
         self.buf.drain(..total);
-        Ok(Some(pdu))
+        Ok(Some(Pdu { bhs, data }))
     }
 }
 
@@ -527,9 +555,9 @@ impl Message {
     /// Decodes `pdu`.
     pub fn decode(pdu: Pdu) -> Result<Self, PduError> {
         let p = &pdu;
-        let flags = p.bhs[1];
+        let flags = p.byte(1);
         let fin = flags & F != 0;
-        let imm = p.bhs[0] & IMMEDIATE != 0;
+        let imm = p.byte(0) & IMMEDIATE != 0;
         let (sn24, sn28, sn32) = (p.u32_at(24), p.u32_at(28), p.u32_at(32));
         Ok(match p.opcode() {
             opcode::NOP_OUT => Message::NopOut(NopOut {
@@ -551,7 +579,7 @@ impl Message {
                 expected_len: p.u32_at(20),
                 cmd_sn: sn24,
                 exp_stat_sn: sn28,
-                cdb: p.bhs[32..48].try_into().expect("fixed-width slice"),
+                cdb: p.array(32),
                 data: pdu.data,
             }),
             opcode::LOGIN_REQUEST => Message::LoginRequest(LoginRequest {
@@ -559,7 +587,7 @@ impl Message {
                 cont: flags & C != 0,
                 csg: flags >> 2 & 3,
                 nsg: flags & 3,
-                isid: p.bhs[8..14].try_into().expect("fixed-width slice"),
+                isid: p.array(8),
                 tsih: p.u16_at(14),
                 itt: p.u32_at(16),
                 cid: p.u16_at(20),
@@ -607,8 +635,8 @@ impl Message {
             opcode::SCSI_RESPONSE => Message::ScsiResponse(ScsiResponse {
                 overflow: flags & 0x04 != 0,
                 underflow: flags & 0x02 != 0,
-                response: p.bhs[2],
-                status: p.bhs[3],
+                response: p.byte(2),
+                status: p.byte(3),
                 itt: p.u32_at(16),
                 stat_sn: sn24,
                 exp_cmd_sn: sn28,
@@ -622,14 +650,14 @@ impl Message {
                 cont: flags & C != 0,
                 csg: flags >> 2 & 3,
                 nsg: flags & 3,
-                isid: p.bhs[8..14].try_into().expect("fixed-width slice"),
+                isid: p.array(8),
                 tsih: p.u16_at(14),
                 itt: p.u32_at(16),
                 stat_sn: sn24,
                 exp_cmd_sn: sn28,
                 max_cmd_sn: sn32,
-                status_class: p.bhs[36],
-                status_detail: p.bhs[37],
+                status_class: p.byte(36),
+                status_detail: p.byte(37),
                 data: pdu.data,
             }),
             opcode::TEXT_RESPONSE => Message::TextResponse(TextResponse {
@@ -648,7 +676,7 @@ impl Message {
                 ack: flags & 0x40 != 0,
                 overflow: flags & 0x04 != 0,
                 underflow: flags & 0x02 != 0,
-                status: (flags & 0x01 != 0).then_some(p.bhs[3]),
+                status: (flags & 0x01 != 0).then_some(p.byte(3)),
                 lun: p.lun(),
                 itt: p.u32_at(16),
                 ttt: p.u32_at(20),
@@ -661,7 +689,7 @@ impl Message {
                 data: pdu.data,
             }),
             opcode::LOGOUT_RESPONSE => Message::LogoutResponse(LogoutResponse {
-                response: p.bhs[2],
+                response: p.byte(2),
                 itt: p.u32_at(16),
                 stat_sn: sn24,
                 exp_cmd_sn: sn28,
@@ -685,13 +713,13 @@ impl Message {
                 stat_sn: sn24,
                 exp_cmd_sn: sn28,
                 max_cmd_sn: sn32,
-                event: p.bhs[36],
-                vcode: p.bhs[37],
+                event: p.byte(36),
+                vcode: p.byte(37),
                 params: [p.u16_at(38), p.u16_at(40), p.u16_at(42)],
                 data: pdu.data,
             }),
             opcode::REJECT => Message::Reject(Reject {
-                reason: p.bhs[2],
+                reason: p.byte(2),
                 stat_sn: sn24,
                 exp_cmd_sn: sn28,
                 max_cmd_sn: sn32,
@@ -714,8 +742,8 @@ impl Message {
         }
         match self {
             Message::NopOut(m) => {
-                p.bhs[0] |= bit(m.immediate, IMMEDIATE);
-                p.bhs[1] = F;
+                p.set_byte(0, p.byte(0) | bit(m.immediate, IMMEDIATE));
+                p.set_byte(1, F);
                 p.set_lun(m.lun);
                 p.set_u32(16, m.itt);
                 p.set_u32(20, m.ttt);
@@ -724,19 +752,19 @@ impl Message {
                 p.data = m.data;
             }
             Message::ScsiCommand(m) => {
-                p.bhs[1] = bit(m.final_pdu, F) | bit(m.read, 0x40) | bit(m.write, 0x20) | m.attr & 7;
+                p.set_byte(1, bit(m.final_pdu, F) | bit(m.read, 0x40) | bit(m.write, 0x20) | m.attr & 7);
                 p.set_lun(m.lun);
                 p.set_u32(16, m.itt);
                 p.set_u32(20, m.expected_len);
                 p.set_u32(24, m.cmd_sn);
                 p.set_u32(28, m.exp_stat_sn);
-                p.bhs[32..48].copy_from_slice(&m.cdb);
+                p.set_bytes(32, &m.cdb);
                 p.data = m.data;
             }
             Message::LoginRequest(m) => {
-                p.bhs[0] |= IMMEDIATE; // login requests are always immediate
-                p.bhs[1] = login_flags(m.transit, m.cont, m.csg, m.nsg);
-                p.bhs[8..14].copy_from_slice(&m.isid);
+                p.set_byte(0, p.byte(0) | IMMEDIATE); // login requests are always immediate
+                p.set_byte(1, login_flags(m.transit, m.cont, m.csg, m.nsg));
+                p.set_bytes(8, &m.isid);
                 p.set_u16(14, m.tsih);
                 p.set_u32(16, m.itt);
                 p.set_u16(20, m.cid);
@@ -745,8 +773,8 @@ impl Message {
                 p.data = m.data;
             }
             Message::TextRequest(m) => {
-                p.bhs[0] |= bit(m.immediate, IMMEDIATE);
-                p.bhs[1] = bit(m.final_pdu, F) | bit(m.cont, C);
+                p.set_byte(0, p.byte(0) | bit(m.immediate, IMMEDIATE));
+                p.set_byte(1, bit(m.final_pdu, F) | bit(m.cont, C));
                 p.set_lun(m.lun);
                 p.set_u32(16, m.itt);
                 p.set_u32(20, m.ttt);
@@ -755,7 +783,7 @@ impl Message {
                 p.data = m.data;
             }
             Message::DataOut(m) => {
-                p.bhs[1] = bit(m.final_pdu, F);
+                p.set_byte(1, bit(m.final_pdu, F));
                 p.set_lun(m.lun);
                 p.set_u32(16, m.itt);
                 p.set_u32(20, m.ttt);
@@ -765,15 +793,15 @@ impl Message {
                 p.data = m.data;
             }
             Message::LogoutRequest(m) => {
-                p.bhs[0] |= IMMEDIATE;
-                p.bhs[1] = F | m.reason & 0x7f;
+                p.set_byte(0, p.byte(0) | IMMEDIATE);
+                p.set_byte(1, F | m.reason & 0x7f);
                 p.set_u32(16, m.itt);
                 p.set_u16(20, m.cid);
                 p.set_u32(24, m.cmd_sn);
                 p.set_u32(28, m.exp_stat_sn);
             }
             Message::NopIn(m) => {
-                p.bhs[1] = F;
+                p.set_byte(1, F);
                 p.set_lun(m.lun);
                 p.set_u32(16, m.itt);
                 p.set_u32(20, m.ttt);
@@ -781,9 +809,9 @@ impl Message {
                 p.data = m.data;
             }
             Message::ScsiResponse(m) => {
-                p.bhs[1] = F | bit(m.overflow, 0x04) | bit(m.underflow, 0x02);
-                p.bhs[2] = m.response;
-                p.bhs[3] = m.status;
+                p.set_byte(1, F | bit(m.overflow, 0x04) | bit(m.underflow, 0x02));
+                p.set_byte(2, m.response);
+                p.set_byte(3, m.status);
                 p.set_u32(16, m.itt);
                 status(&mut p, m.stat_sn, m.exp_cmd_sn, m.max_cmd_sn);
                 p.set_u32(36, m.exp_data_sn);
@@ -791,17 +819,17 @@ impl Message {
                 p.data = m.data;
             }
             Message::LoginResponse(m) => {
-                p.bhs[1] = login_flags(m.transit, m.cont, m.csg, m.nsg);
-                p.bhs[8..14].copy_from_slice(&m.isid);
+                p.set_byte(1, login_flags(m.transit, m.cont, m.csg, m.nsg));
+                p.set_bytes(8, &m.isid);
                 p.set_u16(14, m.tsih);
                 p.set_u32(16, m.itt);
                 status(&mut p, m.stat_sn, m.exp_cmd_sn, m.max_cmd_sn);
-                p.bhs[36] = m.status_class;
-                p.bhs[37] = m.status_detail;
+                p.set_byte(36, m.status_class);
+                p.set_byte(37, m.status_detail);
                 p.data = m.data;
             }
             Message::TextResponse(m) => {
-                p.bhs[1] = bit(m.final_pdu, F) | bit(m.cont, C);
+                p.set_byte(1, bit(m.final_pdu, F) | bit(m.cont, C));
                 p.set_lun(m.lun);
                 p.set_u32(16, m.itt);
                 p.set_u32(20, m.ttt);
@@ -809,12 +837,15 @@ impl Message {
                 p.data = m.data;
             }
             Message::DataIn(m) => {
-                p.bhs[1] = bit(m.final_pdu, F)
-                    | bit(m.ack, 0x40)
-                    | bit(m.overflow, 0x04)
-                    | bit(m.underflow, 0x02)
-                    | bit(m.status.is_some(), 0x01);
-                p.bhs[3] = m.status.unwrap_or(0);
+                p.set_byte(
+                    1,
+                    bit(m.final_pdu, F)
+                        | bit(m.ack, 0x40)
+                        | bit(m.overflow, 0x04)
+                        | bit(m.underflow, 0x02)
+                        | bit(m.status.is_some(), 0x01),
+                );
+                p.set_byte(3, m.status.unwrap_or(0));
                 p.set_lun(m.lun);
                 p.set_u32(16, m.itt);
                 p.set_u32(20, m.ttt);
@@ -825,15 +856,15 @@ impl Message {
                 p.data = m.data;
             }
             Message::LogoutResponse(m) => {
-                p.bhs[1] = F;
-                p.bhs[2] = m.response;
+                p.set_byte(1, F);
+                p.set_byte(2, m.response);
                 p.set_u32(16, m.itt);
                 status(&mut p, m.stat_sn, m.exp_cmd_sn, m.max_cmd_sn);
                 p.set_u16(40, m.time2wait);
                 p.set_u16(42, m.time2retain);
             }
             Message::R2t(m) => {
-                p.bhs[1] = F;
+                p.set_byte(1, F);
                 p.set_lun(m.lun);
                 p.set_u32(16, m.itt);
                 p.set_u32(20, m.ttt);
@@ -843,20 +874,20 @@ impl Message {
                 p.set_u32(44, m.desired_len);
             }
             Message::AsyncMessage(m) => {
-                p.bhs[1] = F;
+                p.set_byte(1, F);
                 p.set_lun(m.lun);
                 p.set_u32(16, RESERVED_TAG);
                 status(&mut p, m.stat_sn, m.exp_cmd_sn, m.max_cmd_sn);
-                p.bhs[36] = m.event;
-                p.bhs[37] = m.vcode;
+                p.set_byte(36, m.event);
+                p.set_byte(37, m.vcode);
                 for (i, v) in m.params.iter().enumerate() {
                     p.set_u16(38 + 2 * i, *v);
                 }
                 p.data = m.data;
             }
             Message::Reject(m) => {
-                p.bhs[1] = F;
-                p.bhs[2] = m.reason;
+                p.set_byte(1, F);
+                p.set_byte(2, m.reason);
                 p.set_u32(16, RESERVED_TAG);
                 status(&mut p, m.stat_sn, m.exp_cmd_sn, m.max_cmd_sn);
                 p.set_u32(36, m.data_sn);

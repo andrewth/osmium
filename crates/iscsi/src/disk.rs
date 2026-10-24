@@ -59,14 +59,17 @@ impl<N: Net> IscsiDisk<N> {
         }
         let mut d = [0u8; 96];
         let n = session.command(&scsi::inquiry(d.len() as u16), Data::In(&mut d))?;
-        let inquiry = Inquiry::parse(&d[..n]).ok_or(IscsiError::Protocol("short INQUIRY data"))?;
+        let inquiry = Inquiry::parse(d.get(..n).ok_or(IscsiError::Protocol("short INQUIRY data"))?)
+            .ok_or(IscsiError::Protocol("short INQUIRY data"))?;
 
         let mut d = [0u8; 32];
-        let n = session.command(&scsi::read_capacity_10(), Data::In(&mut d[..8]))?;
-        let mut capacity = Capacity::parse_10(&d[..n]).ok_or(IscsiError::Protocol("short READ CAPACITY data"))?;
+        let n = session.command(&scsi::read_capacity_10(), Data::In(d.get_mut(..8).unwrap_or_default()))?;
+        let mut capacity = Capacity::parse_10(d.get(..n).unwrap_or_default())
+            .ok_or(IscsiError::Protocol("short READ CAPACITY data"))?;
         if capacity.last_lba == u32::MAX as u64 {
             let n = session.command(&scsi::read_capacity_16(), Data::In(&mut d))?;
-            capacity = Capacity::parse_16(&d[..n]).ok_or(IscsiError::Protocol("short READ CAPACITY data"))?;
+            capacity = Capacity::parse_16(d.get(..n).unwrap_or_default())
+                .ok_or(IscsiError::Protocol("short READ CAPACITY data"))?;
         }
         let bs = capacity.block_size;
         if !bs.is_power_of_two() || !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&bs) || capacity.last_lba == u64::MAX {

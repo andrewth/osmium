@@ -180,7 +180,7 @@ impl<N: Net> Conn<N> {
         let bytes = m.encode().to_bytes_with(self.header_digest, self.data_digest);
         let mut sent = 0;
         while sent < bytes.len() {
-            match self.tcp(|t| t.send(&bytes[sent..])) {
+            match self.tcp(|t| t.send(bytes.get(sent..).unwrap_or_default())) {
                 Ok(n) => sent += n,
                 Err(osmium_net::Error::WouldBlock) => self.pump(deadline)?,
                 Err(e) => return Err(e.into()),
@@ -202,7 +202,7 @@ impl<N: Net> Conn<N> {
             let mut buf = [0u8; 2048];
             match self.tcp(|t| t.recv(&mut buf)) {
                 Ok(0) | Err(osmium_net::Error::InvalidState) => return Err(IscsiError::Closed),
-                Ok(n) => self.reader.push(&buf[..n]),
+                Ok(n) => self.reader.push(buf.get(..n).unwrap_or_default()),
                 Err(osmium_net::Error::WouldBlock) => self.pump(deadline)?,
                 Err(e) => return Err(e.into()),
             }
@@ -521,6 +521,7 @@ impl<N: Net> Session<N> {
             Data::In(b) => (true, false, b.len()),
             Data::Out(b) => (false, true, b.len()),
         };
+        let expected_len = u32::try_from(expected).map_err(|_| IscsiError::Protocol("transfer too large"))?;
         let max_burst = p.max_burst_length as usize;
         // Unsolicited data, up to FirstBurstLength: immediate data in the
         // command PDU if allowed, then Data-Out PDUs unless InitialR2T.
@@ -533,7 +534,7 @@ impl<N: Net> Session<N> {
             _ => (0, 0),
         };
         let immediate_data = match &data {
-            Data::Out(b) => b[..immediate].to_vec(),
+            Data::Out(b) => b.get(..immediate).unwrap_or_default().to_vec(),
             _ => Vec::new(),
         };
         self.conn.send(
@@ -544,7 +545,7 @@ impl<N: Net> Session<N> {
                 attr: 1, // SIMPLE
                 lun: self.lun,
                 itt,
-                expected_len: expected as u32,
+                expected_len,
                 cmd_sn: self.cmd_sn,
                 exp_stat_sn: self.exp_stat_sn,
                 cdb: *cdb,
@@ -556,7 +557,9 @@ impl<N: Net> Session<N> {
         if let Data::Out(b) = &data
             && unsolicited > immediate
         {
-            self.data_out(itt, RESERVED_TAG, &b[immediate..unsolicited], immediate, deadline)?;
+            let burst =
+                b.get(immediate..unsolicited).ok_or(IscsiError::Protocol("unsolicited data beyond the buffer"))?;
+            self.data_out(itt, RESERVED_TAG, burst, immediate, deadline)?;
         }
 
         // DataPDUInOrder and DataSequenceInOrder are Yes, with one R2T at a
@@ -575,7 +578,8 @@ impl<N: Net> Session<N> {
                     if d.data_sn != data_sn || d.offset as usize != received {
                         return Err(IscsiError::Protocol("Data-In out of order"));
                     }
-                    let end = received + d.data.len();
+                    let end =
+                        received.checked_add(d.data.len()).ok_or(IscsiError::Protocol("Data-In beyond the buffer"))?;
                     let dst = buf.get_mut(received..end).ok_or(IscsiError::Protocol("Data-In beyond the buffer"))?;
                     dst.copy_from_slice(&d.data);
                     received = end;
@@ -596,7 +600,10 @@ impl<N: Net> Session<N> {
                     if len == 0 || len > max_burst {
                         return Err(IscsiError::Protocol("R2T length outside 1..=MaxBurstLength"));
                     }
-                    let chunk = b.get(sent..sent + len).ok_or(IscsiError::Protocol("R2T beyond the buffer"))?;
+                    let chunk = sent
+                        .checked_add(len)
+                        .and_then(|end| b.get(sent..end))
+                        .ok_or(IscsiError::Protocol("R2T beyond the buffer"))?;
                     self.data_out(itt, r.ttt, chunk, sent, deadline)?;
                     sent += len;
                     r2t_sn = r2t_sn.wrapping_add(1);

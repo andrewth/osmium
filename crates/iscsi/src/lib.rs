@@ -56,6 +56,8 @@ pub mod text;
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
+mod fuzz;
+#[cfg(test)]
 mod tests;
 
 pub use disk::IscsiDisk;

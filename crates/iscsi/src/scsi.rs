@@ -62,9 +62,21 @@ pub const ASC_LBA_OUT_OF_RANGE: u8 = 0x21;
 /// The largest block count one READ(10)/WRITE(10) can carry.
 pub const MAX_BLOCKS_10: u32 = 0xffff;
 
+/// The `N` bytes at `at` of `d`, if `d` is long enough.
+fn chunk<const N: usize>(d: &[u8], at: usize) -> Option<[u8; N]> {
+    d.get(at..)?.first_chunk::<N>().copied()
+}
+
+/// Copies `src` into `dst` at `at`, if it fits.
+fn put(dst: &mut [u8], at: usize, src: &[u8]) {
+    if let Some(d) = at.checked_add(src.len()).and_then(|end| dst.get_mut(at..end)) {
+        d.copy_from_slice(src);
+    }
+}
+
 fn cdb(bytes: &[u8]) -> Cdb {
     let mut c = [0; 16];
-    c[..bytes.len()].copy_from_slice(bytes);
+    put(&mut c, 0, bytes);
     c
 }
 
@@ -75,8 +87,8 @@ pub fn test_unit_ready() -> Cdb {
 
 /// Standard INQUIRY data, up to `len` bytes.
 pub fn inquiry(len: u16) -> Cdb {
-    let n = len.to_be_bytes();
-    cdb(&[op::INQUIRY, 0, 0, n[0], n[1], 0])
+    let [n0, n1] = len.to_be_bytes();
+    cdb(&[op::INQUIRY, 0, 0, n0, n1, 0])
 }
 
 /// READ CAPACITY(10), which returns 8 bytes.
@@ -87,14 +99,14 @@ pub fn read_capacity_10() -> Cdb {
 /// READ CAPACITY(16), returning up to 32 bytes.
 pub fn read_capacity_16() -> Cdb {
     let mut c = cdb(&[op::SERVICE_ACTION_IN_16, SA_READ_CAPACITY_16]);
-    c[13] = 32;
+    put(&mut c, 13, &[32]);
     c
 }
 
 /// REPORT LUNS, returning up to `len` bytes.
 pub fn report_luns(len: u32) -> Cdb {
     let mut c = cdb(&[op::REPORT_LUNS]);
-    c[6..10].copy_from_slice(&len.to_be_bytes());
+    put(&mut c, 6, &len.to_be_bytes());
     c
 }
 
@@ -107,13 +119,13 @@ pub fn synchronize_cache_10() -> Cdb {
 /// count, else READ(16) or WRITE(16).
 fn rw(op10: u8, op16: u8, lba: u64, blocks: u32) -> Cdb {
     if lba.saturating_add(blocks.max(1) as u64) <= u32::MAX as u64 + 1 && blocks <= MAX_BLOCKS_10 {
-        let l = (lba as u32).to_be_bytes();
-        let n = (blocks as u16).to_be_bytes();
-        cdb(&[op10, 0, l[0], l[1], l[2], l[3], 0, n[0], n[1], 0])
+        let [l0, l1, l2, l3] = (lba as u32).to_be_bytes();
+        let [n0, n1] = (blocks as u16).to_be_bytes();
+        cdb(&[op10, 0, l0, l1, l2, l3, 0, n0, n1, 0])
     } else {
         let mut c = cdb(&[op16]);
-        c[2..10].copy_from_slice(&lba.to_be_bytes());
-        c[10..14].copy_from_slice(&blocks.to_be_bytes());
+        put(&mut c, 2, &lba.to_be_bytes());
+        put(&mut c, 10, &blocks.to_be_bytes());
         c
     }
 }
@@ -132,14 +144,11 @@ pub fn write(lba: u64, blocks: u32) -> Cdb {
 /// decodes it.
 pub fn rw_range(cdb: &[u8]) -> Option<(u64, u32)> {
     match cdb.first()? {
-        0x28 | 0x2a if cdb.len() >= 10 => Some((
-            u32::from_be_bytes(cdb[2..6].try_into().expect("fixed-width slice")) as u64,
-            u16::from_be_bytes([cdb[7], cdb[8]]) as u32,
-        )),
-        0x88 | 0x8a if cdb.len() >= 14 => Some((
-            u64::from_be_bytes(cdb[2..10].try_into().expect("fixed-width slice")),
-            u32::from_be_bytes(cdb[10..14].try_into().expect("fixed-width slice")),
-        )),
+        0x28 | 0x2a => {
+            let lba = u32::from_be_bytes(chunk(cdb, 2)?) as u64;
+            Some((lba, u16::from_be_bytes(chunk(cdb, 7)?) as u32))
+        }
+        0x88 | 0x8a => Some((u64::from_be_bytes(chunk(cdb, 2)?), u32::from_be_bytes(chunk(cdb, 10)?))),
         _ => None,
     }
 }
@@ -160,9 +169,17 @@ impl Sense {
     /// data.
     pub fn parse(d: &[u8]) -> Option<Self> {
         match d.first()? & 0x7f {
-            0x70 | 0x71 if d.len() >= 14 => Some(Self { key: d[2] & 0xf, asc: d[12], ascq: d[13] }),
-            0x70 | 0x71 if d.len() >= 3 => Some(Self { key: d[2] & 0xf, asc: 0, ascq: 0 }),
-            0x72 | 0x73 if d.len() >= 4 => Some(Self { key: d[1] & 0xf, asc: d[2], ascq: d[3] }),
+            0x70 | 0x71 => {
+                let key = d.get(2)? & 0xf;
+                match d.get(12..14) {
+                    Some(&[asc, ascq]) => Some(Self { key, asc, ascq }),
+                    _ => Some(Self { key, asc: 0, ascq: 0 }),
+                }
+            }
+            0x72 | 0x73 => match d.get(1..4) {
+                Some(&[key, asc, ascq]) => Some(Self { key: key & 0xf, asc, ascq }),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -171,18 +188,14 @@ impl Sense {
     /// SenseLength, then the sense data (RFC 7143 §11.4.7.2).
     pub fn from_response(data: &[u8]) -> Option<Self> {
         let len = u16::from_be_bytes([*data.first()?, *data.get(1)?]) as usize;
-        Self::parse(data.get(2..2 + len)?)
+        Self::parse(data.get(2..)?.get(..len)?)
     }
 
     /// Fixed format sense data with `key`, `asc` and `ascq`, as a target
     /// returns it.
     pub fn to_fixed(self) -> [u8; 18] {
         let mut d = [0; 18];
-        d[0] = 0x70;
-        d[2] = self.key;
-        d[7] = 10;
-        d[12] = self.asc;
-        d[13] = self.ascq;
+        put(&mut d, 0, &[0x70, 0, self.key, 0, 0, 0, 0, 10, 0, 0, 0, 0, self.asc, self.ascq]);
         d
     }
 }
@@ -206,15 +219,13 @@ pub struct Inquiry {
 impl Inquiry {
     /// Parses at least 36 bytes of standard INQUIRY data.
     pub fn parse(d: &[u8]) -> Option<Self> {
-        if d.len() < 36 {
-            return None;
-        }
+        let [peripheral, flags] = chunk(d, 0)?;
         Some(Self {
-            peripheral: d[0],
-            removable: d[1] & 0x80 != 0,
-            vendor: d[8..16].try_into().expect("fixed-width slice"),
-            product: d[16..32].try_into().expect("fixed-width slice"),
-            revision: d[32..36].try_into().expect("fixed-width slice"),
+            peripheral,
+            removable: flags & 0x80 != 0,
+            vendor: chunk(d, 8)?,
+            product: chunk(d, 16)?,
+            revision: chunk(d, 32)?,
         })
     }
 
@@ -256,23 +267,17 @@ impl Capacity {
     /// Parses READ CAPACITY(10) data. A last LBA of 0xffffffff means the
     /// medium is too large and READ CAPACITY(16) is needed.
     pub fn parse_10(d: &[u8]) -> Option<Self> {
-        Some(Self {
-            last_lba: u32::from_be_bytes(d.get(0..4)?.try_into().expect("fixed-width slice")) as u64,
-            block_size: u32::from_be_bytes(d.get(4..8)?.try_into().expect("fixed-width slice")),
-        })
+        Some(Self { last_lba: u32::from_be_bytes(chunk(d, 0)?) as u64, block_size: u32::from_be_bytes(chunk(d, 4)?) })
     }
 
     /// Parses READ CAPACITY(16) data.
     pub fn parse_16(d: &[u8]) -> Option<Self> {
-        Some(Self {
-            last_lba: u64::from_be_bytes(d.get(0..8)?.try_into().expect("fixed-width slice")),
-            block_size: u32::from_be_bytes(d.get(8..12)?.try_into().expect("fixed-width slice")),
-        })
+        Some(Self { last_lba: u64::from_be_bytes(chunk(d, 0)?), block_size: u32::from_be_bytes(chunk(d, 8)?) })
     }
 
-    /// The number of blocks.
+    /// The number of blocks (saturating, for a target that claims the last LBA is `u64::MAX`).
     pub fn blocks(&self) -> u64 {
-        self.last_lba + 1
+        self.last_lba.saturating_add(1)
     }
 }
 
