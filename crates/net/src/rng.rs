@@ -14,16 +14,18 @@ fn siphash(k0: u64, k1: u64, words: &[u64]) -> u64 {
         k1 ^ 0x7465_6462_7974_6573,
     ];
     fn round(v: &mut [u64; 4]) {
-        v[0] = v[0].wrapping_add(v[1]);
-        v[1] = v[1].rotate_left(13) ^ v[0];
-        v[0] = v[0].rotate_left(32);
-        v[2] = v[2].wrapping_add(v[3]);
-        v[3] = v[3].rotate_left(16) ^ v[2];
-        v[0] = v[0].wrapping_add(v[3]);
-        v[3] = v[3].rotate_left(21) ^ v[0];
-        v[2] = v[2].wrapping_add(v[1]);
-        v[1] = v[1].rotate_left(17) ^ v[2];
-        v[2] = v[2].rotate_left(32);
+        let [mut v0, mut v1, mut v2, mut v3] = *v;
+        v0 = v0.wrapping_add(v1);
+        v1 = v1.rotate_left(13) ^ v0;
+        v0 = v0.rotate_left(32);
+        v2 = v2.wrapping_add(v3);
+        v3 = v3.rotate_left(16) ^ v2;
+        v0 = v0.wrapping_add(v3);
+        v3 = v3.rotate_left(21) ^ v0;
+        v2 = v2.wrapping_add(v1);
+        v1 = v1.rotate_left(17) ^ v2;
+        v2 = v2.rotate_left(32);
+        *v = [v0, v1, v2, v3];
     }
     for &w in words {
         v[3] ^= w;
@@ -67,7 +69,9 @@ impl Rng {
     pub(crate) fn mix(&mut self, entropy: &[u8]) {
         for chunk in entropy.chunks(8) {
             let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
+            for (d, s) in word.iter_mut().zip(chunk) {
+                *d = *s;
+            }
             let w = u64::from_le_bytes(word) ^ (chunk.len() as u64) << 59;
             let (k0, k1) = (self.k0, self.k1);
             self.k0 = siphash(k0, k1, &[w, 0]);
@@ -94,24 +98,26 @@ impl Rng {
     /// every 4 microseconds, here every 250 per millisecond.
     pub(crate) fn isn(&self, local: SocketAddr, remote: SocketAddr, now: Instant) -> u32 {
         // An IPv4 address is hashed as one word and an IPv6 address as two.
-        let mut words = [0; 6];
+        let mut words = [0u64; 6];
         let mut n = 0;
+        let mut push = |w: u64| {
+            if let Some(slot) = words.get_mut(n) {
+                *slot = w;
+                n += 1;
+            }
+        };
         for ip in [local.ip(), remote.ip()] {
             match ip {
-                IpAddr::V4(a) => {
-                    words[n] = u64::from(u32::from(a));
-                    n += 1;
-                }
+                IpAddr::V4(a) => push(u64::from(u32::from(a))),
                 IpAddr::V6(a) => {
                     let v = u128::from(a);
-                    words[n] = (v >> 64) as u64;
-                    words[n + 1] = v as u64;
-                    n += 2;
+                    push((v >> 64) as u64);
+                    push(v as u64);
                 }
             }
         }
-        words[n] = u64::from(local.port()) << 16 | u64::from(remote.port());
-        let hash = siphash(self.k1, self.k0, &words[..=n]) as u32;
+        push(u64::from(local.port()) << 16 | u64::from(remote.port()));
+        let hash = siphash(self.k1, self.k0, words.get(..n).unwrap_or(&[])) as u32;
         hash.wrapping_add((now.as_millis() as u32).wrapping_mul(250))
     }
 }

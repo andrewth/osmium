@@ -13,7 +13,7 @@ use core::net::Ipv6Addr;
 
 use osmium_hal::net::MacAddress;
 
-use crate::wire::checksum;
+use crate::wire::{checksum, put};
 
 /// EtherType of IPv6.
 pub const ETHERTYPE_IPV6: u16 = 0x86dd;
@@ -79,44 +79,44 @@ pub const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 pub const ALL_ROUTERS: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
 
 fn be16(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    Some(u16::from_be_bytes(*b.get(at..)?.first_chunk()?))
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    Some(u32::from_be_bytes(*b.get(at..)?.first_chunk()?))
 }
 
 fn addr(b: &[u8], at: usize) -> Option<Ipv6Addr> {
-    Some(Ipv6Addr::from(<[u8; 16]>::try_from(b.get(at..at + 16)?).ok()?))
+    Some(Ipv6Addr::from(*b.get(at..)?.first_chunk::<16>()?))
 }
 
 fn mac(b: &[u8]) -> Option<MacAddress> {
-    Some(MacAddress(b.get(..6)?.try_into().ok()?))
+    Some(MacAddress(*b.first_chunk()?))
 }
 
 /// Returns true for `fe80::/10`.
 pub fn is_link_local(a: Ipv6Addr) -> bool {
-    a.segments()[0] & 0xffc0 == 0xfe80
+    a.segments().first().is_some_and(|s| s & 0xffc0 == 0xfe80)
 }
 
 /// The multicast address a node joins for each of its unicast addresses,
 /// `ff02::1:ffXX:XXXX` with the low 24 bits of `a`.
 pub fn solicited_node(a: Ipv6Addr) -> Ipv6Addr {
-    let o = a.octets();
-    Ipv6Addr::from([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, o[13], o[14], o[15]])
+    let [.., a, b, c] = a.octets();
+    Ipv6Addr::from([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, a, b, c])
 }
 
 /// The Ethernet address IPv6 multicast address `a` maps to: `33:33` and its
 /// low 32 bits (RFC 2464).
 pub fn multicast_mac(a: Ipv6Addr) -> MacAddress {
-    let o = a.octets();
-    MacAddress([0x33, 0x33, o[12], o[13], o[14], o[15]])
+    let [.., a, b, c, d] = a.octets();
+    MacAddress([0x33, 0x33, a, b, c, d])
 }
 
 /// The modified EUI-64 interface identifier of `mac` (RFC 4291 appendix A).
 pub fn eui64(mac: MacAddress) -> [u8; 8] {
-    let m = mac.0;
-    [m[0] ^ 2, m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]]
+    let [m0, m1, m2, m3, m4, m5] = mac.0;
+    [m0 ^ 2, m1, m2, 0xff, 0xfe, m3, m4, m5]
 }
 
 /// The link-local address `mac` autoconfigures: `fe80::` and its EUI-64.
@@ -210,7 +210,7 @@ impl Ipv6Header {
     /// a routing header with hops left, a jumbo payload, or an option that
     /// calls for it to be discarded.
     pub fn parse(b: &[u8]) -> Option<(Self, &[u8])> {
-        if b.len() < IPV6_HEADER_LEN || b[0] >> 4 != 6 {
+        if b.len() < IPV6_HEADER_LEN || *b.first()? >> 4 != 6 {
             return None;
         }
         let total = usize::from(be16(b, 4)?);
@@ -218,8 +218,8 @@ impl Ipv6Header {
         let mut header = Self {
             src: addr(b, 8)?,
             dst: addr(b, 24)?,
-            next_header: b[6],
-            hop_limit: b[7],
+            next_header: *b.get(6)?,
+            hop_limit: *b.get(7)?,
             payload_len: 0,
             fragment: None,
         };
@@ -277,13 +277,11 @@ impl Ipv6Header {
     /// Writes the 40-byte header for `self.payload_len` bytes of
     /// `self.next_header` payload, with no extension headers.
     pub fn emit(&self, buf: &mut [u8]) {
-        buf[0] = 0x60;
-        buf[1..4].fill(0);
-        buf[4..6].copy_from_slice(&(self.payload_len as u16).to_be_bytes());
-        buf[6] = self.next_header;
-        buf[7] = self.hop_limit;
-        buf[8..24].copy_from_slice(&self.src.octets());
-        buf[24..40].copy_from_slice(&self.dst.octets());
+        put(buf, 0, &[0x60, 0, 0, 0]);
+        put(buf, 4, &(self.payload_len as u16).to_be_bytes());
+        put(buf, 6, &[self.next_header, self.hop_limit]);
+        put(buf, 8, &self.src.octets());
+        put(buf, 24, &self.dst.octets());
     }
 }
 
@@ -307,7 +305,7 @@ impl Icmpv6Header {
         if checksum::finish(checksum::add(checksum::pseudo_header(src, dst, PROTO_ICMPV6, b.len()), b)) != 0 {
             return None;
         }
-        Some((Self { ty: b[0], code: b[1] }, &b[ICMPV6_HEADER_LEN..]))
+        Some((Self { ty: *b.first()?, code: *b.get(1)? }, b.get(ICMPV6_HEADER_LEN..)?))
     }
 
     /// Builds the message from `src` to `dst`: this header, `body`, and the
@@ -318,7 +316,7 @@ impl Icmpv6Header {
         b.extend_from_slice(&[self.ty, self.code, 0, 0]);
         b.extend_from_slice(body);
         let sum = checksum::finish(checksum::add(checksum::pseudo_header(src, dst, PROTO_ICMPV6, len), &b));
-        b[2..4].copy_from_slice(&sum.to_be_bytes());
+        put(&mut b, 2, &sum.to_be_bytes());
         b
     }
 }
@@ -363,17 +361,17 @@ fn parse_options(mut b: &[u8]) -> Option<NdOptions> {
             return None;
         }
         let opt = b.get(..len)?;
-        b = &b[len..];
+        b = b.get(len..)?;
         match ty {
-            OPT_SOURCE_LL if len == 8 => o.source_ll = mac(&opt[2..]),
-            OPT_TARGET_LL if len == 8 => o.target_ll = mac(&opt[2..]),
+            OPT_SOURCE_LL if len == 8 => o.source_ll = mac(opt.get(2..)?),
+            OPT_TARGET_LL if len == 8 => o.target_ll = mac(opt.get(2..)?),
             OPT_MTU if len == 8 => o.mtu = be32(opt, 4),
             OPT_PREFIX_INFO if len == 32 => {
                 if o.prefixes.len() < 8 {
                     o.prefixes.push(PrefixInfo {
-                        prefix_len: opt[2],
-                        on_link: opt[3] & 0x80 != 0,
-                        autonomous: opt[3] & 0x40 != 0,
+                        prefix_len: *opt.get(2)?,
+                        on_link: *opt.get(3)? & 0x80 != 0,
+                        autonomous: *opt.get(3)? & 0x40 != 0,
                         valid_lifetime: be32(opt, 4)?,
                         preferred_lifetime: be32(opt, 8)?,
                         prefix: addr(opt, 16)?,
@@ -382,7 +380,7 @@ fn parse_options(mut b: &[u8]) -> Option<NdOptions> {
             }
             OPT_RDNSS if len >= 24 && (len - 8) % 16 == 0 => {
                 let lifetime = be32(opt, 4)?;
-                for chunk in opt[8..].as_chunks::<16>().0.iter().take(4) {
+                for chunk in opt.get(8..)?.as_chunks::<16>().0.iter().take(4) {
                     if lifetime == 0 {
                         o.rdnss_withdrawn.push(Ipv6Addr::from(*chunk));
                     } else {

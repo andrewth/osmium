@@ -119,7 +119,7 @@ impl Reassembly {
             return false;
         }
         let at = self.pieces.partition_point(|(o, _)| *o < offset);
-        if let Some((o, d)) = at.checked_sub(1).map(|i| &self.pieces[i])
+        if let Some((o, d)) = at.checked_sub(1).and_then(|i| self.pieces.get(i))
             && o + d.len() > offset
         {
             return false;
@@ -178,6 +178,11 @@ pub struct Interface {
     looping: bool,
     /// A packet was looped back since [`loopback_pending`](Self::loopback_pending) last said so.
     looped: bool,
+}
+
+/// The part of an Ethernet frame after its header.
+fn ip_area(frame: &mut [u8]) -> &mut [u8] {
+    frame.get_mut(ETH_HEADER_LEN..).unwrap_or(&mut [])
 }
 
 impl Interface {
@@ -461,7 +466,7 @@ impl Interface {
         let header = Ipv4Header { src, dst, protocol: p.protocol, ttl: TTL, ident: 0, payload_len: p.payload.len() };
         let mut bytes = vec![0; IPV4_HEADER_LEN + p.payload.len()];
         header.emit(&mut bytes);
-        bytes[IPV4_HEADER_LEN..].copy_from_slice(&p.payload);
+        crate::wire::put(&mut bytes, IPV4_HEADER_LEN, &p.payload);
         self.loopback.push_back(bytes);
         self.looped = true;
     }
@@ -475,7 +480,7 @@ impl Interface {
             Ipv6Header { src, dst, next_header: protocol, hop_limit: 64, payload_len: payload.len(), fragment: None };
         let mut bytes = vec![0; IPV6_HEADER_LEN + payload.len()];
         header.emit(&mut bytes);
-        bytes[IPV6_HEADER_LEN..].copy_from_slice(payload);
+        crate::wire::put(&mut bytes, IPV6_HEADER_LEN, payload);
         self.loopback.push_back(bytes);
         self.looped = true;
     }
@@ -497,7 +502,7 @@ impl Interface {
     fn ip_frames(&mut self, dst_mac: MacAddress, p: &Packet) -> Vec<Vec<u8>> {
         let (IpAddr::V4(p_src), IpAddr::V4(p_dst)) = (p.src, p.dst) else { return Vec::new() };
         self.ident = self.ident.wrapping_add(1);
-        let step = (self.mtu - IPV4_HEADER_LEN) / 8 * 8;
+        let step = self.mtu.saturating_sub(IPV4_HEADER_LEN) / 8 * 8;
         let whole = IPV4_HEADER_LEN + p.payload.len() <= self.mtu;
         // IGMP carries the router alert option (RFC 2236); it is never
         // fragmented.
@@ -510,22 +515,25 @@ impl Interface {
         } else {
             TTL
         };
+        if step == 0 && !whole {
+            return Vec::new();
+        }
         let mut frames = Vec::with_capacity(if whole { 1 } else { p.payload.len().div_ceil(step) });
         let mut offset = 0;
         while offset < p.payload.len() || (whole && frames.is_empty()) {
-            let len = if whole { p.payload.len() } else { step.min(p.payload.len() - offset) };
+            let len = if whole { p.payload.len() } else { step.min(p.payload.len().saturating_sub(offset)) };
             let mut frame = self.ethernet_frame(dst_mac, ETHERTYPE_IPV4, hlen + len);
             let header =
                 Ipv4Header { src: p_src, dst: p_dst, protocol: p.protocol, ttl, ident: self.ident, payload_len: len };
             if alert {
-                ipopt::emit_with_router_alert(&header, &mut frame[ETH_HEADER_LEN..]);
+                ipopt::emit_with_router_alert(&header, ip_area(&mut frame));
             } else if whole {
-                header.emit(&mut frame[ETH_HEADER_LEN..]);
+                header.emit(ip_area(&mut frame));
             } else {
                 let fragment = Fragment { more: offset + len < p.payload.len(), offset };
-                header.emit_fragment(&mut frame[ETH_HEADER_LEN..], fragment);
+                header.emit_fragment(ip_area(&mut frame), fragment);
             }
-            frame[ETH_HEADER_LEN + hlen..].copy_from_slice(&p.payload[offset..offset + len]);
+            crate::wire::put(&mut frame, ETH_HEADER_LEN + hlen, p.payload.get(offset..offset + len).unwrap_or(&[]));
             frames.push(frame);
             offset += len;
         }
@@ -591,14 +599,14 @@ impl Interface {
             target_ip,
         };
         let mut frame = self.ethernet_frame(MacAddress::BROADCAST, ETHERTYPE_ARP, ARP_LEN);
-        request.emit(&mut frame[ETH_HEADER_LEN..]);
+        request.emit(ip_area(&mut frame));
         self.queue_frame(frame);
     }
 
     fn retry_arp(&mut self, now: Instant) {
         let mut i = 0;
         while i < self.requests.len() {
-            let r = &mut self.requests[i];
+            let Some(r) = self.requests.get_mut(i) else { break };
             if now - r.first >= ARP_GIVE_UP {
                 let ip = r.ip;
                 self.requests.swap_remove(i);
@@ -619,11 +627,13 @@ impl Interface {
         self.requests.retain(|r| r.ip != ip);
         let mut i = 0;
         while i < self.pending.len() {
-            if self.pending[i].next_hop == ip {
-                let p = self.pending.remove(i).expect("i < pending.len()");
-                self.queue_ip(mac, &p.packet);
-            } else {
-                i += 1;
+            match self.pending.get(i) {
+                Some(p) if p.next_hop == ip => {
+                    if let Some(p) = self.pending.remove(i) {
+                        self.queue_ip(mac, &p.packet);
+                    }
+                }
+                _ => i += 1,
             }
         }
     }
@@ -668,7 +678,7 @@ impl Interface {
                 target_ip: arp.sender_ip,
             };
             let mut frame = self.ethernet_frame(arp.sender_mac, ETHERTYPE_ARP, ARP_LEN);
-            reply.emit(&mut frame[ETH_HEADER_LEN..]);
+            reply.emit(ip_area(&mut frame));
             self.queue_frame(frame);
         }
     }
@@ -704,7 +714,7 @@ impl Interface {
                 self.reassembling.len() - 1
             }
         };
-        let r = &mut self.reassembling[i];
+        let r = self.reassembling.get_mut(i)?;
         if !r.add(fragment.offset, fragment.more, payload) {
             self.reassembling.remove(i);
             return None;
@@ -714,7 +724,7 @@ impl Interface {
         self.reassembling.remove(i);
         let mut packet = vec![0; IPV4_HEADER_LEN + data.len()];
         header.emit(&mut packet);
-        packet[IPV4_HEADER_LEN..].copy_from_slice(&data);
+        crate::wire::put(&mut packet, IPV4_HEADER_LEN, &data);
         Some(packet)
     }
 
@@ -820,8 +830,8 @@ impl Interface {
                     // eight bytes of the datagram (RFC 792).
                     // Not the frame's padding, which `bytes` may carry past
                     // the packet.
-                    let header_len = usize::from(bytes[0] & 0xf) * 4;
-                    let quoted = &bytes[..header_len + payload.len().min(UDP_HEADER_LEN)];
+                    let header_len = usize::from(bytes.first().copied().unwrap_or(0) & 0xf) * 4;
+                    let quoted = bytes.get(..header_len + payload.len().min(UDP_HEADER_LEN)).unwrap_or(&[]);
                     // The ident and seq fields are the message's four unused bytes.
                     let header =
                         IcmpHeader { ty: ICMP_DEST_UNREACHABLE, code: ICMP_PORT_UNREACHABLE, ident: 0, seq: 0 };

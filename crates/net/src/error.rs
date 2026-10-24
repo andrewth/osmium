@@ -20,6 +20,8 @@ pub enum Error {
     ConnectionReset,
     /// The peer stopped acknowledging data.
     TimedOut,
+    /// There was no memory to queue the data or add the socket.
+    OutOfMemory,
 }
 
 impl fmt::Display for Error {
@@ -32,6 +34,7 @@ impl fmt::Display for Error {
             Error::ConnectionRefused => "connection refused",
             Error::ConnectionReset => "connection reset",
             Error::TimedOut => "connection timed out",
+            Error::OutOfMemory => "out of memory",
         })
     }
 }

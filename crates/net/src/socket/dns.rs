@@ -296,7 +296,7 @@ fn parse_response(msg: &[u8]) -> Option<Response> {
         let ttl = u32::from_be_bytes(msg.get(pos + 4..pos + 8)?.try_into().ok()?);
         let len = usize::from(be16(msg, pos + 8)?);
         let data = pos + 10;
-        msg.get(data..data + len)?;
+        let rdata = msg.get(data..data.checked_add(len)?)?;
         pos = data + len;
         if class != CLASS_IN || !chain.contains(&owner) {
             continue;
@@ -309,7 +309,7 @@ fn parse_response(msg: &[u8]) -> Option<Response> {
                 r.ttl = r.ttl.min(ttl);
             }
             TYPE_A if qtype == TYPE_A && len == 4 && r.addresses.len() < MAX_ADDRESSES => {
-                let ip = Ipv4Addr::new(msg[data], msg[data + 1], msg[data + 2], msg[data + 3]);
+                let ip = Ipv4Addr::from(<[u8; 4]>::try_from(rdata).ok()?);
                 // An answer is never a non-address.
                 if !(ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()) {
                     r.addresses.push(ip.into());
@@ -317,8 +317,7 @@ fn parse_response(msg: &[u8]) -> Option<Response> {
                 }
             }
             TYPE_AAAA if qtype == TYPE_AAAA && len == 16 && r.addresses.len() < MAX_ADDRESSES => {
-                let octets: [u8; 16] = msg[data..data + 16].try_into().ok()?;
-                let ip = Ipv6Addr::from(octets);
+                let ip = Ipv6Addr::from(<[u8; 16]>::try_from(rdata).ok()?);
                 if !(ip.is_unspecified() || ip.is_multicast()) {
                     r.addresses.push(ip.into());
                     r.ttl = r.ttl.min(ttl);
@@ -431,7 +430,7 @@ impl DnsClient {
     pub fn result_ip(&mut self, query: DnsQuery) -> Option<Result<Vec<IpAddr>, DnsError>> {
         let i = self.queries.iter().position(|q| q.handle == query);
         let Some(i) = i else { return Some(Err(DnsError::Cancelled)) };
-        self.queries[i].result.as_ref()?;
+        self.queries.get(i)?.result.as_ref()?;
         let q = self.queries.remove(i);
         self.dead.extend(q.socks.iter().map(|&(h, _)| h));
         q.result.map(|(r, _)| r)
@@ -467,7 +466,7 @@ impl DnsClient {
     }
 
     fn finish(&mut self, i: usize, outcome: Outcome, ttl: Option<Duration>, now: Instant) {
-        let q = &mut self.queries[i];
+        let Some(q) = self.queries.get_mut(i) else { return };
         q.result = Some((outcome.clone(), now));
         let Some(ttl) = ttl else { return };
         let entry = CacheEntry { name: q.name.clone(), qtype: q.qtype, outcome, expires: now + ttl };
@@ -482,15 +481,15 @@ impl DnsClient {
     /// server that socket asked.
     fn handle_response(&mut self, i: usize, msg: &[u8], from: IpAddr, now: Instant) {
         let Some(r) = parse_response(msg) else { return };
-        let q = &self.queries[i];
+        let Some(q) = self.queries.get_mut(i) else { return };
         if q.result.is_some() || q.id != r.id || q.name != r.name || q.qtype != r.qtype {
             return;
         }
         if r.truncated && r.rcode == 0 {
             // The answer is partial: get all of it over TCP. One attempt
             // only; a second truncated datagram changes nothing.
-            if matches!(self.queries[i].tcp, Tcp::No) {
-                self.queries[i].tcp = Tcp::Wanted { server: from, partial: r.addresses, ttl: r.ttl };
+            if matches!(q.tcp, Tcp::No) {
+                q.tcp = Tcp::Wanted { server: from, partial: r.addresses, ttl: r.ttl };
             }
             return;
         }
@@ -507,7 +506,11 @@ impl DnsClient {
             0 => self.finish(i, Err(DnsError::NoAddress), Some(NEGATIVE_TTL), now),
             3 => self.finish(i, Err(DnsError::NameNotFound), Some(NEGATIVE_TTL), now),
             // Another server may do better.
-            _ if self.queries[i].attempts < ATTEMPTS => self.queries[i].next_try = now,
+            _ if self.queries.get(i).is_some_and(|q| q.attempts < ATTEMPTS) => {
+                if let Some(q) = self.queries.get_mut(i) {
+                    q.next_try = now;
+                }
+            }
             _ => self.finish(i, Err(DnsError::ServerFailure), None, now),
         }
     }
@@ -518,7 +521,8 @@ impl DnsClient {
         // Close the sockets of the jobs whose lookup ended, and reap.
         let mut j = 0;
         while j < self.jobs.len() {
-            let ended = self.queries.iter().find(|q| q.handle == self.jobs[j].query).is_none_or(|q| q.result.is_some());
+            let Some(job) = self.jobs.get(j) else { break };
+            let ended = self.queries.iter().find(|q| q.handle == job.query).is_none_or(|q| q.result.is_some());
             if ended {
                 let job = self.jobs.swap_remove(j);
                 self.retire(job.socket, now, sockets);
@@ -528,10 +532,12 @@ impl DnsClient {
         }
         let mut c = 0;
         while c < self.closing.len() {
-            let (handle, deadline) = self.closing[c];
-            let done = matches!(sockets.get::<TcpSocket>(handle).state(), TcpState::Closed | TcpState::TimeWait);
+            let Some(&(handle, deadline)) = self.closing.get(c) else { break };
+            let done = sockets
+                .try_get::<TcpSocket>(handle)
+                .is_none_or(|s| matches!(s.state(), TcpState::Closed | TcpState::TimeWait));
             if done || now >= deadline {
-                sockets.remove(handle);
+                sockets.try_remove(handle);
                 self.closing.swap_remove(c);
             } else {
                 c += 1;
@@ -540,13 +546,12 @@ impl DnsClient {
 
         // Start the wanted connections.
         for i in 0..self.queries.len() {
-            if self.queries[i].result.is_some() || !matches!(self.queries[i].tcp, Tcp::Wanted { .. }) {
+            let Some(q) = self.queries.get_mut(i) else { break };
+            if q.result.is_some() || !matches!(q.tcp, Tcp::Wanted { .. }) {
                 continue;
             }
-            let Tcp::Wanted { server, partial, ttl } = core::mem::replace(&mut self.queries[i].tcp, Tcp::Active) else {
-                continue;
-            };
-            let q = &self.queries[i];
+            let Tcp::Wanted { server, partial, ttl } = core::mem::replace(&mut q.tcp, Tcp::Active) else { continue };
+            let q = &*q;
             let mut message = encode_query(q.id, &q.name, q.qtype);
             message.splice(0..0, (message.len() as u16).to_be_bytes());
             let mut socket = TcpSocket::new(TCP_RX, TCP_TX);
@@ -565,18 +570,26 @@ impl DnsClient {
                 partial,
                 ttl,
             });
-            self.queries[i].next_try = now + TCP_TIMEOUT;
+            if let Some(q) = self.queries.get_mut(i) {
+                q.next_try = now + TCP_TIMEOUT;
+            }
         }
 
         // Move data.
         let mut j = 0;
         while j < self.jobs.len() {
-            let Some(i) = self.queries.iter().position(|q| q.handle == self.jobs[j].query) else {
+            let Some(job) = self.jobs.get_mut(j) else { break };
+            let Some(i) = self.queries.iter().position(|q| q.handle == job.query) else {
                 j += 1;
                 continue;
             };
-            let job = &mut self.jobs[j];
-            let socket = sockets.get_mut::<TcpSocket>(job.socket);
+            let Some(socket) = sockets.try_get_mut::<TcpSocket>(job.socket) else {
+                // The socket is gone; the lookup cannot go on over TCP.
+                let (partial, ttl) = (core::mem::take(&mut job.partial), job.ttl);
+                self.tcp_failed(i, partial, ttl, now);
+                j += 1;
+                continue;
+            };
             let mut chunk = [0u8; 512];
             let mut failed = socket.error().is_some() || now - job.started >= TCP_TIMEOUT;
             while !failed {
@@ -585,7 +598,9 @@ impl DnsClient {
                         // The server closed before it finished answering.
                         failed = true;
                     }
-                    Ok(n) if job.buf.len() + n <= TCP_RX => job.buf.extend_from_slice(&chunk[..n]),
+                    Ok(n) if job.buf.len().saturating_add(n) <= TCP_RX => {
+                        job.buf.extend_from_slice(chunk.get(..n).unwrap_or(&chunk));
+                    }
                     Ok(_) => failed = true,
                     Err(_) => break,
                 }
@@ -594,16 +609,14 @@ impl DnsClient {
                 failed = true;
             }
             let reply = match job.buf.as_slice() {
-                [hi, lo, rest @ ..] if rest.len() >= usize::from(u16::from_be_bytes([*hi, *lo])) => {
-                    Some(&rest[..usize::from(u16::from_be_bytes([*hi, *lo]))])
-                }
+                [hi, lo, rest @ ..] => rest.get(..usize::from(u16::from_be_bytes([*hi, *lo]))),
                 _ => None,
             };
             if let Some(msg) = reply {
                 // The connection is the server's: its answer need not be
                 // checked against a source address, only against the query.
                 let response = parse_response(msg).filter(|r| {
-                    r.id == self.queries[i].id && r.name == self.queries[i].name && r.qtype == self.queries[i].qtype
+                    self.queries.get(i).is_some_and(|q| r.id == q.id && r.name == q.name && r.qtype == q.qtype)
                 });
                 let (partial, ttl) = (core::mem::take(&mut job.partial), job.ttl);
                 match response {
@@ -622,7 +635,9 @@ impl DnsClient {
 
     /// Closes a job's socket and leaves it to be removed.
     fn retire(&mut self, socket: SocketHandle, now: Instant, sockets: &mut SocketSet) {
-        sockets.get_mut::<TcpSocket>(socket).close();
+        if let Some(s) = sockets.try_get_mut::<TcpSocket>(socket) {
+            s.close();
+        }
         self.closing.push((socket, now + TCP_CLOSE_GRACE));
     }
 
@@ -644,11 +659,15 @@ impl DnsClient {
         self.remove_dead(sockets);
         let mut buf = [0u8; MAX_RESPONSE];
         for i in 0..self.queries.len() {
-            for k in 0..self.queries[i].socks.len() {
-                let (socket, server) = self.queries[i].socks[k];
-                while let Ok((n, from)) = sockets.get_mut::<UdpSocket>(socket).recv_from(&mut buf) {
-                    if n <= buf.len() && from == server && servers.contains(&server.ip()) {
-                        self.handle_response(i, &buf[..n], from.ip(), now);
+            let socks = self.queries.get(i).map(|q| q.socks.clone()).unwrap_or_default();
+            for (socket, server) in socks {
+                while let Some(Ok((n, from))) = sockets.try_get_mut::<UdpSocket>(socket).map(|s| s.recv_from(&mut buf))
+                {
+                    if from == server
+                        && servers.contains(&server.ip())
+                        && let Some(msg) = buf.get(..n)
+                    {
+                        self.handle_response(i, msg, from.ip(), now);
                     }
                 }
             }
@@ -656,13 +675,13 @@ impl DnsClient {
         self.poll_tcp(now, sockets);
 
         for i in 0..self.queries.len() {
-            let q = &self.queries[i];
+            let Some(q) = self.queries.get_mut(i) else { break };
             if q.result.is_none() && q.next_try <= now && matches!(q.tcp, Tcp::No) {
                 if servers.is_empty() {
                     if now - q.started >= NO_SERVER_WAIT {
                         self.finish(i, Err(DnsError::NoServer), None, now);
                     } else {
-                        self.queries[i].next_try = now + Duration::from_millis(250);
+                        q.next_try = now + Duration::from_millis(250);
                     }
                     continue;
                 }
@@ -670,21 +689,23 @@ impl DnsClient {
                     self.finish(i, Err(DnsError::Timeout), None, now);
                     continue;
                 }
-                let server = SocketAddr::new(servers[usize::from(q.attempts) % servers.len()], SERVER_PORT);
+                let Some(&server_ip) = servers.get(usize::from(q.attempts) % servers.len()) else { continue };
+                let server = SocketAddr::new(server_ip, SERVER_PORT);
                 let message = encode_query(q.id, &q.name, q.qtype);
                 // A port of its own for each query, so that an off-path forger
                 // must guess it as well as the id (RFC 5452).
                 let any = if server.is_ipv6() { Ipv6Addr::UNSPECIFIED.into() } else { Ipv4Addr::UNSPECIFIED.into() };
                 let mut socket = UdpSocket::new(4, 4);
-                socket
+                let sent = socket
                     .bind_addr(SocketAddr::new(any, sockets.free_ephemeral_port(&mut self.rng)))
-                    .expect("a fresh socket binds");
-                match socket.send_to(&message, server) {
+                    .and_then(|()| socket.send_to(&message, server));
+                match sent {
                     Ok(()) => {
-                        let q = &mut self.queries[i];
-                        q.socks.push((sockets.add(socket), server));
-                        q.next_try = now + FIRST_TIMEOUT * (1 << q.attempts);
-                        q.attempts += 1;
+                        if let Some(q) = self.queries.get_mut(i) {
+                            q.socks.push((sockets.add(socket), server));
+                            q.next_try = now + FIRST_TIMEOUT * (1u32 << q.attempts.min(16));
+                            q.attempts += 1;
+                        }
                     }
                     // Try again at the next poll.
                     Err(Error::WouldBlock) => {}
@@ -868,9 +889,9 @@ mod tests {
             let noise = [7u8; 30];
             let addrs: Vec<[u8; 4]> = big_answer()
                 .iter()
-                .map(|a| match a {
-                    IpAddr::V4(a) => a.octets(),
-                    IpAddr::V6(_) => unreachable!("big_answer is IPv4"),
+                .filter_map(|a| match a {
+                    IpAddr::V4(a) => Some(a.octets()),
+                    IpAddr::V6(_) => None, // big_answer is IPv4
                 })
                 .collect();
             let mut answers: Vec<(&[u8], u16, u32, &[u8])> = (0..30).map(|_| (Q, 16, 60, &noise[..])).collect();

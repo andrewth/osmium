@@ -35,20 +35,39 @@ pub const TCP_HEADER_LEN: usize = 20;
 /// Length of an ICMP echo header.
 pub const ICMP_HEADER_LEN: usize = 8;
 
-fn be16(b: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([b[at], b[at + 1]])
+/// The `N` bytes at `at`, or zeros if `b` is too short. Every caller checks
+/// the length first, so the fallback is never used on a well-formed parse.
+pub(crate) fn array<const N: usize>(b: &[u8], at: usize) -> [u8; N] {
+    b.get(at..).and_then(|s| s.first_chunk::<N>()).copied().unwrap_or([0; N])
 }
 
-fn be32(b: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+/// Copies `src` to `buf` at `at`; does nothing if `buf` is too short (the
+/// emitters' callers size the buffer by the header's constant length).
+pub(crate) fn put(buf: &mut [u8], at: usize, src: &[u8]) {
+    if let Some(dst) = at.checked_add(src.len()).and_then(|end| buf.get_mut(at..end)) {
+        dst.copy_from_slice(src);
+    }
 }
 
-fn ip(b: &[u8], at: usize) -> Ipv4Addr {
-    Ipv4Addr::new(b[at], b[at + 1], b[at + 2], b[at + 3])
+pub(crate) fn be16(b: &[u8], at: usize) -> u16 {
+    u16::from_be_bytes(array(b, at))
 }
 
-fn mac(b: &[u8], at: usize) -> MacAddress {
-    MacAddress(b[at..at + 6].try_into().expect("fixed-width slice"))
+pub(crate) fn be32(b: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(array(b, at))
+}
+
+pub(crate) fn ip(b: &[u8], at: usize) -> Ipv4Addr {
+    Ipv4Addr::from(array::<4>(b, at))
+}
+
+pub(crate) fn mac(b: &[u8], at: usize) -> MacAddress {
+    MacAddress(array(b, at))
+}
+
+/// The byte at `at`, or 0 if `b` is too short.
+pub(crate) fn byte(b: &[u8], at: usize) -> u8 {
+    b.get(at).copied().unwrap_or(0)
 }
 
 /// The Internet checksum (RFC 1071).
@@ -57,16 +76,20 @@ pub mod checksum {
 
     /// Adds `data` to a running one's-complement sum, as big-endian 16-bit
     /// words, padding an odd final byte with zero.
-    pub fn add(mut sum: u32, data: &[u8]) -> u32 {
+    pub fn add(sum: u32, data: &[u8]) -> u32 {
+        // A 64-bit accumulator cannot overflow for any slice length.
+        let mut sum = u64::from(sum);
         let (words, rest) = data.as_chunks::<2>();
         for w in words {
-            sum += u32::from(u16::from_be_bytes(*w));
+            sum += u64::from(u16::from_be_bytes(*w));
         }
         if let [last] = rest {
-            sum += u32::from(*last) << 8;
+            sum += u64::from(*last) << 8;
         }
-        // Fold early so that long inputs cannot overflow.
-        (sum & 0xffff) + (sum >> 16)
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u32
     }
 
     /// Folds a running sum and complements it: the value to store in a
@@ -123,14 +146,14 @@ impl EthernetHeader {
             return None;
         }
         let header = Self { dst: mac(frame, 0), src: mac(frame, 6), ethertype: be16(frame, 12) };
-        Some((header, &frame[ETH_HEADER_LEN..]))
+        Some((header, frame.get(ETH_HEADER_LEN..)?))
     }
 
     /// Writes the header into the first [`ETH_HEADER_LEN`] bytes of `buf`.
     pub fn emit(&self, buf: &mut [u8]) {
-        buf[0..6].copy_from_slice(&self.dst.0);
-        buf[6..12].copy_from_slice(&self.src.0);
-        buf[12..14].copy_from_slice(&self.ethertype.to_be_bytes());
+        put(buf, 0, &self.dst.0);
+        put(buf, 6, &self.src.0);
+        put(buf, 12, &self.ethertype.to_be_bytes());
     }
 }
 
@@ -157,7 +180,7 @@ pub struct ArpPacket {
 impl ArpPacket {
     /// Parses an ARP packet, rejecting other hardware and protocol types.
     pub fn parse(b: &[u8]) -> Option<Self> {
-        if b.len() < ARP_LEN || b[0..6] != [0, 1, 0x08, 0x00, 6, 4] {
+        if b.len() < ARP_LEN || b.get(0..6) != Some(&[0, 1, 0x08, 0x00, 6, 4]) {
             return None;
         }
         Some(Self {
@@ -171,12 +194,12 @@ impl ArpPacket {
 
     /// Writes the packet into the first [`ARP_LEN`] bytes of `buf`.
     pub fn emit(&self, buf: &mut [u8]) {
-        buf[0..6].copy_from_slice(&[0, 1, 0x08, 0x00, 6, 4]);
-        buf[6..8].copy_from_slice(&self.op.to_be_bytes());
-        buf[8..14].copy_from_slice(&self.sender_mac.0);
-        buf[14..18].copy_from_slice(&self.sender_ip.octets());
-        buf[18..24].copy_from_slice(&self.target_mac.0);
-        buf[24..28].copy_from_slice(&self.target_ip.octets());
+        put(buf, 0, &[0, 1, 0x08, 0x00, 6, 4]);
+        put(buf, 6, &self.op.to_be_bytes());
+        put(buf, 8, &self.sender_mac.0);
+        put(buf, 14, &self.sender_ip.octets());
+        put(buf, 18, &self.target_mac.0);
+        put(buf, 24, &self.target_ip.octets());
     }
 }
 
@@ -226,27 +249,29 @@ impl Ipv4Header {
     /// Like [`parse`](Self::parse), but also returns where the payload sits
     /// in its datagram, for packets that are fragments.
     pub fn parse_fragment(b: &[u8]) -> Option<(Self, Fragment, &[u8])> {
-        if b.len() < IPV4_HEADER_LEN || b[0] >> 4 != 4 {
+        let &first = b.first()?;
+        if b.len() < IPV4_HEADER_LEN || first >> 4 != 4 {
             return None;
         }
-        let header_len = usize::from(b[0] & 0xf) * 4;
+        let header_len = usize::from(first & 0xf) * 4;
         let total_len = usize::from(be16(b, 2));
         if header_len < IPV4_HEADER_LEN || total_len < header_len || total_len > b.len() {
             return None;
         }
-        if checksum::of(&b[..header_len]) != 0 || crate::ipopt::parse(&b[IPV4_HEADER_LEN..header_len]).is_none() {
+        if checksum::of(b.get(..header_len)?) != 0 || crate::ipopt::parse(b.get(IPV4_HEADER_LEN..header_len)?).is_none()
+        {
             return None;
         }
-        let fragment = Fragment { more: b[6] & 0x20 != 0, offset: usize::from(be16(b, 6) & 0x1fff) * 8 };
+        let fragment = Fragment { more: byte(b, 6) & 0x20 != 0, offset: usize::from(be16(b, 6) & 0x1fff) * 8 };
         let header = Self {
             src: ip(b, 12),
             dst: ip(b, 16),
-            protocol: b[9],
-            ttl: b[8],
+            protocol: byte(b, 9),
+            ttl: byte(b, 8),
             ident: be16(b, 4),
             payload_len: total_len - header_len,
         };
-        Some((header, fragment, &b[header_len..total_len]))
+        Some((header, fragment, b.get(header_len..total_len)?))
     }
 
     /// Writes the header, with DF set and its checksum, into the first
@@ -264,18 +289,15 @@ impl Ipv4Header {
 
     fn emit_inner(&self, buf: &mut [u8], flags_offset: u16) {
         let total = (IPV4_HEADER_LEN + self.payload_len) as u16;
-        buf[0] = 0x45;
-        buf[1] = 0;
-        buf[2..4].copy_from_slice(&total.to_be_bytes());
-        buf[4..6].copy_from_slice(&self.ident.to_be_bytes());
-        buf[6..8].copy_from_slice(&flags_offset.to_be_bytes());
-        buf[8] = self.ttl;
-        buf[9] = self.protocol;
-        buf[10..12].fill(0);
-        buf[12..16].copy_from_slice(&self.src.octets());
-        buf[16..20].copy_from_slice(&self.dst.octets());
-        let sum = checksum::of(&buf[..IPV4_HEADER_LEN]);
-        buf[10..12].copy_from_slice(&sum.to_be_bytes());
+        put(buf, 0, &[0x45, 0]);
+        put(buf, 2, &total.to_be_bytes());
+        put(buf, 4, &self.ident.to_be_bytes());
+        put(buf, 6, &flags_offset.to_be_bytes());
+        put(buf, 8, &[self.ttl, self.protocol, 0, 0]);
+        put(buf, 12, &self.src.octets());
+        put(buf, 16, &self.dst.octets());
+        let sum = checksum::of(buf.get(..IPV4_HEADER_LEN).unwrap_or(&[]));
+        put(buf, 10, &sum.to_be_bytes());
     }
 }
 
@@ -309,8 +331,8 @@ impl IcmpHeader {
         if b.len() < ICMP_HEADER_LEN || checksum::of(b) != 0 {
             return None;
         }
-        let header = Self { ty: b[0], code: b[1], ident: be16(b, 4), seq: be16(b, 6) };
-        Some((header, &b[ICMP_HEADER_LEN..]))
+        let header = Self { ty: byte(b, 0), code: byte(b, 1), ident: be16(b, 4), seq: be16(b, 6) };
+        Some((header, b.get(ICMP_HEADER_LEN..)?))
     }
 
     /// Builds the message: this header, `data`, and the checksum.
@@ -321,7 +343,7 @@ impl IcmpHeader {
         b.extend_from_slice(&self.seq.to_be_bytes());
         b.extend_from_slice(data);
         let sum = checksum::of(&b);
-        b[2..4].copy_from_slice(&sum.to_be_bytes());
+        put(&mut b, 2, &sum.to_be_bytes());
         b
     }
 }
@@ -347,14 +369,14 @@ impl UdpHeader {
         if len < UDP_HEADER_LEN || len > b.len() {
             return None;
         }
-        let b = &b[..len];
+        let b = b.get(..len)?;
         // Over IPv4 a zero checksum means none was computed; IPv6 has no such
         // escape (RFC 8200 section 8.1).
         let unchecked = be16(b, 6) == 0 && src.is_ipv4();
         if !unchecked && checksum::finish(checksum::add(checksum::pseudo_header(src, dst, PROTO_UDP, len), b)) != 0 {
             return None;
         }
-        Some((Self { src_port: be16(b, 0), dst_port: be16(b, 2) }, &b[UDP_HEADER_LEN..]))
+        Some((Self { src_port: be16(b, 0), dst_port: be16(b, 2) }, b.get(UDP_HEADER_LEN..)?))
     }
 
     /// Builds the datagram from `src` to `dst`: this header, `payload`, and
@@ -373,7 +395,7 @@ impl UdpHeader {
             0 => 0xffff,
             s => s,
         };
-        b[6..8].copy_from_slice(&sum.to_be_bytes());
+        put(&mut b, 6, &sum.to_be_bytes());
         b
     }
 }
@@ -430,7 +452,7 @@ impl TcpHeader {
         if b.len() < TCP_HEADER_LEN {
             return None;
         }
-        let offset = usize::from(b[12] >> 4) * 4;
+        let offset = usize::from(byte(b, 12) >> 4) * 4;
         if offset < TCP_HEADER_LEN || offset > b.len() {
             return None;
         }
@@ -442,11 +464,11 @@ impl TcpHeader {
             dst_port: be16(b, 2),
             seq: be32(b, 4),
             ack: be32(b, 8),
-            flags: b[13] & 0x3f,
+            flags: byte(b, 13) & 0x3f,
             window: be16(b, 14),
             ..Self::default()
         };
-        let mut opts = &b[TCP_HEADER_LEN..offset];
+        let mut opts = b.get(TCP_HEADER_LEN..offset)?;
         while let [kind, rest @ ..] = opts {
             match kind {
                 0 => break,
@@ -459,25 +481,24 @@ impl TcpHeader {
                     }
                     match (*kind, len) {
                         (2, 4) => header.mss = Some(be16(opts, 2)),
-                        (3, 3) => header.wscale = Some(opts[2]),
+                        (3, 3) => header.wscale = Some(byte(opts, 2)),
                         (4, 2) => header.sack_permitted = true,
                         (8, 10) => header.timestamps = Some((be32(opts, 2), be32(opts, 6))),
                         (5, _) if len >= 10 && (len - 2) % 8 == 0 => {
-                            for block in opts[2..len].as_chunks::<8>().0 {
-                                if usize::from(header.sack_len) == MAX_SACK_BLOCKS {
-                                    break;
-                                }
-                                header.sack[usize::from(header.sack_len)] = (be32(block, 0), be32(block, 4));
+                            for block in opts.get(2..len).unwrap_or(&[]).as_chunks::<8>().0 {
+                                let Some(slot) = header.sack.get_mut(usize::from(header.sack_len)) else { break };
+                                *slot = (be32(block, 0), be32(block, 4));
                                 header.sack_len += 1;
                             }
                         }
                         _ => {}
                     }
-                    opts = &opts[len..];
+                    let Some(next) = opts.get(len..) else { break };
+                    opts = next;
                 }
             }
         }
-        Some((header, &b[offset..]))
+        Some((header, b.get(offset..)?))
     }
 
     /// Builds the segment from `src` to `dst`: this header (with its
@@ -503,7 +524,7 @@ impl TcpHeader {
         // The 40 bytes of options hold four SACK blocks, or three beside
         // timestamps.
         let room = if self.timestamps.is_some() { MAX_SACK_BLOCKS - 1 } else { MAX_SACK_BLOCKS };
-        let blocks = &self.sack[..usize::from(self.sack_len).min(room)];
+        let blocks = self.sack.get(..usize::from(self.sack_len).min(room)).unwrap_or(&[]);
         if !blocks.is_empty() {
             opts.extend_from_slice(&[1, 1, 5, 2 + 8 * blocks.len() as u8]);
             for (left, right) in blocks {
@@ -527,7 +548,7 @@ impl TcpHeader {
         b.extend_from_slice(&opts);
         b.extend_from_slice(payload);
         let sum = checksum::finish(checksum::add(checksum::pseudo_header(src, dst, PROTO_TCP, len), &b));
-        b[16..18].copy_from_slice(&sum.to_be_bytes());
+        put(&mut b, 16, &sum.to_be_bytes());
         b
     }
 
@@ -661,6 +682,63 @@ mod tests {
         b[6..8].fill(0);
         b[8] ^= 1;
         assert!(UdpHeader::parse(&b, src, dst).is_some(), "a zero checksum is not checked");
+    }
+
+    #[test]
+    fn every_truncation_of_a_packet_is_handled() {
+        let (src, dst) = (Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8));
+        let tcp = TcpHeader { flags: TCP_SYN, mss: Some(1460), sack_permitted: true, ..Default::default() }
+            .emit(src, dst, b"x");
+        let udp = UdpHeader { src_port: 1, dst_port: 2 }.emit(src, dst, b"payload");
+        let icmp = IcmpHeader { ty: ICMP_ECHO_REQUEST, code: 0, ident: 1, seq: 2 }.emit(b"abc");
+        let mut ip = [0u8; 28];
+        Ipv4Header { src, dst, protocol: PROTO_UDP, ttl: 1, ident: 0, payload_len: 8 }.emit(&mut ip);
+        for n in 0..tcp.len() {
+            assert_eq!(TcpHeader::parse(&tcp[..n], src, dst), None);
+        }
+        for n in 0..udp.len() {
+            assert_eq!(UdpHeader::parse(&udp[..n], src, dst), None);
+        }
+        for n in 0..icmp.len() {
+            assert_eq!(IcmpHeader::parse(&icmp[..n]), None);
+        }
+        for n in 0..ip.len() {
+            assert_eq!(Ipv4Header::parse_fragment(&ip[..n]), None);
+        }
+        for n in 0..ARP_LEN {
+            assert_eq!(
+                ArpPacket::parse(
+                    &[0, 1, 8, 0, 6, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..n]
+                ),
+                None
+            );
+        }
+        for n in 0..ETH_HEADER_LEN {
+            assert_eq!(EthernetHeader::parse(&[0; ETH_HEADER_LEN][..n]), None);
+        }
+    }
+
+    #[test]
+    fn emitting_into_a_short_buffer_does_not_panic() {
+        let h = Ipv4Header {
+            src: Ipv4Addr::LOCALHOST,
+            dst: Ipv4Addr::LOCALHOST,
+            protocol: 0,
+            ttl: 1,
+            ident: 0,
+            payload_len: 0,
+        };
+        for n in 0..IPV4_HEADER_LEN {
+            h.emit(&mut alloc::vec![0; n]);
+            EthernetHeader { dst: MacAddress::default(), src: MacAddress::default(), ethertype: 0 }
+                .emit(&mut alloc::vec![0; n]);
+        }
+    }
+
+    #[test]
+    fn the_checksum_of_a_long_input_does_not_overflow() {
+        let data = alloc::vec![0xffu8; 1 << 20];
+        assert_eq!(checksum::of(&data), 0);
     }
 
     #[test]

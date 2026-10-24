@@ -27,6 +27,14 @@ pub struct UdpSocket {
     tx_limit: usize,
 }
 
+/// Copies the first `n` bytes of `src` to the start of `dst`, as far as both
+/// have them.
+fn copy_prefix(dst: &mut [u8], src: &[u8], n: usize) {
+    for (d, s) in dst.iter_mut().zip(src).take(n) {
+        *d = *s;
+    }
+}
+
 impl UdpSocket {
     /// An unbound socket that queues up to `rx_packets` received and
     /// `tx_packets` outgoing datagrams. Datagrams that arrive when the
@@ -84,7 +92,12 @@ impl UdpSocket {
         if self.tx.len() >= self.tx_limit {
             return Err(Error::WouldBlock);
         }
-        self.tx.push_back((remote, data.to_vec()));
+        // Made first, so running out of memory queues nothing.
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(data.len()).map_err(|_| Error::OutOfMemory)?;
+        copy.extend_from_slice(data);
+        self.tx.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        self.tx.push_back((remote, copy));
         Ok(())
     }
 
@@ -93,7 +106,7 @@ impl UdpSocket {
     pub fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
         let (from, data) = self.rx.pop_front().ok_or(Error::WouldBlock)?;
         let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
+        copy_prefix(buf, &data, n);
         Ok((data.len(), from))
     }
 
@@ -102,7 +115,7 @@ impl UdpSocket {
     pub fn peek_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
         let (from, data) = self.rx.front().ok_or(Error::WouldBlock)?;
         let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
+        copy_prefix(buf, data, n);
         Ok((data.len(), *from))
     }
 

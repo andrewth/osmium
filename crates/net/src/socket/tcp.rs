@@ -137,6 +137,8 @@ pub struct TcpSocket {
     /// The connection came from [`listen`](Self::listen); a reset in
     /// SYN-RECEIVED returns it to LISTEN.
     passive: bool,
+    /// Its owner let go of it: remove it once it has finished closing.
+    released: bool,
     /// The address [`listen_on`](Self::listen_on) was given, which a listener returns to.
     listen_addr: SocketAddr,
 
@@ -250,6 +252,7 @@ impl TcpSocket {
             remote: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             fresh: false,
             passive: false,
+            released: false,
             listen_addr: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
             rx: VecDeque::new(),
             rx_cap: rx_cap.min(MAX_RX_CAP),
@@ -437,6 +440,18 @@ impl TcpSocket {
         self.error
     }
 
+    /// Marks the socket as let go of by its owner, so whoever keeps the
+    /// [`SocketSet`](crate::SocketSet) can remove it once it is closed (see
+    /// [`released`](Self::released)). It does not close anything itself.
+    pub fn release(&mut self) {
+        self.released = true;
+    }
+
+    /// Whether [`release`](Self::release) was called.
+    pub fn released(&self) -> bool {
+        self.released
+    }
+
     /// Returns true unless the socket is closed (TIME-WAIT counts as open).
     pub fn is_open(&self) -> bool {
         self.state != State::Closed
@@ -497,11 +512,12 @@ impl TcpSocket {
         if !self.may_send() {
             return Err(self.error.unwrap_or(Error::InvalidState));
         }
-        let n = data.len().min(self.tx_cap - self.tx.len());
+        let n = data.len().min(self.tx_cap.saturating_sub(self.tx.len()));
         if n == 0 && !data.is_empty() {
             return Err(Error::WouldBlock);
         }
-        self.tx.extend(&data[..n]);
+        self.tx.try_reserve(n).map_err(|_| Error::OutOfMemory)?;
+        self.tx.extend(data.get(..n).unwrap_or(data));
         Ok(n)
     }
 
@@ -553,7 +569,7 @@ impl TcpSocket {
     }
 
     fn rx_window(&self) -> u32 {
-        ((self.rx_cap - self.rx.len()) as u32).min(self.max_window())
+        (self.rx_cap.saturating_sub(self.rx.len()) as u32).min(self.max_window())
     }
 
     fn fail(&mut self, error: Error) {
@@ -626,7 +642,9 @@ impl TcpSocket {
     }
 
     fn update_rtt(&mut self, rtt: Duration) {
-        // RFC 6298 2.2 and 2.3, with alpha = 1/8 and beta = 1/4.
+        // RFC 6298 2.2 and 2.3, with alpha = 1/8 and beta = 1/4. A sample
+        // beyond the largest timeout is no better than that.
+        let rtt = rtt.min(MAX_RTO);
         let (srtt, rttvar) = match self.srtt {
             None => (rtt, rtt / 2),
             Some((srtt, rttvar)) => {
@@ -847,7 +865,7 @@ impl TcpSocket {
                 let wnd = self.rx_window();
                 if seq == self.rcv_nxt {
                     let take = data.len().min(wnd as usize);
-                    self.rx.extend(&data[..take]);
+                    self.rx.extend(data.get(..take).unwrap_or(data));
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(take as u32);
                     fin_ok = take == data.len();
                     self.ooo_drain();
@@ -858,8 +876,8 @@ impl TcpSocket {
                     let rel = seq.wrapping_sub(self.rcv_nxt);
                     let take = if rel < wnd { data.len().min((wnd - rel) as usize) } else { 0 };
                     fin_ok = take == data.len();
-                    if take > 0 {
-                        self.ooo_insert(seq, &data[..take]);
+                    if let Some(held) = data.get(..take).filter(|d| !d.is_empty()) {
+                        self.ooo_insert(seq, held);
                     }
                     if seg.has(TCP_FIN) && fin_ok {
                         self.ooo_fin = Some(seg.seq.wrapping_add(payload.len() as u32));
@@ -1005,7 +1023,8 @@ impl TcpSocket {
         let base = self.rcv_nxt;
         let mut i = 0;
         while i < self.ooo.len() {
-            let (rs, ref rd) = self.ooo[i];
+            let Some((rs, rd)) = self.ooo.get(i) else { break };
+            let rs = *rs;
             let re = rs.wrapping_add(rd.len() as u32);
             if before(end, rs) {
                 break;
@@ -1016,13 +1035,13 @@ impl TcpSocket {
             }
             let (rs, rd) = self.ooo.remove(i);
             if before(rs, start) {
-                let mut merged = rd[..start.wrapping_sub(rs) as usize].to_vec();
+                let mut merged = rd.get(..start.wrapping_sub(rs) as usize).unwrap_or(&rd).to_vec();
                 merged.append(&mut buf);
                 buf = merged;
                 start = rs;
             }
             if before(end, re) {
-                buf.extend_from_slice(&rd[end.wrapping_sub(rs) as usize..]);
+                buf.extend_from_slice(rd.get(end.wrapping_sub(rs) as usize..).unwrap_or(&[]));
                 end = re;
             }
         }
@@ -1043,7 +1062,7 @@ impl TcpSocket {
             let skip = self.rcv_nxt.wrapping_sub(start) as usize;
             if let Some(rest) = data.get(skip..) {
                 let take = rest.len().min(self.rx_window() as usize);
-                self.rx.extend(&rest[..take]);
+                self.rx.extend(rest.get(..take).unwrap_or(rest));
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(take as u32);
             }
         }
@@ -1063,14 +1082,15 @@ impl TcpSocket {
         // Timestamps leave room for three blocks.
         let room = if self.ts_ok { MAX_SACK_BLOCKS - 1 } else { MAX_SACK_BLOCKS };
         for b in recent.chain(others).take(room) {
-            h.sack[usize::from(h.sack_len)] = b;
+            let Some(slot) = h.sack.get_mut(usize::from(h.sack_len)) else { break };
+            *slot = b;
             h.sack_len += 1;
         }
     }
 
     /// Merges the peer's SACK blocks into the scoreboard.
     fn process_sack(&mut self, seg: &TcpHeader) {
-        for &(l, r) in &seg.sack[..usize::from(seg.sack_len)] {
+        for &(l, r) in seg.sack.iter().take(usize::from(seg.sack_len)) {
             // Only data in flight counts; this also drops D-SACKs.
             let l = if before(l, self.snd_una) { self.snd_una } else { l };
             if !before(l, r) || before(self.snd_max, r) {
@@ -1080,7 +1100,7 @@ impl TcpSocket {
             let (mut start, mut end) = (l, r);
             let mut i = 0;
             while i < self.scoreboard.len() {
-                let (rs, re) = self.scoreboard[i];
+                let Some(&(rs, re)) = self.scoreboard.get(i) else { break };
                 if before(end, rs) {
                     break;
                 }
@@ -1332,7 +1352,7 @@ impl TcpSocket {
             return 0;
         }
         let flags = TCP_ACK | if fin { TCP_FIN } else { 0 };
-        let payload: Vec<u8> = self.tx.range(offset..offset + len).copied().collect();
+        let payload: Vec<u8> = self.tx.iter().skip(offset).take(len).copied().collect();
         let header = self.segment_at(seq, flags);
         self.emit(header, &payload, out);
         len as u32 + u32::from(fin)
@@ -1491,7 +1511,7 @@ impl TcpSocket {
             if offset > self.tx.len() {
                 break; // the FIN is out
             }
-            let unsent = self.tx.len() - offset;
+            let unsent = self.tx.len().saturating_sub(offset);
             let len = unsent.min(self.window_left()).min(self.snd_mss);
             let fin = self.fin_queued && offset + len == self.tx.len();
             if len == 0 && !fin {
@@ -1504,7 +1524,7 @@ impl TcpSocket {
             if fin {
                 flags |= TCP_FIN;
             }
-            let payload: Vec<u8> = self.tx.range(offset..offset + len).copied().collect();
+            let payload: Vec<u8> = self.tx.iter().skip(offset).take(len).copied().collect();
             let header = self.segment(flags);
             self.emit(header, &payload, out);
             let new_data = self.snd_nxt == self.snd_max;

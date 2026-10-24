@@ -385,7 +385,7 @@ impl Interface {
         // Neighbor solicitation retries.
         let mut i = 0;
         while i < self.v6.requests.len() {
-            let r = &mut self.v6.requests[i];
+            let Some(r) = self.v6.requests.get_mut(i) else { break };
             if now - r.first >= NS_GIVE_UP {
                 let ip = r.ip;
                 self.v6.requests.swap_remove(i);
@@ -420,8 +420,8 @@ impl Interface {
     ) -> Vec<u8> {
         let mut frame = self.ethernet_frame(dst_mac, ETHERTYPE_IPV6, IPV6_HEADER_LEN + payload.len());
         let header = Ipv6Header { src, dst, next_header, hop_limit, payload_len: payload.len(), fragment: None };
-        header.emit(&mut frame[ETH_HEADER_LEN..]);
-        frame[ETH_HEADER_LEN + IPV6_HEADER_LEN..].copy_from_slice(payload);
+        header.emit(frame.get_mut(ETH_HEADER_LEN..).unwrap_or(&mut []));
+        crate::wire::put(&mut frame, ETH_HEADER_LEN + IPV6_HEADER_LEN, payload);
         frame
     }
 
@@ -481,8 +481,8 @@ impl Interface {
         self.v6.requests.retain(|r| r.ip != ip);
         let mut i = 0;
         while i < self.v6.pending.len() {
-            if self.v6.pending[i].0 == ip {
-                let (_, p) = self.v6.pending.remove(i).expect("i < pending.len()");
+            if self.v6.pending.get(i).is_some_and(|(hop, _)| *hop == ip) {
+                let Some((_, p)) = self.v6.pending.remove(i) else { break };
                 if let (IpAddr::V6(src), IpAddr::V6(dst)) = (p.src, p.dst) {
                     let frame = self.ip6_frame(mac, src, dst, p.protocol, HOP_LIMIT, &p.payload);
                     self.queue_frame(frame);
@@ -564,7 +564,7 @@ impl Interface {
         // minimum MTU. Nothing is said about packets sent to a group.
         if to_us && !ip.src.is_unspecified() {
             let mut body = alloc::vec![0; 4];
-            body.extend_from_slice(&bytes[..bytes.len().min(MAX_QUOTE)]);
+            body.extend_from_slice(bytes.get(..MAX_QUOTE).unwrap_or(bytes));
             let header = Icmpv6Header { ty: ICMPV6_DEST_UNREACHABLE, code: ICMPV6_PORT_UNREACHABLE };
             let payload = header.emit(ip.dst, ip.src, &body);
             self.send_ip6(now, Packet { src: ip.dst.into(), dst: ip.src.into(), protocol: PROTO_ICMPV6, payload });

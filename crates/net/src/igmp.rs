@@ -73,18 +73,19 @@ impl IgmpPacket {
     /// IGMPv3 query (twelve bytes or more) is read as the v2 query it
     /// resembles, with its response code decoded.
     pub fn parse(b: &[u8]) -> Option<Self> {
-        if b.len() < IGMP_LEN || crate::wire::checksum::of(b) != 0 {
+        let [ty, code, _, _, g0, g1, g2, g3, ..] = *b else { return None };
+        if crate::wire::checksum::of(b) != 0 {
             return None;
         }
-        let group = Ipv4Addr::new(b[4], b[5], b[6], b[7]);
-        let mut max_response = b[1];
-        if b[0] == IGMP_QUERY && b.len() >= 12 && max_response >= 128 {
+        let group = Ipv4Addr::new(g0, g1, g2, g3);
+        let mut max_response = code;
+        if ty == IGMP_QUERY && b.len() >= 12 && max_response >= 128 {
             // The floating-point code of RFC 3376 4.1.1, in tenths of a
             // second, clamped to what a v2 field holds.
             let (exp, mant) = (u32::from(max_response >> 4 & 7), u32::from(max_response & 0xf));
             max_response = ((mant | 0x10) << (exp + 3)).min(255) as u8;
         }
-        Some(Self { ty: b[0], max_response, group })
+        Some(Self { ty, max_response, group })
     }
 
     /// Builds the message with its checksum.
@@ -92,7 +93,7 @@ impl IgmpPacket {
         let mut b = alloc::vec![self.ty, self.max_response, 0, 0];
         b.extend_from_slice(&self.group.octets());
         let sum = crate::wire::checksum::of(&b);
-        b[2..4].copy_from_slice(&sum.to_be_bytes());
+        crate::wire::put(&mut b, 2, &sum.to_be_bytes());
         b
     }
 }
@@ -170,8 +171,9 @@ impl Igmp {
             return Ok(None);
         }
         let i = self.members.iter().position(|m| m.group == group).ok_or(Error::InvalidState)?;
-        self.members[i].refs -= 1;
-        if self.members[i].refs > 0 {
+        let member = self.members.get_mut(i).ok_or(Error::InvalidState)?;
+        member.refs = member.refs.saturating_sub(1);
+        if member.refs > 0 {
             return Ok(None);
         }
         let m = self.members.remove(i);
@@ -328,5 +330,14 @@ mod tests {
         }
         assert_eq!(igmp.join(Ipv4Addr::new(239, 1, 0, 0), Instant::ZERO), Err(Error::WouldBlock));
         assert!(igmp.join(Ipv4Addr::new(239, 0, 0, 3), Instant::ZERO).is_ok(), "a repeat join needs no slot");
+    }
+
+    #[test]
+    fn truncated_messages_are_rejected() {
+        let wire = IgmpPacket { ty: IGMP_QUERY, max_response: 10, group: Ipv4Addr::UNSPECIFIED }.emit();
+        assert!(IgmpPacket::parse(&wire).is_some());
+        for n in 0..IGMP_LEN {
+            assert!(IgmpPacket::parse(&wire[..n]).is_none());
+        }
     }
 }

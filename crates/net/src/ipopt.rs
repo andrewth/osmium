@@ -7,7 +7,7 @@
 //! not supported, and a source-routed packet addressed to us is a classic
 //! spoofing tool (RFC 7126 recommends dropping them).
 
-use crate::wire::{IPV4_HEADER_LEN, Ipv4Header, checksum};
+use crate::wire::{IPV4_HEADER_LEN, Ipv4Header, checksum, put};
 
 /// Option type: end of option list.
 pub const OPT_END: u8 = 0;
@@ -58,12 +58,12 @@ pub fn parse(mut opts: &[u8]) -> Option<Options> {
                     OPT_ROUTER_ALERT if len != 4 => return None,
                     OPT_ROUTER_ALERT => found.router_alert = true,
                     // Type, length, pointer (which starts at 4) and data.
-                    OPT_RECORD_ROUTE | OPT_TIMESTAMP if len < 3 || opts[2] < 4 => return None,
+                    OPT_RECORD_ROUTE | OPT_TIMESTAMP if len < 3 || opts.get(2).is_none_or(|&p| p < 4) => return None,
                     OPT_RECORD_ROUTE => found.record_route = true,
                     OPT_TIMESTAMP => found.timestamp = true,
                     _ => {}
                 }
-                opts = &opts[len..];
+                opts = opts.get(len..)?;
             }
         }
     }
@@ -82,12 +82,12 @@ pub fn of_packet(packet: &[u8]) -> Option<Options> {
 pub fn emit_with_router_alert(header: &Ipv4Header, buf: &mut [u8]) {
     header.emit(buf);
     let total = (HEADER_LEN_ROUTER_ALERT + header.payload_len) as u16;
-    buf[0] = 0x46;
-    buf[2..4].copy_from_slice(&total.to_be_bytes());
-    buf[20..24].copy_from_slice(&[OPT_ROUTER_ALERT, 4, 0, 0]);
-    buf[10..12].fill(0);
-    let sum = checksum::of(&buf[..HEADER_LEN_ROUTER_ALERT]);
-    buf[10..12].copy_from_slice(&sum.to_be_bytes());
+    put(buf, 0, &[0x46]);
+    put(buf, 2, &total.to_be_bytes());
+    put(buf, 20, &[OPT_ROUTER_ALERT, 4, 0, 0]);
+    put(buf, 10, &[0, 0]);
+    let sum = checksum::of(buf.get(..HEADER_LEN_ROUTER_ALERT).unwrap_or(&[]));
+    put(buf, 10, &sum.to_be_bytes());
 }
 
 #[cfg(test)]

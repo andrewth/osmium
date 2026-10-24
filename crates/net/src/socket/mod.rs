@@ -5,8 +5,8 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use osmium_hal::net::MacAddress;
 
-use crate::Instant;
 use crate::rng::Rng;
+use crate::{Error, Instant};
 
 pub mod dhcp;
 pub mod dns;
@@ -172,8 +172,8 @@ impl SocketSet {
     /// reused.
     pub fn add(&mut self, socket: impl AnySocket) -> SocketHandle {
         let socket = Some(socket.upcast());
-        if let Some(i) = self.slots.iter().position(Option::is_none) {
-            self.slots[i] = socket;
+        if let Some((i, slot)) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_none()) {
+            *slot = socket;
             SocketHandle(i)
         } else {
             self.slots.push(socket);
@@ -181,22 +181,58 @@ impl SocketSet {
         }
     }
 
-    /// The socket `handle` names.
-    ///
-    /// # Panics
-    ///
-    /// If the handle was removed or names a socket of another type.
-    pub fn get<T: AnySocket>(&self, handle: SocketHandle) -> &T {
-        self.slots.get(handle.0).and_then(Option::as_ref).and_then(T::downcast).expect("no socket of that type")
+    /// [`add`](Self::add), failing with [`Error::OutOfMemory`] instead of
+    /// panicking. The set is unchanged on failure.
+    pub fn try_add(&mut self, socket: impl AnySocket) -> Result<SocketHandle, Error> {
+        let socket = Some(socket.upcast());
+        if let Some((i, slot)) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_none()) {
+            *slot = socket;
+            return Ok(SocketHandle(i));
+        }
+        self.slots.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        self.slots.push(socket);
+        Ok(SocketHandle(self.slots.len() - 1))
+    }
+
+    /// The socket `handle` names, or `None` if the handle was removed or
+    /// names a socket of another type.
+    pub fn try_get<T: AnySocket>(&self, handle: SocketHandle) -> Option<&T> {
+        self.slots.get(handle.0).and_then(Option::as_ref).and_then(T::downcast)
+    }
+
+    /// The socket `handle` names, or `None` if the handle was removed or
+    /// names a socket of another type.
+    pub fn try_get_mut<T: AnySocket>(&mut self, handle: SocketHandle) -> Option<&mut T> {
+        self.slots.get_mut(handle.0).and_then(Option::as_mut).and_then(T::downcast_mut)
+    }
+
+    /// Removes the socket `handle` names and returns it, or `None` if it was
+    /// already removed.
+    pub fn try_remove(&mut self, handle: SocketHandle) -> Option<Socket> {
+        self.slots.get_mut(handle.0).and_then(Option::take)
     }
 
     /// The socket `handle` names.
     ///
     /// # Panics
     ///
-    /// If the handle was removed or names a socket of another type.
+    /// If the handle was removed or names a socket of another type; that is
+    /// a bug in the caller, as handles are not derived from external input.
+    /// [`try_get`](Self::try_get) does not panic.
+    #[allow(clippy::expect_used)] // invariant: the caller's own live handle
+    pub fn get<T: AnySocket>(&self, handle: SocketHandle) -> &T {
+        self.try_get(handle).expect("no socket of that type")
+    }
+
+    /// The socket `handle` names.
+    ///
+    /// # Panics
+    ///
+    /// If the handle was removed or names a socket of another type; see
+    /// [`get`](Self::get). [`try_get_mut`](Self::try_get_mut) does not panic.
+    #[allow(clippy::expect_used)] // invariant: the caller's own live handle
     pub fn get_mut<T: AnySocket>(&mut self, handle: SocketHandle) -> &mut T {
-        self.slots.get_mut(handle.0).and_then(Option::as_mut).and_then(T::downcast_mut).expect("no socket of that type")
+        self.try_get_mut(handle).expect("no socket of that type")
     }
 
     /// Removes the socket `handle` names and returns it. A TCP connection
@@ -205,9 +241,11 @@ impl SocketSet {
     ///
     /// # Panics
     ///
-    /// If the handle was already removed.
+    /// If the handle was already removed (a caller bug);
+    /// [`try_remove`](Self::try_remove) does not panic.
+    #[allow(clippy::expect_used)] // invariant: the caller's own live handle
     pub fn remove(&mut self, handle: SocketHandle) -> Socket {
-        self.slots.get_mut(handle.0).and_then(Option::take).expect("socket already removed")
+        self.try_remove(handle).expect("socket already removed")
     }
 
     /// Every socket, in handle order.

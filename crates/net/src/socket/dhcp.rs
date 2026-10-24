@@ -7,7 +7,7 @@ use core::time::Duration;
 use osmium_hal::net::MacAddress;
 
 use super::{Cx, Packet};
-use crate::wire::{PROTO_UDP, UdpHeader};
+use crate::wire::{PROTO_UDP, UdpHeader, put};
 use crate::{Config, Instant};
 
 pub(crate) const CLIENT_PORT: u16 = 68;
@@ -89,23 +89,23 @@ impl Default for Message {
 }
 
 fn addr(b: &[u8]) -> Option<Ipv4Addr> {
-    Some(Ipv4Addr::from(<[u8; 4]>::try_from(b.get(..4)?).ok()?))
+    Some(Ipv4Addr::from(*b.first_chunk::<4>()?))
 }
 
 impl Message {
     pub(crate) fn parse(b: &[u8]) -> Option<Self> {
-        if b.len() < FIXED_LEN || b[1] != 1 || b[2] != 6 || b[236..240] != MAGIC {
+        if b.len() < FIXED_LEN || b.get(1..3) != Some(&[1, 6]) || b.get(236..240) != Some(&MAGIC) {
             return None;
         }
         let mut m = Message {
-            op: b[0],
-            xid: u32::from_be_bytes(b[4..8].try_into().expect("fixed-width slice")),
-            ciaddr: addr(&b[12..])?,
-            yiaddr: addr(&b[16..])?,
-            chaddr: MacAddress(b[28..34].try_into().expect("fixed-width slice")),
+            op: *b.first()?,
+            xid: u32::from_be_bytes(*b.get(4..)?.first_chunk()?),
+            ciaddr: addr(b.get(12..)?)?,
+            yiaddr: addr(b.get(16..)?)?,
+            chaddr: MacAddress(*b.get(28..)?.first_chunk()?),
             ..Message::default()
         };
-        let mut opts = &b[FIXED_LEN..];
+        let mut opts = b.get(FIXED_LEN..)?;
         while let [code, rest @ ..] = opts {
             match *code {
                 OPT_END => break,
@@ -113,7 +113,7 @@ impl Message {
                 code => {
                     let (&len, rest) = rest.split_first()?;
                     let value = rest.get(..usize::from(len))?;
-                    let be32 = || Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?));
+                    let be32 = || Some(u32::from_be_bytes(*value.first_chunk()?));
                     match code {
                         OPT_MESSAGE_TYPE => m.ty = *value.first()?,
                         OPT_SERVER_ID => m.server = addr(value),
@@ -125,7 +125,7 @@ impl Message {
                         OPT_RENEWAL_TIME => m.renewal = be32(),
                         _ => {}
                     }
-                    opts = &rest[usize::from(len)..];
+                    opts = rest.get(usize::from(len)..)?;
                 }
             }
         }
@@ -134,19 +134,17 @@ impl Message {
 
     pub(crate) fn emit(&self) -> Vec<u8> {
         let mut b = alloc::vec![0u8; FIXED_LEN];
-        b[0] = self.op;
-        b[1] = 1; // Ethernet
-        b[2] = 6;
-        b[4..8].copy_from_slice(&self.xid.to_be_bytes());
-        if self.op == BOOTREQUEST && self.ciaddr.is_unspecified() {
-            // Ask for broadcast replies: we cannot take unicast before we
-            // have an address on stacks that filter by address.
-            b[10] = 0x80;
-        }
-        b[12..16].copy_from_slice(&self.ciaddr.octets());
-        b[16..20].copy_from_slice(&self.yiaddr.octets());
-        b[28..34].copy_from_slice(&self.chaddr.0);
-        b[236..240].copy_from_slice(&MAGIC);
+        let broadcast = self.op == BOOTREQUEST && self.ciaddr.is_unspecified();
+        // Ask for broadcast replies: we cannot take unicast before we have an
+        // address on stacks that filter by address.
+        let flags: u8 = if broadcast { 0x80 } else { 0 };
+        put(&mut b, 0, &[self.op, 1 /* Ethernet */, 6]);
+        put(&mut b, 4, &self.xid.to_be_bytes());
+        put(&mut b, 10, &[flags]);
+        put(&mut b, 12, &self.ciaddr.octets());
+        put(&mut b, 16, &self.yiaddr.octets());
+        put(&mut b, 28, &self.chaddr.0);
+        put(&mut b, 236, &MAGIC);
         let mut opt = |code: u8, value: &[u8]| {
             b.push(code);
             b.push(value.len() as u8);
@@ -325,7 +323,7 @@ impl DhcpClient {
                 self.next_send = now + self.backoff(Duration::from_secs(60));
                 (l.config.address, l.server)
             }
-            Phase::Bound => unreachable!(),
+            Phase::Bound => return,
         };
         self.attempts += 1;
         let payload = UdpHeader { src_port: CLIENT_PORT, dst_port: SERVER_PORT }.emit(src, dst, &m.emit());
@@ -592,6 +590,24 @@ mod tests {
             let c = requesting(|m| m.router = Some(router.into()));
             assert_eq!(c.config().unwrap().gateway, None, "router {router:?}");
         }
+    }
+
+    #[test]
+    fn truncated_and_garbage_messages_are_rejected() {
+        let wire =
+            Message { op: BOOTREPLY, ty: OFFER, server: Some(Ipv4Addr::new(10, 0, 0, 1)), ..Message::default() }.emit();
+        assert!(Message::parse(&wire).is_some());
+        for n in 0..FIXED_LEN {
+            assert!(Message::parse(&wire[..n]).is_none());
+        }
+        // An option whose length runs past the end.
+        let mut bad = wire[..FIXED_LEN].to_vec();
+        bad.extend_from_slice(&[OPT_DNS, 200, 1, 2]);
+        assert!(Message::parse(&bad).is_none());
+        // A length byte missing.
+        let mut bad = wire[..FIXED_LEN].to_vec();
+        bad.push(OPT_DNS);
+        assert!(Message::parse(&bad).is_none());
     }
 
     #[test]
