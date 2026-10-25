@@ -1,6 +1,6 @@
 //! NS16550A-compatible UART.
 
-use crate::ioext::IoMemExt;
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::mmio::{IoMem, IoMemError};
 use osmium_hal::serial::SerialPort;
 

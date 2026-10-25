@@ -8,7 +8,7 @@ license = "GPL-2.0-only"
 
 [dependencies]
 # No heap and no scheduler: just what firmware needs.
-osmium = { path = "../../crates/osmium", default-features = false, features = ["sync", "hal", "drivers", "exec", "riscv-m-mode"] }
+osmium = { path = "../../crates/osmium", default-features = false, features = ["sync", "hal", "drivers", "sysdrv", "exec", "riscv-m-mode"] }
 
 [profile.dev]
 panic = "abort"

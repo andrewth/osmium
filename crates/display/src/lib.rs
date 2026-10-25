@@ -1,4 +1,4 @@
-//! Display controllers.
+//! Display drivers built on `osmium-hal`.
 //!
 //! Each driver ends in an [`osmium_hal::display::Display`]: a linear
 //! framebuffer, plus a flush for devices that copy from guest memory.
@@ -8,15 +8,22 @@
 //!   without the BIOS.
 //! - [`vbe`]: VESA BIOS Extensions mode lists and mode information, for
 //!   kernels that can call the video BIOS.
-//! - [`VirtioGpu`](crate::virtio::gpu::VirtioGpu): virtio-gpu.
+//! - [`VirtioGpu`](virtio_gpu::VirtioGpu): virtio-gpu.
 //!
 //! A UEFI GOP framebuffer needs no driver: `osmium_boot::uefi` turns the
 //! GOP mode into a [`osmium_hal::display::FramebufferInfo`].
+//!
+//! The virtio driver runs over the transports and queues of `osmium-drivers`.
+#![no_std]
+
+#[cfg(test)]
+extern crate std;
 
 use osmium_hal::pci::{ConfigAccess, Function};
 
 pub mod bochs;
 pub mod vbe;
+pub mod virtio_gpu;
 
 /// A display adapter recognized on PCI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

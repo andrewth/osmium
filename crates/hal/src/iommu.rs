@@ -12,7 +12,7 @@
 //!   addresses;
 //! - after changing the table the IOTLB is invalidated ([`Iommu::invalidate`]).
 //!
-//! The drivers (in `osmium-drivers`) implement [`Iommu`] for AMD-Vi, Intel
+//! The drivers (in `osmium-sysdrv`) implement [`Iommu`] for AMD-Vi, Intel
 //! VT-d, Arm SMMUv3 and the RISC-V IOMMU. [`IoDomain`] owns a table and keeps
 //! it consistent with the hardware, and [`IommuDma`] is a [`DmaAllocator`]
 //! whose buffers are visible to a device only at an IOVA, which is what a

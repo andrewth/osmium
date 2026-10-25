@@ -355,7 +355,7 @@ mod tests {
     use super::fake::{self, FakeClock, FakeDev, FakeHba};
     use super::port::{CLB, CMD, CMD_FR, CMD_FRE, CMD_ST, CMD_SUD, PORT_MEM_LEN};
     use super::*;
-    use crate::virtio::testing::HostDma;
+    use osmium_drivers::virtio::testing::HostDma;
 
     #[test]
     fn init_probes_ports() {

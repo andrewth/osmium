@@ -3,7 +3,7 @@
 //! A virtio driver is split the way the specification is: a [`Transport`]
 //! ([`mmio::MmioTransport`] or [`pci::PciTransport`]) reaches the device's registers, a
 //! [`queue::VirtQueue`] shares buffers with it through DMA memory, and the
-//! device driver (such as `osmium_netdev::virtio_net::VirtioNet`) speaks the device type's protocol over
+//! device driver (such as `osmium_netdev::virtio_net::VirtioNet` or `osmium_storage::virtio_blk::VirtioBlk`) speaks the device type's protocol over
 //! both.
 //!
 //! Both the legacy (0.9.5) and modern (1.x) interfaces are supported, since
@@ -14,8 +14,6 @@
 use osmium_hal::virtio::device_id;
 use osmium_mm::PhysAddr;
 
-pub mod blk;
-pub mod gpu;
 pub mod mmio;
 pub mod pci;
 pub mod queue;

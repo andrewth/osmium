@@ -11,7 +11,7 @@ use core::ops::ControlFlow;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use osmium::drivers::ramdisk::RamDisk;
+use osmium::storage::ramdisk::RamDisk;
 use osmium::hal::block::BlockDevice as _;
 use osmium::hal::dma::{DmaAllocator, DmaBuffer};
 use osmium::hal::{print, println};
@@ -331,11 +331,11 @@ pub fn demo_irq() {
 extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     use core::fmt::Write;
     use osmium::boot::fdt::Fdt;
-    use osmium::drivers::plic::Plic;
-    use osmium::drivers::uart16550::{Mmio, Uart16550 as UartDriver};
+    use osmium::sysdrv::plic::Plic;
+    use osmium::sysdrv::uart16550::{Mmio, Uart16550 as UartDriver};
     use osmium::drivers::virtio::DeviceType;
     use osmium::drivers::virtio::Transport;
-    use osmium::drivers::virtio::blk::VirtioBlk;
+    use osmium::storage::virtio_blk::VirtioBlk;
     use osmium::drivers::virtio::mmio::MmioTransport;
     use osmium::netdev::virtio_net::VirtioNet;
     use osmium::hal::block::BlockDevice;

@@ -27,9 +27,9 @@ use osmium::arch::x86_64 as x86;
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::acpi::{Acpi, Dmar, EcamWindow, Ivrs, Madt, Mcfg};
 use osmium::boot::pvh::StartInfo;
-use osmium::drivers::lapic::{self, LocalApic};
-use osmium::drivers::pit::{self, Pit};
-use osmium::drivers::uart16550::{Pio, Uart16550};
+use osmium::sysdrv::lapic::{self, LocalApic};
+use osmium::sysdrv::pit::{self, Pit};
+use osmium::sysdrv::uart16550::{Pio, Uart16550};
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::display::{Display, FramebufferInfo};
 use osmium::hal::mmio::IoMem;
@@ -275,7 +275,7 @@ static RX: osmium::sync::SpscRing<u8, 256> = osmium::sync::SpscRing::new();
 static RX_PRODUCER: IrqSpinLock<Option<osmium::sync::Producer<'static, u8, 256>>> = IrqSpinLock::new(None);
 static RX_READY: osmium::sched::WaitQueue = osmium::sched::WaitQueue::new();
 /// First I/O APIC (address, first GSI) and COM1's line, from the MADT.
-static IOAPIC_INFO: Once<(u64, u32, u32, osmium::drivers::ioapic::LineMode)> = Once::new();
+static IOAPIC_INFO: Once<(u64, u32, u32, osmium::sysdrv::ioapic::LineMode)> = Once::new();
 
 static UART: Once<SerialConsole<Uart16550<Pio>>> = Once::new();
 static LAPIC: Once<LocalApic> = Once::new();
@@ -374,7 +374,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
         {
             let (gsi, active_low, level) = m.isa_irq(COM1_IRQ);
             IOAPIC_INFO
-                .call_once(|| (io.addr, io.gsi_base, gsi, osmium::drivers::ioapic::LineMode { active_low, level }));
+                .call_once(|| (io.addr, io.gsi_base, gsi, osmium::sysdrv::ioapic::LineMode { active_low, level }));
         }
         let enabled = madt.iter().flat_map(|m| m.local_apics()).filter(|c| c.enabled);
         for (slot, c) in madt_ids.iter_mut().zip(enabled) {
@@ -594,7 +594,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
 /// Sets a `width` by `height` 32-bit VESA mode through the video BIOS, and
 /// returns its framebuffer and the video memory size.
 fn vesa(width: u16, height: u16) -> Option<(PhysAddr, FramebufferInfo, usize)> {
-    use osmium::drivers::display::vbe::{RealModeBios, Vbe};
+    use osmium::display::vbe::{RealModeBios, Vbe};
     // SAFETY: 0x5000..0x8000 is free low memory, kept from the frame
     // allocator and identity-mapped (and executable) in the boot tables,
     // whose root is below 4 GiB. Only this CPU runs, and nothing has
@@ -629,7 +629,7 @@ fn vesa(width: u16, height: u16) -> Option<(PhysAddr, FramebufferInfo, usize)> {
 /// Draws on the VESA framebuffer, reading the mode back from the Bochs
 /// DISPI registers the BIOS programmed, then on every PCI display adapter.
 fn display_demo(vesa: Option<(PhysAddr, FramebufferInfo, usize)>, ecam: Option<EcamWindow>) {
-    use osmium::drivers::display::bochs::BochsVbe;
+    use osmium::display::bochs::BochsVbe;
     let mut guard = PT.lock();
     let pt = guard.as_mut().expect("as_mut returned None");
     // Identity-maps device memory (the pages not mapped yet); returns a
@@ -765,7 +765,7 @@ fn serial_demo() {
         return;
     };
     // SAFETY: the MADT says the I/O APIC lives here; mapped uncached above.
-    let ioapic = osmium::drivers::ioapic::IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
+    let ioapic = osmium::sysdrv::ioapic::IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
     let (producer, mut rx) = RX.split().expect("split returned None");
     *RX_PRODUCER.lock() = Some(producer);
     ioapic.route(gsi, COM1_VECTOR, LAPIC.get().expect("LAPIC initialised").id() as u8, mode);

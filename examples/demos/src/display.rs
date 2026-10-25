@@ -1,10 +1,10 @@
 //! Display demos: find a PCI display adapter, set a mode and draw colour
 //! bars that `scripts/screen.py` can check in a QEMU screendump.
 
-use osmium::drivers::display::PciDisplay;
-use osmium::drivers::display::bochs::BochsVbe;
+use osmium::display::PciDisplay;
+use osmium::display::bochs::BochsVbe;
 use osmium::drivers::virtio::Transport;
-use osmium::drivers::virtio::gpu::VirtioGpu;
+use osmium::display::virtio_gpu::VirtioGpu;
 use osmium::drivers::virtio::pci::PciTransport;
 use osmium::hal::display::{Display, Rect, Rgb};
 use osmium::hal::dma::DmaAllocator;

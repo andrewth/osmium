@@ -148,30 +148,36 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - 🗺 Async variants of device traits, PCI bridge walking
 
 ### `osmium-drivers`: reference drivers
+- ✅ virtio-mmio transport (legacy and 1.x), split virtqueue
+- ✅ IP over InfiniBand (`Mlx4::open_ipoib` → `IpoibPort`, a `NetDevice`): joins the broadcast group with the subnet administrator (retried with backoff), adopts the group's queue key, rewrites ARP and frames between Ethernet and IPoIB with invented MACs for neighbors; every unicast datagram uses the broadcast group's service level (no path record queries); simulator-tested only
+- ✅ virtio-pci transport (modern, capability-located registers); tested against a fake function and on QEMU `virtio-gpu-pci`/`virtio-vga`
+- 🗺 virtio console; virtio-gpu cursor, EDID and interrupts; a framebuffer text console; xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3; HPET; NVMe multiple I/O queues
+
+### `osmium-display`: display drivers
+- ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
+- ✅ Bochs DISPI display (`BochsVbe`): QEMU std VGA, `bochs-display` and `virtio-vga` modes over MMIO on any architecture or ports on x86
+- ✅ VESA BIOS Extensions: controller and mode information, mode search and LFB mode setting through a `VideoBios` (x86's real-mode thunk, or a fake in tests)
+
+### `osmium-sysdrv`: UARTs, timers, `fw_cfg`, interrupt controllers and IOMMUs
 - ✅ NS16550A UART (port I/O and MMIO backends)
 - ✅ Arm PL011 UART
+- ✅ Intel 8254 PIT (calibration delays)
 - ✅ RISC-V CLINT (machine timer and software interrupts, for M-mode firmware)
 - ✅ RISC-V PLIC
 - ✅ Arm GICv2 (distributor + CPU interface, SGIs with correct source-CPU EOI)
 - ✅ x86 local APIC (xAPIC MMIO, INIT/STARTUP IPIs)
-- ✅ Intel 8254 PIT (calibration delays)
 - ✅ x86 I/O APIC (GSI routing, polarity/trigger, masking); the x86_64 example routes COM1's receive interrupt through it into an `SpscRing`
-- ✅ RAM disk `BlockDevice`
-- ✅ virtio-mmio transport (legacy and 1.x), split virtqueue
-- ✅ virtio-blk `BlockDevice` (read-only and flush features, requests split at 64 KiB)
-- ✅ IP over InfiniBand (`Mlx4::open_ipoib` → `IpoibPort`, a `NetDevice`): joins the broadcast group with the subnet administrator (retried with backoff), adopts the group's queue key, rewrites ARP and frames between Ethernet and IPoIB with invented MACs for neighbors; every unicast datagram uses the broadcast group's service level (no path record queries); simulator-tested only
-- ✅ AHCI (SATA): HBA handoff and port bring-up, IDENTIFY, READ/WRITE DMA EXT and FLUSH CACHE EXT, native command queuing (up to 8 commands in flight), interrupt-driven completion (INTx or MSI, polled fallback kept), ATAPI optical drives as read-only block devices (IDENTIFY PACKET DEVICE, READ(10), READ CAPACITY) for `osmium-fs-iso9660`; each disk is its own `BlockDevice` that outlives the HBA; error recovery with CLO or COMRESET; boots against QEMU `ich9-ahci` + `ide-hd`
-- ✅ NVMe: admin and one I/O queue pair (phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting with up to four commands in flight (out-of-order completions), optional MSI-X completion interrupts (`Nvme::with_interrupts`; polling remains the default), normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
 - ✅ Intel VT-d (`iommu::vtd::Vtd`): legacy-mode root and context tables, 48-bit four-level second-level tables, register-based context-cache and IOTLB invalidation (a firmware-enabled invalidation queue is switched off), fault-recording registers; refuses units without `ECAP.C` unless the caller vouches for coherency (`new_assuming_coherent`); boots against QEMU `intel-iommu` and `iommu-testdev`
 - ✅ AMD-Vi (`iommu::amdvi::AmdVi`): device table, command buffer (device-table and page invalidations, completion waits) and event log, four-level I/O tables; the first attach blocks every other requester ID with an explicit entry, since an invalid entry passes DMA through; boots against QEMU `amd-iommu,dma-remap=on`
 - ✅ Arm SMMUv3 (`iommu::smmuv3::Smmuv3`): linear stream table, command and event queues, stage-2-only contexts over `Aarch64Stage2` (`CFGI_STE`, `TLBI_S12_VMALL`, `CMD_SYNC`), command-error recovery; boots against QEMU `virt,iommu=smmuv3`
 - ✅ RISC-V IOMMU (`iommu::riscv::RiscvIommu`): two-level device directory with base or extended device contexts, first-stage Sv39 contexts (`PSCID` = domain), command queue (`IODIR.INVAL_DDT`, `IOTINVAL.VMA`, `IOFENCE.C`) and fault queue, `Bare` until the first attach; boots against QEMU `riscv-iommu-pci`, with NVMe running through it
 - 🗺 IOMMU: interrupt remapping, scalable-mode VT-d, SMMUv3 stage 1 and 2-level stream tables, PASIDs and ATS, RISC-V G-stage and MSI page tables, huge IOVA mappings, and cache maintenance for units that do not snoop the CPU caches
-- ✅ virtio-pci transport (modern, capability-located registers); tested against a fake function and on QEMU `virtio-gpu-pci`/`virtio-vga`
-- ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
-- ✅ Bochs DISPI display (`BochsVbe`): QEMU std VGA, `bochs-display` and `virtio-vga` modes over MMIO on any architecture or ports on x86
-- ✅ VESA BIOS Extensions: controller and mode information, mode search and LFB mode setting through a `VideoBios` (x86's real-mode thunk, or a fake in tests)
-- 🗺 virtio console; virtio-gpu cursor, EDID and interrupts; a framebuffer text console; xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3; HPET; NVMe multiple I/O queues
+
+### `osmium-storage`: storage drivers
+- ✅ RAM disk `BlockDevice`
+- ✅ virtio-blk `BlockDevice` (read-only and flush features, requests split at 64 KiB)
+- ✅ AHCI (SATA): HBA handoff and port bring-up, IDENTIFY, READ/WRITE DMA EXT and FLUSH CACHE EXT, native command queuing (up to 8 commands in flight), interrupt-driven completion (INTx or MSI, polled fallback kept), ATAPI optical drives as read-only block devices (IDENTIFY PACKET DEVICE, READ(10), READ CAPACITY) for `osmium-fs-iso9660`; each disk is its own `BlockDevice` that outlives the HBA; error recovery with CLO or COMRESET; boots against QEMU `ich9-ahci` + `ide-hd`
+- ✅ NVMe: admin and one I/O queue pair (phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting with up to four commands in flight (out-of-order completions), optional MSI-X completion interrupts (`Nvme::with_interrupts`; polling remains the default), normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
 
 ### `osmium-usb`: USB host controllers and class drivers
 

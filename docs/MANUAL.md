@@ -204,7 +204,10 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `hal` | osmium-hal | no | MMIO and port I/O, device traits (including `Display` and `Framebuffer`), `IrqTable`, the console and `println!` |
 | `usb` | osmium-usb | no | xHCI, EHCI, OHCI and UHCI host controllers, USB class drivers |
 | `netdev` | osmium-netdev | no | virtio-net, mlx4, USB CDC-ECM and CDC-NCM network drivers |
-| `drivers` | osmium-drivers | no | UARTs, interrupt controllers, timers, virtio (MMIO and PCI), AHCI, NVMe, displays, RAM disk |
+| `drivers` | osmium-drivers | no | virtio core: MMIO and PCI transports, virtqueue |
+| `display` | osmium-display | no | virtio-gpu, Bochs DISPI, VESA BIOS Extensions |
+| `sysdrv` | osmium-sysdrv | no | UARTs, PIT, `fw_cfg`, interrupt controllers (PLIC, CLINT, GICv2, local APIC, I/O APIC) and IOMMUs (VT-d, AMD-Vi, SMMUv3, RISC-V) |
+| `storage` | osmium-storage | no | virtio-blk, AHCI, NVMe and RAM disk (enables `drivers`) |
 | `boot` | osmium-boot | `FdtWriter` only | FDT, Multiboot2, PVH, UEFI (system table, GOP), ACPI, ELF loading |
 | `acpi` | osmium-acpi | yes | FADT, an AML interpreter, `_CRS`, `_PRT`, sleep states, power off, SCI and GPEs (enables `boot`) |
 | `exec` | osmium-exec | no | A heap-free async executor |
@@ -217,7 +220,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `iscsi` | osmium-iscsi | yes | iSCSI initiator: a remote disk over TCP as a `BlockDevice` (enables `net`) |
 | `virt` | osmium-virt | yes | Hypervisor building blocks |
 
-`default` is `sync`, `mm`, `hal`, `drivers`, `usb`, `netdev` and `boot`. `full` turns on all
+`default` is `sync`, `mm`, `hal`, `drivers`, `sysdrv`, `storage`, `display`, `usb`, `netdev` and `boot`. `full` turns on all
 of the above.
 
 Three features choose the privilege level the arch code runs at:
@@ -573,10 +576,10 @@ port I/O.
 | Serial | `uart16550::Uart16550` (MMIO or `Pio`), `pl011::Pl011` |
 | Interrupt controllers | `plic::Plic`, `gicv2::GicV2`, `lapic::LocalApic`, `ioapic::IoApic` |
 | Timers | `clint::Clint`, `pit::Pit` |
-| Block | `ramdisk::RamDisk`, `virtio::blk::VirtioBlk`, `osmium::usb::class::storage::UsbStorage` (fewer than 2^32 blocks, so under 2 TiB at 512 B; block sizes a power of two from 512 B to 64 KiB), `ahci::Ahci`, `nvme::Nvme`; iSCSI in `osmium::iscsi` |
+| Block | `storage::ramdisk::RamDisk`, `storage::virtio_blk::VirtioBlk`, `osmium::usb::class::storage::UsbStorage` (fewer than 2^32 blocks, so under 2 TiB at 512 B; block sizes a power of two from 512 B to 64 KiB), `storage::ahci::Ahci`, `storage::nvme::Nvme`; iSCSI in `osmium::iscsi` |
 | Network (`osmium::netdev`) | `virtio_net::VirtioNet`, `usb::ecm::UsbEthernet`, `usb::ncm::UsbNcm`, `mlx4::Mlx4` (polled, or MSI-X via `enable_msix`; checksum and segmentation offloads are inherent `EthPort` methods, since `NetDevice` has no offload flags; InfiniBand ports are `IbPort` (UD datagrams, reliable connections, which needs `service` called regularly), and `Mlx4::open_ipoib` makes one a `NetDevice`) |
 | USB (`osmium::usb`) | `xhci::Xhci` (polled, INTx, MSI or MSI-X via `enable_message_interrupts`), `ehci::Ehci` (high-speed only; low- and full-speed devices go to the companion), `ohci::Ohci` and `uhci::Uhci` (low/full speed, hubs; all three polled, no isochronous), `class::hid::BootKeyboard`, `class::hub::Hub`, `class::isoch::{IsochIn, IsochOut}` |
-| Display | `virtio::gpu::VirtioGpu` (virtio-gpu and virtio-vga, MMIO or PCI), `display::bochs::BochsVbe` (QEMU std VGA, bochs-display, virtio-vga in VGA mode), `display::vbe::Vbe` (VESA BIOS Extensions, x86) |
+| Display | `display::virtio_gpu::VirtioGpu` (virtio-gpu and virtio-vga, MMIO or PCI), `display::bochs::BochsVbe` (QEMU std VGA, bochs-display, virtio-vga in VGA mode), `display::vbe::Vbe` (VESA BIOS Extensions, x86) |
 
 Drivers that do DMA take a `DmaAllocator`, and `LockedFrames` is one.
 Its `free_coherent` is `unsafe`: free a buffer only once the device can no

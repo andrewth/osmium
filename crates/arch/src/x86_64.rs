@@ -463,7 +463,7 @@ pub mod bios;
 ///
 /// A boot CPU calls [`install`](smp::install) once, then for each AP
 /// [`prepare`](smp::prepare) followed by INIT, STARTUP, STARTUP (for example
-/// `osmium_drivers::lapic::LocalApic::start_ap`), and waits for the AP to
+/// `osmium_sysdrv::lapic::LocalApic::start_ap`), and waits for the AP to
 /// check in before preparing the next one: they share the trampoline's slots.
 #[cfg(bare)]
 pub mod smp {

@@ -15,9 +15,9 @@ use core::task::Poll;
 
 use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
 use osmium::arch::{cpu, irq};
-use osmium::drivers::clint::Clint;
-use osmium::drivers::plic::Plic;
-use osmium::drivers::uart16550::{Mmio, Uart16550};
+use osmium::sysdrv::clint::Clint;
+use osmium::sysdrv::plic::Plic;
+use osmium::sysdrv::uart16550::{Mmio, Uart16550};
 use osmium::exec::{AtomicWaker, Executor, Signal};
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::irq::InterruptController;

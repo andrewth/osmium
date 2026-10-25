@@ -1,0 +1,18 @@
+[package]
+name = "osmium-storage"
+description = "Osmium: storage drivers (virtio-blk, AHCI, NVMe, RAM disk)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-arch.workspace = true
+osmium-drivers.workspace = true
+osmium-hal.workspace = true
+
+[dev-dependencies]
+osmium-drivers = { workspace = true, features = ["testing"] }

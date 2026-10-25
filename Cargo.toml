@@ -15,6 +15,9 @@ osmium-sync = { path = "crates/sync", version = "0.1.0" }
 osmium-mm = { path = "crates/mm", version = "0.1.0" }
 osmium-hal = { path = "crates/hal", version = "0.1.0" }
 osmium-drivers = { path = "crates/drivers", version = "0.1.0" }
+osmium-sysdrv = { path = "crates/sysdrv", version = "0.1.0" }
+osmium-display = { path = "crates/display", version = "0.1.0" }
+osmium-storage = { path = "crates/storage", version = "0.1.0" }
 osmium-usb = { path = "crates/usb", version = "0.1.0" }
 osmium-netdev = { path = "crates/netdev", version = "0.1.0" }
 osmium-sched = { path = "crates/sched", version = "0.1.0" }

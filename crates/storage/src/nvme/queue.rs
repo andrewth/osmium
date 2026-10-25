@@ -122,7 +122,7 @@ impl<'d, D: DmaAllocator + ?Sized> Queue<'d, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::testing::HostDma;
+    use osmium_drivers::virtio::testing::HostDma;
 
     /// Posts a completion the way a controller does.
     fn post(q: &Queue<'_, HostDma>, slot: u16, cid: u16, phase: bool, status: u16) {

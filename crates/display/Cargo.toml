@@ -1,0 +1,19 @@
+[package]
+name = "osmium-display"
+description = "Osmium: display drivers (virtio-gpu, Bochs DISPI, VESA BIOS Extensions)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-arch.workspace = true
+osmium-drivers.workspace = true
+osmium-hal.workspace = true
+osmium-mm.workspace = true
+
+[dev-dependencies]
+osmium-drivers = { workspace = true, features = ["testing"] }

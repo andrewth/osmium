@@ -12,13 +12,19 @@ categories = ["no-std", "embedded", "hardware-support", "os"]
 workspace = true
 
 [features]
-default = ["sync", "mm", "hal", "drivers", "usb", "netdev", "boot"]
+default = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "netdev", "boot"]
 ## Everything, including the parts that need `alloc`.
-full = ["sync", "mm", "hal", "drivers", "usb", "netdev", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net", "fs-ext4", "fs-iso9660", "iscsi", "acpi"]
+full = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "netdev", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net", "fs-ext4", "fs-iso9660", "iscsi", "acpi"]
 sync = ["dep:osmium-sync"]
 mm = ["sync", "dep:osmium-mm"]
 hal = ["sync", "mm", "dep:osmium-hal"]
 drivers = ["hal", "mm", "sync", "dep:osmium-drivers"]
+## Interrupt controllers (PLIC, CLINT, GICv2, local APIC, I/O APIC) and IOMMUs (VT-d, AMD-Vi, SMMUv3, RISC-V).
+sysdrv = ["hal", "mm", "sync", "dep:osmium-sysdrv"]
+## Storage drivers: virtio-blk, AHCI, NVMe and RAM disk.
+storage = ["hal", "drivers", "dep:osmium-storage"]
+## Display drivers: virtio-gpu, Bochs DISPI and VESA BIOS Extensions.
+display = ["hal", "mm", "drivers", "dep:osmium-display"]
 ## USB host controllers (xHCI, EHCI, OHCI, UHCI) and class drivers.
 usb = ["hal", "mm", "dep:osmium-usb"]
 ## Network device drivers: virtio-net, mlx4, USB CDC-ECM and CDC-NCM.
@@ -59,6 +65,9 @@ osmium-sync = { workspace = true, optional = true }
 osmium-mm = { workspace = true, optional = true }
 osmium-hal = { workspace = true, optional = true }
 osmium-drivers = { workspace = true, optional = true }
+osmium-sysdrv = { workspace = true, optional = true }
+osmium-storage = { workspace = true, optional = true }
+osmium-display = { workspace = true, optional = true }
 osmium-usb = { workspace = true, optional = true }
 osmium-netdev = { workspace = true, optional = true }
 osmium-boot = { workspace = true, optional = true }

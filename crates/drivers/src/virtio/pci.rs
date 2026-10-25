@@ -10,7 +10,7 @@
 //! Transitional devices also work, through the same capabilities; the
 //! legacy I/O BAR interface is not supported.
 
-use crate::ioext::IoMemExt;
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::{Bar, BarKind, ConfigAccess, Function, cap};
 use osmium_hal::virtio::pci::*;

@@ -16,8 +16,8 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use osmium::boot::acpi::EcamWindow;
-use osmium::drivers::lapic;
-use osmium::drivers::nvme::{self, Interrupts, IrqSignal, Nvme, NvmeError};
+use osmium::sysdrv::lapic;
+use osmium::storage::nvme::{self, Interrupts, IrqSignal, Nvme, NvmeError};
 use osmium::hal::block::BlockDevice;
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci::{self, Function, MsiError};
