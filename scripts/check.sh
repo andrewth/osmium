@@ -195,6 +195,7 @@ EXPECT=(
     'OHCI interrupts: [1-9]'
     '\[ahci\]  port 0 "QEMU HARDDISK": 16384 sectors of 512; round trip Ok(8192)'
     '\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192)'
+    '\[nvme\]  .* 4 I/O queues; round trip on each: 4 ok'
     '\[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512'
     '\[iscsi\] wrote and read back block 8192'
     '\[virtio-gpu\] 640x400 32bpp, stride 2560: colour bars drawn'
@@ -256,6 +257,7 @@ if command -v qemu-system-riscv64 >/dev/null && qemu-system-riscv64 -device help
         'riscv-iommu: detached device blocked'
         '\[iommu\] NVMe .* attached to domain 1'
         '\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512. round trip Ok(8192)'
+        '\[nvme\]  .* 4 I/O queues; round trip on each: 4 ok'
         '\[iommu\] NVMe detached: Ok(()), 0 faults logged'
     )
     boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
