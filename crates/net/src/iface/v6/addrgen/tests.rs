@@ -39,10 +39,14 @@ fn icmp_frame(dst_mac: MacAddress, dst: Ipv6Addr, ty: u8, body: &[u8]) -> Vec<u8
 
 /// Delivers a router advertisement of `prefix` to `h` at `secs`.
 fn advertise(h: &mut Host, secs: u64, prefix: Ipv6Addr, valid: u32, preferred: u32) {
+    advertise_flags(h, secs, prefix, valid, preferred, (false, false));
+}
+
+fn advertise_flags(h: &mut Host, secs: u64, prefix: Ipv6Addr, valid: u32, preferred: u32, flags: (bool, bool)) {
     let ra = RouterAdvert {
         hop_limit: 64,
-        managed: false,
-        other: false,
+        managed: flags.0,
+        other: flags.1,
         router_lifetime: 1800,
         source_ll: Some(ROUTER_MAC),
         mtu: None,
@@ -272,4 +276,14 @@ fn a_temporary_address_in_use_is_replaced_up_to_three_times() {
     let addr = a.iface.ipv6_temporary_addresses()[0].addr;
     claim(&mut a, 11, addr);
     assert_eq!(a.iface.v6.privacy.temps[0].valid_until, before);
+}
+
+#[test]
+fn router_advertisement_flags_are_reported() {
+    let (mut a, _b, _) = pair6();
+    assert_eq!(a.iface.ipv6_ra_flags(), (false, false));
+    advertise_flags(&mut a, 10, NET, 7200, 3600, (true, false));
+    assert_eq!(a.iface.ipv6_ra_flags(), (true, false));
+    advertise_flags(&mut a, 11, NET, 7200, 3600, (false, true));
+    assert_eq!(a.iface.ipv6_ra_flags(), (false, true));
 }

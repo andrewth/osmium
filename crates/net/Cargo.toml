@@ -1,6 +1,6 @@
 [package]
 name = "osmium-net"
-description = "Osmium: a polled IPv4 and IPv6 network stack (ARP, neighbor discovery, ICMP, UDP, TCP, DHCP) over any NetDevice"
+description = "Osmium: a polled IPv4 and IPv6 network stack (ARP, neighbor discovery, ICMP, UDP, TCP, DHCP, DHCPv6) over any NetDevice"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

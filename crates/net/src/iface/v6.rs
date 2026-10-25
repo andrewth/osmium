@@ -24,6 +24,7 @@ use crate::{Error, Instant};
 
 mod addrgen;
 mod frag;
+mod lease;
 pub use addrgen::TemporaryAddress;
 
 /// Hop limit of the packets we originate.
@@ -137,6 +138,8 @@ pub(super) struct State {
     reasm: crate::frag6::Reassembler,
     /// How SLAAC addresses are formed, and the temporary ones.
     privacy: addrgen::Privacy,
+    /// The managed and other-configuration flags of the last advertisement.
+    ra_flags: (bool, bool),
 }
 
 fn lifetime(now: Instant, secs: u32) -> Option<Instant> {
@@ -163,6 +166,7 @@ impl State {
             rs_next: None,
             reasm: frag::new_reassembler(),
             privacy: addrgen::Privacy::default(),
+            ra_flags: (false, false),
         }
     }
 
@@ -762,6 +766,7 @@ impl Interface {
         }
         let Some(ra) = RouterAdvert::parse(body) else { return };
         self.v6.rs_next = None;
+        self.v6.ra_flags = (ra.managed, ra.other);
         if let Some(ll) = ra.source_ll.filter(|m| !m.is_multicast()) {
             self.learned6(now, ip.src, ll);
         }

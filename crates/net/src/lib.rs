@@ -35,6 +35,8 @@
 //! reassembled on receipt within bounded limits ([`frag6`]).
 //! Addresses can be MAC-derived (the default), opaque and stable per network
 //! (RFC 7217), or accompanied by temporary ones (RFC 4941); see [`privacy`].
+//! [`dhcp6::Dhcp6Client`] leases addresses from a DHCPv6 server or, in stateless
+//! mode, only DNS servers and other configuration.
 //!
 //! Not supported: IP forwarding, IGMPv3 reports.
 //!
@@ -46,6 +48,7 @@ extern crate alloc;
 extern crate std;
 
 mod arp;
+pub mod dhcp6;
 mod error;
 pub mod frag6;
 mod iface;
@@ -59,9 +62,9 @@ mod time;
 pub mod wire;
 
 #[cfg(test)]
-mod testing;
-#[cfg(test)]
 mod loopback_tests;
+#[cfg(test)]
+mod testing;
 
 pub use error::Error;
 pub use iface::{Config, Interface, Ipv6Address, TemporaryAddress};
