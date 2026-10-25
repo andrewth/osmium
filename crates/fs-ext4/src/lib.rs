@@ -835,6 +835,11 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if let Some(node) = self.nodes.find(&ino).and_then(|n| n.me.get()?.upgrade()) {
             return Ok(node);
         }
+        // Only the root is reachable among the reserved inodes (the journal,
+        // the resize inode and the like), and nothing is past the last one.
+        if ino == 0 || ino > get32(&self.sb, sb::INODES_COUNT) || (ino < self.first_ino && ino != ROOT_INO) {
+            return Err(Errno::EIO);
+        }
         let slot = match spare {
             Some(slot) => slot,
             None => try_arc_uninit()?,
@@ -1032,6 +1037,12 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     fn in_meta_zone(&self, b: u64) -> bool {
         let i = self.meta_zones.partition_point(|&(start, _)| start <= b);
         i > 0 && self.meta_zones.get(i - 1).is_some_and(|&(_, end)| b < end)
+    }
+
+    /// Whether any block in `start..end` lies in a metadata zone.
+    fn meta_overlaps(&self, start: u64, end: u64) -> bool {
+        let i = self.meta_zones.partition_point(|&(zs, _)| zs < end);
+        i > 0 && self.meta_zones.get(i - 1).is_some_and(|&(_, ze)| ze > start)
     }
 
     /// The merged metadata zones: every group's superblock backup and
@@ -1561,7 +1572,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let per_group = get32(&self.sb, sb::BLOCKS_PER_GROUP) as u64;
         let first = get32(&self.sb, sb::FIRST_DATA_BLOCK) as u64;
         let end = start.checked_add(count).ok_or(Errno::EIO)?;
-        if start < first || end > self.blocks_count() {
+        if start < first || end > self.blocks_count() || self.meta_overlaps(start, end) {
             return Err(Errno::EIO);
         }
         {
@@ -3477,6 +3488,25 @@ mod tests {
 
     fn incompat(image: &[u8]) -> u32 {
         get32(&image[1024..2048], sb::FEATURE_INCOMPAT)
+    }
+
+    #[test]
+    fn a_directory_entry_cannot_reach_a_reserved_inode() {
+        let scratch = Scratch::new("reserved");
+        let tree = scratch.0.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("zz"), b"data").unwrap();
+        for kind in [EXT2, EXT4] {
+            let Some(mut image) = mkfs(&scratch, kind, 1024, 8 << 20, Some(&tree)) else { return };
+            // The entry for "zz": inode, record length, name length 2, regular file.
+            let at = image.windows(4).position(|w| w == [2, 1, b'z', b'z']).expect("the root directory entry") - 6;
+            for target in [1u32, 7, 8, 0x7fff_ffff] {
+                image[at..at + 4].copy_from_slice(&target.to_le_bytes());
+                let ext2 = Ext2::mount(VecDisk(image.clone()), 1).unwrap();
+                let root = ext2.root().unwrap();
+                assert!(root.lookup("zz").is_err(), "inode {target}");
+            }
+        }
     }
 
     #[test]

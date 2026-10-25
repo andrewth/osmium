@@ -423,3 +423,35 @@ fn faulting_and_unmapping_survive_running_out_of_memory() {
     );
     assert!(failures > 0);
 }
+
+#[test]
+fn mprotect_write_on_a_page_shared_by_fork_copies_it() {
+    let (p, _) = process("mprotect-fork-share");
+    let f = MemFile::new(pages(1, P as usize));
+    let fd = open(&p, &f, Access::RW);
+    let a = mmap(&p, P, READ, MAP_PRIVATE, fd, 0) as u64;
+    assert_eq!(get(&p, a, 1), b"a");
+    let child = p.memory().fork().unwrap();
+    child.mprotect(a, P, MapFlags::READ | MapFlags::WRITE).unwrap();
+    child.write(a, b"c").unwrap();
+    assert_eq!(get(&p, a, 1), b"a", "the parent still sees the original");
+    let mut b = [0];
+    child.read(a, &mut b).unwrap();
+    assert_eq!(b, *b"c");
+}
+
+#[test]
+fn copy_on_write_does_not_undo_mprotect_read() {
+    let (p, _) = process("mprotect-cow-ro");
+    // Pages mapped this way belong to no file mapping or lazy area.
+    let a = 0x5000_0000;
+    p.memory().map_anon(a, P, MapFlags::READ | MapFlags::WRITE).unwrap();
+    put(&p, a, b"x");
+    let child = p.memory().fork().unwrap();
+    child.mprotect(a, P, MapFlags::READ).unwrap();
+    assert!(child.write(a, b"y").is_err(), "a kernel copy respects mprotect");
+    assert!(!child.page_fault(a, true), "so does a user store");
+    child.mprotect(a, P, MapFlags::READ | MapFlags::WRITE).unwrap();
+    child.write(a, b"z").unwrap();
+    assert_eq!(get(&p, a, 1), b"x");
+}

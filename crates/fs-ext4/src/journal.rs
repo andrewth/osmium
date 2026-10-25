@@ -31,6 +31,8 @@ use osmium_sync::fallible::{try_push, try_zeroed};
 
 use super::{ByBlock, COMPAT_HAS_JOURNAL, Fs, SUPERBLOCK_OFFSET, byte, crc32c, get32, or_byte, put_bytes, sb, sub};
 
+/// The most separate pieces a journal may be stored in.
+const MAX_RUNS: usize = 65536;
 const MAGIC: u32 = 0xc03b_3998;
 
 const DESCRIPTOR: u32 = 1;
@@ -206,8 +208,11 @@ impl Journal {
             if !usable(fs, p) {
                 return Err(Errno::EINVAL);
             }
+            let nruns = journal.runs.len();
             match journal.runs.last_mut() {
                 Some((lstart, pstart, n)) if *lstart + *n == l && *pstart + *n == p => *n += 1,
+                // Overlapping maps can make every block a run of its own.
+                _ if nruns >= MAX_RUNS => return Err(Errno::EINVAL),
                 _ => try_push(&mut journal.runs, (l, p, 1))?,
             }
         }

@@ -1,6 +1,7 @@
 //! Blocking synchronization built on the scheduler.
 
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -116,15 +117,22 @@ impl<T: ?Sized> Mutex<T> {
             // attempt reads nothing else, so Relaxed is enough.
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
-            .then(|| MutexGuard { mutex: self })
+            .then(|| MutexGuard { mutex: self, _not_sync: PhantomData })
     }
 }
 
 /// Access to the data of a locked [`Mutex`].
+///
+/// It is `Sync` only if the data is, since sharing the guard shares `&T`.
 #[must_use]
 pub struct MutexGuard<'lock, T: ?Sized> {
     mutex: &'lock Mutex<T>,
+    /// Withdraws the automatic `Sync`, which would not ask for `T: Sync`.
+    _not_sync: PhantomData<Cell<()>>,
 }
+
+// SAFETY: a shared guard only hands out `&T`.
+unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
 
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
