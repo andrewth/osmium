@@ -9,13 +9,13 @@
 use alloc::vec::Vec;
 
 use osmium::boot::fdt::Fdt;
-use osmium::sysdrv::iommu::smmuv3::{Smmuv3, StreamTableLayout};
 use osmium::hal::iommu::{DeviceId, Iommu};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci;
 use osmium::hal::println;
 use osmium::hal::timer::Clock;
 use osmium::mm::{MapFlags, PAGE_SIZE, PhysAddr, VirtAddr};
+use osmium::sysdrv::iommu::smmuv3::{Smmuv3, StreamTableLayout};
 
 struct Uptime;
 
