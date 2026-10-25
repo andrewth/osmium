@@ -26,9 +26,25 @@ pub struct RamFs {
     root: Arc<RamNode>,
 }
 
+/// Caps on what a [`RamFs`] holds, like `tmpfs`'s `size=` and `nr_inodes=`
+/// options: a write, truncate or create that would pass one fails with
+/// `ENOSPC`. `None` means no cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// The most bytes of file contents (and symbolic link targets).
+    pub max_bytes: Option<u64>,
+    /// The most nodes besides the root: files, directories, links, devices.
+    pub max_inodes: Option<u64>,
+}
+
 struct Shared {
     dev: u64,
     next_ino: AtomicU64,
+    limits: Limits,
+    /// Bytes of contents held now.
+    bytes: AtomicU64,
+    /// Nodes (other than the root) held now.
+    inodes: AtomicU64,
     clock: ClockSlot,
     /// Held across a `rename`, so that two of them never wait on each
     /// other's directories and the loop check sees a still tree.
@@ -42,9 +58,32 @@ struct Times {
     ctime: Timestamp,
 }
 
+impl Shared {
+    /// Reserves `n` more units against `used`'s cap `max`, or `ENOSPC`.
+    #[allow(deprecated)] // `fetch_update` is the spelling the MSRV has
+    fn charge(used: &AtomicU64, max: Option<u64>, n: u64) -> Result<(), Errno> {
+        used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+            u.checked_add(n).filter(|&total| max.is_none_or(|max| total <= max))
+        })
+        .map(drop)
+        .map_err(|_| Errno::ENOSPC)
+    }
+
+    #[allow(deprecated)] // `fetch_update` is the spelling the MSRV has
+    fn refund(used: &AtomicU64, n: u64) {
+        let _ = used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| Some(u.saturating_sub(n)));
+    }
+
+    fn charge_bytes(&self, n: u64) -> Result<(), Errno> {
+        Self::charge(&self.bytes, self.limits.max_bytes, n)
+    }
+}
+
 /// What every name of a file shares.
 struct Inner {
     fs: Arc<Shared>,
+    /// Whether it counts against [`Limits::max_inodes`] (all but the root).
+    counted: bool,
     mode: AtomicU32,
     /// Names it has in directories; 0 once all are removed.
     linked: AtomicU32,
@@ -68,6 +107,17 @@ impl Deref for RamNode {
     type Target = Inner;
     fn deref(&self) -> &Inner {
         &self.inner
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Body::Data(data) = &mut self.body {
+            Shared::refund(&self.fs.bytes, data.get_mut().len() as u64);
+        }
+        if self.counted {
+            Shared::refund(&self.fs.inodes, 1);
+        }
     }
 }
 
@@ -111,9 +161,32 @@ impl RamFs {
 
     /// [`RamFs::new`], failing with `ENOMEM` instead of panicking.
     pub fn try_new(dev: u64) -> Result<Self, Errno> {
-        let fs =
-            try_arc(Shared { dev, next_ino: AtomicU64::new(1), clock: ClockSlot::new(), rename: SpinLock::new(()) })?;
-        Ok(RamFs { root: RamNode::new(&fs, FileKind::Directory, 0o755, "")? })
+        Self::try_with_limits(dev, Limits::default())
+    }
+
+    /// [`RamFs::try_new`] with caps on size and node count (tmpfs's
+    /// `size=` and `nr_inodes=`); see [`Limits`].
+    pub fn try_with_limits(dev: u64, limits: Limits) -> Result<Self, Errno> {
+        let fs = try_arc(Shared {
+            dev,
+            next_ino: AtomicU64::new(1),
+            limits,
+            bytes: AtomicU64::new(0),
+            inodes: AtomicU64::new(0),
+            clock: ClockSlot::new(),
+            rename: SpinLock::new(()),
+        })?;
+        Ok(RamFs { root: RamNode::new(&fs, FileKind::Directory, 0o755, "", false)? })
+    }
+
+    /// The caps this file system was made with.
+    pub fn limits(&self) -> Limits {
+        self.root.fs.limits
+    }
+
+    /// Bytes of contents and nodes (other than the root) held now.
+    pub fn usage(&self) -> (u64, u64) {
+        (self.root.fs.bytes.load(Ordering::Relaxed), self.root.fs.inodes.load(Ordering::Relaxed))
     }
 
     /// Stamps files with `clock` instead of the global one.
@@ -129,16 +202,21 @@ impl RamFs {
 }
 
 impl RamNode {
-    fn new(fs: &Arc<Shared>, kind: FileKind, mode: u32, name: &str) -> Result<Arc<Self>, Errno> {
+    fn new(fs: &Arc<Shared>, kind: FileKind, mode: u32, name: &str, counted: bool) -> Result<Arc<Self>, Errno> {
         let body = match kind {
             FileKind::Regular | FileKind::Symlink => Body::Data(RwSpinLock::new(Vec::new())),
             FileKind::Directory => Body::Dir(RwSpinLock::new(ArcTree::new())),
             _ => Body::Node,
         };
         let name = try_string(name)?;
+        if counted {
+            Shared::charge(&fs.inodes, fs.limits.max_inodes, 1)?;
+        }
         let now = fs.clock.now();
+        // From here `Inner`'s drop gives the inode back, whatever fails.
         let inner = try_arc(Inner {
             fs: fs.clone(),
+            counted,
             mode: AtomicU32::new(mode & 0o7777),
             linked: AtomicU32::new(1),
             body,
@@ -248,7 +326,12 @@ impl File for RamNode {
         let end = off.checked_add(buf.len() as u64).filter(|&end| end <= MAX_SIZE).ok_or(Errno::EFBIG)?;
         let (Ok(off), Ok(end)) = (usize::try_from(off), usize::try_from(end)) else { return Err(Errno::EFBIG) };
         if end > data.len() {
-            data.try_reserve(end - data.len()).map_err(|_| Errno::ENOMEM)?;
+            let grow = end - data.len();
+            self.fs.charge_bytes(grow as u64)?;
+            if data.try_reserve(grow).is_err() {
+                Shared::refund(&self.fs.bytes, grow as u64);
+                return Err(Errno::ENOMEM);
+            }
             data.resize(end, 0);
         }
         data.get_mut(off..end).ok_or(Errno::EIO)?.copy_from_slice(buf);
@@ -295,7 +378,14 @@ impl File for RamNode {
         let data = &mut *guard;
         let len = len as usize;
         if len > data.len() {
-            data.try_reserve(len - data.len()).map_err(|_| Errno::ENOMEM)?;
+            let grow = len - data.len();
+            self.fs.charge_bytes(grow as u64)?;
+            if data.try_reserve(grow).is_err() {
+                Shared::refund(&self.fs.bytes, grow as u64);
+                return Err(Errno::ENOMEM);
+            }
+        } else {
+            Shared::refund(&self.fs.bytes, (data.len() - len) as u64);
         }
         data.resize(len, 0);
         drop(guard);
@@ -320,7 +410,7 @@ impl File for RamNode {
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
         check_name(name)?;
         // Made first: running out of memory then changes nothing.
-        let node = RamNode::new(&self.fs, kind, mode, name)?;
+        let node = RamNode::new(&self.fs, kind, mode, name, true)?;
         let mut entries = self.dir()?.write();
         if entries.insert(node.clone()).is_err() {
             return Err(Errno::EEXIST);
@@ -629,6 +719,51 @@ mod tests {
         assert!(vfs.lookup("/inside").is_ok());
         vfs.unmount("/").unwrap();
         assert!(vfs.lookup("/mnt").is_ok());
+    }
+
+    #[test]
+    fn limits_cap_bytes_and_nodes() {
+        let fs = RamFs::try_with_limits(1, Limits { max_bytes: Some(10), max_inodes: Some(2) }).unwrap();
+        let vfs = Vfs::new(fs.root());
+        assert_eq!(fs.limits().max_bytes, Some(10));
+        let a = vfs.open("/a", RW | OpenFlags::CREATE, 0o644).unwrap();
+        assert_eq!(a.write(0, b"123456").unwrap(), 6);
+        // Past the byte cap: nothing is written.
+        assert_eq!(a.write(6, b"12345").err(), Some(Errno::ENOSPC));
+        assert_eq!(a.stat().size, 6);
+        assert_eq!(a.write(6, b"1234").unwrap(), 4);
+        assert_eq!(a.write(10, b"x").err(), Some(Errno::ENOSPC));
+        assert_eq!(a.truncate(11).err(), Some(Errno::ENOSPC));
+        assert_eq!(fs.usage(), (10, 1));
+        // Overwriting in place needs no room.
+        assert_eq!(a.write(0, b"abc").unwrap(), 3);
+        // The node cap counts the root out.
+        vfs.mkdir("/d", 0o755).unwrap();
+        assert_eq!(vfs.open("/b", OpenFlags::CREATE, 0o644).err(), Some(Errno::ENOSPC));
+        assert_eq!(vfs.mkdir("/e", 0o755).err(), Some(Errno::ENOSPC));
+        assert_eq!(fs.usage(), (10, 2));
+        // Shrinking and unlinking give room back.
+        a.truncate(4).unwrap();
+        assert_eq!(fs.usage().0, 4);
+        vfs.rmdir("/d").unwrap();
+        assert_eq!(fs.usage(), (4, 1));
+        vfs.open("/b", OpenFlags::CREATE, 0o644).unwrap();
+        // An unlinked file that is still open keeps its space.
+        vfs.unlink("/a").unwrap();
+        assert_eq!(fs.usage(), (4, 2));
+        drop(a);
+        assert_eq!(fs.usage(), (0, 1));
+        // Hard links share one file's charge.
+        let b = vfs.lookup("/b").unwrap();
+        b.write(0, b"zz").unwrap();
+        vfs.link("/b", "/c").unwrap();
+        assert_eq!(fs.usage(), (2, 1));
+        // No limits: nothing is refused.
+        let free = RamFs::new(2);
+        assert_eq!(free.limits(), Limits::default());
+        let v = Vfs::new(free.root());
+        let f = v.open("/f", RW | OpenFlags::CREATE, 0o644).unwrap();
+        f.write(0, &[0; 4096]).unwrap();
     }
 
     #[test]

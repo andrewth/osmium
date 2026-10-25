@@ -5,7 +5,7 @@
 //! size, direct and indirect block maps, extent trees, sparse files, fast and
 //! slow symbolic links, and the `filetype`, `sparse_super`, `sparse_super2`,
 //! `large_file`, `meta_bg`, `extent`, `64bit`, `flex_bg`, `uninit_bg`, `metadata_csum`,
-//! `metadata_csum_seed`, `huge_file`, `dir_nlink` and `extra_isize`
+//! `metadata_csum_seed`, `huge_file`, `dir_index`, `dir_nlink` and `extra_isize`
 //! features. With `extent`, new files get extent trees; uninitialized
 //! (preallocated) extents read as zeroes and are split as they are written.
 //! Every checksum is verified on read and kept current on write.
@@ -24,10 +24,22 @@
 //! features (`inline_data`, `largedir`, `ea_inode`, encryption, casefolding,
 //! compression) are refused. A file system with an unknown read-only
 //! feature (`quota`, `bigalloc`, ...) mounts read-only.
-//! Hashed directory indexes are ignored for lookup and dropped (the flag is
-//! cleared) when a directory changes, as Linux's ext2 driver does; with
-//! `metadata_csum` the index blocks become empty, checksummed directory
-//! blocks.
+//! Hashed (htree) directories, with `dir_index`, are looked up through their
+//! index and kept indexed as they change: a full leaf block is split by hash
+//! and a full index block is split or the tree grows a level, and a
+//! directory that outgrows one block is given an index (see the `htree`
+//! module). An index that cannot be trusted (an unknown hash version, bad
+//! limits, a block out of range, a bad checksum) is not followed: the
+//! directory is read linearly, and the next insertion clears its index flag
+//! (with `metadata_csum` the index blocks become empty, checksummed directory
+//! blocks).
+//!
+//! Extended attributes (`user.`, `trusted.`, `security.` and `system.` names)
+//! are read and written through [`File::xattr_get`] and its siblings, kept in
+//! the inode's spare space and in one attribute block per inode (see the
+//! `xattr` module). A set that does not fit in the two fails with `ENOSPC`;
+//! the `ea_inode` feature, which would keep big values in inodes of their
+//! own, is refused like the other unsupported incompatible ones.
 //!
 //! All state lives behind one spin lock held across device I/O, and there is
 //! no block cache: simple and correct, not fast. A journaled operation
@@ -42,7 +54,9 @@ extern crate std;
 
 mod csum;
 mod extent;
+mod htree;
 mod journal;
+mod xattr;
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -59,7 +73,7 @@ use osmium_sync::{Once, SpinLock};
 use csum::{crc16, crc32c};
 use journal::Journal;
 use osmium_fs::dev::makedev;
-use osmium_fs::{Clock, ClockSlot, DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat, Timestamp};
+use osmium_fs::{Clock, ClockSlot, DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat, Timestamp, XattrSet};
 
 const MAGIC: u16 = 0xef53;
 const ROOT_INO: u32 = 2;
@@ -71,6 +85,10 @@ const NDIR_BLOCKS: usize = 12;
 const LINK_MAX: u16 = 65000;
 
 const COMPAT_HAS_JOURNAL: u32 = 0x0004;
+/// Hashed directory indexes are kept and used.
+const COMPAT_DIR_INDEX: u32 = 0x0020;
+/// Extended attributes are in use.
+const COMPAT_EXT_ATTR: u32 = 0x0008;
 const COMPAT_SPARSE_SUPER2: u32 = 0x0200;
 const INCOMPAT_FILETYPE: u32 = 0x0002;
 /// The journal holds transactions to replay.
@@ -136,6 +154,9 @@ mod sb {
     pub const FEATURE_RO_COMPAT: usize = 100;
     pub const UUID: usize = 0x68;
     pub const RESERVED_GDT_BLOCKS: usize = 0xce;
+    pub const HASH_SEED: usize = 0xec;
+    pub const DEF_HASH_VERSION: usize = 0xfc;
+    pub const FLAGS: usize = 0x160;
     pub const JOURNAL_INUM: usize = 0xe0;
     pub const DESC_SIZE: usize = 0xfe;
     pub const FIRST_META_BG: usize = 0x104;
@@ -1680,25 +1701,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if self.has_block_map(&inode) {
             self.truncate_blocks(ino, &mut inode, 0)?;
         }
-        let acl = inode.file_acl();
-        if acl != 0 {
-            let mut block = self.read_block(acl)?;
-            let refs = if get32(&block, 0) == XATTR_MAGIC { get32(&block, 4) } else { 1 };
-            if refs <= 1 {
-                self.free_block(acl)?;
-            } else {
-                put32(&mut block, 4, refs - 1);
-                if self.csum == Csum::Crc32c {
-                    put32(&mut block, 0x10, 0);
-                    let sum = crc32c(crc32c(self.csum_seed, &acl.to_le_bytes()), &block);
-                    put32(&mut block, 0x10, sum);
-                }
-                self.write_block(acl, &block)?;
-            }
-            put32(&mut inode.raw, ino::FILE_ACL, 0);
-            put16(&mut inode.raw, ino::FILE_ACL_HIGH, 0);
-            inode.add_sectors(-((self.block_size / 512) as i64));
-        }
+        self.release_xattr_block(&mut inode)?;
         // e2fsck reads a deletion time below the inode count as an orphan
         // list link, so without a clock pick one above it.
         let now = self.now().max(get32(&self.sb, sb::INODES_COUNT).saturating_add(1));
@@ -2108,18 +2111,36 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok((ino, rec_len, name))
     }
 
-    fn find_entry(&mut self, dir: u32, name: &str) -> Result<Option<u32>, Errno> {
-        self.scan_dir(dir, |fs, _, data| {
+    /// Finds the live entry `name` of a directory: the block holding it, the
+    /// block's bytes and the entry's offset. An indexed directory is searched
+    /// through its index when that can be trusted, else linearly.
+    fn locate_entry(&mut self, dir: u32, name: &str) -> Result<Option<htree::Located>, Errno> {
+        let mut inode = self.read_inode(dir)?;
+        if inode.kind() != FileKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        // `.` and `..` are not hashed: they are in the first block.
+        if name != "."
+            && name != ".."
+            && let Some(hit) = self.dx_locate(dir, &mut inode, name.as_bytes())?
+        {
+            return Ok(hit);
+        }
+        self.scan_dir(dir, |fs, b, data| {
             let (mut off, space) = (0, fs.dir_space(data));
             while off < space {
                 let (ino, rec_len, entry) = fs.record(data, off)?;
                 if ino != 0 && entry == name.as_bytes() {
-                    return Ok(Some(ino));
+                    return Ok(Some((b, core::mem::take(data), off)));
                 }
                 off += rec_len;
             }
             Ok(None)
         })
+    }
+
+    fn find_entry(&mut self, dir: u32, name: &str) -> Result<Option<u32>, Errno> {
+        Ok(self.locate_entry(dir, name)?.map(|(_, data, off)| get32(&data, off)))
     }
 
     fn dir_entry(&mut self, dir: u32, index: usize) -> Result<Option<DirEntry>, Errno> {
@@ -2218,8 +2239,17 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     fn add_entry(&mut self, dir: u32, name: &str, ino: u32, kind: FileKind) -> Result<(), Errno> {
-        self.drop_index(dir)?;
+        if self.read_inode(dir)?.flags() & INDEX_FL != 0 {
+            if self.dx_add(dir, name.as_bytes(), ino, dirent_type(kind))? {
+                return Ok(());
+            }
+            // The index cannot be followed: it goes, and the entry is added
+            // to the directory read as a plain one.
+            self.drop_index(dir)?;
+        }
         let need = rec_len_for(name.len());
+        let single = self.read_inode(dir)?.size() == self.block_size as u64;
+        let mut first = None;
         let placed = self.scan_dir(dir, |fs, b, data| {
             let (mut off, space) = (0, fs.dir_space(data));
             while off < space {
@@ -2237,46 +2267,46 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 }
                 off += rec_len;
             }
+            if single {
+                first = Some((b, try_to_vec(data)?));
+            }
             Ok(None)
         })?;
         if placed.is_some() {
             return Ok(());
         }
-        // No room: append a block.
-        let mut inode = self.read_inode(dir)?;
-        // A size that is not a block multiple still ends in a partial block.
-        let next = inode.size().div_ceil(self.block_size as u64);
-        let b = self.bmap(dir, &mut inode, next, true)?;
-        inode.set_size(next.saturating_add(1).saturating_mul(self.block_size as u64));
-        self.write_inode(dir, &inode)?;
+        // No room. A directory of one full block gets an index, as Linux
+        // gives it one; a bigger linear directory grows by a block.
+        if let Some((b, block)) = first
+            && self.dx_make_index(dir, b, &block, name.as_bytes(), ino, dirent_type(kind))?
+        {
+            return Ok(());
+        }
         let (mut data, space) = self.new_dir_block()?;
         self.write_record(&mut data, 0, ino, space, name, kind);
+        let (_, [b, _]) = self.grow_dir(dir, 1)?;
         self.write_dir_block(dir, b, &mut data)
     }
 
     fn remove_entry(&mut self, dir: u32, name: &str) -> Result<(), Errno> {
-        self.drop_index(dir)?;
-        let removed = self.scan_dir(dir, |fs, b, data| {
-            let (mut off, mut prev, space) = (0, None, fs.dir_space(data));
-            while off < space {
-                let (ino, rec_len, entry) = fs.record(data, off)?;
-                if ino != 0 && entry == name.as_bytes() {
-                    match prev {
-                        Some(p) => {
-                            let merged = get16(data, p + 4) as usize + rec_len;
-                            put16(data, p + 4, merged as u16);
-                        }
-                        None => put32(data, off, 0),
-                    }
-                    fs.write_dir_block(dir, b, data)?;
-                    return Ok(Some(()));
-                }
-                prev = Some(off);
-                off += rec_len;
+        let (b, mut data, at) = self.locate_entry(dir, name)?.ok_or(Errno::ENOENT)?;
+        let (mut off, mut prev, space) = (0, None, self.dir_space(&data));
+        while off < space && off < at {
+            prev = Some(off);
+            off += self.record(&data, off)?.1;
+        }
+        let rec_len = self.record(&data, at)?.1;
+        match prev {
+            // Merge into the previous record...
+            Some(p) if off == at => {
+                let merged = get16(&data, p + 4) as usize + rec_len;
+                put16(&mut data, p + 4, merged as u16);
             }
-            Ok(None)
-        })?;
-        removed.ok_or(Errno::ENOENT)
+            // ...or, first in the block, mark it unused.
+            None if at == 0 => put32(&mut data, at, 0),
+            _ => return Err(Errno::EIO),
+        }
+        self.write_dir_block(dir, b, &mut data)
     }
 
     fn is_empty_dir(&mut self, dir: u32) -> Result<bool, Errno> {
@@ -2458,6 +2488,10 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     /// Points directory `ino`'s `..` entry at `parent`.
     fn set_dotdot(&mut self, ino: u32, parent: u32) -> Result<(), Errno> {
+        let mut inode = self.read_inode(ino)?;
+        if self.dx_set_dotdot(ino, &mut inode, parent)? {
+            return Ok(());
+        }
         let done = self.scan_dir(ino, |fs, b, data| {
             let (mut off, space) = (0, fs.dir_space(data));
             while off < space {
@@ -2658,6 +2692,22 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             return Err(Errno::EXDEV);
         }
         self.with(|fs| fs.transact(|fs| fs.rename(self.ino, old_name, dst.ino, new_name)))
+    }
+
+    fn xattr_get(&self, name: &[u8]) -> Result<Vec<u8>, Errno> {
+        self.with(|fs| fs.xattr_get(self.ino, name))
+    }
+
+    fn xattr_set(&self, name: &[u8], value: &[u8], how: XattrSet) -> Result<(), Errno> {
+        self.with(|fs| fs.transact(|fs| fs.xattr_set(self.ino, name, value, how)))
+    }
+
+    fn xattr_remove(&self, name: &[u8]) -> Result<(), Errno> {
+        self.with(|fs| fs.transact(|fs| fs.xattr_remove(self.ino, name)))
+    }
+
+    fn xattr_list(&self) -> Result<Vec<Vec<u8>>, Errno> {
+        self.with(|fs| fs.xattr_list(self.ino))
     }
 
     fn readlink(&self) -> Result<String, Errno> {
@@ -3071,6 +3121,329 @@ mod tests {
             drop((big, vfs));
             let image = unmount(ext2);
             assert_eq!(fsck(&scratch, &image, &["/big/file-1999"])[0], b"1999");
+        }
+    }
+
+    /// The first block of directory `path`, as the file system holds it:
+    /// its inode flags, physical block and bytes.
+    fn dir_root(ext2: &Ext2<VecDisk>, vfs: &Vfs, path: &str) -> (u32, u64, Vec<u8>) {
+        let ino = vfs.lookup(path).unwrap().stat().ino as u32;
+        let mut fs = ext2.shared.fs.lock();
+        let mut inode = fs.read_inode(ino).unwrap();
+        let phys = fs.bmap(ino, &mut inode, 0, false).unwrap();
+        (inode.flags(), phys, fs.read_block(phys).unwrap())
+    }
+
+    #[test]
+    fn indexed_directories_grow_and_shrink() {
+        let scratch = Scratch::new("dx");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        for kind in [EXT2, EXT3, EXT4, EXT4_CRC16] {
+            // 1 KiB blocks need a second index level for this many names.
+            for (block, count) in [(1024, 3000), (4096, 1500)] {
+                let Some(image) = mkfs(&scratch, kind, block, 32 << 20, None) else { return };
+                let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+                let vfs = Vfs::new(ext2.root().unwrap());
+                vfs.mkdir("/d", 0o755).unwrap();
+                vfs.mkdir("/other", 0o755).unwrap();
+                let name = |i: usize| format!("/d/file-with-a-fairly-long-name-{i:05}");
+                for i in 0..count {
+                    vfs.open(&name(i), rw, 0o644).unwrap().write(0, name(i).as_bytes()).unwrap();
+                }
+                let (flags, _, root) = dir_root(&ext2, &vfs, "/d");
+                assert!(flags & INDEX_FL != 0, "{} {block}: not indexed", kind.0);
+                let levels = root[htree::DX_INFO + 6];
+                assert_eq!(levels, (block == 1024) as u8, "{} {block}", kind.0);
+
+                for i in (0..count).step_by(7) {
+                    assert_eq!(read_all(&*vfs.lookup(&name(i)).unwrap()), name(i).as_bytes());
+                }
+                assert_eq!(vfs.lookup(&name(count)).err(), Some(Errno::ENOENT));
+
+                // Remove a third, add others into the gaps and beyond.
+                for i in (0..count).step_by(3) {
+                    vfs.unlink(&name(i)).unwrap();
+                }
+                for i in 0..count / 3 {
+                    vfs.open(&format!("/d/new-{i:05}-padding-to-length"), rw, 0o644).unwrap();
+                }
+                let expect = count - count.div_ceil(3) + count / 3;
+                let dir = vfs.lookup("/d").unwrap();
+                let listed = names(&*dir);
+                assert_eq!(listed.len(), expect);
+                assert_eq!(listed.iter().collect::<std::collections::HashSet<_>>().len(), expect);
+                assert_eq!(vfs.lookup(&name(0)).err(), Some(Errno::ENOENT));
+                assert!(vfs.lookup(&name(1)).is_ok());
+                assert!(vfs.lookup("/d/new-00000-padding-to-length").is_ok());
+
+                // Moving the directory rewrites its `..` in the index root.
+                vfs.rename("/d", "/other/d").unwrap();
+                assert!(vfs.lookup("/other/d/new-00001-padding-to-length").is_ok());
+                drop((dir, vfs));
+                let image = unmount(ext2);
+                let cats = fsck(&scratch, &image, &["/other/d/file-with-a-fairly-long-name-00001"]);
+                assert_eq!(cats[0], b"/d/file-with-a-fairly-long-name-00001");
+
+                let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+                let vfs = Vfs::new(ext2.root().unwrap());
+                assert!(dir_root(&ext2, &vfs, "/other/d").0 & INDEX_FL != 0);
+                assert_eq!(names(&*vfs.lookup("/other/d").unwrap()).len(), expect);
+                for i in 0..count / 3 {
+                    vfs.unlink(&format!("/other/d/new-{i:05}-padding-to-length")).unwrap();
+                }
+                for i in (0..count).filter(|i| i % 3 != 0) {
+                    vfs.unlink(&format!("/other/d/file-with-a-fairly-long-name-{i:05}")).unwrap();
+                }
+                assert!(names(&*vfs.lookup("/other/d").unwrap()).is_empty());
+                vfs.rmdir("/other/d").unwrap();
+                drop(vfs);
+                fsck(&scratch, &unmount(ext2), &[]);
+            }
+        }
+    }
+
+    #[test]
+    fn untrusted_indexes_are_read_linearly_and_dropped() {
+        let scratch = Scratch::new("dxbad");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        for kind in [EXT3, EXT4] {
+            let Some(image) = mkfs(&scratch, kind, 1024, 16 << 20, None) else { return };
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let vfs = Vfs::new(ext2.root().unwrap());
+            vfs.mkdir("/d", 0o755).unwrap();
+            for i in 0..600 {
+                vfs.open(&format!("/d/entry-with-a-longish-name-{i:04}"), rw, 0o644).unwrap();
+            }
+            let (flags, phys, _) = dir_root(&ext2, &vfs, "/d");
+            assert!(flags & INDEX_FL != 0);
+            drop(vfs);
+            let mut image = unmount(ext2);
+            // An unknown hash version in the root (with checksums, the root's
+            // checksum is wrong as well).
+            image[phys as usize * 1024 + htree::DX_INFO + 4] = 9;
+
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let vfs = Vfs::new(ext2.root().unwrap());
+            for i in (0..600).step_by(11) {
+                assert!(vfs.lookup(&format!("/d/entry-with-a-longish-name-{i:04}")).is_ok());
+            }
+            assert_eq!(vfs.lookup("/d/entry-with-a-longish-name-0600").err(), Some(Errno::ENOENT));
+            vfs.unlink("/d/entry-with-a-longish-name-0003").unwrap();
+            assert!(dir_root(&ext2, &vfs, "/d").0 & INDEX_FL != 0);
+            // An insertion gives up the index.
+            vfs.open("/d/added", rw, 0o644).unwrap();
+            assert!(dir_root(&ext2, &vfs, "/d").0 & INDEX_FL == 0);
+            assert_eq!(names(&*vfs.lookup("/d").unwrap()).len(), 600);
+            drop(vfs);
+            fsck(&scratch, &unmount(ext2), &[]);
+        }
+    }
+
+    /// What `debugfs` lists for `path`'s extended attributes.
+    fn ea_list(scratch: &Scratch, image: &[u8], path: &str) -> String {
+        let img = scratch.0.join("ea");
+        fs::write(&img, image).unwrap();
+        let out = Command::new("debugfs").arg("-R").arg(format!("ea_list {path}")).arg(&img).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn extended_attributes_pass_fsck() {
+        let scratch = Scratch::new("xattr");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        let big: Vec<u8> = (0..500).map(|i| (i % 251) as u8).collect();
+        fs::write(scratch.0.join("big"), &big).unwrap();
+        let bigfile = scratch.0.join("big");
+        for kind in [EXT2, EXT3, EXT4, EXT4_CRC16] {
+            for block in [1024, 4096] {
+                let Some(image) = mkfs(&scratch, kind, block, 8 << 20, None) else { return };
+                let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+                let vfs = Vfs::new(ext2.root().unwrap());
+                vfs.open("/a", rw, 0o644).unwrap();
+                vfs.open("/b", rw, 0o644).unwrap();
+                vfs.mkdir("/dir", 0o755).unwrap();
+                vfs.symlink("target", "/link").unwrap();
+                drop(vfs);
+                // Attributes written by Linux's tools: in an inode, and in a block.
+                let image = debugfs(
+                    &scratch,
+                    unmount(ext2),
+                    &[
+                        "ea_set /a user.linux fromlinux",
+                        &format!("ea_set -f {} /b user.big", bigfile.display()),
+                        "ea_set /dir security.selinux ctx",
+                    ],
+                );
+                let free_before = {
+                    let ext2 = Ext2::mount(VecDisk(image.clone()), 1).unwrap();
+                    free_counts(&ext2)
+                };
+
+                let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+                let vfs = Vfs::new(ext2.root().unwrap());
+                let (a, b, dir) = (vfs.lookup("/a").unwrap(), vfs.lookup("/b").unwrap(), vfs.lookup("/dir").unwrap());
+                assert_eq!(a.xattr_get(b"user.linux").unwrap(), b"fromlinux");
+                assert_eq!(b.xattr_get(b"user.big").unwrap(), big);
+                assert_eq!(dir.xattr_list().unwrap(), [b"security.selinux".to_vec()]);
+                assert_eq!(a.xattr_get(b"user.none").err(), Some(Errno::ENODATA));
+                assert_eq!(a.xattr_get(b"nonsense").err(), Some(Errno::ENODATA));
+
+                // Setting, replacing and removing, in the inode and in the block.
+                let mine = vec![7u8; 50];
+                a.xattr_set(b"user.mine", &mine, XattrSet::Create).unwrap();
+                assert_eq!(a.xattr_set(b"user.mine", b"x", XattrSet::Create).err(), Some(Errno::EEXIST));
+                assert_eq!(a.xattr_set(b"user.other", b"x", XattrSet::Replace).err(), Some(Errno::ENODATA));
+                assert_eq!(a.xattr_set(b"bogus.name", b"x", XattrSet::Any).err(), Some(Errno::EOPNOTSUPP));
+                assert_eq!(a.xattr_set(b"system.posix_acl_access", b"x", XattrSet::Any).err(), Some(Errno::EOPNOTSUPP));
+                assert_eq!(
+                    a.xattr_set(&[b"user.".as_slice(), &[b'n'; 256]].concat(), b"x", XattrSet::Any).err(),
+                    Some(Errno::ERANGE)
+                );
+                a.xattr_set(b"user.mine", b"short", XattrSet::Replace).unwrap();
+                b.xattr_set(b"user.second", &mine, XattrSet::Any).unwrap();
+                b.xattr_set(b"trusted.t", b"", XattrSet::Any).unwrap();
+                dir.xattr_set(b"user.d", b"dir", XattrSet::Any).unwrap();
+                let link = ext2.root().unwrap().lookup("link").unwrap();
+                link.xattr_set(b"user.l", b"link", XattrSet::Any).unwrap();
+                assert_eq!(read_all(&*link), b"target");
+                assert_eq!(vfs.readlink("/link").unwrap(), "target");
+                let mut names = a.xattr_list().unwrap();
+                names.sort();
+                assert_eq!(names, [b"user.linux".to_vec(), b"user.mine".to_vec()]);
+                a.xattr_remove(b"user.linux").unwrap();
+                assert_eq!(a.xattr_remove(b"user.linux").err(), Some(Errno::ENODATA));
+                assert_eq!(a.xattr_get(b"user.mine").unwrap(), b"short");
+
+                // Too much for the room: refused, and what was there stays.
+                let mut stored = 0;
+                for i in 0..300 {
+                    match dir.xattr_set(format!("user.key{i:03}").as_bytes(), &[i as u8; 20], XattrSet::Any) {
+                        Ok(()) => stored += 1,
+                        Err(e) => {
+                            assert_eq!(e, Errno::ENOSPC);
+                            break;
+                        }
+                    }
+                }
+                assert!(stored > 10 && stored < 300, "{stored}");
+                assert_eq!(dir.xattr_list().unwrap().len(), stored + 2);
+                assert_eq!(dir.xattr_get(b"user.key005").unwrap(), [5u8; 20]);
+                assert_eq!(dir.xattr_set(b"user.huge", &vec![0; 70_000], XattrSet::Any).err(), Some(Errno::E2BIG));
+                drop((a, b, dir, link, vfs));
+                let image = unmount(ext2);
+                fsck(&scratch, &image, &[]);
+                assert!(ea_list(&scratch, &image, "/a").contains("user.mine (5) = \"short\""));
+                assert!(ea_list(&scratch, &image, "/dir").contains("user.key003 (20)"));
+                assert!(ea_list(&scratch, &image, "/b").contains("user.second (50)"));
+
+                // Remove them all: the blocks they took are given back.
+                let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+                let vfs = Vfs::new(ext2.root().unwrap());
+                for name in ["a", "b", "dir", "link"] {
+                    let file = ext2.root().unwrap().lookup(name).unwrap();
+                    for attr in file.xattr_list().unwrap() {
+                        file.xattr_remove(&attr).unwrap();
+                    }
+                    assert!(file.xattr_list().unwrap().is_empty());
+                }
+                drop(vfs);
+                let after = free_counts(&ext2);
+                assert!(after[0] >= free_before[0], "{after:?} {free_before:?}");
+                fsck(&scratch, &unmount(ext2), &[]);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_attribute_blocks_are_copied_on_write() {
+        let scratch = Scratch::new("xattr-shared");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        for kind in [EXT3, EXT4] {
+            let Some(image) = mkfs(&scratch, kind, 1024, 8 << 20, None) else { return };
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let vfs = Vfs::new(ext2.root().unwrap());
+            let a = vfs.open("/a", rw, 0o644).unwrap();
+            let b = vfs.open("/b", rw, 0o644).unwrap();
+            a.xattr_set(b"user.x", &[1u8; 300], XattrSet::Any).unwrap();
+            // Another inode with the same block, as Linux shares identical ones.
+            {
+                let (a_ino, b_ino) = (a.stat().ino as u32, b.stat().ino as u32);
+                let mut fs = ext2.shared.fs.lock();
+                fs.transact(|fs| {
+                    let ia = fs.read_inode(a_ino)?;
+                    let blk = ia.file_acl();
+                    assert!(blk != 0);
+                    let mut data = fs.read_block(blk)?;
+                    put32(&mut data, 4, 2);
+                    fs.seal_xattr_block(blk, &mut data);
+                    fs.write_block(blk, &data)?;
+                    let mut ib = fs.read_inode(b_ino)?;
+                    put32(&mut ib.raw, ino::FILE_ACL, blk as u32);
+                    ib.add_sectors((fs.block_size / 512) as i64);
+                    fs.write_inode(b_ino, &ib)
+                })
+                .unwrap();
+            }
+            assert_eq!(b.xattr_get(b"user.x").unwrap(), [1u8; 300]);
+            b.xattr_set(b"user.y", &[2u8; 200], XattrSet::Any).unwrap();
+            assert_eq!(a.xattr_list().unwrap(), [b"user.x".to_vec()]);
+            assert_eq!(b.xattr_list().unwrap().len(), 2);
+            a.xattr_remove(b"user.x").unwrap();
+            assert_eq!(b.xattr_get(b"user.x").unwrap(), [1u8; 300]);
+            drop((a, b, vfs));
+            let image = unmount(ext2);
+            fsck(&scratch, &image, &[]);
+            assert!(ea_list(&scratch, &image, "/b").contains("user.y (200)"));
+        }
+    }
+
+    #[test]
+    fn growing_directories_and_attributes_on_a_full_disk() {
+        let scratch = Scratch::new("fulldir");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        for kind in [Kind("ext2", &["-N", "1500"]), Kind("ext4", &["-g", "512", "-N", "1500"])] {
+            // However many blocks are left, a creation that needs one it
+            // cannot have fails whole.
+            for spare in 0..5u64 {
+                let Some(image) = mkfs(&scratch, kind, 1024, 4 << 20, None) else { return };
+                let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+                let vfs = Vfs::new(ext2.root().unwrap());
+                vfs.mkdir("/d", 0o755).unwrap();
+                vfs.mkdir("/e", 0o755).unwrap();
+                let name = |dir: &str, i: usize| format!("/{dir}/entry-with-a-longish-name-{i:04}");
+                for i in 0..30 {
+                    vfs.open(&name("e", i), rw, 0o644).unwrap();
+                }
+                let fill = vfs.open("/fill", rw, 0o644).unwrap();
+                let (chunk, mut total) = (vec![1u8; 1024], 0u64);
+                while let Ok(n @ 1..) = fill.write(total, &chunk) {
+                    total += n as u64;
+                }
+                fill.truncate(total - spare * 1024).unwrap();
+
+                let (mut made, mut refused) = (0, 0);
+                for dir in ["d", "e"] {
+                    for i in 100..300 {
+                        match vfs.open(&name(dir, i), rw, 0o644) {
+                            Ok(_) => made += 1,
+                            Err(e) => {
+                                assert_eq!(e, Errno::ENOSPC);
+                                assert_eq!(vfs.stat(&name(dir, i), false).err(), Some(Errno::ENOENT));
+                                refused += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                assert!(made > 0 && refused > 0, "{} {spare}: {made} made, {refused} refused", kind.0);
+                let file = vfs.lookup(&name("e", 0)).unwrap();
+                if let Err(e) = file.xattr_set(b"user.big", &[9u8; 600], XattrSet::Any) {
+                    assert_eq!(e, Errno::ENOSPC);
+                    assert_eq!(file.xattr_get(b"user.big").err(), Some(Errno::ENODATA));
+                }
+                drop((file, fill, vfs));
+                fsck(&scratch, &unmount(ext2), &[]);
+            }
         }
     }
 
