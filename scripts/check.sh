@@ -199,6 +199,11 @@ EXPECT=(
     'xHCI interrupts: [1-9]'
     'FP guests interleaved on one hart: vCPU a0=1 got 12, a0=2 got 14 (expected 12 and 14)'
     '\[usb\]     ecm: ARP: 10.0.2.2 is at'
+    '\[usb\]     hid interface 0: report descriptor with [0-9]* fields, applications \[10006\]'
+    '\[usb\]     hid interface 0: report descriptor with [0-9]* fields, applications \[10002\]'
+    '\[usb\]     hid keyboard ready'
+    '\[usb\]     hid mouse ready, axes Some'
+    'mouse transfer still pending after disk I/O'
     '\[usb\]   EHCI at .*, 6 ports'
     'EHCI interrupts: [1-9]'
     '\[usb\]   OHCI at .*, 3 ports'
@@ -232,7 +237,7 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -netdev user,id=n0,tftp="$tftp",guestfwd=tcp:10.0.2.100:7-cmd:cat,guestfwd=tcp:10.0.2.100:3260-cmd:"python3 scripts/iscsi-target.py $iscsi" -device virtio-net-device,netdev=n0 \
     -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
     -device usb-ehci,id=ehci -drive if=none,id=stick-ehci,format=raw,file="$stick_ehci" -device usb-storage,bus=ehci.0,drive=stick-ehci \
-    -device pci-ohci,id=ohci -drive if=none,id=stick-ohci,format=raw,file="$stick_ohci" -device usb-storage,bus=ohci.0,drive=stick-ohci \
+    -device pci-ohci,id=ohci -device usb-mouse,bus=ohci.0 -drive if=none,id=stick-ohci,format=raw,file="$stick_ohci" -device usb-storage,bus=ohci.0,drive=stick-ohci \
     -drive if=none,id=vd0,format=raw,file="$vdisk" -device virtio-blk-device,drive=vd0 \
     -netdev user,id=n1 -device usb-net,netdev=n1,bus=xhci.0 \
     -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,bus=xhci.0,drive=stick \

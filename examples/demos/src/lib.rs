@@ -333,7 +333,8 @@ where
     G: osmium::sync::Guardian + 'static,
 {
     use osmium::netdev::usb::ecm::{EcmFunction, UsbEthernet};
-    use osmium::usb::class::hid::BootKeyboard;
+    use osmium::usb::class::hid::device::{fetch_report_descriptor, hid_interfaces};
+    use osmium::usb::class::hid::{HidKeyboard, HidMouse};
     use osmium::usb::class::storage::UsbStorage;
     use osmium::hal::block::BlockDevice;
     use osmium::hal::usb::{Descriptor, Descriptors, UsbHost, enumerate, read_configuration, set_configuration};
@@ -422,15 +423,36 @@ where
     }
 
     // Both drivers hold the controller through its lock.
-    let mut keyboard = None;
+    // HID devices are driven through their report descriptors.
     for (id, config) in &found {
-        if let Ok(mut kb) = BootKeyboard::new(shared, *id, config) {
+        for interface in hid_interfaces(config) {
+            match fetch_report_descriptor(&mut host, *id, config, interface) {
+                Ok(d) => println!(
+                    "[usb]     hid interface {interface}: report descriptor with {} fields, applications {:x?}",
+                    d.fields().len(),
+                    d.applications()
+                ),
+                Err(e) => println!("[usb]     hid interface {interface}: report descriptor failed: {e}"),
+            }
+        }
+    }
+    let mut keyboard = None;
+    let mut mouse = None;
+    for (id, config) in &found {
+        if let Ok(mut kb) = HidKeyboard::new(shared, *id, config) {
             // Starts the interrupt transfer that stays outstanding below.
             match kb.poll() {
-                Ok(_) => println!("[usb]     boot keyboard ready"),
+                Ok(_) => println!("[usb]     hid keyboard ready"),
                 Err(e) => println!("[usb]     keyboard poll failed: {e}"),
             }
             keyboard = Some(kb);
+        }
+        if let Ok(mut m) = HidMouse::new(shared, *id, config) {
+            match m.poll() {
+                Ok(_) => println!("[usb]     hid mouse ready, axes {:?}", m.range()),
+                Err(e) => println!("[usb]     mouse poll failed: {e}"),
+            }
+            mouse = Some(m);
         }
     }
     for (id, config) in &found {
@@ -457,6 +479,13 @@ where
             Ok(None) => println!("[usb]     keyboard transfer still pending after disk I/O"),
             Ok(Some(ev)) => println!("[usb]     key event {ev:?}"),
             Err(e) => println!("[usb]     keyboard poll failed: {e}"),
+        }
+    }
+    if let Some(m) = &mut mouse {
+        match m.poll() {
+            Ok(None) => println!("[usb]     mouse transfer still pending after disk I/O"),
+            Ok(Some(ev)) => println!("[usb]     pointer event {ev:?}"),
+            Err(e) => println!("[usb]     mouse poll failed: {e}"),
         }
     }
 }
