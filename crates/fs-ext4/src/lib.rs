@@ -59,7 +59,7 @@ use osmium_sync::{Once, SpinLock};
 use csum::{crc16, crc32c};
 use journal::Journal;
 use osmium_fs::dev::makedev;
-use osmium_fs::{DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat};
+use osmium_fs::{Clock, ClockSlot, DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat, Timestamp};
 
 const MAGIC: u16 = 0xef53;
 const ROOT_INO: u32 = 2;
@@ -365,6 +365,10 @@ impl Inode {
         (get16(&self.raw, ino::FILE_ACL_HIGH) as u64) << 32 | get32(&self.raw, ino::FILE_ACL) as u64
     }
 
+    fn time(&self, field: usize) -> Timestamp {
+        Timestamp::from_secs(get32(&self.raw, field) as i64)
+    }
+
     fn set_times(&mut self, now: u32, fields: &[usize]) {
         for &f in fields {
             put32(&mut self.raw, f, now);
@@ -428,7 +432,7 @@ struct Fs<D: BlockDevice + Send + 'static> {
     /// The CRC32C seed every `metadata_csum` checksum starts from.
     csum_seed: u32,
     read_only: bool,
-    clock: fn() -> u32,
+    clock: ClockSlot,
     /// One node per in-use inode, so an unlinked file is freed when its
     /// last reference goes. It does not own them: each leaves it when it is
     /// dropped.
@@ -574,8 +578,13 @@ fn super_span(dev_bs: usize) -> usize {
     (last - first + 1) * bs
 }
 
-fn no_clock() -> u32 {
-    0
+/// A plain function as a [`Clock`], for [`Ext2::set_clock`].
+struct FnClock(fn() -> u32);
+
+impl Clock for FnClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::from_secs((self.0)() as i64)
+    }
 }
 
 impl<D: BlockDevice + Send + 'static> Ext2<D> {
@@ -612,7 +621,7 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
             csum: Csum::None,
             csum_seed: 0,
             read_only: false,
-            clock: no_clock,
+            clock: ClockSlot::new(),
             nodes: Registry::new(),
             st_dev: devno,
             meta_zones: Vec::new(),
@@ -645,9 +654,17 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
     }
 
     /// Sets the clock that stamps access, change and modification times, in
-    /// seconds since 1970. Without one, new times are 0.
+    /// seconds since 1970. Without one, the global [`osmium_fs::clock`] is
+    /// used, and without that new times are 0. See also
+    /// [`set_clock_source`](Ext2::set_clock_source).
     pub fn set_clock(&self, clock: fn() -> u32) {
-        self.shared.fs.lock().clock = clock;
+        self.set_clock_source(Arc::new(FnClock(clock)));
+    }
+
+    /// Takes the time from `clock` (to the second: inodes without the extra
+    /// time fields have no more, and the extra fields are not written).
+    pub fn set_clock_source(&self, clock: Arc<dyn Clock>) {
+        self.shared.fs.lock().clock.set(clock);
     }
 
     /// Whether changes are journaled: the file system has an internal JBD2
@@ -888,7 +905,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     fn now(&self) -> u32 {
-        (self.clock)()
+        // Times are 32 bits here: before 1970 and after 2106 saturate.
+        self.clock.now().sec.clamp(0, u32::MAX as i64) as u32
     }
 
     // ---- Raw I/O ----
@@ -2372,6 +2390,158 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok(())
     }
 
+    /// Checks a name for a new entry.
+    fn check_new_name(name: &str) -> Result<(), Errno> {
+        if name.len() > NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    /// A directory that can take new entries: `ENOTDIR`, or `ENOENT` if it
+    /// has been removed.
+    fn live_dir(&mut self, dir: u32) -> Result<Inode, Errno> {
+        let parent = self.read_inode(dir)?;
+        if parent.kind() != FileKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if parent.links() == 0 {
+            return Err(Errno::ENOENT);
+        }
+        Ok(parent)
+    }
+
+    /// Adds the entry `name` in `dir` for the existing non-directory `ino`.
+    fn link(&mut self, dir: u32, name: &str, ino: u32) -> Result<(), Errno> {
+        self.writable()?;
+        Self::check_new_name(name)?;
+        self.live_dir(dir)?;
+        let mut inode = self.read_inode(ino)?;
+        let kind = inode.kind();
+        if kind == FileKind::Directory {
+            return Err(Errno::EPERM);
+        }
+        // An unlinked file stays unlinked (it may already be queued to be freed).
+        if inode.links() == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if inode.links() >= LINK_MAX {
+            return Err(Errno::EMLINK);
+        }
+        if self.find_entry(dir, name)?.is_some() {
+            return Err(Errno::EEXIST);
+        }
+        self.add_entry(dir, name, ino, kind)?;
+        let now = self.now();
+        inode.set_links(inode.links() + 1);
+        inode.set_times(now, &[ino::CTIME]);
+        self.write_inode(ino, &inode)?;
+        // Adding the entry may have grown the directory.
+        let mut parent = self.read_inode(dir)?;
+        parent.set_times(now, &[ino::MTIME, ino::CTIME]);
+        self.write_inode(dir, &parent)
+    }
+
+    /// Points directory `ino`'s `..` entry at `parent`.
+    fn set_dotdot(&mut self, ino: u32, parent: u32) -> Result<(), Errno> {
+        let done = self.scan_dir(ino, |fs, b, data| {
+            let (mut off, space) = (0, fs.dir_space(data));
+            while off < space {
+                let (used, rec_len, name) = fs.record(data, off)?;
+                if used != 0 && name == b".." {
+                    put32(data, off, parent);
+                    fs.write_dir_block(ino, b, data)?;
+                    return Ok(Some(()));
+                }
+                off += rec_len;
+            }
+            Ok(None)
+        })?;
+        done.ok_or(Errno::EIO)
+    }
+
+    /// Whether directory `ancestor` is `dir` or above it, by walking `..`.
+    fn is_ancestor(&mut self, ancestor: u32, dir: u32) -> Result<bool, Errno> {
+        let mut cur = dir;
+        // A loop in a damaged image ends the walk with an error.
+        for _ in 0..4096 {
+            if cur == ancestor {
+                return Ok(true);
+            }
+            if cur == ROOT_INO {
+                return Ok(false);
+            }
+            cur = self.find_entry(cur, "..")?.ok_or(Errno::EIO)?;
+        }
+        Err(Errno::EIO)
+    }
+
+    /// Moves `old_dir/old_name` to `new_dir/new_name`, replacing a target as
+    /// `rename(2)` does.
+    fn rename(&mut self, old_dir: u32, old_name: &str, new_dir: u32, new_name: &str) -> Result<(), Errno> {
+        self.writable()?;
+        Self::check_new_name(new_name)?;
+        if old_name == "." || old_name == ".." {
+            return Err(Errno::EINVAL);
+        }
+        self.live_dir(old_dir)?;
+        let new_parent = self.live_dir(new_dir)?;
+        let ino = self.find_entry(old_dir, old_name)?.ok_or(Errno::ENOENT)?;
+        let inode = self.read_inode(ino)?;
+        let kind = inode.kind();
+        let is_dir = kind == FileKind::Directory;
+        let across = old_dir != new_dir;
+        if is_dir && across && self.is_ancestor(ino, new_dir)? {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(existing) = self.find_entry(new_dir, new_name)? {
+            if existing == ino {
+                return Ok(());
+            }
+            let target_is_dir = self.read_inode(existing)?.kind() == FileKind::Directory;
+            match (is_dir, target_is_dir) {
+                (true, false) => return Err(Errno::ENOTDIR),
+                (false, true) => return Err(Errno::EISDIR),
+                _ => {}
+            }
+            // Fails with `ENOTEMPTY` for a directory with entries.
+            self.remove(new_dir, new_name, target_is_dir)?;
+        }
+        let uncounted = self.dir_nlink && new_parent.links() == 1;
+        if is_dir && across && !self.dir_nlink && !uncounted && self.read_inode(new_dir)?.links() >= LINK_MAX {
+            return Err(Errno::EMLINK);
+        }
+        self.add_entry(new_dir, new_name, ino, kind)?;
+        self.remove_entry(old_dir, old_name)?;
+        let now = self.now();
+        if is_dir && across {
+            self.set_dotdot(ino, new_dir)?;
+            let mut np = self.read_inode(new_dir)?;
+            if !(self.dir_nlink && np.links() == 1) {
+                let links = np.links().saturating_add(1);
+                np.set_links(if links >= LINK_MAX && self.dir_nlink { 1 } else { links });
+            }
+            self.write_inode(new_dir, &np)?;
+            let mut op = self.read_inode(old_dir)?;
+            if op.links() > 2 {
+                op.set_links(op.links() - 1);
+            }
+            self.write_inode(old_dir, &op)?;
+        }
+        let mut moved = self.read_inode(ino)?;
+        moved.set_times(now, &[ino::CTIME]);
+        self.write_inode(ino, &moved)?;
+        for d in [old_dir, new_dir] {
+            let mut p = self.read_inode(d)?;
+            p.set_times(now, &[ino::MTIME, ino::CTIME]);
+            self.write_inode(d, &p)?;
+        }
+        Ok(())
+    }
+
     fn stat(&mut self, ino: u32) -> Result<Stat, Errno> {
         let inode = self.read_inode(ino)?;
         let kind = inode.kind();
@@ -2393,6 +2563,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             nlink: inode.links() as u32,
             size: inode.size(),
             rdev,
+            atime: inode.time(ino::ATIME),
+            mtime: inode.time(ino::MTIME),
+            ctime: inode.time(ino::CTIME),
         })
     }
 }
@@ -2454,6 +2627,26 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
         self.with(|fs| fs.transact(|fs| fs.remove(self.ino, name, dir)))
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
+    fn link(&self, name: &str, target: &dyn File) -> Result<(), Errno> {
+        let target = target.as_any().and_then(|a| a.downcast_ref::<Node<D>>()).ok_or(Errno::EXDEV)?;
+        if !Arc::ptr_eq(&target.shared, &self.shared) {
+            return Err(Errno::EXDEV);
+        }
+        self.with(|fs| fs.transact(|fs| fs.link(self.ino, name, target.ino)))
+    }
+
+    fn rename(&self, old_name: &str, new_dir: &dyn File, new_name: &str) -> Result<(), Errno> {
+        let dst = new_dir.as_any().and_then(|a| a.downcast_ref::<Node<D>>()).ok_or(Errno::EXDEV)?;
+        if !Arc::ptr_eq(&dst.shared, &self.shared) {
+            return Err(Errno::EXDEV);
+        }
+        self.with(|fs| fs.transact(|fs| fs.rename(self.ino, old_name, dst.ino, new_name)))
     }
 
     fn readlink(&self) -> Result<String, Errno> {
@@ -2754,6 +2947,83 @@ mod tests {
                 assert!(vfs.lookup("/many/entry-with-a-longish-name-0001").is_ok());
                 assert_eq!(vfs.lookup("/many/entry-with-a-longish-name-0000").err(), Some(Errno::ENOENT));
             }
+        }
+    }
+
+    #[test]
+    fn links_renames_and_times_pass_fsck() {
+        let scratch = Scratch::new("rename");
+        for kind in [EXT2, EXT3, EXT4, EXT4_GROUPS] {
+            let Some(image) = mkfs(&scratch, kind, 1024, 8 << 20, None) else { return };
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let clock = Arc::new(osmium_fs::ManualClock::new(Timestamp::from_secs(1_700_000_000)));
+            ext2.set_clock_source(clock.clone());
+            let vfs = Vfs::new(ext2.root().unwrap());
+            let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+
+            vfs.open("/a", rw, 0o644).unwrap().write(0, b"alpha").unwrap();
+            let st = vfs.stat("/a", true).unwrap();
+            assert_eq!((st.mtime.sec, st.ctime.sec, st.atime.sec), (1_700_000_000, 1_700_000_000, 1_700_000_000));
+
+            // Hard links: same inode, counted, and the data outlives a name.
+            clock.advance(10);
+            vfs.link("/a", "/b").unwrap();
+            let (a, b) = (vfs.stat("/a", true).unwrap(), vfs.stat("/b", true).unwrap());
+            assert_eq!((a.ino, a.nlink, b.nlink), (b.ino, 2, 2));
+            assert_eq!((a.mtime.sec, a.ctime.sec), (1_700_000_000, 1_700_000_010));
+            assert_eq!(vfs.link("/a", "/b").err(), Some(Errno::EEXIST));
+            vfs.mkdir("/d", 0o755).unwrap();
+            assert_eq!(vfs.link("/d", "/d2").err(), Some(Errno::EPERM));
+            vfs.unlink("/a").unwrap();
+            assert_eq!(read_all(&*vfs.lookup("/b").unwrap()), b"alpha");
+            assert_eq!(vfs.stat("/b", true).unwrap().nlink, 1);
+
+            // Rename a file into a directory, over another, and back.
+            clock.advance(10);
+            vfs.rename("/b", "/d/c").unwrap();
+            assert_eq!(vfs.lookup("/b").err(), Some(Errno::ENOENT));
+            assert_eq!(vfs.stat("/d/c", true).unwrap().ctime.sec, 1_700_000_020);
+            assert_eq!(vfs.stat("/d", true).unwrap().mtime.sec, 1_700_000_020);
+            vfs.open("/over", rw, 0o644).unwrap().write(0, b"old").unwrap();
+            vfs.rename("/d/c", "/over").unwrap();
+            assert_eq!(read_all(&*vfs.lookup("/over").unwrap()), b"alpha");
+            vfs.rename("/over", "/over").unwrap();
+
+            // Directories: across parents (".." and link counts follow),
+            // over an empty one, and refused into themselves.
+            vfs.mkdir("/p", 0o755).unwrap();
+            vfs.mkdir("/q", 0o755).unwrap();
+            vfs.mkdir("/p/sub", 0o755).unwrap();
+            vfs.open("/p/sub/f", rw, 0o644).unwrap().write(0, b"deep").unwrap();
+            let (p, q) = (vfs.stat("/p", true).unwrap().nlink, vfs.stat("/q", true).unwrap().nlink);
+            vfs.rename("/p/sub", "/q/moved").unwrap();
+            assert_eq!(vfs.stat("/p", true).unwrap().nlink, p - 1);
+            assert_eq!(vfs.stat("/q", true).unwrap().nlink, q + 1);
+            assert_eq!(read_all(&*vfs.lookup("/q/moved/f").unwrap()), b"deep");
+            assert_eq!(vfs.canonicalize("/q/moved/..").unwrap(), "/q");
+            assert_eq!(vfs.rename("/q", "/q/moved/q").err(), Some(Errno::EINVAL));
+            vfs.mkdir("/empty", 0o755).unwrap();
+            vfs.rename("/q/moved", "/empty").unwrap();
+            assert_eq!(read_all(&*vfs.lookup("/empty/f").unwrap()), b"deep");
+            vfs.open("/q/keep", rw, 0o644).unwrap();
+            assert_eq!(vfs.rename("/empty", "/q").err(), Some(Errno::ENOTEMPTY));
+            assert_eq!(vfs.rename("/empty", "/over").err(), Some(Errno::ENOTDIR));
+            assert_eq!(vfs.rename("/over", "/empty").err(), Some(Errno::EISDIR));
+
+            // An open file renamed over is freed when its handle goes.
+            let held = vfs.open("/over", OpenFlags::READ, 0).unwrap();
+            vfs.open("/fresh", rw, 0o644).unwrap();
+            vfs.rename("/fresh", "/over").unwrap();
+            assert_eq!(read_all(&*held), b"alpha");
+            drop((held, vfs));
+
+            let image = unmount(ext2);
+            fsck(&scratch, &image, &[]);
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let vfs = Vfs::new(ext2.root().unwrap());
+            assert_eq!(read_all(&*vfs.lookup("/empty/f").unwrap()), b"deep");
+            assert_eq!(vfs.stat("/q", true).unwrap().nlink, 2);
+            assert_eq!(vfs.stat("/over", true).unwrap().size, 0);
         }
     }
 
