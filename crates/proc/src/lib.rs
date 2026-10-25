@@ -50,6 +50,11 @@
 //!   (`resume_user` in `osmium_arch::riscv64` / `aarch64`), and where a new
 //!   program's stack and `mmap` area go.
 //!
+//! - [`osmium_arch::mmu::set_remote_flush`] lets a process's threads run on
+//!   several CPUs at once (AArch64 needs nothing): unmapping and
+//!   copy-on-write changes then shoot down the other CPUs' TLB entries.
+//!   Without it `clone` pins a process's threads to one CPU. See [`thread`].
+//!
 //! A process is a group of [`Thread`]s, each with its own task: `clone` makes
 //! processes (`fork`, `vfork`) or, with `CLONE_THREAD`, threads (see
 //! [`thread`]), and [`signal`] delivers signals to user handlers. Forked

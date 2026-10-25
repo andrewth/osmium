@@ -535,7 +535,7 @@ pub fn current() -> Option<Arc<Process>> {
 /// process; false if the task is not a user task or the fault is not one to
 /// resolve.
 pub fn handle_page_fault(addr: u64, write: bool) -> bool {
-    current().is_some_and(|p| p.handle_page_fault(addr, write))
+    current().is_some_and(|p| p.handle_page_fault(addr, write) || (write && crate::thread::stale_write_fault(&p, addr)))
 }
 
 /// The root table to activate for `next`, for the scheduler's switch hook
