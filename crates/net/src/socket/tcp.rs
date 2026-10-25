@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
-use super::{Cx, Packet, binds};
+use super::{Cx, Packet, ReuseOptions, binds};
 use crate::wire::{MAX_SACK_BLOCKS, PROTO_TCP, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
 use crate::{Error, Instant};
 
@@ -141,6 +141,12 @@ pub struct TcpSocket {
     released: bool,
     /// The address [`listen_on`](Self::listen_on) was given, which a listener returns to.
     listen_addr: SocketAddr,
+    /// `SO_REUSEADDR` / `SO_REUSEPORT`; kept across [`reset`](Self::reset).
+    reuse: ReuseOptions,
+    /// The listening sockets of one owner that share a `SO_REUSEPORT`
+    /// accept queue (0: the socket stands alone). See
+    /// [`set_reuse_group`](Self::set_reuse_group).
+    reuse_group: u32,
 
     rx: VecDeque<u8>,
     rx_cap: usize,
@@ -254,6 +260,8 @@ impl TcpSocket {
             passive: false,
             released: false,
             listen_addr: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0),
+            reuse: ReuseOptions::NONE,
+            reuse_group: 0,
             rx: VecDeque::new(),
             rx_cap: rx_cap.min(MAX_RX_CAP),
             ooo: Vec::new(),
@@ -313,7 +321,10 @@ impl TcpSocket {
 
     fn reset(&mut self) {
         let (sack_enabled, ts_enabled) = (self.sack_enabled, self.ts_enabled);
+        let (reuse, reuse_group) = (self.reuse, self.reuse_group);
         *self = Self::new(self.rx_cap, self.tx_cap);
+        self.reuse = reuse;
+        self.reuse_group = reuse_group;
         self.sack_enabled = sack_enabled;
         self.ts_enabled = ts_enabled;
     }
@@ -618,6 +629,46 @@ impl TcpSocket {
         }
         self.challenge_tokens -= 1;
         true
+    }
+
+    /// Sets `SO_REUSEADDR` / `SO_REUSEPORT` for the next bind or listen
+    /// (see [`SocketSet::listen_tcp`](super::SocketSet::listen_tcp)). They
+    /// stay set when the socket is reused.
+    pub fn set_reuse(&mut self, reuse: ReuseOptions) {
+        self.reuse = reuse;
+    }
+
+    /// The socket's reuse options.
+    pub fn reuse(&self) -> ReuseOptions {
+        self.reuse
+    }
+
+    /// Declares this listener one of a group (`group` is not 0) that
+    /// stands for a single listening socket of the application, such as
+    /// the sockets of one backlog. With `SO_REUSEPORT`, a new connection
+    /// is spread over the groups, not over the sockets, and goes to a free
+    /// listener of the group it picked.
+    pub fn set_reuse_group(&mut self, group: u32) {
+        self.reuse_group = group;
+    }
+
+    /// The group set by [`set_reuse_group`](Self::set_reuse_group), 0 for none.
+    pub fn reuse_group(&self) -> u32 {
+        self.reuse_group
+    }
+
+    /// What the socket holds of the address space for a bind check: the
+    /// address it is bound to and whether it listens. `None` if it holds
+    /// none (closed, or no port yet).
+    pub(crate) fn bound(&self) -> Option<(SocketAddr, bool)> {
+        if self.state == State::Closed {
+            return None;
+        }
+        // A half-open listener holds the address it listens on, not the one
+        // the SYN came to.
+        let listening = self.state == State::Listen || (self.state == State::SynReceived && self.passive);
+        let addr = if listening { self.listen_addr } else { self.local };
+        (addr.port() != 0).then_some((addr, listening))
     }
 
     /// Returns true if the socket listens for connections to `dst`.

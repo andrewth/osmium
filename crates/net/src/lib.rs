@@ -59,6 +59,8 @@ pub mod wire;
 mod testing;
 #[cfg(test)]
 mod loopback_tests;
+#[cfg(test)]
+mod reuse_tests;
 
 pub use error::Error;
 pub use iface::{Config, Interface, Ipv6Address};
@@ -67,7 +69,7 @@ pub use socket::dns::{DnsClient, DnsError, DnsQuery};
 pub use socket::icmp::{EchoReply, IcmpSocket};
 pub use socket::tcp::{State as TcpState, TcpSocket};
 pub use socket::udp::UdpSocket;
-pub use socket::{AnySocket, Socket, SocketHandle, SocketSet};
+pub use socket::{AnySocket, BindProtocol, ReuseOptions, Socket, SocketHandle, SocketSet};
 pub use time::Instant;
 
 pub use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};

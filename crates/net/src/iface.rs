@@ -809,19 +809,24 @@ impl Interface {
                 let dst = SocketAddr::new(ip.dst.into(), udp.dst_port);
                 let src = SocketAddr::new(ip.src.into(), udp.src_port);
                 let mut delivered = false;
-                for (_, s) in sockets.iter_mut() {
-                    match s {
-                        Socket::Udp(s) if s.accepts(dst) => {
+                let targets = sockets.udp_targets(src, dst);
+                // The DHCP client takes its replies when its handle comes before the UDP sockets'.
+                let dhcp = if udp.dst_port == dhcp::CLIENT_PORT && udp.src_port == dhcp::SERVER_PORT {
+                    sockets.iter().find(|(h, s)| matches!(s, Socket::Dhcp(_)) && targets.first().is_none_or(|t| h < t))
+                } else {
+                    None
+                };
+                if let Some((h, _)) = dhcp {
+                    if let Some(s) = sockets.try_get_mut::<crate::DhcpClient>(h) {
+                        s.process(&mut cx, data);
+                    }
+                    delivered = true;
+                } else {
+                    for h in targets {
+                        if let Some(s) = sockets.try_get_mut::<crate::UdpSocket>(h) {
                             s.process(src, data);
                             delivered = true;
-                            break;
                         }
-                        Socket::Dhcp(s) if udp.dst_port == dhcp::CLIENT_PORT && udp.src_port == dhcp::SERVER_PORT => {
-                            s.process(&mut cx, data);
-                            delivered = true;
-                            break;
-                        }
-                        _ => {}
                     }
                 }
                 // No errors about frames that went to the whole link.
@@ -860,7 +865,6 @@ impl Interface {
                 let src = SocketAddr::new(ip.src.into(), tcp.src_port);
                 let socket = {
                     let mut exact = None;
-                    let mut listen = None;
                     let mut queued = None;
                     for (h, s) in sockets.iter() {
                         if let Socket::Tcp(s) = s {
@@ -868,15 +872,12 @@ impl Interface {
                                 exact = Some(h);
                                 break;
                             }
-                            if listen.is_none() && s.accepts_listen(dst) {
-                                listen = Some(h);
-                            }
                             if queued.is_none() && s.accepts_queued(dst) {
                                 queued = Some(h);
                             }
                         }
                     }
-                    exact.or(listen).or(queued)
+                    exact.or_else(|| sockets.tcp_listener(src, dst)).or(queued)
                 };
                 let rst = match socket {
                     Some(h) => sockets.get_mut::<crate::TcpSocket>(h).process(&mut cx, dst, src, &tcp, data),
