@@ -46,6 +46,8 @@ pub enum SatpMode {
     Sv39 = 8,
     /// Four-level, 48-bit virtual addresses.
     Sv48 = 9,
+    /// Five-level, 57-bit virtual addresses.
+    Sv57 = 10,
 }
 
 /// Encodes a `satp` value.

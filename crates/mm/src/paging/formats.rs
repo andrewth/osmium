@@ -3,9 +3,10 @@
 //! | Format | Use | Levels | Input bits |
 //! |---|---|---|---|
 //! | [`X86_64`] | x86_64 4-level paging | 4 | 48, sign-extended |
+//! | [`X86_64La57`] | x86_64 5-level paging (`CR4.LA57`) | 5 | 57, sign-extended |
 //! | [`Aarch64`] | AArch64 stage 1, 4 KiB granule | 4 | 48, sign-extended |
 //! | [`Aarch64El2`] | AArch64 EL2 stage 1 (non-VHE), 4 KiB granule | 4 | 48 |
-//! | [`Sv39`] / [`Sv48`] | RISC-V supervisor paging | 3 / 4 | 39 / 48, sign-extended |
+//! | [`Sv39`] / [`Sv48`] / [`Sv57`] | RISC-V supervisor paging | 3 / 4 / 5 | 39 / 48 / 57, sign-extended |
 //! | [`Sv39x4`] / [`Sv48x4`] | RISC-V G-stage (guest physical), 16 KiB root | 3 / 4 | 41 / 50 |
 //! | [`Ept`] | Intel extended page tables (guest physical) | 4 | 48 |
 //! | [`Aarch64Stage2`] | AArch64 stage 2 (guest IPA), starting level 0 | 4 | 48 |
@@ -107,6 +108,44 @@ impl PageTableFormat for X86_64 {
             f = f | MapFlags::DEVICE;
         }
         f
+    }
+}
+
+/// x86_64 5-level paging (LA57): [`X86_64`] with one more level, a 57-bit
+/// address space. The entry encoding is the same. The CPU must have
+/// `CR4.LA57` set, which can only be done before long mode is entered (or by
+/// leaving and re-entering it), so a kernel that wants this has to enable it
+/// in its boot code.
+pub struct X86_64La57;
+
+impl PageTableFormat for X86_64La57 {
+    const LEVELS: usize = 5;
+    const VA_BITS: u32 = 57;
+    const SIGN_EXTEND: bool = true;
+    const MAX_LEAF_LEVEL: usize = 2;
+
+    fn table(pa: PhysAddr) -> u64 {
+        X86_64::table(pa)
+    }
+
+    fn leaf(pa: PhysAddr, f: MapFlags, level: usize) -> u64 {
+        X86_64::leaf(pa, f, level)
+    }
+
+    fn is_valid(pte: u64) -> bool {
+        X86_64::is_valid(pte)
+    }
+
+    fn is_leaf(pte: u64, level: usize) -> bool {
+        X86_64::is_leaf(pte, level)
+    }
+
+    fn addr(pte: u64, level: usize) -> PhysAddr {
+        X86_64::addr(pte, level)
+    }
+
+    fn flags(pte: u64, level: usize) -> MapFlags {
+        X86_64::flags(pte, level)
     }
 }
 
@@ -290,6 +329,8 @@ pub struct Riscv<const LEVELS: usize, const VA_BITS: u32>;
 pub type Sv39 = Riscv<3, 39>;
 /// RISC-V Sv48.
 pub type Sv48 = Riscv<4, 48>;
+/// RISC-V Sv57 (`satp.MODE` 10).
+pub type Sv57 = Riscv<5, 57>;
 
 impl<const LEVELS: usize, const VA_BITS: u32> PageTableFormat for Riscv<LEVELS, VA_BITS> {
     const LEVELS: usize = LEVELS;
