@@ -22,7 +22,9 @@ use crate::socket::{Cx, Packet, Socket, SocketSet};
 use crate::wire::*;
 use crate::{Error, Instant};
 
+mod addrgen;
 mod frag;
+pub use addrgen::TemporaryAddress;
 
 /// Hop limit of the packets we originate.
 const HOP_LIMIT: u8 = 64;
@@ -133,6 +135,8 @@ pub(super) struct State {
     rs_next: Option<Instant>,
     /// Fragmented datagrams being put back together.
     reasm: crate::frag6::Reassembler,
+    /// How SLAAC addresses are formed, and the temporary ones.
+    privacy: addrgen::Privacy,
 }
 
 fn lifetime(now: Instant, secs: u32) -> Option<Instant> {
@@ -158,6 +162,7 @@ impl State {
             rs_sent: 0,
             rs_next: None,
             reasm: frag::new_reassembler(),
+            privacy: addrgen::Privacy::default(),
         }
     }
 
@@ -179,7 +184,7 @@ impl State {
         if !self.enabled {
             return None;
         }
-        self.addrs.iter().find(|a| matches!(a.dad, Dad::Done)).map(|a| a.addr)
+        self.preferred_temp().or_else(|| self.addrs.iter().find(|a| matches!(a.dad, Dad::Done)).map(|a| a.addr))
     }
 
     /// The MTU in use, given the link's.
@@ -214,7 +219,7 @@ impl State {
             .chain(self.routers.iter().map(|r| r.expires))
             .chain(self.dns_expires);
         let nd = self.requests.iter().map(|r| r.last + NS_RETRY);
-        dad.chain(self.rs_next).chain(expiry).chain(nd).chain(self.reasm.poll_at()).min()
+        dad.chain(self.rs_next).chain(expiry).chain(nd).chain(self.reasm.poll_at()).chain(self.privacy_poll_at()).min()
     }
 
     fn on_link(&self, dst: Ipv6Addr) -> bool {
@@ -267,8 +272,10 @@ impl Interface {
     /// Turns IPv6 off and forgets its addresses, routers and neighbors.
     pub fn disable_ipv6(&mut self) {
         let slaac = self.v6.slaac;
+        let privacy = core::mem::take(&mut self.v6.privacy).reset();
         self.v6 = State::new(self.mac);
         self.v6.slaac = slaac;
+        self.v6.privacy = privacy;
     }
 
     /// Returns true if IPv6 is on.
@@ -388,6 +395,7 @@ impl Interface {
             v6.dns.clear();
             v6.dns_expires = None;
         }
+        self.privacy_poll(now);
 
         // Neighbor solicitation retries.
         let mut i = 0;
@@ -742,7 +750,9 @@ impl Interface {
             self.v6.link_local.dad = Dad::Duplicate;
             self.v6.rs_next = None;
         } else {
+            let expires = self.v6.addrs.iter().find(|x| x.addr == a).and_then(|x| x.expires);
             self.v6.addrs.retain(|x| x.addr != a);
+            self.address_collided(a, expires);
         }
     }
 
@@ -805,7 +815,8 @@ impl Interface {
             if !p.autonomous || p.prefix_len != 64 {
                 continue;
             }
-            let addr = with_prefix(p.prefix, 64, eui64(self.mac));
+            self.temp_for_prefix(now, p.prefix, p.valid_lifetime, p.preferred_lifetime);
+            let addr = self.slaac_address(p.prefix);
             if let Some(a) = self.v6.addrs.iter_mut().find(|a| a.addr == addr) {
                 // RFC 4862 section 5.5.3 e).
                 let Some(current) = a.expires else { continue };

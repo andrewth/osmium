@@ -33,6 +33,8 @@
 //! by the address they bind or connect to. IPv6 extension headers are walked
 //! on receipt; IPv6 datagrams larger than the MTU are fragmented on send and
 //! reassembled on receipt within bounded limits ([`frag6`]).
+//! Addresses can be MAC-derived (the default), opaque and stable per network
+//! (RFC 7217), or accompanied by temporary ones (RFC 4941); see [`privacy`].
 //!
 //! Not supported: IP forwarding, IGMPv3 reports.
 //!
@@ -50,6 +52,7 @@ mod iface;
 pub mod igmp;
 pub mod ipopt;
 pub mod ipv6;
+pub mod privacy;
 mod rng;
 mod socket;
 mod time;
@@ -61,7 +64,7 @@ mod testing;
 mod loopback_tests;
 
 pub use error::Error;
-pub use iface::{Config, Interface, Ipv6Address};
+pub use iface::{Config, Interface, Ipv6Address, TemporaryAddress};
 pub use socket::dhcp::{DhcpClient, DhcpEvent};
 pub use socket::dns::{DnsClient, DnsError, DnsQuery};
 pub use socket::icmp::{EchoReply, IcmpSocket};
