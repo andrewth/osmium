@@ -11,6 +11,14 @@
 //! from the hypervisor (timer, console, HSM, IPI, RFENCE, reset). Its
 //! console output is printed with a `| ` prefix. The guest used by
 //! `scripts/check.sh` is Osmium's own `riscv-virt` kernel.
+//!
+//! On a hart with the Ssaia extension (QEMU: `-cpu rv64,ssaia=true`), a
+//! small demo guest also runs first with an emulated APLIC in MSI mode and an
+//! IMSIC interrupt file instead of a PLIC: it enables the file through
+//! `siselect`/`sireg`, takes an interrupt sent by the APLIC's `setipnum`, one
+//! written straight to the file's page, and a UART interrupt routed through
+//! the APLIC, claiming each with `stopei`. The hypervisor completes those CSR
+//! accesses (virtual-instruction traps) against the model.
 #![no_std]
 #![no_main]
 
@@ -40,7 +48,7 @@ use osmium::mm::heap::LockedHeap;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind};
 use osmium::sync::{IrqSpinLock, Once};
-use osmium::virt::devices::{Uart16550 as Uart16550Model, VirtualPlic};
+use osmium::virt::devices::{Uart16550 as Uart16550Model, VirtualAplic, VirtualImsic, VirtualPlic};
 use osmium::virt::riscv::fdt::GuestMachine;
 use osmium::virt::riscv::{self, HartId, RiscvVcpu, sbi};
 use osmium::virt::smp::GuestCpus;
@@ -84,9 +92,89 @@ boot_stack_top:
 "#
 );
 
+// The AIA demo guest (VS-mode, MMU off, hart 0). It reaches the IMSIC's
+// registers through siselect (0x150), sireg (0x151) and stopei (0x15c).
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .globl aia_guest, aia_guest_end
+aia_guest:
+    li s0, 0x0d000000               # APLIC
+    li s1, 0x28000000               # this hart's IMSIC file
+    li s2, 0x10000000               # 16550
+    li t0, 0x200
+    csrs sie, t0                    # SEIE: wfi wakes for the external interrupt
+    li t0, 0x70
+    csrw 0x150, t0                  # siselect = eidelivery
+    li t1, 1
+    csrw 0x151, t1                  # sireg: delivery on
+    li t0, 0x72
+    csrw 0x150, t0                  # siselect = eithreshold
+    csrw 0x151, zero
+    li t0, 0xc0
+    csrw 0x150, t0                  # siselect = eie0
+    li t1, 0x2a0                    # identities 5, 7 and 9
+    csrw 0x151, t1
+    csrr s3, 0x151                  # read the enables back
+    li t0, 0x104
+    sw t0, 0(s0)                    # APLIC domaincfg: IE, MSI delivery
+    lw s4, 0(s0)
+    li t0, 6
+    sw t0, 0x28(s0)                 # sourcecfg[10]: level, active high
+    li t0, 5
+    li t5, 0x3028
+    add t5, s0, t5
+    sw t0, 0(t5)                    # target[10]: hart 0, EIID 5
+    li t0, 10
+    li t5, 0x1edc
+    add t5, s0, t5
+    sw t0, 0(t5)                    # setienum 10
+    li t5, 0x1cdc
+    add t5, s0, t5
+    sw t0, 0(t5)                    # setipnum 10: the APLIC sends EIID 5
+    wfi
+    csrrw s5, 0x15c, zero           # stopei: claim
+    li t0, 7
+    sw t0, 0(s1)                    # a message straight into the file
+    wfi
+    csrrw s6, 0x15c, zero
+    li t0, 9
+    li t5, 0x3028
+    add t5, s0, t5
+    sw t0, 0(t5)                    # target[10]: EIID 9 for the UART
+    li t0, 1
+    sb t0, 1(s2)                    # 16550 IER: receive interrupt
+1:  wfi
+    csrrw s7, 0x15c, zero
+    beqz s7, 1b
+    la a0, 4f
+2:  lbu t0, 0(a0)                   # prefix
+    beqz t0, 3f
+    sb t0, 0(s2)
+    addi a0, a0, 1
+    j 2b
+3:  lbu t0, 5(s2)                   # LSR: echo while data is ready
+    andi t0, t0, 1
+    beqz t0, 5f
+    lbu t0, 0(s2)
+    sb t0, 0(s2)
+    j 3b
+5:  csrrw s8, 0x15c, zero           # nothing left
+    li a7, 8                        # SBI legacy shutdown
+    ecall
+6:  j 6b
+4:  .asciz "[guest] AIA UART interrupt, received: "
+    .balign 4
+aia_guest_end:
+"#
+);
+
 unsafe extern "C" {
     static _kernel_start: u8;
     static _kernel_end: u8;
+    static aia_guest: u8;
+    static aia_guest_end: u8;
     fn secondary_start();
 }
 
@@ -237,6 +325,17 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     }
     println!("[smp]   {ncpus} host harts online, one per guest vCPU");
 
+    // The AIA demo, on a hart that can run it.
+    let isa = fdt.find_node("/cpus/cpu@0").or_else(|| fdt.find_node("/cpus").and_then(|c| c.children().next()));
+    let ext = |name: &str| {
+        isa.as_ref().is_some_and(|n| {
+            n.property("riscv,isa-extensions").is_some_and(|p| p.as_str_list().any(|e| e == name))
+                || n.property("riscv,isa").and_then(|p| p.as_str()).is_some_and(|i| i.split('_').any(|e| e == name))
+        })
+    };
+    if ext("ssaia") {
+        aia_demo(ext("smstateen") || ext("ssstateen"));
+    }
     if !image_window {
         println!("[hyp]   RAM ends below {:#x}: run QEMU with -m 512M and a guest kernel", IMAGE_BASE + IMAGE_WINDOW);
         host_sbi::shutdown()
@@ -419,6 +518,84 @@ fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
     last
 }
 
+/// Runs a guest that uses an emulated APLIC (MSI delivery) and IMSIC: see the
+/// module documentation.
+fn aia_demo(smstateen: bool) {
+    const APLIC: u64 = 0x0d00_0000;
+    const IMSIC: u64 = 0x2800_0000;
+    const UART_SOURCE: u32 = 10;
+    riscv::enable_aia(smstateen);
+    let ram = FRAMES.lock().alloc(9).expect("no memory for the guest");
+    let len = (PAGE_SIZE as u64) << 9;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guest until it is freed below.
+    unsafe { mem.add_region(GuestPhysAddr(GUEST_RAM), ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image in .rodata.
+    let image = unsafe {
+        let start = &raw const aia_guest;
+        core::slice::from_raw_parts(start, (&raw const aia_guest_end).offset_from(start) as usize)
+    };
+    mem.write(GuestPhysAddr(GUEST_RAM), image).expect("write failed");
+    let mem = Arc::new(mem);
+    let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
+    map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
+
+    let vcpu =
+        RiscvVcpu::new(GuestPhysAddr(GUEST_RAM), HartId(0), 0, hgatp_sv39x4(gstage.root(), 2)).with_memory(mem.clone());
+    let line = vcpu.external_irq();
+    let imsic = Arc::new(VirtualImsic::new(1, 255, move |_, level| line.store(level, Ordering::Release)));
+    let i = imsic.clone();
+    let aplic = Arc::new(
+        VirtualAplic::new(32, 1, |_, _| {}).with_msi(move |hart, _guest, eiid| i.set_pending(hart as usize, eiid)),
+    );
+    let mut vcpu = vcpu.with_imsic(imsic.clone(), 0);
+    let a = aplic.clone();
+    let uart = Arc::new(Uart16550Model::new(guest_console()).with_irq(move |level| a.set_input(UART_SOURCE, level)));
+    let mmio = Bus::new();
+    mmio.insert(APLIC, VirtualAplic::mmio_size(0), aplic).expect("insert failed");
+    mmio.insert(IMSIC, VirtualImsic::mmio_size(1), imsic.mmio()).expect("insert failed");
+    mmio.insert(GUEST_UART, 8, uart.clone()).expect("insert failed");
+
+    let (mut halts, mut typed) = (0, false);
+    let sbi_out = guest_console();
+    let exit = run_vcpu(&mut vcpu, &mmio, &Bus::new(), |v, exit| match exit {
+        VmExit::Hypercall { .. } => match sbi::handle(v, &mem, exit, &mut |b| b.iter().for_each(|&c| sbi_out(c))) {
+            Some(sbi::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
+            _ => ControlFlow::Continue(()),
+        },
+        VmExit::Halt => {
+            halts += 1;
+            if v.state.x[22] != 0 && !typed {
+                // Two interrupts are in: "type" a line for the third.
+                typed = true;
+                for &b in b"ping\n" {
+                    uart.push_input(b);
+                }
+            }
+            let deadline = riscv::time() + 10_000_000;
+            while !v.interrupt_pending(riscv::time()) {
+                if riscv::time() > deadline {
+                    return ControlFlow::Break(VmExit::Halt);
+                }
+                core::hint::spin_loop();
+            }
+            ControlFlow::Continue(())
+        }
+        VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+        other => ControlFlow::Break(other),
+    });
+    let x = &vcpu.state.x;
+    println!(
+        "[hyp]   AIA guest exit {exit:?}: eie0 {:#x}, APLIC domaincfg {:#x}; stopei claimed {:#x} (APLIC setipnum), {:#x} (IMSIC page write), {:#x} (UART via APLIC), then {:#x}; {halts} halts",
+        x[19], x[20], x[21], x[22], x[23], x[24]
+    );
+    drop(mmio);
+    drop(gstage);
+    // SAFETY: the guest has stopped and nothing references its RAM.
+    unsafe { FRAMES.lock().dealloc(ram, 9) };
+}
+
 /// Loads `elf` into fresh guest RAM and runs it with one vCPU per host
 /// hart until it shuts down.
 fn boot_guest(elf: &Elf<'_>, harts: usize) {
@@ -448,6 +625,7 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
         timebase: 10_000_000,
         memory: &[(GUEST_RAM, len)],
         plic: Some((PLIC_BASE, 32)),
+        aia: None,
         uarts: &[(GUEST_UART, UART_IRQ)],
         virtio: if HOST_NIC.get().is_some() {
             &[(BLK_BASE, BLK_IRQ), (NET_BASE, NET_IRQ)]

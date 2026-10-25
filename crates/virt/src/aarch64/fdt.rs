@@ -7,21 +7,43 @@ use osmium_boot::fdt::FdtWriter;
 
 /// An AArch64 guest's machine, described in the layout Linux and
 /// `osmium-boot` expect from QEMU `virt`: CPUs started with PSCI over `hvc`,
-/// a GICv2, the architected timer, PL011 UARTs and virtio-mmio devices.
+/// a GICv2 or GICv3, the architected timer, PL011 UARTs and virtio-mmio devices.
 /// Interrupts are given as SPI numbers (INTID - 32).
 pub struct ArmMachine<'src> {
     /// Number of CPUs (MPIDR affinity 0 = 0, 1, ...).
     pub cpus: u32,
     /// RAM as (base, size).
     pub memory: &'src [(u64, u64)],
-    /// GICv2 distributor and CPU interface bases.
-    pub gic: (u64, u64),
+    /// The interrupt controller.
+    pub gic: ArmGic,
     /// PL011 UARTs as (base, SPI); the first is the console.
     pub uarts: &'src [(u64, u32)],
     /// virtio-mmio devices as (base, SPI).
     pub virtio: &'src [(u64, u32)],
     /// Kernel command line.
     pub bootargs: &'src str,
+}
+
+/// The interrupt controller an [`ArmMachine`] describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmGic {
+    /// A GICv2: distributor and CPU interface bases (64 KiB each).
+    V2 {
+        /// Distributor base.
+        distributor: u64,
+        /// CPU interface base.
+        cpu_interface: u64,
+    },
+    /// A GICv3 (no ITS): distributor base (64 KiB) and the base and size of
+    /// the redistributor region (128 KiB per CPU).
+    V3 {
+        /// Distributor base.
+        distributor: u64,
+        /// Redistributor region base.
+        redistributors: u64,
+        /// Redistributor region size.
+        redistributors_size: u64,
+    },
 }
 
 const GIC_PHANDLE: u32 = 1;
@@ -38,7 +60,8 @@ impl ArmMachine<'_> {
         let mut w = FdtWriter::new();
         let cells = |v: u64| [(v >> 32) as u32, v as u32];
         let reg = |a: u64, s: u64| [cells(a), cells(s)].concat();
-        let ppi_cpus = ((1u32 << self.cpus) - 1) << 8;
+        // GICv2 PPI specifiers carry a CPU mask in bits 15:8; GICv3's do not.
+        let ppi_cpus = if matches!(self.gic, ArmGic::V2 { .. }) { ((1u32 << self.cpus) - 1) << 8 } else { 0 };
 
         w.begin_node("");
         w.property_u32("#address-cells", 2);
@@ -79,10 +102,21 @@ impl ArmMachine<'_> {
             w.end_node();
         }
 
-        let (gicd, gicc) = self.gic;
+        let (ArmGic::V2 { distributor: gicd, .. } | ArmGic::V3 { distributor: gicd, .. }) = self.gic;
         w.begin_node(&format!("intc@{gicd:x}"));
-        w.property_string_list("compatible", &["arm,cortex-a15-gic"]);
-        w.property_cells("reg", &[reg(gicd, 0x1_0000), reg(gicc, 0x1_0000)].concat());
+        match self.gic {
+            ArmGic::V2 { distributor, cpu_interface } => {
+                w.property_string_list("compatible", &["arm,cortex-a15-gic"]);
+                w.property_cells("reg", &[reg(distributor, 0x1_0000), reg(cpu_interface, 0x1_0000)].concat());
+            }
+            ArmGic::V3 { distributor, redistributors, redistributors_size } => {
+                w.property_string_list("compatible", &["arm,gic-v3"]);
+                w.property_cells(
+                    "reg",
+                    &[reg(distributor, 0x1_0000), reg(redistributors, redistributors_size)].concat(),
+                );
+            }
+        }
         w.property_u32("#interrupt-cells", 3);
         w.property_u32("#address-cells", 0);
         w.property_empty("interrupt-controller");
@@ -137,7 +171,7 @@ mod tests {
         let m = ArmMachine {
             cpus: 2,
             memory: &[(0x4000_0000, 0x400_0000)],
-            gic: (0x0800_0000, 0x0801_0000),
+            gic: ArmGic::V2 { distributor: 0x0800_0000, cpu_interface: 0x0801_0000 },
             uarts: &[(0x0900_0000, 1)],
             virtio: &[(0x0a00_0000, 16)],
             bootargs: "console=ttyAMA0",
@@ -158,5 +192,29 @@ mod tests {
         assert_eq!(uart.reg().next(), Some((0x0900_0000, Some(0x1000))));
         assert_eq!(fdt.all_nodes().filter(|n| n.compatible().any(|c| c == "virtio,mmio")).count(), 1);
         assert_eq!(fdt.find_node("/cpus").unwrap().children().count(), 2);
+    }
+
+    #[test]
+    fn gicv3_node() {
+        let m = ArmMachine {
+            cpus: 4,
+            memory: &[(0x4000_0000, 0x400_0000)],
+            gic: ArmGic::V3 {
+                distributor: 0x0800_0000,
+                redistributors: 0x080a_0000,
+                redistributors_size: 4 * 0x2_0000,
+            },
+            uarts: &[],
+            virtio: &[],
+            bootargs: "",
+        };
+        let dtb = m.to_dtb();
+        let fdt = Fdt::new(&dtb).unwrap();
+        assert!(fdt.find_compatible(&["arm,cortex-a15-gic"]).is_none());
+        let gic = fdt.find_compatible(&["arm,gic-v3"]).unwrap();
+        let regs: Vec<_> = gic.reg().collect();
+        assert_eq!(regs, [(0x0800_0000, Some(0x1_0000)), (0x080a_0000, Some(0x8_0000))]);
+        let timer = fdt.find_compatible(&["arm,armv8-timer"]).unwrap();
+        assert_eq!(timer.interrupts().nth(2 * 3 + 2), Some(4), "level-high, no CPU mask");
     }
 }

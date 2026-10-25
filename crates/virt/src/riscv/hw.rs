@@ -304,7 +304,19 @@ pub fn time() -> u64 {
     t
 }
 
-fn load_vs(c: &VsCsrs) {
+/// Lets VS-mode use the AIA CSRs (`siselect`, `sireg`, `stopei`): with
+/// Smstateen, `hstateen0` must grant them (bits 60 CSRIND, 59 AIA, 58
+/// IMSIC; bit 63 keeps the other state-enable bits as they were). Call on
+/// each hart before running a vCPU that has an IMSIC, only if the hart has
+/// Ssaia, and `smstateen` says whether it also has Smstateen/Ssstateen
+/// (otherwise there is no `hstateen0`).
+pub fn enable_aia(smstateen: bool) {
+    if smstateen {
+        csr_write!("0x60c", 1u64 << 63 | 1 << 60 | 1 << 59 | 1 << 58);
+    }
+}
+
+fn load_vs(c: &VsCsrs, aia: bool) {
     csr_write!("0x200", c.vsstatus);
     csr_write!("0x204", c.vsie);
     csr_write!("0x205", c.vstvec);
@@ -315,9 +327,12 @@ fn load_vs(c: &VsCsrs) {
     csr_write!("0x280", c.vsatp);
     csr_write!("0x645", c.hvip);
     csr_write!("0x24d", c.vstimecmp);
+    if aia {
+        csr_write!("0x250", c.vsiselect);
+    }
 }
 
-fn save_vs(c: &mut VsCsrs) {
+fn save_vs(c: &mut VsCsrs, aia: bool) {
     c.vsstatus = csr_read!("0x200");
     c.vsie = csr_read!("0x204");
     c.vstvec = csr_read!("0x205");
@@ -328,6 +343,9 @@ fn save_vs(c: &mut VsCsrs) {
     c.vsatp = csr_read!("0x280");
     c.hvip = csr_read!("0x645");
     c.vstimecmp = csr_read!("0x24d");
+    if aia {
+        c.vsiselect = csr_read!("0x250");
+    }
 }
 
 /// Executes a remote fence requested of this hart: `fence.i`, then
@@ -433,11 +451,11 @@ pub(super) fn run(v: &mut RiscvVcpu) {
     // Sampled again now that interrupts are masked: a line raised since
     // `Vcpu::run` copied it would otherwise wait for the next exit.
     v.sync_lines();
-    load_vs(&v.csrs);
+    load_vs(&v.csrs, v.aia.is_some());
     // SAFETY: `state` stays valid and exclusively borrowed for the guest run;
     // the assembly saves and restores every callee-saved host register.
     unsafe { osmium_hs_run(&mut v.state) };
-    save_vs(&mut v.csrs);
+    save_vs(&mut v.csrs, v.aia.is_some());
     if v.csrs.vsstatus & SSTATUS_FS != 0 {
         save_fp(&mut v.fp);
     }

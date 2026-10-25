@@ -13,7 +13,19 @@
 //! | Host interrupt | [`VmExit::ExternalInterrupt`] |
 //! | Anything else | [`VmExit::Unhandled`] with `scause` |
 //!
-//! [`sbi`] answers the common SBI calls on top of this. The guest's timer
+//! [`sbi`] answers the common SBI calls on top of this.
+//!
+//! # Virtual AIA
+//!
+//! [`RiscvVcpu::with_imsic`] attaches the vCPU to a
+//! [`VirtualImsic`] as one hart's interrupt
+//! file. The guest's `sireg` and `stopei` CSRs (Ssaia) then trap to the
+//! hypervisor as virtual-instruction exceptions (the host leaves
+//! `hstatus.VGEIN` zero, so there is no hardware guest interrupt file) and
+//! are completed in software against the model; `siselect` is the guest's
+//! `vsiselect` and switched with the other VS CSRs. The host needs Ssaia
+//! (`vsiselect`) and, with Smstateen, `hstateen0` bits that let VS-mode reach
+//! the AIA CSRs (`enable_aia`, on riscv64 builds). The guest's timer
 //! uses `vstimecmp`, so the CPU needs the Sstc extension. The guest's
 //! floating-point registers ([`FpState`], D extension) are loaded before
 //! every run and saved after it if the guest has FP enabled
@@ -27,11 +39,12 @@ pub mod sbi;
 #[cfg(all(target_arch = "riscv64", feature = "riscv64-hs"))]
 mod hw;
 #[cfg(all(target_arch = "riscv64", feature = "riscv64-hs"))]
-pub use hw::{init_cpu, time};
+pub use hw::{enable_aia, init_cpu, time};
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::devices::VirtualImsic;
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::stage2::Hgatp;
 use crate::vcpu::{Vcpu, VmExit};
@@ -45,6 +58,14 @@ pub mod hstatus {
     pub const SPVP: u64 = 1 << 8;
     /// `wfi` in VS-mode raises a virtual-instruction trap.
     pub const VTW: u64 = 1 << 21;
+}
+
+/// CSR numbers (Ssaia) the IMSIC emulation completes.
+mod csr {
+    /// `sireg`, indirect access to the register `siselect` names.
+    pub const SIREG: u32 = 0x151;
+    /// `stopei`, the top external interrupt (read) and claim (write).
+    pub const STOPEI: u32 = 0x15c;
 }
 
 const SSTATUS_SPP: u64 = 1 << 8;
@@ -100,6 +121,8 @@ pub struct VsCsrs {
     pub hvip: u64,
     /// `vstimecmp` (Sstc).
     pub vstimecmp: u64,
+    /// `vsiselect` (Ssaia), switched only for vCPUs with an IMSIC.
+    pub vsiselect: u64,
 }
 
 impl Default for VsCsrs {
@@ -115,6 +138,7 @@ impl Default for VsCsrs {
             vsatp: 0,
             hvip: 0,
             vstimecmp: u64::MAX,
+            vsiselect: 0,
         }
     }
 }
@@ -141,6 +165,8 @@ pub struct RiscvVcpu {
     pending: Option<MemOp>,
     external: Arc<AtomicBool>,
     ipi: Option<Arc<AtomicBool>>,
+    /// The vCPU's hart and interrupt file, if it has an IMSIC.
+    aia: Option<(Arc<VirtualImsic>, usize)>,
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
     /// Guest memory, for fetching faulting instructions in software.
     mem: Option<Arc<GuestMemory>>,
@@ -209,6 +235,7 @@ impl RiscvVcpu {
             pending: None,
             external: Arc::new(AtomicBool::new(false)),
             ipi: None,
+            aia: None,
             running: None,
             fence: None,
             flush: false,
@@ -238,6 +265,16 @@ impl RiscvVcpu {
     /// interrupt controller built before the vCPU.
     pub fn with_external_irq(mut self, line: Arc<AtomicBool>) -> Self {
         self.external = line;
+        self
+    }
+
+    /// Attaches the vCPU to `imsic` as hart `hart`'s interrupt file: the
+    /// guest's `sireg` and `stopei` accesses are emulated against it (see
+    /// the module documentation). Wire the IMSIC's output for this hart to
+    /// [`external_irq`](Self::external_irq) so the guest sees its external
+    /// interrupt.
+    pub fn with_imsic(mut self, imsic: Arc<VirtualImsic>, hart: usize) -> Self {
+        self.aia = Some((imsic, hart));
         self
     }
 
@@ -282,6 +319,61 @@ impl RiscvVcpu {
     pub fn complete_sbi(&mut self, error: i64, value: u64) {
         self.state.x[10] = error as u64;
         self.state.x[11] = value;
+    }
+
+    /// Completes a guest access to an IMSIC CSR (`sireg` while `siselect` names
+    /// an interrupt-file register, or `stopei`), which trapped as a
+    /// virtual-instruction exception, against the vCPU's interrupt file and
+    /// steps past it. Returns whether the exit was one. `fetch` reads the
+    /// instruction at a guest-virtual PC when `stval` does not hold it.
+    pub fn emulate_aia_csr(&mut self, fetch: impl FnOnce(u64) -> Option<u32>) -> bool {
+        let Some((imsic, hart)) = &self.aia else { return false };
+        let s = &mut self.state;
+        if s.scause != 22 {
+            return false;
+        }
+        let Some(insn) = (if s.stval != 0 { Some(s.stval as u32) } else { fetch(s.pc) }) else { return false };
+        // A Zicsr instruction: SYSTEM opcode, funct3 other than ecall/ebreak (0) and hlv/hsv (4).
+        let funct3 = (insn >> 12) & 7;
+        if insn & 0x7f != 0x73 || funct3 == 0 || funct3 == 4 {
+            return false;
+        }
+        let (csr, rd, rs1) = (insn >> 20, ((insn >> 7) & 31) as usize, ((insn >> 15) & 31) as usize);
+        let src = if funct3 & 4 != 0 { rs1 as u64 } else { s.x.get(rs1).copied().unwrap_or(0) };
+        let op = funct3 & 3; // 1 = write, 2 = set bits, 3 = clear bits
+        // csrrs/csrrc with a zero source only read.
+        let writes = op == 1 || rs1 != 0;
+        let old = match csr {
+            csr::STOPEI => {
+                let top = imsic.topei(*hart);
+                if writes {
+                    // Any write claims what the read reported.
+                    imsic.claim(*hart);
+                }
+                top
+            }
+            csr::SIREG => {
+                let sel = self.csrs.vsiselect;
+                let Some(old) = imsic.read_reg(*hart, sel) else { return false };
+                if writes {
+                    let new = match op {
+                        1 => src,
+                        2 => old | src,
+                        _ => old & !src,
+                    };
+                    imsic.write_reg(*hart, sel, new);
+                }
+                old
+            }
+            _ => return false,
+        };
+        if rd != 0
+            && let Some(r) = s.x.get_mut(rd)
+        {
+            *r = old;
+        }
+        s.pc = s.pc.wrapping_add(4);
+        true
     }
 
     /// Turns the trap recorded in `state` into an exit. `fetch` reads the
@@ -397,17 +489,23 @@ impl Vcpu for RiscvVcpu {
         if self.fence.as_ref().is_some_and(|f| f.swap(false, Ordering::AcqRel)) {
             hw::fence_guest(self.hgatp.0);
         }
-        hw::run(self);
+        let exit = loop {
+            hw::run(self);
+            let (mem, vsatp) = (self.mem.clone(), self.csrs.vsatp);
+            let fetch = move |pc| match &mem {
+                Some(m) => fetch_soft(m, vsatp, pc),
+                None => hw::fetch(pc),
+            };
+            if !self.emulate_aia_csr(&fetch) {
+                break self.classify(&fetch);
+            }
+            // The access may have claimed an interrupt: refresh the external line.
+            self.sync_lines();
+        };
         if let Some(r) = &self.running {
             r.store(crate::smp::NOT_RUNNING, Ordering::Release);
         }
-        match self.mem.clone() {
-            Some(mem) => {
-                let vsatp = self.csrs.vsatp;
-                self.classify(|pc| fetch_soft(&mem, vsatp, pc))
-            }
-            None => self.classify(hw::fetch),
-        }
+        exit
     }
 
     #[cfg(not(all(target_arch = "riscv64", feature = "riscv64-hs")))]
@@ -544,5 +642,77 @@ mod tests {
         v.csrs.vstimecmp = 100;
         assert!(!v.interrupt_pending(99));
         assert!(v.interrupt_pending(100));
+    }
+
+    /// A Zicsr instruction word.
+    fn csr_insn(csr: u32, funct3: u32, rd: u32, rs1: u32) -> u64 {
+        u64::from(csr << 20 | rs1 << 15 | funct3 << 12 | rd << 7 | 0x73)
+    }
+
+    #[test]
+    fn imsic_csrs_are_emulated() {
+        use crate::devices::{VirtualImsic, imsic_isel};
+
+        let imsic = Arc::new(VirtualImsic::new(1, 255, |_, _| {}));
+        let mut v = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), HartId(0), 0, Hgatp(0)).with_imsic(imsic.clone(), 0);
+        let csr = |v: &mut RiscvVcpu, insn: u64, pc: u64| {
+            v.state.scause = 22;
+            v.state.stval = insn;
+            v.state.pc = pc;
+            v.emulate_aia_csr(|_| None)
+        };
+
+        // The guest sets vsiselect = eidelivery (hardware does that) and writes sireg = 1.
+        v.csrs.vsiselect = imsic_isel::EIDELIVERY;
+        v.state.x[6] = 1;
+        assert!(csr(&mut v, csr_insn(0x151, 1, 0, 6), 0x8000_1000), "csrw sireg, t1");
+        assert_eq!(v.state.pc, 0x8000_1004);
+        assert_eq!(imsic.read_reg(0, imsic_isel::EIDELIVERY), Some(1));
+        // csrrs reads and sets: eie0 |= 1 << 5, then reads back through csrr.
+        v.csrs.vsiselect = imsic_isel::EIE0;
+        v.state.x[7] = 1 << 5;
+        assert!(csr(&mut v, csr_insn(0x151, 2, 10, 7), 0x8000_1004), "csrrs a0, sireg, t2");
+        assert_eq!(v.state.x[10], 0, "old value");
+        assert!(csr(&mut v, csr_insn(0x151, 2, 11, 0), 0x8000_1008), "csrr a1, sireg");
+        assert_eq!(v.state.x[11], 1 << 5);
+        // Immediate and clear forms: csrrci x0, sireg, 0 changes nothing, csrrwi writes the immediate.
+        assert!(csr(&mut v, csr_insn(0x151, 7, 0, 0), 0x8000_100c));
+        assert_eq!(imsic.read_reg(0, imsic_isel::EIE0), Some(1 << 5));
+        v.csrs.vsiselect = imsic_isel::EITHRESHOLD;
+        assert!(csr(&mut v, csr_insn(0x151, 5, 0, 9), 0x8000_1010), "csrwi sireg, 9");
+        assert_eq!(imsic.read_reg(0, imsic_isel::EITHRESHOLD), Some(9));
+
+        // stopei reads the top interrupt and a write claims it.
+        assert!(csr(&mut v, csr_insn(0x15c, 2, 12, 0), 0x8000_1014), "csrr a2, stopei");
+        assert_eq!(v.state.x[12], 0);
+        imsic.set_pending(0, 5);
+        assert!(csr(&mut v, csr_insn(0x15c, 2, 12, 0), 0x8000_1018));
+        assert_eq!(v.state.x[12], 5 << 16 | 5);
+        assert_eq!(imsic.topei(0), 5 << 16 | 5, "a plain read does not claim");
+        assert!(csr(&mut v, csr_insn(0x15c, 1, 13, 0), 0x8000_101c), "csrrw a3, stopei, zero");
+        assert_eq!(v.state.x[13], 5 << 16 | 5);
+        assert_eq!(imsic.topei(0), 0, "claimed");
+
+        // Not ours: another CSR, a register that does not exist, a non-CSR, another cause.
+        assert!(!csr(&mut v, csr_insn(0x100, 1, 0, 6), 0x8000_2000));
+        v.csrs.vsiselect = 0x71;
+        assert!(!csr(&mut v, csr_insn(0x151, 1, 0, 6), 0x8000_2000));
+        assert!(!csr(&mut v, 0x0010_0073, 0x8000_2000), "ebreak");
+        assert!(!csr(&mut v, WFI, 0x8000_2000));
+        assert_eq!(v.state.pc, 0x8000_2000, "left alone");
+        v.state.scause = 21;
+        assert!(!v.emulate_aia_csr(|_| None));
+        // Without an IMSIC nothing is emulated.
+        let mut plain = RiscvVcpu::new(GuestPhysAddr(0x8000_0000), HartId(0), 0, Hgatp(0));
+        plain.state.scause = 22;
+        plain.state.stval = csr_insn(0x15c, 2, 12, 0);
+        assert!(!plain.emulate_aia_csr(|_| None));
+        // The instruction can come from guest memory when stval is empty.
+        v.state.scause = 22;
+        v.state.stval = 0;
+        v.state.pc = 0x8000_3000;
+        v.csrs.vsiselect = imsic_isel::EIDELIVERY;
+        assert!(v.emulate_aia_csr(|pc| (pc == 0x8000_3000).then_some(csr_insn(0x151, 2, 14, 0) as u32)));
+        assert_eq!(v.state.x[14], 1);
     }
 }

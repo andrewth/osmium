@@ -534,6 +534,21 @@ if command -v qemu-system-riscv64 >/dev/null; then
         '| \[hyp\]   no H extension in riscv,isa: skipping the guests' '| \[done\]' 'guest exit Shutdown' \
         'fp: the kernel does not offer FP'
     rm -f "$nestlog" "$nestiscsi"
+    # On a hart with Ssaia the hypervisor first runs a guest with an emulated
+    # APLIC (MSI delivery) and IMSIC: it enables the interrupt file through
+    # siselect/sireg and claims three interrupts with stopei, all completed
+    # by the hypervisor (virtual-instruction traps). Needs a QEMU with Ssaia.
+    if timeout 2 qemu-system-riscv64 -machine virt -cpu rv64,ssaia=true -nographic -S -monitor none -serial none >/dev/null 2>&1 || [ $? -eq 124 ]; then
+        echo "== boot examples/riscv-hyp with an APLIC and IMSIC guest under QEMU"
+        aialog=$(mktemp)
+        run_qemu "riscv-hyp (AIA)" "$aialog" 60 qemu-system-riscv64 -machine virt -bios default -cpu rv64,ssaia=true -smp 2 -m 512M -nographic \
+            -kernel examples/riscv-hyp/target/riscv64imac-unknown-none-elf/release/riscv-hyp
+        expect "riscv-hyp (AIA)" "$aialog" '| \[guest\] AIA UART interrupt, received: ping' \
+            'AIA guest exit Shutdown: eie0 0x2a0, APLIC domaincfg 0x[0-9a-f]*80000104; stopei claimed 0x50005 (APLIC setipnum), 0x70007 (IMSIC page write), 0x90009 (UART via APLIC), then 0x0'
+        rm -f "$aialog"
+    else
+        echo "== QEMU lacks the Ssaia CPU option; skipping the riscv-hyp APLIC/IMSIC boot"
+    fi
 fi
 
 # EL2 hypervisor (QEMU starts it at EL2 with virtualization=on): checked for
@@ -552,6 +567,22 @@ if command -v qemu-system-aarch64 >/dev/null; then
         '2 CPUs online at EL2' '\[smp-guest\] cpu 0: got the SGI in guest code; cpu 1 is off' \
         'vCPU 0 kicked out of guest code by a host SGI [1-9]' \
         'SMP guest: 2 vCPUs on host CPUs 0 and 1; CPU_ON returned 0, cpu 1 got context 0x1234, IAR 0x401' '\[done\]'
+    rm -f "$hyplog"
+    # On a GICv3 host the hypervisor also runs guests that use an emulated
+    # GICv3 (distributor and redistributors in software, the CPU interface
+    # through list registers; ICC_SGI1R_EL1 writes trap), on one vCPU and on
+    # two, next to the GICv2 guests above.
+    echo "== boot examples/aarch64-hyp on a GICv3 host under QEMU"
+    hyplog=$(mktemp)
+    run_qemu "aarch64-hyp (GICv3)" "$hyplog" 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=3 -cpu max -smp 2 -m 128M -nographic \
+        -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp
+    expect "aarch64-hyp (GICv3)" "$hyplog" 'physical GICv3 (distributor/redistributors) at' '2 CPUs online at EL2' \
+        'vGIC guest exit Shutdown: INTID 27 (timer) then INTID 33 (UART), [0-9]* halts, [0-9]* timer exits' \
+        '\[guest\] GICv3 UART interrupt, received: ping' \
+        'vGICv3 guest exit Shutdown: MPIDR 0x80000000, INTID 3 (SGI via ICC_SGI1R), INTID 27 (timer) then INTID 33 (UART)' \
+        '\[smp-guest\] cpu 1: up, sending cpu 0 SGI 1 with ICC_SGI1R_EL1, turning off' \
+        '\[smp-guest\] cpu 0: got the SGI in guest code; cpu 1 is off' \
+        'SMP GICv3 guest: 2 vCPUs on host CPUs 0 and 1; CPU_ON returned 0, cpu 1 got context 0x1234, IAR 0x1' '\[done\]'
     rm -f "$hyplog"
     # The same hypervisor booting the aarch64-virt kernel built above as a
     # two-vCPU EL1 guest (QEMU's loader places the ELF raw in host RAM).

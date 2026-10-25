@@ -21,7 +21,7 @@ PVH with generated ACPI tables.
 | `Bus` | MMIO and port-I/O address spaces of `BusDevice`s |
 | `Vcpu` + `VmExit` | A backend runs guest code until the next exit, normalized into `MmioRead`, `MmioWrite`, `PioIn`, `PioOut`, `Hypercall`, `Halt`, `ExternalInterrupt`, `Shutdown` or `Unhandled` |
 | `run_vcpu` | The loop: services MMIO and port I/O from the buses and hands every other exit to your closure |
-| Devices (`devices`, `virtio`) | 16550 UART, PLIC, GICv2, 8259 PIC pair, 8254 PIT, local APIC; virtio-mmio console, block and net |
+| Devices (`devices`, `virtio`) | 16550 UART, PLIC, APLIC and IMSIC, GICv2, GICv3 (no ITS), 8259 PIC pair, 8254 PIT, local APIC; virtio-mmio console, block and net |
 
 ## The run loop
 
@@ -48,7 +48,7 @@ claims returns all ones; a write to one is dropped, as on real hardware.
 | MMIO exits from | guest-page faults, decoded from `htinst` or the instruction (`hlvx`) | data aborts with a valid syndrome | nested page faults, decoded by `x86::decode` |
 | Hypercalls | `ecall` (SBI: `riscv::sbi`) | `hvc` (PSCI: `aarch64::psci`) | `vmmcall` |
 | Interrupt input | `external_irq()` line, becomes `hvip.VSEIP` | `irq_line()`, becomes `HCR_EL2.VI` | `irq_line()` plus `connect_intr` (injected through `EVENTINJ`) |
-| Interrupt controller to emulate | `VirtualPlic` | `VirtualGicV2` | `VirtualPic`, or `VirtualLapic` per vCPU plus `VirtualIoApic` |
+| Interrupt controller to emulate | `VirtualPlic`, or `VirtualAplic` + `VirtualImsic` | `VirtualGicV2`, or `VirtualGicV3` | `VirtualPic`, or `VirtualLapic` per vCPU plus `VirtualIoApic` |
 | Guest timer | Sstc `vstimecmp`, switched per vCPU | virtual timer; `connect_timer` feeds it to the GIC | `VirtualPit` on the PIC's IRQ 0, or the `VirtualLapic` timer; either driven by `poll` at its `next_deadline` |
 
 Each backend saves the host's callee-saved registers, runs the guest, and
@@ -105,12 +105,43 @@ CPU loop), take start requests with `take_start`, and connect the vCPU
   physical IPI, which exits the guest (the host runs with interrupts on, so
   `VMRUN` honours them), and `attach_svm` records where it runs.
 
+## Advanced interrupt controllers
+
+**GICv3** (`devices::VirtualGicV3`). Distributor and redistributors in
+software; one distributor view and one redistributor region for every vCPU's
+bus. The guest's CPU interface is the *host's* virtual one (`ICV_*` through
+`HCR_EL2.IMO`), so this needs a GICv3 host with `ICC_SRE_EL2.Enable` (the
+`osmium-drivers` `GicV3::init_cpu(true)` does that). Attach a vCPU with
+`Aarch64Vcpu::with_vgic_v3(gic, cpu)`: around every run it loads the GIC's
+pending interrupts into `ICH_LR<n>_EL2` and reads the acknowledged and
+completed state back (`fill_list_registers` / `sync_list_registers`); guest
+`ICC_SGI1R_EL1` writes trap and call `send_sgi`; the guest's `MPIDR_EL1` is
+`vcpu_mpidr(cpu)` so it finds its redistributor by affinity. Not modeled:
+LPIs and the ITS, GICv4, message-based SPIs, and the GICv2-compatibility
+mode. If more interrupts are pending than list registers, the rest wait for
+the next exit; the vCPU asks for a maintenance interrupt
+(`ICH_HCR_EL2.UIE`), which only helps if the host enables that PPI.
+`ArmGic::V3` in the device-tree writer describes it to a guest.
+
+**APLIC and IMSIC** (`devices::VirtualAplic`, `VirtualImsic`). One APLIC
+domain, in MSI or direct delivery mode, forwarding messages through a
+callback to the IMSIC interrupt files (one per hart); the IMSIC reports each
+hart's external-interrupt line, wired to `RiscvVcpu::external_irq`. The
+guest's `siselect` is the VS CSR, but `sireg` and `stopei` raise
+virtual-instruction traps because the host has no guest interrupt file
+(`hstatus.VGEIN` = 0); `RiscvVcpu::with_imsic` completes them against the
+model. The host needs Ssaia (QEMU `-cpu rv64,ssaia=true`) and calls
+`riscv::enable_aia` per hart. Not modeled: machine-level domains and
+delegation, guest interrupt files (`hgeip`) for nested guests, and wired
+sources in a second domain. `riscv::fdt::Aia` adds the `riscv,aplic` and
+`riscv,imsics` nodes to a guest's device tree.
+
 ## Describing the machine
 
 `riscv::fdt::GuestMachine` writes a device tree for a RISC-V guest (harts,
-memory, PLIC, UARTs, virtio-mmio slots) in the layout Linux expects from
+memory, PLIC or APLIC and IMSIC, UARTs, virtio-mmio slots) in the layout Linux expects from
 QEMU `virt`; pass its address in `a1`. `aarch64::fdt::ArmMachine` does the
-same for an AArch64 guest (PSCI over `hvc`, GICv2, timer, PL011s,
+same for an AArch64 guest (PSCI over `hvc`, GICv2 or GICv3, timer, PL011s,
 virtio-mmio); pass it in `x0`. On x86, `x86::pc::PcBoot` writes what a PVH
 kernel boots from: the `hvm_start_info` (pass it in `ebx`), its memory map
 and ACPI tables with a MADT; `x86::pc::pvh_entry` finds the kernel's
