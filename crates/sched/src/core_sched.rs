@@ -336,8 +336,6 @@ fn schedule(requeue: Option<EnqueueReason>) {
     irq::restore(irq_state);
 }
 
-/// Releases the task we switched away from. Runs first thing after every
-/// switch, on the new task's stack, with IRQs disabled.
 /// Saves the outgoing task's FP/SIMD registers if they are loaded on this
 /// CPU. A task that never used them after its last switch has nothing to save.
 ///
@@ -450,6 +448,8 @@ pub fn reset_current_fp() {
     })
 }
 
+/// Releases the task we switched away from. Runs first thing after every
+/// switch, on the new task's stack, with IRQs disabled.
 fn finish_switch() {
     // SAFETY: IRQs are disabled across every switch.
     let prev = unsafe { (*CPUS.as_ptr()).prev.take() };
