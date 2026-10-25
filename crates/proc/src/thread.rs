@@ -538,6 +538,8 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
     unsafe { TIDS.lock().remove(th) };
     p.group.ended.wake_all();
     if live == 0 {
+        // Shared file mappings reach their files before anyone can see the process end.
+        let _ = p.memory().sync_files();
         p.set_exited(status);
     } else if group_wide.is_some() {
         crate::signal::wake_blocked();

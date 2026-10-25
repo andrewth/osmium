@@ -19,15 +19,25 @@ mod sys {
     pub const EXECVE: u64 = 221;
     pub const WAIT4: u64 = 260;
     pub const SCHED_YIELD: u64 = 124;
-    pub const GETCPU: u64 = 168;
+    pub const OPENAT: u64 = 56;
+    pub const CLOSE: u64 = 57;
+    pub const LSEEK: u64 = 62;
+    pub const MMAP: u64 = 222;
     pub const MUNMAP: u64 = 215;
+    pub const MPROTECT: u64 = 226;
+    pub const MSYNC: u64 = 227;
+    pub const GETCPU: u64 = 168;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
+        call6(nr, [a[0], a[1], a[2], a[3], a[4], 0])
+    }
+
+    pub fn call6(nr: u64, a: [u64; 6]) -> i64 {
         let ret: u64;
-        // SAFETY: a7 = number, a0-a4 = arguments, a0 = result.
+        // SAFETY: a7 = number, a0-a5 = arguments, a0 = result.
         unsafe {
             core::arch::asm!("ecall", in("a7") nr, inlateout("a0") a[0] => ret, in("a1") a[1], in("a2") a[2],
-                in("a3") a[3], in("a4") a[4], options(nostack))
+                in("a3") a[3], in("a4") a[4], in("a5") a[5], options(nostack))
         };
         ret as i64
     }
@@ -138,15 +148,25 @@ mod sys {
     pub const EXECVE: u64 = 221;
     pub const WAIT4: u64 = 260;
     pub const SCHED_YIELD: u64 = 124;
-    pub const GETCPU: u64 = 168;
+    pub const OPENAT: u64 = 56;
+    pub const CLOSE: u64 = 57;
+    pub const LSEEK: u64 = 62;
+    pub const MMAP: u64 = 222;
     pub const MUNMAP: u64 = 215;
+    pub const MPROTECT: u64 = 226;
+    pub const MSYNC: u64 = 227;
+    pub const GETCPU: u64 = 168;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
+        call6(nr, [a[0], a[1], a[2], a[3], a[4], 0])
+    }
+
+    pub fn call6(nr: u64, a: [u64; 6]) -> i64 {
         let ret: u64;
-        // SAFETY: x8 = number, x0-x4 = arguments, x0 = result.
+        // SAFETY: x8 = number, x0-x5 = arguments, x0 = result.
         unsafe {
             core::arch::asm!("svc #0", in("x8") nr, inlateout("x0") a[0] => ret, in("x1") a[1], in("x2") a[2],
-                in("x3") a[3], in("x4") a[4], options(nostack))
+                in("x3") a[3], in("x4") a[4], in("x5") a[5], options(nostack))
         };
         ret as i64
     }
@@ -257,16 +277,26 @@ mod sys {
     pub const EXECVE: u64 = 59;
     pub const WAIT4: u64 = 61;
     pub const SCHED_YIELD: u64 = 24;
-    pub const GETCPU: u64 = 309;
+    pub const OPENAT: u64 = 257;
+    pub const CLOSE: u64 = 3;
+    pub const LSEEK: u64 = 8;
+    pub const MMAP: u64 = 9;
     pub const MUNMAP: u64 = 11;
+    pub const MPROTECT: u64 = 10;
+    pub const MSYNC: u64 = 26;
+    pub const GETCPU: u64 = 309;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
+        call6(nr, [a[0], a[1], a[2], a[3], a[4], 0])
+    }
+
+    pub fn call6(nr: u64, a: [u64; 6]) -> i64 {
         let ret: u64;
-        // SAFETY: rax = number, rdi/rsi/rdx/r10/r8 = arguments; the CPU
+        // SAFETY: rax = number, rdi/rsi/rdx/r10/r8/r9 = arguments; the CPU
         // clobbers rcx and r11.
         unsafe {
             core::arch::asm!("syscall", inlateout("rax") nr => ret, in("rdi") a[0], in("rsi") a[1], in("rdx") a[2],
-                in("r10") a[3], in("r8") a[4], out("rcx") _, out("r11") _, options(nostack))
+                in("r10") a[3], in("r8") a[4], in("r9") a[5], out("rcx") _, out("r11") _, options(nostack))
         };
         ret as i64
     }
@@ -573,6 +603,75 @@ const CHILD_CLEARTID: u64 = 0x20_0000;
 const CHILD_SETTID: u64 = 0x100_0000;
 
 /// Signal handlers, and threads joined with `futex`, as C libraries use them.
+/// File-backed `mmap`: a private mapping is a copy, a shared one reaches the
+/// file through `msync` and `munmap`, and survives `fork` as one page.
+fn file_maps() {
+    const AT_FDCWD: u64 = -100i64 as u64;
+    // O_RDWR | O_CREAT | O_TRUNC
+    const FLAGS: u64 = 2 | 0o100 | 0o1000;
+    const PROT_RW: u64 = 3;
+    const MAP_SHARED: u64 = 1;
+    const MAP_PRIVATE: u64 = 2;
+    const MS_SYNC: u64 = 4;
+    let path = b"/tmp/mmap.dat\0";
+    let fd = sys::call(sys::OPENAT, [AT_FDCWD, path.as_ptr() as u64, FLAGS, 0o644, 0]) as u64;
+    let mut data = [0u8; 5000];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let wrote = sys::call(sys::WRITE, [fd, data.as_ptr() as u64, 5000, 0, 0]);
+    let file_byte = |at: u64| {
+        let mut b = [0u8; 1];
+        sys::call(sys::LSEEK, [fd, at, 0, 0, 0]);
+        sys::call(sys::READ, [fd, b.as_mut_ptr() as u64, 1, 0, 0]);
+        b[0]
+    };
+
+    let private = sys::call6(sys::MMAP, [0, 8192, PROT_RW, MAP_PRIVATE, fd, 0]);
+    let shared = sys::call6(sys::MMAP, [0, 8192, PROT_RW, MAP_SHARED, fd, 0]);
+    let mut ok = wrote == 5000 && private > 0 && shared > 0;
+    if ok {
+        let (private, shared) = (private as *mut u8, shared as *mut u8);
+        // SAFETY: both mappings are 8192 bytes, readable and writable. The
+        // file has 5000 bytes, so the rest of the second page reads as zero.
+        unsafe {
+            ok &= private.add(4999).read_volatile() == (4999 % 251) as u8 && private.add(5000).read_volatile() == 0;
+            private.write_volatile(0xee);
+            ok &= file_byte(0) == 0 && private.read_volatile() == 0xee;
+            shared.add(1).write_volatile(0xdd);
+            ok &= sys::call(sys::MSYNC, [shared as u64, 8192, MS_SYNC, 0, 0]) == 0 && file_byte(1) == 0xdd;
+            ok &= shared.read_volatile() == 0 && shared.add(4999).read_volatile() == (4999 % 251) as u8;
+            // The private copy was loaded before the shared store.
+            ok &= private.add(1).read_volatile() == 1;
+        }
+        // A forked child's store to a shared page is the parent's too.
+        if sys::fork() == 0 {
+            // SAFETY: as above.
+            unsafe { shared.add(3).write_volatile(0x77) };
+            exit(0);
+        }
+        wait(-1);
+        // SAFETY: as above.
+        unsafe {
+            ok &= shared.add(3).read_volatile() == 0x77;
+            shared.add(2).write_volatile(0xcc);
+        }
+        // Unmapping saves what the child and we stored.
+        ok &= sys::call(sys::MUNMAP, [shared as u64, 8192, 0, 0, 0]) == 0;
+        ok &= file_byte(2) == 0xcc && file_byte(3) == 0x77;
+        // Read-only and back, with the data kept.
+        ok &= sys::call(sys::MPROTECT, [private as u64, 4096, 1, 0, 0]) == 0;
+        // SAFETY: as above; the page is readable.
+        ok &= unsafe { private.read_volatile() } == 0xee;
+        ok &= sys::call(sys::MPROTECT, [private as u64, 4096, PROT_RW, 0, 0]) == 0;
+        // SAFETY: as above; the page is writable again.
+        unsafe { private.write_volatile(0xef) };
+        ok &= sys::call(sys::MUNMAP, [private as u64, 8192, 0, 0, 0]) == 0 && file_byte(0) == 0;
+    }
+    sys::call(sys::CLOSE, [fd, 0, 0, 0, 0]);
+    say!("mmap: private copy, shared write-back (msync, munmap, fork), mprotect: {}", if ok { "ok" } else { "FAILED" });
+}
+
 fn signals_and_threads() {
     let pid = sys::call(sys::GETPID, [0; 5]) as u64;
 
@@ -1108,6 +1207,7 @@ unsafe extern "C" fn main(sp: *const u64) -> ! {
     } else {
         say!("fp: the kernel does not offer FP (AT_HWCAP)");
     }
+    file_maps();
     signals_and_threads();
     restarts_and_pi();
     queued_signals_and_job_control();

@@ -95,7 +95,7 @@ mod uregs;
 
 pub use exec::{ARG_MAX, INTERP_OFFSET, Platform, UserEntry, set_platform};
 pub use fd::{FdTable, OpenFile, set_console};
-pub use memory::{AddressSpace, UserMemory};
+pub use memory::{AddressSpace, FileMapping, UserMemory};
 pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for};
 pub use syscall::{Outcome, Sys, dispatch, dispatch_as};
 pub use thread::Thread;

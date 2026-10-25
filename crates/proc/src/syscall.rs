@@ -45,6 +45,8 @@ pub enum Sys {
     Brk,
     Mmap,
     Munmap,
+    Mprotect,
+    Msync,
     SchedYield,
     Uname,
     Clone,
@@ -130,6 +132,8 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (8, Sys::Lseek),
     (9, Sys::Mmap),
     (11, Sys::Munmap),
+    (10, Sys::Mprotect),
+    (26, Sys::Msync),
     (12, Sys::Brk),
     (16, Sys::Ioctl),
     (19, Sys::Readv),
@@ -229,6 +233,8 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (168, Sys::Getcpu),
     (214, Sys::Brk),
     (215, Sys::Munmap),
+    (226, Sys::Mprotect),
+    (227, Sys::Msync),
     (222, Sys::Mmap),
     (198, Sys::Socket),
     (200, Sys::Bind),
@@ -391,8 +397,10 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Getcpu => getcpu(p, a[0], a[1]),
         Sys::Getppid => Ok(p.parent().map_or(0, |pid| pid.0 as u64)),
         Sys::Brk => Ok(p.brk(a[0])),
-        Sys::Mmap => mmap(p, a[1], a[2], a[3], a[4] as i32),
+        Sys::Mmap => mmap(p, a[1], a[2], a[3], a[4] as i32, a[5]),
         Sys::Munmap => munmap(p, a[0], a[1]),
+        Sys::Mprotect => mprotect(p, a[0], a[1], a[2]),
+        Sys::Msync => msync(p, a[0], a[1], a[2]),
         Sys::SchedYield => {
             osmium_sched::yield_now();
             Ok(0)
@@ -849,23 +857,47 @@ fn unlinkat(p: &Process, dirfd: i32, path: u64, flags: u64) -> SysResult {
     if flags & AT_REMOVEDIR != 0 { vfs.rmdir(&path) } else { vfs.unlink(&path) }.map(|()| 0)
 }
 
-fn mmap(p: &Process, len: u64, prot: u64, flags: u64, fd: i32) -> SysResult {
-    const MAP_PRIVATE: u64 = 0x02;
-    const MAP_FIXED: u64 = 0x10;
-    const MAP_ANONYMOUS: u64 = 0x20;
-    if flags & MAP_ANONYMOUS == 0 || fd != -1 {
-        return Err(Errno::ENODEV);
-    }
-    if flags & MAP_PRIVATE == 0 || flags & MAP_FIXED != 0 {
+const PROT_READ: u64 = 1;
+const PROT_WRITE: u64 = 2;
+const PROT_EXEC: u64 = 4;
+
+/// `PROT_*` as page access. A page that can be written can be read: the
+/// page tables cannot say otherwise. Unknown bits are an error.
+fn prot_flags(prot: u64) -> Result<MapFlags, Errno> {
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return Err(Errno::EINVAL);
     }
     let mut mf = MapFlags::NONE;
-    for (bit, f) in [(1, MapFlags::READ), (2, MapFlags::WRITE), (4, MapFlags::EXEC)] {
+    for (bit, f) in [(PROT_READ, MapFlags::READ), (PROT_WRITE, MapFlags::RW), (PROT_EXEC, MapFlags::EXEC)] {
         if prot & bit != 0 {
             mf = mf | f;
         }
     }
-    p.mmap_demand(len, mf)
+    Ok(mf)
+}
+
+fn mmap(p: &Process, len: u64, prot: u64, flags: u64, fd: i32, off: u64) -> SysResult {
+    const MAP_SHARED: u64 = 0x01;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_FIXED: u64 = 0x10;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    let mf = prot_flags(prot)?;
+    if flags & MAP_FIXED != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // Exactly one of the two.
+    let (shared, private) = (flags & MAP_SHARED != 0, flags & MAP_PRIVATE != 0);
+    if shared == private {
+        return Err(Errno::EINVAL);
+    }
+    if flags & MAP_ANONYMOUS != 0 {
+        if shared || fd != -1 {
+            return Err(Errno::EINVAL);
+        }
+        return p.mmap_demand(len, mf);
+    }
+    let f = open_file(p, fd)?;
+    p.mmap_file(len, mf, shared, &f, off)
 }
 
 fn munmap(p: &Process, addr: u64, len: u64) -> SysResult {
@@ -875,9 +907,35 @@ fn munmap(p: &Process, addr: u64, len: u64) -> SysResult {
     }
     // Made first: once the pages are gone there is no going back.
     let spare = crate::mmap::FreeRange::spare().map_err(|_| Errno::ENOMEM)?;
-    p.memory().unmap(addr, len);
-    p.mmap_release(addr, len, spare);
-    Ok(0)
+    // A failure to save a shared mapping's pages is reported, but the
+    // memory is gone either way. Out of memory changed nothing.
+    let r = p.memory().munmap(addr, len);
+    if r != Err(Errno::ENOMEM) {
+        p.mmap_release(addr, len, spare);
+    }
+    r.map(|()| 0)
+}
+
+fn mprotect(p: &Process, addr: u64, len: u64, prot: u64) -> SysResult {
+    let len = len.checked_next_multiple_of(4096).ok_or(Errno::ENOMEM)?;
+    if !addr.is_multiple_of(4096) {
+        return Err(Errno::EINVAL);
+    }
+    p.memory().mprotect(addr, len, prot_flags(prot)?).map(|()| 0)
+}
+
+fn msync(p: &Process, addr: u64, len: u64, flags: u64) -> SysResult {
+    const MS_ASYNC: u64 = 1;
+    const MS_INVALIDATE: u64 = 2;
+    const MS_SYNC: u64 = 4;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || flags & MS_ASYNC != 0 && flags & MS_SYNC != 0
+        || !addr.is_multiple_of(4096)
+    {
+        return Err(Errno::EINVAL);
+    }
+    let len = len.checked_next_multiple_of(4096).ok_or(Errno::ENOMEM)?;
+    p.memory().msync(addr, len, flags & MS_SYNC != 0).map(|()| 0)
 }
 
 pub(crate) fn outcome(r: Result<Outcome, Errno>) -> Outcome {

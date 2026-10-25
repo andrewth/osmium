@@ -243,7 +243,7 @@ fn brk_and_mmap_map_memory() {
     assert_eq!(a, 0x100_0000);
     put(&p, a as u64 + 0x2fff, b"m");
     assert_eq!(call(&p, Sys::Mmap, &[0, 0x1000, 3, 0x22, u64::MAX, 0]), 0x100_3000);
-    assert_eq!(call(&p, Sys::Mmap, &[0, 0x1000, 3, 0x02, 3, 0]), -(Errno::ENODEV.0 as i64), "file mappings");
+    assert_eq!(call(&p, Sys::Mmap, &[0, 0x1000, 3, 0x02, 9, 0]), -(Errno::EBADF.0 as i64), "file mappings need a file");
     assert_eq!(call(&p, Sys::Munmap, &[a as u64, 0x3000]), 0);
     assert!(p.memory().read(a as u64, &mut [0]).is_err());
 
@@ -837,6 +837,7 @@ fn a_child_that_never_got_a_task_can_be_forgotten() {
 }
 
 mod blocked;
+mod filemap;
 mod hostile;
 mod jobsig;
 mod oom;

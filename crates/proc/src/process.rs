@@ -19,7 +19,7 @@ use osmium_sync::{IrqSpinLock, Once};
 
 use osmium_fs::Errno;
 
-use crate::fd::FdTable;
+use crate::fd::{FdTable, OpenFile};
 use crate::memory::UserMemory;
 use crate::mmap::{FreeRange, MmapArea};
 
@@ -517,9 +517,12 @@ impl Process {
 
     /// `mmap` for private anonymous memory: maps `len` bytes of zeroed
     /// pages and returns their address. With no access at all (`PROT_NONE`)
-    /// the range is only reserved: left unmapped, any access faults.
+    /// the range is only reserved (see [`UserMemory::mprotect`]): any access faults.
     pub fn mmap_anon(&self, len: u64, flags: MapFlags) -> Result<u64, Errno> {
-        self.mmap_with(len, flags, |memory, va, len| memory.map_anon(va, len, flags))
+        // No access: only reserved, and left unmapped so that any touch faults.
+        self.mmap_with(len, |memory, va, len| {
+            if flags == MapFlags::NONE { memory.map_lazy(va, len, flags) } else { memory.map_anon(va, len, flags) }
+        })
     }
 
     /// [`mmap_anon`](Self::mmap_anon) with demand paging: reserves the
@@ -528,13 +531,12 @@ impl Process {
     /// cannot fail for lack of memory up front. This is what the `mmap`
     /// system call uses.
     pub fn mmap_demand(&self, len: u64, flags: MapFlags) -> Result<u64, Errno> {
-        self.mmap_with(len, flags, |memory, va, len| memory.map_lazy(va, len, flags))
+        self.mmap_with(len, |memory, va, len| memory.map_lazy(va, len, flags))
     }
 
     fn mmap_with(
         &self,
         len: u64,
-        flags: MapFlags,
         map: impl FnOnce(&dyn UserMemory, u64, u64) -> Result<(), Errno>,
     ) -> Result<u64, Errno> {
         let len = len.checked_next_multiple_of(PAGE).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
@@ -542,16 +544,53 @@ impl Process {
         let spare = FreeRange::spare().map_err(|_| Errno::ENOMEM)?;
         let mut area = self.mmap.lock();
         let va = area.alloc(len)?;
-        if flags != MapFlags::NONE {
-            let memory = self.memory();
-            if let Err(e) = map(&*memory, va, len) {
-                // Give back what was mapped before it ran out.
-                memory.unmap(va, len);
-                area.release(va, va + len, spare);
-                return Err(e);
-            }
+        let memory = self.memory();
+        if let Err(e) = map(&*memory, va, len) {
+            // Give back what was mapped before it ran out.
+            memory.unmap(va, len);
+            area.release(va, va + len, spare);
+            return Err(e);
         }
         Ok(va)
+    }
+
+    /// `mmap` of `file` from byte `offset` (page-aligned): places the mapping
+    /// in the `mmap` area and returns its address. Nothing is read until
+    /// the pages are touched.
+    ///
+    /// The file must be a regular file opened for reading, and for a shared
+    /// mapping that may be written (`prot` includes `WRITE`), for writing and
+    /// not append-only. `offset + len` must fit in a file offset.
+    pub fn mmap_file(
+        &self,
+        len: u64,
+        prot: MapFlags,
+        shared: bool,
+        file: &OpenFile,
+        offset: u64,
+    ) -> Result<u64, Errno> {
+        let len = len.checked_next_multiple_of(PAGE).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        if !offset.is_multiple_of(PAGE) {
+            return Err(Errno::EINVAL);
+        }
+        if offset.checked_add(len).is_none_or(|end| end > i64::MAX as u64) {
+            return Err(Errno::EOVERFLOW);
+        }
+        if file.file().try_stat()?.kind != osmium_fs::FileKind::Regular {
+            return Err(Errno::ENODEV);
+        }
+        let access = file.access();
+        if !access.read || shared && prot.contains(MapFlags::WRITE) && (!access.write || access.append) {
+            return Err(Errno::EACCES);
+        }
+        let map = crate::memory::FileMapping {
+            file: file.file().clone(),
+            offset,
+            shared,
+            prot,
+            writable: access.write && !access.append,
+        };
+        self.mmap_with(len, |memory, va, len| memory.map_file(va, len, map))
     }
 }
 
