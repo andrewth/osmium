@@ -118,6 +118,7 @@ fn net_errno(e: Error) -> Errno {
         Error::ConnectionRefused => Errno::ECONNREFUSED,
         Error::ConnectionReset => Errno::ECONNRESET,
         Error::TimedOut => Errno::ETIMEDOUT,
+        Error::AddressInUse => Errno::EADDRINUSE,
         Error::OutOfMemory => Errno::ENOMEM,
     }
 }
