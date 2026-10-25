@@ -145,6 +145,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ USB: setup packets, standard descriptor parsing, the `UsbHost` host-controller trait, and generic device enumeration
 - ✅ virtio constants and split-ring layout shared by drivers and device models (including virtio-pci capabilities and virtio-gpu commands)
 - ✅ Displays: `Framebuffer` over any `IoMem` (16/24/32 bpp, any channel layout from VBE, GOP or virtio-gpu; fill, per-pixel drawing, 1-bpp bitmaps for fonts, scrolling) and the `Display` trait, whose `flush` serves devices that copy from guest memory
+- ✅ Framebuffer text console (`osmium_hal::fbcon`): `FbConsole` implements `Console` on any `Framebuffer` (so any pixel format incl. 32-bit RGB/BGR), with an original 5x7 ASCII font in an 8x8 cell (integer scaling), cursor, wrapping, scrolling, `\n \r \b \t` and ANSI CSI cursor movement, erase (`J`, `K`) and 16-colour SGR; host-tested on Vec-backed framebuffers, not yet booted in an example
 - 🗺 Async variants of device traits, PCI bridge walking
 
 ### `osmium-drivers`: reference drivers
@@ -181,7 +182,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
 - ✅ Bochs DISPI display (`BochsVbe`): QEMU std VGA, `bochs-display` and `virtio-vga` modes over MMIO on any architecture or ports on x86
 - ✅ VESA BIOS Extensions: controller and mode information, mode search and LFB mode setting through a `VideoBios` (x86's real-mode thunk, or a fake in tests)
-- 🗺 virtio console; virtio-gpu cursor, EDID and interrupts; a framebuffer text console; xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3; HPET; NVMe multiple I/O queues
+- 🗺 virtio console; virtio-gpu cursor, EDID and interrupts; xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3; HPET; NVMe multiple I/O queues
 
 ### `osmium-sched`: tasks and scheduling
 - ✅ Real context switch for x86_64, AArch64 and RISC-V 64 (naked functions; callee-saved registers only)

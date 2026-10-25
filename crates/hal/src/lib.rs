@@ -30,6 +30,7 @@ extern crate std;
 pub mod block;
 pub mod console;
 pub mod display;
+pub mod fbcon;
 pub mod dma;
 pub mod iommu;
 pub mod irq;
