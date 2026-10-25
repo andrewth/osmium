@@ -145,7 +145,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ USB: setup packets, standard descriptor parsing, the `UsbHost` host-controller trait, and generic device enumeration
 - ✅ virtio constants and split-ring layout shared by drivers and device models (including virtio-pci capabilities and virtio-gpu commands)
 - ✅ Displays: `Framebuffer` over any `IoMem` (16/24/32 bpp, any channel layout from VBE, GOP or virtio-gpu; fill, per-pixel drawing, 1-bpp bitmaps for fonts, scrolling) and the `Display` trait, whose `flush` serves devices that copy from guest memory
-- 🗺 Async variants of device traits, PCI bridge walking
+- ✅ Async device traits (`hal::asynch`): `AsyncBlockDevice`, `AsyncSerialPort` and `AsyncNetDevice` (not `Send`-bounded, no executor dependency; interrupt-driven drivers wake the task's waker, e.g. an `osmium-exec` `AtomicWaker`), plus `Blocking` (run a blocking `BlockDevice` to completion in one poll) and `Polled` (retry a serial port or `NetDevice` on "not ready", yielding between tries) adapters; host-tested. No driver implements the async traits natively yet, and there is no async timer or USB trait
+- ✅ PCI bridge walking (`pci::walk`, `Bridge`): depth-first enumeration through PCI-to-PCI bridges that assigns primary/secondary/subordinate bus numbers, places unassigned memory BARs from a `BarAllocator` and programs each bridge's 1 MiB-granular non-prefetchable memory window around its subtree; host-tested against a simulated three-level hierarchy. Not done: I/O and prefetchable bridge windows (left closed), 64-bit windows above 4 GiB, hot-plug, ARI/SR-IOV bus reservation, and the examples still use the brute-force `for_each_function`
 
 ### `osmium-drivers`: reference drivers
 - ✅ NS16550A UART (port I/O and MMIO backends)

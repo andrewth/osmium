@@ -10,6 +10,8 @@
 //! - [`port`]: typed x86 I/O ports.
 //! - [`serial`], [`irq`], [`timer`], [`block`], [`net`]: device-class traits
 //!   that drivers implement and kernels consume.
+//! - [`asynch`]: async counterparts of the block, serial and network traits,
+//!   and adapters from the blocking ones.
 //! - [`usb`]: USB descriptors and requests, the [`usb::UsbHost`]
 //!   host-controller trait and device enumeration.
 //! - [`pci`]: configuration space (ECAM), enumeration, BARs, capabilities.
@@ -27,6 +29,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod asynch;
 pub mod block;
 pub mod console;
 pub mod display;
