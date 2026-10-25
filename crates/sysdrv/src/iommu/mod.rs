@@ -21,10 +21,11 @@
 //!   [`IommuError::Timeout`] and
 //!   dropping the driver leaks its tables instead of freeing memory the unit
 //!   might still read.
-//! - Interrupt remapping is not configured. Devices that raise MSIs through
-//!   an interrupt controller's doorbell address may need that address mapped
-//!   in their domain (SMMUv3, RISC-V IOMMU) or reserved out of the IOVA
-//!   window (x86 `0xfee0_0000..0xfef0_0000`).
+//! - Interrupt remapping is configured only for VT-d, and only when asked
+//!   for ([`vtd::remap`]). Devices that raise MSIs through an interrupt
+//!   controller's doorbell address may need that address mapped in their
+//!   domain (SMMUv3, RISC-V IOMMU) or reserved out of the IOVA window (x86
+//!   `0xfee0_0000..0xfef0_0000`).
 
 pub mod amdvi;
 pub mod ats;
