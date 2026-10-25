@@ -4,10 +4,12 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddrV4};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, Stat};
-use osmium_net::{Error, Socket, SocketAddr, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket};
+use osmium_net::{
+    BindProtocol, Error, ReuseOptions, Socket, SocketAddr, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket,
+};
 use osmium_sync::IrqSpinLock;
 use osmium_sync::fallible::{try_arc, try_zeroed};
 
@@ -56,6 +58,10 @@ const TCP_NODELAY: u64 = 1;
 /// `O_NONBLOCK` in `fcntl` status flags.
 pub(crate) const O_NONBLOCK: u64 = 0o4000;
 
+/// The next group number for the listeners of a socket (see
+/// `TcpSocket::set_reuse_group`).
+static NEXT_GROUP: AtomicU32 = AtomicU32::new(1);
+
 /// Bytes a stream socket buffers in each direction.
 const TCP_BUFFER: usize = 16 * 1024;
 /// Datagrams a UDP socket queues in each direction.
@@ -78,9 +84,9 @@ type Backlog = [Option<SocketHandle>; MAX_BACKLOG];
 enum Tcp {
     /// Not connected or listening, possibly bound to an address.
     Unconnected(Option<SocketAddrV4>),
-    /// Waiting for connections on `port`: one listening socket per slot of
+    /// Waiting for connections to `addr`: one listening socket per slot of
     /// backlog.
-    Listening { port: u16, backlog: Backlog },
+    Listening { addr: SocketAddrV4, backlog: Backlog },
     /// Connecting or connected.
     Connected(SocketHandle),
 }
@@ -100,6 +106,10 @@ pub struct SocketFile {
     /// `SO_RCVTIMEO` and `SO_SNDTIMEO` in nanoseconds; 0 waits for ever.
     rcv_timeout: AtomicU64,
     snd_timeout: AtomicU64,
+    /// `SO_REUSEADDR` and `SO_REUSEPORT`. Processes have no user ids yet, so
+    /// every socket has the same owner for `SO_REUSEPORT`.
+    reuse_addr: AtomicBool,
+    reuse_port: AtomicBool,
 }
 
 /// What a receive took.
@@ -150,6 +160,8 @@ impl SocketFile {
             nonblock: AtomicBool::new(nonblock),
             rcv_timeout: AtomicU64::new(0),
             snd_timeout: AtomicU64::new(0),
+            reuse_addr: AtomicBool::new(false),
+            reuse_port: AtomicBool::new(false),
         }
     }
 
@@ -188,7 +200,19 @@ impl SocketFile {
         a
     }
 
+    /// The socket's `SO_REUSEADDR` and `SO_REUSEPORT`.
+    fn reuse(&self) -> ReuseOptions {
+        ReuseOptions {
+            addr: self.reuse_addr.load(Ordering::Relaxed),
+            port: self.reuse_port.load(Ordering::Relaxed),
+            owner: 0,
+        }
+    }
+
     /// Checks that `a` can be bound here and picks a port if it has none.
+    /// A port that is named is checked against the other sockets with the
+    /// `SO_REUSEADDR` and `SO_REUSEPORT` rules; one that is chosen must be
+    /// free of every socket.
     fn bind_addr(&self, a: SocketAddrV4, udp: bool) -> Result<SocketAddrV4, Errno> {
         self.net.op(|iface, s| {
             if !a.ip().is_unspecified() && !a.ip().is_loopback() && iface.config().map(|c| c.address) != Some(*a.ip()) {
@@ -198,8 +222,10 @@ impl SocketFile {
             if port == 0 {
                 port =
                     (0..64).map(|_| iface.ephemeral_port()).find(|&p| !in_use(s, p, udp)).ok_or(Errno::EADDRINUSE)?;
-            } else if in_use(s, port, udp) {
-                return Err(Errno::EADDRINUSE);
+            } else {
+                let proto = if udp { BindProtocol::Udp } else { BindProtocol::Tcp };
+                s.check_bind(proto, SocketAddr::V4(SocketAddrV4::new(*a.ip(), port)), self.reuse(), None)
+                    .map_err(net_errno)?;
             }
             Ok(SocketAddrV4::new(*a.ip(), port))
         })
@@ -238,13 +264,21 @@ impl SocketFile {
             Some(a) => a,
             None => self.bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), false)?,
         };
-        let port = a.port();
         let n = backlog.clamp(1, MAX_BACKLOG);
+        let reuse = self.reuse();
+        // The listeners of this socket share an accept group, so that
+        // `SO_REUSEPORT` spreads connections over sockets, not listeners.
+        let group = NEXT_GROUP.fetch_add(1, Ordering::Relaxed).max(1);
         let backlog = self.net.op(|_, s| {
+            // Listening is a bind of its own: another socket may have come
+            // since `bind`.
+            s.check_bind(BindProtocol::Tcp, SocketAddr::V4(a), reuse, None).map_err(net_errno)?;
             let mut backlog: Backlog = [None; MAX_BACKLOG];
             for slot in backlog.iter_mut().take(n) {
                 let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
-                if let Err(e) = t.listen(port) {
+                t.set_reuse(reuse);
+                t.set_reuse_group(group);
+                if let Err(e) = t.listen_on(a) {
                     for h in backlog.iter().flatten() {
                         drop(s.remove(*h));
                     }
@@ -263,7 +297,7 @@ impl SocketFile {
             }
             Ok(backlog)
         })?;
-        *kind = Kind::Tcp(Tcp::Listening { port, backlog });
+        *kind = Kind::Tcp(Tcp::Listening { addr: a, backlog });
         Ok(())
     }
 
@@ -280,13 +314,20 @@ impl SocketFile {
             // (The order is kind, then net, as in `connect`.)
             let (taken, snapshot) = {
                 let mut kind = self.kind.lock();
-                let Kind::Tcp(Tcp::Listening { port, backlog }) = &mut *kind else { return Err(Errno::EINVAL) };
-                let port = *port;
+                let Kind::Tcp(Tcp::Listening { addr, backlog }) = &mut *kind else { return Err(Errno::EINVAL) };
+                let addr = *addr;
                 let taken = self.net.op(|_, s| {
                     let i = backlog.iter().position(|h| h.is_some_and(|h| ready(s, h)))?;
                     let h = backlog.get(i).copied().flatten()?;
                     let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
-                    if let Err(e) = t.listen(port) {
+                    // The replacement is one more listener of the same socket.
+                    let (reuse, group) = {
+                        let old = s.get::<TcpSocket>(h);
+                        (old.reuse(), old.reuse_group())
+                    };
+                    t.set_reuse(reuse);
+                    t.set_reuse_group(group);
+                    if let Err(e) = t.listen_on(addr) {
                         return Some(Err(net_errno(e)));
                     }
                     // Without a socket to replace it, the connection stays
@@ -338,6 +379,9 @@ impl SocketFile {
                 let port = bound.map_or(0, |a| a.port());
                 let h = self.net.op(|_, s| {
                     let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
+                    // A connection keeps the options, which decide whether a
+                    // bind may take its port while it lingers.
+                    t.set_reuse(self.reuse());
                     t.connect(to, port).map(|()| s.add(t))
                 });
                 let h = h.map_err(net_errno)?;
@@ -565,11 +609,28 @@ impl SocketFile {
         }
     }
 
+    /// Sets `SO_REUSEPORT` (`port`) or `SO_REUSEADDR`. As on Linux they matter
+    /// to the binds made afterwards; a datagram socket that is bound already
+    /// takes the change at once, as its options live in the stack.
+    fn set_reuse_option(&self, port: bool, on: bool) {
+        if port { &self.reuse_port } else { &self.reuse_addr }.store(on, Ordering::Relaxed);
+        let reuse = self.reuse();
+        if let Kind::Udp { handle, .. } = &*self.kind.lock() {
+            let h = *handle;
+            self.net.op(|_, s| s.get_mut::<UdpSocket>(h).set_reuse(reuse));
+        }
+    }
+
+    /// The value of `SO_REUSEPORT` (`port`) or `SO_REUSEADDR`.
+    fn reuse_option(&self, port: bool) -> bool {
+        if port { &self.reuse_port } else { &self.reuse_addr }.load(Ordering::Relaxed)
+    }
+
     /// The local address, `getsockname`.
     pub fn local_addr(&self) -> SocketAddrV4 {
         let a = match &*self.kind.lock() {
             Kind::Tcp(Tcp::Unconnected(b)) => b.unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            Kind::Tcp(Tcp::Listening { port, .. }) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, *port),
+            Kind::Tcp(Tcp::Listening { addr, .. }) => *addr,
             Kind::Tcp(Tcp::Connected(h)) => self.net.peek(|_, s| v4(s.get::<TcpSocket>(*h).local_endpoint())),
             Kind::Udp { handle, .. } => self
                 .net
@@ -1067,7 +1128,14 @@ pub(crate) fn setsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, 
     if len < 4 {
         return Err(Errno::EINVAL);
     }
-    p.memory().read(val, &mut [0u8; 4])?;
+    let mut word = [0u8; 4];
+    p.memory().read(val, &mut word)?;
+    if level == SOL_SOCKET
+        && matches!(name, SO_REUSEADDR | SO_REUSEPORT)
+        && let Any::Inet(s) = s
+    {
+        s.set_reuse_option(name == SO_REUSEPORT, u32::from_ne_bytes(word) != 0);
+    }
     Ok(0)
 }
 
@@ -1081,6 +1149,10 @@ pub(crate) fn getsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, 
             Any::Unix(_) => 0,
         },
         (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => TCP_BUFFER as i32,
+        (SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT) => match &s {
+            Any::Inet(s) => i32::from(s.reuse_option(name == SO_REUSEPORT)),
+            Any::Unix(_) => 0,
+        },
         _ if known_option(level, name) => 0,
         _ => return Err(Errno::ENOPROTOOPT),
     };

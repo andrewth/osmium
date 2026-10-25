@@ -652,7 +652,8 @@ impl TcpSocket {
         self.reuse_group = group;
     }
 
-    pub(crate) fn reuse_group(&self) -> u32 {
+    /// The group set by [`set_reuse_group`](Self::set_reuse_group), 0 for none.
+    pub fn reuse_group(&self) -> u32 {
         self.reuse_group
     }
 
