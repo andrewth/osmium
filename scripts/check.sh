@@ -424,6 +424,19 @@ if command -v qemu-system-x86_64 >/dev/null && qemu-system-x86_64 -device help 2
     boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
         -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
         -device intel-iommu,aw-bits=48 -device iommu-testdev
+    # The same in scalable mode, with interrupt remapping switched on and off around it
+    # (the split irqchip is what QEMU requires for `intremap`).
+    EXPECT=(
+        '\[iommu\] VT-d unit at 0xfed90000: 48 bit I/O addresses'
+        '\[iommu\] VT-d scalable mode: PASID directory and table per device, queued invalidation'
+        '\[iommu\] VT-d interrupt remapping on with 256 entries; entry programmed true, invalidated and cleared true'
+        'vt-d-scalable: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'
+        'vt-d-scalable: DMA to an unmapped IOVA blocked'
+        'vt-d-scalable: detached device blocked'
+    )
+    boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
+        -machine q35,kernel-irqchip=split -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
+        -device intel-iommu,aw-bits=48,x-scalable-mode=on,intremap=on -device iommu-testdev
     EXPECT=(
         '\[iommu\] AMD-Vi unit at 0xfed80000: 48 bit I/O addresses'
         'amd-vi: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'

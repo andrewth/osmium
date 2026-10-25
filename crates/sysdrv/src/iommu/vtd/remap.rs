@@ -262,8 +262,11 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         self.regs.w32(super::GCMD, st.gcmd | SIRTP);
         self.wait(|| self.regs.r32(super::GSTS) & SIRTP != 0)?;
         self.qi_iec(None)?;
-        self.set_enabled(&mut st, CFI, allow_compatibility)?;
-        self.set_enabled(&mut st, IRE, true)?;
+        // CFI goes in the same command as IRE, and only IRE's status is waited for:
+        // units need not report CFI (QEMU's does not).
+        st.gcmd = if allow_compatibility { st.gcmd | CFI } else { st.gcmd & !CFI } | IRE;
+        self.regs.w32(super::GCMD, st.gcmd);
+        self.wait(|| self.regs.r32(super::GSTS) & IRE != 0)?;
         st.ir = Some(Remap { table: core::mem::ManuallyDrop::into_inner(table), entries, extended });
         Ok(())
     }
