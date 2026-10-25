@@ -26,12 +26,15 @@ pub mod opcode {
     #![allow(missing_docs)]
     pub const NOP_OUT: u8 = 0x00;
     pub const SCSI_COMMAND: u8 = 0x01;
+    pub const TASK_MGMT_REQUEST: u8 = 0x02;
     pub const LOGIN_REQUEST: u8 = 0x03;
     pub const TEXT_REQUEST: u8 = 0x04;
     pub const DATA_OUT: u8 = 0x05;
     pub const LOGOUT_REQUEST: u8 = 0x06;
+    pub const SNACK_REQUEST: u8 = 0x10;
     pub const NOP_IN: u8 = 0x20;
     pub const SCSI_RESPONSE: u8 = 0x21;
+    pub const TASK_MGMT_RESPONSE: u8 = 0x22;
     pub const LOGIN_RESPONSE: u8 = 0x23;
     pub const TEXT_RESPONSE: u8 = 0x24;
     pub const DATA_IN: u8 = 0x25;
@@ -69,6 +72,9 @@ pub enum PduError {
     TooLong(usize),
     /// A header or data digest does not match its contents.
     Digest,
+    /// A data digest does not match, but the PDU was framed correctly and
+    /// has been skipped (see [`PduReader::set_recoverable`]): its header.
+    DataDigest([u8; BHS_LEN]),
 }
 
 impl fmt::Display for PduError {
@@ -76,7 +82,7 @@ impl fmt::Display for PduError {
         match self {
             PduError::UnknownOpcode(op) => write!(f, "unknown iSCSI opcode {op:#04x}"),
             PduError::TooLong(n) => write!(f, "iSCSI data segment of {n} bytes is too long"),
-            PduError::Digest => write!(f, "iSCSI digest mismatch"),
+            PduError::Digest | PduError::DataDigest(_) => write!(f, "iSCSI digest mismatch"),
         }
     }
 }
@@ -192,12 +198,13 @@ pub struct PduReader {
     max_data: usize,
     header_digest: bool,
     data_digest: bool,
+    recoverable: bool,
 }
 
 impl PduReader {
     /// A reader that rejects data segments longer than `max_data` bytes.
     pub fn new(max_data: usize) -> Self {
-        Self { buf: Vec::new(), max_data, header_digest: false, data_digest: false }
+        Self { buf: Vec::new(), max_data, header_digest: false, data_digest: false, recoverable: false }
     }
 
     /// Changes the longest data segment accepted.
@@ -210,6 +217,15 @@ impl PduReader {
     pub fn set_digests(&mut self, header: bool, data: bool) {
         self.header_digest = header;
         self.data_digest = data;
+    }
+
+    /// With `on`, a PDU whose data digest fails is skipped and reported as
+    /// [`PduError::DataDigest`] with its header, and the stream stays in
+    /// step: what error recovery level 1 needs to ask for the PDU again. A
+    /// failed header digest still ends the stream, since the length in the
+    /// header cannot be trusted.
+    pub fn set_recoverable(&mut self, on: bool) {
+        self.recoverable = on;
     }
 
     /// Appends bytes received from the stream.
@@ -255,6 +271,10 @@ impl PduReader {
         };
         let body = frame.get(data_at..end).unwrap_or(&[]);
         if with_digest && frame.get(end..).is_none_or(|d| crc32c(body).to_le_bytes() != d) {
+            if self.recoverable {
+                self.buf.drain(..total);
+                return Err(PduError::DataDigest(bhs));
+            }
             return Err(PduError::Digest);
         }
         let mut data = Vec::new();
@@ -405,6 +425,78 @@ pub struct R2t {
     pub desired_len: u32,
 }
 
+/// SNACK Request (RFC 7143 §11.16).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct SnackRequest {
+    /// One of [`snack`]: 0 Data/R2T, 1 Status, 2 DataACK, 3 R-Data.
+    pub kind: u8,
+    pub lun: [u8; 8],
+    /// The command's tag; [`RESERVED_TAG`] for a Status SNACK.
+    pub itt: u32,
+    /// A DataACK's Target Transfer Tag, else [`RESERVED_TAG`].
+    pub ttt: u32,
+    pub exp_stat_sn: u32,
+    /// The first DataSN, R2TSN or StatSN wanted (a DataACK's ExpDataSN).
+    pub beg_run: u32,
+    /// How many, 0 for all from `beg_run` on.
+    pub run_length: u32,
+}
+
+/// SNACK types.
+pub mod snack {
+    /// Resend Data-In or R2T PDUs.
+    pub const DATA_R2T: u8 = 0;
+    /// Resend status.
+    pub const STATUS: u8 = 1;
+    /// Acknowledge Data-In received.
+    pub const DATA_ACK: u8 = 2;
+    /// Resend Data-In for a command whose status arrived.
+    pub const R_DATA: u8 = 3;
+}
+
+/// Task Management Function Request (RFC 7143 §11.5).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct TmfRequest {
+    pub immediate: bool,
+    /// One of [`tmf`].
+    pub function: u8,
+    pub lun: [u8; 8],
+    pub itt: u32,
+    /// The task a function acts on.
+    pub ref_task_tag: u32,
+    pub cmd_sn: u32,
+    pub exp_stat_sn: u32,
+    /// The CmdSN of the referenced task.
+    pub ref_cmd_sn: u32,
+    /// For TASK REASSIGN of a read: the next DataSN expected.
+    pub exp_data_sn: u32,
+}
+
+/// Task management functions.
+pub mod tmf {
+    /// ABORT TASK.
+    pub const ABORT_TASK: u8 = 1;
+    /// LOGICAL UNIT RESET.
+    pub const LUN_RESET: u8 = 5;
+    /// Reassign a task to this connection (error recovery level 2).
+    pub const TASK_REASSIGN: u8 = 14;
+}
+
+/// Task Management Function Response (RFC 7143 §11.6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct TmfResponse {
+    /// 0 complete, 5 task does not exist, 6 LUN does not exist, 255
+    /// function rejected, and so on.
+    pub response: u8,
+    pub itt: u32,
+    pub stat_sn: u32,
+    pub exp_cmd_sn: u32,
+    pub max_cmd_sn: u32,
+}
+
 /// NOP-Out (RFC 7143 §11.18).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -531,6 +623,9 @@ pub enum Message {
     TextRequest(TextRequest),
     DataOut(DataOut),
     LogoutRequest(LogoutRequest),
+    SnackRequest(SnackRequest),
+    TmfRequest(TmfRequest),
+    TmfResponse(TmfResponse),
     NopIn(NopIn),
     ScsiResponse(ScsiResponse),
     LoginResponse(LoginResponse),
@@ -622,6 +717,33 @@ impl Message {
                 cid: p.u16_at(20),
                 cmd_sn: sn24,
                 exp_stat_sn: sn28,
+            }),
+            opcode::SNACK_REQUEST => Message::SnackRequest(SnackRequest {
+                kind: flags & 0x0f,
+                lun: p.lun(),
+                itt: p.u32_at(16),
+                ttt: p.u32_at(20),
+                exp_stat_sn: sn28,
+                beg_run: p.u32_at(36),
+                run_length: p.u32_at(40),
+            }),
+            opcode::TASK_MGMT_REQUEST => Message::TmfRequest(TmfRequest {
+                immediate: imm,
+                function: flags & 0x7f,
+                lun: p.lun(),
+                itt: p.u32_at(16),
+                ref_task_tag: p.u32_at(20),
+                cmd_sn: sn24,
+                exp_stat_sn: sn28,
+                ref_cmd_sn: sn32,
+                exp_data_sn: p.u32_at(36),
+            }),
+            opcode::TASK_MGMT_RESPONSE => Message::TmfResponse(TmfResponse {
+                response: p.byte(2),
+                itt: p.u32_at(16),
+                stat_sn: sn24,
+                exp_cmd_sn: sn28,
+                max_cmd_sn: sn32,
             }),
             opcode::NOP_IN => Message::NopIn(NopIn {
                 lun: p.lun(),
@@ -800,6 +922,32 @@ impl Message {
                 p.set_u32(24, m.cmd_sn);
                 p.set_u32(28, m.exp_stat_sn);
             }
+            Message::SnackRequest(m) => {
+                p.set_byte(1, F | m.kind & 0x0f);
+                p.set_lun(m.lun);
+                p.set_u32(16, m.itt);
+                p.set_u32(20, m.ttt);
+                p.set_u32(28, m.exp_stat_sn);
+                p.set_u32(36, m.beg_run);
+                p.set_u32(40, m.run_length);
+            }
+            Message::TmfRequest(m) => {
+                p.set_byte(0, p.byte(0) | bit(m.immediate, IMMEDIATE));
+                p.set_byte(1, F | m.function & 0x7f);
+                p.set_lun(m.lun);
+                p.set_u32(16, m.itt);
+                p.set_u32(20, m.ref_task_tag);
+                p.set_u32(24, m.cmd_sn);
+                p.set_u32(28, m.exp_stat_sn);
+                p.set_u32(32, m.ref_cmd_sn);
+                p.set_u32(36, m.exp_data_sn);
+            }
+            Message::TmfResponse(m) => {
+                p.set_byte(1, F);
+                p.set_byte(2, m.response);
+                p.set_u32(16, m.itt);
+                status(&mut p, m.stat_sn, m.exp_cmd_sn, m.max_cmd_sn);
+            }
             Message::NopIn(m) => {
                 p.set_byte(1, F);
                 p.set_lun(m.lun);
@@ -906,6 +1054,9 @@ impl Message {
             Message::TextRequest(_) => opcode::TEXT_REQUEST,
             Message::DataOut(_) => opcode::DATA_OUT,
             Message::LogoutRequest(_) => opcode::LOGOUT_REQUEST,
+            Message::SnackRequest(_) => opcode::SNACK_REQUEST,
+            Message::TmfRequest(_) => opcode::TASK_MGMT_REQUEST,
+            Message::TmfResponse(_) => opcode::TASK_MGMT_RESPONSE,
             Message::NopIn(_) => opcode::NOP_IN,
             Message::ScsiResponse(_) => opcode::SCSI_RESPONSE,
             Message::LoginResponse(_) => opcode::LOGIN_RESPONSE,
@@ -929,6 +1080,7 @@ impl Message {
             Message::TextResponse(m) => Some(m.stat_sn),
             Message::DataIn(m) if m.status.is_some() => Some(m.stat_sn),
             Message::LogoutResponse(m) => Some(m.stat_sn),
+            Message::TmfResponse(m) => Some(m.stat_sn),
             Message::AsyncMessage(m) => Some(m.stat_sn),
             Message::Reject(m) => Some(m.stat_sn),
             _ => None,
@@ -944,6 +1096,7 @@ impl Message {
             Message::TextResponse(m) => Some((m.exp_cmd_sn, m.max_cmd_sn)),
             Message::DataIn(m) => Some((m.exp_cmd_sn, m.max_cmd_sn)),
             Message::LogoutResponse(m) => Some((m.exp_cmd_sn, m.max_cmd_sn)),
+            Message::TmfResponse(m) => Some((m.exp_cmd_sn, m.max_cmd_sn)),
             Message::R2t(m) => Some((m.exp_cmd_sn, m.max_cmd_sn)),
             Message::AsyncMessage(m) => Some((m.exp_cmd_sn, m.max_cmd_sn)),
             Message::Reject(m) => Some((m.exp_cmd_sn, m.max_cmd_sn)),
@@ -1049,6 +1202,33 @@ mod tests {
             data: vec![0xaa; 5],
         }));
         round_trip(Message::LogoutRequest(LogoutRequest { reason: 0, itt: 9, cid: 0, cmd_sn: 3, exp_stat_sn: 9 }));
+        round_trip(Message::SnackRequest(SnackRequest {
+            kind: snack::R_DATA,
+            lun,
+            itt: 4,
+            ttt: RESERVED_TAG,
+            exp_stat_sn: 8,
+            beg_run: 3,
+            run_length: 2,
+        }));
+        round_trip(Message::TmfRequest(TmfRequest {
+            immediate: true,
+            function: tmf::TASK_REASSIGN,
+            lun,
+            itt: 12,
+            ref_task_tag: 4,
+            cmd_sn: 6,
+            exp_stat_sn: 9,
+            ref_cmd_sn: 5,
+            exp_data_sn: 7,
+        }));
+        round_trip(Message::TmfResponse(TmfResponse {
+            response: 5,
+            itt: 12,
+            stat_sn: 3,
+            exp_cmd_sn: 4,
+            max_cmd_sn: 9,
+        }));
         round_trip(Message::NopIn(NopIn {
             lun,
             itt: RESERVED_TAG,
@@ -1198,6 +1378,41 @@ mod tests {
 
         r.push(&Message::NopIn(NopIn { data: vec![0; 17], ..Default::default() }).encode().to_bytes());
         assert_eq!(r.next_pdu(), Err(PduError::TooLong(17)));
+    }
+
+    #[test]
+    fn a_recoverable_reader_skips_a_pdu_with_a_bad_data_digest() {
+        let m = |itt| Message::NopOut(NopOut { itt, ttt: RESERVED_TAG, data: vec![7; 8], ..NopOut::default() });
+        let mut bad = m(1).encode().to_bytes_with(false, true);
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        let good = m(2).encode().to_bytes_with(false, true);
+        for recoverable in [false, true] {
+            let mut r = PduReader::new(1 << 16);
+            r.set_digests(false, true);
+            r.set_recoverable(recoverable);
+            r.push(&bad);
+            r.push(&good);
+            match r.next_pdu() {
+                Err(PduError::Digest) => assert!(!recoverable),
+                Err(PduError::DataDigest(bhs)) => {
+                    assert!(recoverable);
+                    assert_eq!(u32::from_be_bytes([bhs[16], bhs[17], bhs[18], bhs[19]]), 1);
+                    let pdu = r.next_pdu().unwrap().unwrap();
+                    assert_eq!(Message::decode(pdu).unwrap(), m(2));
+                    assert_eq!(r.buffered(), 0);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // A bad header digest is never recoverable.
+        let mut hd = m(3).encode().to_bytes_with(true, false);
+        hd[49] ^= 1;
+        let mut r = PduReader::new(1 << 16);
+        r.set_digests(true, false);
+        r.set_recoverable(true);
+        r.push(&hd);
+        assert_eq!(r.next_pdu(), Err(PduError::Digest));
     }
 
     #[test]
