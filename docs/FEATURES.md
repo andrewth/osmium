@@ -154,7 +154,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ virtio-mmio transport (legacy and 1.x), split virtqueue
 - ✅ IP over InfiniBand (`Mlx4::open_ipoib` → `IpoibPort`, a `NetDevice`): joins the broadcast group with the subnet administrator (retried with backoff), adopts the group's queue key, rewrites ARP and frames between Ethernet and IPoIB with invented MACs for neighbors; every unicast datagram uses the broadcast group's service level (no path record queries); simulator-tested only
 - ✅ virtio-pci transport (modern, capability-located registers); tested against a fake function and on QEMU `virtio-gpu-pci`/`virtio-vga`
-- 🗺 virtio-console emergency write and per-port names; virtio-gpu cursor, EDID and interrupts; xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3; HPET; NVMe multiple I/O queues
+- 🗺 virtio-console emergency write and per-port names; virtio-gpu cursor, EDID and interrupts; xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3; HPET message (FSB) interrupt delivery; NVMe multiple I/O queues
 
 ### `osmium-display`: display drivers
 - ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
@@ -166,6 +166,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ NS16550A UART (port I/O and MMIO backends)
 - ✅ Arm PL011 UART
 - ✅ Intel 8254 PIT (calibration delays)
+- ✅ x86 HPET (`Hpet`: capability checks and a checked femtosecond period, the main counter as a `Clock` with 32-bit wrap extension, comparators as `OneShotTimer`s or periodic timers, legacy-replacement or I/O APIC routing, level acknowledgement; `boot::acpi::HpetTable` finds it). Host-tested against simulated registers; `x86_64-pc` boots it from the ACPI table under QEMU (agreement with the PIT, one-shot and periodic comparator interrupts through the I/O APIC)
 - ✅ RISC-V CLINT (machine timer and software interrupts, for M-mode firmware)
 - ✅ RISC-V PLIC
 - ✅ Arm GICv2 (distributor + CPU interface, SGIs with correct source-CPU EOI)

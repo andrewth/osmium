@@ -27,8 +27,8 @@
 //! 64 bits by noticing wraps, so it must be called at least once per wrap (about 5 minutes at
 //! 14.3 MHz); a comparator that is armed does so itself.
 
-use osmium_hal::ioext::IoMemExt;
 use core::sync::atomic::{AtomicU64, Ordering};
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::timer::{Clock, OneShotTimer};
 
