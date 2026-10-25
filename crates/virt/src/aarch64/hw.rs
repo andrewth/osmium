@@ -15,7 +15,7 @@ use core::mem::offset_of;
 
 use osmium_arch::trap::offsets;
 
-use super::{Aarch64Vcpu, El1Regs, FpState, GuestState};
+use super::{Aarch64Vcpu, El1Regs, FpState, GuestState, VgicLink};
 
 global_asm!(
     r#"
@@ -135,6 +135,101 @@ macro_rules! msr {
         // SAFETY: the hypervisor owns the EL1 context and the EL2 controls.
         unsafe { asm!(concat!("msr ", $r, ", {}"), in(reg) $v, options(nomem, nostack, preserves_flags)) }
     };
+}
+
+/// `ICH_HCR_EL2.En`: the virtual CPU interface is on. `UIE` asks for a
+/// maintenance interrupt once at most one list register is still in use.
+const ICH_HCR_EN: u64 = 1;
+const ICH_HCR_UIE: u64 = 1 << 1;
+
+/// The virtual GIC CPU interface registers (by encoding, as the assembler
+/// accepts them without the GICv3 name set): `ICH_HCR_EL2`, `ICH_VTR_EL2`,
+/// `ICH_VMCR_EL2`, `ICH_AP0R0_EL2`, `ICH_AP1R0_EL2`.
+macro_rules! ich {
+    (hcr) => {
+        "S3_4_C12_C11_0"
+    };
+    (vtr) => {
+        "S3_4_C12_C11_1"
+    };
+    (vmcr) => {
+        "S3_4_C12_C11_7"
+    };
+    (ap0r0) => {
+        "S3_4_C12_C8_0"
+    };
+    (ap1r0) => {
+        "S3_4_C12_C9_0"
+    };
+}
+
+/// Generates `read_lr(n)` and `write_lr(n, v)` over `ICH_LR<n>_EL2`, whose
+/// encodings are `S3_4_C12_C(12 + n/8)_(n%8)`.
+macro_rules! list_registers {
+    ($($n:literal => $crm:literal, $op2:literal;)*) => {
+        fn read_lr(n: usize) -> u64 {
+            match n {
+                $($n => {
+                    let v: u64;
+                    // SAFETY: reading a list register at EL2 has no side effects.
+                    unsafe { asm!(concat!("mrs {}, S3_4_C12_C", $crm, "_", $op2), out(reg) v, options(nomem, nostack, preserves_flags)) };
+                    v
+                })*
+                _ => 0,
+            }
+        }
+
+        fn write_lr(n: usize, v: u64) {
+            match n {
+                // SAFETY: the hypervisor owns the virtual CPU interface.
+                $($n => unsafe { asm!(concat!("msr S3_4_C12_C", $crm, "_", $op2, ", {}"), in(reg) v, options(nomem, nostack, preserves_flags)) },)*
+                _ => {}
+            }
+        }
+    };
+}
+
+list_registers! {
+    0 => 12, 0; 1 => 12, 1; 2 => 12, 2; 3 => 12, 3; 4 => 12, 4; 5 => 12, 5; 6 => 12, 6; 7 => 12, 7;
+    8 => 13, 0; 9 => 13, 1; 10 => 13, 2; 11 => 13, 3; 12 => 13, 4; 13 => 13, 5; 14 => 13, 6; 15 => 13, 7;
+}
+
+/// How many list registers this CPU implements (`ICH_VTR_EL2.ListRegs` + 1).
+pub(super) fn list_registers() -> usize {
+    let vtr: u64;
+    // SAFETY: reading an ID register at EL2 has no side effects.
+    unsafe { asm!(concat!("mrs {}, ", ich!(vtr)), out(reg) vtr, options(nomem, nostack, preserves_flags)) };
+    (vtr & 0x1f) as usize + 1
+}
+
+fn load_vgic(l: &VgicLink) {
+    // SAFETY: the hypervisor owns the virtual CPU interface; it is off while the host runs.
+    unsafe {
+        asm!(concat!("msr ", ich!(vmcr), ", {}"), in(reg) l.vmcr, options(nomem, nostack, preserves_flags));
+        asm!(concat!("msr ", ich!(ap0r0), ", {}"), in(reg) l.ap0r0, options(nomem, nostack, preserves_flags));
+        asm!(concat!("msr ", ich!(ap1r0), ", {}"), in(reg) l.ap1r0, options(nomem, nostack, preserves_flags));
+    }
+    for (n, &v) in l.lr.iter().enumerate().take(l.nlr) {
+        write_lr(n, v);
+    }
+    let hcr = ICH_HCR_EN | if l.overflow { ICH_HCR_UIE } else { 0 };
+    // SAFETY: as above.
+    unsafe { asm!(concat!("msr ", ich!(hcr), ", {}"), in(reg) hcr, options(nomem, nostack, preserves_flags)) };
+}
+
+fn save_vgic(l: &mut VgicLink) {
+    let (vmcr, ap0, ap1): (u64, u64, u64);
+    // SAFETY: reads the virtual CPU interface and then switches it off for the host.
+    unsafe {
+        asm!(concat!("mrs {}, ", ich!(vmcr)), out(reg) vmcr, options(nomem, nostack, preserves_flags));
+        asm!(concat!("mrs {}, ", ich!(ap0r0)), out(reg) ap0, options(nomem, nostack, preserves_flags));
+        asm!(concat!("mrs {}, ", ich!(ap1r0)), out(reg) ap1, options(nomem, nostack, preserves_flags));
+        asm!(concat!("msr ", ich!(hcr), ", {}"), in(reg) 0u64, options(nomem, nostack, preserves_flags));
+    }
+    (l.vmcr, l.ap0r0, l.ap1r0) = (vmcr, ap0, ap1);
+    for (n, v) in l.lr.iter_mut().enumerate().take(l.nlr) {
+        *v = read_lr(n);
+    }
 }
 
 /// `HCR_EL2` while a guest runs: stage 2 on (VM), set/way invalidation
@@ -291,8 +386,13 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     if mrs!("vtcr_el2") != VTCR_48 {
         init_cpu();
     }
-    let hcr = HCR_GUEST | if v.irq.load(core::sync::atomic::Ordering::Acquire) { HCR_VI } else { 0 };
+    // A GICv3 guest's interrupts come from the list registers instead.
+    let vi = v.vgic.is_none() && v.irq.load(core::sync::atomic::Ordering::Acquire);
+    let hcr = HCR_GUEST | if vi { HCR_VI } else { 0 };
     msr!("hcr_el2", hcr);
+    if let Some(m) = v.vmpidr {
+        msr!("vmpidr_el2", m);
+    }
     // A different vCPU than this CPU last ran (or a new VM that reuses an
     // old one's VMID and root): install its VTTBR and flush.
     let cpu = osmium_arch::cpu::current_id();
@@ -315,6 +415,9 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     }
     load_el1(&v.el1);
     load_fp(&v.fp);
+    if let Some(l) = &v.vgic {
+        load_vgic(l);
+    }
     // SAFETY: orders the context writes before entering the guest.
     unsafe { asm!("isb", options(nomem, nostack, preserves_flags)) };
     // SAFETY: `state` stays valid and exclusively borrowed for the guest run;
@@ -322,6 +425,9 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     unsafe { osmium_el2_run(&mut v.state) };
     save_el1(&mut v.el1);
     save_fp(&mut v.fp);
+    if let Some(l) = &mut v.vgic {
+        save_vgic(l);
+    }
     // The guest's timer must not fire while the host runs; its level is
     // recomputed in software before the next entry.
     msr!("cntv_ctl_el0", 0u64);

@@ -12,6 +12,19 @@
 //! | Anything else | [`VmExit::Unhandled`] with the raw `ESR_EL2` |
 //!
 //! [`psci`] answers the PSCI calls a single-vCPU guest makes.
+//!
+//! # Virtual GICv3
+//!
+//! [`Aarch64Vcpu::with_vgic_v3`] attaches the vCPU to a
+//! [`VirtualGicV3`]. The guest then uses the host's virtual CPU interface
+//! (`ICV_*`, via `HCR_EL2.IMO` and `ICH_HCR_EL2.En`), which needs a GICv3 host
+//! with `ICC_SRE_EL2.Enable` set. Around every guest run the vCPU copies
+//! pending interrupts from the model into the list registers and the
+//! acknowledged or completed state back (`ICH_LR<n>_EL2`, `ICH_VMCR_EL2`,
+//! `ICH_AP*R0_EL2` are part of the world switch). The guest's writes to
+//! `ICC_SGI1R_EL1` trap to EL2 and are forwarded to the model. A vCPU with a
+//! GICv3 sees `MPIDR_EL1` = [`vcpu_mpidr`](crate::devices::vcpu_mpidr), which
+//! is how a guest finds its redistributor.
 
 pub mod fdt;
 pub mod psci;
@@ -25,8 +38,34 @@ mod hw;
 #[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
 pub use hw::{HCR_GUEST, VTCR_48, counter, init_cpu};
 
+use crate::devices::VirtualGicV3;
 use crate::memory::GuestPhysAddr;
 use crate::vcpu::{Vcpu, VmExit};
+
+/// The most list registers a GICv3 implements.
+pub const MAX_LIST_REGISTERS: usize = 16;
+
+/// The list registers modeled by the host-side tests, which have no hardware.
+#[cfg(not(all(target_arch = "aarch64", feature = "aarch64-el2")))]
+#[cfg_attr(not(test), allow(dead_code))]
+const SIMULATED_LIST_REGISTERS: usize = 4;
+
+/// A vCPU's virtual CPU interface state and its link to the GIC model.
+#[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+struct VgicLink {
+    gic: Arc<VirtualGicV3>,
+    cpu: usize,
+    /// `ICH_LR<n>_EL2` images, `nlr` of them valid.
+    lr: [u64; MAX_LIST_REGISTERS],
+    nlr: usize,
+    /// More interrupts were pending than list registers: ask for a
+    /// maintenance interrupt when the guest has consumed them.
+    overflow: bool,
+    /// `ICH_VMCR_EL2` (the guest's `ICC_PMR`, `ICC_BPR` and group enables).
+    vmcr: u64,
+    ap0r0: u64,
+    ap1r0: u64,
+}
 
 /// Exception classes (`ESR_EL2.EC`).
 mod ec {
@@ -179,6 +218,10 @@ pub struct Aarch64Vcpu {
     irq: Arc<AtomicBool>,
     timer: Option<Box<dyn Fn(bool) + Send + Sync>>,
     pending: Option<Load>,
+    vgic: Option<VgicLink>,
+    /// `VMPIDR_EL2`, if the vCPU sets one (what the guest reads as `MPIDR_EL1`).
+    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    vmpidr: Option<u64>,
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
     /// See [`new_vcpu_id`](crate::vcpu::new_vcpu_id).
     #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
@@ -219,6 +262,8 @@ impl Aarch64Vcpu {
             irq: Arc::new(AtomicBool::new(false)),
             timer: None,
             pending: None,
+            vgic: None,
+            vmpidr: None,
             running: None,
             flush: false,
             last_cpu: crate::vcpu::NO_CPU,
@@ -236,6 +281,50 @@ impl Aarch64Vcpu {
     pub fn with_irq_line(mut self, line: Arc<AtomicBool>) -> Self {
         self.irq = line;
         self
+    }
+
+    /// Attaches the vCPU, as CPU `cpu` of `gic`, to a virtual GICv3: see the
+    /// module documentation. Also gives the guest `MPIDR_EL1` =
+    /// [`vcpu_mpidr`](crate::devices::vcpu_mpidr)`(cpu)`. Interrupt delivery
+    /// goes through the GIC's list registers, so the vCPU's IRQ line (see
+    /// [`irq_line`](Self::irq_line)) only reports, for `interrupt_pending`,
+    /// whether the guest has something to take; wire the GIC's output to it.
+    pub fn with_vgic_v3(mut self, gic: Arc<VirtualGicV3>, cpu: usize) -> Self {
+        self.vgic = Some(VgicLink {
+            gic,
+            cpu,
+            lr: [0; MAX_LIST_REGISTERS],
+            nlr: 0,
+            overflow: false,
+            vmcr: 0,
+            ap0r0: 0,
+            ap1r0: 0,
+        });
+        self.vmpidr = Some(crate::devices::vcpu_mpidr(cpu));
+        self
+    }
+
+    /// Loads the list registers for the next entry from the GIC model.
+    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    fn vgic_fill(&mut self) {
+        let Some(l) = &mut self.vgic else { return };
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
+        let n = hw::list_registers();
+        #[cfg(not(all(target_arch = "aarch64", feature = "aarch64-el2")))]
+        let n = SIMULATED_LIST_REGISTERS;
+        l.nlr = n.min(MAX_LIST_REGISTERS);
+        if let Some(regs) = l.lr.get_mut(..l.nlr) {
+            l.overflow = l.gic.fill_list_registers(l.cpu, regs);
+        }
+    }
+
+    /// Hands the list registers the guest left back to the GIC model.
+    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    fn vgic_sync(&mut self) {
+        let Some(l) = &mut self.vgic else { return };
+        if let Some(regs) = l.lr.get(..l.nlr) {
+            l.gic.sync_list_registers(l.cpu, regs, l.vmcr);
+        }
     }
 
     /// Connects the guest's virtual timer to an interrupt line (usually the
@@ -282,6 +371,20 @@ impl Aarch64Vcpu {
         }
         // ISS: Direction (bit 0, 1 = read), Rt (bits 9:5).
         let rt = ((s.esr >> 5) & 31) as usize;
+        // ICC_SGI1R_EL1, ICC_ASGI1R_EL1 and ICC_SGI0R_EL1 (Op0 3, Op1 0, CRn 12, CRm 11, Op2 5-7) write: an
+        // SGI request for the virtual GIC.
+        let (op0, op2, op1, crn, crm) =
+            ((s.esr >> 20) & 3, (s.esr >> 17) & 7, (s.esr >> 14) & 7, (s.esr >> 10) & 15, (s.esr >> 1) & 15);
+        if s.esr & 1 == 0
+            && (op0, op1, crn, crm) == (3, 0, 12, 11)
+            && (5..=7).contains(&op2)
+            && let Some(l) = &self.vgic
+        {
+            let v = s.x.get(rt).copied().unwrap_or(0);
+            l.gic.send_sgi(l.cpu, v);
+            s.pc = s.pc.wrapping_add(4);
+            return true;
+        }
         if s.esr & 1 != 0
             && let Some(r) = s.x.get_mut(rt)
         {
@@ -346,7 +449,9 @@ impl Vcpu for Aarch64Vcpu {
         }
         let exit = loop {
             self.sync_timer(hw::counter());
+            self.vgic_fill();
             hw::run(self);
+            self.vgic_sync();
             if !self.emulate_sysreg() {
                 break self.classify();
             }
@@ -418,6 +523,60 @@ mod tests {
         assert_eq!(v.state.x[3], 7);
         v.state.esr = ec::HVC64 << 26;
         assert!(!v.emulate_sysreg());
+    }
+
+    #[test]
+    fn vgic_v3_sgi_trap_and_list_registers() {
+        use crate::devices::VirtualGicV3;
+        use core::sync::atomic::AtomicBool;
+
+        let lines = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+        let l = lines.clone();
+        let gic = Arc::new(VirtualGicV3::new(2, 64, move |cpu, v| {
+            if let Some(x) = l.get(cpu) {
+                x.store(v, Ordering::SeqCst)
+            }
+        }));
+        let (d, r) = (gic.distributor(), gic.redistributors());
+        // Bring both redistributors up as a guest would; enable SGI 3 on vCPU 1.
+        for cpu in 0..2u64 {
+            r.write(cpu * 0x2_0000 + 0x14, &0u32.to_le_bytes());
+            r.write(cpu * 0x2_0000 + 0x1_0000 + 0x100, &(1u32 << 3).to_le_bytes());
+        }
+        d.write(0, &0x13u32.to_le_bytes());
+        let mut v0 = Aarch64Vcpu::new(GuestPhysAddr(0x4000_0000), 0, 0).with_vgic_v3(gic.clone(), 0);
+        let mut v1 = Aarch64Vcpu::new(GuestPhysAddr(0x4000_0000), 0, 0).with_vgic_v3(gic.clone(), 1);
+        assert_eq!(v1.vmpidr, Some(1 << 31 | 1));
+        v1.vgic_fill();
+        v1.vgic.as_mut().unwrap().vmcr = 0xf8 << 24 | 2;
+        v1.vgic_sync();
+
+        // MSR ICC_SGI1R_EL1, x4 at vCPU 0: Op0 3, Op1 0, CRn 12, CRm 11, Op2 5.
+        let iss = 3 << 20 | 5 << 17 | 12 << 10 | 4 << 5 | 11 << 1;
+        v0.state.vector = vector::SYNC;
+        v0.state.esr = ec::SYSREG << 26 | 1 << 25 | iss;
+        v0.state.x[4] = 3 << 24 | 0b10; // SGI 3 to Aff0 = 1
+        assert!(v0.emulate_sysreg());
+        assert_eq!(v0.state.pc, 0x4000_0004);
+        assert!(lines[1].load(Ordering::SeqCst), "vCPU 1 has an interrupt to take");
+        assert!(!lines[0].load(Ordering::SeqCst));
+
+        // Entry loads it into a list register as pending.
+        v1.vgic_fill();
+        let l = v1.vgic.as_mut().unwrap();
+        assert_eq!(l.lr[0] >> 62, 1);
+        assert_eq!(l.lr[0] as u32, 3);
+        // The guest acknowledges and completes it (hardware edits the register).
+        l.lr[0] = 0;
+        v1.vgic_sync();
+        assert!(!lines[1].load(Ordering::SeqCst));
+        // A read of the same register is not an SGI request.
+        v0.state.esr = ec::SYSREG << 26 | 1 << 25 | iss | 1;
+        v0.state.x[4] = 0x55;
+        assert!(v0.emulate_sysreg());
+        assert_eq!(v0.state.x[4], 0);
+        v1.vgic_fill();
+        assert_eq!(v1.vgic.as_ref().unwrap().lr[0], 0);
     }
 
     #[test]
