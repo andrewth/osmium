@@ -15,7 +15,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc -q --workspace --all-features --no-deps
 
 for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64imac-unknown-none-elf; do
     echo "== build $target"
-    cargo build -q --workspace --all-features --target "$target"
+    # osmium-drivers only has the std-backed `testing` feature, so it is built as a dependency instead.
+    cargo build -q --workspace --exclude osmium-drivers --all-features --target "$target"
 done
 
 # Variants that save FP registers in the context switch.
