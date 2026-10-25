@@ -156,7 +156,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ virtio-mmio transport (legacy and 1.x), split virtqueue
 - ✅ IP over InfiniBand (`Mlx4::open_ipoib` → `IpoibPort`, a `NetDevice`): joins the broadcast group with the subnet administrator (retried with backoff), adopts the group's queue key, rewrites ARP and frames between Ethernet and IPoIB with invented MACs for neighbors; every unicast datagram uses the broadcast group's service level (no path record queries); simulator-tested only
 - ✅ virtio-pci transport (modern, capability-located registers); tested against a fake function and on QEMU `virtio-gpu-pci`/`virtio-vga`
-- 🗺 virtio-console emergency write and per-port names; virtio-gpu control-command completion by interrupt (a driver-level `handle_interrupt` exists, but no example routes the device's IRQ); xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3 ITS and LPIs; HPET; NVMe multiple I/O queues
+- 🗺 virtio-console emergency write and per-port names; virtio-gpu control-command completion by interrupt (a driver-level `handle_interrupt` exists, but no example routes the device's IRQ); xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3 ITS and LPIs; HPET; an MSI-X vector per NVMe I/O queue
 
 ### `osmium-display`: display drivers
 - ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
@@ -185,7 +185,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ RAM disk `BlockDevice`
 - ✅ virtio-blk `BlockDevice` (read-only and flush features, requests split at 64 KiB)
 - ✅ AHCI (SATA): HBA handoff and port bring-up, IDENTIFY, READ/WRITE DMA EXT and FLUSH CACHE EXT, native command queuing (up to 8 commands in flight), interrupt-driven completion (INTx or MSI, polled fallback kept), ATAPI optical drives as read-only block devices (IDENTIFY PACKET DEVICE, READ(10), READ CAPACITY) for `osmium-fs-iso9660`; each disk is its own `BlockDevice` that outlives the HBA; error recovery with CLO or COMRESET; boots against QEMU `ich9-ahci` + `ide-hd`
-- ✅ NVMe: admin and one I/O queue pair (phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting with up to four commands in flight (out-of-order completions), optional MSI-X completion interrupts (`Nvme::with_interrupts`; polling remains the default), normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
+- ✅ NVMe: admin and one or several I/O queue pairs (Set Features / Number of Queues negotiated, up to eight, each with its own bounce buffers, command identifiers and spin lock, so `read_blocks_on`/`write_blocks_on`/`flush_on` and `Nvme::queue` handles run concurrently on different queues; `Nvme::new` keeps one pair, `Nvme::with_queues` asks for more and falls back to one if the controller refuses; phase tags, doorbell stride), IDENTIFY controller and namespaces, PRP lists, MDTS-limited splitting with up to four commands in flight (out-of-order completions), optional MSI-X completion interrupts (`Nvme::with_interrupts`, all queues sharing one vector; polling remains the default), normal shutdown on drop; a `BlockDevice` over the chosen namespace; boots against QEMU `nvme`
 
 ### `osmium-usb`: USB host controllers and class drivers
 

@@ -503,14 +503,17 @@ fn nvme_demo<D: DmaAllocator>(addr: pci::Address, io: IoMem, dma: &D, before: &d
         Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: init failed: {e:?}"),
     }
     // Again with several I/O queue pairs, each given a round trip of its own.
-    if let Ok(disk) = Nvme::with_queues(more, dma, &Uptime, None, 4) {
-        let n = disk.io_queues();
-        let mut ok = 0;
-        for mut handle in (0..n).filter_map(|q| disk.queue(q)) {
-            before();
-            ok += demos::block_roundtrip(&mut handle).is_ok() as usize;
+    match Nvme::with_queues(more, dma, &Uptime, None, 4) {
+        Ok(disk) => {
+            let n = disk.io_queues();
+            let mut ok = 0;
+            for mut handle in (0..n).filter_map(|q| disk.queue(q)) {
+                before();
+                ok += demos::block_roundtrip(&mut handle).is_ok() as usize;
+            }
+            println!("[nvme]  {b:02x}:{d:02x}.{f} {n} I/O queues; round trip on each: {ok} ok");
         }
-        println!("[nvme]  {b:02x}:{d:02x}.{f} {n} I/O queues; round trip on each: {ok} ok");
+        Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: multi-queue init failed: {e:?}"),
     }
 }
 
