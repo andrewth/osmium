@@ -29,6 +29,9 @@ pub use msi::{Msi, MsiError, MsiMessage, Msix, MsixPba, MsixTable};
 mod bridge;
 pub use bridge::{Bridge, WalkError, WalkSummary, walk};
 
+mod ats;
+pub use ats::{Ats, AtsError, PasidCap};
+
 mod sriov;
 pub use sriov::{ExtCapabilities, SrIov, SrIovError, ext_cap};
 
