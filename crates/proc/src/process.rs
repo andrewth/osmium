@@ -19,7 +19,7 @@ use osmium_sync::{IrqSpinLock, Once};
 
 use osmium_fs::Errno;
 
-use crate::fd::FdTable;
+use crate::fd::{FdTable, OpenFile};
 use crate::memory::UserMemory;
 use crate::mmap::{FreeRange, MmapArea};
 
@@ -369,10 +369,14 @@ impl Process {
 
     /// Handles a user page fault at `addr`. A write to a copy-on-write page
     /// (shared by `fork`) gets its own copy and returns true: return to user
-    /// mode and the instruction runs again. Any other fault returns false,
-    /// and ends the process (see [`handle_page_fault`]).
+    /// mode and the instruction runs again. So does a touch of a page of a
+    /// file mapping that is not loaded yet, or a first store to a clean page
+    /// of a shared one (see [`UserMemory::file_fault`]): a trap handler passes
+    /// reads and instruction fetches too. Any other fault returns false, and
+    /// ends the process (see [`handle_page_fault`]).
     pub fn handle_page_fault(&self, addr: u64, write: bool) -> bool {
-        write && self.memory().cow_fault(addr)
+        let memory = self.memory();
+        write && memory.cow_fault(addr) || memory.file_fault(addr, write)
     }
 
     /// The root page table to activate when switching to this process.
@@ -481,14 +485,60 @@ impl Process {
         let spare = FreeRange::spare().map_err(|_| Errno::ENOMEM)?;
         let mut area = self.mmap.lock();
         let va = area.alloc(len)?;
-        if flags != MapFlags::NONE {
-            let memory = self.memory();
-            if let Err(e) = memory.map_anon(va, len, flags) {
-                // Give back what was mapped before it ran out.
-                memory.unmap(va, len);
-                area.release(va, va + len, spare);
-                return Err(e);
-            }
+        let memory = self.memory();
+        // Reserved: no pages, but `mprotect` can later give it some.
+        let r = if flags != MapFlags::NONE { memory.map_anon(va, len, flags) } else { memory.reserve(va, len) };
+        if let Err(e) = r {
+            // Give back what was mapped before it ran out.
+            memory.unmap(va, len);
+            area.release(va, va + len, spare);
+            return Err(e);
+        }
+        Ok(va)
+    }
+
+    /// `mmap` of `file` from byte `offset` (page-aligned): places the mapping
+    /// in the `mmap` area and returns its address. Nothing is read until
+    /// the pages are touched.
+    ///
+    /// The file must be a regular file opened for reading, and for a shared
+    /// mapping that may be written (`prot` includes `WRITE`), for writing and
+    /// not append-only. `offset + len` must fit in a file offset.
+    pub fn mmap_file(
+        &self,
+        len: u64,
+        prot: MapFlags,
+        shared: bool,
+        file: &OpenFile,
+        offset: u64,
+    ) -> Result<u64, Errno> {
+        let len = len.checked_next_multiple_of(PAGE).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        if !offset.is_multiple_of(PAGE) {
+            return Err(Errno::EINVAL);
+        }
+        if offset.checked_add(len).is_none_or(|end| end > i64::MAX as u64) {
+            return Err(Errno::EOVERFLOW);
+        }
+        if file.file().try_stat()?.kind != osmium_fs::FileKind::Regular {
+            return Err(Errno::ENODEV);
+        }
+        let access = file.access();
+        if !access.read || shared && prot.contains(MapFlags::WRITE) && (!access.write || access.append) {
+            return Err(Errno::EACCES);
+        }
+        let map = crate::memory::FileMapping {
+            file: file.file().clone(),
+            offset,
+            shared,
+            prot,
+            writable: access.write && !access.append,
+        };
+        let spare = FreeRange::spare().map_err(|_| Errno::ENOMEM)?;
+        let mut area = self.mmap.lock();
+        let va = area.alloc(len)?;
+        if let Err(e) = self.memory().map_file(va, len, map) {
+            area.release(va, va + len, spare);
+            return Err(e);
         }
         Ok(va)
     }

@@ -170,6 +170,8 @@ impl Process {
         let root = memory.root();
         let old = self.replace_image(name, memory, brk, brk_limit, mmap);
         activate(root);
+        // Shared file mappings are saved before the image goes. A failure has nowhere to be reported.
+        let _ = old.sync_files();
         drop(old);
         if osmium_arch::fp::enabled() {
             // The new program starts with cleared FP/SIMD registers.

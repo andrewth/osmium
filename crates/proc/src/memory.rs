@@ -16,6 +16,10 @@ use osmium_sync::intrusive::{Adapter, KeyAdapter, Shared, TreeLink};
 
 use osmium_fs::Errno;
 
+mod filemap;
+pub use filemap::FileMapping;
+use filemap::FileMaps;
+
 const PAGE: u64 = PAGE_SIZE as u64;
 
 /// The most memory an executable's segments may span together.
@@ -63,6 +67,50 @@ pub trait UserMemory: Send + Sync {
     /// `code`; the kernel's own stubs, such as the signal return trampoline.
     fn map_code(&self, _va: u64, _code: &[u8]) -> Result<(), Errno> {
         Err(Errno::ENOSYS)
+    }
+
+    /// Records a file mapping over `va..va + len` (page-aligned, inside the
+    /// user half and clear of every other mapping). Nothing is read yet: the
+    /// pages are loaded when first touched (see [`UserMemory::file_fault`]).
+    fn map_file(&self, _va: u64, _len: u64, _map: FileMapping) -> Result<(), Errno> {
+        Err(Errno::ENODEV)
+    }
+    /// Reserves `va..va + len` (page-aligned) with no access: anonymous
+    /// memory that [`UserMemory::mprotect`] can later make usable. The
+    /// default does nothing, since an unmapped range already faults.
+    fn reserve(&self, _va: u64, _len: u64) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// Handles a user fault at `va` in a file mapping or reservation: loads
+    /// the page (a read, or a write to a private mapping), or makes a clean
+    /// page of a shared mapping writable and records it as dirty. Returns
+    /// true if the instruction can be retried; false if `va` is in no
+    /// mapping, the access is not allowed, or the page is past the end of
+    /// the file.
+    fn file_fault(&self, _va: u64, _write: bool) -> bool {
+        false
+    }
+    /// [`UserMemory::unmap`] for `munmap`: also writes back the dirty pages
+    /// of shared file mappings and drops the mappings, and reports a failure
+    /// to do either. On `ENOMEM` nothing was changed. `len` is page-aligned.
+    fn munmap(&self, va: u64, len: u64) -> Result<(), Errno> {
+        self.unmap(va, len);
+        Ok(())
+    }
+    /// Changes the access of `va..va + len` (page-aligned) to `prot`, some of
+    /// `READ`, `WRITE` and `EXEC`. Pages not loaded yet get it when they are.
+    fn mprotect(&self, _va: u64, _len: u64, _prot: MapFlags) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+    /// Writes the dirty pages of shared file mappings in `va..va + len`
+    /// back to their files, and with `sync`, makes them durable.
+    fn msync(&self, _va: u64, _len: u64, _sync: bool) -> Result<(), Errno> {
+        Ok(())
+    }
+    /// Writes back every dirty page of every shared file mapping: when the
+    /// space is about to be given up.
+    fn sync_files(&self) -> Result<(), Errno> {
+        Ok(())
     }
 }
 
@@ -204,15 +252,22 @@ struct Inner<F: PageTableFormat, A: TableAlloc> {
     /// The pages this space maps, by user address. A frame is freed when no
     /// space's pages refer to it.
     pages: ArcTree<ByVa<A>>,
+    /// The file mappings and reservations, and which pages of shared ones
+    /// are dirty.
+    maps: FileMaps,
 }
 
 impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
     /// Gives the copy-on-write page at `va` (page-aligned) its own writable
     /// frame. Returns false if it is not one, or memory ran out.
     fn break_cow(&self, inner: &mut Inner<F, A>, va: u64) -> bool {
-        let Inner { pt, pages } = inner;
+        let Inner { pt, pages, maps } = inner;
         let Some(page) = pages.find(&va) else { return false };
         if !page.is_cow() {
+            return false;
+        }
+        // A mapping made read-only after the fork stays so.
+        if maps.find(va).is_some_and(|v| !v.prot().contains(MapFlags::WRITE)) {
             return false;
         }
         let vaddr = VirtAddr::new(va);
@@ -258,6 +313,46 @@ impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
 }
 
 impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + Sync + 'static> AddressSpace<F, A> {
+    /// Unmaps and frees the pages of `va..va + len`, and drops the file
+    /// mappings there after writing back what shared ones hold. With
+    /// `strict`, running out of memory to split a mapping fails the call
+    /// before anything is changed; otherwise the pages go regardless.
+    fn unmap_range(&self, va: u64, len: u64, strict: bool) -> Result<(), Errno> {
+        debug_assert_threads_pinned();
+        let end = va.saturating_add(len);
+        // Before the pages go: this is the last chance to save them.
+        let saved = self.writeback(va, end);
+        let mut inner = self.inner.lock();
+        let Inner { pt, pages, maps } = &mut *inner;
+        if strict {
+            maps.carve(va, end, filemap::Edit::Remove)?;
+        } else {
+            maps.remove(va, end);
+        }
+        maps.clear_dirty(va, end);
+        // Every user page is one of ours, so visit those rather than each
+        // page of a range that may span most of the address space.
+        let mut from = va & !(PAGE - 1);
+        while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&at| at < end) {
+            from = at + PAGE;
+            match pt.unmap(VirtAddr::new(at)) {
+                // The flush is local to this CPU. That is enough because all
+                // of a process's threads share one CPU (`clone` pins them),
+                // so no other CPU holds a stale TLB entry.
+                Ok((_, flush)) => flush.flush(),
+                // Mapped, yet it cannot be unmapped: leave it, and its frame.
+                Err(_) if pt.translate(VirtAddr::new(at)).is_some() => continue,
+                // Not mapped: nothing refers to the frame.
+                Err(_) => {}
+            }
+            // The frame goes with the page, unless a relative still maps it.
+            drop(pages.take_key(&at));
+        }
+        saved
+    }
+}
+
+impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + Sync + 'static> AddressSpace<F, A> {
     /// Creates an empty space whose root entries `shared` point at the same
     /// tables as `kernel`'s, so the kernel stays mapped while it is active.
     ///
@@ -271,7 +366,12 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         let mut pt = PageTable::new(alloc.clone())?;
         // SAFETY: forwarded contract.
         unsafe { pt.share_root_entries(kernel, shared.clone()) };
-        Ok(Self { root: pt.root(), alloc, shared, inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new() }) })
+        Ok(Self {
+            root: pt.root(),
+            alloc,
+            shared,
+            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new(), maps: FileMaps::default() }),
+        })
     }
 
     /// Whether `va..end` is non-empty, in the lower (user) half, and clear of
@@ -311,6 +411,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        self.fault_in(va, buf.len(), false)?;
         let inner = self.inner.lock();
         walk(&inner.pt, va, buf.len(), MapFlags::READ, |src, off, n| {
             let to = buf.get_mut(off..off.saturating_add(n)).ok_or(Errno::EFAULT)?;
@@ -321,6 +422,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Errno> {
+        self.fault_in(va, data.len(), true)?;
         let mut inner = self.inner.lock();
         let end = va.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
         let mut from = va & !(PAGE - 1);
@@ -372,28 +474,36 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn unmap(&self, va: u64, len: u64) {
-        debug_assert_threads_pinned();
-        let end = va.saturating_add(len);
-        let mut inner = self.inner.lock();
-        let Inner { pt, pages } = &mut *inner;
-        // Every user page is one of ours, so visit those rather than each
-        // page of a range that may span most of the address space.
-        let mut from = va & !(PAGE - 1);
-        while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&at| at < end) {
-            from = at + PAGE;
-            match pt.unmap(VirtAddr::new(at)) {
-                // The flush is local to this CPU. That is enough because all
-                // of a process's threads share one CPU (`clone` pins them),
-                // so no other CPU holds a stale TLB entry.
-                Ok((_, flush)) => flush.flush(),
-                // Mapped, yet it cannot be unmapped: leave it, and its frame.
-                Err(_) if pt.translate(VirtAddr::new(at)).is_some() => continue,
-                // Not mapped: nothing refers to the frame.
-                Err(_) => {}
-            }
-            // The frame goes with the page, unless a relative still maps it.
-            drop(pages.take_key(&at));
-        }
+        // This cannot report a failure, so it unmaps whatever happens.
+        let _ = self.unmap_range(va, len, false);
+    }
+
+    fn munmap(&self, va: u64, len: u64) -> Result<(), Errno> {
+        self.unmap_range(va, len, true)
+    }
+
+    fn map_file(&self, va: u64, len: u64, map: FileMapping) -> Result<(), Errno> {
+        self.map_file_impl(va, len, map)
+    }
+
+    fn reserve(&self, va: u64, len: u64) -> Result<(), Errno> {
+        self.reserve_impl(va, len)
+    }
+
+    fn file_fault(&self, va: u64, write: bool) -> bool {
+        self.file_fault_impl(va, write)
+    }
+
+    fn mprotect(&self, va: u64, len: u64, prot: MapFlags) -> Result<(), Errno> {
+        self.mprotect_impl(va, len, prot)
+    }
+
+    fn msync(&self, va: u64, len: u64, sync: bool) -> Result<(), Errno> {
+        self.msync_impl(va, len, sync)
+    }
+
+    fn sync_files(&self) -> Result<(), Errno> {
+        self.writeback(0, u64::MAX)
     }
 
     fn load_elf(&self, elf: &Elf<'_>) -> Result<u64, Errno> {
@@ -412,7 +522,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             return Err(Errno::ENOMEM);
         }
         let mut inner = self.inner.lock();
-        let Inner { pt, pages } = &mut *inner;
+        let Inner { pt, pages, .. } = &mut *inner;
         // The frames the loader allocates, until we know which page each is.
         let mut fresh: Fresh<A> = ArcTree::new();
         let loaded = elf.load_into(pt, MapFlags::USER, || {
@@ -452,7 +562,8 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         // Making pages read-only flushes this CPU only: see `unmap`.
         debug_assert_threads_pinned();
         let mut guard = self.inner.lock();
-        let Inner { pt: parent_pt, pages: parent_pages } = &mut *guard;
+        let Inner { pt: parent_pt, pages: parent_pages, maps: parent_maps } = &mut *guard;
+        let maps = parent_maps.try_clone()?;
         let mut pt = PageTable::new(self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
         // SAFETY: our shared root entries are the kernel's, which outlive
         // this space (see `new`) and so the copy, made under the same terms.
@@ -461,7 +572,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             root: pt.root(),
             alloc: self.alloc.clone(),
             shared: self.shared.clone(),
-            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new() }),
+            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new(), maps }),
         };
         {
             let mut copy = child.inner.lock();
@@ -471,7 +582,9 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                 let Some(t) = parent_pt.translate(va) else { continue };
                 let mut flags = t.flags;
                 let mut cow = page.is_cow();
-                if flags.contains(MapFlags::WRITE) {
+                // Shared file pages stay shared and writable: that is the point.
+                let shared = parent_maps.find(page.va()).is_some_and(|v| v.shared());
+                if flags.contains(MapFlags::WRITE) && !shared {
                     flags = flags.difference(MapFlags::WRITE);
                     if !flags.contains(MapFlags::READ) && !flags.contains(MapFlags::EXEC) {
                         flags = flags | MapFlags::READ;
