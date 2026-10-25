@@ -413,6 +413,63 @@ impl EndpointDescriptor {
     }
 }
 
+/// A SuperSpeed endpoint companion descriptor (USB 3.2 §9.6.7), which
+/// follows the endpoint descriptor of a SuperSpeed device's endpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SsCompanion {
+    /// `bMaxBurst`: packets per burst, minus one (0–15).
+    pub max_burst: u8,
+    /// `bmAttributes`. For bulk endpoints bits 0–4 are `MaxStreams`; for
+    /// isochronous ones bits 0–1 are `Mult`.
+    pub attributes: u8,
+    /// `wBytesPerInterval`: bytes per service interval of a periodic endpoint.
+    pub bytes_per_interval: u16,
+}
+
+impl SsCompanion {
+    /// Bytes on the wire.
+    pub const LEN: usize = 6;
+
+    /// Parses an SS endpoint companion descriptor.
+    pub fn parse(b: &[u8]) -> Result<Self, BadDescriptor> {
+        check(b, descriptor_type::SS_ENDPOINT_COMPANION, Self::LEN)?;
+        Ok(Self { max_burst: byte(b, 2), attributes: byte(b, 3), bytes_per_interval: le16(b, 4) })
+    }
+
+    /// `MaxStreams` of a bulk endpoint: it supports 2^n streams, or none if 0.
+    pub const fn max_streams_exp(&self) -> u8 {
+        self.attributes & 0x1f
+    }
+
+    /// `Mult` of an isochronous endpoint: bursts per service interval, minus
+    /// one (0–2).
+    pub const fn mult(&self) -> u8 {
+        self.attributes & 3
+    }
+}
+
+/// An endpoint to enable with [`UsbHost::configure_endpoints_ss`]: its
+/// descriptor, its SuperSpeed companion if the device has one, and how many
+/// bulk streams to set up on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SsEndpoint {
+    /// The endpoint descriptor.
+    pub descriptor: EndpointDescriptor,
+    /// The companion descriptor that followed it, if any.
+    pub companion: Option<SsCompanion>,
+    /// Stream IDs wanted (1 through this) on a bulk endpoint, or 0 for none.
+    /// A host grants what the controller and the device allow; ask
+    /// [`StreamHost::stream_count`] how many it set up.
+    pub streams: u16,
+}
+
+impl SsEndpoint {
+    /// An endpoint with no companion and no streams.
+    pub const fn plain(descriptor: EndpointDescriptor) -> Self {
+        Self { descriptor, companion: None, streams: 0 }
+    }
+}
+
 /// One descriptor from a configuration descriptor set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Descriptor<'src> {
@@ -596,6 +653,79 @@ pub trait UsbHost {
         let _ = (hub, ports, think_time, multi_tt);
         Err(UsbError::Unsupported)
     }
+
+    /// Like [`configure_endpoints`](Self::configure_endpoints), but passes
+    /// the SuperSpeed endpoint companions on: a controller uses `bMaxBurst`
+    /// and `wBytesPerInterval` in its endpoint contexts and can set up bulk
+    /// streams (see [`StreamHost`]).
+    ///
+    /// The default ignores the companions and requested streams and calls
+    /// `configure_endpoints`, so a controller that knows nothing of them
+    /// keeps working; at most 30 endpoints.
+    fn configure_endpoints_ss(&mut self, dev: DeviceId, endpoints: &[SsEndpoint]) -> Result<(), UsbError> {
+        let mut plain = [EndpointDescriptor { address: 0, attributes: 0, max_packet_size_raw: 0, interval: 0 }; 30];
+        for (dst, src) in plain.iter_mut().zip(endpoints) {
+            *dst = src.descriptor;
+        }
+        self.configure_endpoints(dev, plain.get(..endpoints.len()).ok_or(UsbError::NoResources)?)
+    }
+}
+
+/// A host controller that supports bulk streams on SuperSpeed endpoints
+/// (USB 3.2 §8.12.1.4): one bulk endpoint carries several independent
+/// transfer queues, each named by a stream ID, which a device such as a UASP
+/// drive uses to service commands out of order.
+///
+/// Request streams with [`SsEndpoint::streams`] in
+/// [`UsbHost::configure_endpoints_ss`], then submit transfers per stream. At
+/// most one transfer is outstanding per stream; another on the same stream
+/// fails with [`UsbError::Busy`] until it is collected. Plain [`UsbHost`]
+/// transfers on an endpoint with streams fail with [`UsbError::BadEndpoint`].
+pub trait StreamHost: UsbHost {
+    /// Streams set up on endpoint address `endpoint` of `dev`: valid stream
+    /// IDs are 1 through this. Zero if the endpoint has none.
+    fn stream_count(&self, dev: DeviceId, endpoint: u8) -> u16;
+
+    /// Starts an IN transfer of up to `len` bytes on stream `stream_id` of
+    /// bulk endpoint `endpoint`, without waiting.
+    fn stream_submit_in(&mut self, dev: DeviceId, endpoint: u8, stream_id: u16, len: usize) -> Result<(), UsbError>;
+
+    /// Starts an OUT transfer of `data` on stream `stream_id`.
+    fn stream_submit_out(&mut self, dev: DeviceId, endpoint: u8, stream_id: u16, data: &[u8]) -> Result<(), UsbError>;
+
+    /// Collects the transfer on stream `stream_id` of the endpoint with
+    /// address `endpoint` (direction bit included): `None` while it is
+    /// pending, else the bytes moved (IN data is copied into `buf`).
+    /// `Some(Err(BadEndpoint))` if none was submitted. A failed transfer
+    /// leaves the endpoint's other streams running.
+    fn stream_poll(
+        &mut self,
+        dev: DeviceId,
+        endpoint: u8,
+        stream_id: u16,
+        buf: &mut [u8],
+    ) -> Option<Result<usize, UsbError>>;
+}
+
+impl<H: StreamHost + ?Sized> StreamHost for &mut H {
+    fn stream_count(&self, dev: DeviceId, endpoint: u8) -> u16 {
+        (**self).stream_count(dev, endpoint)
+    }
+    fn stream_submit_in(&mut self, dev: DeviceId, endpoint: u8, stream_id: u16, len: usize) -> Result<(), UsbError> {
+        (**self).stream_submit_in(dev, endpoint, stream_id, len)
+    }
+    fn stream_submit_out(&mut self, dev: DeviceId, endpoint: u8, stream_id: u16, data: &[u8]) -> Result<(), UsbError> {
+        (**self).stream_submit_out(dev, endpoint, stream_id, data)
+    }
+    fn stream_poll(
+        &mut self,
+        dev: DeviceId,
+        endpoint: u8,
+        stream_id: u16,
+        buf: &mut [u8],
+    ) -> Option<Result<usize, UsbError>> {
+        (**self).stream_poll(dev, endpoint, stream_id, buf)
+    }
 }
 
 /// When an isochronous transfer should go on the bus.
@@ -700,6 +830,9 @@ impl<H: UsbHost + ?Sized> UsbHost for &mut H {
     fn configure_hub(&mut self, hub: DeviceId, ports: u8, think_time: u8, multi_tt: bool) -> Result<(), UsbError> {
         (**self).configure_hub(hub, ports, think_time, multi_tt)
     }
+    fn configure_endpoints_ss(&mut self, dev: DeviceId, endpoints: &[SsEndpoint]) -> Result<(), UsbError> {
+        (**self).configure_endpoints_ss(dev, endpoints)
+    }
 }
 
 /// A host controller behind a lock, so that several class drivers (a disk
@@ -744,6 +877,30 @@ impl<H: UsbHost + ?Sized, G: osmium_sync::Guardian> UsbHost for &osmium_sync::Sp
     }
     fn configure_hub(&mut self, hub: DeviceId, ports: u8, think_time: u8, multi_tt: bool) -> Result<(), UsbError> {
         self.lock().configure_hub(hub, ports, think_time, multi_tt)
+    }
+    fn configure_endpoints_ss(&mut self, dev: DeviceId, endpoints: &[SsEndpoint]) -> Result<(), UsbError> {
+        self.lock().configure_endpoints_ss(dev, endpoints)
+    }
+}
+
+impl<H: StreamHost + ?Sized, G: osmium_sync::Guardian> StreamHost for &osmium_sync::SpinLock<H, G> {
+    fn stream_count(&self, dev: DeviceId, endpoint: u8) -> u16 {
+        self.lock().stream_count(dev, endpoint)
+    }
+    fn stream_submit_in(&mut self, dev: DeviceId, endpoint: u8, stream_id: u16, len: usize) -> Result<(), UsbError> {
+        self.lock().stream_submit_in(dev, endpoint, stream_id, len)
+    }
+    fn stream_submit_out(&mut self, dev: DeviceId, endpoint: u8, stream_id: u16, data: &[u8]) -> Result<(), UsbError> {
+        self.lock().stream_submit_out(dev, endpoint, stream_id, data)
+    }
+    fn stream_poll(
+        &mut self,
+        dev: DeviceId,
+        endpoint: u8,
+        stream_id: u16,
+        buf: &mut [u8],
+    ) -> Option<Result<usize, UsbError>> {
+        self.lock().stream_poll(dev, endpoint, stream_id, buf)
     }
 }
 
@@ -877,25 +1034,36 @@ pub fn set_configuration<H: UsbHost + ?Sized>(
     let header = ConfigurationDescriptor::parse(config)?;
 
     const MAX_ENDPOINTS: usize = 30;
-    let mut endpoints =
-        [EndpointDescriptor { address: 0, attributes: 0, max_packet_size_raw: 0, interval: 0 }; MAX_ENDPOINTS];
+    let none = EndpointDescriptor { address: 0, attributes: 0, max_packet_size_raw: 0, interval: 0 };
+    let mut endpoints = [SsEndpoint::plain(none); MAX_ENDPOINTS];
     let mut count = 0;
     let mut in_default = false;
+    // The endpoint a companion descriptor would belong to.
+    let mut last: Option<usize> = None;
     for d in Descriptors::new(config) {
         match d? {
-            Descriptor::Interface(i) => in_default = i.alternate == 0,
+            Descriptor::Interface(i) => {
+                in_default = i.alternate == 0;
+                last = None;
+            }
             Descriptor::Endpoint(e) if in_default => {
                 // Checked before the device is configured: dropping an endpoint silently would leave it unusable.
                 let slot = endpoints.get_mut(count).ok_or(UsbError::NoResources)?;
-                *slot = e;
+                *slot = SsEndpoint::plain(e);
+                last = Some(count);
                 count += 1;
             }
-            _ => {}
+            Descriptor::Other(raw) if raw.get(1) == Some(&descriptor_type::SS_ENDPOINT_COMPANION) => {
+                if let Some(ep) = last.take().and_then(|k| endpoints.get_mut(k)) {
+                    ep.companion = SsCompanion::parse(raw).ok();
+                }
+            }
+            _ => last = None,
         }
     }
     host.control_out(dev, SetupPacket::set_configuration(header.value), &[])?;
     if count > 0 {
-        host.configure_endpoints(dev, endpoints.get(..count).ok_or(UsbError::NoResources)?)?;
+        host.configure_endpoints_ss(dev, endpoints.get(..count).ok_or(UsbError::NoResources)?)?;
     }
     Ok(header)
 }
@@ -973,6 +1141,7 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         configured: Vec<u8>,
+        companions: Vec<Option<SsCompanion>>,
         set_config: Option<u16>,
         detached: bool,
     }
@@ -993,6 +1162,11 @@ mod tests {
         fn configure_endpoints(&mut self, _: DeviceId, eps: &[EndpointDescriptor]) -> Result<(), UsbError> {
             self.configured.extend(eps.iter().map(|e| e.address));
             Ok(())
+        }
+        fn configure_endpoints_ss(&mut self, dev: DeviceId, eps: &[SsEndpoint]) -> Result<(), UsbError> {
+            self.companions.extend(eps.iter().map(|e| e.companion));
+            let plain: Vec<_> = eps.iter().map(|e| e.descriptor).collect();
+            self.configure_endpoints(dev, &plain)
         }
         fn control_in(&mut self, _: DeviceId, s: SetupPacket, buf: &mut [u8]) -> Result<usize, UsbError> {
             let src: &[u8] = match s.value >> 8 {
@@ -1031,6 +1205,33 @@ mod tests {
         assert_eq!(msc.endpoint(TransferType::Bulk, Direction::Out).map(|e| e.address), Some(0x02));
         assert!(msc.endpoint(TransferType::Interrupt, Direction::In).is_none());
         assert!(find_interface(&CONFIG, |i| i.class == 3).is_none());
+    }
+
+    #[test]
+    fn companion_descriptors_reach_the_host() {
+        // A SuperSpeed UAS-style interface: bulk IN with burst 15 and 16 streams, bulk OUT with no companion.
+        let config: [u8; 45] = [
+            9, 2, 45, 0, 1, 1, 0, 0x80, 50, // configuration
+            9, 4, 0, 0, 3, 8, 6, 0x62, 0, // interface
+            7, 5, 0x81, 2, 0x00, 0x04, 0, // bulk IN 1024
+            6, 48, 15, 4, 0, 0, // companion: burst 15, MaxStreams 4
+            7, 5, 0x02, 2, 0x00, 0x04, 0, // bulk OUT 1024
+            7, 5, 0x83, 3, 0x00, 0x04, 0, // interrupt IN
+        ];
+        assert_eq!(
+            SsCompanion::parse(&config[25..31]),
+            Ok(SsCompanion { max_burst: 15, attributes: 4, bytes_per_interval: 0 })
+        );
+        assert_eq!(SsCompanion::parse(&config[25..30]), Err(BadDescriptor));
+        assert_eq!(SsCompanion::parse(&config[18..25]), Err(BadDescriptor), "not a companion");
+        assert_eq!(SsCompanion { attributes: 0x1e, ..Default::default() }.max_streams_exp(), 0x1e);
+        assert_eq!(SsCompanion { attributes: 0x82, ..Default::default() }.mult(), 2);
+
+        let mut host = FakeHost::default();
+        set_configuration(&mut host, DeviceId(1), &config).unwrap();
+        assert_eq!(host.configured, [0x81, 0x02, 0x83]);
+        let burst = host.companions.iter().map(|c| c.map(|c| c.max_burst)).collect::<Vec<_>>();
+        assert_eq!(burst, [Some(15), None, None], "the companion belongs to the endpoint before it");
     }
 
     #[test]

@@ -61,7 +61,9 @@ pub mod completion {
     pub const MISSED_SERVICE: u8 = 23;
     pub const COMMAND_RING_STOPPED: u8 = 24;
     pub const COMMAND_ABORTED: u8 = 25;
+    pub const INVALID_STREAM_TYPE: u8 = 10;
     pub const ISOCH_BUFFER_OVERRUN: u8 = 31;
+    pub const INVALID_STREAM_ID: u8 = 34;
 }
 
 /// Control-word bits.
@@ -82,6 +84,10 @@ pub mod flag {
     /// Isoch TRB: start as soon as possible instead of in a given frame.
     pub const SIA: u32 = 1 << 31;
 }
+
+/// Stream Context Type of a stream context that points at a primary
+/// transfer ring (rather than a secondary stream array).
+pub const SCT_PRIMARY_RING: u32 = 1;
 
 /// Setup Stage transfer type (TRT).
 const TRT_NO_DATA: u32 = 0;
@@ -178,6 +184,19 @@ impl Trb {
     /// with cycle state `cycle`.
     pub const fn set_tr_dequeue(slot: u8, dci: u8, dequeue: u64, cycle: bool) -> Self {
         Self::new(kind::SET_TR_DEQUEUE, dequeue | cycle as u64, 0, (slot as u32) << 24 | (dci as u32) << 16)
+    }
+
+    /// Set TR Dequeue Pointer Command for stream `stream_id` of a stream
+    /// endpoint: its primary transfer ring resumes at `dequeue` with cycle
+    /// state `cycle`.
+    pub const fn set_tr_dequeue_stream(slot: u8, dci: u8, stream_id: u16, dequeue: u64, cycle: bool) -> Self {
+        let sct = SCT_PRIMARY_RING as u64;
+        Self::new(
+            kind::SET_TR_DEQUEUE,
+            dequeue | sct << 1 | cycle as u64,
+            (stream_id as u32) << 16,
+            (slot as u32) << 24 | (dci as u32) << 16,
+        )
     }
 
     /// Setup Stage with the request inline. The transfer type follows the

@@ -26,10 +26,17 @@
 //! [`ISOCH_SLOT_LEN`] bytes each, started ASAP, in a given frame or one
 //! interval after the previous one.
 //!
-//! Not yet supported: streams, SuperSpeed burst sizes from companion
-//! descriptors (so SuperSpeed isochronous runs with a burst of one),
-//! isochronous transfers spanning several TRBs, warm reset of SuperSpeed hub
-//! ports, and more than one interrupter.
+//! SuperSpeed endpoint companions ([`SsEndpoint`], passed through
+//! [`UsbHost::configure_endpoints_ss`]) set the endpoint contexts' Max Burst
+//! Size, Mult and Max ESIT Payload. A bulk endpoint can also carry streams
+//! ([`StreamHost`]): the endpoint context then points at a linear primary
+//! stream context array, each stream context at its own transfer ring, and a
+//! doorbell names the stream to run. Up to [`MAX_STREAMS`] streams on each of
+//! [`MAX_STREAM_ENDPOINTS`] endpoints, one outstanding transfer per stream.
+//!
+//! Not yet supported: secondary stream arrays, isochronous transfers
+//! spanning several TRBs or more than [`ISOCH_SLOT_LEN`] bytes, warm reset of
+//! SuperSpeed hub ports, and more than one interrupter.
 
 pub mod ring;
 pub mod trb;
@@ -41,8 +48,8 @@ use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::{ConfigAccess, Function, MsiError, MsiMessage};
 use osmium_hal::timer::Clock;
 use osmium_hal::usb::{
-    DeviceId, Direction, EndpointDescriptor, IsochHost, IsochStart, PortStatus, SetupPacket, Speed, TransferType,
-    UsbError, UsbHost,
+    DeviceId, Direction, EndpointDescriptor, IsochHost, IsochStart, PortStatus, SetupPacket, Speed, SsEndpoint,
+    StreamHost, TransferType, UsbError, UsbHost,
 };
 use osmium_mm::PhysAddr;
 
@@ -75,6 +82,9 @@ const CRCR_CA: u32 = 1 << 2;
 const CRCR_CRR: u32 = 1 << 3;
 /// HCCPARAMS1: the controller can address 64 bits of memory.
 const HCC_AC64: u32 = 1 << 0;
+/// `HCCPARAMS1` Maximum Primary Stream Array Size: the array holds up to
+/// 2^(n+1) stream contexts.
+const HCC_MAX_PSA_SHIFT: u32 = 12;
 
 const CMD_RUN: u32 = 1 << 0;
 const CMD_RESET: u32 = 1 << 1;
@@ -180,6 +190,15 @@ pub const ISOCH_SLOT_LEN: usize = 4096;
 /// Frames ahead of now that the first `IsochStart::Next` transfer starts.
 const ISOCH_LEAD_FRAMES: u16 = 3;
 
+/// Bytes of one stream context.
+const STREAM_CTX_BYTES: usize = 16;
+
+/// Streams (stream IDs 1 through this) per endpoint. The primary stream
+/// array then has 16 contexts: ID 0 is reserved.
+pub const MAX_STREAMS: usize = 15;
+/// Endpoints with streams at once, over all devices.
+pub const MAX_STREAM_ENDPOINTS: usize = 2;
+
 /// Why the controller could not be brought up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XhciError {
@@ -263,6 +282,21 @@ impl<'d, D: DmaAllocator + ?Sized> Slot<'d, D> {
     }
 }
 
+/// A bulk endpoint with streams: the primary stream context array the
+/// endpoint context points at, a transfer ring per stream and each stream's
+/// outstanding transfer (index = stream ID - 1). The endpoint's own ring in
+/// the slot is unused while streams are on.
+struct StreamEp<'d, D: DmaAllocator + ?Sized> {
+    dev: u8,
+    dci: usize,
+    /// The array. Context `n` (16 bytes at `16 * n`) is stream ID `n`'s.
+    array: OwnedDma<'d, D>,
+    /// Stream IDs 1 through `count` are set up.
+    count: usize,
+    rings: [Option<ProducerRing<'d, D>>; MAX_STREAMS],
+    pending: [Option<Pending<'d, D>>; MAX_STREAMS],
+}
+
 /// A configured endpoint: its transfer ring and any `submit_in` transfer.
 struct Endpoint<'d, D: DmaAllocator + ?Sized> {
     dci: usize,
@@ -300,6 +334,8 @@ pub struct Xhci<'d, D: DmaAllocator + ?Sized> {
     /// The controller takes 64-bit addresses; if not, all DMA memory must
     /// lie below 4 GiB.
     ac64: bool,
+    /// Maximum Primary Stream Array Size from `HCCPARAMS1`.
+    max_psa: u8,
     /// A command could not be aborted and may still run: no more commands.
     commands_stuck: bool,
     dma: &'d D,
@@ -310,6 +346,7 @@ pub struct Xhci<'d, D: DmaAllocator + ?Sized> {
     bounce: ManuallyDrop<OwnedDma<'d, D>>,
     slots: ManuallyDrop<[Option<Slot<'d, D>>; MAX_SLOTS as usize]>,
     isoch: ManuallyDrop<[Option<IsochEp<'d, D>>; MAX_ISOCH_ENDPOINTS]>,
+    streams: ManuallyDrop<[Option<StreamEp<'d, D>>; MAX_STREAM_ENDPOINTS]>,
     interrupts: u64,
     /// With message interrupts (never shared) every one is serviced,
     /// whatever `USBSTS` and `IMAN` say.
@@ -361,7 +398,9 @@ fn error_from(code: u8) -> UsbError {
         | completion::ISOCH_BUFFER_OVERRUN => UsbError::Transaction,
         completion::NO_SLOTS | completion::RESOURCE => UsbError::NoResources,
         completion::SLOT_NOT_ENABLED => UsbError::NoDevice,
-        completion::ENDPOINT_NOT_ENABLED => UsbError::BadEndpoint,
+        completion::ENDPOINT_NOT_ENABLED | completion::INVALID_STREAM_TYPE | completion::INVALID_STREAM_ID => {
+            UsbError::BadEndpoint
+        }
         _ => UsbError::Controller,
     }
 }
@@ -412,6 +451,36 @@ fn new_dma<'d, D: DmaAllocator + ?Sized>(dma: &'d D, ac64: bool, len: usize) -> 
 /// A transfer ring the controller can reach.
 fn new_ring<'d, D: DmaAllocator + ?Sized>(dma: &'d D, ac64: bool) -> Option<ProducerRing<'d, D>> {
     ProducerRing::new(dma).filter(|r| reachable(ac64, r.base().as_u64(), RING_BYTES))
+}
+
+/// A stream endpoint's primary stream context array of `entries` contexts
+/// and the transfer rings of stream IDs 1 through `count`.
+fn new_stream_ep<'d, D: DmaAllocator + ?Sized>(
+    dma: &'d D,
+    ac64: bool,
+    dev: u8,
+    dci: usize,
+    count: usize,
+    entries: usize,
+) -> Option<StreamEp<'d, D>> {
+    // The array is 64-byte aligned and within a 64 KiB boundary: DMA memory is page-aligned.
+    let array = new_dma(dma, ac64, entries.checked_mul(STREAM_CTX_BYTES)?)?;
+    let mut rings = [const { None }; MAX_STREAMS];
+    for (n, slot) in rings.iter_mut().enumerate().take(count) {
+        let ring = new_ring(dma, ac64)?;
+        // TR Dequeue Pointer, Stream Context Type and Dequeue Cycle State; the rest stays zero.
+        let ctx = ring.base().as_u64() | (trb::SCT_PRIMARY_RING as u64) << 1 | ring.cycle() as u64;
+        array.store((n + 1) * STREAM_CTX_BYTES, ctx.to_le());
+        *slot = Some(ring);
+    }
+    Some(StreamEp { dev, dci, array, count, rings, pending: [const { None }; MAX_STREAMS] })
+}
+
+impl<D: DmaAllocator + ?Sized> StreamEp<'_, D> {
+    /// Bus address of the stream context array, for the endpoint context.
+    fn array_addr(&self) -> u64 {
+        self.array.device_addr().as_u64()
+    }
 }
 
 impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
@@ -476,6 +545,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
             ctx_size,
             max_ports,
             ac64: hccparams1 & HCC_AC64 != 0,
+            max_psa: (hccparams1 >> HCC_MAX_PSA_SHIFT & 0xf) as u8,
             commands_stuck: false,
             dma,
             dcbaa: ManuallyDrop::new(dcbaa),
@@ -485,6 +555,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
             bounce: ManuallyDrop::new(OwnedDma::new(dma, BOUNCE_LEN).ok_or(no_mem)?),
             slots: ManuallyDrop::new([const { None }; MAX_SLOTS as usize]),
             isoch: ManuallyDrop::new([const { None }; MAX_ISOCH_ENDPOINTS]),
+            streams: ManuallyDrop::new([const { None }; MAX_STREAM_ENDPOINTS]),
             interrupts: 0,
             mode: InterruptMode::Intx,
             clock,
@@ -775,6 +846,14 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
             }
             return;
         }
+        // A stream's event is told apart by the TRB it names: the event has no stream ID.
+        if let Some(s) = self.streams.iter_mut().flatten().find(|s| s.dev == ev.slot_id() && s.dci == i) {
+            let hit = s.pending.iter_mut().flatten().find(|p| p.trb == ev.param);
+            if let Some(p) = hit {
+                p.done = Some(ev);
+            }
+            return;
+        }
         let pending = self.slot(DeviceId(ev.slot_id())).ok().and_then(|s| s.endpoint(i)?.pending.as_mut());
         if let Some(p) = pending
             && p.trb == ev.param
@@ -801,7 +880,11 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         if endpoint & 0xf == 0 {
             return Err(UsbError::BadEndpoint); // endpoint 0 carries control transfers only
         }
-        let ep = self.live_slot(dev)?.endpoint(dci(endpoint)).ok_or(UsbError::BadEndpoint)?;
+        let i = dci(endpoint);
+        if self.streams.iter().flatten().any(|s| s.dev == dev.0 && s.dci == i) {
+            return Err(UsbError::BadEndpoint); // its transfers name a stream
+        }
+        let ep = self.live_slot(dev)?.endpoint(i).ok_or(UsbError::BadEndpoint)?;
         if ep.pending.is_some() {
             return Err(UsbError::Busy);
         }
@@ -1165,6 +1248,9 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
                 for e in self.isoch.iter_mut().filter(|e| e.as_ref().is_some_and(|e| e.dev == dev.0)) {
                     *e = None;
                 }
+                for e in self.streams.iter_mut().filter(|e| e.as_ref().is_some_and(|e| e.dev == dev.0)) {
+                    *e = None;
+                }
                 // A child that could not be disabled is orphaned: its parent
                 // id may be handed out again.
                 for s in self.slots.iter_mut().flatten().filter(|s| s.topo.parent == dev.0) {
@@ -1181,21 +1267,44 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
     }
 
     fn configure_endpoints(&mut self, dev: DeviceId, endpoints: &[EndpointDescriptor]) -> Result<(), UsbError> {
+        let none = EndpointDescriptor { address: 0, attributes: 0, max_packet_size_raw: 0, interval: 0 };
+        let mut plain = [SsEndpoint::plain(none); MAX_ENDPOINTS];
+        for (dst, src) in plain.iter_mut().zip(endpoints) {
+            dst.descriptor = *src;
+        }
+        self.configure_endpoints_ss(dev, plain.get(..endpoints.len()).ok_or(UsbError::NoResources)?)
+    }
+
+    fn configure_endpoints_ss(&mut self, dev: DeviceId, endpoints: &[SsEndpoint]) -> Result<(), UsbError> {
         let (c, dma, ac64) = (self.ctx_size, self.dma, self.ac64);
         // Isochronous queue entries free once the ones being replaced go.
-        let replaced = |e: &IsochEp<'_, D>| e.dev == dev.0 && endpoints.iter().any(|n| dci(n.address) == e.dci);
+        let replaced =
+            |e: &IsochEp<'_, D>| e.dev == dev.0 && endpoints.iter().any(|n| dci(n.descriptor.address) == e.dci);
         let isoch_free = self.isoch.iter().filter(|e| e.as_ref().is_none_or(replaced)).count();
-        let isoch_new = endpoints.iter().filter(|e| e.transfer_type() == TransferType::Isochronous).count();
+        let isoch_new = endpoints.iter().filter(|e| e.descriptor.transfer_type() == TransferType::Isochronous).count();
         if isoch_new > isoch_free {
             return Err(UsbError::NoResources);
         }
+        // Likewise for endpoints with streams.
+        let streams_replaced =
+            |e: &StreamEp<'_, D>| e.dev == dev.0 && endpoints.iter().any(|n| dci(n.descriptor.address) == e.dci);
+        let streams_free = self.streams.iter().filter(|e| e.as_ref().is_none_or(streams_replaced)).count();
+        if endpoints.iter().filter(|e| e.streams > 0).count() > streams_free {
+            return Err(UsbError::NoResources);
+        }
+        let max_psa = self.max_psa;
         let slot = self.live_slot(dev)?;
         let speed = slot.speed;
         let mut new_rings: [Option<(usize, ProducerRing<'_, D>)>; MAX_ENDPOINTS] = [const { None }; MAX_ENDPOINTS];
         let mut new_isoch: [Option<IsochEp<'_, D>>; MAX_ENDPOINTS] = [const { None }; MAX_ENDPOINTS];
+        let mut new_streams: [Option<StreamEp<'_, D>>; MAX_STREAM_ENDPOINTS] = [const { None }; MAX_STREAM_ENDPOINTS];
         // Endpoints the device keeps plus the new ones must fit the table.
-        let kept =
-            slot.endpoints.iter().flatten().filter(|e| endpoints.iter().all(|n| dci(n.address) != e.dci)).count();
+        let kept = slot
+            .endpoints
+            .iter()
+            .flatten()
+            .filter(|e| endpoints.iter().all(|n| dci(n.descriptor.address) != e.dci))
+            .count();
         if kept + endpoints.len() > MAX_ENDPOINTS {
             return Err(UsbError::NoResources);
         }
@@ -1203,7 +1312,8 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         // Endpoints being replaced are dropped and re-added (xHCI 1.2 section 4.6.6).
         let mut drop = 0u32;
         let mut last = 1;
-        for (k, ep) in endpoints.iter().enumerate() {
+        for (k, sse) in endpoints.iter().enumerate() {
+            let ep = &sse.descriptor;
             let i = dci(ep.address);
             if i < 2 {
                 return Err(UsbError::BadEndpoint);
@@ -1223,11 +1333,26 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             // SuperSpeed isochronous only). Elsewhere those bits are reserved.
             let isoch = ep.transfer_type() == TransferType::Isochronous;
             let periodic = isoch || ep.transfer_type() == TransferType::Interrupt;
-            let burst = if periodic && speed == Speed::High { ep.extra_transactions() as u32 } else { 0 };
-            if burst > 2 || (isoch && speed == Speed::Low) {
+            // A SuperSpeed endpoint's burst, Mult and ESIT come from its companion descriptor.
+            let ss = matches!(speed, Speed::Super | Speed::SuperPlus);
+            let companion = sse.companion.filter(|_| ss);
+            let burst = if ss {
+                companion.map_or(0, |c| (c.max_burst & 0xf) as u32)
+            } else if periodic && speed == Speed::High {
+                ep.extra_transactions() as u32
+            } else {
+                0
+            };
+            let mult = if ss && isoch { companion.map_or(0, |c| c.mult() as u32) } else { 0 };
+            if (burst > 2 && !ss) || mult > 2 || (isoch && speed == Speed::Low) {
                 return Err(UsbError::BadEndpoint);
             }
-            let esit = if periodic { mps * (burst + 1) } else { 0 };
+            // At most 16 bits x 16 x 3, which fits.
+            let esit = match companion {
+                _ if !periodic => 0,
+                Some(c) if c.bytes_per_interval > 0 => c.bytes_per_interval as u32,
+                _ => mps * (burst + 1) * (mult + 1),
+            };
             if isoch {
                 if esit as usize > ISOCH_SLOT_LEN || mps == 0 {
                     return Err(UsbError::BadEndpoint);
@@ -1245,7 +1370,7 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
                     max_len: esit as usize,
                     mps,
                     burst,
-                    ss: matches!(speed, Speed::Super | Speed::SuperPlus),
+                    ss,
                     period_frames: (microframes / 8) as u16,
                     last_frame: None,
                 });
@@ -1255,11 +1380,32 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             for n in 0..8 {
                 ctx_set(&slot.input, ctx, n, 0);
             }
-            ctx_set(&slot.input, ctx, 0, interval(ep, speed) << 16);
+            let mut deq = ring.base().as_u64() | ring.cycle() as u64;
+            // Streams: the dequeue pointer names the primary stream array instead.
+            let mut stream_bits = 0;
+            if sse.streams > 0 {
+                let device_max = companion.map_or(0, |c| c.max_streams_exp());
+                if ep.transfer_type() != TransferType::Bulk || !ss || device_max == 0 {
+                    return Err(UsbError::BadEndpoint);
+                }
+                // The array needs at least 4 contexts (MaxPStreams 0 means no streams).
+                if max_psa < 1 {
+                    return Err(UsbError::Unsupported);
+                }
+                let host_ids = (1usize << (max_psa.min(15) as u32 + 1)) - 1;
+                let device_ids = 1usize.checked_shl(device_max as u32).unwrap_or(usize::MAX);
+                let granted = (sse.streams as usize).min(MAX_STREAMS).min(device_ids).min(host_ids);
+                let entries = (granted + 1).next_power_of_two().max(4);
+                let new = new_stream_ep(dma, ac64, dev.0, i, granted, entries).ok_or(UsbError::NoResources)?;
+                deq = new.array_addr();
+                stream_bits = (entries.trailing_zeros() - 1) << 10 | 1 << 15;
+                *new_streams.iter_mut().find(|n| n.is_none()).ok_or(UsbError::NoResources)? = Some(new);
+            }
+            // The Max ESIT Payload's high byte is in the first dword.
+            ctx_set(&slot.input, ctx, 0, interval(ep, speed) << 16 | (esit >> 16) << 24 | stream_bits | mult << 8);
             // Isochronous endpoints do not retry (CErr 0).
             let cerr = if isoch { 0 } else { 3 };
             ctx_set(&slot.input, ctx, 1, cerr << 1 | ty << 3 | burst << 8 | mps << 16);
-            let deq = ring.base().as_u64() | ring.cycle() as u64;
             ctx_set(&slot.input, ctx, 2, deq as u32);
             ctx_set(&slot.input, ctx, 3, (deq >> 32) as u32);
             let avg = if periodic { esit } else { 3072 };
@@ -1288,6 +1434,17 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         for e in self.isoch.iter_mut() {
             if e.as_ref().is_some_and(replaced) {
                 *e = None;
+            }
+        }
+        for e in self.streams.iter_mut() {
+            if e.as_ref().is_some_and(streams_replaced) {
+                *e = None;
+            }
+        }
+        for new in new_streams.into_iter().flatten() {
+            // Room was checked above.
+            if let Some(free) = self.streams.iter_mut().find(|e| e.is_none()) {
+                *free = Some(new);
             }
         }
         for new in new_isoch.into_iter().flatten() {
@@ -1507,6 +1664,147 @@ impl<D: DmaAllocator + ?Sized> IsochHost for Xhci<'_, D> {
     }
 }
 
+impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
+    /// The stream endpoint with DCI `i` on `dev`.
+    fn stream_ep(&mut self, dev: DeviceId, i: usize) -> Result<&mut StreamEp<'d, D>, UsbError> {
+        self.streams.iter_mut().flatten().find(|s| s.dev == dev.0 && s.dci == i).ok_or(UsbError::BadEndpoint)
+    }
+
+    /// Rings the doorbell of `dev`'s endpoint `dci` for stream `stream_id`.
+    fn ring_stream(&self, dev: u8, dci: usize, stream_id: usize) {
+        self.ring_doorbell(dev, dci as u32 | (stream_id as u32) << 16);
+    }
+
+    fn stream_submit(
+        &mut self,
+        dev: DeviceId,
+        endpoint: u8,
+        stream_id: u16,
+        data: Option<&[u8]>,
+        len: usize,
+    ) -> Result<(), UsbError> {
+        let i = dci(endpoint);
+        let (dma, ac64) = (self.dma, self.ac64);
+        self.live_slot(dev)?;
+        let s = self.stream_ep(dev, i)?;
+        // IN endpoints have odd DCIs.
+        if (i & 1 == 1) != data.is_none() {
+            return Err(UsbError::BadEndpoint);
+        }
+        let n = (stream_id as usize).checked_sub(1).filter(|&n| n < s.count).ok_or(UsbError::BadEndpoint)?;
+        if s.pending.get(n).ok_or(UsbError::BadEndpoint)?.is_some() {
+            return Err(UsbError::Busy);
+        }
+        if len == 0 || len > MAX_SUBMIT_LEN {
+            return Err(UsbError::NoResources);
+        }
+        let buf = new_dma(dma, ac64, MAX_SUBMIT_LEN).ok_or(UsbError::NoResources)?;
+        if let Some(data) = data {
+            buf.write(0, data);
+        }
+        let addr = buf.device_addr().as_u64();
+        let ring = s.rings.get_mut(n).and_then(Option::as_mut).ok_or(UsbError::BadEndpoint)?;
+        let trb = ring.push(Trb::normal(addr, len as u32)).as_u64();
+        *s.pending.get_mut(n).ok_or(UsbError::BadEndpoint)? = Some(Pending { buf, trb, len, done: None });
+        self.ring_stream(dev.0, i, stream_id as usize);
+        Ok(())
+    }
+
+    /// Gets a stream endpoint going again after stream `stream_id`'s
+    /// transfer `failed`: resets the endpoint, skips the failed stream's
+    /// ring past its queued TRBs and restarts the other streams' transfers.
+    /// If the dequeue pointer cannot be moved the transfer's buffer is
+    /// leaked (a TRB might still use it) and the slot is dead.
+    fn recover_stream(&mut self, dev: DeviceId, i: usize, stream_id: usize, failed: Pending<'d, D>) {
+        let ring = self.stream_ep(dev, i).ok().and_then(|s| s.rings.get(stream_id.wrapping_sub(1))?.as_ref());
+        let Some((addr, cycle)) = ring.map(|r| (r.enqueue_addr().as_u64(), r.cycle())) else {
+            return;
+        };
+        if self.command(Trb::reset_endpoint(dev.0, i as u8)).is_err() {
+            let _ = self.command(Trb::stop_endpoint(dev.0, i as u8));
+        }
+        let moved = Trb::set_tr_dequeue_stream(dev.0, i as u8, stream_id as u16, addr, cycle);
+        if self.command(moved).is_err() {
+            core::mem::forget(failed);
+            if let Ok(slot) = self.slot(dev) {
+                slot.dead = true;
+            }
+            return;
+        }
+        // Every stream stopped with the endpoint: restart those with work queued.
+        let Ok(s) = self.stream_ep(dev, i) else {
+            return;
+        };
+        let busy: [bool; MAX_STREAMS] =
+            core::array::from_fn(|n| s.pending.get(n).and_then(Option::as_ref).is_some_and(|p| p.done.is_none()));
+        for (n, _) in busy.iter().enumerate().filter(|(_, b)| **b) {
+            self.ring_stream(dev.0, i, n + 1);
+        }
+    }
+}
+
+impl<D: DmaAllocator + ?Sized> StreamHost for Xhci<'_, D> {
+    fn stream_count(&self, dev: DeviceId, endpoint: u8) -> u16 {
+        let i = dci(endpoint);
+        self.streams.iter().flatten().find(|s| s.dev == dev.0 && s.dci == i).map_or(0, |s| s.count as u16)
+    }
+
+    fn stream_submit_in(&mut self, dev: DeviceId, endpoint: u8, stream_id: u16, len: usize) -> Result<(), UsbError> {
+        self.stream_submit(dev, endpoint | 0x80, stream_id, None, len)
+    }
+
+    fn stream_submit_out(&mut self, dev: DeviceId, endpoint: u8, stream_id: u16, data: &[u8]) -> Result<(), UsbError> {
+        self.stream_submit(dev, endpoint & 0x7f, stream_id, Some(data), data.len())
+    }
+
+    fn stream_poll(
+        &mut self,
+        dev: DeviceId,
+        endpoint: u8,
+        stream_id: u16,
+        buf: &mut [u8],
+    ) -> Option<Result<usize, UsbError>> {
+        let i = dci(endpoint);
+        if endpoint & 0xf == 0 {
+            return Some(Err(UsbError::BadEndpoint));
+        }
+        if let Err(e) = self.slot(dev) {
+            return Some(Err(e));
+        }
+        self.drain_events();
+        let n = (stream_id as usize).wrapping_sub(1);
+        let s = match self.stream_ep(dev, i) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        match s.pending.get(n) {
+            Some(Some(p)) if p.done.is_none() => return None,
+            Some(Some(_)) => {}
+            _ => return Some(Err(UsbError::BadEndpoint)),
+        }
+        let p = s.pending.get_mut(n)?.take()?;
+        let ev = p.done?;
+        Some(match ev.completion_code() {
+            completion::SUCCESS | completion::SHORT_PACKET => {
+                let moved = p.len - (ev.residual() as usize).min(p.len);
+                if i & 1 == 1 {
+                    let m = moved.min(buf.len());
+                    if let Some(dst) = buf.get_mut(..m) {
+                        p.buf.read(0, dst);
+                    }
+                    Ok(m)
+                } else {
+                    Ok(moved)
+                }
+            }
+            code => {
+                self.recover_stream(dev, i, stream_id as usize, p);
+                Err(error_from(code))
+            }
+        })
+    }
+}
+
 impl<D: DmaAllocator + ?Sized> Drop for Xhci<'_, D> {
     fn drop(&mut self) {
         // Stop the controller before the rings and contexts are freed. One
@@ -1517,6 +1815,7 @@ impl<D: DmaAllocator + ?Sized> Drop for Xhci<'_, D> {
         }
         // SAFETY: each field is dropped once, here, and not used again.
         unsafe {
+            ManuallyDrop::drop(&mut self.streams);
             ManuallyDrop::drop(&mut self.isoch);
             ManuallyDrop::drop(&mut self.slots);
             ManuallyDrop::drop(&mut self.bounce);
@@ -1597,6 +1896,7 @@ mod tests {
             ctx_size: 32,
             max_ports: 1,
             ac64: true,
+            max_psa: 4,
             commands_stuck: false,
             dma,
             dcbaa: ManuallyDrop::new(OwnedDma::new(dma, 2048).unwrap()),
@@ -1606,6 +1906,7 @@ mod tests {
             bounce: ManuallyDrop::new(OwnedDma::new(dma, BOUNCE_LEN).unwrap()),
             slots: ManuallyDrop::new(slots),
             isoch: ManuallyDrop::new([const { None }; MAX_ISOCH_ENDPOINTS]),
+            streams: ManuallyDrop::new([const { None }; MAX_STREAM_ENDPOINTS]),
             interrupts: 0,
             mode: InterruptMode::Intx,
             clock: None,
@@ -2246,5 +2547,277 @@ mod tests {
         hc.detach(dev);
         assert_eq!(hc.isoch.iter().flatten().count(), 0);
         assert!(dma.live.get() < live);
+    }
+    // ---- SuperSpeed companions and streams ----
+
+    use osmium_hal::usb::SsCompanion;
+
+    fn bulk(address: u8) -> EndpointDescriptor {
+        EndpointDescriptor { address, attributes: 2, max_packet_size_raw: 1024, interval: 0 }
+    }
+
+    fn ss_ep(descriptor: EndpointDescriptor, max_burst: u8, attributes: u8, streams: u16) -> SsEndpoint {
+        let companion = SsCompanion { max_burst, attributes, bytes_per_interval: 0 };
+        SsEndpoint { descriptor, companion: Some(companion), streams }
+    }
+
+    /// Configures `eps` on slot 1 at SuperSpeed, completing the command.
+    fn configure_ss(hc: &mut Xhci<'_, crate::virtio::testing::HostDma>, eps: &[SsEndpoint]) -> Result<(), UsbError> {
+        hc.slot(DeviceId(1)).unwrap().speed = Speed::Super;
+        let configure = hc.commands.enqueue_addr();
+        hc.events.inject(command_completion(configure, completion::SUCCESS, 1));
+        hc.configure_endpoints_ss(DeviceId(1), eps)
+    }
+
+    #[test]
+    fn superspeed_burst_sizes_come_from_the_companion() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = fake(&dma, &mut regs);
+        let iso = EndpointDescriptor { address: 0x84, attributes: 1, max_packet_size_raw: 1024, interval: 1 };
+        // Bulk IN with burst 15 (16 packets), bulk OUT without a companion, and an
+        // isochronous IN of 2 bursts of 2 packets each (Mult 1) = 4096 bytes.
+        let mut iso_ss = ss_ep(iso, 1, 1, 0);
+        iso_ss.companion.as_mut().unwrap().bytes_per_interval = 4096;
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 15, 0, 0), SsEndpoint::plain(bulk(0x03)), iso_ss]).unwrap();
+        let input = &hc.slot(DeviceId(1)).unwrap().input;
+        assert_eq!(ctx_get(input, 6 * 32, 1) >> 8 & 0xff, 15, "bulk burst");
+        assert_eq!(ctx_get(input, 7 * 32, 1) >> 8 & 0xff, 0, "no companion: one packet");
+        // DCI 9 is context 10.
+        assert_eq!(ctx_get(input, 10 * 32, 1), EP_TYPE_ISOCH_IN << 3 | 1 << 8 | 1024 << 16);
+        assert_eq!(ctx_get(input, 10 * 32, 0) >> 8 & 3, 1, "Mult");
+        assert_eq!(ctx_get(input, 10 * 32, 4) >> 16, 4096, "wBytesPerInterval is the max ESIT payload");
+        let e = hc.isoch.iter().flatten().next().unwrap();
+        assert_eq!((e.burst, e.max_len, e.ss), (1, 4096, true));
+        // A companion means nothing below SuperSpeed, and Mult 3 is reserved.
+        hc.slot(DeviceId(1)).unwrap().speed = Speed::High;
+        let configure = hc.commands.enqueue_addr();
+        hc.events.inject(command_completion(configure, completion::SUCCESS, 1));
+        hc.configure_endpoints_ss(DeviceId(1), &[ss_ep(bulk(0x82), 15, 0, 0)]).unwrap();
+        let input = &hc.slot(DeviceId(1)).unwrap().input;
+        assert_eq!(ctx_get(input, 6 * 32, 1) >> 8 & 0xff, 0);
+        assert_eq!(configure_ss(&mut hc, &[ss_ep(iso, 0, 3, 0)]), Err(UsbError::BadEndpoint));
+    }
+
+    #[test]
+    fn stream_endpoint_context_and_arrays() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = fake(&dma, &mut regs);
+        // The device supports 2^5 streams; 8 asked for gives a 16-context array.
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 3, 5, 8), ss_ep(bulk(0x03), 3, 5, 8)]).unwrap();
+        let (dev, in_ep, out_ep) = (DeviceId(1), 0x82, 0x03);
+        assert_eq!((hc.stream_count(dev, in_ep), hc.stream_count(dev, out_ep), hc.stream_count(dev, 0x01)), (8, 8, 0));
+        let s = hc.streams.iter().flatten().find(|s| s.dci == 5).unwrap();
+        let (array, count) = (s.array_addr(), s.count);
+        assert_eq!(count, 8);
+        let input = &hc.slot(dev).unwrap().input;
+        let dw0 = ctx_get(input, 6 * 32, 0);
+        assert_eq!(dw0 >> 10 & 0x1f, 3, "MaxPStreams: 2^(3+1) contexts");
+        assert_eq!(dw0 >> 15 & 1, 1, "linear stream array");
+        let deq = ctx_get(input, 6 * 32, 2) as u64 | (ctx_get(input, 6 * 32, 3) as u64) << 32;
+        assert_eq!(deq, array, "the dequeue pointer names the array, with no cycle bit");
+        assert_eq!(array % 64, 0);
+        // Each stream context points at its own ring (SCT 1, DCS 1); unused ones are zero.
+        let s = hc.streams.iter().flatten().find(|s| s.dci == 5).unwrap();
+        let ctx = |n: usize| -> (u64, u64) { (s.array.load::<u64>(n * 16), s.array.load::<u64>(n * 16 + 8)) };
+        assert_eq!(ctx(0), (0, 0));
+        let mut bases = std::vec::Vec::new();
+        for n in 1..=8 {
+            let ring = s.rings[n - 1].as_ref().unwrap();
+            assert_eq!(ctx(n), (ring.base().as_u64() | 1 << 1 | 1, 0), "stream {n}");
+            bases.push(ring.base());
+        }
+        bases.sort();
+        bases.dedup();
+        assert_eq!(bases.len(), 8);
+        assert_eq!(ctx(9), (0, 0));
+        assert!(s.rings[8].is_none());
+
+        // Smaller and larger requests round the array and clamp the count.
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 3)]).unwrap();
+        assert_eq!(hc.stream_count(dev, in_ep), 3, "replaced, not added to");
+        assert_eq!(ctx_get(&hc.slot(dev).unwrap().input, 6 * 32, 0) >> 10 & 0x1f, 1, "a 4-context array");
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 1000)]).unwrap();
+        assert_eq!(hc.stream_count(dev, in_ep), MAX_STREAMS as u16);
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 2, 1000)]).unwrap();
+        assert_eq!(hc.stream_count(dev, in_ep), 4, "the device supports 2^2 streams");
+        hc.max_psa = 1; // the controller: 2^2 contexts, so stream IDs 1 to 3
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 1000)]).unwrap();
+        assert_eq!(hc.stream_count(dev, in_ep), 3);
+        // Reconfiguring the endpoint without streams frees them.
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 0)]).unwrap();
+        assert_eq!(hc.stream_count(dev, in_ep), 0);
+        assert_eq!(ctx_get(&hc.slot(dev).unwrap().input, 6 * 32, 0) >> 10 & 0x1f, 0);
+    }
+
+    #[test]
+    fn streams_are_refused_where_they_cannot_work() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = fake(&dma, &mut regs);
+        // The device advertises none, or the endpoint is not bulk.
+        assert_eq!(configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 0, 4)]), Err(UsbError::BadEndpoint));
+        assert_eq!(
+            configure_ss(&mut hc, &[SsEndpoint { streams: 4, ..SsEndpoint::plain(bulk(0x82)) }]),
+            Err(UsbError::BadEndpoint)
+        );
+        let int = EndpointDescriptor { address: 0x83, attributes: 3, max_packet_size_raw: 1024, interval: 3 };
+        assert_eq!(configure_ss(&mut hc, &[ss_ep(int, 0, 5, 4)]), Err(UsbError::BadEndpoint));
+        // Not at SuperSpeed.
+        hc.slot(DeviceId(1)).unwrap().speed = Speed::High;
+        assert_eq!(hc.configure_endpoints_ss(DeviceId(1), &[ss_ep(bulk(0x82), 0, 5, 4)]), Err(UsbError::BadEndpoint));
+        // A controller without primary stream arrays.
+        hc.max_psa = 0;
+        assert_eq!(configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 4)]), Err(UsbError::Unsupported));
+        // Only MAX_STREAM_ENDPOINTS at a time.
+        hc.max_psa = 4;
+        let three = [ss_ep(bulk(0x81), 0, 5, 2), ss_ep(bulk(0x82), 0, 5, 2), ss_ep(bulk(0x83), 0, 5, 2)];
+        assert_eq!(configure_ss(&mut hc, &three), Err(UsbError::NoResources));
+        assert_eq!(hc.streams.iter().flatten().count(), 0, "nothing half-built is left");
+        // The plain trait method works on a controller with streams.
+        let configure = hc.commands.enqueue_addr();
+        hc.events.inject(command_completion(configure, completion::SUCCESS, 1));
+        hc.configure_endpoints(DeviceId(1), &[bulk(0x82)]).unwrap();
+        assert_eq!(hc.stream_count(DeviceId(1), 0x82), 0);
+    }
+
+    /// Slot 1 at SuperSpeed with streams 1 to 4 on bulk IN 2 (DCI 5) and bulk OUT 3 (DCI 6).
+    fn stream_setup<'dma>(
+        dma: &'dma crate::virtio::testing::HostDma,
+        regs: &mut [u32],
+    ) -> Xhci<'dma, crate::virtio::testing::HostDma> {
+        let mut hc = fake(dma, regs);
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 4), ss_ep(bulk(0x03), 0, 5, 4)]).unwrap();
+        hc
+    }
+
+    fn stream_trb(hc: &Xhci<'_, crate::virtio::testing::HostDma>, dci: usize, stream: usize, i: usize) -> (Trb, u64) {
+        let ring = hc.streams.iter().flatten().find(|s| s.dci == dci).unwrap().rings[stream - 1].as_ref().unwrap();
+        (ring.get(i), ring.base().as_u64() + 16 * i as u64)
+    }
+
+    #[test]
+    fn stream_transfers_use_their_own_rings_and_doorbells() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = stream_setup(&dma, &mut regs);
+        let dev = DeviceId(1);
+        let doorbell = hc.db + 4;
+
+        hc.stream_submit_in(dev, 2, 3, 512).unwrap();
+        assert_eq!(hc.r32(doorbell), 5 | 3 << 16, "target DCI 5, stream 3");
+        let (trb, addr3) = stream_trb(&hc, 5, 3, 0);
+        assert_eq!((trb.kind(), trb.status & 0x1_ffff), (kind::NORMAL, 512));
+        assert_eq!(stream_trb(&hc, 5, 1, 0).0, Trb::default(), "the other streams' rings are untouched");
+        hc.stream_submit_in(dev, 2, 1, 64).unwrap();
+        assert_eq!(hc.r32(doorbell), 5 | 1 << 16);
+        let (_, addr1) = stream_trb(&hc, 5, 1, 0);
+
+        assert_eq!(hc.stream_submit_in(dev, 2, 3, 8), Err(UsbError::Busy), "one transfer per stream");
+        assert_eq!(hc.stream_submit_in(dev, 2, 0, 8), Err(UsbError::BadEndpoint), "stream 0 is reserved");
+        assert_eq!(hc.stream_submit_in(dev, 2, 5, 8), Err(UsbError::BadEndpoint), "beyond the streams set up");
+        assert_eq!(hc.stream_submit_in(dev, 4, 1, 8), Err(UsbError::BadEndpoint), "no streams on endpoint 4");
+        assert_eq!(hc.stream_submit_in(dev, 2, 2, 0), Err(UsbError::NoResources));
+        assert_eq!(hc.stream_submit_out(dev, 2, 2, &[1]), Err(UsbError::BadEndpoint), "endpoint 2 IN has no OUT");
+        // Transfers without a stream ID have nowhere to go.
+        assert_eq!(hc.submit_in(dev, 2, 8), Err(UsbError::BadEndpoint));
+        assert_eq!(hc.transfer_out(dev, 3, &[1]), Err(UsbError::BadEndpoint));
+        assert_eq!(hc.transfer_in(dev, 2, &mut [0; 4]), Err(UsbError::BadEndpoint));
+
+        // Still pending; the event names the TRB, which finds the stream.
+        assert_eq!(hc.stream_poll(dev, 0x82, 3, &mut [0; 8]), None);
+        hc.streams.iter_mut().flatten().find(|s| s.dci == 5).unwrap().pending[0]
+            .as_ref()
+            .unwrap()
+            .buf
+            .write(0, b"stream 1");
+        let mut short = transfer_event(1, 5, addr1);
+        short.status = (completion::SHORT_PACKET as u32) << 24 | 56; // 8 of 64 bytes moved
+        hc.events.inject(short);
+        let mut buf = [0u8; 512];
+        assert_eq!(hc.stream_poll(dev, 0x82, 1, &mut buf), Some(Ok(8)));
+        assert_eq!(&buf[..8], b"stream 1");
+        assert_eq!(hc.stream_poll(dev, 0x82, 3, &mut buf), None, "stream 3 is still running");
+        assert_eq!(hc.stream_poll(dev, 0x82, 1, &mut buf), Some(Err(UsbError::BadEndpoint)), "collected");
+        hc.events.inject(transfer_event(1, 5, addr3));
+        assert_eq!(hc.stream_poll(dev, 0x82, 3, &mut buf), Some(Ok(512)));
+
+        // OUT: the data is copied into the transfer's buffer and the doorbell names stream 2.
+        hc.stream_submit_out(dev, 3, 2, b"hello").unwrap();
+        assert_eq!(hc.r32(doorbell), 6 | 2 << 16);
+        let (trb, addr) = stream_trb(&hc, 6, 2, 0);
+        assert_eq!((trb.kind(), trb.status & 0x1_ffff), (kind::NORMAL, 5));
+        let mut got = [0u8; 5];
+        hc.streams.iter().flatten().find(|s| s.dci == 6).unwrap().pending[1].as_ref().unwrap().buf.read(0, &mut got);
+        assert_eq!(&got, b"hello");
+        hc.events.inject(transfer_event(1, 6, addr));
+        assert_eq!(hc.stream_poll(dev, 0x03, 2, &mut []), Some(Ok(5)));
+        assert_eq!(hc.stream_submit_in(dev, 3, 2, 8), Err(UsbError::BadEndpoint), "endpoint 3 is OUT");
+        // A second transfer on the same stream follows on its ring.
+        hc.stream_submit_out(dev, 3, 2, b"again").unwrap();
+        assert_eq!(stream_trb(&hc, 6, 2, 1).0.kind(), kind::NORMAL);
+    }
+
+    #[test]
+    fn failed_stream_transfer_is_skipped_and_other_streams_restart() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = stream_setup(&dma, &mut regs);
+        let dev = DeviceId(1);
+        hc.stream_submit_in(dev, 2, 1, 64).unwrap();
+        hc.stream_submit_in(dev, 2, 2, 64).unwrap();
+        let (_, addr1) = stream_trb(&hc, 5, 1, 0);
+        let mut stall = transfer_event(1, 5, addr1);
+        stall.status = (completion::STALL as u32) << 24;
+        hc.events.inject(stall);
+        hc.drain_events(); // the poll below would otherwise take the answers to the commands too
+        let (reset, set) = (hc.commands.enqueue_addr(), hc.commands.enqueue_addr() + 16);
+        hc.events.inject(command_completion(reset, completion::SUCCESS, 1));
+        hc.events.inject(command_completion(set, completion::SUCCESS, 1));
+        // Recover directly: poll's own drain would eat the answers to the commands.
+        let p = hc.streams.iter_mut().flatten().find(|s| s.dci == 5).unwrap().pending[0].take().unwrap();
+        hc.recover_stream(dev, 5, 1, p);
+        // [0] is the Configure Endpoint command of the setup.
+        let (reset_trb, set_trb) = (hc.commands.get(1), hc.commands.get(2));
+        assert_eq!((reset_trb.kind(), reset_trb.control >> 16 & 0x1f), (kind::RESET_ENDPOINT, 5));
+        assert_eq!(set_trb.kind(), kind::SET_TR_DEQUEUE);
+        assert_eq!(set_trb.status >> 16, 1, "stream 1");
+        let ring1_next = stream_trb(&hc, 5, 1, 1).1;
+        assert_eq!(set_trb.param, ring1_next | 1 << 1 | 1, "past the failed TRB, SCT 1, cycle 1");
+        assert_eq!(hc.r32(hc.db + 4), 5 | 2 << 16, "the stream that was still queued runs again");
+        assert!(!hc.slot(dev).unwrap().dead);
+    }
+
+    #[test]
+    fn stream_error_with_unanswered_recovery_kills_the_slot() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = stream_setup(&dma, &mut regs);
+        let dev = DeviceId(1);
+        hc.stream_submit_out(dev, 3, 4, b"x").unwrap();
+        let (_, addr) = stream_trb(&hc, 6, 4, 0);
+        let mut bad = transfer_event(1, 6, addr);
+        bad.status = (completion::STALL as u32) << 24;
+        hc.events.inject(bad);
+        assert_eq!(hc.stream_poll(dev, 0x03, 4, &mut []), Some(Err(UsbError::Stall)));
+        assert!(hc.slot(dev).unwrap().dead, "the controller never moved the dequeue pointer");
+        assert_eq!(hc.stream_submit_out(dev, 3, 4, b"y"), Err(UsbError::NoDevice));
+    }
+
+    #[test]
+    fn detaching_frees_the_streams() {
+        let dma = crate::virtio::testing::HostDma::default();
+        let mut regs = std::vec![0u32; 0x400];
+        let mut hc = stream_setup(&dma, &mut regs);
+        let live = dma.live.get();
+        hc.stream_submit_in(DeviceId(1), 2, 1, 64).unwrap();
+        let disable = hc.commands.enqueue_addr();
+        hc.events.inject(command_completion(disable, completion::SUCCESS, 1));
+        hc.detach(DeviceId(1));
+        assert_eq!(hc.streams.iter().flatten().count(), 0);
+        assert_eq!(hc.stream_count(DeviceId(1), 0x82), 0);
+        // 2 arrays and 8 stream rings, the pending buffer, and the slot's own memory.
+        assert!(dma.live.get() + 11 <= live + 1, "{} -> {}", live, dma.live.get());
     }
 }
