@@ -931,7 +931,8 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
                 }
                 None => println!("[usb]   xHCI interrupts unavailable; polling"),
             }
-            demos::usb(xhci, now_ns);
+            let found = demos::usb(xhci, now_ns);
+            demos::usb_uas(xhci, &found, now_ns);
             println!("[usb]   xHCI interrupts: {}", xhci.lock().interrupts_handled());
         }
         None => println!("[usb]   no xHCI controller"),

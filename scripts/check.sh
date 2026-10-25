@@ -117,7 +117,9 @@ screen_wait() {
 # reassembly, stable opaque and temporary addresses, and DHCPv6 against a
 # server played by the demo. Behind
 # the xHCI controller (and likewise EHCI and OHCI, each with its own stick), a USB stick on a scratch image answers a SCSI INQUIRY and
-# takes a block write while the keyboard's interrupt transfer stays pending. A
+# takes a block write while the keyboard's interrupt transfer stays pending,
+# and a UASP disk behind xHCI answers two INQUIRYs at once on bulk streams 1
+# and 2. A
 # guest runs in VS-mode under the H extension. With dosfstools installed the
 # stick is formatted FAT32, the kernel writes a file on it, and fsck.fat must
 # accept the result. A SATA disk behind AHCI and an NVMe namespace each take
@@ -131,9 +133,10 @@ stick_ohci=$(mktemp)
 vdisk=$(mktemp)
 sata=$(mktemp)
 nvdisk=$(mktemp)
+uasdisk=$(mktemp)
 iscsi=$(mktemp)
 vcon=$(mktemp)
-truncate -s 8M "$vdisk" "$sata" "$nvdisk" "$iscsi"
+truncate -s 8M "$vdisk" "$sata" "$nvdisk" "$iscsi" "$uasdisk"
 truncate -s 40000K "$stick" "$stick_ehci" "$stick_ohci"
 tftp=$(mktemp -d)
 echo "hello over UDP" >"$tftp/osmium.txt"
@@ -212,6 +215,9 @@ EXPECT=(
     '\[usb\]     hid keyboard ready'
     '\[usb\]     hid mouse ready, axes Some'
     'mouse transfer still pending after disk I/O'
+    '\[usb\]     uas: 4 streams on the status pipe'
+    '\[usb\]     uas: stream 1: INQUIRY "QEMU" "QEMU HARDDISK", SCSI status 0'
+    '\[usb\]     uas: stream 2: INQUIRY "QEMU" "QEMU HARDDISK", SCSI status 0'
     '\[usb\]   EHCI at .*, 6 ports'
     'EHCI interrupts: [1-9]'
     '\[usb\]   OHCI at .*, 3 ports'
@@ -244,7 +250,8 @@ EXPECT=(
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi \
     -netdev user,id=n0,tftp="$tftp",guestfwd=tcp:10.0.2.100:7-cmd:cat,guestfwd=tcp:10.0.2.100:3260-cmd:"python3 scripts/iscsi-target.py $iscsi" -device virtio-net-device,netdev=n0 \
-    -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
+    -device qemu-xhci,id=xhci,p2=6,p3=6 -device usb-kbd,bus=xhci.0 \
+    -drive if=none,id=uasd,format=raw,file="$uasdisk" -device usb-uas,bus=xhci.0,id=uas -device scsi-hd,bus=uas.0,scsi-id=0,lun=0,drive=uasd \
     -device usb-ehci,id=ehci -drive if=none,id=stick-ehci,format=raw,file="$stick_ehci" -device usb-storage,bus=ehci.0,drive=stick-ehci \
     -device pci-ohci,id=ohci -device usb-mouse,bus=ohci.0 -drive if=none,id=stick-ohci,format=raw,file="$stick_ohci" -device usb-storage,bus=ohci.0,drive=stick-ohci \
     -drive if=none,id=vd0,format=raw,file="$vdisk" -device virtio-blk-device,drive=vd0 \
@@ -265,7 +272,7 @@ if [ "${#fat_expect[@]}" -gt 0 ] && command -v qemu-system-riscv64 >/dev/null; t
         grep -q "/OSMIUM/Hello from osmium.txt" <<<"$report" || { echo "$report"; echo "riscv-virt: file missing on a stick behind EHCI or OHCI"; exit 1; }
     done
 fi
-rm -f "$stick" "$stick_ehci" "$stick_ohci" "$vdisk" "$sata" "$nvdisk" "$iscsi" "$vcon"
+rm -f "$stick" "$stick_ehci" "$stick_ohci" "$vdisk" "$sata" "$nvdisk" "$iscsi" "$vcon" "$uasdisk"
 rm -rf "$tftp"
 # RISC-V IOMMU: QEMU's riscv-iommu-pci translates the DMA of every PCI device
 # on the bus, so this boot carries only an NVMe disk and QEMU's iommu-testdev.
