@@ -11,8 +11,10 @@
 //! clock a timed wait fails with `ENOSYS`. `CLOCK_REALTIME` and
 //! `CLOCK_MONOTONIC` both read that clock.
 //!
-//! Priority-inheritance futexes (`LOCK_PI` and friends) are not implemented
-//! and fail with `ENOSYS`. `WAKE_OP` and the requeue operations compare and
+//! Priority-inheritance futexes (`LOCK_PI` and friends) are in
+//! `crate::futex_pi`. A timed or untimed `FUTEX_WAIT` that a signal handler
+//! interrupts fails with `EINTR`; if no handler runs it continues through
+//! `restart_syscall` (see `crate::restart`). `WAKE_OP` and the requeue operations compare and
 //! modify user memory under the futex lock, which orders them against other
 //! futex calls but not against the program's own atomic instructions.
 //!
@@ -38,8 +40,12 @@ const WAKE: u64 = 1;
 const REQUEUE: u64 = 3;
 const CMP_REQUEUE: u64 = 4;
 const WAKE_OP: u64 = 5;
+const LOCK_PI: u64 = 6;
+const UNLOCK_PI: u64 = 7;
+const TRYLOCK_PI: u64 = 8;
 const WAIT_BITSET: u64 = 9;
 const WAKE_BITSET: u64 = 10;
+const LOCK_PI2: u64 = 13;
 /// `FUTEX_CLOCK_REALTIME`.
 const CLOCK_REALTIME: u64 = 256;
 /// `FUTEX_PRIVATE_FLAG`.
@@ -47,9 +53,9 @@ const PRIVATE: u64 = 128;
 const BITSET_ANY: u32 = u32::MAX;
 
 /// A futex word's bits: the owner's thread id, and the two flags.
-const TID_MASK: u32 = 0x3fff_ffff;
-const OWNER_DIED: u32 = 0x4000_0000;
-const WAITERS_BIT: u32 = 0x8000_0000;
+pub(crate) const TID_MASK: u32 = 0x3fff_ffff;
+pub(crate) const OWNER_DIED: u32 = 0x4000_0000;
+pub(crate) const WAITERS_BIT: u32 = 0x8000_0000;
 
 /// The size of the kernel's `robust_list_head`: list, offset, pending.
 const ROBUST_HEAD_LEN: u64 = 24;
@@ -126,7 +132,7 @@ impl Drop for Waiter {
 static WAITERS: IrqSpinLock<WaiterList> = IrqSpinLock::new(WaiterList(List::new()));
 /// Every sleeping thread waits here and checks its own waiter; wakes are
 /// rare enough that waking the lot is simpler than a queue per address.
-static SLEEPERS: WaitQueue = WaitQueue::new();
+pub(crate) static SLEEPERS: WaitQueue = WaitQueue::new();
 static CLOCK: Once<fn() -> u64> = Once::new();
 
 /// Sets the monotonic clock, in nanoseconds, that futex timeouts read. Only
@@ -177,7 +183,7 @@ fn wake_bits(pid: Pid, addr: u64, n: u32, mask: u32) -> u32 {
     woken
 }
 
-fn read_u32(p: &Process, addr: u64) -> Result<u32, Errno> {
+pub(crate) fn read_u32(p: &Process, addr: u64) -> Result<u32, Errno> {
     let mut cur = [0; 4];
     p.memory().read(addr, &mut cur)?;
     Ok(u32::from_ne_bytes(cur))
@@ -202,12 +208,12 @@ pub(crate) fn enqueue_bits(
     Ok(w)
 }
 
-/// Blocks until `w` is woken, the thread is interrupted, or the clock
-/// reaches `deadline` (`ETIMEDOUT`).
-fn sleep_until(p: &Process, th: &Thread, w: &Waiter, deadline: Option<u64>) -> Result<(), Errno> {
+/// Blocks until `ready` holds, the thread is interrupted (`EINTR`), or the
+/// clock reaches `deadline` (`ETIMEDOUT`). `ready` is checked first.
+pub(crate) fn sleep_on(p: &Process, th: &Thread, deadline: Option<u64>, ready: impl Fn() -> bool) -> Result<(), Errno> {
     let now = CLOCK.get().copied();
-    let r = SLEEPERS.wait_until(|| {
-        if w.woken.load(Ordering::SeqCst) {
+    SLEEPERS.wait_until(|| {
+        if ready() {
             Some(Ok(()))
         } else if crate::signal::interrupted(p, th) {
             Some(Err(Errno::EINTR))
@@ -216,7 +222,13 @@ fn sleep_until(p: &Process, th: &Thread, w: &Waiter, deadline: Option<u64>) -> R
         } else {
             None
         }
-    });
+    })
+}
+
+/// Blocks until `w` is woken, the thread is interrupted, or the clock
+/// reaches `deadline` (`ETIMEDOUT`).
+fn sleep_until(p: &Process, th: &Thread, w: &Waiter, deadline: Option<u64>) -> Result<(), Errno> {
+    let r = sleep_on(p, th, deadline, || w.woken.load(Ordering::SeqCst));
     if r.is_err() {
         w.dequeue();
         // A wake that raced with the interruption still counts.
@@ -225,6 +237,37 @@ fn sleep_until(p: &Process, th: &Thread, w: &Waiter, deadline: Option<u64>) -> R
         }
     }
     r
+}
+
+/// Whether futex operation `op` is `FUTEX_LOCK_PI` or `FUTEX_LOCK_PI2`.
+pub(crate) fn is_lock_pi(op: u64) -> bool {
+    matches!(op & !(PRIVATE | CLOCK_REALTIME), LOCK_PI | LOCK_PI2)
+}
+
+/// Whether futex operation `op` is a wait that `restart_syscall` continues.
+pub(crate) fn is_wait(op: u64) -> bool {
+    matches!(op & !(PRIVATE | CLOCK_REALTIME), WAIT | WAIT_BITSET)
+}
+
+/// Waits at `uaddr` while it holds `val`, until woken or `deadline`. If a
+/// signal interrupts it, the thread's restart block lets `restart_syscall`
+/// continue it with the same deadline.
+pub(crate) fn wait(
+    p: &Process,
+    th: &Thread,
+    uaddr: u64,
+    val: u32,
+    bitset: u32,
+    deadline: Option<u64>,
+) -> Result<u64, Errno> {
+    *th.ext.restart.lock() = None;
+    let w = core::pin::pin!(Waiter::new(p.pid(), uaddr, bitset));
+    w.as_ref().enqueue(p, val)?;
+    let r = sleep_until(p, th, &w, deadline);
+    if r == Err(Errno::EINTR) {
+        *th.ext.restart.lock() = Some(crate::restart::Block::FutexWait { uaddr, val, bitset, deadline });
+    }
+    r.map(|()| 0)
 }
 
 /// Reads a `struct timespec` at `addr` as nanoseconds.
@@ -343,7 +386,7 @@ pub(crate) fn futex(p: &Process, th: &Thread, a: [u64; 6]) -> Result<u64, Errno>
     }
     let count = |v: u64| (v as i32).max(0) as u32;
     let cmd = op & !(PRIVATE | CLOCK_REALTIME);
-    if op & CLOCK_REALTIME != 0 && cmd != WAIT_BITSET {
+    if op & CLOCK_REALTIME != 0 && cmd != WAIT_BITSET && cmd != LOCK_PI2 {
         return Err(Errno::ENOSYS);
     }
     match cmd {
@@ -353,10 +396,12 @@ pub(crate) fn futex(p: &Process, th: &Thread, a: [u64; 6]) -> Result<u64, Errno>
                 return Err(Errno::EINVAL);
             }
             let deadline = deadline(p, timeout, cmd == WAIT_BITSET)?;
-            let w = core::pin::pin!(Waiter::new(p.pid(), uaddr, bitset));
-            w.as_ref().enqueue(p, val as u32)?;
-            sleep_until(p, th, &w, deadline).map(|()| 0)
+            wait(p, th, uaddr, val as u32, bitset, deadline)
         }
+        // The timeout is absolute.
+        LOCK_PI | LOCK_PI2 => crate::futex_pi::lock(p, th, uaddr, deadline(p, timeout, true)?),
+        UNLOCK_PI => crate::futex_pi::unlock(p, th, uaddr),
+        TRYLOCK_PI => crate::futex_pi::trylock(p, th, uaddr),
         WAKE | WAKE_BITSET => {
             let mask = if cmd == WAKE_BITSET { val3 as u32 } else { BITSET_ANY };
             if mask == 0 {
@@ -368,7 +413,7 @@ pub(crate) fn futex(p: &Process, th: &Thread, a: [u64; 6]) -> Result<u64, Errno>
         REQUEUE => requeue(p, [uaddr, uaddr2], [count(val), count(timeout)], None),
         CMP_REQUEUE => requeue(p, [uaddr, uaddr2], [count(val), count(timeout)], Some(val3 as u32)),
         WAKE_OP => wake_op(p, [uaddr, uaddr2], [count(val), count(timeout)], val3 as u32),
-        // Priority-inheritance futexes (6, 7, 8, 11, 12, 13) and the rest.
+        // The requeue-PI operations (11, 12) and the rest.
         _ => Err(Errno::ENOSYS),
     }
 }
@@ -438,6 +483,9 @@ pub(crate) fn exit_robust_list(p: &Process, th: &Thread) {
 }
 
 fn owner_died(p: &Process, tid: u32, addr: u64) {
+    if crate::futex_pi::owner_died(p, tid, addr) {
+        return;
+    }
     let mut waiters = WAITERS.lock();
     let Ok(v) = read_u32(p, addr) else { return };
     if v & TID_MASK != tid {

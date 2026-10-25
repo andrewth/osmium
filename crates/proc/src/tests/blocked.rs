@@ -31,7 +31,7 @@ pub(super) fn become_cpu() {
 /// test's own task yields to it on this CPU). Returns the task and the cell
 /// that `body`'s result lands in; it holds `PENDING` while the task is
 /// blocked.
-fn block_in(
+pub(super) fn block_in(
     p: &Arc<Process>,
     body: impl FnOnce(&Process) -> i64 + Send + 'static,
 ) -> (Arc<osmium_sched::Task>, Arc<AtomicI64>) {
