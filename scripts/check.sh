@@ -301,13 +301,18 @@ boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
 # Arm SMMUv3 in front of the PCI bus (virt,iommu=smmuv3), with QEMU's
 # iommu-testdev: stage-2 translation of the test device's DMA, a blocked
-# unmapped address and a blocked detached device.
+# unmapped address and a blocked detached device; then the same through
+# stage 1 behind a two-level stream table.
 if command -v qemu-system-aarch64 >/dev/null && qemu-system-aarch64 -device help 2>&1 | grep -q 'iommu-testdev'; then
     EXPECT=(
         '\[iommu\] SMMUv3 at 0x[0-9a-f]*: 44 bit I/O addresses'
         'smmuv3: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'
         'smmuv3: DMA to an unmapped IOVA blocked'
         'smmuv3: detached device blocked'
+        'SMMUv3 stage 1, two-level stream table: true'
+        'smmuv3 stage 1: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'
+        'smmuv3 stage 1: DMA to an unmapped IOVA blocked'
+        'smmuv3 stage 1: detached device blocked'
     )
     boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
         -machine virt,gic-version=2,iommu=smmuv3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi \
