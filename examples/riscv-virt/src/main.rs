@@ -1174,6 +1174,39 @@ fn fork_exec_demo(cpu: usize) {
     println!("[user]  init and its children reaped; {freed} of 1 init address space torn down");
 }
 
+/// Position-independent programs, from `examples/user/pie.rs` (twice) and
+/// `ld.rs`.
+static PIE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pie.elf"));
+static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
+static LD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ld.elf"));
+
+/// Runs `/bin/pie`, a static PIE that the kernel relocates, and `/bin/dyn`,
+/// the same program linked against the interpreter `/bin/ld`, which
+/// relocates it.
+fn pie_demo() {
+    demos::user::install("pie", PIE_ELF);
+    demos::user::install("dyn", DYN_ELF);
+    demos::user::install("ld", LD_ELF);
+    for name in ["pie", "dyn"] {
+        let process =
+            Process::new_boxed(name, (platform().new_memory)().expect("out of memory for an address space"), 0);
+        let path = alloc::format!("/bin/{name}");
+        let task = process.spawn(TaskBuilder::new(name), move || {
+            let entry = osmium::proc::current()
+                .expect("current returned None")
+                .exec(&path, &[path.as_bytes()], &[])
+                .expect("exec of a position-independent program failed");
+            // SAFETY: exec activated the new table; traps are installed and
+            // the switch hook keeps TrapCpu's kernel stack on this task.
+            unsafe { riscv64::enter_user(entry.pc as usize, entry.sp as usize) }
+        });
+        drop(process);
+        task.join();
+        drop(task);
+    }
+    println!("[user]  position-independent programs exited");
+}
+
 fn user_demo() {
     osmium::proc::set_platform(platform());
     // SAFETY: linker symbols delimiting the user programs.
@@ -1200,6 +1233,7 @@ fn user_demo() {
     let freed = demos::user::freed(&processes);
     println!("[user]  {freed} of 4 address spaces torn down with their tasks");
     fork_exec_demo(cpu);
+    pie_demo();
     socket_demo();
 }
 
