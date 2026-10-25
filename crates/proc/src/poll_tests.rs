@@ -136,10 +136,10 @@ fn stream_pair_with_peek_and_vectors() {
     assert_eq!(get(&p, MSG + 48, 4), [0; 4], "msg_flags");
     assert_eq!(get(&p, NAMELEN, 4), [0; 4], "no name");
 
-    // Names mean nothing to a connected pair; control data is not supported.
+    // Names mean nothing to a connected pair; control data is read, and a wild pointer fails.
     assert_eq!(call(&p, Sys::Sendto, &[a, B1, 2, 0, B2, 16]), err(Errno::EISCONN));
     msghdr(&p, 0, 0, &[(B1, 2)], 8);
-    assert_eq!(call(&p, Sys::Sendmsg, &[a, MSG, 0]), err(Errno::EOPNOTSUPP));
+    assert_eq!(call(&p, Sys::Sendmsg, &[a, MSG, 0]), err(Errno::EFAULT));
     assert_eq!(call(&p, Sys::Recvmsg, &[b, MSG, 0x10000]), err(Errno::EOPNOTSUPP), "unknown flag");
 
     // Getsockname gives an unnamed AF_UNIX address; SO_TYPE is a stream.
@@ -150,7 +150,7 @@ fn stream_pair_with_peek_and_vectors() {
     put(&p, B2, &4u32.to_ne_bytes());
     assert_eq!(call(&p, Sys::Getsockopt, &[a, 1, 3, B1, B2]), 0);
     assert_eq!(get(&p, B1, 4), 1i32.to_ne_bytes());
-    assert_eq!(call(&p, Sys::Bind, &[a, B1, 16]), err(Errno::EOPNOTSUPP));
+    assert_eq!(call(&p, Sys::Bind, &[a, B1, 1]), err(Errno::EINVAL), "too short for an address");
 
     // shutdown(SHUT_WR) is end of file for the peer; close is a hang-up.
     assert_eq!(call(&p, Sys::Shutdown, &[a, 1]), 0);

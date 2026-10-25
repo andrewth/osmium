@@ -74,6 +74,7 @@ pub mod net;
 mod pipe;
 pub mod poll;
 mod process;
+mod scm;
 pub mod signal;
 pub mod socket;
 pub mod syscall;
@@ -87,6 +88,7 @@ pub use memory::{AddressSpace, UserMemory};
 pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for};
 pub use syscall::{Outcome, Sys, dispatch, dispatch_as};
 pub use thread::Thread;
+pub use unix::{MAX_IN_FLIGHT, UnixSocket, in_flight};
 
 use osmium_fs::Vfs;
 use osmium_sync::Once;

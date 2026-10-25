@@ -156,6 +156,8 @@ fn console() -> &'static Arc<Console> {
             ("hello.txt", Arc::new(Text("hello, file\n", 2)) as Arc<dyn File>),
             ("etc", etc),
             ("bin", bin),
+            // Somewhere to bind sockets.
+            ("tmp", osmium_fs::RamFs::new(7).root()),
         ]);
         set_vfs(Box::leak(Box::new(Vfs::new(Arc::new(root)))));
         c
@@ -373,7 +375,7 @@ fn files_through_the_vfs() {
         names.push(String::from_utf8(name[..name.iter().position(|&b| b == 0).unwrap()].to_vec()).unwrap());
         off += reclen;
     }
-    assert_eq!(names, [".", "..", "hello.txt", "etc", "bin"]);
+    assert_eq!(names, [".", "..", "hello.txt", "etc", "bin", "tmp"]);
     assert_eq!(call(&p, Sys::Getdents64, &[dir, DATA + 0x1000, 0x1000]), 0, "exhausted");
 }
 
@@ -746,3 +748,4 @@ mod blocked;
 mod hostile;
 mod oom;
 mod sigthread;
+mod unix;
