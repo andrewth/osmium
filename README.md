@@ -33,7 +33,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA, display), IOMMU domains and `IommuDma`, linear framebuffers with pixel formats, `IrqTable`, global console with `println!` | no |
 | `osmium-drivers` | virtio core: MMIO and PCI transports (legacy and 1.x) and the split virtqueue, and the virtio-console driver | no |
 | `osmium-display` | virtio-gpu (also as virtio-vga), Bochs DISPI (QEMU std VGA, bochs-display) and VESA BIOS (VBE) mode setting | no |
-| `osmium-sysdrv` | NS16550A, PL011, i8254 PIT, QEMU `fw_cfg` (ports or MMIO, DMA), RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers | no |
+| `osmium-sysdrv` | NS16550A, PL011, i8254 PIT, QEMU `fw_cfg` (ports or MMIO, DMA), RISC-V PLIC and CLINT, GICv2, GICv3, x86 local APIC (with INIT/SIPI), x86 I/O APIC, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers | no |
 | `osmium-storage` | RAM disk, virtio-blk (MMIO, legacy and 1.x), AHCI (SATA) and NVMe disks | no |
 | `osmium-usb` | xHCI USB host controller (interrupt-driven), UHCI, OHCI and EHCI (polled or interrupt-driven), hubs, isochronous endpoints, USB mass storage and HID boot keyboards | no |
 | `osmium-netdev` | virtio-net (MMIO or PCI, legacy and 1.x), Mellanox ConnectX-3 (mlx4) Ethernet (polled or MSI-X, checksum and segmentation offload; no RSS or steering) and InfiniBand (subnet management, unreliable datagrams, multicast, reliable connections with RDMA, IPoIB; no SR-IOV; both simulator-tested only), USB CDC-ECM and CDC-NCM Ethernet (NCM simulator-tested only) | no |

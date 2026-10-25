@@ -1,9 +1,9 @@
-//! A small kernel for QEMU's AArch64 `virt` machine (GICv2), built entirely
+//! A small kernel for QEMU's AArch64 `virt` machine (GICv2 or GICv3), built entirely
 //! from Osmium components. QEMU starts ELF kernels at EL1 with the MMU off
 //! and the device tree at the base of RAM.
 //!
 //! The same steps as the RISC-V example, on different hardware: PL011 UART,
-//! GICv2 interrupt controller, generic timer, AArch64 stage-1 paging and
+//! GICv2 or GICv3 interrupt controller (probed from the device tree), generic timer, AArch64 stage-1 paging and
 //! PSCI for power-off.
 #![no_std]
 #![no_main]
@@ -23,6 +23,7 @@ use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
 use osmium::sysdrv::gicv2::GicV2;
+use osmium::sysdrv::gicv3::{GicV3, SysRegs};
 use osmium::sysdrv::pl011::Pl011;
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::irq::{InterruptController, IrqTable};
@@ -203,7 +204,71 @@ fn set_exception_stack() {
 }
 
 static UART: Once<SerialConsole<Pl011>> = Once::new();
-static GIC: Once<GicV2> = Once::new();
+static GIC: Once<Gic> = Once::new();
+
+/// The interrupt controller the device tree describes.
+enum Gic {
+    V2(GicV2),
+    V3(GicV3<SysRegs>),
+}
+
+impl Gic {
+    fn init_cpu(&self) {
+        match self {
+            Gic::V2(g) => g.init_cpu(),
+            Gic::V3(g) => assert!(g.init_cpu(), "GICv3 CPU interface failed to come up"),
+        }
+    }
+
+    fn num_irqs(&self) -> u32 {
+        match self {
+            Gic::V2(g) => g.num_irqs(),
+            Gic::V3(g) => g.num_irqs(),
+        }
+    }
+
+    fn send_sgi(&self, cpu: usize, sgi: u32) {
+        match self {
+            Gic::V2(g) => g.send_sgi(1 << cpu, sgi),
+            Gic::V3(g) => {
+                g.send_sgi(1 << cpu, sgi);
+            }
+        }
+    }
+}
+
+impl InterruptController for Gic {
+    fn enable(&self, irq: u32) {
+        match self {
+            Gic::V2(g) => g.enable(irq),
+            Gic::V3(g) => g.enable(irq),
+        }
+    }
+    fn disable(&self, irq: u32) {
+        match self {
+            Gic::V2(g) => g.disable(irq),
+            Gic::V3(g) => g.disable(irq),
+        }
+    }
+    fn claim(&self) -> Option<u32> {
+        match self {
+            Gic::V2(g) => g.claim(),
+            Gic::V3(g) => g.claim(),
+        }
+    }
+    fn complete(&self, irq: u32) {
+        match self {
+            Gic::V2(g) => g.complete(irq),
+            Gic::V3(g) => g.complete(irq),
+        }
+    }
+    fn set_priority(&self, irq: u32, priority: u8) {
+        match self {
+            Gic::V2(g) => g.set_priority(irq, priority),
+            Gic::V3(g) => g.set_priority(irq, priority),
+        }
+    }
+}
 static IRQS: IrqTable<256> = IrqTable::new();
 static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
 static TIMERS: TimerQueue = TimerQueue::new();
@@ -283,10 +348,13 @@ extern "C" fn kmain(x0: usize) -> ! {
     RATE.call_once(|| TickRate::new(aarch64::counter_frequency()));
 
     // --- Interrupt controller and timer line ------------------------------
-    let gic_node = fdt.find_compatible(&["arm,cortex-a15-gic", "arm,gic-400"]).expect("no GICv2");
+    let v3_node = fdt.find_compatible(&["arm,gic-v3"]);
+    let gic_node = v3_node.or_else(|| fdt.find_compatible(&["arm,cortex-a15-gic", "arm,gic-400"])).expect("no GIC");
+    let is_v3 = v3_node.is_some();
     let mut regs = gic_node.reg();
     let (gicd, gicd_len) =
         regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
+    // GICv2: the CPU interface; GICv3: the redistributor region.
     let (gicc, gicc_len) =
         regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
     // The virtual timer is the third `interrupts` triple: (PPI, number, flags).
@@ -294,7 +362,9 @@ extern "C" fn kmain(x0: usize) -> ! {
     let timer = fdt.find_compatible(&["arm,armv8-timer"]).expect("no timer");
     let vtimer_irq = 16 + timer.interrupts().nth(2 * 3 + 1).expect("timer has no virtual timer interrupt");
     println!(
-        "[gic]   distributor {gicd:#x}, cpu interface {gicc:#x}; virtual timer is INTID {vtimer_irq}; PSCI via {conduit:?}"
+        "[gic]   GICv{} distributor {gicd:#x}, {} {gicc:#x}; virtual timer is INTID {vtimer_irq}; PSCI via {conduit:?}",
+        if is_v3 { 3 } else { 2 },
+        if is_v3 { "redistributors" } else { "cpu interface" }
     );
 
     // --- Physical memory ---------------------------------------------------
@@ -375,9 +445,13 @@ extern "C" fn kmain(x0: usize) -> ! {
     // --- Interrupts, scheduler ---------------------------------------------
     // SAFETY: the device tree says the GIC lives here, mapped as device memory above.
     let gic = GIC.call_once(|| unsafe {
-        GicV2::new(IoMem::new(gicd as *mut u8, gicd_len as usize), IoMem::new(gicc as *mut u8, gicc_len as usize))
+        let (d, c) = (IoMem::new(gicd as *mut u8, gicd_len as usize), IoMem::new(gicc as *mut u8, gicc_len as usize));
+        if is_v3 { Gic::V3(GicV3::new(d, c, SysRegs::new())) } else { Gic::V2(GicV2::new(d, c)) }
     });
-    gic.init_distributor();
+    match gic {
+        Gic::V2(g) => g.init_distributor(),
+        Gic::V3(g) => g.init_distributor(),
+    }
     VTIMER_IRQ.store(vtimer_irq, Ordering::Relaxed);
     IRQS.register(vtimer_irq, &on_timer).expect("register failed");
     IRQS.register(IPI_SGI, &|_| {
@@ -391,7 +465,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     println!("[sched] FIFO scheduler, {} ms tick, {} lines on the GIC", TICK_NS / 1_000_000, gic.num_irqs());
 
     // --- Secondary CPUs -----------------------------------------------------
-    osmium::sched::set_remote_wake_hook(|cpu| GIC.get().expect("GIC initialised").send_sgi(1 << cpu, IPI_SGI));
+    osmium::sched::set_remote_wake_hook(|cpu| GIC.get().expect("GIC initialised").send_sgi(cpu, IPI_SGI));
     let boot_mpidr = aarch64::read_mpidr_el1() & 0xff_00ff_ffff;
     let cpus = fdt.find_node("/cpus").expect("no /cpus");
     let mpidrs = cpus
@@ -405,6 +479,10 @@ extern "C" fn kmain(x0: usize) -> ! {
             stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
             cpu: ncpus,
         }));
+        if let Gic::V3(g) = gic {
+            // SGIs are addressed by affinity, so the boot CPU maps the new CPU first.
+            g.register_cpu(ncpus, mpidr);
+        }
         // SAFETY: `secondary_start` sets up its stack from `boot`.
         let rc = unsafe { psci::cpu_on(conduit, mpidr, secondary_start as *const () as u64, boot as *const _ as u64) };
         // One CPU at a time: one that fails to start or never checks in

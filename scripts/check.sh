@@ -286,8 +286,14 @@ EXPECT=(
     '/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries'
     '\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111'
 )
+EXPECT=('\[gic\]   GICv2 distributor')
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
+# The same kernel on a GICv3 (distributor, redistributors, system-register
+# CPU interface, affinity-routed SGIs), probed from the device tree.
+EXPECT=('\[gic\]   GICv3 distributor' '\[smp\]   MPIDR 0x[0-9a-f]* online as CPU 3')
+boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
+    -machine virt,gic-version=3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
 # Arm SMMUv3 in front of the PCI bus (virt,iommu=smmuv3), with QEMU's
 # iommu-testdev: stage-2 translation of the test device's DMA, a blocked
 # unmapped address and a blocked detached device.
