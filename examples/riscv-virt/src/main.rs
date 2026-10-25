@@ -491,6 +491,7 @@ impl<B: BlockDevice> BlockDevice for Before<'_, B> {
 /// a block round trip on it, calling `before` ahead of each transfer.
 fn nvme_demo<D: DmaAllocator>(addr: pci::Address, io: IoMem, dma: &D, before: &dyn Fn()) {
     let (b, d, f) = (addr.bus, addr.device, addr.function);
+    let more = io.clone();
     match Nvme::new(io, dma, &Uptime) {
         Ok(disk) => {
             let (model, nsid) = (alloc::string::String::from(disk.model()), disk.namespace());
@@ -500,6 +501,19 @@ fn nvme_demo<D: DmaAllocator>(addr: pci::Address, io: IoMem, dma: &D, before: &d
             println!("[nvme]  {b:02x}:{d:02x}.{f} \"{model}\" namespace {nsid}: {n} blocks of {bs}; round trip {r:?}");
         }
         Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: init failed: {e:?}"),
+    }
+    // Again with several I/O queue pairs, each given a round trip of its own.
+    match Nvme::with_queues(more, dma, &Uptime, None, 4) {
+        Ok(disk) => {
+            let n = disk.io_queues();
+            let mut ok = 0;
+            for mut handle in (0..n).filter_map(|q| disk.queue(q)) {
+                before();
+                ok += demos::block_roundtrip(&mut handle).is_ok() as usize;
+            }
+            println!("[nvme]  {b:02x}:{d:02x}.{f} {n} I/O queues; round trip on each: {ok} ok");
+        }
+        Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: multi-queue init failed: {e:?}"),
     }
 }
 

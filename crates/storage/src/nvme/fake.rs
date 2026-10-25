@@ -21,10 +21,13 @@ use std::vec::Vec;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::timer::Clock;
 
-use super::{ACQ, AQA, ASQ, CAP, CC, CSTS, DOORBELLS, IrqSignal, PAGE, VS, op};
+use super::{ACQ, AQA, ASQ, CAP, CC, CSTS, DOORBELLS, IrqSignal, MAX_IO_QUEUES, PAGE, VS, op};
 
 /// Bytes of register window.
 pub const REGS_LEN: usize = 0x2000;
+
+/// Queue pair slots, the admin queue's included.
+const QUEUES: usize = MAX_IO_QUEUES + 1;
 
 pub const MODEL: &str = "QEMU NVMe Ctrl";
 pub const SERIAL: &str = "osmium0";
@@ -37,6 +40,7 @@ pub const INVALID_NAMESPACE: u16 = 0x00b;
 pub const LBA_OUT_OF_RANGE: u16 = 0x080;
 pub const UNRECOVERED_READ: u16 = 0x281;
 pub const INVALID_QUEUE: u16 = 0x101;
+pub const INVALID_FIELD: u16 = 0x002;
 
 /// A namespace: a RAM disk of `data.len() >> lbads` blocks.
 pub struct Ns {
@@ -87,6 +91,13 @@ pub struct Config {
     pub status_flags: bool,
     /// Posts the completions found in one doorbell scan in reverse order.
     pub reorder: bool,
+    /// I/O queue pairs the controller grants at most (it grants fewer if
+    /// fewer are asked for).
+    pub max_queues: u16,
+    /// Fails Set Features, as some controllers do.
+    pub reject_features: bool,
+    /// Fails creating I/O queues with identifiers past this one.
+    pub fail_queue_after: u16,
     pub namespaces: Vec<Ns>,
 }
 
@@ -112,6 +123,9 @@ impl Default for Config {
             io_delay_ns: 0,
             status_flags: false,
             reorder: false,
+            max_queues: MAX_IO_QUEUES as u16,
+            reject_features: false,
+            fail_queue_after: u16::MAX,
             namespaces: vec![Ns::new(1, 9, 1024)],
         }
     }
@@ -178,6 +192,8 @@ pub struct Fake {
     pub max_inflight: AtomicU32,
     /// Dword 11 of the last Create I/O Completion Queue.
     pub cq_flags: AtomicU32,
+    /// Queue pairs the last Set Features asked for.
+    pub queues_asked: AtomicU32,
 }
 
 // The driver's buffers are identity-mapped host memory.
@@ -260,6 +276,7 @@ impl Fake {
             signal: IrqSignal::new(),
             max_inflight: AtomicU32::new(0),
             cq_flags: AtomicU32::new(0),
+            queues_asked: AtomicU32::new(0),
         }
     }
 
@@ -302,18 +319,23 @@ impl Fake {
         self.stop.store(true, Ordering::Release);
     }
 
+    /// The I/O commands that ran on queue `qid`.
+    pub fn queue_commands(&self, qid: u16) -> Vec<Cmd> {
+        self.commands().into_iter().filter(|c| c.qid == qid).collect()
+    }
+
     pub fn commands(&self) -> Vec<Cmd> {
         self.log.lock().unwrap().clone()
     }
 
     pub fn io_commands(&self) -> Vec<Cmd> {
-        self.commands().into_iter().filter(|c| c.qid == 1).collect()
+        self.commands().into_iter().filter(|c| c.qid != 0).collect()
     }
 
     /// Plays the controller until [`stop`](Self::stop).
     pub fn serve(&self) {
-        let mut sqs: [Option<Sq>; 2] = [None; 2];
-        let mut cqs: [Option<Cq>; 2] = [None; 2];
+        let mut sqs: [Option<Sq>; QUEUES] = [None; QUEUES];
+        let mut cqs: [Option<Cq>; QUEUES] = [None; QUEUES];
         let mut enabled = false;
         let mut ready_at = self.cfg.enabling.then(|| self.now_ns() + 20_000_000);
         while !self.stop.load(Ordering::Acquire) {
@@ -333,8 +355,8 @@ impl Fake {
                     self.disables.fetch_add(1, Ordering::Relaxed);
                 }
                 enabled = false;
-                sqs = [None; 2];
-                cqs = [None; 2];
+                sqs = [None; QUEUES];
+                cqs = [None; QUEUES];
                 self.set_reg(CSTS, 0);
             } else if !enabled && self.reg(CSTS) == 0 {
                 if self.cfg.fatal {
@@ -359,11 +381,11 @@ impl Fake {
                 self.set_reg(CSTS, self.reg(CSTS) | 0x8);
             }
             let mut busy = false;
-            for qid in 0..2u16 {
+            for qid in 0..QUEUES as u16 {
                 let Some(mut sq) = sqs[qid as usize] else { continue };
                 let tail = self.doorbell(qid, false);
                 assert!(tail < sq.size, "SQ {qid} tail {tail} within {}", sq.size);
-                if qid == 1 {
+                if qid != 0 {
                     let waiting = (tail + sq.size - sq.head) % sq.size;
                     self.max_inflight.fetch_max(waiting as u32, Ordering::Relaxed);
                 }
@@ -377,7 +399,7 @@ impl Fake {
                         self.admin(&sqe, &mut sqs, &mut cqs)
                     } else {
                         if self.cfg.ignore_io || self.cfg.fatal_io {
-                            self.record(1, &sqe, 0);
+                            self.record(qid, &sqe, 0);
                             if self.cfg.fatal_io {
                                 self.set_reg(CSTS, self.reg(CSTS) | 2);
                             } else if !self.hour_passed.swap(true, Ordering::AcqRel) {
@@ -390,14 +412,14 @@ impl Fake {
                         if self.cfg.io_delay_ns != 0 {
                             self.take_time(self.cfg.io_delay_ns);
                         }
-                        self.nvm(&sqe)
+                        self.nvm(qid, &sqe)
                     };
                     let cid = (sqe[0] >> 16) as u16;
                     let Some(cq) = cqs[sq.cqid as usize].as_mut() else { continue };
-                    if qid == 1 && self.cfg.stray {
+                    if qid != 0 && self.cfg.stray {
                         self.post(cq, sq.cqid, cid ^ 0x8000, qid, sq.head, 0, 0);
                     }
-                    if qid == 1 && self.cfg.reorder {
+                    if qid != 0 && self.cfg.reorder {
                         deferred.push((sq.cqid, cid, sq.head, result, status));
                         continue;
                     }
@@ -465,7 +487,7 @@ impl Fake {
         }
     }
 
-    fn admin(&self, sqe: &[u32; 16], sqs: &mut [Option<Sq>; 2], cqs: &mut [Option<Cq>; 2]) -> (u32, u16) {
+    fn admin(&self, sqe: &[u32; 16], sqs: &mut [Option<Sq>; QUEUES], cqs: &mut [Option<Cq>; QUEUES]) -> (u32, u16) {
         self.record(0, sqe, 0);
         let (prp1, _) = Self::prps(sqe);
         let qid = sqe[10] as u16;
@@ -518,52 +540,67 @@ impl Fake {
                 (0, 0)
             }
             op::SET_FEATURES => {
-                assert_eq!((sqe[10], sqe[11]), (0x07, 0), "one queue pair");
-                (0, 0)
+                assert_eq!(sqe[10], 0x07, "Number of Queues");
+                assert_eq!(sqe[11] & 0xffff, sqe[11] >> 16, "equal submission and completion counts");
+                self.queues_asked.store(sqe[11] as u16 as u32 + 1, Ordering::Relaxed);
+                if self.cfg.reject_features {
+                    return (0, INVALID_FIELD);
+                }
+                // Zero-based, as asked for or fewer; the grant is a property of the controller.
+                let granted = (sqe[11] as u16).min(self.cfg.max_queues.saturating_sub(1)) as u32;
+                (granted | granted << 16, 0)
             }
             op::CREATE_CQ => {
-                assert_eq!(qid, 1);
+                assert!((1..=self.cfg.max_queues).contains(&qid), "queue {qid} within what was granted");
+                if qid > self.cfg.fail_queue_after {
+                    return (0, INVALID_FIELD);
+                }
                 assert!(sqe[11] & 0xffff == 1 || sqe[11] & 0xffff == 3, "contiguous, interrupts on or off");
                 self.cq_flags.store(sqe[11], Ordering::Relaxed);
                 assert!(size >= 2 && size <= self.cfg.mqes + 1, "CQ size {size}");
                 assert_eq!(prp1 % PAGE as u64, 0);
-                cqs[1] = Some(Cq { base: prp1, size, tail: 0, phase: true, ien: sqe[11] & 2 != 0 });
+                cqs[qid as usize] = Some(Cq { base: prp1, size, tail: 0, phase: true, ien: sqe[11] & 2 != 0 });
                 (0, 0)
             }
             op::CREATE_SQ => {
-                assert_eq!((qid, sqe[11]), (1, 1 << 16 | 1), "qid 1 on CQ 1, contiguous");
+                assert!((1..=self.cfg.max_queues).contains(&qid), "queue {qid} within what was granted");
+                assert_eq!(sqe[11], (qid as u32) << 16 | 1, "on the CQ with the same identifier, contiguous");
                 assert!(size >= 2 && size <= self.cfg.mqes + 1, "SQ size {size}");
                 assert_eq!(prp1 % PAGE as u64, 0);
-                if cqs[1].is_none() {
+                if qid > self.cfg.fail_queue_after || cqs[qid as usize].is_none() {
                     return (0, INVALID_QUEUE);
                 }
-                sqs[1] = Some(Sq { base: prp1, size, head: 0, cqid: 1 });
+                sqs[qid as usize] = Some(Sq { base: prp1, size, head: 0, cqid: qid });
                 (0, 0)
             }
             op::DELETE_SQ => {
-                assert_eq!(qid, 1);
-                sqs[1] = None;
+                if sqs.get(qid as usize).is_none_or(Option::is_none) {
+                    return (0, INVALID_QUEUE);
+                }
+                sqs[qid as usize] = None;
                 (0, 0)
             }
             op::DELETE_CQ => {
-                assert_eq!(qid, 1);
-                assert!(sqs[1].is_none(), "the SQ goes first");
-                cqs[1] = None;
+                if cqs.get(qid as usize).is_none_or(Option::is_none) {
+                    return (0, INVALID_QUEUE);
+                }
+                assert!(sqs[qid as usize].is_none(), "the SQ goes first");
+                cqs[qid as usize] = None;
                 (0, 0)
             }
             _ => (0, INVALID_OPCODE),
         }
     }
 
-    fn nvm(&self, sqe: &[u32; 16]) -> (u32, u16) {
+    fn nvm(&self, qid: u16, sqe: &[u32; 16]) -> (u32, u16) {
         let opcode = sqe[0] as u8;
         let mut nss = self.namespaces.lock().unwrap();
         let Some(ns) = nss.iter_mut().find(|n| n.nsid == sqe[1]) else {
-            self.record(1, sqe, 0);
+            self.record(qid, sqe, 0);
             return (0, INVALID_NAMESPACE);
         };
         if opcode == op::FLUSH {
-            self.record(1, sqe, 0);
+            self.record(qid, sqe, 0);
             return (0, if self.cfg.reject_flush { INTERNAL_ERROR } else { 0 });
         }
         let lba = sqe[10] as u64 | (sqe[11] as u64) << 32;
@@ -571,7 +608,7 @@ impl Fake {
         let len = (blocks as usize) << ns.lbads;
         let (prp1, prp2) = Self::prps(sqe);
         let (segs, list) = prp_segments(prp1, prp2, len);
-        self.record(1, sqe, list);
+        self.record(qid, sqe, list);
         if self.cfg.mdts != 0 {
             assert!(len <= PAGE << self.cfg.mdts, "{len} bytes exceeds MDTS");
         }

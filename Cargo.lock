@@ -180,6 +180,8 @@ dependencies = [
  "osmium-arch",
  "osmium-drivers",
  "osmium-hal",
+ "osmium-mm",
+ "osmium-sync",
 ]
 
 [[package]]
