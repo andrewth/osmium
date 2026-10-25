@@ -272,10 +272,11 @@ pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
 
 /// Logs in to the iSCSI target QEMU's user network forwards to
 /// `10.0.2.100:3260` (`scripts/iscsi-target.py`), after a DHCP lease on
-/// `dev`, and round-trips a block on its LUN 0.
+/// `dev`, lists its logical units (REPORT LUNS), and round-trips a block on
+/// LUN 0.
 pub fn iscsi(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     use osmium::hal::block::BlockDevice;
-    use osmium::iscsi::{IscsiDisk, Options, Stack};
+    use osmium::iscsi::{IscsiSession, Options, Stack};
     use osmium::net::{DhcpClient, Instant, Interface, Ipv4Addr, SocketAddrV4, SocketSet};
 
     const PORTAL: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 100), 3260);
@@ -296,10 +297,18 @@ pub fn iscsi(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     // The target is local and answers in milliseconds; where nothing forwards
     // the port (a guest of riscv-hyp), give up quickly.
     opts.timeout = core::time::Duration::from_secs(3);
-    let mut disk = match IscsiDisk::connect(net, PORTAL, &opts) {
-        Ok(disk) => disk,
+    let session = match IscsiSession::connect(net, PORTAL, &opts) {
+        Ok(session) => session,
         Err(e) => {
             println!("[iscsi] login to {PORTAL} failed: {e:?}");
+            return;
+        }
+    };
+    println!("[iscsi] REPORT LUNS: {:?} over {} connection(s)", session.luns(), session.connections());
+    let mut disk = match session.disk(0) {
+        Ok(disk) => disk,
+        Err(e) => {
+            println!("[iscsi] LUN 0 failed: {e:?}");
             return;
         }
     };

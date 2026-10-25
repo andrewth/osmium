@@ -193,6 +193,7 @@ EXPECT=(
     'OHCI interrupts: [1-9]'
     '\[ahci\]  port 0 "QEMU HARDDISK": 16384 sectors of 512; round trip Ok(8192)'
     '\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192)'
+    '\[iscsi\] REPORT LUNS: \[0\] over 1 connection'
     '\[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512'
     '\[iscsi\] wrote and read back block 8192'
     '\[virtio-gpu\] 640x400 32bpp, stride 2560: colour bars drawn'
@@ -437,6 +438,7 @@ if command -v qemu-system-riscv64 >/dev/null; then
         '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
         '| \[net\]   DHCP: 10.0.2.15/24 via 10.0.2.2' '| \[net\]   ping 10.0.2.2: seq 1 in' \
         '| \[net\]   TCP echo from 10.0.2.100:7: "hello over TCP"' \
+        '| \[iscsi\] REPORT LUNS: \[0\] over 1 connection' \
         '| \[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512' \
         '| \[iscsi\] wrote and read back block 8192' \
         '| \[blk\]   virtio-blk (1.x) at 0x10001000: 8192 sectors; wrote and read back sector 4096' \
