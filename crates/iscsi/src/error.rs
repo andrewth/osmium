@@ -19,8 +19,9 @@ pub enum IscsiError {
     /// is dropped.
     Protocol(&'static str),
     /// The target refused the login (RFC 7143 §11.13.5). Class 1 is a
-    /// redirection, which is not followed; 2 an initiator error (detail 3:
-    /// no such target), 3 a target error.
+    /// redirection, which is followed unless it names no usable address or
+    /// the target keeps moving us; 2 an initiator error (detail 3: no such
+    /// target), 3 a target error.
     Login {
         /// Status-Class.
         class: u8,
@@ -46,6 +47,8 @@ pub enum IscsiError {
     Digest,
     /// The session has logged out or failed.
     NoSession,
+    /// The session is in use (borrowed) by another operation.
+    Busy,
 }
 
 impl IscsiError {
@@ -75,6 +78,7 @@ impl fmt::Display for IscsiError {
             IscsiError::Scsi { status, sense: None } => write!(f, "SCSI status {status:#04x}"),
             IscsiError::Digest => f.write_str("iSCSI digest mismatch"),
             IscsiError::NoSession => f.write_str("no iSCSI session"),
+            IscsiError::Busy => f.write_str("iSCSI session in use"),
         }
     }
 }

@@ -218,6 +218,7 @@ EXPECT=(
     '\[ahci\]  port 0 "QEMU HARDDISK": 16384 sectors of 512; round trip Ok(8192)'
     '\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192)'
     '\[nvme\]  .* 4 I/O queues; round trip on each: 4 ok'
+    '\[iscsi\] REPORT LUNS: \[0\] over 1 connection'
     '\[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512'
     '\[iscsi\] wrote and read back block 8192'
     '\[virtio-gpu\] 640x400 32bpp, stride 2560: colour bars drawn'
@@ -526,6 +527,7 @@ if command -v qemu-system-riscv64 >/dev/null; then
         '| \[net\]   IPv6 fragmentation: 4000 bytes sent in [0-9]* fragments and reassembled' \
         '| \[net\]   IPv6 privacy: stable opaque address 2001:db8:1:2:' \
         '| \[net\]   DHCPv6: leased 2001:db8:1:2::1234, DNS 2001:db8::53' \
+        '| \[iscsi\] REPORT LUNS: \[0\] over 1 connection' \
         '| \[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512' \
         '| \[iscsi\] wrote and read back block 8192' \
         '| \[blk\]   virtio-blk (1.x) at 0x10001000: 8192 sectors; wrote and read back sector 4096' \
