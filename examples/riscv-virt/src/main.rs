@@ -30,6 +30,7 @@ use osmium::usb::ohci::Ohci;
 use osmium::sysdrv::plic::Plic;
 use osmium::sysdrv::uart16550::{Mmio, Uart16550};
 use osmium::storage::virtio_blk::VirtioBlk;
+use osmium::drivers::virtio::console::VirtioConsole;
 use osmium::drivers::virtio::mmio::MmioTransport;
 use osmium::netdev::virtio_net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
@@ -727,6 +728,36 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             }
         }
         None => println!("[blk]   no virtio-blk device"),
+    }
+
+    // --- virtio-console ------------------------------------------------------
+    let vcon = virtio_slots(&fdt).find_map(|(base, len)| {
+        // SAFETY: the device tree puts a virtio-mmio slot here, mapped above;
+        // nothing else uses it (earlier probes' transports were dropped).
+        let t = MmioTransport::new(unsafe { IoMem::new(base as *mut u8, len as usize) }).ok()?;
+        (t.device_type() == DeviceType::Console).then_some((base, t))
+    });
+    match vcon {
+        Some((base, t)) => {
+            let legacy = if t.is_legacy() { "legacy" } else { "1.x" };
+            let mut con = VirtioConsole::new(t, &FRAMES).expect("virtio-console init failed");
+            // With multiport the device announces its ports through the control queue.
+            for _ in 0..50_000_000u32 {
+                con.poll();
+                if con.port_present(0) {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            let msg = b"hello from osmium over virtio-console\n";
+            match con.write(0, msg) {
+                Ok(()) => {
+                    println!("[vcon]  virtio-console ({legacy}) at {base:#x}: wrote {} bytes to port 0", msg.len())
+                }
+                Err(e) => println!("[vcon]  virtio-console ({legacy}) at {base:#x}: write failed: {e:?}"),
+            }
+        }
+        None => println!("[vcon]  no virtio-console device"),
     }
 
     // --- IOMMU behind PCIe ------------------------------------------------------

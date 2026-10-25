@@ -129,6 +129,7 @@ vdisk=$(mktemp)
 sata=$(mktemp)
 nvdisk=$(mktemp)
 iscsi=$(mktemp)
+vcon=$(mktemp)
 truncate -s 8M "$vdisk" "$sata" "$nvdisk" "$iscsi"
 truncate -s 40000K "$stick" "$stick_ehci" "$stick_ohci"
 tftp=$(mktemp -d)
@@ -207,6 +208,7 @@ EXPECT=(
     'net: socketpair: epoll idle 0, ready 1 with data 42; sendmsg 9, recvmsg 9: "ping-pong"'
     'net: UDP loopback: bind 0, sent 5, peeked 5 then read 5 from 127.0.0.1:[0-9]*: "local"'
     '\[sock\]  net exited'
+    '\[vcon\]  virtio-console ([a-z0-9.]*) at 0x[0-9a-f]*: wrote 38 bytes to port 0'
     ${fat_expect[@]+"${fat_expect[@]}"}
 )
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
@@ -220,8 +222,10 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,bus=xhci.0,drive=stick \
     -device ahci,id=ahci0 -drive if=none,id=sd0,format=raw,file="$sata" -device ide-hd,drive=sd0,bus=ahci0.0 \
     -drive if=none,id=nv0,format=raw,file="$nvdisk" -device nvme,serial=osmium0,drive=nv0 \
-    -device virtio-gpu-device -device virtio-gpu-pci,id=gpu -device bochs-display -qmp "unix:$qmp,server=on,wait=off"
+    -device virtio-gpu-device -device virtio-gpu-pci,id=gpu -device bochs-display -qmp "unix:$qmp,server=on,wait=off" \
+    -chardev file,id=vc0,path="$vcon" -device virtio-serial-device -device virtconsole,chardev=vc0
 screen_wait riscv-virt
+grep -aq "hello from osmium over virtio-console" "$vcon" || { echo "riscv-virt: virtio-console output did not reach the host"; exit 1; }
 if [ "${#fat_expect[@]}" -gt 0 ] && command -v qemu-system-riscv64 >/dev/null; then
     echo "== fsck.fat the USB stick the kernel wrote"
     report=$(PATH=$PATH:/usr/sbin fsck.fat -n -l "$stick") || { echo "$report"; echo "riscv-virt: fsck.fat rejected the USB stick"; exit 1; }
@@ -231,7 +235,7 @@ if [ "${#fat_expect[@]}" -gt 0 ] && command -v qemu-system-riscv64 >/dev/null; t
         grep -q "/OSMIUM/Hello from osmium.txt" <<<"$report" || { echo "$report"; echo "riscv-virt: file missing on a stick behind EHCI or OHCI"; exit 1; }
     done
 fi
-rm -f "$stick" "$stick_ehci" "$stick_ohci" "$vdisk" "$sata" "$nvdisk" "$iscsi"
+rm -f "$stick" "$stick_ehci" "$stick_ohci" "$vdisk" "$sata" "$nvdisk" "$iscsi" "$vcon"
 rm -rf "$tftp"
 # RISC-V IOMMU: QEMU's riscv-iommu-pci translates the DMA of every PCI device
 # on the bus, so this boot carries only an NVMe disk and QEMU's iommu-testdev.

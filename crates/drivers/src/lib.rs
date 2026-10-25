@@ -2,7 +2,7 @@
 //! implementations ([`virtio::mmio`], [`virtio::pci`]) and the split virtqueue ([`virtio::queue`]).
 //!
 //! The device drivers themselves live in `osmium-storage` (virtio-blk), `osmium-netdev` (virtio-net)
-//! and `osmium-display` (virtio-gpu).
+//! and `osmium-display` (virtio-gpu); the virtio console is here, in [`virtio::console`].
 #![no_std]
 
 #[cfg(any(test, feature = "testing"))]

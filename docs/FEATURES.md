@@ -154,10 +154,11 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ virtio-mmio transport (legacy and 1.x), split virtqueue
 - ✅ IP over InfiniBand (`Mlx4::open_ipoib` → `IpoibPort`, a `NetDevice`): joins the broadcast group with the subnet administrator (retried with backoff), adopts the group's queue key, rewrites ARP and frames between Ethernet and IPoIB with invented MACs for neighbors; every unicast datagram uses the broadcast group's service level (no path record queries); simulator-tested only
 - ✅ virtio-pci transport (modern, capability-located registers); tested against a fake function and on QEMU `virtio-gpu-pci`/`virtio-vga`
-- 🗺 virtio console; virtio-gpu cursor, EDID and interrupts; xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3; HPET; NVMe multiple I/O queues
+- 🗺 virtio-console emergency write and per-port names; virtio-gpu cursor, EDID and interrupts; xHCI streams and SuperSpeed burst sizes from companion descriptors; HID report descriptors; GICv3; HPET; NVMe multiple I/O queues
 
 ### `osmium-display`: display drivers
 - ✅ virtio-gpu 2D as a `Display` (display info, resource create, attach backing, set scanout, transfer and flush), over MMIO or PCI; `virtio-vga` is a VGA (Bochs DISPI) until it takes over; checked by QEMU screendumps
+- ✅ virtio-console (`VirtioConsole`), MMIO or PCI transport, legacy or 1.x: a single port, or multiport with the control queues (`DEVICE_ADD`/`REMOVE`, `PORT_READY`/`PORT_OPEN`, console resize) for up to 4 ports; non-blocking reads and synchronous writes per port, port 0 as a `SerialPort` (so `SerialConsole` makes it the global console); tested against a simulated device, and on QEMU `virtio-serial-device` with `virtconsole` (riscv-virt writes a line the host reads from a chardev file); the PCI transport is shared with virtio-gpu but not booted with a console
 - ✅ Bochs DISPI display (`BochsVbe`): QEMU std VGA, `bochs-display` and `virtio-vga` modes over MMIO on any architecture or ports on x86
 - ✅ VESA BIOS Extensions: controller and mode information, mode search and LFB mode setting through a `VideoBios` (x86's real-mode thunk, or a fake in tests)
 
