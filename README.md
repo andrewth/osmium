@@ -145,8 +145,8 @@ features.
   details were written from the Linux driver, not a datasheet.
 - `osmium-net` sockets now take `SocketAddr`; a socket serves one address
   family, and there is no IPv6 fragmentation or path-MTU discovery.
-  Isochronous transfers are limited to 4 KiB per service interval, SuperSpeed
-  burst sizes from companion descriptors are ignored, and a SuperSpeed hub
+  Isochronous transfers are limited to 4 KiB per service interval, xHCI
+  streams have no secondary arrays (at most 7 streams on each of 4 endpoints), and a SuperSpeed hub
   port needing a warm reset is not recovered.
 - UHCI, OHCI and EHCI have no isochronous endpoints, and EHCI supports no
   hubs.

@@ -579,7 +579,9 @@ pub fn usb_uas<H, G>(
                         sense[6]
                     );
                 }
-                (a, b) => println!("[usb]     uas: stream {tag}: data {a:?}, status {b:?} (sense IU {:02x?})", &sense[..8]),
+                (a, b) => {
+                    println!("[usb]     uas: stream {tag}: data {a:?}, status {b:?} (sense IU {:02x?})", &sense[..8])
+                }
             }
         }
     }
