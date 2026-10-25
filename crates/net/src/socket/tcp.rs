@@ -1345,6 +1345,45 @@ impl TcpSocket {
         }
     }
 
+    /// Returns true if this connection is `local` to `remote` and has sent
+    /// the sequence number `seq` without it being acknowledged: the test
+    /// that an ICMP error quoting `seq` is about this connection and not a
+    /// guess (RFC 5927).
+    pub(crate) fn has_in_flight(&self, local: SocketAddr, remote: SocketAddr, seq: u32) -> bool {
+        self.local == local && self.remote == remote && before_eq(self.snd_una, seq) && before(seq, self.snd_max)
+    }
+
+    /// A router reported that the path to `dst` carries `mtu` at most. A
+    /// connection to `dst` shrinks its segments to fit and, since the
+    /// larger ones in flight were dropped, sends again from the first
+    /// unacknowledged byte now rather than after a timeout. That is no
+    /// congestion signal (RFC 1191 6.5), so the window is left alone.
+    pub(crate) fn path_mtu_reduced(&mut self, dst: IpAddr, mtu: usize) {
+        let synchronized = matches!(
+            self.state,
+            State::Established | State::FinWait1 | State::FinWait2 | State::CloseWait | State::Closing | State::LastAck
+        );
+        if !synchronized || self.remote.ip() != dst {
+            return;
+        }
+        let ip_header = if dst.is_ipv6() { crate::ipv6::IPV6_HEADER_LEN } else { crate::wire::IPV4_HEADER_LEN };
+        let options = if self.ts_ok { TS_OPTION_LEN } else { 0 };
+        let limit = mtu.saturating_sub(ip_header + crate::wire::TCP_HEADER_LEN + options).max(1);
+        if self.snd_mss <= limit {
+            return;
+        }
+        self.snd_mss = limit;
+        if self.snd_una != self.snd_max {
+            self.snd_nxt = self.snd_una;
+            self.timer = None;
+            self.rtt_sample = None;
+            self.in_recovery = false;
+            self.rexmit_one = None;
+            self.scoreboard.clear();
+            self.dup_acks = 0;
+        }
+    }
+
     fn segment(&self, flags: u8) -> TcpHeader {
         self.segment_at(self.snd_nxt, flags)
     }
@@ -1785,6 +1824,7 @@ mod tests {
             mac: Default::default(),
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng: &mut rng,
@@ -1814,6 +1854,7 @@ mod tests {
             mac: Default::default(),
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng,
@@ -1833,6 +1874,7 @@ mod tests {
             mac: Default::default(),
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng: &mut rng,
@@ -1858,6 +1900,7 @@ mod tests {
                 mac: Default::default(),
                 mss: 1460,
                 mss6: 1440,
+                pmtu: None,
                 addr6: None,
                 link_local6: None,
                 rng: &mut rng,
@@ -1876,6 +1919,7 @@ mod tests {
             mac: Default::default(),
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng,
@@ -2040,6 +2084,7 @@ mod tests {
             mac: Default::default(),
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng: &mut rng,
@@ -2061,6 +2106,7 @@ mod tests {
             mac: Default::default(),
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng: &mut rng,
@@ -2391,6 +2437,7 @@ mod tests {
             mac: Default::default(),
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng: &mut rng,
@@ -2409,6 +2456,7 @@ mod tests {
             mac: Default::default(),
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng: &mut rng,
@@ -2541,6 +2589,7 @@ mod tests {
                 mac: Default::default(),
                 mss: 1460,
                 mss6: 1440,
+                pmtu: None,
                 addr6: None,
                 link_local6: None,
                 rng: &mut rng,

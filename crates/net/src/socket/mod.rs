@@ -34,6 +34,8 @@ pub(crate) struct Cx<'cx> {
     pub(crate) mss: u16,
     /// The same over IPv6.
     pub(crate) mss6: u16,
+    /// What the path MTU cache has learned, if the caller keeps one.
+    pub(crate) pmtu: Option<&'cx crate::pmtu::PathMtuCache>,
     pub(crate) rng: &'cx mut Rng,
 }
 
@@ -49,9 +51,16 @@ impl Cx<'_> {
         }
     }
 
-    /// The TCP maximum segment size for a connection to `remote`.
+    /// The TCP maximum segment size for a connection to `remote`: the
+    /// interface's, or less if a router has reported a smaller path MTU.
     pub(crate) fn mss_for(&self, remote: &SocketAddr) -> u16 {
-        if remote.is_ipv6() { self.mss6 } else { self.mss }
+        let link = if remote.is_ipv6() { self.mss6 } else { self.mss };
+        let overhead = if remote.is_ipv6() { crate::ipv6::IPV6_HEADER_LEN } else { crate::wire::IPV4_HEADER_LEN }
+            + crate::wire::TCP_HEADER_LEN;
+        match self.pmtu.and_then(|c| c.lookup(remote.ip(), self.now)) {
+            Some(mtu) => link.min(mtu.saturating_sub(overhead).clamp(1, usize::from(u16::MAX)) as u16),
+            None => link,
+        }
     }
 }
 
