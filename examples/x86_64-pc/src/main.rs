@@ -231,25 +231,40 @@ fn on_switch(next: &osmium::sched::Task) {
 
 /// CPUs that still owe an acknowledgement of the current shootdown.
 static SHOOT_PENDING: AtomicUsize = AtomicUsize::new(0);
-/// Page the current shootdown invalidates.
+/// First page the current shootdown invalidates, and how many pages.
 static SHOOT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SHOOT_PAGES: AtomicUsize = AtomicUsize::new(0);
 /// Held by the CPU running a shootdown.
 static SHOOT_BUSY: AtomicBool = AtomicBool::new(false);
 
-/// Invalidates this CPU's entry for the pending shootdown page, if it owes one.
+/// Invalidates this CPU's entries for the pending shootdown pages, if it owes them.
 fn shootdown_service() {
     let me = 1usize << cpu::current_id();
     if SHOOT_PENDING.load(Ordering::Acquire) & me != 0 {
-        osmium::arch::mmu::flush_page(SHOOT_ADDR.load(Ordering::Acquire));
+        let (va, pages) = (SHOOT_ADDR.load(Ordering::Acquire), SHOOT_PAGES.load(Ordering::Acquire));
+        if pages > 32 {
+            osmium::arch::mmu::flush_all();
+        } else {
+            for i in 0..pages {
+                osmium::arch::mmu::flush_page(va + i * PAGE_SIZE);
+            }
+        }
         SHOOT_PENDING.fetch_and(!me, Ordering::AcqRel);
     }
 }
 
 /// Invalidates `va` on every online CPU and returns once all have done so.
-/// Waiting CPUs keep servicing requests, so two initiators cannot deadlock
-/// even when interrupts are off.
 fn shootdown(va: usize) {
     osmium::arch::mmu::flush_page(va);
+    shootdown_others(va, 1);
+}
+
+/// Invalidates `pages` pages from `va` on every online CPU but this one, and
+/// returns once they have all done so (the hook behind
+/// `osmium::arch::mmu::flush_remote`, for user threads on several CPUs).
+/// Waiting CPUs keep servicing requests, so two initiators cannot deadlock
+/// even when interrupts are off.
+fn shootdown_others(va: usize, pages: usize) {
     let me = cpu::current_id();
     let others = ((1usize << ONLINE.load(Ordering::Acquire)) - 1) & !(1 << me);
     if others == 0 {
@@ -260,6 +275,7 @@ fn shootdown(va: usize) {
         core::hint::spin_loop();
     }
     SHOOT_ADDR.store(va, Ordering::Release);
+    SHOOT_PAGES.store(pages, Ordering::Release);
     SHOOT_PENDING.store(others, Ordering::Release);
     let apic = LAPIC.get().expect("LAPIC initialised");
     for cpu in (0..MAX_CPUS).filter(|c| others & (1 << c) != 0) {
@@ -583,6 +599,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     osmium::sched::set_remote_wake_hook(|cpu| {
         LAPIC.get().expect("LAPIC initialised").send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, IPI_VECTOR)
     });
+    osmium::arch::mmu::set_remote_flush(shootdown_others);
     // SAFETY: the trampoline page is free low memory (reserved from the
     // allocator), mapped writable above; no AP is starting yet.
     unsafe { x86::smp::install() };
@@ -1007,9 +1024,17 @@ fn platform() -> osmium::proc::Platform {
         // SAFETY: the table shares the kernel's root entry 0. Instruction
         // fetch is coherent with stores on x86, so nothing else is needed.
         activate: |root| unsafe { x86::write_cr3(root.0) },
-        // SAFETY: the child's task is running with its table active (the
-        // switch hook), and the frame is its parent's from a system call.
-        resume: |frame| unsafe { x86::resume_user(&frame) },
+        resume: |frame| {
+            // A new thread can start on another CPU before its creator has
+            // recorded its task id, so the switch hook that loaded FS.base
+            // did not know the thread pointer yet. Load it now.
+            let tls = osmium::proc::thread::tls_for(&osmium::sched::current()).unwrap_or(0);
+            // SAFETY: a base the thread itself set, checked canonical by `arch_prctl`.
+            unsafe { x86::wrmsr(x86::msr::IA32_FS_BASE, tls) };
+            // SAFETY: the child's task is running with its table active (the
+            // switch hook), and the frame is its parent's from a system call.
+            unsafe { x86::resume_user(&frame) }
+        },
         stack_top: 0xff_0000_0000,
         stack_size: 64 * 1024,
         mmap_area: 0xa0_0000_0000..0xa1_0000_0000,

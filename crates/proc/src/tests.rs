@@ -835,3 +835,4 @@ mod blocked;
 mod hostile;
 mod oom;
 mod sigthread;
+mod smp;

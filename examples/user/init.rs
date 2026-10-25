@@ -19,6 +19,8 @@ mod sys {
     pub const EXECVE: u64 = 221;
     pub const WAIT4: u64 = 260;
     pub const SCHED_YIELD: u64 = 124;
+    pub const GETCPU: u64 = 168;
+    pub const MUNMAP: u64 = 215;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
         let ret: u64;
@@ -129,6 +131,8 @@ mod sys {
     pub const EXECVE: u64 = 221;
     pub const WAIT4: u64 = 260;
     pub const SCHED_YIELD: u64 = 124;
+    pub const GETCPU: u64 = 168;
+    pub const MUNMAP: u64 = 215;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
         let ret: u64;
@@ -239,6 +243,8 @@ mod sys {
     pub const EXECVE: u64 = 59;
     pub const WAIT4: u64 = 61;
     pub const SCHED_YIELD: u64 = 24;
+    pub const GETCPU: u64 = 309;
+    pub const MUNMAP: u64 = 11;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
         let ret: u64;
@@ -499,6 +505,39 @@ extern "C" fn waiter(_: u64) -> ! {
     exit(0)
 }
 
+/// A page of its own, for the threads on other CPUs to read until one
+/// thread unmaps it.
+#[repr(align(4096))]
+struct OwnPage([u8; 4096]);
+static mut SMP_PAGE: OwnPage = OwnPage([1; 4096]);
+static SMP_READY: AtomicU32 = AtomicU32::new(0);
+static SMP_FAULTED: AtomicU32 = AtomicU32::new(0);
+/// Bit `n` is set once a thread was seen running on CPU `n`.
+static SMP_CPUS: AtomicU32 = AtomicU32::new(0);
+
+fn note_cpu() {
+    let mut cpu = 0u32;
+    sys::call(sys::GETCPU, [&mut cpu as *mut u32 as u64, 0, 0, 0, 0]);
+    SMP_CPUS.fetch_or(1 << (cpu & 31), Ordering::SeqCst);
+}
+
+/// Reads the shared page until it is unmapped under it.
+extern "C" fn page_reader(_: u64) -> ! {
+    note_cpu();
+    SMP_READY.fetch_add(1, Ordering::SeqCst);
+    loop {
+        // SAFETY: a mapped byte until the leader unmaps it; then the fault
+        // reaches `on_smp_segv`.
+        unsafe { core::ptr::read_volatile((&raw const SMP_PAGE) as *const u8) };
+    }
+}
+
+/// Counts the fault and ends this thread only.
+extern "C" fn on_smp_segv(_sig: i32, _info: *const u8, _ctx: *const u8) {
+    SMP_FAULTED.fetch_add(1, Ordering::SeqCst);
+    exit(0)
+}
+
 extern "C" fn spinner(_: u64) -> ! {
     loop {
         core::hint::spin_loop();
@@ -628,6 +667,39 @@ fn signals_and_threads() {
         "threads: exit_group ended a spinning thread, process {reaped} status {code}: {}",
         if code == 9 { "ok" } else { "FAILED" }
     );
+
+    // The threads of one process run on several CPUs at once, and unmapping
+    // a page in one of them reaches the TLBs of the others: the readers fault.
+    if sys::fork() == 0 {
+        catch(11, on_smp_segv);
+        for i in 0..3u64 {
+            // SAFETY: statics only this program uses; each thread has its own stack.
+            unsafe {
+                let top = (&raw mut WAITER_STACKS) as u64 + (i + 1) * 16384;
+                sys::clone_thread(THREAD, top, 0, 0, 0, page_reader, 0);
+            }
+        }
+        let mut spins = 0u64;
+        while SMP_READY.load(Ordering::SeqCst) < 3 && spins < 20_000_000 {
+            sys::call(sys::SCHED_YIELD, [0; 5]);
+            spins += 1;
+        }
+        note_cpu();
+        let cpus = SMP_CPUS.load(Ordering::SeqCst).count_ones();
+        sys::call(sys::MUNMAP, [(&raw const SMP_PAGE) as u64, 4096, 0, 0, 0]);
+        spins = 0;
+        while SMP_FAULTED.load(Ordering::SeqCst) < 3 && spins < 20_000_000 {
+            sys::call(sys::SCHED_YIELD, [0; 5]);
+            spins += 1;
+        }
+        let ok = SMP_READY.load(Ordering::SeqCst) == 3 && cpus >= 2 && SMP_FAULTED.load(Ordering::SeqCst) == 3;
+        say!(
+            "smp: 3 threads of process {pid} read a page on several CPUs; munmap faulted them all: {}",
+            if ok { "ok" } else { "FAILED" }
+        );
+        exit(if ok { 0 } else { 1 });
+    }
+    wait(-1);
 }
 
 /// # Safety

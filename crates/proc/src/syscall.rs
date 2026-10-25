@@ -41,6 +41,7 @@ pub enum Sys {
     Getpid,
     Getppid,
     Gettid,
+    Getcpu,
     Brk,
     Mmap,
     Munmap,
@@ -135,6 +136,7 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (80, Sys::Chdir),
     (110, Sys::Getppid),
     (186, Sys::Gettid),
+    (309, Sys::Getcpu),
     (217, Sys::Getdents64),
     (231, Sys::ExitGroup),
     (257, Sys::Openat),
@@ -213,6 +215,7 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (172, Sys::Getpid),
     (173, Sys::Getppid),
     (178, Sys::Gettid),
+    (168, Sys::Getcpu),
     (214, Sys::Brk),
     (215, Sys::Munmap),
     (222, Sys::Mmap),
@@ -369,6 +372,7 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Unlinkat => unlinkat(p, fd, a[1], a[2]),
         Sys::Getpid => Ok(p.pid().0 as u64),
         Sys::Gettid => Ok(th.tid() as u64),
+        Sys::Getcpu => getcpu(p, a[0], a[1]),
         Sys::Getppid => Ok(p.parent().map_or(0, |pid| pid.0 as u64)),
         Sys::Brk => Ok(p.brk(a[0])),
         Sys::Mmap => mmap(p, a[1], a[2], a[3], a[4] as i32),
@@ -1038,6 +1042,18 @@ fn fcntl(p: &Process, fd: i32, cmd: u64, arg: u64) -> SysResult {
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// `getcpu(&cpu, &node)`: the CPU the calling thread runs on (it may move at
+/// once) and node 0. A null pointer is skipped.
+fn getcpu(p: &Process, cpu: u64, node: u64) -> SysResult {
+    if cpu != 0 {
+        p.memory().write(cpu, &(osmium_arch::cpu::current_id() as u32).to_ne_bytes())?;
+    }
+    if node != 0 {
+        p.memory().write(node, &0u32.to_ne_bytes())?;
+    }
+    Ok(0)
 }
 
 fn uname(p: &Process, buf: u64) -> SysResult {
