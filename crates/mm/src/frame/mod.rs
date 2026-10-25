@@ -86,6 +86,70 @@ pub unsafe trait FrameAllocator {
     fn alloc_frame(&mut self) -> Option<PhysAddr> {
         self.alloc(0)
     }
+
+    /// The kind recorded for the frame at `pa`, or `None` if this allocator
+    /// does not keep per-frame metadata or does not manage the frame.
+    fn kind(&self, _pa: PhysAddr) -> Option<FrameKind> {
+        None
+    }
+
+    /// Records the kind of the frame at `pa`. Returns false if this allocator
+    /// keeps no per-frame metadata or does not manage the frame.
+    fn set_kind(&mut self, _pa: PhysAddr, _kind: FrameKind) -> bool {
+        false
+    }
+
+    /// The number of references to the frame at `pa`, or `None` if this
+    /// allocator keeps no per-frame metadata or does not manage the frame.
+    fn refs(&self, _pa: PhysAddr) -> Option<u32> {
+        None
+    }
+
+    /// Takes the first reference to the allocated frame at `pa`, moving its
+    /// count from zero to one. Returns false if the frame already has one, or
+    /// this allocator keeps no per-frame metadata or does not manage it.
+    fn claim(&self, _pa: PhysAddr) -> bool {
+        false
+    }
+
+    /// Adds a reference to a frame that has one. Returns the new count, or
+    /// `None` if the frame has none (free, or never claimed).
+    fn retain(&self, _pa: PhysAddr) -> Option<u32> {
+        None
+    }
+
+    /// Drops a reference. Returns the remaining count, or `None` if the frame
+    /// had none. The frame is not freed here: the caller frees it at zero.
+    fn release(&self, _pa: PhysAddr) -> Option<u32> {
+        None
+    }
+}
+
+/// What a frame is used for, as recorded in the allocator's per-frame metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameKind {
+    /// On a free list.
+    Free = 0,
+    /// Allocated, and not yet given a use.
+    Allocated = 1,
+    /// A page-table page.
+    Table = 2,
+    /// A user page, which address spaces map and reference.
+    User = 3,
+}
+
+impl FrameKind {
+    /// Decodes a stored kind byte; `None` for a byte no kind was stored as.
+    pub(crate) const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Free),
+            1 => Some(Self::Allocated),
+            2 => Some(Self::Table),
+            3 => Some(Self::User),
+            _ => None,
+        }
+    }
 }
 
 /// The smallest order whose block holds `bytes`.
