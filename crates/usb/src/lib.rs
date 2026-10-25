@@ -8,6 +8,7 @@
 //! | [`uhci::Uhci`] | UHCI USB 1.1 host controller (I/O ports or MMIO; polled) | `UsbHost` |
 //! | [`class::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
 //! | [`class::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
+//! | [`class::hid::HidKeyboard`], [`class::hid::HidMouse`] | USB keyboards and pointers driven by their HID report descriptors | key and pointer events |
 //!
 //! Every controller is constructed from an [`osmium_hal::mmio::IoMem`] (or a
 //! port base), so it works the same under any memory map and can be tested
