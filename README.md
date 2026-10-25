@@ -35,7 +35,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-display` | virtio-gpu (also as virtio-vga), Bochs DISPI (QEMU std VGA, bochs-display) and VESA BIOS (VBE) mode setting | no |
 | `osmium-sysdrv` | NS16550A, PL011, i8254 PIT, QEMU `fw_cfg` (ports or MMIO, DMA), RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers | no |
 | `osmium-storage` | RAM disk, virtio-blk (MMIO, legacy and 1.x), AHCI (SATA) and NVMe disks | no |
-| `osmium-usb` | xHCI USB host controller (interrupt-driven), UHCI, OHCI and EHCI (polled), hubs, isochronous endpoints, USB mass storage and HID boot keyboards | no |
+| `osmium-usb` | xHCI USB host controller (interrupt-driven), UHCI, OHCI and EHCI (polled or interrupt-driven), hubs, isochronous endpoints, USB mass storage and HID boot keyboards | no |
 | `osmium-netdev` | virtio-net (MMIO or PCI, legacy and 1.x), Mellanox ConnectX-3 (mlx4) Ethernet (polled or MSI-X, checksum and segmentation offload; no RSS or steering) and InfiniBand (subnet management, unreliable datagrams, multicast, reliable connections with RDMA, IPoIB; no SR-IOV; both simulator-tested only), USB CDC-ECM and CDC-NCM Ethernet (NCM simulator-tested only) | no |
 | `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG/DMAR/IVRS reader, ELF64 loader, PE32+ loader and relocator, UEFI system table and GOP | writer only |
 | `osmium-acpi` | ACPI: FADT, an AML interpreter (namespace, control methods, operation regions and fields), `_CRS` resource decoding, `_PRT` PCI interrupt routing, sleep states and power off, reset, SCI fixed events and GPEs | yes |
@@ -148,8 +148,8 @@ features.
   Isochronous transfers are limited to 4 KiB per service interval, SuperSpeed
   burst sizes from companion descriptors are ignored, and a SuperSpeed hub
   port needing a warm reset is not recovered.
-- UHCI, OHCI and EHCI are polled only, without isochronous endpoints, and
-  EHCI supports no hubs.
+- UHCI, OHCI and EHCI have no isochronous endpoints, and EHCI supports no
+  hubs.
 
 ## License
 
