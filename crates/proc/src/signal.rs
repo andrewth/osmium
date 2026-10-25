@@ -1,7 +1,9 @@
 //! POSIX signals: dispositions, masks, pending sets, and delivery to a user
 //! handler on a signal frame.
 //!
-//! Signals do not queue: each signal number is pending or not. Process-wide
+//! Standard signals do not queue: each signal number is pending or not.
+//! Real-time signals (32 and up) and `rt_sigqueueinfo` queue with their
+//! `siginfo` (see [`crate::sigqueue`]). Process-wide
 //! state (dispositions, the process-directed pending set) lives in
 //! `Signals`; each thread has a mask and a pending set of its own
 //! ([`crate::thread::Thread`]). Delivery happens when a thread returns to
@@ -9,16 +11,19 @@
 //! `syscall::handle`) or a kernel's own call to it runs.
 //!
 //! The signal frame is Osmium's own layout, not Linux's `ucontext`: 128 bytes
-//! of `siginfo` (`si_signo`, `si_code`, and `si_pid` or `si_addr` where
-//! Linux has them), then the saved signal mask, then the saved user
+//! of `siginfo` (`si_signo`, `si_code`, `si_pid` or `si_addr`, and at offset
+//! 24 `si_value` of a queued signal, where Linux has them), then the saved signal mask, then the saved user
 //! registers. Handlers get `(signo, &siginfo, &frame_tail)` in the first three
 //! argument registers, and return through a trampoline that calls
 //! `rt_sigreturn`: the one the caller names with `SA_RESTORER` (x86_64), or a
 //! page the kernel maps in the process's `mmap` area.
 //!
-//! Not implemented: queued real-time signals, `sigaltstack`, `sigsuspend`,
-//! stopping and continuing (stop signals are ignored), a credential model for
-//! `kill` (see its documentation), and restarting
+//! `sigaltstack` and `SA_ONSTACK`, `rt_sigsuspend`, and stopping and
+//! continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT`, reported by `wait4`; see
+//! [`crate::jobctl`]) are implemented.
+//!
+//! Not implemented: a credential model for `kill` (see its documentation),
+//! `sigtimedwait`/`sigwaitinfo`, and restarting
 //! interrupted system calls (`SA_RESTART`): a blocked call (`futex`, `poll`,
 //! `select`, `epoll_wait`, pipe and socket reads and writes, `accept`,
 //! `connect`, `wait4`) fails with `EINTR` when a signal it would act on
@@ -37,6 +42,7 @@ use osmium_sync::IrqSpinLock;
 
 use crate::bytes::{put, slice};
 use crate::process::{ExitStatus, Pid, Process};
+use crate::sigqueue::{Info, SIGRTMIN, code};
 use crate::thread::Thread;
 use crate::uregs::{NREGS, UserRegs};
 
@@ -94,7 +100,7 @@ const SI_KERNEL: i32 = 0x80;
 const SEGV_MAPERR: i32 = 1;
 
 /// The mask bit of signal `sig`; 0 for a number outside `1..=NSIG`.
-fn bit(sig: u8) -> u64 {
+pub(crate) fn bit(sig: u8) -> u64 {
     1u64.checked_shl(u32::from(sig).wrapping_sub(1)).unwrap_or(0)
 }
 
@@ -104,12 +110,11 @@ fn index(sig: u8) -> Option<usize> {
 }
 
 /// Signals that cannot be blocked, caught or ignored.
-const UNBLOCKABLE: u64 = 1 << (SIGKILL - 1) | 1 << (SIGSTOP - 1);
+pub(crate) const UNBLOCKABLE: u64 = 1 << (SIGKILL - 1) | 1 << (SIGSTOP - 1);
 
-/// Whether the default action discards the signal (stopping is not
-/// implemented, so stop signals count).
+/// Whether the default action discards the signal.
 fn default_ignored(sig: u8) -> bool {
-    matches!(sig, SIGCHLD | SIGCONT | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU | SIGURG | SIGWINCH)
+    matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
 }
 
 /// What to do on a signal, as `rt_sigaction` sets it.
@@ -135,6 +140,10 @@ pub(crate) struct Signals {
     senders: [AtomicU32; NSIG],
     /// Address of the kernel's `rt_sigreturn` trampoline page, or 0.
     trampoline: AtomicU64,
+    /// Queued signals sent to the process as a whole.
+    pub(crate) queue: crate::sigqueue::SigQueue,
+    /// Stopped or continued.
+    pub(crate) job: crate::jobctl::JobCtl,
 }
 
 fn default_ignored_set() -> u64 {
@@ -149,10 +158,18 @@ impl Signals {
             ignored: AtomicU64::new(default_ignored_set()),
             senders: [const { AtomicU32::new(0) }; NSIG],
             trampoline: AtomicU64::new(0),
+            queue: crate::sigqueue::SigQueue::new(),
+            job: crate::jobctl::JobCtl::new(),
         }
     }
 
-    fn action(&self, sig: u8) -> SigAction {
+    /// Drops the process-directed pending signals in `mask`.
+    pub(crate) fn discard_pending(&self, mask: u64) {
+        self.pending.fetch_and(!mask, Ordering::SeqCst);
+        self.queue.discard(mask);
+    }
+
+    pub(crate) fn action(&self, sig: u8) -> SigAction {
         index(sig).and_then(|i| self.actions.lock().get(i).copied()).unwrap_or_default()
     }
 
@@ -175,7 +192,7 @@ impl Signals {
         if discards {
             self.ignored.fetch_or(bit(sig), Ordering::SeqCst);
             // Setting a signal to be ignored discards it from the pending set.
-            self.pending.fetch_and(!bit(sig), Ordering::SeqCst);
+            self.discard_pending(bit(sig));
         } else {
             self.ignored.fetch_and(!bit(sig), Ordering::SeqCst);
         }
@@ -220,6 +237,7 @@ fn poke(p: &Process) {
 /// that is interrupted or whose process is ending gives up.
 pub(crate) fn wake_blocked() {
     crate::futex::interrupt();
+    crate::jobctl::wake();
     crate::poll::notify();
     if let Some(stack) = crate::net::stack() {
         stack.wake_waiters();
@@ -229,25 +247,26 @@ pub(crate) fn wake_blocked() {
 /// Sends `sig` to the process as a whole (`kill`): any thread that does not
 /// block it may take it. Signal 0 only checks that the process exists.
 pub fn send(p: &Process, sig: u8, from: Pid) -> Result<(), Errno> {
-    check(p, sig)?;
-    if sig == 0 {
-        return Ok(());
-    }
-    if sig == SIGKILL {
-        kill_group(p, ExitStatus::Signal(SIGKILL));
-        return Ok(());
-    }
-    if p.signals.ignored.load(Ordering::SeqCst) & bit(sig) != 0 {
-        return Ok(());
-    }
-    p.signals.set_sender(sig, from);
-    p.signals.pending.fetch_or(bit(sig), Ordering::SeqCst);
-    poke(p);
-    Ok(())
+    post(p, None, sig, from, None, false)
 }
 
 /// Sends `sig` to one thread (`tkill`).
 pub fn send_to_thread(p: &Process, th: &Thread, sig: u8, from: Pid) -> Result<(), Errno> {
+    post(p, Some(th), sig, from, None, false)
+}
+
+/// The one way a signal is sent: to thread `th`, or to the process if
+/// `None`. `info` is a `siginfo` to deliver with it, which queues the
+/// signal (see [`crate::sigqueue`]); `strict` makes a full queue an `EAGAIN`
+/// error instead of a signal that is pending without an entry.
+pub(crate) fn post(
+    p: &Process,
+    th: Option<&Thread>,
+    sig: u8,
+    from: Pid,
+    info: Option<Info>,
+    strict: bool,
+) -> Result<(), Errno> {
     check(p, sig)?;
     if sig == 0 {
         return Ok(());
@@ -256,11 +275,31 @@ pub fn send_to_thread(p: &Process, th: &Thread, sig: u8, from: Pid) -> Result<()
         kill_group(p, ExitStatus::Signal(SIGKILL));
         return Ok(());
     }
+    // `SIGCONT` resumes the process, and a stop signal cancels it, even if the signal is then discarded.
+    crate::jobctl::prepare(p, sig);
     if p.signals.ignored.load(Ordering::SeqCst) & bit(sig) != 0 {
         return Ok(());
     }
+    let (queue, pending) = match th {
+        Some(t) => (&t.sig.queue, &t.pending),
+        None => (&p.signals.queue, &p.signals.pending),
+    };
+    let entry = info.or_else(|| {
+        let code = if th.is_some() { code::SI_TKILL } else { code::SI_USER };
+        (sig >= SIGRTMIN).then_some(Info { code, pid: from.0, value: 0 })
+    });
+    if let Some(entry) = entry
+        && (sig >= SIGRTMIN || pending.load(Ordering::SeqCst) & bit(sig) == 0)
+    {
+        // The entry goes in before the pending bit, which a taker clears first.
+        if let Err(e) = queue.push(sig, entry)
+            && strict
+        {
+            return Err(e);
+        }
+    }
     p.signals.set_sender(sig, from);
-    th.pending.fetch_or(bit(sig), Ordering::SeqCst);
+    pending.fetch_or(bit(sig), Ordering::SeqCst);
     poke(p);
     Ok(())
 }
@@ -308,8 +347,9 @@ pub(crate) fn current_interrupted() -> bool {
     interrupted(&p, &th)
 }
 
-/// Takes the lowest-numbered pending signal `th` does not block.
-fn take_next(p: &Process, th: &Thread) -> Option<(u8, SigAction)> {
+/// Takes the lowest-numbered pending signal `th` does not block, with the
+/// `siginfo` it was queued with, if any.
+fn take_next(p: &Process, th: &Thread) -> Option<(u8, SigAction, Option<Info>)> {
     loop {
         let (mine, shared) = (th.pending.load(Ordering::SeqCst), p.signals.pending.load(Ordering::SeqCst));
         let ready = (mine | shared) & !th.mask.load(Ordering::SeqCst);
@@ -318,9 +358,14 @@ fn take_next(p: &Process, th: &Thread) -> Option<(u8, SigAction)> {
         }
         let sig = ready.trailing_zeros() as u8 + 1;
         let b = bit(sig);
-        let taken = if mine & b != 0 { &th.pending } else { &p.signals.pending };
+        let (taken, queue) =
+            if mine & b != 0 { (&th.pending, &th.sig.queue) } else { (&p.signals.pending, &p.signals.queue) };
         if taken.fetch_and(!b, Ordering::SeqCst) & b != 0 {
-            return Some((sig, p.signals.action(sig)));
+            let (info, more) = queue.pop(sig);
+            if more {
+                taken.fetch_or(b, Ordering::SeqCst);
+            }
+            return Some((sig, p.signals.action(sig), info));
         }
     }
 }
@@ -335,6 +380,8 @@ const FRAME_REGS: usize = 136;
 /// end, as that status.
 pub(crate) fn deliver_to<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) -> Option<ExitStatus> {
     loop {
+        // A stopped process waits here, whichever thread notices first.
+        crate::jobctl::hold(p, th);
         if let Some(status) = p.group.exiting.get() {
             return Some(*status);
         }
@@ -342,10 +389,20 @@ pub(crate) fn deliver_to<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) ->
             // Another thread's `execve` is replacing the program.
             return Some(ExitStatus::Code(0));
         }
-        let (sig, act) = take_next(p, th)?;
+        let Some((sig, act, info)) = take_next(p, th) else {
+            // `sigsuspend` ended without a handler to return from: its mask is back.
+            if let Some(mask) = th.sig.take_saved_mask() {
+                th.mask.store(mask, Ordering::SeqCst);
+            }
+            return None;
+        };
         match act.handler {
             SIG_IGN => continue,
             SIG_DFL if default_ignored(sig) => continue,
+            SIG_DFL if crate::jobctl::is_stop(sig) => {
+                crate::jobctl::stop_group(p, sig);
+                continue;
+            }
             SIG_DFL => {
                 let status = ExitStatus::Signal(sig);
                 kill_group(p, status);
@@ -353,7 +410,7 @@ pub(crate) fn deliver_to<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) ->
             }
             _ => {}
         }
-        if push_frame(p, th, regs, sig, act).is_err() {
+        if push_frame(p, th, regs, sig, act, info).is_err() {
             // No usable stack or trampoline: the program cannot continue.
             let status = ExitStatus::Signal(SIGSEGV);
             kill_group(p, status);
@@ -363,7 +420,14 @@ pub(crate) fn deliver_to<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) ->
     }
 }
 
-fn push_frame<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R, sig: u8, act: SigAction) -> Result<(), Errno> {
+fn push_frame<R: UserRegs>(
+    p: &Process,
+    th: &Thread,
+    regs: &mut R,
+    sig: u8,
+    act: SigAction,
+    info: Option<Info>,
+) -> Result<(), Errno> {
     let ra = if act.flags & sa::RESTORER != 0 && act.restorer != 0 {
         act.restorer
     } else {
@@ -373,27 +437,33 @@ fn push_frame<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R, sig: u8, act:
     if ra == 0 || !R::valid_pc(act.handler) {
         return Err(Errno::EFAULT);
     }
-    let (code, value) = match th.take_fault(sig) {
-        Some(addr) => (SEGV_MAPERR, addr),
-        None => {
+    let (code, value, queued) = match (th.take_fault(sig), info) {
+        (Some(addr), _) => (SEGV_MAPERR, addr, 0),
+        (None, Some(i)) => (i.code, u64::from(i.pid), i.value),
+        (None, None) => {
             let from = p.signals.sender(sig);
-            if from == 0 { (SI_KERNEL, 0) } else { (SI_USER, from as u64) }
+            if from == 0 { (SI_KERNEL, 0, 0) } else { (SI_USER, from as u64, 0) }
         }
     };
     let mut buf = [0u8; FRAME_SIZE];
     put(&mut buf, 0, &i32::from(sig).to_ne_bytes())?;
     put(&mut buf, 8, &code.to_ne_bytes())?;
     put(&mut buf, 16, &value.to_ne_bytes())?;
-    put(&mut buf, FRAME_MASK, &th.mask.load(Ordering::SeqCst).to_ne_bytes())?;
+    put(&mut buf, 24, &queued.to_ne_bytes())?;
+    // The mask to return to: `sigsuspend`'s caller gets its own back, not the temporary one.
+    let saved_mask = th.sig.take_saved_mask().unwrap_or_else(|| th.mask.load(Ordering::SeqCst));
+    put(&mut buf, FRAME_MASK, &saved_mask.to_ne_bytes())?;
     for (i, w) in regs.save_user().iter().enumerate() {
         put(&mut buf, FRAME_REGS + i * 8, &w.to_ne_bytes())?;
     }
-    let base = regs
-        .user_sp()
-        .checked_sub(R::RED_ZONE + FRAME_SIZE as u64)
-        .map(|sp| sp & !15)
-        .filter(|&sp| sp != 0)
-        .ok_or(Errno::EFAULT)?;
+    let user_sp = regs.user_sp();
+    let base = match th.sig.alt_top(act.flags, user_sp) {
+        // `SA_ONSTACK` with an alternate stack that is not in use: its top, with no red zone to keep.
+        Some((top, low)) => top.checked_sub(FRAME_SIZE as u64).map(|sp| sp & !15).filter(|&sp| sp >= low),
+        None => user_sp.checked_sub(R::RED_ZONE + FRAME_SIZE as u64).map(|sp| sp & !15),
+    }
+    .filter(|&sp| sp != 0)
+    .ok_or(Errno::EFAULT)?;
     p.memory().write(base, &buf)?;
     let sp = if R::RET_ON_STACK {
         p.memory().write(base - 8, &ra.to_ne_bytes())?;
@@ -608,6 +678,7 @@ pub(crate) fn tgkill(p: &Process, tgid: i32, tid: i32, sig: u64) -> Result<u64, 
 /// After `execve`: dispositions reset, and the thread-pointer register clear.
 pub(crate) fn on_exec(p: &Process) {
     p.signals.reset_on_exec();
+    p.leader().sig.reset_on_exec();
     p.group.reset_on_exec();
 }
 
@@ -643,5 +714,9 @@ pub fn user_fault(frame: &mut TrapFrame, sig: u8, addr: usize) -> Option<ExitSta
 impl Signals {
     pub(crate) fn action_for_test(&self, sig: u8) -> SigAction {
         self.action(sig)
+    }
+
+    pub(crate) fn pending_for_test(&self) -> u64 {
+        self.pending.load(Ordering::SeqCst)
     }
 }

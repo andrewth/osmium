@@ -264,6 +264,48 @@ impl Process {
         Ok(reaped.and_then(|c| c.exit_status().map(|status| (c.pid, status))))
     }
 
+    /// [`wait_child`](Self::wait_child) that also reports children stopped
+    /// (`untraced`) or continued (`continued`) by a signal, once each.
+    pub(crate) fn wait_child_job(
+        &self,
+        pid: Option<Pid>,
+        nohang: bool,
+        untraced: bool,
+        continued: bool,
+    ) -> Result<Option<(Pid, crate::jobctl::WaitEvent)>, Errno> {
+        use crate::jobctl::WaitEvent;
+        enum Found {
+            Reaped(Arc<Process>),
+            Event(Pid, WaitEvent),
+        }
+        let matches = |c: &Process| pid.is_none_or(|pid| c.pid == pid);
+        let found = self.child_exited.wait_until(|| {
+            let mut children = self.children.lock();
+            if !children.iter().any(matches) {
+                return Some(Err(Errno::ECHILD));
+            }
+            if let Some(child) = children.remove_first_where(|c| matches(c) && c.exit_status().is_some()) {
+                return Some(Ok(Some(Found::Reaped(child))));
+            }
+            let event = children
+                .iter()
+                .filter(|c| matches(c))
+                .find_map(|c| c.signals.job.take_report(untraced, continued).map(|e| Found::Event(c.pid, e)));
+            match event {
+                Some(found) => Some(Ok(Some(found))),
+                None if nohang => Some(Ok(None)),
+                None if crate::signal::current_interrupted() => Some(Err(Errno::EINTR)),
+                None => None,
+            }
+        })?;
+        Ok(match found {
+            // Dropped here, outside the lock: it may free the child's memory.
+            Some(Found::Reaped(c)) => c.exit_status().map(|status| (c.pid, WaitEvent::Exited(status))),
+            Some(Found::Event(pid, event)) => Some((pid, event)),
+            None => None,
+        })
+    }
+
     /// Drops the child `pid` that [`fork`](Self::fork) made but that never
     /// got a task, so `wait4` does not wait for it.
     pub(crate) fn forget_child(&self, pid: Pid) {
