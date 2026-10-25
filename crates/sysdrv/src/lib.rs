@@ -6,6 +6,7 @@
 //! | [`pl011::Pl011`] | Arm PrimeCell UART | `SerialPort` |
 //! | [`fwcfg::FwCfg`] | QEMU `fw_cfg` (ports or MMIO, optional DMA) | named blobs: tables, kernel, ramfb |
 //! | [`pit::Pit`] | Intel 8254 PIT | calibration delays |
+//! | [`hpet::Hpet`] | x86 High Precision Event Timer | `Clock`; comparators as `OneShotTimer` or periodic |
 //! | [`plic::Plic`] | RISC-V Platform-Level Interrupt Controller | `InterruptController` |
 //! | [`gicv2::GicV2`] | Arm Generic Interrupt Controller v2 | `InterruptController` |
 //! | [`lapic::LocalApic`] | x86 local APIC (xAPIC MMIO) | EOI, IPIs, timer, MSI messages |
@@ -26,6 +27,7 @@ extern crate std;
 pub mod clint;
 pub mod fwcfg;
 pub mod gicv2;
+pub mod hpet;
 pub mod ioapic;
 pub mod iommu;
 pub mod lapic;
