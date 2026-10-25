@@ -838,5 +838,6 @@ mod blocked;
 mod hostile;
 mod oom;
 mod pie;
+mod restart;
 mod sigthread;
 mod smp;

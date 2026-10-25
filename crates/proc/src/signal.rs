@@ -16,13 +16,14 @@
 //! `rt_sigreturn`: the one the caller names with `SA_RESTORER` (x86_64), or a
 //! page the kernel maps in the process's `mmap` area.
 //!
+//! A blocked call (`futex`, `poll`, `select`, `epoll_wait`, pipe and socket
+//! reads and writes, `accept`, `connect`, `wait4`) fails with `EINTR` when a
+//! signal it would act on arrives or the process is ending; `SA_RESTART`
+//! handlers restart the calls that Linux restarts, see `crate::restart`.
+//!
 //! Not implemented: queued real-time signals, `sigaltstack`, `sigsuspend`,
-//! stopping and continuing (stop signals are ignored), a credential model for
-//! `kill` (see its documentation), and restarting
-//! interrupted system calls (`SA_RESTART`): a blocked call (`futex`, `poll`,
-//! `select`, `epoll_wait`, pipe and socket reads and writes, `accept`,
-//! `connect`, `wait4`) fails with `EINTR` when a signal it would act on
-//! arrives or the process is ending.
+//! stopping and continuing (stop signals are ignored), and a credential model
+//! for `kill` (see its documentation).
 #![cfg_attr(
     not(any(test, target_arch = "riscv64", target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64"))),
     allow(dead_code)
@@ -334,6 +335,18 @@ const FRAME_REGS: usize = 136;
 /// a signal frame below the user stack. Returns `Some` if the process must
 /// end, as that status.
 pub(crate) fn deliver_to<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) -> Option<ExitStatus> {
+    deliver_with(p, th, regs, None)
+}
+
+/// [`deliver_to`] for a system call that failed with `EINTR`, with the plan
+/// to continue it in `restart` (see `crate::restart`): `regs` is rewound to
+/// issue the call again if no handler runs, or if the handler's flags allow.
+pub(crate) fn deliver_with<R: UserRegs>(
+    p: &Process,
+    th: &Thread,
+    regs: &mut R,
+    restart: Option<crate::restart::Restart>,
+) -> Option<ExitStatus> {
     loop {
         if let Some(status) = p.group.exiting.get() {
             return Some(*status);
@@ -342,7 +355,12 @@ pub(crate) fn deliver_to<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) ->
             // Another thread's `execve` is replacing the program.
             return Some(ExitStatus::Code(0));
         }
-        let (sig, act) = take_next(p, th)?;
+        let Some((sig, act)) = take_next(p, th) else {
+            if let Some(r) = restart {
+                regs.rewind_syscall(r.nr, r.arg0);
+            }
+            return None;
+        };
         match act.handler {
             SIG_IGN => continue,
             SIG_DFL if default_ignored(sig) => continue,
@@ -353,6 +371,13 @@ pub(crate) fn deliver_to<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) ->
             }
             _ => {}
         }
+        if let Some(r) = restart
+            && r.after_handler(act.flags)
+        {
+            // The frame saves these registers, so the handler returns into the call.
+            regs.rewind_syscall(r.nr, r.arg0);
+        }
+        *th.ext.restart.lock() = None;
         if push_frame(p, th, regs, sig, act).is_err() {
             // No usable stack or trampoline: the program cannot continue.
             let status = ExitStatus::Signal(SIGSEGV);

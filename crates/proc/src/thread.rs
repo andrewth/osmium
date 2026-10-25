@@ -84,6 +84,8 @@ pub struct Thread {
     /// one, and how many in a row hit it: see [`stale_write_fault`].
     stale_page: AtomicU64,
     stale_count: AtomicU32,
+    /// Restart block and priority-inheritance state.
+    pub(crate) ext: crate::thread_ext::ThreadExt,
     /// Links the thread into its group's list.
     group_link: Shared<Link>,
     /// Links a non-leader thread into [`TIDS`], keyed by `key`.
@@ -144,6 +146,7 @@ impl Thread {
             alive: AtomicBool::new(true),
             stale_page: AtomicU64::new(0),
             stale_count: AtomicU32::new(0),
+            ext: crate::thread_ext::ThreadExt::new(),
             group_link: Shared::new(Link::new()),
             tid_link: Shared::new(TreeLink::new()),
             key: tid,
@@ -275,15 +278,18 @@ pub(crate) fn find(tid: u32) -> Option<(Arc<Process>, Arc<Thread>)> {
 /// A new process's first task claims the leader thread the first time it
 /// asks.
 pub(crate) fn current_thread(p: &Process) -> Arc<Thread> {
-    let id = osmium_sched::current().id().0 + 1;
+    let task = osmium_sched::current();
+    let id = task.id().0 + 1;
     let threads = p.group.threads.lock();
     if let Some(t) = threads.clone_first_where(|t| t.task.load(Ordering::SeqCst) == id) {
+        t.ext.bind(&task);
         return t;
     }
     let leader = ThreadGroup::leader_in(&threads);
     // The first thread's task is spawned before it can run and cannot be
     // named until then, so it is recognised by being the first to ask.
     let _ = leader.task.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst);
+    leader.ext.bind(&task);
     leader
 }
 
