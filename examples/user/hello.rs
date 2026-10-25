@@ -187,14 +187,17 @@ fn process_api() {
         }
     });
 
-    // One anonymous page: PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS.
-    let page = sys::call6(sys::MMAP, [0, 4096, 3, 0x22, u64::MAX, 0]);
+    // Two anonymous pages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS. The kernel
+    // maps none of it up front: the first touch of each page is a page fault that gives it a frame,
+    // a read for the second page and then a write for the first.
+    let page = sys::call6(sys::MMAP, [0, 8192, 3, 0x22, u64::MAX, 0]);
     let mapped = (page as i64) > 0 && {
         let p = page as *mut u32;
-        // SAFETY: the kernel just mapped this page read/write.
+        // SAFETY: the kernel reserved these two pages read/write.
         unsafe {
+            let zero = p.add(1024).read_volatile() == 0;
             p.write_volatile(42);
-            p.read_volatile() == 42
+            zero && p.read_volatile() == 42
         }
     };
 

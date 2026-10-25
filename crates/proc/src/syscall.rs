@@ -840,7 +840,7 @@ fn mmap(p: &Process, len: u64, prot: u64, flags: u64, fd: i32) -> SysResult {
             mf = mf | f;
         }
     }
-    p.mmap_anon(len, mf)
+    p.mmap_demand(len, mf)
 }
 
 fn munmap(p: &Process, addr: u64, len: u64) -> SysResult {

@@ -1302,8 +1302,9 @@ fn handle_trap(frame: &mut TrapFrame) {
         match frame.cause() {
             Trap::Syscall => return syscall(frame),
             Trap::Interrupt(_) => {}
-            // A write to a page `fork` shares gets its own copy; retry.
-            Trap::PageFault { addr, access: Access::Write } if osmium::proc::handle_page_fault(addr as u64, true) => {
+            // A write to a page `fork` shares gets its own copy, and the first touch of a
+            // demand-paged `mmap` page its frame; retry.
+            Trap::PageFault { addr, access } if osmium::proc::handle_page_fault(addr as u64, access == Access::Write) => {
                 return;
             }
             cause => return user_fault(frame, cause),

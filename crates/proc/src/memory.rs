@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use osmium_boot::elf::Elf;
 use osmium_mm::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
 use osmium_mm::paging::{MapError, MapFlags, PageSize, PageTable, PageTableFormat, TableAlloc};
+use osmium_mm::vma::{VmaError, VmaSpare, VmaTree};
 use osmium_sync::IrqSpinLock;
 use osmium_sync::arc::ArcTree;
 use osmium_sync::fallible::{OutOfMemory, try_arc};
@@ -59,6 +60,24 @@ pub trait UserMemory: Send + Sync {
     /// other space still shares it) and returns true, so the faulting
     /// instruction can be retried. Returns false for any other fault.
     fn cow_fault(&self, va: u64) -> bool;
+    /// Reserves `va..va + len` (page-aligned) as an area of zeroed,
+    /// user-accessible pages with `flags`, without allocating any: each page
+    /// gets its frame the first time something touches it (a page fault, see
+    /// [`UserMemory::page_fault`], or a kernel copy through `read` or
+    /// `write`). Fails with `EINVAL` if the range overlaps an area or a page
+    /// that is already there, or is not in the user half.
+    fn map_lazy(&self, _va: u64, _len: u64, _flags: MapFlags) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+    /// Handles a user page fault at `va`, a write if `write`: a page of a
+    /// [`map_lazy`](UserMemory::map_lazy) area that has no frame yet gets
+    /// one, zeroed; a write to a copy-on-write page is handled as by
+    /// [`UserMemory::cow_fault`]. Returns true if the faulting instruction
+    /// can be retried, false for any other fault (including an access the
+    /// area's flags do not allow).
+    fn page_fault(&self, va: u64, write: bool) -> bool {
+        write && self.cow_fault(va)
+    }
     /// Maps fresh read-only, executable pages at `va` (page-aligned) holding
     /// `code`; the kernel's own stubs, such as the signal return trampoline.
     fn map_code(&self, _va: u64, _code: &[u8]) -> Result<(), Errno> {
@@ -204,13 +223,16 @@ struct Inner<F: PageTableFormat, A: TableAlloc> {
     /// The pages this space maps, by user address. A frame is freed when no
     /// space's pages refer to it.
     pages: ArcTree<ByVa<A>>,
+    /// The areas reserved with `map_lazy`, whether or not their pages exist
+    /// yet. Pages that were mapped any other way are in no area.
+    vmas: VmaTree,
 }
 
 impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
     /// Gives the copy-on-write page at `va` (page-aligned) its own writable
     /// frame. Returns false if it is not one, or memory ran out.
     fn break_cow(&self, inner: &mut Inner<F, A>, va: u64) -> bool {
-        let Inner { pt, pages } = inner;
+        let Inner { pt, pages, .. } = inner;
         let Some(page) = pages.find(&va) else { return false };
         if !page.is_cow() {
             return false;
@@ -257,6 +279,51 @@ impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
     }
 }
 
+impl<F: PageTableFormat, A: TableAlloc + Clone + Send + Sync> AddressSpace<F, A> {
+    /// Maps a zeroed page at `page` (aligned) with `flags` plus `USER` and
+    /// records it. Any page already recorded there is replaced.
+    fn install_zeroed(&self, inner: &mut Inner<F, A>, page: u64, flags: MapFlags) -> Result<(), Errno> {
+        let pa = self.alloc.alloc_table().ok_or(Errno::ENOMEM)?;
+        // The page owns the frame from here, and frees it if anything
+        // below fails.
+        let node = Page::new(pa, self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
+        // SAFETY: a fresh frame, reachable through the allocator's mapping.
+        unsafe { self.alloc.phys_to_virt(pa).write_bytes(0, PAGE_SIZE) };
+        match inner.pt.map(VirtAddr::new(page), pa, PageSize::Size4K, flags | MapFlags::USER) {
+            // The space may be active here, and RISC-V may cache invalid entries.
+            Ok(flush) => flush.flush(),
+            Err(e) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
+        }
+        node.place(page);
+        // A page that is not mapped has no node: see `unmap`.
+        drop(inner.pages.take_key(&page));
+        assert!(inner.pages.insert(node).is_ok(), "the page's slot was just emptied");
+        Ok(())
+    }
+
+    /// Gives the pages of `map_lazy` areas in `va..va + len` that have no
+    /// frame one, for a kernel copy that is about to go through the page
+    /// table. Pages whose area does not allow the access are left, so the
+    /// copy fails on them as it would on any unmapped page.
+    fn populate(&self, inner: &mut Inner<F, A>, va: u64, len: usize, write: bool) -> Result<(), Errno> {
+        let Some(end) = va.checked_add(len as u64) else { return Ok(()) };
+        let first = va & !(PAGE - 1);
+        let mut from = first;
+        while let Some(area) = inner.vmas.first_overlap(from, end) {
+            from = area.end;
+            if !area.flags.contains(if write { MapFlags::WRITE } else { MapFlags::READ }) {
+                continue;
+            }
+            for page in (area.start.max(first)..area.end.min(end)).step_by(PAGE_SIZE) {
+                if inner.pages.find(&page).is_none() {
+                    self.install_zeroed(inner, page, area.flags)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + Sync + 'static> AddressSpace<F, A> {
     /// Creates an empty space whose root entries `shared` point at the same
     /// tables as `kernel`'s, so the kernel stays mapped while it is active.
@@ -271,7 +338,12 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         let mut pt = PageTable::new(alloc.clone())?;
         // SAFETY: forwarded contract.
         unsafe { pt.share_root_entries(kernel, shared.clone()) };
-        Ok(Self { root: pt.root(), alloc, shared, inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new() }) })
+        Ok(Self {
+            root: pt.root(),
+            alloc,
+            shared,
+            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new(), vmas: VmaTree::new() }),
+        })
     }
 
     /// Whether `va..end` is non-empty, in the lower (user) half, and clear of
@@ -311,7 +383,8 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Errno> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        self.populate(&mut inner, va, buf.len(), false)?;
         walk(&inner.pt, va, buf.len(), MapFlags::READ, |src, off, n| {
             let to = buf.get_mut(off..off.saturating_add(n)).ok_or(Errno::EFAULT)?;
             // SAFETY: `src` points at `n` bytes of a user-readable frame.
@@ -323,6 +396,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Errno> {
         let mut inner = self.inner.lock();
         let end = va.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
+        self.populate(&mut inner, va, data.len(), true)?;
         let mut from = va & !(PAGE - 1);
         while from < end
             && let Some(page) = inner.pages.lower_bound(&from)
@@ -352,21 +426,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             if inner.pt.translate(VirtAddr::new(page)).is_some() {
                 continue;
             }
-            let pa = self.alloc.alloc_table().ok_or(Errno::ENOMEM)?;
-            // The page owns the frame from here, and frees it if anything
-            // below fails.
-            let node = Page::new(pa, self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
-            // SAFETY: a fresh frame, reachable through the allocator's mapping.
-            unsafe { self.alloc.phys_to_virt(pa).write_bytes(0, PAGE_SIZE) };
-            match inner.pt.map(VirtAddr::new(page), pa, PageSize::Size4K, flags | MapFlags::USER) {
-                // The space may be active here, and RISC-V may cache invalid entries.
-                Ok(flush) => flush.flush(),
-                Err(e) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
-            }
-            node.place(page);
-            // A page that is not mapped has no node: see `unmap`.
-            drop(inner.pages.take_key(&page));
-            assert!(inner.pages.insert(node).is_ok(), "the page's slot was just emptied");
+            self.install_zeroed(&mut inner, page, flags)?;
         }
         Ok(())
     }
@@ -375,7 +435,12 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         debug_assert_threads_pinned();
         let end = va.saturating_add(len);
         let mut inner = self.inner.lock();
-        let Inner { pt, pages } = &mut *inner;
+        let Inner { pt, pages, vmas } = &mut *inner;
+        // Made first, so the areas can be cut without failing. If there is
+        // no memory for it, the part of an area above the range is lost,
+        // and its untouched pages will fault instead of appearing.
+        let spare = if vmas.needs_spare(va, end) { VmaSpare::new().ok() } else { None };
+        vmas.remove(va & !(PAGE - 1), end, spare);
         // Every user page is one of ours, so visit those rather than each
         // page of a range that may span most of the address space.
         let mut from = va & !(PAGE - 1);
@@ -412,7 +477,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             return Err(Errno::ENOMEM);
         }
         let mut inner = self.inner.lock();
-        let Inner { pt, pages } = &mut *inner;
+        let Inner { pt, pages, .. } = &mut *inner;
         // The frames the loader allocates, until we know which page each is.
         let mut fresh: Fresh<A> = ArcTree::new();
         let loaded = elf.load_into(pt, MapFlags::USER, || {
@@ -452,7 +517,8 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         // Making pages read-only flushes this CPU only: see `unmap`.
         debug_assert_threads_pinned();
         let mut guard = self.inner.lock();
-        let Inner { pt: parent_pt, pages: parent_pages } = &mut *guard;
+        let Inner { pt: parent_pt, pages: parent_pages, vmas: parent_vmas } = &mut *guard;
+        let vmas = parent_vmas.try_clone().map_err(|_| Errno::ENOMEM)?;
         let mut pt = PageTable::new(self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
         // SAFETY: our shared root entries are the kernel's, which outlive
         // this space (see `new`) and so the copy, made under the same terms.
@@ -461,7 +527,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             root: pt.root(),
             alloc: self.alloc.clone(),
             shared: self.shared.clone(),
-            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new() }),
+            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new(), vmas }),
         };
         {
             let mut copy = child.inner.lock();
@@ -502,6 +568,41 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     fn cow_fault(&self, va: u64) -> bool {
         let mut inner = self.inner.lock();
         self.break_cow(&mut inner, va & !(PAGE - 1))
+    }
+
+    fn map_lazy(&self, va: u64, len: u64, flags: MapFlags) -> Result<(), Errno> {
+        if !va.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
+            return Err(Errno::EINVAL);
+        }
+        let end = va.checked_add(len).ok_or(Errno::EINVAL)?;
+        if !self.is_user_range(va, end) {
+            return Err(Errno::EINVAL);
+        }
+        let mut inner = self.inner.lock();
+        if inner.pages.lower_bound(&va).is_some_and(|p| p.va() < end) {
+            return Err(Errno::EINVAL);
+        }
+        inner
+            .vmas
+            .insert(va, end, flags)
+            .map_err(|e| if e == VmaError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL })
+    }
+
+    fn page_fault(&self, va: u64, write: bool) -> bool {
+        let page = va & !(PAGE - 1);
+        let mut inner = self.inner.lock();
+        if inner.pages.find(&page).is_some() {
+            // Already has a frame: only a write to a shared one is ours to fix.
+            return write && self.break_cow(&mut inner, page);
+        }
+        let Some(area) = inner.vmas.find(page) else { return false };
+        // A read or fetch may use any readable or executable area.
+        let allowed = if write {
+            area.flags.contains(MapFlags::WRITE)
+        } else {
+            area.flags.contains(MapFlags::READ) || area.flags.contains(MapFlags::EXEC)
+        };
+        allowed && self.install_zeroed(&mut inner, page, area.flags).is_ok()
     }
 
     fn map_code(&self, va: u64, code: &[u8]) -> Result<(), Errno> {
