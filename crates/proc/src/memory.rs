@@ -163,6 +163,9 @@ struct Page<A: TableAlloc> {
     /// Set when a fork made a writable page read-only: a write fault copies
     /// the frame, or makes it writable again if no one else shares it.
     cow: AtomicBool,
+    /// Set when `mprotect` took write access away: a copy-on-write fault or a
+    /// kernel copy must not give it back.
+    ro: AtomicBool,
     link: Shared<TreeLink>,
 }
 
@@ -183,6 +186,7 @@ impl<A: TableAlloc> Page<A> {
             va: UnsafeCell::new(0),
             frame: UnsafeCell::new(frame),
             cow: AtomicBool::new(cow),
+            ro: AtomicBool::new(false),
             link: Shared::new(TreeLink::new()),
         })
     }
@@ -209,6 +213,14 @@ impl<A: TableAlloc> Page<A> {
 
     fn set_cow(&self, cow: bool) {
         self.cow.store(cow, Ordering::Relaxed);
+    }
+
+    fn is_ro(&self) -> bool {
+        self.ro.load(Ordering::Relaxed)
+    }
+
+    fn set_ro(&self, ro: bool) {
+        self.ro.store(ro, Ordering::Relaxed);
     }
 }
 
@@ -283,7 +295,7 @@ impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
     fn break_cow(&self, inner: &mut Inner<F, A>, va: u64, deferred: &mut Deferred<A>) -> bool {
         let Inner { pt, pages, maps, vmas } = inner;
         let Some(page) = pages.find(&va) else { return false };
-        if !page.is_cow() {
+        if !page.is_cow() || page.is_ro() {
             return false;
         }
         // A mapping made read-only after the fork stays so.
@@ -698,6 +710,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                 }
                 // On failure, dropping `child` releases the pages shared so far.
                 let node = Page::sharing(page.frame().clone(), cow).map_err(|_| Errno::ENOMEM)?;
+                node.set_ro(page.is_ro());
                 match copy.pt.map(va, t.pa, PageSize::Size4K, flags) {
                     // The copy is not active anywhere yet.
                     Ok(flush) => flush.ignore(),

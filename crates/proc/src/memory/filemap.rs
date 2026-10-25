@@ -447,8 +447,18 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                 while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&a| a < end) {
                     from = at + PAGE;
                     let mut flags = prot;
-                    let cow = pages.find(&at).is_some_and(|p| p.is_cow());
-                    let clean = maps.find(at).is_some_and(|v| v.shared) && !maps.is_dirty(at);
+                    let shared = maps.find(at).is_some_and(|v| v.shared);
+                    let clean = shared && !maps.is_dirty(at);
+                    let mut cow = false;
+                    if let Some(p) = pages.find(&at) {
+                        p.set_ro(!prot.contains(MapFlags::WRITE));
+                        // A frame a fork relative still maps must be copied
+                        // before it is written, whatever it was before.
+                        if prot.contains(MapFlags::WRITE) && !shared && Arc::strong_count(p.frame()) > 1 {
+                            p.set_cow(true);
+                        }
+                        cow = p.is_cow();
+                    }
                     // A copy-on-write page gets its write access back by faulting,
                     // and a clean shared page by being written to.
                     if cow || clean {
