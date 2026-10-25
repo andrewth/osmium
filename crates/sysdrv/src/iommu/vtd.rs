@@ -115,8 +115,10 @@ const IIRG_DOMAIN: u64 = 2 << 60;
 const FSTS_PFO: u32 = 1 << 0;
 /// Primary pending fault: a record waits, and FRI says which.
 const FSTS_PPF: u32 = 1 << 1;
-/// Invalidation queue error, completion error and time-out error.
-const FSTS_QI_ERRORS: u32 = 1 << 4 | 1 << 5 | 1 << 6;
+/// Invalidation queue error: the unit stopped at a bad descriptor.
+const FSTS_IQE: u32 = 1 << 4;
+/// Invalidation queue, completion and time-out errors.
+const FSTS_QI_ERRORS: u32 = FSTS_IQE | 1 << 5 | 1 << 6;
 
 /// Fault recording register: F (bit 127), read/write type and reason.
 const FRCD_F: u64 = 1 << 63;
@@ -557,11 +559,8 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         let st = self.state.lock();
         let tables = st.tables.as_ref().ok_or(IommuError::NotAttached)?;
         let (_, slot, off) = self.context_location(device);
-        let ctx = tables
-            .context
-            .get(slot)
-            .filter(|c| c.load::<u64>(off) & PRESENT != 0)
-            .ok_or(IommuError::NotAttached)?;
+        let ctx =
+            tables.context.get(slot).filter(|c| c.load::<u64>(off) & PRESENT != 0).ok_or(IommuError::NotAttached)?;
         let domain = if self.scalable {
             let pasid = pasid_buf(tables, device, false)?.ok_or(IommuError::NotAttached)?;
             (pasid.load::<u64>(PASID_TABLE + 8) & 0xffff) as u16
@@ -646,6 +645,7 @@ mod tests {
     use osmium_mm::paging::MapFlags;
 
     use super::super::testing::*;
+    use super::remap::{Irte, Source};
     use super::*;
 
     const REGS: usize = 0x1000;
@@ -659,9 +659,18 @@ mod tests {
         DeviceId::new(0, a)
     }
 
+    const SCALABLE: u64 = ECAP_SMTS | ECAP_SLTS | ECAP_QI;
+    const REMAP: u64 = ECAP_IR | ECAP_QI | ECAP_EIM;
+
     #[derive(Default)]
     struct Hw {
         root: u64,
+        /// The root table is in scalable mode.
+        smt: bool,
+        /// Interrupt remapping table base, size and mode as latched by SIRTP.
+        irta: u64,
+        /// GSTS bits the unit keeps set whatever the driver asks.
+        pin_status: Option<u32>,
         log: Vec<std::string::String>,
         /// Never completes invalidations.
         stall: bool,
@@ -673,6 +682,37 @@ mod tests {
         regs: HostRegs,
         hw: Arc<Mutex<Hw>>,
         _pump: Pump,
+    }
+
+    /// Executes the descriptors between the queue's head and tail.
+    fn process_queue(r: &HostRegs, hw: &mut Hw) {
+        let (iqa, tail) = (r.r64(IQA), r.r64(IQT));
+        let (base, len) = (iqa & !0xfff, if iqa & 1 << 11 != 0 { 32 } else { 16 });
+        let mut head = r.r64(IQH);
+        // After a queue error the unit waits for software to acknowledge it.
+        while head != tail && r.r32(FSTS) & FSTS_IQE == 0 {
+            let (lo, hi) = (mem64(base + head), mem64(base + head + 8));
+            let (g, did) = (lo >> 4 & 3, lo >> 16 & 0xffff);
+            match lo & 0xf {
+                1 => hw.log.push(std::format!("qi ctx g{g} did {did} sid {:#x}", lo >> 32 & 0xffff)),
+                2 => hw.log.push(std::format!("qi iotlb g{g} did {did}")),
+                4 => hw.log.push(std::format!("qi iec g{g} idx {}", lo >> 32 & 0xffff)),
+                7 => hw.log.push(std::format!("qi pasid g{g} did {did} pasid {}", lo >> 32 & 0xfffff)),
+                5 => {
+                    if lo & 1 << 5 != 0 {
+                        // SAFETY: the driver's status word, in a live DMA allocation.
+                        unsafe { (hi as *mut u32).write_volatile((lo >> 32) as u32) };
+                    }
+                }
+                t => {
+                    hw.log.push(std::format!("qi bad type {t}"));
+                    r.w32(FSTS, r.r32(FSTS) | 1 << 4);
+                    return;
+                }
+            }
+            head = (head + len) % 4096;
+            r.w64(IQH, head);
+        }
     }
 
     fn fake(cap_extra: u64, ecap_extra: u64) -> Fake {
@@ -688,18 +728,29 @@ mod tests {
             let g = r.r32(GCMD);
             let mut s = r.r32(GSTS);
             if g & SRTP != 0 {
-                hw.root = r.r64(RTADDR);
+                let rt = r.r64(RTADDR);
+                hw.root = rt & !0xfff;
+                hw.smt = rt & RTADDR_SCALABLE != 0;
                 hw.log.push("srtp".into());
                 s |= SRTP;
                 r.w32(GCMD, g & !SRTP);
+            }
+            if g & SIRTP != 0 {
+                hw.irta = r.r64(IRTA);
+                hw.log.push("sirtp".into());
+                s |= SIRTP;
+                r.w32(GCMD, r.r32(GCMD) & !SIRTP);
             }
             if g & WBF != 0 {
                 r.w32(GCMD, r.r32(GCMD) & !WBF);
                 hw.log.push("wbf".into());
             }
             // Persistent bits follow their commands.
-            for bit in [TE, QIE] {
+            for bit in [TE, QIE, IRE, CFI] {
                 s = if g & bit != 0 { s | bit } else { s & !bit };
+            }
+            if let Some(pinned) = hw.pin_status {
+                s |= pinned;
             }
             r.w32(GSTS, s);
             // F is write-one-to-clear: the driver writes just F to hand a record back.
@@ -708,8 +759,15 @@ mod tests {
                     r.w64(FRO + i * 16 + 8, 0);
                 }
             }
+            // Like the other write-one-to-clear bits: the driver writes all the error bits at once.
+            if r.r32(FSTS) & FSTS_QI_ERRORS == FSTS_QI_ERRORS {
+                r.w32(FSTS, r.r32(FSTS) & !FSTS_QI_ERRORS);
+            }
             if hw.stall {
                 return;
+            }
+            if s & QIE != 0 {
+                process_queue(&r, &mut hw);
             }
             let c = r.r64(CCMD);
             if c & ICC != 0 {
@@ -739,23 +797,53 @@ mod tests {
             if !self.translating() {
                 return Ok(iova); // untranslated
             }
-            let root = self.hw.lock().unwrap().root;
-            let rootent = mem64(root + (sid >> 8) as u64 * 16);
+            let (root, smt) = {
+                let hw = self.hw.lock().unwrap();
+                (hw.root, hw.smt)
+            };
+            let rootent = mem64(root + (sid >> 8) as u64 * 16 + if smt { (sid >> 7 & 1) as u64 * 8 } else { 0 });
             if rootent & 1 == 0 {
                 return Err("root entry not present");
             }
-            let ctx = (rootent & !0xfff) + (sid & 0xff) as u64 * 16;
-            let (lo, hi) = (mem64(ctx), mem64(ctx + 8));
-            if lo & 1 == 0 {
-                return Err("context entry not present");
+            let (mut table, levels);
+            if smt {
+                let ctx = (rootent & !0xfff) + (sid & 0x7f) as u64 * 32;
+                let lo = mem64(ctx);
+                if lo & 1 == 0 {
+                    return Err("context entry not present");
+                }
+                assert_eq!(lo & 0xffe, 0, "PASIDE, DTE and PDTS are unused");
+                let rid_pasid = mem64(ctx + 8) & 0xf_ffff;
+                let dirent = mem64((lo & !0xfff) + (rid_pasid >> 6) * 8);
+                if dirent & 1 == 0 {
+                    return Err("PASID directory entry not present");
+                }
+                let pe = (dirent & !0xfff) + (rid_pasid & 63) * 64;
+                let q0 = mem64(pe);
+                if q0 & 1 == 0 {
+                    return Err("PASID entry not present");
+                }
+                assert_eq!(q0 >> 6 & 7, 2, "second-level translation only");
+                levels = match q0 >> 2 & 7 {
+                    2 => 4,
+                    1 => 3,
+                    _ => return Err("bad address width"),
+                };
+                table = q0 & !0xfff & 0x000f_ffff_ffff_ffff;
+            } else {
+                let ctx = (rootent & !0xfff) + (sid & 0xff) as u64 * 16;
+                let (lo, hi) = (mem64(ctx), mem64(ctx + 8));
+                if lo & 1 == 0 {
+                    return Err("context entry not present");
+                }
+                assert_eq!(lo >> 2 & 3, 0, "translation type: untranslated requests via second level");
+                levels = match hi & 7 {
+                    2 => 4,
+                    1 => 3,
+                    _ => return Err("bad address width"),
+                };
+                table = lo & !0xfff & 0x000f_ffff_ffff_ffff;
             }
-            assert_eq!(lo >> 2 & 3, 0, "translation type: untranslated requests via second level");
-            let levels = match hi & 7 {
-                2 => 4,
-                1 => 3,
-                _ => return Err("bad address width"),
-            };
-            let mut table = lo & !0xfff & 0x000f_ffff_ffff_ffff;
             for level in (0..levels).rev() {
                 let e = mem64(table + ((iova >> (12 + 9 * level)) & 0x1ff) * 8);
                 if e & 3 == 0 {
@@ -773,8 +861,43 @@ mod tests {
             panic!("walk did not terminate")
         }
 
+        /// Looks `handle` up in the interrupt remapping table as the unit would, and
+        /// returns the delivered (vector, destination) if `sid` may use it.
+        fn remap(&self, sid: u16, handle: u16) -> Result<(u8, u32), &'static str> {
+            if self.regs.r32(GSTS) & IRE == 0 {
+                return Err("remapping off");
+            }
+            let irta = self.hw.lock().unwrap().irta;
+            if handle as u64 >= 1 << ((irta & 0xf) + 1) {
+                return Err("index out of range");
+            }
+            let at = (irta & !0xfff) + handle as u64 * 16;
+            let (lo, hi) = (mem64(at), mem64(at + 8));
+            if lo & 1 == 0 {
+                return Err("entry not present");
+            }
+            match hi >> 18 & 3 {
+                0 => {}
+                1 if hi as u16 == sid => {}
+                2 if (hi >> 8) as u8 <= (sid >> 8) as u8 && (sid >> 8) as u8 <= hi as u8 => {}
+                _ => return Err("source mismatch"),
+            }
+            let dest = if irta & 1 << 11 != 0 { (lo >> 32) as u32 } else { (lo >> 40) as u8 as u32 };
+            Ok((((lo >> 16) & 0xff) as u8, dest))
+        }
+
         fn domain_of(&self, sid: u16) -> u64 {
-            let root = self.hw.lock().unwrap().root;
+            let (root, smt) = {
+                let hw = self.hw.lock().unwrap();
+                (hw.root, hw.smt)
+            };
+            if smt {
+                let ent = mem64(root + (sid >> 8) as u64 * 16 + (sid >> 7 & 1) as u64 * 8);
+                let ctx = (ent & !0xfff) + (sid & 0x7f) as u64 * 32;
+                let dir = mem64(ctx) & !0xfff;
+                let table = mem64(dir) & !0xfff;
+                return mem64(table + 8) & 0xffff;
+            }
             let ctx = (mem64(root + (sid >> 8) as u64 * 16) & !0xfff) + (sid & 0xff) as u64 * 16;
             mem64(ctx + 8) >> 8 & 0xffff
         }
@@ -1029,5 +1152,254 @@ mod tests {
         assert_eq!(f.translate(dev(NIC).bdf(), iova, false), Err("not present"));
         assert_eq!(backing.live(), 0);
         alloc.with_domain(|d| d.detach(dev(NIC))).unwrap();
+    }
+
+    fn scalable<'dev>(f: &Fake, dma: &'dev HostDma, clock: &'dev StdClock) -> Vtd<'dev, HostDma> {
+        Vtd::new_scalable(f.regs.io(), dma, clock, 0).expect("scalable unit comes up")
+    }
+
+    #[test]
+    fn scalable_mode_needs_scalable_hardware() {
+        let (dma, clock) = (HostDma::default(), StdClock::default());
+        for ecap in [0, ECAP_SMTS | ECAP_QI, ECAP_SMTS | ECAP_SLTS, ECAP_SLTS | ECAP_QI] {
+            let f = fake(0, ecap);
+            assert_eq!(Vtd::new_scalable(f.regs.io(), &dma, &clock, 0).err(), Some(IommuError::Unsupported));
+        }
+        assert_eq!(dma.live(), 0);
+        // Legacy mode still works on such a unit.
+        let f = fake(0, SCALABLE);
+        let vtd = setup(&f, &dma, &clock);
+        assert!(!vtd.scalable());
+        assert_eq!(f.regs.r32(GSTS) & QIE, 0, "legacy mode keeps register invalidation");
+    }
+
+    #[test]
+    fn scalable_mode_comes_up_through_the_queue() {
+        let (dma, clock) = (HostDma::default(), StdClock::default());
+        let f = fake(0, SCALABLE);
+        let vtd = scalable(&f, &dma, &clock);
+        assert!(vtd.scalable() && !vtd.translating());
+        assert_ne!(f.regs.r32(GSTS) & QIE, 0);
+        assert_ne!(f.regs.r64(IQA) & 1 << 11, 0, "256-bit descriptors");
+        assert!(f.hw.lock().unwrap().smt, "root table type");
+        let log = f.log();
+        assert_eq!(log, ["srtp", "qi ctx g1 did 0 sid 0x0", "qi pasid g3 did 0 pasid 0", "qi iotlb g1 did 0"]);
+        // root, two-page context index, PASID index, queue and status.
+        assert_eq!(dma.live(), 4);
+        drop(vtd);
+        assert_eq!(dma.live(), 0);
+        assert_eq!(f.regs.r32(GSTS) & QIE, 0);
+    }
+
+    #[test]
+    fn scalable_attach_translates_and_detach_blocks() {
+        let (dma, clock, tables) = (HostDma::default(), StdClock::default(), HostTables::default());
+        let f = fake(0, SCALABLE);
+        let vtd = scalable(&f, &dma, &clock);
+        let backing = HostDma::default();
+        let buf = backing.alloc_coherent(8192).unwrap();
+        let base = buf.device_addr().as_u64();
+        let mut d = IoDomain::new(&vtd, DomainId(7), &tables).unwrap();
+        d.map(0x20_0000, buf.device_addr(), 0x2000, MapFlags::RW).unwrap();
+        d.map(0x40_0000, buf.device_addr(), 0x1000, MapFlags::READ).unwrap();
+        // Functions below and above 128 of one bus use the two halves of the root entry.
+        let (low, high) = (dev(NIC), dev(Address::new(0, 0x1f, 7)));
+        d.attach(low).unwrap();
+        d.attach(high).unwrap();
+        assert!(f.translating());
+        for sid in [low.bdf(), high.bdf()] {
+            assert_eq!(f.domain_of(sid), 7);
+            assert_eq!(f.translate(sid, 0x20_0123, true), Ok(base + 0x123));
+            assert_eq!(f.translate(sid, 0x40_0000, false), Ok(base));
+            assert_eq!(f.translate(sid, 0x40_0000, true), Err("permission"));
+            assert_eq!(f.translate(sid, 0x30_0000, false), Err("not present"));
+        }
+        assert_eq!(f.translate(dev(Address::new(0, 3, 2)).bdf(), 0x20_0000, false), Err("context entry not present"));
+        assert_eq!(f.translate(dev(FAR).bdf(), 0x20_0000, false), Err("root entry not present"));
+        // The mapping change reaches the unit through a domain-selective IOTLB descriptor.
+        d.map(0x50_0000, buf.device_addr() + 0x1000, 0x1000, MapFlags::RW).unwrap();
+        assert_eq!(f.translate(low.bdf(), 0x50_0008, true), Ok(base + 0x1008));
+        let log = f.log();
+        assert!(log.iter().any(|l| l == "qi ctx g3 did 7 sid 0x19"), "device-selective context flush: {log:?}");
+        assert!(log.iter().any(|l| l == "qi pasid g1 did 7 pasid 0"), "PASID-selective flush: {log:?}");
+        assert!(log.iter().any(|l| l == "qi iotlb g2 did 7"), "domain-selective IOTLB flush: {log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("ctx ") || l.starts_with("iotlb ")), "no register invalidation");
+
+        assert_eq!(d.attach(low), Err(IommuError::Busy));
+        let live = dma.live();
+        d.detach(low).unwrap();
+        assert_eq!(f.translate(low.bdf(), 0x20_0000, false), Err("context entry not present"));
+        assert_eq!(f.translate(high.bdf(), 0x20_0000, true), Ok(base), "the other half is untouched");
+        assert_eq!(d.detach(low), Err(IommuError::NotAttached));
+        // Attaching again reuses the PASID structures.
+        d.attach(low).unwrap();
+        assert_eq!(dma.live(), live);
+        assert_eq!(f.translate(low.bdf(), 0x20_0000, true), Ok(base));
+        drop(d);
+        assert_eq!(f.translate(low.bdf(), 0x20_0000, false), Err("context entry not present"));
+        drop(vtd);
+        // SAFETY: nothing maps it any more.
+        unsafe { backing.free_coherent(buf) };
+        assert_eq!(dma.live(), 0, "PASID buffers freed too");
+        assert_eq!(tables.live.load(core::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn scalable_attach_rolls_back_when_the_queue_stalls() {
+        let (dma, clock, tables) = (HostDma::default(), StdClock::default(), HostTables::default());
+        let f = fake(0, SCALABLE);
+        let mut vtd = scalable(&f, &dma, &clock);
+        vtd.set_timeout_ns(50_000_000);
+        f.hw.lock().unwrap().stall = true;
+        {
+            let mut d = IoDomain::new(&vtd, DomainId(1), &tables).unwrap();
+            assert_eq!(d.attach(dev(NIC)), Err(IommuError::Timeout));
+            assert!(!f.translating());
+        }
+        f.hw.lock().unwrap().stall = false;
+        // The stalled descriptors drain, and the queue is usable again.
+        std::thread::sleep(core::time::Duration::from_millis(20));
+        let mut d = IoDomain::new(&vtd, DomainId(1), &tables).unwrap();
+        d.attach(dev(NIC)).unwrap();
+        assert!(f.translating());
+    }
+
+    #[test]
+    fn queue_errors_are_reported_and_recovered() {
+        let (dma, clock) = (HostDma::default(), StdClock::default());
+        let f = fake(0, SCALABLE);
+        let vtd = scalable(&f, &dma, &clock);
+        assert_eq!(vtd.qi_submit([0xf, 0]), Err(IommuError::Hardware));
+        std::thread::sleep(core::time::Duration::from_millis(5));
+        assert_eq!(f.regs.r32(FSTS) & FSTS_QI_ERRORS, 0, "error acknowledged");
+        // Skip the bad descriptor as the unit would, and carry on.
+        vtd.qi_iec(None).unwrap();
+    }
+
+    #[test]
+    fn takes_over_firmware_interrupt_remapping() {
+        let (f, dma, clock) = (fake(0, REMAP), HostDma::default(), StdClock::default());
+        f.regs.w32(GSTS, TE | QIE | IRE);
+        f.regs.w32(GCMD, TE | QIE | IRE);
+        let vtd = setup(&f, &dma, &clock);
+        assert_eq!(f.regs.r32(GSTS) & (TE | QIE | IRE), 0);
+        assert_eq!(vtd.interrupt_entries(), 0);
+        assert!(!vtd.interrupt_remapping_enabled());
+    }
+
+    #[test]
+    fn interrupt_remapping_lifecycle() {
+        let (f, dma, clock) = (fake(0, REMAP), HostDma::default(), StdClock::default());
+        let vtd = setup(&f, &dma, &clock);
+        assert!(vtd.supports_interrupt_remapping() && vtd.supports_extended_interrupt_mode());
+        let sid = dev(NIC).bdf();
+        assert_eq!(vtd.set_irte(0, &Irte::fixed(0x40, 1, Source::Any)), Err(IommuError::NotAttached));
+        assert_eq!(f.remap(sid, 0), Err("remapping off"));
+
+        // Bad sizes.
+        for n in [0, 1, 3, 255, 1 << 17] {
+            assert_eq!(vtd.enable_interrupt_remapping(n, false, false), Err(IommuError::OutOfRange), "{n}");
+        }
+        assert_eq!(dma.live(), 2, "nothing allocated yet");
+        vtd.enable_interrupt_remapping(256, false, false).unwrap();
+        assert_eq!(vtd.enable_interrupt_remapping(256, false, false), Err(IommuError::Busy));
+        assert!(vtd.interrupt_remapping_enabled());
+        assert_eq!(vtd.interrupt_entries(), 256);
+        assert_eq!(f.regs.r32(GSTS) & CFI, 0, "compatibility-format interrupts blocked");
+        let irta = f.regs.r64(IRTA);
+        assert_eq!(irta & 0xf, 7, "2^(7+1) entries");
+        assert_eq!(irta & 1 << 11, 0, "xAPIC mode");
+        let log = f.log();
+        assert!(log.ends_with(&["sirtp".into(), "qi iec g0 idx 0".into()]), "{log:?}");
+        assert_ne!(f.regs.r32(GSTS) & QIE, 0, "remapping brings the queue up");
+
+        // Entries start out blocked.
+        assert_eq!(f.remap(sid, 5), Err("entry not present"));
+        let irte = Irte { vector: 0x61, destination: 3, level: true, ..Irte::fixed(0, 0, Source::Device(NIC)) };
+        vtd.set_irte(5, &irte).unwrap();
+        assert_eq!(f.remap(sid, 5), Ok((0x61, 3)));
+        assert_eq!(f.remap(dev(FAR).bdf(), 5), Err("source mismatch"));
+        assert_eq!(vtd.irte(5), Some(irte));
+        assert!(f.log().iter().any(|l| l == "qi iec g1 idx 5"), "entry-selective invalidation");
+        // Retarget; a bus range admits the NIC but not the far bus.
+        let wide = Irte::fixed(0x62, 0xff, Source::Buses { first: 0, last: 3 });
+        vtd.set_irte(5, &wide).unwrap();
+        assert_eq!(f.remap(sid, 5), Ok((0x62, 0xff)));
+        assert_eq!(f.remap(dev(FAR).bdf(), 5), Err("source mismatch"));
+        // xAPIC IDs are 8 bits.
+        assert_eq!(vtd.set_irte(6, &Irte::fixed(0x62, 0x100, Source::Any)), Err(IommuError::OutOfRange));
+        assert_eq!(vtd.set_irte(256, &irte), Err(IommuError::OutOfRange));
+        assert_eq!(f.remap(sid, 6), Err("entry not present"));
+
+        vtd.clear_irte(5).unwrap();
+        assert_eq!(f.remap(sid, 5), Err("entry not present"));
+        assert_eq!(vtd.irte(5), None);
+        assert_eq!(vtd.clear_irte(256), Err(IommuError::OutOfRange));
+
+        // A message built for the handle selects the same entry in the address.
+        let m = remap::msi_message(5);
+        assert_eq!(m.address >> 5 & 0x7fff, 5);
+        vtd.disable_interrupt_remapping().unwrap();
+        assert!(!vtd.interrupt_remapping_enabled());
+        assert_eq!(vtd.disable_interrupt_remapping(), Err(IommuError::NotAttached));
+        // Can be enabled again, in extended mode, with compatibility format on.
+        vtd.enable_interrupt_remapping(2, true, true).unwrap();
+        assert_ne!(f.regs.r32(GSTS) & CFI, 0);
+        assert_ne!(f.regs.r64(IRTA) & 1 << 11, 0);
+        vtd.set_irte(1, &Irte::fixed(0x70, 0x1234, Source::Any)).unwrap();
+        assert_eq!(f.remap(sid, 1), Ok((0x70, 0x1234)));
+        assert_eq!(f.remap(sid, 2), Err("index out of range"));
+        drop(vtd);
+        assert_eq!(f.regs.r32(GSTS) & (IRE | QIE), 0);
+        assert_eq!(dma.live(), 0, "table and queue freed");
+    }
+
+    #[test]
+    fn interrupt_remapping_needs_hardware_support() {
+        let (dma, clock) = (HostDma::default(), StdClock::default());
+        // No IR, IR without the queue, and no extended mode.
+        for ecap in [0, ECAP_IR, ECAP_QI] {
+            let f = fake(0, ecap);
+            let vtd = setup(&f, &dma, &clock);
+            assert!(!vtd.supports_interrupt_remapping());
+            assert_eq!(vtd.enable_interrupt_remapping(256, false, false), Err(IommuError::Unsupported));
+        }
+        let f = fake(0, ECAP_IR | ECAP_QI);
+        let vtd = setup(&f, &dma, &clock);
+        assert_eq!(vtd.enable_interrupt_remapping(256, true, false), Err(IommuError::Unsupported));
+        vtd.enable_interrupt_remapping(256, false, false).unwrap();
+    }
+
+    #[test]
+    fn legacy_translation_uses_the_queue_once_remapping_starts_it() {
+        let (f, dma, clock, tables) = (fake(0, REMAP), HostDma::default(), StdClock::default(), HostTables::default());
+        let vtd = setup(&f, &dma, &clock);
+        vtd.enable_interrupt_remapping(8, false, false).unwrap();
+        let mut d = IoDomain::new(&vtd, DomainId(4), &tables).unwrap();
+        d.map(0x1000, PhysAddr::new(0xaaa000), 0x1000, MapFlags::RW).unwrap();
+        d.attach(dev(NIC)).unwrap();
+        assert_eq!(f.translate(dev(NIC).bdf(), 0x1000, false), Ok(0xaaa000));
+        let log = f.log();
+        assert!(log.iter().any(|l| l == "qi ctx g3 did 4 sid 0x19"), "{log:?}");
+        assert!(log.iter().any(|l| l == "qi iotlb g2 did 4"));
+        let queued = log.iter().position(|l| l == "sirtp").unwrap();
+        assert!(
+            !log[queued..].iter().any(|l| l.starts_with("ctx ") || l.starts_with("iotlb ")),
+            "no register invalidation after the queue starts: {log:?}"
+        );
+        drop(d);
+    }
+
+    #[test]
+    fn remapping_that_will_not_stop_leaks_its_table() {
+        let (f, dma, clock) = (fake(0, REMAP), HostDma::default(), StdClock::default());
+        let mut vtd = setup(&f, &dma, &clock);
+        vtd.set_timeout_ns(20_000_000);
+        vtd.enable_interrupt_remapping(4, false, false).unwrap();
+        // The unit stops acknowledging.
+        f.hw.lock().unwrap().pin_status = Some(IRE | QIE | TE);
+        let before = dma.live();
+        drop(vtd);
+        assert_eq!(dma.live(), before, "the tables, remapping table and queue stay allocated");
     }
 }

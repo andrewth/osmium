@@ -37,7 +37,7 @@ const MSI_SHV: u64 = 1 << 3;
 /// device (which cannot use the vectors in its data field) takes
 /// [`msi_message_with_subhandle`] instead.
 pub const fn msi_message(handle: u16) -> MsiMessage {
-    MsiMessage { address: msi_address(handle) , data: 0 }
+    MsiMessage { address: msi_address(handle), data: 0 }
 }
 
 /// Like [`msi_message`] for a device that supports `1 << n` MSI vectors and
@@ -120,15 +120,7 @@ pub struct Irte {
 impl Irte {
     /// An edge-triggered, fixed-delivery interrupt to the CPU with physical ID `destination`.
     pub const fn fixed(vector: u8, destination: u32, source: Source) -> Self {
-        Self {
-            vector,
-            destination,
-            delivery: Delivery::Fixed,
-            logical: false,
-            level: false,
-            redirect: false,
-            source,
-        }
+        Self { vector, destination, delivery: Delivery::Fixed, logical: false, level: false, redirect: false, source }
     }
 
     /// The entry's two quadwords, present. `extended` is whether the table
@@ -154,7 +146,9 @@ impl Irte {
         // Source ID, qualifier (compare all bits) and verification type.
         let hi = match self.source {
             Source::Any => 0,
-            Source::Device(a) => ((a.bus as u64) << 8 | ((a.device & 31) as u64) << 3 | (a.function & 7) as u64) | 1 << 18,
+            Source::Device(a) => {
+                ((a.bus as u64) << 8 | ((a.device & 31) as u64) << 3 | (a.function & 7) as u64) | 1 << 18
+            }
             Source::Buses { first, last } => {
                 if first > last {
                     return Err(IommuError::OutOfRange);

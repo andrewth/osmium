@@ -98,6 +98,19 @@ impl IoApic {
         self.write_locked(&g, reg, low);
     }
 
+    /// Like [`route`](Self::route), but with the entry in the remappable format
+    /// (VT-d interrupt remapping): it names interrupt remapping table entry
+    /// `handle`, which supplies the destination and delivery mode. `vector`
+    /// must match the entry's.
+    pub fn route_remapped(&self, gsi: u32, handle: u16, vector: u8, mode: LineMode) {
+        let Some(reg) = self.entry(gsi) else { return };
+        let on = crate::iommu::vtd::remap::ioapic_entry(handle, vector, mode.active_low, mode.level, false);
+        let g = self.lock.lock();
+        self.write_locked(&g, reg, MASKED);
+        self.write_locked(&g, reg + 1, (on >> 32) as u32);
+        self.write_locked(&g, reg, on as u32);
+    }
+
     /// Updates the low half of `gsi`'s entry with one lock hold, so a
     /// concurrent update is not lost.
     fn modify(&self, gsi: u32, f: impl FnOnce(u32) -> u32) {
@@ -138,6 +151,18 @@ mod tests {
         drop(apic);
         assert_eq!(regs[IOREGSEL / 4], REG_REDIRECTION + 8, "entry 4, low half written last");
         assert_eq!(regs[IOWIN / 4], 40, "vector 40, edge, active high, unmasked");
+    }
+
+    #[test]
+    fn route_remapped_writes_the_handle_and_format_bit() {
+        let mut regs = [0u32; 8];
+        regs[IOWIN / 4] = 23 << 16;
+        // SAFETY: the window covers a local array.
+        let apic = IoApic::new(unsafe { IoMem::new(regs.as_mut_ptr().cast(), 32) }, 0);
+        apic.route_remapped(4, 0x8003, 40, LineMode { active_low: false, level: true });
+        drop(apic);
+        // Only the last write (the low half) is observable.
+        assert_eq!(regs[IOWIN / 4], 40 | 1 << 11 | LEVEL, "vector, handle bit 15, level, unmasked");
     }
 
     #[test]

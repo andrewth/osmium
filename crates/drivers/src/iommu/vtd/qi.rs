@@ -8,7 +8,7 @@ use osmium_arch::barrier;
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
 use osmium_hal::iommu::IommuError;
 
-use super::{CAP_DRD, CAP_DWD, ECAP_QI, ECAP_SMTS, FSTS, FSTS_QI_ERRORS, IQA, IQH, IQT, QIE, State, Vtd};
+use super::{CAP_DRD, CAP_DWD, ECAP_QI, ECAP_SMTS, FSTS, FSTS_IQE, FSTS_QI_ERRORS, IQA, IQH, IQT, QIE, State, Vtd};
 
 /// Bytes of the ring (one page, the smallest size: `IQA.QS` = 0).
 const RING_LEN: usize = 4096;
@@ -113,17 +113,19 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         let (len, slots) = (q.desc_len(), q.slots());
         let wait = [TYPE_WAIT | WAIT_SW | (q.seq as u64) << 32, q.mem.device_addr().as_u64() + STATUS as u64];
         q.mem.store::<u32>(STATUS, 0);
-        // Slots are used in pairs and the ring holds an even number of them.
-        for (i, d) in [desc, wait].into_iter().enumerate() {
-            let at = (q.tail + i) % slots * len;
+        let put = |q: &Queue<'d, D>, slot: usize, d: [u64; 2]| {
+            let at = slot % slots * len;
             q.mem.store::<u64>(at, d[0]);
             q.mem.store::<u64>(at + 8, d[1]);
             if q.wide {
                 q.mem.store::<u64>(at + 16, 0);
                 q.mem.store::<u64>(at + 24, 0);
             }
-        }
-        q.tail = (q.tail + 2) % slots;
+        };
+        let first = q.tail;
+        put(q, first, desc);
+        put(q, first + 1, wait);
+        q.tail = (first + 2) % slots;
         barrier::dma_wmb();
         // The tail register holds the byte offset of the next free slot.
         self.regs.w64(IQT, (q.tail * len) as u64);
@@ -134,11 +136,16 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
                 q.mem.load::<u32>(STATUS) == seq
             }
         });
-        if self.regs.r32(FSTS) & FSTS_QI_ERRORS != 0 {
-            // The unit stopped at the bad descriptor: acknowledge, and resume
-            // submitting from where it stands.
+        let errors = self.regs.r32(FSTS) & FSTS_QI_ERRORS;
+        if errors != 0 {
+            // A queue error stops the unit at the bad descriptor, which it runs again once the
+            // error is acknowledged. Replace it with the wait descriptor (as Linux does), so
+            // the queue goes on and the status word is still written.
+            if errors & FSTS_IQE != 0 && self.regs.r64(IQH) as usize / len == first {
+                put(q, first, wait);
+                barrier::dma_wmb();
+            }
             self.regs.w32(FSTS, FSTS_QI_ERRORS);
-            q.tail = (self.regs.r64(IQH) as usize / len) % slots;
             return Err(IommuError::Hardware);
         }
         result
