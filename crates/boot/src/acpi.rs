@@ -375,6 +375,43 @@ impl<'src> Ivrs<'src> {
     }
 }
 
+/// The High Precision Event Timer description table (`HPET`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HpetTable {
+    /// Physical base address of the 1 KiB register block.
+    pub base: u64,
+    /// The hardware revision and comparator layout word (`EVENT_TIMER_BLOCK_ID`).
+    pub block_id: u32,
+    /// Sequence number of this block (0 for the first).
+    pub number: u8,
+    /// Smallest periodic-mode tick the hardware can be programmed with reliably.
+    pub min_tick: u16,
+}
+
+impl HpetTable {
+    /// Parses an `HPET` table. Returns `None` for another table, a truncated
+    /// one, or a register block that is not in system memory (address space
+    /// 0) or has a zero address.
+    pub fn parse(t: Table<'_>) -> Option<Self> {
+        if &t.signature() != b"HPET" {
+            return None;
+        }
+        let b = t.body();
+        // Block id (4), then a 12-byte generic address structure: space id,
+        // bit width, bit offset, access size, 64-bit address.
+        if *b.get(4)? != 0 {
+            return None;
+        }
+        let base = le64(b, 8).filter(|&a| a != 0)?;
+        Some(Self {
+            base,
+            block_id: le32(b, 0)?,
+            number: *b.get(16)?,
+            min_tick: u16::from_le_bytes(b.get(17..19)?.try_into().ok()?),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +536,27 @@ mod tests {
         let read = |pa: u64, len: usize| mem.get(pa as usize..pa as usize + len);
         assert_eq!(Acpi::new(0, read).err(), Some(AcpiError::BadRsdp));
     }
+    #[test]
+    fn hpet_table() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x8086_a201u32.to_le_bytes());
+        body.extend_from_slice(&[0, 64, 0, 0]);
+        body.extend_from_slice(&0xfed0_0000u64.to_le_bytes());
+        body.push(0);
+        body.extend_from_slice(&0x0080u16.to_le_bytes());
+        body.push(0);
+        let t = table(b"HPET", &body);
+        let h = HpetTable::parse(Table { data: &t }).unwrap();
+        assert_eq!(h, HpetTable { base: 0xfed0_0000, block_id: 0x8086_a201, number: 0, min_tick: 0x80 });
+        assert!(HpetTable::parse(Table { data: &table(b"APIC", &body) }).is_none());
+        assert!(HpetTable::parse(Table { data: &table(b"HPET", &body[..10]) }).is_none(), "truncated");
+        body[4] = 1; // port I/O
+        assert!(HpetTable::parse(Table { data: &table(b"HPET", &body) }).is_none());
+        body[4] = 0;
+        body[8..16].fill(0);
+        assert!(HpetTable::parse(Table { data: &table(b"HPET", &body) }).is_none(), "null base");
+    }
+
     #[test]
     fn dmar_and_ivrs_units() {
         // DMAR: a reserved-memory structure (type 1) the walker must skip,
