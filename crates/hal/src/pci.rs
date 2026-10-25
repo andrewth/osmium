@@ -14,6 +14,9 @@
 //! [`Function::msi`] and [`Function::msix`] program message-signalled
 //! interrupts ([`MsiMessage`]).
 //!
+//! [`walk`] enumerates through PCI-to-PCI bridges, numbering buses and
+//! programming bridge memory windows ([`Bridge`]).
+//!
 //! [`Function::extended_capabilities`] walks PCIe extended configuration
 //! space, and [`Function::sriov`] turns a function's virtual functions on and
 //! off.
@@ -22,6 +25,9 @@ use crate::mmio::IoMem;
 
 mod msi;
 pub use msi::{Msi, MsiError, MsiMessage, Msix, MsixPba, MsixTable};
+
+mod bridge;
+pub use bridge::{Bridge, WalkError, WalkSummary, walk};
 
 mod sriov;
 pub use sriov::{ExtCapabilities, SrIov, SrIovError, ext_cap};
@@ -468,6 +474,12 @@ impl BarAllocator {
     /// Allocates from `[base, base + size)` (bus addresses). A window running past `u64::MAX` is clamped to it.
     pub const fn new(base: u64, size: u64) -> Self {
         Self { next: base, end: base.saturating_add(size) }
+    }
+
+    /// Rounds the next free address up to a multiple of `align`. Past the
+    /// window's end, the next allocation fails.
+    pub(crate) fn align_to(&mut self, align: u64) {
+        self.next = self.next.checked_next_multiple_of(align).unwrap_or(self.end);
     }
 
     /// Returns an address for a region of `size` bytes, aligned to `size`.
