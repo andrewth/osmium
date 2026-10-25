@@ -22,12 +22,15 @@
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
 //! | `net` | `osmium-net` | IPv4 stack: ARP, ICMP echo, UDP, TCP, DHCP client |
 //! | `iscsi` | `osmium-iscsi` | iSCSI initiator: a remote SCSI disk over TCP as a block device |
+//! | `acpi` | `osmium-acpi` | ACPI: FADT, AML interpreter, devices, resources, PCI routing, sleep states, SCI and GPE events |
 //!
 //! The library never defines an entry point, panic handler or global
 //! allocator: the OS assembles those from the parts it uses.
 #![no_std]
 
 pub use osmium_arch as arch;
+#[cfg(feature = "acpi")]
+pub use osmium_acpi as acpi;
 #[cfg(feature = "boot")]
 pub use osmium_boot as boot;
 #[cfg(feature = "drivers")]

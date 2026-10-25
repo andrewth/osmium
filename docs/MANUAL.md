@@ -204,6 +204,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `hal` | osmium-hal | no | MMIO and port I/O, device traits (including `Display` and `Framebuffer`), `IrqTable`, the console and `println!` |
 | `drivers` | osmium-drivers | no | UARTs, interrupt controllers, timers, virtio (MMIO and PCI), xHCI/USB, AHCI, NVMe, displays, mlx4, RAM disk |
 | `boot` | osmium-boot | `FdtWriter` only | FDT, Multiboot2, PVH, UEFI (system table, GOP), ACPI, ELF loading |
+| `acpi` | osmium-acpi | yes | FADT, an AML interpreter, `_CRS`, `_PRT`, sleep states, power off, SCI and GPEs (enables `boot`) |
 | `exec` | osmium-exec | no | A heap-free async executor |
 | `sched` | osmium-sched | yes | Tasks, context switch, scheduler, `Mutex`, `WaitQueue`, timers |
 | `fs` | osmium-fs | yes | VFS, RamFs, `/dev`, cpio, ext2/ext3/ext4 |
@@ -320,6 +321,37 @@ map.page_align_usable();
 To find devices, use `fdt.find_compatible(&["ns16550a"])` together with `Node::reg()` and
 `Node::interrupts()`. On ACPI machines, use `acpi::Acpi::new(rsdp, read)`
 followed by `Madt::parse` (CPUs, I/O APICs) and `Mcfg::parse` (PCIe ECAM).
+
+The `acpi` feature adds an AML interpreter for what the static tables do not say: which devices there
+are, what resources they use, how PCI interrupts are wired, and how to power off. You supply a `Host`
+that reaches memory, ports and PCI configuration space (every method has a refusing default, so
+implement what your machine has), then load the tables and ask:
+
+```rust
+use osmium::acpi::aml::{Config, Interpreter};
+use osmium::acpi::fadt::Fadt;
+use osmium::acpi::pm::Pm;
+
+let acpi = Acpi::new(rsdp, read).unwrap();
+let mut aml = Interpreter::new(MyHost::new(), Config::default());
+aml.load_tables(&acpi).unwrap();          // the DSDT from the FADT, then every SSDT
+let report = aml.initialize();            // _REG, _INI, _STA
+for bridge in aml.find_devices("PNP0A08") {
+    let windows = aml.current_resources(bridge).unwrap();               // _CRS
+    let irq = aml.route_pci_irq(bridge, 3, 0, 0).unwrap();              // _PRT: device 3, INTA
+}
+let pm = Pm::new(Fadt::parse(acpi.find(b"FACP").unwrap()).unwrap());
+pm.enable(aml.host_mut()).unwrap();       // switch the chipset to ACPI mode
+// ... from the SCI handler: pm.handle_sci(&mut aml) runs _Exx/_Lxx and reports fixed events
+pm.power_off(&mut aml).unwrap();          // _PTS(5), then SLP_TYP and SLP_EN from \_S5_
+```
+
+AML is firmware's code, so the interpreter treats it as untrusted: a call that loops, recurses or
+sleeps without end is cut off by the limits in `Config` (`max_depth`, `max_steps`, `max_sleep_us`), and
+objects have size limits. The interpreter recurses once per nesting level and needs about 0.65 KiB of
+stack for each in a release build (the default `max_depth` of 96 fits in 64 KiB; a debug build needs
+about eight times that), and `Interpreter::peak_depth` says how deep your firmware actually goes (QEMU's
+q35 DSDT peaks at 8).
 
 ### 5.4 Frames, heap and page tables
 

@@ -14,7 +14,7 @@ workspace = true
 [features]
 default = ["sync", "mm", "hal", "drivers", "boot"]
 ## Everything, including the parts that need `alloc`.
-full = ["sync", "mm", "hal", "drivers", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net", "fs-ext4", "fs-iso9660", "iscsi"]
+full = ["sync", "mm", "hal", "drivers", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net", "fs-ext4", "fs-iso9660", "iscsi", "acpi"]
 sync = ["dep:osmium-sync"]
 mm = ["sync", "dep:osmium-mm"]
 hal = ["sync", "mm", "dep:osmium-hal"]
@@ -40,6 +40,8 @@ fs-ext4 = ["fs", "hal", "sync", "dep:osmium-fs-ext4"]
 fs-iso9660 = ["fs", "hal", "sync", "dep:osmium-fs-iso9660"]
 ## iSCSI initiator: a remote SCSI disk over TCP as a block device (needs `alloc`).
 iscsi = ["net", "dep:osmium-iscsi"]
+## ACPI: FADT, an AML interpreter, devices, resources, PCI routing and power management (needs `alloc`).
+acpi = ["boot", "dep:osmium-acpi"]
 ## RISC-V machine-mode CSRs.
 riscv-m-mode = ["osmium-arch/riscv-m-mode"]
 ## AArch64 EL2 registers.
@@ -54,6 +56,7 @@ osmium-mm = { workspace = true, optional = true }
 osmium-hal = { workspace = true, optional = true }
 osmium-drivers = { workspace = true, optional = true }
 osmium-boot = { workspace = true, optional = true }
+osmium-acpi = { workspace = true, optional = true }
 osmium-sched = { workspace = true, optional = true }
 osmium-virt = { workspace = true, optional = true }
 osmium-exec = { workspace = true, optional = true }

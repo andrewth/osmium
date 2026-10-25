@@ -1,0 +1,13 @@
+[package]
+name = "osmium-acpi"
+description = "Osmium: ACPI power management and an AML interpreter (FADT, namespace, devices, resources, PCI routing, sleep states, SCI and GPE events)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-boot.workspace = true

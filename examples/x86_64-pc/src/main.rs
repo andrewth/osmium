@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod aml;
 mod iommu;
 mod msi;
 mod usb;
@@ -295,6 +296,9 @@ fn now_ns() -> u64 {
 
 /// Powers QEMU off: ACPI PM1a control (q35/i440fx), then isa-debug-exit.
 fn shutdown() -> ! {
+    // The firmware's own way first: \_S5_ from the DSDT, written to the register the FADT names.
+    aml::power_off();
+    // With no ACPI tables to say how (a guest of the x86_64-hyp example), QEMU's fixed PM1a control register.
     // SAFETY: QEMU's ACPI PM1a control register; SLP_TYP=0, SLP_EN.
     unsafe {
         x86::outw(0x604, 0x2000);
@@ -409,6 +413,12 @@ extern "C" fn kmain(start_info: usize) -> ! {
     let squares: Vec<u64> = (0..1000).map(|i| i * i).collect();
     let s: String = ["heap", "works"].join(" ");
     println!("[heap]  {s} (sum of squares {})", squares.iter().sum::<u64>());
+
+    // --- AML: the DSDT's devices, and the way to power off -------------------------
+    // Needs the heap, and the boot tables' identity map of the ACPI tables and of what AML touches.
+    if let Some(rsdp) = info.rsdp() {
+        aml::init(rsdp.0);
+    }
 
     // --- Paging (4-level, W^X, NX) -----------------------------------------
     let mut pt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("new failed");

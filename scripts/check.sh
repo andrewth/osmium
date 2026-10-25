@@ -315,6 +315,13 @@ for s in "$stick_uhci" "$stick_ehci"; do
 done
 screen qemu-system-x86_64 640 400
 EXPECT=(
+    '\[aml\]   1 tables loaded (0 failed): [0-9]* objects, [0-9]* devices'
+    '\[aml\]   _REG run [0-9]* times, _INI [0-9]* times, 0 methods failed'
+    '\[aml\]   host bridge .*PCI0 (PNP0A08): [0-9]* resources, buses Some((0, 255))'
+    '\[aml\]   PCI routing: [0-9]* rows; device [0-9]* INT[A-D] -> GSI [0-9]* (level'
+    '\[aml\]   .*_S5_ sleep type 0/0'
+    '\[acpi\]  ACPI mode on, SCI on IRQ 9'
+    '\[acpi\]  powering off through .*_S5_'
     '\[guard\] task "deep" overflowed'
     'user-bad killed: PageFault'
     'user-1 exited with status 0 (kernel sees CPU 1)'

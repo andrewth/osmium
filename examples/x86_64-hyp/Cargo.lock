@@ -6,6 +6,7 @@ version = 4
 name = "osmium"
 version = "0.1.0"
 dependencies = [
+ "osmium-acpi",
  "osmium-arch",
  "osmium-boot",
  "osmium-drivers",
@@ -22,6 +23,13 @@ dependencies = [
  "osmium-sched",
  "osmium-sync",
  "osmium-virt",
+]
+
+[[package]]
+name = "osmium-acpi"
+version = "0.1.0"
+dependencies = [
+ "osmium-boot",
 ]
 
 [[package]]

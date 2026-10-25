@@ -100,6 +100,12 @@ impl<'src, F: Fn(u64, usize) -> Option<&'src [u8]>> Acpi<'src, F> {
         checksum_ok(data).then_some(Table { data })
     }
 
+    /// The table at physical address `pa` if its header, length and checksum are valid. Tables the root
+    /// does not list, such as the DSDT named by the FADT, are read this way.
+    pub fn table_at_address(&self, pa: u64) -> Option<Table<'src>> {
+        Self::table_at(&self.read, pa)
+    }
+
     /// Every table listed by the root whose checksum is valid.
     pub fn tables(&self) -> impl Iterator<Item = Table<'src>> + '_ {
         let step = if self.wide { 8 } else { 4 };
