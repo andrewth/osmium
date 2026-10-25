@@ -972,10 +972,11 @@ fn on_trap(frame: &mut TrapFrame) {
 }
 
 fn handle_trap(frame: &mut TrapFrame) {
-    // A write to a page `fork` shares gets its own copy; retry.
-    if let Trap::PageFault { addr, access: Access::Write } = frame.cause()
+    // A write to a page `fork` shares gets its own copy, and a touch of a
+    // file mapping's page loads it; retry.
+    if let Trap::PageFault { addr, access } = frame.cause()
         && frame.from_user()
-        && osmium::proc::handle_page_fault(addr as u64, true)
+        && osmium::proc::handle_page_fault(addr as u64, access == Access::Write)
     {
         return;
     }
