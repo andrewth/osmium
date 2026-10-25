@@ -267,6 +267,7 @@ else
     echo "== QEMU lacks riscv-iommu-pci or iommu-testdev; skipping the RISC-V IOMMU boot"
 fi
 EXPECT=(
+    '\[fp\]    no SVE: tasks keep q0-q31 only'
     '\[guard\] task "deep" overflowed'
     'nested Breakpoint on the exception stack'
     'user-bad killed: PageFault'
@@ -360,6 +361,7 @@ EXPECT=(
     '1 of 1 init address space torn down'
     '/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries'
     '\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111'
+    '\[fp\]    ymm0 kept across XSAVE/XRSTOR: ok'
     '\[vesa\]  VBE 3.0, .* set mode 0x[0-9a-f]*: 800x600 32bpp at'
     '\[vesa\]  DISPI 0xb0c5 reads back the BIOS.s mode'
     '\[vesa\] 800x600 32bpp, stride 3200: colour bars drawn'

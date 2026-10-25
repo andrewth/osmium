@@ -165,6 +165,37 @@ fn load_cpu_tables() {
     unsafe { (&*ptr).enable_syscall() };
 }
 
+/// Checks that `FpState` keeps all 256 bits of `ymm0` when AVX is on: two
+/// patterns are captured and restored in turn.
+fn avx_selftest() {
+    use osmium::arch::fp::{self, FpState};
+    if !fp::avx_enabled() {
+        println!("[fp]    no AVX (or no XSAVE): FXSAVE switches x87 and SSE state");
+        return;
+    }
+    let a: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+    let b: [u8; 32] = core::array::from_fn(|i| 0xf0 - i as u8);
+    let mut out = [[0u8; 32]; 2];
+    irq::without(|| {
+        // SAFETY: fp::enable ran on this CPU (load_cpu_tables) and returned
+        // true with AVX on, so the VEX loads and stores are legal; the
+        // kernel does not use ymm0 itself, and the pointers cover 32 bytes.
+        unsafe {
+            core::arch::asm!("vmovdqu ymm0, [{}]", in(reg) a.as_ptr(), out("xmm0") _);
+            let sa = FpState::capture();
+            core::arch::asm!("vmovdqu ymm0, [{}]", in(reg) b.as_ptr(), out("xmm0") _);
+            let sb = FpState::capture();
+            sa.restore();
+            core::arch::asm!("vmovdqu [{}], ymm0", in(reg) out[0].as_mut_ptr(), out("xmm0") _);
+            sb.restore();
+            core::arch::asm!("vmovdqu [{}], ymm0", in(reg) out[1].as_mut_ptr(), out("xmm0") _);
+            FpState::new().restore();
+        }
+    });
+    let ok = out[0] == a && out[1] == b;
+    println!("[fp]    ymm0 kept across XSAVE/XRSTOR: {}", if ok { "ok" } else { "FAILED" });
+}
+
 /// Application processors' first stacks (`AP_STACKS[cpu - 1]`; the boot CPU
 /// has its own), where each stays as its CPU's bootstrap task.
 #[repr(align(16))]
@@ -476,6 +507,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: the syscall handler treats every argument as untrusted.
     unsafe { trap::allow_from_user(trap::SYSCALL_VECTOR) };
     println!("[guard] task stacks get unmapped guard pages; double faults run on IST{DOUBLE_FAULT_IST}");
+    avx_selftest();
 
     // --- Displays: the VESA framebuffer, then PCI adapters (virtio-vga) -----
     display_demo(vesa, ecam);

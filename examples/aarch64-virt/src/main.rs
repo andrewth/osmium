@@ -309,6 +309,58 @@ fn shutdown() -> ! {
     psci::system_off(*PSCI.get().unwrap_or(&psci::Conduit::Hvc))
 }
 
+/// When the CPU has SVE (QEMU `-cpu max`, not the default Cortex-A72), checks
+/// that `SveState` keeps all of `z0`: two patterns are captured and restored
+/// in turn. Leaves SVE enabled; the kernel never uses it.
+fn sve_selftest(model: &str) {
+    use osmium::arch::fp::{SveState, sve};
+    // `aarch64-hyp` traps SVE (CPTR_EL2.TZ) and does not switch it between
+    // vCPUs, so its guests must leave it alone.
+    if model.starts_with("osmium") {
+        println!("[fp]    no SVE: tasks keep q0-q31 only");
+        return;
+    }
+    // SAFETY: the kernel is soft-float and never touches SVE registers.
+    let Some(vl) = (unsafe { sve::enable() }) else {
+        println!("[fp]    no SVE: tasks keep q0-q31 only");
+        return;
+    };
+    let mut buf = alloc::vec![0u8; 3 * vl];
+    let (a, rest) = buf.split_at_mut(vl);
+    let (b, out) = rest.split_at_mut(vl);
+    for (i, (x, y)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
+        *x = i as u8 + 1;
+        *y = 0xf0 - i as u8;
+    }
+    let mut sa = alloc::boxed::Box::new(SveState::new());
+    let mut sb = alloc::boxed::Box::new(SveState::new());
+    let mut ok = true;
+    irq::without(|| {
+        // SAFETY: SVE is on (above); `a` and `b` hold `vl` bytes, which is
+        // what `ldr z0` / `str z0` move, and z0 is declared clobbered.
+        unsafe {
+            core::arch::asm!(".arch_extension sve", "ldr z0, [{}]", in(reg) a.as_ptr(), out("v0") _);
+            sa.save();
+            core::arch::asm!(".arch_extension sve", "ldr z0, [{}]", in(reg) b.as_ptr(), out("v0") _);
+            sb.save();
+            sa.restore();
+            core::arch::asm!(".arch_extension sve", "str z0, [{}]", in(reg) out.as_mut_ptr(), out("v0") _);
+        }
+        ok &= out == a;
+        // SAFETY: as above.
+        unsafe {
+            sb.restore();
+            core::arch::asm!(".arch_extension sve", "str z0, [{}]", in(reg) out.as_mut_ptr(), out("v0") _);
+        }
+        ok &= out == b;
+    });
+    println!(
+        "[fp]    SVE {} bit vectors: z0 kept across SveState save/restore: {}",
+        vl * 8,
+        if ok { "ok" } else { "FAILED" }
+    );
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn kmain(x0: usize) -> ! {
     // SAFETY: a single CPU runs this kernel; id 0 is unique.
@@ -396,6 +448,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     let squares: Vec<u64> = (0..1000).map(|i| i * i).collect();
     let s: String = ["heap", "works"].join(" ");
     println!("[heap]  {s} (sum of squares {})", squares.iter().sum::<u64>());
+    sve_selftest(model);
 
     // --- Paging (stage 1, 4 KiB granule, W^X) ------------------------------
     // The kernel's own memory node is mapped piecewise below (W^X); any

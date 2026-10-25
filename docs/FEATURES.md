@@ -110,7 +110,9 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ RISC-V trap entry swaps through `sscratch` to a per-CPU `TrapCpu`: an exception stack when the interrupted kernel stack overflowed, a kernel stack for traps from U-mode, and a hook point for hypervisor guest exits
 - ✅ AArch64 current-EL vectors check `sp` against the same per-CPU `TrapCpu` before the first store and move to an exception stack on overflow (vector sizes enforced at assembly time)
 - ✅ Per-task FP/SIMD state (`fp::FpState`: x87/SSE by FXSAVE, AArch64 `q0`–`q31` with FPCR/FPSR, RISC-V D with `fcsr`) and `fp::enable` per CPU; the scheduler switches it for tasks built with `TaskBuilder::fp_state`, `osmium-proc` gives every process one (copied by `fork`, cleared by `execve`, advertised in `AT_HWCAP`), and all three examples' `init` checks it
-- 🗺 AVX/XSAVE, SVE and lazy FP switching
+- ✅ x86_64 AVX via XSAVE: `fp::enable` turns on `CR4.OSXSAVE` and `XCR0` x87|SSE|AVX when the CPU has them, and `FpState` then switches with `XSAVE`/`XRSTOR` (upper halves of `ymm0`–`ymm15` kept; `fp::avx_enabled`), else falls back to FXSAVE. `examples/x86_64-pc` checks `ymm0` round-trips under QEMU TCG. Not done: AVX-512, PKRU, AMX, `XSAVEOPT`/`XSAVEC`; the `osmium-virt` x86 hypervisors hide XSAVE from guests (guests use FXSAVE)
+- ✅ AArch64 SVE: `fp::sve::enable` (CPACR `ZEN`, `ZCR_EL1` at the longest vector length) and `fp::SveState` (`z0`–`z31`, `p0`–`p15`, `FFR`, `FPCR`/`FPSR`, sized for 2048-bit vectors) switched by the scheduler for tasks built with `TaskBuilder::sve_state` (replaces `fp_state`). Checked under QEMU `-cpu max` (2048-bit vectors) by `examples/aarch64-virt`; `osmium-proc` processes do not get SVE state yet, `aarch64-hyp` traps SVE for guests, SME is not supported, and all CPUs must have the same vector length
+- 🗺 Lazy FP switching (`CR0.TS`/`#NM`, `CPACR_EL1.FPEN` traps, with cross-CPU owner tracking); FP/SIMD state is still switched eagerly on every context switch
 
 ### `osmium-sync`: synchronization
 - ✅ `SpinLock<T, G>`: a fair ticket lock, generic over a *guardian* (`PreemptDisabled` by default, `IrqDisabled`, `NoGuard`)

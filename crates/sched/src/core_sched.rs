@@ -310,8 +310,14 @@ fn schedule(requeue: Option<EnqueueReason>) {
         if let Some(fp) = &cur.fp {
             (*fp.get()).save();
         }
+        if let Some(sve) = &cur.sve {
+            (*sve.get()).save();
+        }
         if let Some(fp) = &next.fp {
             (*fp.get()).restore();
+        }
+        if let Some(sve) = &next.sve {
+            (*sve.get()).restore();
         }
     }
     if let Some(hook) = SWITCH_HOOK.get() {
