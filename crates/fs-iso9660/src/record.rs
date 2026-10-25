@@ -77,17 +77,6 @@ impl<'src> Record<'src> {
     }
 }
 
-/// Days from 1970-01-01 to a proleptic Gregorian date (month 1 to 12).
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
 /// The 7-byte recording date of a directory record (years since 1900,
 /// month, day, hour, minute, second, offset from GMT in 15 minute units).
 /// Out-of-range fields are clamped rather than rejected: a bad date on a
@@ -97,9 +86,15 @@ fn date(d: &[u8]) -> Timestamp {
     if year == 0 && month == 0 && day == 0 {
         return Timestamp::ZERO;
     }
-    let days = days_from_civil(1900 + year as i64, (month as i64).clamp(1, 12), (day as i64).clamp(1, 31));
-    let local = days * 86_400 + (hour.min(23) as i64) * 3600 + (min.min(59) as i64) * 60 + sec.min(59) as i64;
-    Timestamp::from_secs(local - (zone as i8 as i64) * 900)
+    let local = Timestamp::from_civil(
+        1900 + year as i64,
+        (month as i64).clamp(1, 12),
+        (day as i64).clamp(1, 31),
+        hour.min(23) as i64,
+        min.min(59) as i64,
+        sec.min(59) as i64,
+    );
+    Timestamp::from_secs(local.sec - (zone as i8 as i64) * 900)
 }
 
 /// The records of a directory read into memory, with their byte offsets.
@@ -146,8 +141,6 @@ mod tests {
 
     #[test]
     fn recording_dates() {
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(2000, 3, 1), 11017);
         // 2021-02-03 04:05:06 at GMT+1 (4 units of 15 minutes).
         let d = date(&[121, 2, 3, 4, 5, 6, 4]);
         assert_eq!(d.sec, 1_612_325_106 - 3600);
