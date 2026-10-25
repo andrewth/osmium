@@ -270,6 +270,246 @@ pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
     }
 }
 
+/// Exercises osmium-net's IPv6 extras over in-memory links, with virtual
+/// time so that it needs no network: a datagram larger than the MTU is
+/// fragmented and reassembled between two interfaces, an interface forms a
+/// stable opaque and a temporary address from a router advertisement, and
+/// DHCPv6 clients (stateless, then stateful) are answered by a server played
+/// here.
+pub fn net6() {
+    use alloc::collections::VecDeque;
+    use alloc::rc::Rc;
+    use alloc::string::ToString;
+    use alloc::vec;
+    use core::cell::{Cell, RefCell};
+
+    use osmium::hal::net::{MacAddress, NetDevice, NetError};
+    use osmium::net::dhcp6::{self, Dhcp6Client, Dhcp6Event, IaAddr, IaNa, Message, Mode};
+    use osmium::net::ipv6::{self, Icmpv6Header, Ipv6Header, PrefixInfo, RouterAdvert};
+    use osmium::net::privacy::AddressGeneration;
+    use osmium::net::wire::{ETH_HEADER_LEN, EthernetHeader, PROTO_UDP, UdpHeader};
+    use osmium::net::{Instant, Interface, Ipv6Addr, SocketAddr, SocketSet, UdpSocket};
+
+    type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
+
+    /// An Ethernet port on an in-memory link; counts the fragmented IPv6
+    /// frames it sends.
+    struct Tap {
+        mac: MacAddress,
+        rx: Queue,
+        tx: Queue,
+        fragments: Rc<Cell<u32>>,
+    }
+
+    impl NetDevice for Tap {
+        fn mac_address(&self) -> MacAddress {
+            self.mac
+        }
+
+        fn transmit(&mut self, frame: &[u8]) -> Result<(), NetError> {
+            if frame.get(12..14) == Some(&[0x86, 0xdd]) && frame.get(20) == Some(&ipv6::PROTO_FRAGMENT) {
+                self.fragments.set(self.fragments.get() + 1);
+            }
+            self.tx.borrow_mut().push_back(frame.to_vec());
+            Ok(())
+        }
+
+        fn receive(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
+            let frame = self.rx.borrow_mut().pop_front().ok_or(NetError::WouldBlock)?;
+            let n = frame.len().min(buf.len());
+            let (src, dst) =
+                (frame.get(..n).ok_or(NetError::WouldBlock)?, buf.get_mut(..n).ok_or(NetError::WouldBlock)?);
+            dst.copy_from_slice(src);
+            Ok(n)
+        }
+
+        fn can_receive(&self) -> bool {
+            !self.rx.borrow().is_empty()
+        }
+
+        fn can_transmit(&self) -> bool {
+            true
+        }
+    }
+
+    let tap = |n: u8, rx: &Queue, tx: &Queue, fragments: &Rc<Cell<u32>>| Tap {
+        mac: MacAddress([2, 0, 0, 0, 0, n]),
+        rx: rx.clone(),
+        tx: tx.clone(),
+        fragments: fragments.clone(),
+    };
+    let frame =
+        |dst_mac: MacAddress, src_mac: MacAddress, src: Ipv6Addr, dst: Ipv6Addr, next: u8, hop: u8, p: &[u8]| {
+            let mut f = vec![0; ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN + p.len()];
+            EthernetHeader { dst: dst_mac, src: src_mac, ethertype: ipv6::ETHERTYPE_IPV6 }.emit(&mut f);
+            let h = Ipv6Header { src, dst, next_header: next, hop_limit: hop, payload_len: p.len(), fragment: None };
+            if let Some(ip) = f.get_mut(ETH_HEADER_LEN..) {
+                h.emit(ip);
+            }
+            if let Some(body) = f.get_mut(ETH_HEADER_LEN + ipv6::IPV6_HEADER_LEN..) {
+                body.copy_from_slice(p);
+            }
+            f
+        };
+    let any = |port| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
+
+    // A datagram of 4000 bytes over a 1500-byte link.
+    let (ab, ba): (Queue, Queue) = Default::default();
+    let fragments = Rc::new(Cell::new(0));
+    let (mut da, mut db) = (tap(1, &ba, &ab, &fragments), tap(2, &ab, &ba, &fragments));
+    let (mut a, mut b) = (Interface::new(&da, 1), Interface::new(&db, 2));
+    let (mut sa, mut sb) = (SocketSet::new(), SocketSet::new());
+    let ua = sa.add(UdpSocket::new(2, 2));
+    let ub = sb.add(UdpSocket::new(2, 2));
+    let sent: Vec<u8> = (0..4000u32).map(|i| (i * 7 + i / 256) as u8).collect();
+    let mut ok = a.enable_ipv6().is_ok() && b.enable_ipv6().is_ok();
+    ok &= sa.get_mut::<UdpSocket>(ua).bind_addr(any(1000)).is_ok();
+    ok &= sb.get_mut::<UdpSocket>(ub).bind_addr(any(7000)).is_ok();
+    let (mut ms, mut sending, mut got) = (0u64, false, false);
+    while ok && ms < 5000 && !got {
+        let now = Instant::from_millis(ms);
+        a.poll(now, &mut da, &mut sa);
+        b.poll(now, &mut db, &mut sb);
+        if !sending && let Some(to) = b.ipv6_link_local().filter(|_| a.ipv6_link_local().is_some()) {
+            sending = sa.get_mut::<UdpSocket>(ua).send_to(&sent, SocketAddr::new(to.into(), 7000)).is_ok();
+        }
+        let mut buf = vec![0u8; 4096];
+        if let Ok((n, _)) = sb.get_mut::<UdpSocket>(ub).recv_from(&mut buf) {
+            got = buf.get(..n) == Some(sent.as_slice());
+            ok = got;
+        }
+        ms += 1;
+    }
+    if got && fragments.get() > 1 {
+        println!(
+            "[net]   IPv6 fragmentation: {} bytes sent in {} fragments and reassembled",
+            sent.len(),
+            fragments.get()
+        );
+    } else {
+        println!("[net]   IPv6 fragmentation: failed");
+    }
+
+    // Stable opaque and temporary addresses from a router advertisement.
+    let (crx, ctx): (Queue, Queue) = Default::default();
+    let mut dc = tap(3, &crx, &ctx, &Rc::default());
+    let mut c = Interface::new(&dc, 3);
+    let mut sc = SocketSet::new();
+    let router_mac = MacAddress([2, 0, 0, 0, 0, 0x99]);
+    let router = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x99);
+    let prefix = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 0);
+    c.set_ipv6_address_generation(AddressGeneration::StableOpaque { secret: *b"osmium demo key!" });
+    c.set_ipv6_temporary_addresses(true);
+    let _ = c.enable_ipv6();
+    let mut advertised = false;
+    for ms in 0..4000u64 {
+        c.poll(Instant::from_millis(ms), &mut dc, &mut sc);
+        if !advertised && c.ipv6_link_local().is_some() {
+            let ra = RouterAdvert {
+                hop_limit: 64,
+                managed: false,
+                other: true,
+                router_lifetime: 1800,
+                source_ll: Some(router_mac),
+                mtu: None,
+                prefixes: vec![PrefixInfo {
+                    prefix_len: 64,
+                    on_link: true,
+                    autonomous: true,
+                    valid_lifetime: 86_400,
+                    preferred_lifetime: 14_400,
+                    prefix,
+                }],
+                dns: vec![],
+                dns_lifetime: 0,
+                dns_withdrawn: vec![],
+            };
+            let msg =
+                Icmpv6Header { ty: ipv6::ICMPV6_ROUTER_ADVERT, code: 0 }.emit(router, ipv6::ALL_NODES, &ra.emit());
+            let mac = MacAddress([0x33, 0x33, 0, 0, 0, 1]);
+            crx.borrow_mut().push_back(frame(mac, router_mac, router, ipv6::ALL_NODES, ipv6::PROTO_ICMPV6, 255, &msg));
+            advertised = true;
+        }
+        ctx.borrow_mut().clear();
+    }
+    let eui64 = ipv6::with_prefix(prefix, 64, ipv6::eui64(c.mac_address()));
+    let addrs = c.ipv6_addresses();
+    let temps = c.ipv6_temporary_addresses();
+    let stable = addrs
+        .iter()
+        .find(|a| a.usable && ipv6::same_prefix(a.addr, prefix, 64) && !temps.iter().any(|t| t.addr == a.addr))
+        .map(|a| a.addr);
+    match stable {
+        Some(addr) if temps.iter().any(|t| t.usable) && !addrs.iter().any(|a| a.addr == eui64) => {
+            println!("[net]   IPv6 privacy: stable opaque address {addr} and {} temporary", temps.len());
+        }
+        _ => println!("[net]   IPv6 privacy: failed"),
+    }
+    println!("[net]   IPv6 router flags (managed, other): {:?}", c.ipv6_ra_flags());
+
+    // DHCPv6 against a server played by hand.
+    let leased = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 0x1234);
+    let dns_server = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x53);
+    for (n, mode) in [(4u8, Mode::Stateless), (5, Mode::Stateful)] {
+        let (rx, tx): (Queue, Queue) = Default::default();
+        let mut dev = tap(n, &rx, &tx, &Rc::default());
+        let mut iface = Interface::new(&dev, u64::from(n));
+        let mut sockets = SocketSet::new();
+        let _ = iface.enable_ipv6();
+        let Ok(mut client) = Dhcp6Client::new(&mut iface, &mut sockets, mode) else {
+            println!("[net]   DHCPv6: no client");
+            continue;
+        };
+        let (mut configured, mut ms) = (false, 0u64);
+        while !configured && ms < 20_000 {
+            let now = Instant::from_millis(ms);
+            iface.poll(now, &mut dev, &mut sockets);
+            configured = client.poll(now, &mut iface, &mut sockets) == Some(Dhcp6Event::Configured);
+            iface.poll(now, &mut dev, &mut sockets);
+            let from_client: Vec<Vec<u8>> = tx.borrow_mut().drain(..).collect();
+            for f in &from_client {
+                let Some((ip, p)) = f.get(ETH_HEADER_LEN..).and_then(Ipv6Header::parse) else { continue };
+                if ip.next_header != PROTO_UDP || ip.dst != dhcp6::ALL_SERVERS {
+                    continue;
+                }
+                let Some(m) = UdpHeader::parse(p, ip.src, ip.dst).and_then(|(_, body)| Message::parse(body)) else {
+                    continue;
+                };
+                let ty = if m.ty == dhcp6::SOLICIT { dhcp6::ADVERTISE } else { dhcp6::REPLY };
+                let ia = m.ia_na.first().map(|ia| IaNa {
+                    iaid: ia.iaid,
+                    t1: 1800,
+                    t2: 2880,
+                    addrs: vec![IaAddr { addr: leased, preferred: 3600, valid: 7200, status: None }],
+                    status: None,
+                });
+                let reply = Message {
+                    ty,
+                    xid: m.xid,
+                    client_id: m.client_id.clone(),
+                    server_id: Some(dhcp6::duid_ll(router_mac)),
+                    ia_na: ia.into_iter().collect(),
+                    dns: vec![dns_server],
+                    ..Message::default()
+                };
+                let header = UdpHeader { src_port: dhcp6::SERVER_PORT, dst_port: dhcp6::CLIENT_PORT };
+                let udp = header.emit(router, ip.src, &reply.emit());
+                rx.borrow_mut().push_back(frame(dev.mac, router_mac, router, ip.src, PROTO_UDP, 64, &udp));
+            }
+            ms += 1;
+        }
+        let dns = iface.ipv6_dns().first().map(|d| d.to_string()).unwrap_or_default();
+        match (configured, mode) {
+            (true, Mode::Stateless) => println!("[net]   DHCPv6: information request answered, DNS {dns}"),
+            (true, Mode::Stateful) => {
+                let held = client.lease().and_then(|l| l.addresses.first().map(|a| a.addr));
+                println!("[net]   DHCPv6: leased {}, DNS {dns}", held.unwrap_or(Ipv6Addr::UNSPECIFIED));
+            }
+            (false, _) => println!("[net]   DHCPv6: no answer in state {:?}", client.state()),
+        }
+    }
+}
+
 /// Logs in to the iSCSI target QEMU's user network forwards to
 /// `10.0.2.100:3260` (`scripts/iscsi-target.py`), after a DHCP lease on
 /// `dev`, and round-trips a block on its LUN 0.

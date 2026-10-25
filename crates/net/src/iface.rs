@@ -24,7 +24,7 @@ use crate::wire::*;
 
 mod path_mtu;
 mod v6;
-pub use v6::Ipv6Address;
+pub use v6::{Ipv6Address, TemporaryAddress};
 
 /// Frames waiting for the device; more are dropped.
 const TX_QUEUE: usize = 128;

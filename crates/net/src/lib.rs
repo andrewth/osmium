@@ -33,11 +33,14 @@
 //! duplicate address detection, neighbor discovery instead of ARP, SLAAC from
 //! router advertisements, and UDP, TCP and ICMPv6 echo. Sockets are v4 or v6
 //! by the address they bind or connect to. IPv6 extension headers are walked
-//! on receipt; fragmented IPv6 packets are dropped rather than reassembled,
-//! and none are fragmented on send.
+//! on receipt; IPv6 datagrams larger than the MTU are fragmented on send and
+//! reassembled on receipt within bounded limits ([`frag6`]).
+//! Addresses can be MAC-derived (the default), opaque and stable per network
+//! (RFC 7217), or accompanied by temporary ones (RFC 4941); see [`privacy`].
+//! [`dhcp6::Dhcp6Client`] leases addresses from a DHCPv6 server or, in stateless
+//! mode, only DNS servers and other configuration.
 //!
-//! Not supported: IPv6 fragmentation, privacy addresses, DHCPv6, IP
-//! forwarding, IGMPv3 reports.
+//! Not supported: IP forwarding, IGMPv3 reports.
 //!
 //! [`NetDevice`]: osmium_hal::net::NetDevice
 #![no_std]
@@ -47,26 +50,29 @@ extern crate alloc;
 extern crate std;
 
 mod arp;
+pub mod dhcp6;
 mod error;
+pub mod frag6;
 mod iface;
 pub mod igmp;
 pub mod ipopt;
 pub mod ipv6;
 pub mod pmtu;
+pub mod privacy;
 mod rng;
 mod socket;
 mod time;
 pub mod wire;
 
 #[cfg(test)]
-mod testing;
-#[cfg(test)]
 mod loopback_tests;
 #[cfg(test)]
 mod reuse_tests;
+#[cfg(test)]
+mod testing;
 
 pub use error::Error;
-pub use iface::{Config, Interface, Ipv6Address};
+pub use iface::{Config, Interface, Ipv6Address, TemporaryAddress};
 pub use socket::dhcp::{DhcpClient, DhcpEvent};
 pub use socket::dns::{DnsClient, DnsError, DnsQuery};
 pub use socket::icmp::{EchoReply, IcmpSocket};
