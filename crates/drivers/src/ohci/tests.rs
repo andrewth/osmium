@@ -430,3 +430,31 @@ fn a_rejected_endpoint_table_leaves_a_started_transfer_alone() {
     assert_eq!(got, Some(Ok(8)));
     assert_eq!(report, [7; 8]);
 }
+
+#[test]
+fn interrupts_are_serviced_only_when_enabled_and_asserted() {
+    let mut rig = Rig::new(false);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ohci::new(rig.io(), &dma, &clock).unwrap();
+    let w = rig.win();
+    w.w(INTERRUPT_STATUS, INT_WDH);
+    assert!(!hc.handle_interrupt(), "not enabled");
+    hc.enable_interrupts();
+    assert_eq!(w.r(INTERRUPT_ENABLE), INT_MIE | INT_EVENTS);
+    w.w(INTERRUPT_STATUS, 0);
+    assert!(!hc.handle_interrupt(), "not ours");
+    w.w(INTERRUPT_STATUS, INT_RHSC);
+    assert!(hc.handle_interrupt());
+    assert_eq!(hc.interrupts_handled(), 1);
+    hc.disable_interrupts();
+    assert_eq!(w.r(INTERRUPT_DISABLE), INT_MIE | INT_EVENTS);
+}
+
+#[test]
+fn polled_operations_work_with_interrupts_enabled() {
+    let mut rig = Rig::new(false);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ohci::new(rig.io(), &dma, &clock).unwrap();
+    hc.enable_interrupts();
+    fakedev::exercise(&mut hc, &rig.dev, 1);
+}

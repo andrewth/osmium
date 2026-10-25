@@ -1025,6 +1025,7 @@ fn handle_trap(frame: &mut TrapFrame) {
             osmium::sched::preempt_if_needed();
         }
         (msi::VECTOR, _) => msi::on_interrupt(),
+        (usb::VECTOR, _) => usb::on_interrupt(),
         (SPURIOUS_VECTOR, _) => {}
         // A spurious IRQ from a masked PIC: no EOI (none was latched).
         (v, _) if PIC_VECTORS.contains(&v) => {}

@@ -27,10 +27,16 @@
 //! polled every frame rather than every `bInterval` frames, which devices
 //! tolerate: they NAK when they have nothing to say.
 //!
-//! The driver is polled. It needs no interrupt line, and USBINTR stays zero.
+//! Interrupts are optional. [`Uhci::enable_interrupts`] unmasks the
+//! completion and error interrupts, and the kernel's handler for the
+//! controller's line (a PCI INTx, shared with other functions) must then
+//! call [`Uhci::handle_interrupt`]. The last descriptor of every transfer
+//! asks for an interrupt on completion. Polled operations keep working: they
+//! read the descriptors, never USBSTS, so the handler cannot steal a
+//! completion from them. Until interrupts are enabled USBINTR stays zero and
+//! the driver needs no interrupt line.
 //!
-//! Not supported: isochronous endpoints, interrupt-driven completion and
-//! suspend.
+//! Not supported: isochronous endpoints and suspend.
 
 use core::mem::ManuallyDrop;
 
@@ -57,7 +63,17 @@ const CMD_RUN: u16 = 1 << 0;
 const CMD_HCRESET: u16 = 1 << 1;
 const CMD_CONFIGURE: u16 = 1 << 6;
 const CMD_MAXP: u16 = 1 << 7;
+/// A transfer descriptor with the interrupt-on-completion bit finished, or
+/// a short packet detected.
+const STS_INT: u16 = 1 << 0;
+/// A transfer descriptor ended in an error.
+const STS_ERROR: u16 = 1 << 1;
 const STS_HALTED: u16 = 1 << 5;
+/// The USBSTS bits [`Uhci::handle_interrupt`] services.
+const STS_EVENTS: u16 = STS_INT | STS_ERROR;
+/// USBINTR: interrupt on a timeout or CRC error, and on completion.
+const INTR_TIMEOUT_CRC: u16 = 1 << 0;
+const INTR_IOC: u16 = 1 << 2;
 /// Every USBSTS bit that is write-one-to-clear.
 const STS_ALL: u16 = 0x3f;
 
@@ -94,6 +110,7 @@ const TD_BABBLE: u32 = 1 << 20;
 const TD_CRC_TIMEOUT: u32 = 1 << 18;
 const TD_BITSTUFF: u32 = 1 << 17;
 const TD_ERRORS: u32 = TD_STALLED | TD_DATA_BUFFER | TD_BABBLE | TD_CRC_TIMEOUT | TD_BITSTUFF;
+const TD_IOC: u32 = 1 << 24;
 const TD_LOW_SPEED: u32 = 1 << 26;
 const TD_THREE_ERRORS: u32 = 3 << 27;
 const TD_SHORT_PACKET_DETECT: u32 = 1 << 29;
@@ -297,6 +314,10 @@ pub struct Uhci<'d, D: DmaAllocator + ?Sized> {
     devs: DevTable,
     /// The synchronous transfer's memory may still be in use by the controller.
     wedged: bool,
+    /// USBINTR has been unmasked by [`Uhci::enable_interrupts`].
+    interrupts_enabled: bool,
+    /// Interrupts [`Uhci::handle_interrupt`] has serviced.
+    interrupts: u64,
     mem: ManuallyDrop<Mem<'d, D>>,
 }
 
@@ -343,6 +364,8 @@ impl<'d, D: DmaAllocator + ?Sized> Uhci<'d, D> {
             ports,
             devs: DevTable::new(),
             wedged: false,
+            interrupts_enabled: false,
+            interrupts: 0,
             mem: ManuallyDrop::new(Mem { frames, qhs, sync, pending: [const { None }; MAX_PENDING] }),
         };
         hc.build_schedule();
@@ -357,6 +380,49 @@ impl<'d, D: DmaAllocator + ?Sized> Uhci<'d, D> {
             return Err(UhciError::Timeout);
         }
         Ok(hc)
+    }
+
+    /// Lets the controller raise its interrupt line when a transfer
+    /// completes or fails. From now on the kernel's handler must call
+    /// [`handle_interrupt`](Self::handle_interrupt).
+    ///
+    /// Polled operations keep working; see the module documentation. The
+    /// caller serializes both with one lock (the driver is `&mut self`
+    /// throughout), so the handler must not run on a CPU that holds it.
+    pub fn enable_interrupts(&mut self) {
+        self.regs.w16(USBSTS, STS_EVENTS);
+        self.regs.w16(USBINTR, INTR_TIMEOUT_CRC | INTR_IOC);
+        self.interrupts_enabled = true;
+    }
+
+    /// Stops the controller from raising interrupts (polling still works).
+    pub fn disable_interrupts(&mut self) {
+        self.regs.w16(USBINTR, 0);
+        self.interrupts_enabled = false;
+    }
+
+    /// Services the controller's interrupt by acknowledging it. Returns
+    /// false, doing nothing, if interrupts are not enabled or the controller
+    /// was not asserting one (a shared line).
+    pub fn handle_interrupt(&mut self) -> bool {
+        if !self.interrupts_enabled {
+            return false;
+        }
+        let events = self.regs.r16(USBSTS) & STS_EVENTS;
+        if events == 0 {
+            return false;
+        }
+        // Write-one-to-clear. A transfer that completes after this raises
+        // the interrupt again.
+        self.regs.w16(USBSTS, events);
+        self.interrupts += 1;
+        true
+    }
+
+    /// How many interrupts [`handle_interrupt`](Self::handle_interrupt) has
+    /// serviced.
+    pub fn interrupts_handled(&self) -> u64 {
+        self.interrupts
     }
 
     /// Number of root ports found.
@@ -427,6 +493,8 @@ impl<'d, D: DmaAllocator + ?Sized> Uhci<'d, D> {
     fn put_td(x: &Xfer<'d, D>, i: usize, last: bool, ctrl: u32, token: u32, buffer: u32) {
         let link = if last { LINK_TERMINATE } else { x.td_addr(i + 1) | LINK_DEPTH };
         let off = TD_BASE + i * TD_SIZE;
+        // One interrupt per transfer, when its last descriptor retires.
+        let ctrl = if last { ctrl | TD_IOC } else { ctrl };
         x.mem.store(off, link.to_le());
         x.mem.store(off + 4, ctrl.to_le());
         x.mem.store(off + 8, token.to_le());

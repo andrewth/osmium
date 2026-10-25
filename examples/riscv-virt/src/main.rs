@@ -38,7 +38,7 @@ use osmium::hal::block::BlockDevice;
 use osmium::hal::console::{Console, SerialConsole, set_console};
 use osmium::hal::dma::DmaAllocator;
 use osmium::hal::iommu::{DeviceId, DomainId, IoDomain, Iommu, IommuDma};
-use osmium::hal::irq::{InterruptController, IrqTable};
+use osmium::hal::irq::{InterruptController, IrqTable, RegisterError};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci;
 use osmium::hal::println;
@@ -173,7 +173,7 @@ type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
 /// Another CPU holding the lock only delays the handler until it releases.
 static XHCI: Once<osmium::sync::IrqSpinLock<Xhci<'static, Frames>>> = Once::new();
 
-/// The EHCI and OHCI controllers, polled, so under a plain interrupt-masking lock.
+/// The EHCI and OHCI controllers, under the same kind of lock as [`XHCI`].
 static EHCI: Once<osmium::sync::IrqSpinLock<Ehci<'static, Frames>>> = Once::new();
 static OHCI: Once<osmium::sync::IrqSpinLock<Ohci<'static, Frames>>> = Once::new();
 
@@ -182,10 +182,19 @@ static PLIC: Once<Plic> = Once::new();
 /// External interrupt handlers by PLIC source number.
 static IRQS: IrqTable<64> = IrqTable::new();
 
-/// PLIC handler for the xHCI function's INTx line.
-fn xhci_irq(_irq: u32) {
+/// PLIC handler for the USB controllers' INTx lines. QEMU virt swizzles four
+/// sources over every function, so two controllers can share one: each
+/// handler checks its own controller's status and ignores a line that is not
+/// its own.
+fn usb_irq(_irq: u32) {
     if let Some(xhci) = XHCI.get() {
         xhci.lock().handle_interrupt();
+    }
+    if let Some(ehci) = EHCI.get() {
+        ehci.lock().handle_interrupt();
+    }
+    if let Some(ohci) = OHCI.get() {
+        ohci.lock().handle_interrupt();
     }
 }
 
@@ -383,17 +392,11 @@ fn pci_intx_irq(fdt: &Fdt<'_>, addr: pci::Address, pin: u8) -> Option<u32> {
     None
 }
 
-/// Routes the xHCI function's INTx line to a PLIC source on this hart,
-/// registers the handler and turns the controller's interrupter on.
-/// Returns the PLIC source number.
-fn xhci_interrupts(
-    fdt: &Fdt<'_>,
-    xhci: &'static osmium::sync::IrqSpinLock<Xhci<'static, Frames>>,
-    addr: pci::Address,
-    pin: u8,
-    plic_base: u64,
-    plic_len: u64,
-) -> Option<u32> {
+/// Routes a USB function's INTx line to a PLIC source on this hart and
+/// registers [`usb_irq`] for it (once, if functions share the source). The
+/// caller then turns the controller's interrupts on. Returns the PLIC source
+/// number.
+fn usb_interrupts(fdt: &Fdt<'_>, addr: pci::Address, pin: u8, plic_base: u64, plic_len: u64) -> Option<u32> {
     if pin == 0 {
         return None;
     }
@@ -410,10 +413,12 @@ fn xhci_interrupts(
     // SAFETY: the device tree puts the PLIC here; it was mapped as device memory.
     let io = unsafe { IoMem::new(plic_base as *mut u8, plic_len as usize) };
     let plic = PLIC.call_once(|| Plic::new(io, |cpu| Plic::supervisor_context(HARTS[cpu].load(Ordering::Relaxed))));
-    IRQS.register(irq, &xhci_irq).ok()?;
+    match IRQS.register(irq, &usb_irq) {
+        Ok(()) | Err(RegisterError::Busy) => {}
+        Err(RegisterError::OutOfRange) => return None,
+    }
     plic.set_threshold(0);
     plic.enable(irq);
-    xhci.lock().enable_interrupts();
     // SAFETY: only adds supervisor external interrupts; the handler is registered.
     unsafe { riscv64::write_sie(riscv64::read_sie() | riscv64::SIE_SEIE) };
     Some(irq)
@@ -871,8 +876,11 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             // In a static, so drivers built on it (and a file system on the
             // USB stick) and the interrupt handler can live as long as the kernel.
             let xhci = XHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc));
-            match plic_reg.and_then(|(base, len)| xhci_interrupts(&fdt, xhci, addr, pin, base, len?)) {
-                Some(irq) => println!("[usb]   xHCI interrupts on PLIC source {irq}"),
+            match plic_reg.and_then(|(base, len)| usb_interrupts(&fdt, addr, pin, base, len?)) {
+                Some(irq) => {
+                    xhci.lock().enable_interrupts();
+                    println!("[usb]   xHCI interrupts on PLIC source {irq}");
+                }
                 None => println!("[usb]   xHCI interrupts unavailable; polling"),
             }
             demos::usb(xhci, now_ns);
@@ -883,7 +891,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     // --- EHCI and OHCI behind PCIe ---------------------------------------------
     match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, pci::Class::EHCI, 0)) {
-        Some((addr, base, len, _)) => {
+        Some((addr, base, len, pin)) => {
             // SAFETY: BAR 0 was just assigned this range inside the mapped
             // window; nothing else uses it.
             let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
@@ -896,7 +904,16 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
                         addr.function,
                         hc.ports()
                     );
-                    demos::usb(EHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc)), now_ns);
+                    let ehci = EHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc));
+                    match plic_reg.and_then(|(base, len)| usb_interrupts(&fdt, addr, pin, base, len?)) {
+                        Some(irq) => {
+                            ehci.lock().enable_interrupts();
+                            println!("[usb]   EHCI interrupts on PLIC source {irq}");
+                        }
+                        None => println!("[usb]   EHCI interrupts unavailable; polling"),
+                    }
+                    demos::usb(ehci, now_ns);
+                    println!("[usb]   EHCI interrupts: {}", ehci.lock().interrupts_handled());
                 }
                 Err(e) => println!("[usb]   EHCI init failed: {e:?}"),
             }
@@ -904,7 +921,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         None => println!("[usb]   no EHCI controller"),
     }
     match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, osmium::drivers::ohci::CLASS, 0)) {
-        Some((addr, base, len, _)) => {
+        Some((addr, base, len, pin)) => {
             // SAFETY: BAR 0 was just assigned this range inside the mapped
             // window; nothing else uses it.
             let io = unsafe { IoMem::new(base as *mut u8, len as usize) };
@@ -917,7 +934,16 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
                         addr.function,
                         hc.ports()
                     );
-                    demos::usb(OHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc)), now_ns);
+                    let ohci = OHCI.call_once(|| osmium::sync::IrqSpinLock::new(hc));
+                    match plic_reg.and_then(|(base, len)| usb_interrupts(&fdt, addr, pin, base, len?)) {
+                        Some(irq) => {
+                            ohci.lock().enable_interrupts();
+                            println!("[usb]   OHCI interrupts on PLIC source {irq}");
+                        }
+                        None => println!("[usb]   OHCI interrupts unavailable; polling"),
+                    }
+                    demos::usb(ohci, now_ns);
+                    println!("[usb]   OHCI interrupts: {}", ohci.lock().interrupts_handled());
                 }
                 Err(e) => println!("[usb]   OHCI init failed: {e:?}"),
             }

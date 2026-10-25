@@ -4,7 +4,7 @@
 //! [`Ohci`] resets the controller, builds a fixed schedule of endpoint
 //! descriptors and implements [`UsbHost`] for low- and full-speed devices on
 //! its root ports and on full-speed hubs. The registers are memory-mapped
-//! (PCI BAR 0). It is polled: no interrupt is enabled.
+//! (PCI BAR 0). It is polled unless [`Ohci::enable_interrupts`] is called.
 //!
 //! # Schedule
 //!
@@ -28,8 +28,18 @@
 //! Interrupt endpoints are polled every frame rather than every `bInterval`
 //! frames, which devices tolerate.
 //!
-//! Not supported: isochronous endpoints, interrupt-driven completion and
-//! suspend.
+//! # Interrupts
+//!
+//! [`Ohci::enable_interrupts`] unmasks the done-queue and root hub status
+//! change interrupts, and the kernel's handler for the controller's line (a
+//! PCI INTx, shared) must then call [`Ohci::handle_interrupt`]. The last
+//! descriptor of every transfer asks for an interrupt; the controller
+//! raises it at the end of the frame. Polled operations keep working: they
+//! read the descriptors, and the done-queue status bit they acknowledge
+//! is one the handler acknowledges too, which costs neither of them a
+//! completion.
+//!
+//! Not supported: isochronous endpoints and suspend.
 
 use core::mem::ManuallyDrop;
 
@@ -50,6 +60,7 @@ const REVISION: usize = 0x00;
 const CONTROL: usize = 0x04;
 const COMMAND_STATUS: usize = 0x08;
 const INTERRUPT_STATUS: usize = 0x0c;
+const INTERRUPT_ENABLE: usize = 0x10;
 const INTERRUPT_DISABLE: usize = 0x14;
 const HCCA: usize = 0x18;
 const CONTROL_HEAD_ED: usize = 0x20;
@@ -79,6 +90,12 @@ const CMD_BLF: u32 = 1 << 2;
 const CMD_OCR: u32 = 1 << 3;
 
 const INT_WDH: u32 = 1 << 1;
+/// Root hub status change.
+const INT_RHSC: u32 = 1 << 6;
+/// Master interrupt enable.
+const INT_MIE: u32 = 1 << 31;
+/// What [`Ohci::enable_interrupts`] unmasks.
+const INT_EVENTS: u32 = INT_WDH | INT_RHSC;
 /// Every interrupt, and the master enable, for the disable register.
 const INT_ALL: u32 = 0xc000_007f;
 
@@ -226,6 +243,10 @@ pub struct Ohci<'d, D: DmaAllocator + ?Sized> {
     devs: DevTable,
     /// The synchronous transfer's memory may still be in use by the controller.
     wedged: bool,
+    /// The interrupts have been unmasked by [`Ohci::enable_interrupts`].
+    interrupts_enabled: bool,
+    /// Interrupts [`Ohci::handle_interrupt`] has serviced.
+    interrupts: u64,
     mem: ManuallyDrop<Mem<'d, D>>,
 }
 
@@ -256,11 +277,57 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
             ports: ndp,
             devs: DevTable::new(),
             wedged: false,
+            interrupts_enabled: false,
+            interrupts: 0,
             mem: ManuallyDrop::new(Mem { hcca, eds, sync, pending: [const { None }; MAX_PENDING] }),
         };
         hc.build_schedule();
         hc.start()?;
         Ok(hc)
+    }
+
+    /// Lets the controller raise its interrupt line when a transfer retires
+    /// and when the root hub's status changes. From now on the kernel's
+    /// handler must call [`handle_interrupt`](Self::handle_interrupt).
+    ///
+    /// Polled operations keep working; see the module documentation. The
+    /// caller serializes both with one lock (the driver is `&mut self`
+    /// throughout), so the handler must not run on a CPU that holds it.
+    pub fn enable_interrupts(&mut self) {
+        self.w32(INTERRUPT_STATUS, INT_EVENTS);
+        self.w32(INTERRUPT_ENABLE, INT_MIE | INT_EVENTS);
+        self.interrupts_enabled = true;
+    }
+
+    /// Stops the controller from raising interrupts (polling still works).
+    pub fn disable_interrupts(&mut self) {
+        self.w32(INTERRUPT_DISABLE, INT_MIE | INT_EVENTS);
+        self.interrupts_enabled = false;
+    }
+
+    /// Services the controller's interrupt by acknowledging it. Returns
+    /// false, doing nothing, if interrupts are not enabled or the controller
+    /// was not asserting one (a shared line).
+    pub fn handle_interrupt(&mut self) -> bool {
+        if !self.interrupts_enabled {
+            return false;
+        }
+        let events = self.r32(INTERRUPT_STATUS) & INT_EVENTS;
+        if events == 0 {
+            return false;
+        }
+        // Write-one-to-clear. Acknowledging the done queue lets the
+        // controller write the next one. The root hub's status bits stay
+        // where `port_status` reads them.
+        self.w32(INTERRUPT_STATUS, events);
+        self.interrupts += 1;
+        true
+    }
+
+    /// How many interrupts [`handle_interrupt`](Self::handle_interrupt) has
+    /// serviced.
+    pub fn interrupts_handled(&self) -> u64 {
+        self.interrupts
     }
 
     /// Number of root ports.
@@ -366,13 +433,15 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
         usbhc::wait(self.clock, 3_000_000, || self.r32(FM_NUMBER) & 0xffff != start)
     }
 
-    /// Writes descriptor `i` of `x`, linked to descriptor `i + 1`.
+    /// Writes descriptor `i` of `x`, linked to descriptor `i + 1`. `flags`
+    /// say whether it interrupts when it retires: [`TD_NO_INTERRUPT`] for
+    /// all but a transfer's last, which interrupts at the end of the frame.
     fn put_td(x: &Xfer<'d, D>, i: usize, flags: u32, buffer: u32, len: usize) {
         let end = if len == 0 { 0 } else { buffer.wrapping_add(len as u32 - 1) };
         let cbp = if len == 0 { 0 } else { buffer };
         let next = x.td_addr(i + 1);
         let off = i * TD_SIZE;
-        x.mem.store(off, (flags | TD_NO_INTERRUPT | TD_NOT_ACCESSED << 28).to_le());
+        x.mem.store(off, (flags | TD_NOT_ACCESSED << 28).to_le());
         x.mem.store(off + 4, cbp.to_le());
         x.mem.store(off + 8, next.to_le());
         x.mem.store(off + 12, end.to_le());
@@ -382,12 +451,12 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
     fn build_control(x: &Xfer<'d, D>, setup: SetupPacket, len: usize, dir_in: bool) -> Plan {
         x.mem.write(SETUP_OFFSET, &setup.to_bytes());
         let setup_addr = (x.mem.device_addr().as_u64() + SETUP_OFFSET as u64) as u32;
-        Self::put_td(x, 0, TD_SETUP | TD_USE_TOGGLE, setup_addr, 8);
+        Self::put_td(x, 0, TD_SETUP | TD_USE_TOGGLE | TD_NO_INTERRUPT, setup_addr, 8);
         let mut next = 1;
         let mut data = None;
         if len > 0 {
             let (dp, round) = if dir_in { (TD_IN, TD_ROUNDING) } else { (TD_OUT, 0) };
-            Self::put_td(x, 1, dp | round | TD_USE_TOGGLE | TD_TOGGLE, x.buf_addr(), len);
+            Self::put_td(x, 1, dp | round | TD_USE_TOGGLE | TD_TOGGLE | TD_NO_INTERRUPT, x.buf_addr(), len);
             data = Some(1);
             next = 2;
         }

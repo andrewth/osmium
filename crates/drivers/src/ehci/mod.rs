@@ -3,7 +3,8 @@
 //!
 //! [`Ehci`] resets the controller, builds a fixed schedule of queue heads
 //! and implements [`UsbHost`] for high-speed devices on its root ports. The
-//! registers are memory-mapped (PCI BAR 0) and the driver is polled.
+//! registers are memory-mapped (PCI BAR 0) and the driver is polled unless
+//! [`Ehci::enable_interrupts`] is called.
 //!
 //! EHCI has no transaction translator of its own for the root ports:
 //! low- and full-speed devices belong to the companion UHCI or OHCI
@@ -44,8 +45,18 @@
 //! extended dwords zero. A 32-bit controller ignores them. CTRLDSSEGMENT is
 //! set to 0, so everything must still lie below 4 GiB.
 //!
-//! Not supported: isochronous and split transactions, hubs, memory above
-//! 4 GiB and interrupt-driven completion.
+//! # Interrupts
+//!
+//! [`Ehci::enable_interrupts`] unmasks transfer completion, transfer error,
+//! port change and host system error interrupts, and the kernel's handler
+//! for the controller's line (a PCI INTx, shared with the companion
+//! controllers) must then call [`Ehci::handle_interrupt`]. The last qTD of
+//! every transfer asks for an interrupt on completion. Polled operations keep
+//! working: they read the qTDs and PORTSC, and the one status bit they wait
+//! on (asynchronous advance) stays masked, so the handler never takes it.
+//!
+//! Not supported: isochronous and split transactions, hubs and memory above
+//! 4 GiB.
 
 use core::mem::ManuallyDrop;
 
@@ -83,9 +94,17 @@ const CMD_ASYNC_ENABLE: u32 = 1 << 5;
 const CMD_DOORBELL: u32 = 1 << 6;
 /// Interrupt threshold of 8 microframes, the reset default.
 const CMD_THRESHOLD: u32 = 8 << 16;
+const STS_USBINT: u32 = 1 << 0;
+const STS_ERROR: u32 = 1 << 1;
+const STS_PORT_CHANGE: u32 = 1 << 2;
+const STS_HOST_ERROR: u32 = 1 << 4;
 const STS_ASYNC_ADVANCE: u32 = 1 << 5;
 const STS_HALTED: u32 = 1 << 12;
 const STS_ALL: u32 = 0x3f;
+/// What [`Ehci::enable_interrupts`] unmasks in USBINTR, which has the same
+/// layout as USBSTS. Asynchronous advance is not among them: `abort` waits
+/// for it by polling.
+const STS_EVENTS: u32 = STS_USBINT | STS_ERROR | STS_PORT_CHANGE | STS_HOST_ERROR;
 const HCS_PORTS: u32 = 0xf;
 const HCS_PORT_POWER_CONTROL: u32 = 1 << 4;
 const HCC_64BIT: u32 = 1 << 0;
@@ -139,6 +158,7 @@ const QTD_OUT: u32 = 0 << 8;
 const QTD_IN: u32 = 1 << 8;
 const QTD_SETUP: u32 = 2 << 8;
 const QTD_THREE_ERRORS: u32 = 3 << 10;
+const QTD_IOC: u32 = 1 << 15;
 const QTD_TOGGLE: u32 = 1 << 31;
 
 /// Offset of the setup packet in a transfer's memory, after its qTDs.
@@ -241,6 +261,10 @@ pub struct Ehci<'d, D: DmaAllocator + ?Sized> {
     devs: DevTable,
     /// An abort of the synchronous transfer was not confirmed: its memory may still be in use.
     wedged: bool,
+    /// USBINTR has been unmasked by [`Ehci::enable_interrupts`].
+    interrupts_enabled: bool,
+    /// Interrupts [`Ehci::handle_interrupt`] has serviced.
+    interrupts: u64,
     mem: ManuallyDrop<Mem<'d, D>>,
 }
 
@@ -302,12 +326,58 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
             ports: ports as u8,
             devs: DevTable::new(),
             wedged: false,
+            interrupts_enabled: false,
+            interrupts: 0,
             mem: ManuallyDrop::new(Mem { frames, qhs, sync, pending: [const { None }; MAX_PENDING] }),
         };
         hc.build_schedule();
         hc.reset()?;
         hc.start(params)?;
         Ok(hc)
+    }
+
+    /// Lets the controller raise its interrupt line when a transfer
+    /// completes or fails, a port changes or the host system errs. From now
+    /// on the kernel's handler must call
+    /// [`handle_interrupt`](Self::handle_interrupt).
+    ///
+    /// Polled operations keep working; see the module documentation. The
+    /// caller serializes both with one lock (the driver is `&mut self`
+    /// throughout), so the handler must not run on a CPU that holds it.
+    pub fn enable_interrupts(&mut self) {
+        self.op_write(USBSTS, STS_EVENTS);
+        self.op_write(USBINTR, STS_EVENTS);
+        self.interrupts_enabled = true;
+    }
+
+    /// Stops the controller from raising interrupts (polling still works).
+    pub fn disable_interrupts(&mut self) {
+        self.op_write(USBINTR, 0);
+        self.interrupts_enabled = false;
+    }
+
+    /// Services the controller's interrupt by acknowledging it. Returns
+    /// false, doing nothing, if interrupts are not enabled or the controller
+    /// was not asserting one (a shared line).
+    pub fn handle_interrupt(&mut self) -> bool {
+        if !self.interrupts_enabled {
+            return false;
+        }
+        let events = self.op_read(USBSTS) & STS_EVENTS;
+        if events == 0 {
+            return false;
+        }
+        // Write-one-to-clear. A transfer that completes after this raises
+        // the interrupt again.
+        self.op_write(USBSTS, events);
+        self.interrupts += 1;
+        true
+    }
+
+    /// How many interrupts [`handle_interrupt`](Self::handle_interrupt) has
+    /// serviced.
+    pub fn interrupts_handled(&self) -> u64 {
+        self.interrupts
     }
 
     /// Number of root ports.
@@ -434,6 +504,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
         let off = i * QTD_SIZE;
         let next = if last { LINK_TERMINATE } else { x.qtd_addr(i + 1) };
         let alt = alt.map_or(LINK_TERMINATE, |a| x.qtd_addr(a));
+        // One interrupt per transfer, when its last qTD retires.
+        let token = if last { token | QTD_IOC } else { token };
         x.mem.store(off, next.to_le());
         x.mem.store(off + 4, alt.to_le());
         x.mem.store(off + 8, token.to_le());

@@ -335,3 +335,32 @@ fn a_rejected_endpoint_table_leaves_a_started_transfer_alone() {
     assert_eq!(got, Some(Ok(8)));
     assert_eq!(report, [7; 8]);
 }
+
+#[test]
+fn interrupts_are_serviced_only_when_enabled_and_asserted() {
+    let mut rig = Rig::new(false);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Uhci::new(rig.regs(), &dma, &clock).unwrap();
+    assert_eq!(Win(rig.win.as_mut_ptr().cast()).r16(USBINTR), 0, "polled until asked");
+    let w = Win(rig.win.as_mut_ptr().cast());
+    w.w16(USBSTS, STS_HALTED | STS_INT);
+    assert!(!hc.handle_interrupt(), "not enabled");
+    hc.enable_interrupts();
+    assert_eq!(w.r16(USBINTR), INTR_TIMEOUT_CRC | INTR_IOC);
+    w.w16(USBSTS, STS_HALTED);
+    assert!(!hc.handle_interrupt(), "not ours");
+    w.w16(USBSTS, STS_INT);
+    assert!(hc.handle_interrupt());
+    assert_eq!(hc.interrupts_handled(), 1);
+    hc.disable_interrupts();
+    assert_eq!(w.r16(USBINTR), 0);
+}
+
+#[test]
+fn polled_operations_work_with_interrupts_enabled() {
+    let mut rig = Rig::new(false);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Uhci::new(rig.regs(), &dma, &clock).unwrap();
+    hc.enable_interrupts();
+    fakedev::exercise(&mut hc, &rig.dev, 1);
+}
