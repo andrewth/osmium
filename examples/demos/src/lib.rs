@@ -326,8 +326,12 @@ pub fn iscsi(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
 /// the two drivers can share the controller, and is then mounted as FAT32
 /// (see [`fat`]). A CDC-ECM network adapter, in whichever of the device's
 /// configurations offers it, is switched to that configuration and resolves
-/// the gateway with [`arp_tagged`] (`now_ns` times its wait).
-pub fn usb<H, G>(shared: &'static osmium::sync::SpinLock<H, G>, now_ns: fn() -> u64)
+/// the gateway with [`arp_tagged`] (`now_ns` times its wait). Returns each
+/// device it enumerated with its configuration descriptors.
+pub fn usb<H, G>(
+    shared: &'static osmium::sync::SpinLock<H, G>,
+    now_ns: fn() -> u64,
+) -> Vec<(osmium::hal::usb::DeviceId, Vec<u8>)>
 where
     H: osmium::hal::usb::UsbHost + Send + 'static,
     G: osmium::sync::Guardian + 'static,
@@ -457,6 +461,126 @@ where
             Ok(None) => println!("[usb]     keyboard transfer still pending after disk I/O"),
             Ok(Some(ev)) => println!("[usb]     key event {ev:?}"),
             Err(e) => println!("[usb]     keyboard poll failed: {e}"),
+        }
+    }
+    found
+}
+
+/// Runs two SCSI INQUIRY commands at once over USB Attached SCSI on each
+/// SuperSpeed device in `found` with a UASP interface (class 08/06/62),
+/// which checks bulk streams: each command's tag is its stream ID, so its
+/// data and status travel on streams 1 and 2 of the same bulk endpoints.
+pub fn usb_uas<H, G>(
+    shared: &'static osmium::sync::SpinLock<H, G>,
+    found: &[(osmium::hal::usb::DeviceId, Vec<u8>)],
+    now_ns: fn() -> u64,
+) where
+    H: osmium::hal::usb::StreamHost + Send + 'static,
+    G: osmium::sync::Guardian + 'static,
+{
+    use osmium::hal::usb::{
+        Descriptor, Descriptors, SetupPacket, SsCompanion, SsEndpoint, StreamHost, UsbHost, descriptor_type,
+    };
+
+    /// Streams asked for on each data and status pipe.
+    const WANT_STREAMS: u16 = 4;
+
+    let mut host = shared;
+    for (id, config) in found {
+        // The UAS interface, its alternate setting and its endpoints by pipe ID (UAS 1.0 §3.6.1: 1 command,
+        // 2 status, 3 data-in, 4 data-out), from the Pipe Usage descriptors.
+        let mut iface = None;
+        let mut pipes: [Option<SsEndpoint>; 5] = [None; 5];
+        let mut last = None;
+        let mut in_uas = false;
+        for d in Descriptors::new(config).flatten() {
+            match d {
+                Descriptor::Interface(i) => {
+                    in_uas = i.class == 8 && i.subclass == 6 && i.protocol == 0x62;
+                    if in_uas {
+                        iface = Some((i.number, i.alternate));
+                    }
+                    last = None;
+                }
+                Descriptor::Endpoint(e) if in_uas => last = Some(SsEndpoint::plain(e)),
+                Descriptor::Other(raw) if in_uas && raw.get(1) == Some(&descriptor_type::SS_ENDPOINT_COMPANION) => {
+                    if let (Some(ep), Ok(c)) = (last.as_mut(), SsCompanion::parse(raw)) {
+                        ep.companion = Some(c);
+                    }
+                }
+                // Pipe Usage: the pipe ID follows the endpoint (and its companion).
+                Descriptor::Other(raw) if in_uas && raw.get(1) == Some(&0x24) => {
+                    if let (Some(ep), Some(&pipe)) = (last.take(), raw.get(2))
+                        && let Some(slot) = pipes.get_mut(pipe as usize)
+                    {
+                        *slot = Some(ep);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (Some((number, alt)), [_, Some(cmd), Some(status), Some(data_in), Some(data_out)]) = (iface, pipes) else {
+            continue;
+        };
+        println!("[usb]     uas: interface {number} alternate {alt}, SuperSpeed streams wanted {WANT_STREAMS}");
+        let streamed = |mut e: SsEndpoint| {
+            e.streams = WANT_STREAMS;
+            e
+        };
+        let eps = [cmd, streamed(status), streamed(data_in), streamed(data_out)];
+        let setup = SetupPacket::set_interface(number, alt);
+        if let Err(e) = host.control_out(*id, setup, &[]).and_then(|_| host.configure_endpoints_ss(*id, &eps)) {
+            println!("[usb]     uas: configuring failed: {e}");
+            continue;
+        }
+        let ep = |e: &SsEndpoint| e.descriptor.address;
+        let (status_ep, data_ep) = (ep(&status), ep(&data_in));
+        let granted = host.stream_count(*id, status_ep);
+        println!("[usb]     uas: {granted} streams on the status pipe");
+        if granted < 2 {
+            continue;
+        }
+        // Status and data transfers wait on streams 1 and 2 before the commands start them.
+        let mut result = Ok(());
+        for tag in 1..=2u16 {
+            result = result
+                .and_then(|_| host.stream_submit_in(*id, status_ep, tag, 64))
+                .and_then(|_| host.stream_submit_in(*id, data_ep, tag, 36));
+        }
+        for tag in (1..=2u16).rev() {
+            // Command IU (UAS 1.0 §6.2.2): ID 1, the tag, LUN 0 and an INQUIRY CDB for 36 bytes.
+            let mut iu = [0u8; 32];
+            iu[0] = 1;
+            iu[2..4].copy_from_slice(&tag.to_be_bytes());
+            iu[16..22].copy_from_slice(&[0x12, 0, 0, 0, 36, 0]);
+            result = result.and_then(|_| host.transfer_out(*id, ep(&cmd), &iu));
+        }
+        if let Err(e) = result {
+            println!("[usb]     uas: submitting failed: {e}");
+            continue;
+        }
+        let deadline = now_ns() + 2_000_000_000;
+        for tag in 1..=2u16 {
+            let (mut data, mut sense) = ([0u8; 36], [0u8; 64]);
+            let mut done = (None, None);
+            while (done.0.is_none() || done.1.is_none()) && now_ns() < deadline {
+                done.0 = done.0.or(host.stream_poll(*id, data_ep, tag, &mut data));
+                done.1 = done.1.or(host.stream_poll(*id, status_ep, tag, &mut sense));
+                core::hint::spin_loop();
+            }
+            match done {
+                (Some(Ok(36)), Some(Ok(n))) if n >= 7 && sense[0] == 3 && sense[2..4] == tag.to_be_bytes() => {
+                    let text = |b: &[u8]| core::str::from_utf8(b).unwrap_or("?").trim_end().len();
+                    let (vendor, product) = (&data[8..16], &data[16..32]);
+                    println!(
+                        "[usb]     uas: stream {tag}: INQUIRY \"{}\" \"{}\", SCSI status {}",
+                        core::str::from_utf8(&vendor[..text(vendor)]).unwrap_or("?"),
+                        core::str::from_utf8(&product[..text(product)]).unwrap_or("?"),
+                        sense[6]
+                    );
+                }
+                (a, b) => println!("[usb]     uas: stream {tag}: data {a:?}, status {b:?} (sense IU {:02x?})", &sense[..8]),
+            }
         }
     }
 }
