@@ -875,6 +875,7 @@ fn platform() -> osmium::proc::Platform {
         stack_top: 0xff_0000_0000,
         stack_size: 64 * 1024,
         mmap_area: 0xa0_0000_0000..0xa1_0000_0000,
+        load_base: 0xb0_0000_0000,
     }
 }
 

@@ -48,6 +48,12 @@ pub trait UserMemory: Send + Sync {
     /// allows that from here (AArch64); RISC-V still needs a `fence.i` on
     /// the hart that runs it.
     fn load_elf(&self, elf: &Elf<'_>) -> Result<u64, Errno>;
+    /// Like [`load_elf`](UserMemory::load_elf), with `bias` added to every
+    /// address, for a position-independent image. Relocations are not
+    /// applied. The default supports only a bias of 0.
+    fn load_elf_at(&self, elf: &Elf<'_>, bias: u64) -> Result<u64, Errno> {
+        if bias == 0 { self.load_elf(elf) } else { Err(Errno::ENOSYS) }
+    }
     /// A copy of this space for `fork`: the same kernel mappings, and every
     /// page this space owns shared copy-on-write: writable pages become
     /// read-only in both spaces until one of them writes (see
@@ -397,11 +403,16 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn load_elf(&self, elf: &Elf<'_>) -> Result<u64, Errno> {
+        self.load_elf_at(elf, 0)
+    }
+
+    fn load_elf_at(&self, elf: &Elf<'_>, bias: u64) -> Result<u64, Errno> {
         // The loader writes into any page already mapped, and the kernel's
         // are, through the shared root entries: keep every segment out of
         // them, and bound the total so loading cannot exhaust memory.
         let mut total = 0u64;
-        for seg in elf.segments().filter(|s| s.mem_size != 0) {
+        elf.span_at(bias).ok_or(Errno::ENOEXEC)?;
+        for seg in elf.segments_at(bias).filter(|s| s.mem_size != 0) {
             let end = seg.vaddr.checked_add(seg.mem_size).ok_or(Errno::ENOEXEC)?;
             if !self.is_user_range(seg.vaddr, end) {
                 return Err(Errno::ENOEXEC);
@@ -415,7 +426,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         let Inner { pt, pages } = &mut *inner;
         // The frames the loader allocates, until we know which page each is.
         let mut fresh: Fresh<A> = ArcTree::new();
-        let loaded = elf.load_into(pt, MapFlags::USER, || {
+        let loaded = elf.load_into_at(pt, MapFlags::USER, bias, || {
             let pa = self.alloc.alloc_table()?;
             // The page owns the frame from here, and frees it if the loader
             // then fails to map it.
@@ -425,7 +436,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         });
         // Record where each new frame went, so `unmap` and `fork` find it,
         // even after a failure part-way.
-        for seg in elf.segments().filter(|s| s.mem_size != 0) {
+        for seg in elf.segments_at(bias).filter(|s| s.mem_size != 0) {
             let end = seg.vaddr.saturating_add(seg.mem_size);
             for page in (seg.vaddr & !(PAGE - 1)..end).step_by(PAGE_SIZE) {
                 let Some(t) = pt.translate(VirtAddr::new(page)) else { continue };
@@ -444,7 +455,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         drop(fresh);
         loaded.map_err(|e| if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::ENOEXEC })?;
         // Every non-empty segment was checked to end inside the user half above.
-        let end = elf.segments().filter(|s| s.mem_size != 0).map(|s| s.vaddr.saturating_add(s.mem_size)).max();
+        let end = elf.segments_at(bias).filter(|s| s.mem_size != 0).map(|s| s.vaddr.saturating_add(s.mem_size)).max();
         end.unwrap_or(0).checked_next_multiple_of(PAGE).ok_or(Errno::ENOEXEC)
     }
 
