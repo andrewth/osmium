@@ -35,6 +35,12 @@ pub(crate) trait UserRegs {
     /// address `ra` (for architectures that use a link register) and
     /// arguments `args`.
     fn enter_handler(&mut self, pc: u64, sp: u64, ra: u64, args: [u64; 3]);
+    /// Arranges for the system-call instruction that just trapped to run
+    /// again as call `nr` with first argument `arg0`: the program counter
+    /// goes back over the instruction, and the registers the call's result
+    /// overwrote (the number on x86_64, the first argument elsewhere) are
+    /// restored.
+    fn rewind_syscall(&mut self, nr: u64, arg0: u64);
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -76,6 +82,12 @@ impl UserRegs for osmium_arch::trap::TrapFrame {
         self.x[2] = sp;
         self.x[1] = ra;
         self.x[10..13].copy_from_slice(&args);
+    }
+    fn rewind_syscall(&mut self, nr: u64, arg0: u64) {
+        // `ecall` is 4 bytes.
+        self.epc = self.epc.wrapping_sub(4);
+        self.x[10] = arg0;
+        self.x[17] = nr;
     }
 }
 
@@ -120,6 +132,12 @@ impl UserRegs for osmium_arch::trap::TrapFrame {
         self.sp = sp;
         self.x[30] = ra;
         self.x[..3].copy_from_slice(&args);
+    }
+    fn rewind_syscall(&mut self, nr: u64, arg0: u64) {
+        // `svc` is 4 bytes.
+        self.elr = self.elr.wrapping_sub(4);
+        self.x[0] = arg0;
+        self.x[8] = nr;
     }
 }
 
@@ -176,5 +194,10 @@ impl UserRegs for osmium_arch::trap::TrapFrame {
         [self.rdi, self.rsi, self.rdx] = args;
         // A syscall number left in rax must not leak into the handler.
         self.rax = 0;
+    }
+    fn rewind_syscall(&mut self, nr: u64, _arg0: u64) {
+        // `syscall` is 2 bytes, and leaves `rdi` alone.
+        self.rip = self.rip.wrapping_sub(2);
+        self.rax = nr;
     }
 }

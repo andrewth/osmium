@@ -151,11 +151,15 @@ fn console() -> &'static Arc<Console> {
         let c = Arc::new(Console::default());
         set_console(c.clone());
         let etc: Arc<dyn File> = Arc::new(Dir(alloc::vec![("motd", Arc::new(Text("welcome\n", 3)) as Arc<dyn File>)]));
-        let bin: Arc<dyn File> = Arc::new(Dir(alloc::vec![("prog", Arc::new(Bytes(program(), 5)) as Arc<dyn File>)]));
+        let mut programs = alloc::vec![("prog", Arc::new(Bytes(program(), 5)) as Arc<dyn File>)];
+        programs.extend(pie::images());
+        let bin: Arc<dyn File> = Arc::new(Dir(programs));
         let root = Dir(alloc::vec![
             ("hello.txt", Arc::new(Text("hello, file\n", 2)) as Arc<dyn File>),
             ("etc", etc),
             ("bin", bin),
+            // Somewhere to bind sockets.
+            ("tmp", osmium_fs::RamFs::new(7).root()),
         ]);
         set_vfs(Box::leak(Box::new(Vfs::new(Arc::new(root)))));
         c
@@ -373,7 +377,7 @@ fn files_through_the_vfs() {
         names.push(String::from_utf8(name[..name.iter().position(|&b| b == 0).unwrap()].to_vec()).unwrap());
         off += reclen;
     }
-    assert_eq!(names, [".", "..", "hello.txt", "etc", "bin"]);
+    assert_eq!(names, [".", "..", "hello.txt", "etc", "bin", "tmp"]);
     assert_eq!(call(&p, Sys::Getdents64, &[dir, DATA + 0x1000, 0x1000]), 0, "exhausted");
 }
 
@@ -459,6 +463,7 @@ fn platform() {
             stack_top: STACK_TOP,
             stack_size: 0x4000,
             mmap_area: 0x200_0000..0x210_0000,
+            load_base: 0x1000_0000,
         })
     });
 }
@@ -714,6 +719,95 @@ fn unmapping_and_remapping_forgets_copy_on_write() {
     drop((p, c));
     assert_eq!(frames.live(), 1);
 }
+const LAZY: u64 = 0x40_0000;
+
+#[test]
+fn lazy_areas_get_pages_on_first_touch() {
+    let (p, frames) = process("demand");
+    let m = p.memory();
+    let live = frames.live();
+    m.map_lazy(LAZY, 0x10_0000, MapFlags::RW).unwrap();
+    assert_eq!(frames.live(), live, "reserving costs nothing");
+    assert_eq!(m.map_lazy(LAZY + 0x1000, 0x1000, MapFlags::RW), Err(Errno::EINVAL), "overlaps an area");
+    assert_eq!(m.map_lazy(DATA, 0x1000, MapFlags::RW), Err(Errno::EINVAL), "overlaps a page");
+    assert_eq!(m.map_lazy(LAZY + 1, 0x1000, MapFlags::RW), Err(Errno::EINVAL), "unaligned");
+
+    // Faults outside every area are real faults; inside, both kinds work.
+    assert!(!p.handle_page_fault(LAZY - 0x1000, false));
+    assert!(!p.handle_page_fault(LAZY + 0x10_0000, true));
+    assert!(p.handle_page_fault(LAZY + 0x2008, false));
+    assert_eq!(frames.live(), live + 1 + 1, "a page, plus a table");
+    assert!(!p.handle_page_fault(LAZY + 0x2008, false), "it has its page now");
+    assert!(p.handle_page_fault(LAZY + 0x3000, true));
+    assert_eq!(get(&p, LAZY + 0x3000, 4), [0; 4]);
+    put(&p, LAZY + 0x3000, b"data");
+    assert_eq!(get(&p, LAZY + 0x3000, 4), b"data");
+
+    // Kernel copies populate too: a write spanning two untouched pages.
+    let before = frames.live();
+    put(&p, LAZY + 0x5ffe, b"abcd");
+    assert_eq!(frames.live(), before + 2);
+    assert_eq!(get(&p, LAZY + 0x5ffe, 4), b"abcd");
+    // And a read of an untouched page sees zeroes and makes one.
+    assert_eq!(get(&p, LAZY + 0x8000, 4), [0; 4]);
+    assert_eq!(frames.live(), before + 3);
+
+    // Unmapping the middle frees what was touched and splits the area.
+    let before = frames.live();
+    m.unmap(LAZY + 0x2000, 0x2000);
+    assert_eq!(frames.live(), before - 2);
+    assert!(!p.handle_page_fault(LAZY + 0x2000, false), "gone");
+    assert!(p.handle_page_fault(LAZY + 0x4000, true), "the rest is still an area");
+    assert!(p.handle_page_fault(LAZY + 0x1000, false), "and so is the part below");
+    drop((p, m));
+    assert_eq!(frames.live(), 1);
+}
+
+#[test]
+fn lazy_areas_enforce_their_permissions() {
+    let (p, _) = process("demand-perm");
+    let m = p.memory();
+    m.map_lazy(LAZY, 0x1000, MapFlags::READ).unwrap();
+    m.map_lazy(LAZY + 0x1000, 0x1000, MapFlags::NONE).unwrap();
+    assert!(!p.handle_page_fault(LAZY, true), "read-only");
+    assert!(p.handle_page_fault(LAZY, false));
+    assert!(!p.handle_page_fault(LAZY + 0x1000, false), "no access at all");
+    let mut b = [0; 1];
+    assert_eq!(m.read(LAZY + 0x1000, &mut b), Err(Errno::EFAULT));
+    assert_eq!(m.write(LAZY, b"x"), Err(Errno::EFAULT));
+}
+
+#[test]
+fn forked_lazy_areas_fault_in_separately() {
+    let (p, frames) = process("demand-fork");
+    p.memory().map_lazy(LAZY, 0x4000, MapFlags::RW).unwrap();
+    put(&p, LAZY, b"parent");
+    let c = fork_child(&p);
+    // The touched page is shared copy-on-write, the untouched ones are not there yet.
+    let live = frames.live();
+    assert!(c.handle_page_fault(LAZY + 0x2000, true));
+    assert_eq!(frames.live(), live + 1);
+    assert_eq!(get(&p, LAZY + 0x2000, 1), [0], "the parent's page 2 is still absent, and zero");
+    put(&c, LAZY, b"child ");
+    assert_eq!(get(&p, LAZY, 6), b"parent");
+    drop((p, c));
+    assert_eq!(frames.live(), 1);
+}
+
+#[test]
+fn mmap_system_call_is_demand_paged() {
+    let (p, frames) = process("mmap-demand");
+    let live = frames.live();
+    let va = call(&p, Sys::Mmap, &[0, 0x8_0000, 3, 0x22, u64::MAX, 0]) as u64;
+    assert!(va > 0);
+    assert_eq!(frames.live(), live, "no frames until touched");
+    put(&p, va + 0x3000, b"hi");
+    assert_eq!(get(&p, va + 0x3000, 2), b"hi");
+    assert_eq!(frames.live(), live + 2, "a page and a table");
+    assert_eq!(call(&p, Sys::Munmap, &[va, 0x8_0000]), 0);
+    assert!(!p.handle_page_fault(va + 0x3000, false), "unmapped");
+}
+
 #[test]
 fn iovec_arithmetic_is_checked() {
     let (p, _) = process("iov-overflow");
@@ -746,4 +840,8 @@ mod blocked;
 mod filemap;
 mod hostile;
 mod oom;
+mod pie;
+mod restart;
 mod sigthread;
+mod smp;
+mod unix;

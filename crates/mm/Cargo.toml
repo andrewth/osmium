@@ -12,3 +12,8 @@ workspace = true
 [dependencies]
 osmium-arch.workspace = true
 osmium-sync.workspace = true
+
+[features]
+# The `vma` module, which needs the `alloc` crate (and so a global allocator
+# in every binary that links it).
+alloc = ["osmium-sync/alloc"]

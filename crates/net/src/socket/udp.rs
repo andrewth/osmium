@@ -4,7 +4,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr};
 
-use super::{Cx, Packet, binds};
+use super::{Cx, Packet, ReuseOptions, binds};
 use crate::wire::{PROTO_UDP, UdpHeader};
 use crate::{Error, Instant};
 
@@ -21,6 +21,7 @@ pub const MAX_PAYLOAD_V6: usize = 65535 - 8;
 /// A UDP socket with bounded queues of datagrams in each direction.
 pub struct UdpSocket {
     local: Option<SocketAddr>,
+    reuse: ReuseOptions,
     rx: VecDeque<(SocketAddr, Vec<u8>)>,
     tx: VecDeque<(SocketAddr, Vec<u8>)>,
     rx_limit: usize,
@@ -40,7 +41,14 @@ impl UdpSocket {
     /// `tx_packets` outgoing datagrams. Datagrams that arrive when the
     /// receive queue is full are dropped.
     pub fn new(rx_packets: usize, tx_packets: usize) -> Self {
-        Self { local: None, rx: VecDeque::new(), tx: VecDeque::new(), rx_limit: rx_packets, tx_limit: tx_packets }
+        Self {
+            local: None,
+            reuse: ReuseOptions::NONE,
+            rx: VecDeque::new(),
+            tx: VecDeque::new(),
+            rx_limit: rx_packets,
+            tx_limit: tx_packets,
+        }
     }
 
     /// Binds the socket to `port` on every IPv4 address of the interface.
@@ -51,7 +59,9 @@ impl UdpSocket {
         self.bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
     }
 
-    /// Binds the socket to `local`; an unspecified address takes traffic
+    /// Binds the socket to `local` without looking at the other sockets of
+    /// the set ([`SocketSet::bind_udp`](super::SocketSet::bind_udp) also
+    /// refuses an address that is taken); an unspecified address takes traffic
     /// to any address of the interface of its family (including IPv4
     /// broadcasts). A socket serves one family: it sends only to remotes of
     /// the family it is bound to.
@@ -67,6 +77,18 @@ impl UdpSocket {
         Ok(())
     }
 
+    /// Sets `SO_REUSEADDR` / `SO_REUSEPORT`. They take effect at the next
+    /// bind made through [`SocketSet::bind_udp`](super::SocketSet::bind_udp),
+    /// which checks them against the other sockets of the set.
+    pub fn set_reuse(&mut self, reuse: ReuseOptions) {
+        self.reuse = reuse;
+    }
+
+    /// The socket's reuse options.
+    pub fn reuse(&self) -> ReuseOptions {
+        self.reuse
+    }
+
     /// The address the socket is bound to.
     pub fn local_endpoint(&self) -> Option<SocketAddr> {
         self.local
@@ -74,7 +96,7 @@ impl UdpSocket {
 
     /// Unbinds the socket and discards both queues.
     pub fn close(&mut self) {
-        self.local = None;
+        self.local = None; // the reuse options stay
         self.rx.clear();
         self.tx.clear();
     }

@@ -10,7 +10,12 @@
 //! | `sync` | `osmium-sync` | spin locks, once cells, per-CPU data, SPSC ring, intrusive lists |
 //! | `mm` | `osmium-mm` | addresses, memory maps, frame allocators, page tables, heap |
 //! | `hal` | `osmium-hal` | MMIO/port I/O, device traits, IRQ dispatch, console |
-//! | `drivers` | `osmium-drivers` | 16550, PL011, PLIC, GICv2, local APIC, RAM disk |
+//! | `drivers` | `osmium-drivers` | 16550, PL011, PIT, `fw_cfg`, virtio transports and GPU, displays |
+//! | `sysdrv` | `osmium-sysdrv` | PLIC, CLINT, GICv2, local APIC, I/O APIC, VT-d, AMD-Vi, SMMUv3, RISC-V IOMMU |
+//! | `storage` | `osmium-storage` | virtio-blk, AHCI, NVMe, RAM disk |
+//! | `display` | `osmium-display` | virtio-gpu, Bochs DISPI, VESA BIOS Extensions |
+//! | `usb` | `osmium-usb` | xHCI, EHCI, OHCI and UHCI host controllers, USB class drivers |
+//! | `netdev` | `osmium-netdev` | virtio-net, mlx4 and USB CDC network drivers |
 //! | `boot` | `osmium-boot` | FDT and Multiboot2 parsing, FDT writer |
 //! | `sched` | `osmium-sched` | tasks, context switch, schedulers, wait queues, timers |
 //! | `virt` | `osmium-virt` | guest memory, stage-2 tables, device buses, VM exits |
@@ -22,16 +27,29 @@
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
 //! | `net` | `osmium-net` | IPv4 stack: ARP, ICMP echo, UDP, TCP, DHCP client |
 //! | `iscsi` | `osmium-iscsi` | iSCSI initiator: a remote SCSI disk over TCP as a block device |
+//! | `acpi` | `osmium-acpi` | ACPI: FADT, AML interpreter, devices, resources, PCI routing, sleep states, SCI and GPE events |
 //!
 //! The library never defines an entry point, panic handler or global
 //! allocator: the OS assembles those from the parts it uses.
 #![no_std]
 
 pub use osmium_arch as arch;
+#[cfg(feature = "acpi")]
+pub use osmium_acpi as acpi;
 #[cfg(feature = "boot")]
 pub use osmium_boot as boot;
 #[cfg(feature = "drivers")]
 pub use osmium_drivers as drivers;
+#[cfg(feature = "usb")]
+pub use osmium_usb as usb;
+#[cfg(feature = "sysdrv")]
+pub use osmium_sysdrv as sysdrv;
+#[cfg(feature = "display")]
+pub use osmium_display as display;
+#[cfg(feature = "storage")]
+pub use osmium_storage as storage;
+#[cfg(feature = "netdev")]
+pub use osmium_netdev as netdev;
 #[cfg(feature = "exec")]
 pub use osmium_exec as exec;
 #[cfg(feature = "fs")]

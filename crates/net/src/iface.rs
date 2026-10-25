@@ -22,6 +22,7 @@ use crate::socket::tcp::reset_for;
 use crate::socket::{Cx, Packet, Socket, SocketSet, dhcp};
 use crate::wire::*;
 
+mod path_mtu;
 mod v6;
 pub use v6::Ipv6Address;
 
@@ -172,6 +173,8 @@ pub struct Interface {
     igmp: Igmp,
     multicast_ttl: u8,
     v6: v6::State,
+    /// Path MTUs learned from ICMP, for IPv4 and IPv6 destinations.
+    pmtu: crate::pmtu::PathMtuCache,
     /// IPv4 packets addressed to 127.0.0.0/8, delivered by the next poll.
     loopback: VecDeque<Vec<u8>>,
     /// Set while a looped-back packet is being processed.
@@ -208,6 +211,7 @@ impl Interface {
             igmp: Igmp::new(),
             multicast_ttl: 1,
             v6: v6::State::new(dev.mac_address()),
+            pmtu: crate::pmtu::PathMtuCache::new(),
             loopback: VecDeque::new(),
             looping: false,
             looped: false,
@@ -378,6 +382,7 @@ impl Interface {
                 mac: self.mac,
                 mss: self.mss(),
                 mss6: self.mss6(),
+                pmtu: Some(&self.pmtu),
                 rng: &mut self.rng,
             };
             s.dispatch(&mut cx, &mut out);
@@ -499,11 +504,11 @@ impl Interface {
 
     /// The frames that carry `p` to `dst_mac`: one, or fragments if it
     /// exceeds the MTU.
-    fn ip_frames(&mut self, dst_mac: MacAddress, p: &Packet) -> Vec<Vec<u8>> {
+    fn ip_frames(&mut self, dst_mac: MacAddress, p: &Packet, mtu: usize) -> Vec<Vec<u8>> {
         let (IpAddr::V4(p_src), IpAddr::V4(p_dst)) = (p.src, p.dst) else { return Vec::new() };
         self.ident = self.ident.wrapping_add(1);
-        let step = self.mtu.saturating_sub(IPV4_HEADER_LEN) / 8 * 8;
-        let whole = IPV4_HEADER_LEN + p.payload.len() <= self.mtu;
+        let step = mtu.saturating_sub(IPV4_HEADER_LEN) / 8 * 8;
+        let whole = IPV4_HEADER_LEN + p.payload.len() <= mtu;
         // IGMP carries the router alert option (RFC 2236); it is never
         // fragmented.
         let alert = p.protocol == PROTO_IGMP && whole;
@@ -540,8 +545,9 @@ impl Interface {
         frames
     }
 
-    fn queue_ip(&mut self, dst_mac: MacAddress, p: &Packet) {
-        for frame in self.ip_frames(dst_mac, p) {
+    /// Queues `p` for `dst_mac`, fragmented to `mtu`, the path's.
+    fn queue_ip(&mut self, dst_mac: MacAddress, p: &Packet, mtu: usize) {
+        for frame in self.ip_frames(dst_mac, p, mtu) {
             self.queue_frame(frame);
         }
     }
@@ -552,8 +558,9 @@ impl Interface {
         let (IpAddr::V4(_), IpAddr::V4(p_dst)) = (p.src, p.dst) else { return self.send_ip6(now, p) };
         // TCP sizes its segments to the MTU and relies on DF; everything else
         // is fragmented.
-        let too_big = IPV4_HEADER_LEN + p.payload.len() > self.mtu;
-        if (too_big && p.protocol == PROTO_TCP) || p.payload.len() > MAX_DATAGRAM || self.mtu < IPV4_HEADER_LEN + 8 {
+        let mtu = self.pmtu.path_mtu(p.dst, self.mtu, now);
+        let too_big = IPV4_HEADER_LEN + p.payload.len() > mtu;
+        if (too_big && p.protocol == PROTO_TCP) || p.payload.len() > MAX_DATAGRAM || mtu < IPV4_HEADER_LEN + 8 {
             return;
         }
         if p.dst.is_loopback() {
@@ -562,7 +569,7 @@ impl Interface {
         if p.dst.is_multicast() {
             // Multicast has no next hop to resolve: the group names the MAC.
             if self.config.is_some() {
-                self.queue_ip(multicast_mac(p_dst), &p);
+                self.queue_ip(multicast_mac(p_dst), &p, mtu);
             }
             return;
         }
@@ -574,10 +581,10 @@ impl Interface {
             _ => return,
         };
         let Some(hop) = next_hop else {
-            return self.queue_ip(MacAddress::BROADCAST, &p);
+            return self.queue_ip(MacAddress::BROADCAST, &p, mtu);
         };
         if let Some(mac) = self.arp.lookup(hop, now) {
-            return self.queue_ip(mac, &p);
+            return self.queue_ip(mac, &p, mtu);
         }
         if self.pending.len() >= PENDING {
             return;
@@ -630,7 +637,8 @@ impl Interface {
             match self.pending.get(i) {
                 Some(p) if p.next_hop == ip => {
                     if let Some(p) = self.pending.remove(i) {
-                        self.queue_ip(mac, &p.packet);
+                        let mtu = self.pmtu.path_mtu(p.packet.dst, self.mtu, now);
+                        self.queue_ip(mac, &p.packet, mtu);
                     }
                 }
                 _ => i += 1,
@@ -766,6 +774,7 @@ impl Interface {
             mac: self.mac,
             mss: self.mss(),
             mss6: self.mss6(),
+            pmtu: Some(&self.pmtu),
             rng: &mut self.rng,
         };
         let mut reply = None;
@@ -798,6 +807,10 @@ impl Interface {
                             }
                         }
                     }
+                    ICMP_DEST_UNREACHABLE if to_us && icmp.code == crate::pmtu::ICMP_FRAGMENTATION_NEEDED => {
+                        // The unused field's low half is the next hop's MTU.
+                        self.process_frag_needed(now, usize::from(icmp.seq), data, sockets);
+                    }
                     _ => {}
                 }
             }
@@ -809,19 +822,24 @@ impl Interface {
                 let dst = SocketAddr::new(ip.dst.into(), udp.dst_port);
                 let src = SocketAddr::new(ip.src.into(), udp.src_port);
                 let mut delivered = false;
-                for (_, s) in sockets.iter_mut() {
-                    match s {
-                        Socket::Udp(s) if s.accepts(dst) => {
+                let targets = sockets.udp_targets(src, dst);
+                // The DHCP client takes its replies when its handle comes before the UDP sockets'.
+                let dhcp = if udp.dst_port == dhcp::CLIENT_PORT && udp.src_port == dhcp::SERVER_PORT {
+                    sockets.iter().find(|(h, s)| matches!(s, Socket::Dhcp(_)) && targets.first().is_none_or(|t| h < t))
+                } else {
+                    None
+                };
+                if let Some((h, _)) = dhcp {
+                    if let Some(s) = sockets.try_get_mut::<crate::DhcpClient>(h) {
+                        s.process(&mut cx, data);
+                    }
+                    delivered = true;
+                } else {
+                    for h in targets {
+                        if let Some(s) = sockets.try_get_mut::<crate::UdpSocket>(h) {
                             s.process(src, data);
                             delivered = true;
-                            break;
                         }
-                        Socket::Dhcp(s) if udp.dst_port == dhcp::CLIENT_PORT && udp.src_port == dhcp::SERVER_PORT => {
-                            s.process(&mut cx, data);
-                            delivered = true;
-                            break;
-                        }
-                        _ => {}
                     }
                 }
                 // No errors about frames that went to the whole link.
@@ -860,7 +878,6 @@ impl Interface {
                 let src = SocketAddr::new(ip.src.into(), tcp.src_port);
                 let socket = {
                     let mut exact = None;
-                    let mut listen = None;
                     let mut queued = None;
                     for (h, s) in sockets.iter() {
                         if let Socket::Tcp(s) = s {
@@ -868,15 +885,12 @@ impl Interface {
                                 exact = Some(h);
                                 break;
                             }
-                            if listen.is_none() && s.accepts_listen(dst) {
-                                listen = Some(h);
-                            }
                             if queued.is_none() && s.accepts_queued(dst) {
                                 queued = Some(h);
                             }
                         }
                     }
-                    exact.or(listen).or(queued)
+                    exact.or_else(|| sockets.tcp_listener(src, dst)).or(queued)
                 };
                 let rst = match socket {
                     Some(h) => sockets.get_mut::<crate::TcpSocket>(h).process(&mut cx, dst, src, &tcp, data),

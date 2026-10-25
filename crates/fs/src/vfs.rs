@@ -284,6 +284,54 @@ impl Vfs {
         }
     }
 
+    /// Makes `new` a hard link to the existing non-directory `old` (`link`;
+    /// a final symbolic link in `old` is linked itself, not followed).
+    ///
+    /// `EPERM` for a directory or a file system without hard links, `EEXIST`
+    /// if `new` exists, `EXDEV` if the two are on different file systems.
+    pub fn link(&self, old: &str, new: &str) -> Result<(), Errno> {
+        let target = self.resolve(old, false)?.node;
+        if target.try_stat()?.kind == FileKind::Directory {
+            return Err(Errno::EPERM);
+        }
+        let parent = self.parent(new)?;
+        match parent.name {
+            Some(name) if name != "." && name != ".." && !parent.trailing_slash => parent.dir.link(name, &*target),
+            _ => Err(Errno::EEXIST),
+        }
+    }
+
+    /// Moves `old` to `new` (`rename`), replacing `new` if it exists as
+    /// [`File::rename`] describes.
+    ///
+    /// `EBUSY` for `/` or a mount point, `EINVAL` for `.`, `..` or moving a
+    /// directory below itself, `EXDEV` across file systems, `EPERM` where the
+    /// file system has no rename.
+    pub fn rename(&self, old: &str, new: &str) -> Result<(), Errno> {
+        let from = self.parent(old)?;
+        let to = self.parent(new)?;
+        let (Some(from_name), Some(to_name)) = (from.name, to.name) else { return Err(Errno::EBUSY) };
+        if from_name == "." || from_name == ".." || to_name == "." || to_name == ".." {
+            return Err(Errno::EINVAL);
+        }
+        let from_path = join(&from.path, from_name)?;
+        let to_path = join(&to.path, to_name)?;
+        if self.is_mount_point(&from_path) || self.is_mount_point(&to_path) {
+            return Err(Errno::EBUSY);
+        }
+        let kind = from.dir.lookup(from_name)?.try_stat()?.kind;
+        if (from.trailing_slash || to.trailing_slash) && kind != FileKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if from_path == to_path {
+            return Ok(());
+        }
+        if kind == FileKind::Directory && is_inside(&to_path, &from_path) {
+            return Err(Errno::EINVAL);
+        }
+        from.dir.rename(from_name, &*to.dir, to_name)
+    }
+
     /// The target of the symbolic link `path`.
     pub fn readlink(&self, path: &str) -> Result<String, Errno> {
         let node = self.resolve(path, false)?.node;

@@ -9,13 +9,13 @@
 use alloc::vec::Vec;
 
 use osmium::boot::fdt::Fdt;
-use osmium::drivers::iommu::smmuv3::Smmuv3;
 use osmium::hal::iommu::{DeviceId, Iommu};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci;
 use osmium::hal::println;
 use osmium::hal::timer::Clock;
 use osmium::mm::{MapFlags, PAGE_SIZE, PhysAddr, VirtAddr};
+use osmium::sysdrv::iommu::smmuv3::{Smmuv3, StreamTableLayout};
 
 struct Uptime;
 
@@ -92,5 +92,20 @@ pub fn demo(fdt: &Fdt<'_>) {
             demos::iommu::testdev(&unit, id, map(bar.address, bar.size), &crate::FRAMES, "smmuv3");
         }
         Err(e) => println!("[iommu] SMMUv3 at {:#x}: init failed: {e:?}", smmu.0),
+    }
+
+    // The same device again through stage 1 (context descriptor, ASID 2) and a
+    // two-level stream table, which allocates the level-2 table the test
+    // device's stream ID falls in when it attaches.
+    let layout = StreamTableLayout::TwoLevel;
+    match Smmuv3::with_layout(map(smmu.0, 0x20000), &crate::FRAMES, &Uptime, 0, 0x1ff, layout) {
+        Ok(unit) => match unit.stage1() {
+            Ok(stage1) => {
+                println!("[iommu] SMMUv3 stage 1, two-level stream table: {}", unit.two_level());
+                demos::iommu::testdev(&stage1, id, map(bar.address, bar.size), &crate::FRAMES, "smmuv3 stage 1");
+            }
+            Err(e) => println!("[iommu] SMMUv3 has no stage 1: {e:?}"),
+        },
+        Err(e) => println!("[iommu] SMMUv3 two-level init failed: {e:?}"),
     }
 }

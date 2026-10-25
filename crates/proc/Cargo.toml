@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 osmium-arch.workspace = true
 osmium-sync = { workspace = true, features = ["alloc"] }
-osmium-mm.workspace = true
+osmium-mm = { workspace = true, features = ["alloc"] }
 osmium-sched.workspace = true
 osmium-boot.workspace = true
 osmium-fs.workspace = true

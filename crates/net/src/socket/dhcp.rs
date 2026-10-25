@@ -548,6 +548,7 @@ mod tests {
             mac,
             mss: 1460,
             mss6: 1440,
+            pmtu: None,
             addr6: None,
             link_local6: None,
             rng: &mut rng,

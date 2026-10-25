@@ -79,6 +79,32 @@ fn fp_state_follows_its_task() {
 }
 
 #[test]
+fn sve_state_task_runs_and_hosted_enable_reports_none() {
+    become_cpu();
+    // SAFETY: hosted, so there are no SVE registers to disturb.
+    assert_eq!(unsafe { osmium_arch::fp::sve::enable() }, None);
+    assert!(!osmium_arch::fp::avx_enabled());
+    let n = Arc::new(AtomicUsize::new(0));
+    let tasks: Vec<_> = (0..2)
+        .map(|_| {
+            let n = n.clone();
+            // The hosted SveState save/restore are no-ops, so this checks the
+            // builder and the switch path only.
+            builder("sve").sve_state().spawn(move || {
+                for _ in 0..3 {
+                    osmium_sched::yield_now();
+                }
+                n.fetch_add(1, Ordering::Relaxed);
+            })
+        })
+        .collect();
+    for t in &tasks {
+        t.join();
+    }
+    assert_eq!(n.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn exited_task_is_freed() {
     become_cpu();
     let payload = Arc::new(());

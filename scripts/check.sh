@@ -15,7 +15,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc -q --workspace --all-features --no-deps
 
 for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64imac-unknown-none-elf; do
     echo "== build $target"
-    cargo build -q --workspace --all-features --target "$target"
+    # osmium-drivers only has the std-backed `testing` feature, so it is built as a dependency instead.
+    cargo build -q --workspace --exclude osmium-drivers --all-features --target "$target"
 done
 
 # Variants that save FP registers in the context switch.
@@ -128,6 +129,7 @@ vdisk=$(mktemp)
 sata=$(mktemp)
 nvdisk=$(mktemp)
 iscsi=$(mktemp)
+vcon=$(mktemp)
 truncate -s 8M "$vdisk" "$sata" "$nvdisk" "$iscsi"
 truncate -s 40000K "$stick" "$stick_ehci" "$stick_ohci"
 tftp=$(mktemp -d)
@@ -171,7 +173,13 @@ EXPECT=(
     'init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok'
     'init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok'
     'init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok'
+    'init: smp: 3 threads of process [0-9]* read a page on several CPUs; munmap faulted them all: ok'
+    'init: restart: read gave EINTR without SA_RESTART and was restarted transparently with it (1 byte): ok'
+    'init: futex: FUTEX_LOCK_PI waited, was handed the lock by FUTEX_UNLOCK_PI, and released it: ok'
     '1 of 1 init address space torn down'
+    'pie: PIE: position independent code; 23 letters, function pointer says 42; AT_PHDR 0x14[0-9a-f]*; kernel relocated us'
+    'dyn: ld: loaded at 0x14[0-9a-f]*, relocated [0-9]* entries of the program'
+    'dyn: PIE: position independent code; 23 letters, function pointer says 42; AT_PHDR 0x14[0-9a-f]*; interpreter relocated us'
     '/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries'
     '\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111'
     '\[guest\] hello over MMIO'
@@ -194,19 +202,26 @@ EXPECT=(
     'OHCI interrupts: [1-9]'
     '\[ahci\]  port 0 "QEMU HARDDISK": 16384 sectors of 512; round trip Ok(8192)'
     '\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512; round trip Ok(8192)'
+    '\[nvme\]  .* 4 I/O queues; round trip on each: 4 ok'
     '\[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512'
     '\[iscsi\] wrote and read back block 8192'
     '\[virtio-gpu\] 640x400 32bpp, stride 2560: colour bars drawn'
+    '\[virtio-gpu\] EDID: .* prefers [1-9][0-9]*x[1-9][0-9]*'
+    '\[virtio-gpu\] cursor image set and moved'
     '\[bochs\] 640x480 32bpp, stride 2560: colour bars drawn'
     '\[virtio-gpu-mmio\] 640x400 32bpp, stride 2560: colour bars drawn'
+    '\[virtio-gpu-mmio\] EDID: .* prefers [1-9][0-9]*x[1-9][0-9]*'
+    '\[virtio-gpu-mmio\] cursor image set and moved'
     'DNS: localhost is 127.0.0.1'
     '\[sock\]  10.0.2.15 on the socket stack'
     'net: TCP echo from 10.0.2.100:7 via 10.0.2.15:[0-9]*: sent 18, got "hello over sockets"'
     'net: TCP read after the server closed: 0'
     'net: UDP TFTP from 10.0.2.2:[0-9]*: opcode 3 block 1: "hello over UDP"'
     'net: socketpair: epoll idle 0, ready 1 with data 42; sendmsg 9, recvmsg 9: "ping-pong"'
+    'net: unix: bind 0, listen 0, connect 0; sendmsg 1, recvmsg 1: descriptor read "via-fd"'
     'net: UDP loopback: bind 0, sent 5, peeked 5 then read 5 from 127.0.0.1:[0-9]*: "local"'
     '\[sock\]  net exited'
+    '\[vcon\]  virtio-console ([a-z0-9.]*) at 0x[0-9a-f]*: wrote 38 bytes to port 0'
     ${fat_expect[@]+"${fat_expect[@]}"}
 )
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
@@ -220,8 +235,10 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,bus=xhci.0,drive=stick \
     -device ahci,id=ahci0 -drive if=none,id=sd0,format=raw,file="$sata" -device ide-hd,drive=sd0,bus=ahci0.0 \
     -drive if=none,id=nv0,format=raw,file="$nvdisk" -device nvme,serial=osmium0,drive=nv0 \
-    -device virtio-gpu-device -device virtio-gpu-pci,id=gpu -device bochs-display -qmp "unix:$qmp,server=on,wait=off"
+    -device virtio-gpu-device -device virtio-gpu-pci,id=gpu -device bochs-display -qmp "unix:$qmp,server=on,wait=off" \
+    -chardev file,id=vc0,path="$vcon" -device virtio-serial-device -device virtconsole,chardev=vc0
 screen_wait riscv-virt
+grep -aq "hello from osmium over virtio-console" "$vcon" || { echo "riscv-virt: virtio-console output did not reach the host"; exit 1; }
 if [ "${#fat_expect[@]}" -gt 0 ] && command -v qemu-system-riscv64 >/dev/null; then
     echo "== fsck.fat the USB stick the kernel wrote"
     report=$(PATH=$PATH:/usr/sbin fsck.fat -n -l "$stick") || { echo "$report"; echo "riscv-virt: fsck.fat rejected the USB stick"; exit 1; }
@@ -231,7 +248,7 @@ if [ "${#fat_expect[@]}" -gt 0 ] && command -v qemu-system-riscv64 >/dev/null; t
         grep -q "/OSMIUM/Hello from osmium.txt" <<<"$report" || { echo "$report"; echo "riscv-virt: file missing on a stick behind EHCI or OHCI"; exit 1; }
     done
 fi
-rm -f "$stick" "$stick_ehci" "$stick_ohci" "$vdisk" "$sata" "$nvdisk" "$iscsi"
+rm -f "$stick" "$stick_ehci" "$stick_ohci" "$vdisk" "$sata" "$nvdisk" "$iscsi" "$vcon"
 rm -rf "$tftp"
 # RISC-V IOMMU: QEMU's riscv-iommu-pci translates the DMA of every PCI device
 # on the bus, so this boot carries only an NVMe disk and QEMU's iommu-testdev.
@@ -248,6 +265,7 @@ if command -v qemu-system-riscv64 >/dev/null && qemu-system-riscv64 -device help
         'riscv-iommu: detached device blocked'
         '\[iommu\] NVMe .* attached to domain 1'
         '\[nvme\]  .* "QEMU NVMe Ctrl" namespace 1: 16384 blocks of 512. round trip Ok(8192)'
+        '\[nvme\]  .* 4 I/O queues; round trip on each: 4 ok'
         '\[iommu\] NVMe detached: Ok(()), 0 faults logged'
     )
     boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
@@ -259,6 +277,7 @@ else
     echo "== QEMU lacks riscv-iommu-pci or iommu-testdev; skipping the RISC-V IOMMU boot"
 fi
 EXPECT=(
+    '\[fp\]    no SVE: tasks keep q0-q31 only'
     '\[guard\] task "deep" overflowed'
     'nested Breakpoint on the exception stack'
     'user-bad killed: PageFault'
@@ -279,21 +298,35 @@ EXPECT=(
     'init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok'
     'init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok'
     'init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok'
+    'init: smp: 3 threads of process [0-9]* read a page on several CPUs; munmap faulted them all: ok'
+    'init: restart: read gave EINTR without SA_RESTART and was restarted transparently with it (1 byte): ok'
+    'init: futex: FUTEX_LOCK_PI waited, was handed the lock by FUTEX_UNLOCK_PI, and released it: ok'
     '1 of 1 init address space torn down'
     '/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries'
     '\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111'
 )
+EXPECT=('\[gic\]   GICv2 distributor')
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
+# The same kernel on a GICv3 (distributor, redistributors, system-register
+# CPU interface, affinity-routed SGIs), probed from the device tree.
+EXPECT=('\[gic\]   GICv3 distributor' '\[smp\]   MPIDR 0x[0-9a-f]* online as CPU 3')
+boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
+    -machine virt,gic-version=3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
 # Arm SMMUv3 in front of the PCI bus (virt,iommu=smmuv3), with QEMU's
 # iommu-testdev: stage-2 translation of the test device's DMA, a blocked
-# unmapped address and a blocked detached device.
+# unmapped address and a blocked detached device; then the same through
+# stage 1 behind a two-level stream table.
 if command -v qemu-system-aarch64 >/dev/null && qemu-system-aarch64 -device help 2>&1 | grep -q 'iommu-testdev'; then
     EXPECT=(
         '\[iommu\] SMMUv3 at 0x[0-9a-f]*: 44 bit I/O addresses'
         'smmuv3: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'
         'smmuv3: DMA to an unmapped IOVA blocked'
         'smmuv3: detached device blocked'
+        'SMMUv3 stage 1, two-level stream table: true'
+        'smmuv3 stage 1: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'
+        'smmuv3 stage 1: DMA to an unmapped IOVA blocked'
+        'smmuv3 stage 1: detached device blocked'
     )
     boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
         -machine virt,gic-version=2,iommu=smmuv3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi \
@@ -317,6 +350,13 @@ for s in "$stick_uhci" "$stick_ehci"; do
 done
 screen qemu-system-x86_64 640 400
 EXPECT=(
+    '\[aml\]   1 tables loaded (0 failed): [0-9]* objects, [0-9]* devices'
+    '\[aml\]   _REG run [0-9]* times, _INI [0-9]* times, 0 methods failed'
+    '\[aml\]   host bridge .*PCI0 (PNP0A08): [0-9]* resources, buses Some((0, 255))'
+    '\[aml\]   PCI routing: [0-9]* rows; device [0-9]* INT[A-D] -> GSI [0-9]* (level'
+    '\[aml\]   .*_S5_ sleep type 0/0'
+    '\[acpi\]  ACPI mode on, SCI on IRQ 9'
+    '\[acpi\]  powering off through .*_S5_'
     '\[guard\] task "deep" overflowed'
     'user-bad killed: PageFault'
     'user-1 exited with status 0 (kernel sees CPU 1)'
@@ -338,9 +378,18 @@ EXPECT=(
     'init: threads: thread [0-9]* of process [0-9]* joined with futex; shared counter, thread id, TLS: ok'
     'init: threads: 3 threads slept on a futex, were requeued and woken, and joined: ok'
     'init: threads: exit_group ended a spinning thread, process [0-9]* status 9: ok'
+    'init: smp: 3 threads of process [0-9]* read a page on several CPUs; munmap faulted them all: ok'
+    'init: restart: read gave EINTR without SA_RESTART and was restarted transparently with it (1 byte): ok'
+    'init: futex: FUTEX_LOCK_PI waited, was handed the lock by FUTEX_UNLOCK_PI, and released it: ok'
     '1 of 1 init address space torn down'
     '/etc/motd: "welcome to osmium"; /tmp/note ok; / has 5 entries'
     '\[balance\] 8 unpinned tasks spawned on CPU 0 ran on CPUs 0b1111'
+    '\[fp\]    ymm0 kept across XSAVE/XRSTOR: ok'
+    '\[hpet\]  [0-9]* comparators, [0-9]* bit counter at [0-9]* MHz'
+    '\[hpet\]  main counter agrees with a 10 ms PIT wait'
+    '\[hpet\]  comparator [0-9] -> I/O APIC input [0-9]* -> vector 41'
+    '\[hpet\]  one-shot comparator interrupt taken'
+    '\[hpet\]  periodic comparator interrupts taken'
     '\[vesa\]  VBE 3.0, .* set mode 0x[0-9a-f]*: 800x600 32bpp at'
     '\[vesa\]  DISPI 0xb0c5 reads back the BIOS.s mode'
     '\[vesa\] 800x600 32bpp, stride 3200: colour bars drawn'
@@ -391,6 +440,19 @@ if command -v qemu-system-x86_64 >/dev/null && qemu-system-x86_64 -device help 2
     boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
         -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
         -device intel-iommu,aw-bits=48 -device iommu-testdev
+    # The same in scalable mode, with interrupt remapping switched on and off around it
+    # (the split irqchip is what QEMU requires for `intremap`).
+    EXPECT=(
+        '\[iommu\] VT-d unit at 0xfed90000: 48 bit I/O addresses'
+        '\[iommu\] VT-d scalable mode: PASID directory and table per device, queued invalidation'
+        '\[iommu\] VT-d interrupt remapping on with 256 entries; entry programmed true, invalidated and cleared true'
+        'vt-d-scalable: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'
+        'vt-d-scalable: DMA to an unmapped IOVA blocked'
+        'vt-d-scalable: detached device blocked'
+    )
+    boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
+        -machine q35,kernel-irqchip=split -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
+        -device intel-iommu,aw-bits=48,x-scalable-mode=on,intremap=on -device iommu-testdev
     EXPECT=(
         '\[iommu\] AMD-Vi unit at 0xfed80000: 48 bit I/O addresses'
         'amd-vi: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'

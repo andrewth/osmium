@@ -188,7 +188,7 @@ fn sockets_over_a_simulated_link() {
     assert_eq!(call(&p, Sys::Socket, &[2, 1, 0]), err(Errno::EAFNOSUPPORT), "no stack yet");
     let (net, mut peer) = setup();
 
-    assert_eq!(call(&p, Sys::Socket, &[1, 1, 0]), err(Errno::EAFNOSUPPORT));
+    assert_eq!(call(&p, Sys::Socket, &[10, 1, 0]), err(Errno::EAFNOSUPPORT));
     assert_eq!(call(&p, Sys::Socket, &[2, 3, 0]), err(Errno::EPROTOTYPE));
     assert_eq!(call(&p, Sys::Socket, &[2, 2, 6]), err(Errno::EPROTONOSUPPORT));
     assert_eq!(call(&p, Sys::Bind, &[9, ADDR, 16]), err(Errno::EBADF));
@@ -324,6 +324,7 @@ fn sockets_over_a_simulated_link() {
     assert_eq!(call(&p, Sys::Bind, &[u, ADDR, 16]), err(Errno::EBADF));
 
     loopback(&p);
+    address_reuse(&p);
 }
 
 /// Traffic to 127.0.0.0/8 stays inside the stack, and sockets poll, peek and
@@ -404,4 +405,127 @@ fn loopback(p: &Process) {
     assert_eq!(revents(p, rx, IN), 0);
     assert_eq!(call(p, Sys::Close, &[rx]), 0);
     assert_eq!(call(p, Sys::Close, &[tx]), 0);
+}
+
+fn set_opt(p: &Process, fd: u64, name: u64, on: bool) -> i64 {
+    put(p, BUF, &i32::from(on).to_ne_bytes());
+    call(p, Sys::Setsockopt, &[fd, 1, name, BUF, 4])
+}
+
+fn get_opt(p: &Process, fd: u64, name: u64) -> i32 {
+    put(p, LEN, &4u32.to_ne_bytes());
+    assert_eq!(call(p, Sys::Getsockopt, &[fd, 1, name, BUF, LEN]), 0);
+    i32::from_ne_bytes(get(p, BUF, 4).try_into().unwrap())
+}
+
+fn bind_to(p: &Process, fd: u64, ip: Ipv4Addr, port: u16) -> i64 {
+    put(p, ADDR, &sockaddr(ip, port));
+    call(p, Sys::Bind, &[fd, ADDR, 16])
+}
+
+/// `SO_REUSEADDR` and `SO_REUSEPORT` through `setsockopt`, then the bind
+/// checks and the spreading of connections and datagrams they bring.
+fn address_reuse(p: &Process) {
+    const REUSEADDR: u64 = 2;
+    const REUSEPORT: u64 = 15;
+    let lo = Ipv4Addr::new(127, 0, 0, 1);
+    let any = Ipv4Addr::UNSPECIFIED;
+    let stream = |p: &Process| call(p, Sys::Socket, &[2, STREAM_NB, 0]) as u64;
+    let dgram = |p: &Process| call(p, Sys::Socket, &[2, DGRAM | 0o4000, 0]) as u64;
+
+    // The options read back what was set.
+    let a = stream(p);
+    assert_eq!((get_opt(p, a, REUSEADDR), get_opt(p, a, REUSEPORT)), (0, 0));
+    assert_eq!(set_opt(p, a, REUSEADDR, true), 0);
+    assert_eq!((get_opt(p, a, REUSEADDR), get_opt(p, a, REUSEPORT)), (1, 0));
+    assert_eq!(set_opt(p, a, REUSEADDR, false), 0);
+    assert_eq!(get_opt(p, a, REUSEADDR), 0);
+
+    // A listener holds its port against SO_REUSEADDR sockets too.
+    assert_eq!(set_opt(p, a, REUSEADDR, true), 0);
+    assert_eq!(bind_to(p, a, any, 9300), 0);
+    assert_eq!(call(p, Sys::Listen, &[a, 4]), 0);
+    let b = stream(p);
+    assert_eq!(bind_to(p, b, lo, 9300), err(Errno::EADDRINUSE), "no options");
+    assert_eq!(set_opt(p, b, REUSEADDR, true), 0);
+    assert_eq!(bind_to(p, b, lo, 9300), err(Errno::EADDRINUSE), "the other one listens");
+    assert_eq!(call(p, Sys::Close, &[b]), 0);
+    assert_eq!(call(p, Sys::Close, &[a]), 0);
+
+    // SO_REUSEPORT listeners share a port and split the connections.
+    let servers: Vec<u64> = (0..2)
+        .map(|_| {
+            let s = stream(p);
+            assert_eq!(set_opt(p, s, REUSEPORT, true), 0);
+            assert_eq!(bind_to(p, s, any, 9301), 0);
+            assert_eq!(call(p, Sys::Listen, &[s, 8]), 0);
+            s
+        })
+        .collect();
+    let plain = stream(p);
+    assert_eq!(bind_to(p, plain, any, 9301), err(Errno::EADDRINUSE), "without SO_REUSEPORT");
+    let clients: Vec<u64> = (0..8)
+        .map(|_| {
+            let c = stream(p);
+            let r = connect_to(p, c, lo, 9301);
+            assert!(r == 0 || r == err(Errno::EINPROGRESS), "connect: {r}");
+            c
+        })
+        .collect();
+    let mut got = [0; 2];
+    for (n, &s) in got.iter_mut().zip(&servers) {
+        while call(p, Sys::Accept4, &[s, 0, 0, 0o4000]) >= 0 {
+            *n += 1;
+        }
+    }
+    assert_eq!(got.iter().sum::<i32>(), 8, "{got:?}");
+    assert!(got.iter().all(|&n| n > 0), "both sockets accepted: {got:?}");
+    for fd in clients.into_iter().chain(servers).chain([plain]) {
+        call(p, Sys::Close, &[fd]);
+    }
+
+    // The same for datagrams, and SO_REUSEADDR shares a UDP port too.
+    let rx: Vec<u64> = (0..2)
+        .map(|_| {
+            let s = dgram(p);
+            assert_eq!(set_opt(p, s, REUSEPORT, true), 0);
+            assert_eq!(bind_to(p, s, any, 9400), 0);
+            s
+        })
+        .collect();
+    let late = dgram(p);
+    assert_eq!(bind_to(p, late, any, 9400), err(Errno::EADDRINUSE));
+    assert_eq!(set_opt(p, late, REUSEADDR, true), 0);
+    assert_eq!(bind_to(p, late, any, 9400), err(Errno::EADDRINUSE), "the others lack SO_REUSEADDR");
+    let tx: Vec<u64> = (0..8)
+        .map(|_| {
+            let t = dgram(p);
+            put(p, ADDR, &sockaddr(lo, 9400));
+            put(p, BUF, b"d");
+            assert_eq!(call(p, Sys::Sendto, &[t, BUF, 1, 0, ADDR, 16]), 1);
+            t
+        })
+        .collect();
+    let mut got = [0; 2];
+    for (n, &s) in got.iter_mut().zip(&rx) {
+        while call(p, Sys::Recvfrom, &[s, BUF, 8, 0, 0, 0]) > 0 {
+            *n += 1;
+        }
+    }
+    assert_eq!(got.iter().sum::<i32>(), 8, "{got:?}");
+    assert!(got.iter().all(|&n| n > 0), "both sockets received: {got:?}");
+    for fd in tx.into_iter().chain(rx).chain([late]) {
+        call(p, Sys::Close, &[fd]);
+    }
+    let shared: Vec<u64> = (0..2)
+        .map(|_| {
+            let s = dgram(p);
+            assert_eq!(set_opt(p, s, REUSEADDR, true), 0);
+            assert_eq!(bind_to(p, s, any, 9401), 0);
+            s
+        })
+        .collect();
+    for fd in shared {
+        call(p, Sys::Close, &[fd]);
+    }
 }

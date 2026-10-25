@@ -15,28 +15,30 @@ const ESRCH: i64 = -3;
 const EAGAIN: i64 = -(Errno::EAGAIN.0 as i64);
 const EINTR: i64 = -(Errno::EINTR.0 as i64);
 
-const STACK: u64 = DATA + 0x3000;
-const HANDLER: u64 = 0x40_1234;
+pub(super) const STACK: u64 = DATA + 0x3000;
+pub(super) const HANDLER: u64 = 0x40_1234;
 
 /// A register file with the user-visible state of a trap frame.
 #[allow(dead_code)]
-struct Regs<const ON_STACK: bool> {
-    sp: u64,
-    pc: u64,
+pub(super) struct Regs<const ON_STACK: bool> {
+    pub(super) sp: u64,
+    pub(super) pc: u64,
     ra: u64,
     args: [u64; 3],
     ret: u64,
     tls: u64,
     gp: [u64; NREGS],
+    /// The (number, first argument) of the last `rewind_syscall`.
+    pub(super) restarted: Option<(u64, u64)>,
 }
 
 impl<const S: bool> Regs<S> {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut gp = [0; NREGS];
         for (i, r) in gp.iter_mut().enumerate() {
             *r = 0x1000 + i as u64;
         }
-        Self { sp: STACK, pc: 0x40_0000, ra: 0, args: [0; 3], ret: 0, tls: 0, gp }
+        Self { sp: STACK, pc: 0x40_0000, ra: 0, args: [0; 3], ret: 0, tls: 0, gp, restarted: None }
     }
 }
 
@@ -75,9 +77,13 @@ impl<const S: bool> UserRegs for Regs<S> {
     fn enter_handler(&mut self, pc: u64, sp: u64, ra: u64, args: [u64; 3]) {
         (self.pc, self.sp, self.ra, self.args) = (pc, sp, ra, args);
     }
+    fn rewind_syscall(&mut self, nr: u64, arg0: u64) {
+        self.pc -= if S { 2 } else { 4 };
+        self.restarted = Some((nr, arg0));
+    }
 }
 
-fn callt(p: &Process, th: &Thread, sys: Sys, args: &[u64]) -> i64 {
+pub(super) fn callt(p: &Process, th: &Thread, sys: Sys, args: &[u64]) -> i64 {
     let mut a = [0; 6];
     a[..args.len()].copy_from_slice(args);
     match dispatch_as(p, th, sys.number(), a) {
@@ -87,7 +93,7 @@ fn callt(p: &Process, th: &Thread, sys: Sys, args: &[u64]) -> i64 {
 }
 
 /// Installs `act` for `sig` with `rt_sigaction`, through a user buffer.
-fn sigaction(p: &Process, sig: u8, act: SigAction) -> i64 {
+pub(super) fn sigaction(p: &Process, sig: u8, act: SigAction) -> i64 {
     let words = if cfg!(target_arch = "x86_64") {
         alloc::vec![act.handler, act.flags, act.restorer, act.mask]
     } else {
@@ -98,11 +104,11 @@ fn sigaction(p: &Process, sig: u8, act: SigAction) -> i64 {
     call(p, Sys::RtSigaction, &[sig as u64, DATA + 0x800, 0, 8])
 }
 
-fn handler(flags: u64, mask: u64) -> SigAction {
+pub(super) fn handler(flags: u64, mask: u64) -> SigAction {
     SigAction { handler: HANDLER, flags, restorer: 0, mask }
 }
 
-fn bit(sig: u8) -> u64 {
+pub(super) fn bit(sig: u8) -> u64 {
     1 << (sig - 1)
 }
 
@@ -332,12 +338,20 @@ impl Process {
     }
 }
 
-fn clone_flags() -> u64 {
+pub(super) fn clone_flags() -> u64 {
     // VM | FS | FILES | SIGHAND | THREAD | SYSVSEM | SETTLS | PARENT_SETTID | CHILD_CLEARTID
     0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x10_0000 | 0x20_0000
 }
 
-fn clone_thread(p: &Process, th: &Thread, flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -> Outcome {
+pub(super) fn clone_thread(
+    p: &Process,
+    th: &Thread,
+    flags: u64,
+    stack: u64,
+    ptid: u64,
+    ctid: u64,
+    tls: u64,
+) -> Outcome {
     let a = if cfg!(target_arch = "x86_64") {
         [flags, stack, ptid, ctid, tls, 0]
     } else {
@@ -502,8 +516,8 @@ fn futex_wait_and_wake() {
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 0, 8, 0]), EAGAIN);
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr + 1, 0, 7, 0]), EINVAL, "unaligned");
     assert_eq!(callt(&p, &th, Sys::Futex, &[0xdead_0000, 0, 7, 0]), -(Errno::EFAULT.0 as i64));
-    for pi in [6, 7, 8, 11, 12, 13] {
-        assert_eq!(callt(&p, &th, Sys::Futex, &[addr, pi, 0, 0]), -(Errno::ENOSYS.0 as i64), "PI futex {pi}");
+    for pi in [11, 12] {
+        assert_eq!(callt(&p, &th, Sys::Futex, &[addr, pi, 0, 0]), -(Errno::ENOSYS.0 as i64), "requeue-PI futex {pi}");
     }
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 9, 7, 0, 0, 0]), EINVAL, "an empty bitset");
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 10, 1, 0, 0, 0]), EINVAL, "an empty bitset");

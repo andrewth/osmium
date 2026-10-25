@@ -38,7 +38,7 @@ use osmium_fs::{Errno, File};
 use osmium_mm::addr::{PAGE_SIZE, VirtAddr};
 use osmium_mm::paging::{MapFlags, PageSize, PageTableFormat, TableAlloc};
 
-use super::{AddressSpace, Frame, Inner, PAGE, Page, sync_icache};
+use super::{AddressSpace, Deferred, Frame, Inner, PAGE, Page, sync_icache};
 
 /// What `mmap` asks of the space for a file.
 #[derive(Clone)]
@@ -256,14 +256,6 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         self.inner.lock().maps.add(va, end, Some((map.file, map.offset)), map.shared, prot, writable)
     }
 
-    pub(super) fn reserve_impl(&self, va: u64, len: u64) -> Result<(), Errno> {
-        let end = va.checked_add(len).ok_or(Errno::EINVAL)?;
-        if !va.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) || len == 0 {
-            return Err(Errno::EINVAL);
-        }
-        self.inner.lock().maps.add(va, end, None, false, MapFlags::NONE, true)
-    }
-
     /// Makes the pages a kernel copy of `va..va + len` will touch present
     /// (and, for a store, writable), loading them from their files.
     pub(super) fn fault_in(&self, va: u64, len: usize, write: bool) -> Result<(), Errno> {
@@ -359,7 +351,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         }
 
         let mut guard = self.inner.lock();
-        let Inner { pt, pages, maps } = &mut *guard;
+        let Inner { pt, pages, maps, .. } = &mut *guard;
         // Unmapped, or mapped again as something else, while the lock was off.
         let Some(v) = maps.find(page).filter(|v| v.id == id) else { return false };
         let (shared, prot) = (v.shared, v.prot);
@@ -398,7 +390,9 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
 
     /// Whether anything is mapped in `from..to`, by a file mapping or a page.
     fn anything_in(inner: &Inner<F, A>, from: u64, to: u64) -> bool {
-        inner.maps.overlapping(from, to).next().is_some() || inner.pages.lower_bound(&from).is_some_and(|p| p.va() < to)
+        inner.maps.overlapping(from, to).next().is_some()
+            || inner.vmas.overlaps(from, to)
+            || inner.pages.lower_bound(&from).is_some_and(|p| p.va() < to)
     }
 
     pub(super) fn mprotect_impl(&self, va: u64, len: u64, prot: MapFlags) -> Result<(), Errno> {
@@ -415,49 +409,61 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         if none {
             self.writeback(va, end)?;
         }
-        let mut guard = self.inner.lock();
-        if !Self::anything_in(&guard, va, end) {
-            return Err(Errno::ENOMEM);
-        }
-        let Inner { pt, pages, maps } = &mut *guard;
-        for v in maps.overlapping(va, end) {
-            if v.shared && prot.contains(MapFlags::WRITE) && !v.writable {
-                return Err(Errno::EACCES);
+        {
+            // Declared first so it is dropped (and the shootdown sent) after the lock.
+            let mut deferred = Deferred::<A>::new();
+            let mut guard = self.inner.lock();
+            if !Self::anything_in(&guard, va, end) {
+                return Err(Errno::ENOMEM);
+            }
+            let Inner { pt, pages, maps, vmas } = &mut *guard;
+            for v in maps.overlapping(va, end) {
+                if v.shared && prot.contains(MapFlags::WRITE) && !v.writable {
+                    return Err(Errno::EACCES);
+                }
+            }
+            if none {
+                let mut from = va;
+                while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&a| a < end) {
+                    from = at + PAGE;
+                    if !maps.find(at).is_some_and(|v| v.shared) {
+                        return Err(Errno::EINVAL);
+                    }
+                }
+            }
+            // Areas of lazy anonymous memory take the new access too, so pages
+            // that appear later get it. Each piece is atomic; running out of
+            // memory part-way leaves the earlier ones changed.
+            let mut at = va;
+            while let Some(v) = vmas.first_overlap(at, end) {
+                at = v.end;
+                vmas.protect(v.start.max(va), v.end.min(end), prot).map_err(|_| Errno::ENOMEM)?;
+            }
+            maps.carve(va, end, Edit::Prot(prot))?;
+            if none {
+                maps.clear_dirty(va, end);
+            } else {
+                let mut from = va;
+                while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&a| a < end) {
+                    from = at + PAGE;
+                    let mut flags = prot;
+                    let cow = pages.find(&at).is_some_and(|p| p.is_cow());
+                    let clean = maps.find(at).is_some_and(|v| v.shared) && !maps.is_dirty(at);
+                    // A copy-on-write page gets its write access back by faulting,
+                    // and a clean shared page by being written to.
+                    if cow || clean {
+                        flags = flags.difference(MapFlags::WRITE);
+                    }
+                    if let Ok(flush) = pt.protect(VirtAddr::new(at), flags | MapFlags::USER) {
+                        flush.flush();
+                        deferred.stale(at);
+                    }
+                }
             }
         }
         if none {
-            let mut from = va;
-            while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&a| a < end) {
-                from = at + PAGE;
-                if !maps.find(at).is_some_and(|v| v.shared) {
-                    return Err(Errno::EINVAL);
-                }
-            }
-        }
-        maps.carve(va, end, Edit::Prot(prot))?;
-        let mut from = va;
-        while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&a| a < end) {
-            from = at + PAGE;
-            let vaddr = VirtAddr::new(at);
-            if none {
-                if let Ok((_, flush)) = pt.unmap(vaddr) {
-                    flush.flush();
-                }
-                drop(pages.take_key(&at));
-                maps.clear_dirty(at, at + PAGE);
-                continue;
-            }
-            let mut flags = prot;
-            let cow = pages.find(&at).is_some_and(|p| p.is_cow());
-            let clean = maps.find(at).is_some_and(|v| v.shared) && !maps.is_dirty(at);
-            // A copy-on-write page gets its write access back by faulting,
-            // and a clean shared page by being written to.
-            if cow || clean {
-                flags = flags.difference(MapFlags::WRITE);
-            }
-            if let Ok(flush) = pt.protect(vaddr, flags | MapFlags::USER) {
-                flush.flush();
-            }
+            // Every page left is shared and was saved above; they reload on a later grant.
+            self.drop_pages(va, end);
         }
         Ok(())
     }
@@ -493,8 +499,10 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     pub(super) fn writeback(&self, from: u64, to: u64) -> Result<(), Errno> {
         let mut jobs: Vec<Job<A>> = Vec::new();
         {
+            // Declared first so it is dropped (and the shootdown sent) after the lock.
+            let mut deferred = Deferred::<A>::new();
             let mut guard = self.inner.lock();
-            let Inner { pt, pages, maps } = &mut *guard;
+            let Inner { pt, pages, maps, .. } = &mut *guard;
             let count = maps.dirty_in(from, to).len();
             if count == 0 {
                 return Ok(());
@@ -508,6 +516,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                     && let Ok(flush) = pt.protect(VirtAddr::new(d), t.flags.difference(MapFlags::WRITE))
                 {
                     flush.flush();
+                    deferred.stale(d);
                 }
                 jobs.push(Job { file, off: v.off.saturating_add(d - v.start), va: d, frame: page.frame().clone() });
             }

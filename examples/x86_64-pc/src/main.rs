@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+mod aml;
 mod iommu;
 mod msi;
 mod usb;
@@ -24,22 +25,23 @@ use core::ptr::NonNull;
 use osmium::arch::trap::{self, Access, Trap, TrapFrame};
 use osmium::arch::x86_64 as x86;
 use osmium::arch::{MAX_CPUS, cpu, irq};
-use osmium::boot::acpi::{Acpi, Dmar, EcamWindow, Ivrs, Madt, Mcfg};
+use osmium::boot::acpi::{Acpi, Dmar, EcamWindow, HpetTable, Ivrs, Madt, Mcfg};
 use osmium::boot::pvh::StartInfo;
-use osmium::drivers::lapic::{self, LocalApic};
-use osmium::drivers::pit::{self, Pit};
-use osmium::drivers::uart16550::{Pio, Uart16550};
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::display::{Display, FramebufferInfo};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
-use osmium::hal::timer::TickRate;
+use osmium::hal::timer::{Clock, TickRate};
 use osmium::mm::frame::order_for;
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::PageSize;
 use osmium::mm::paging::formats::X86_64;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
+use osmium::sysdrv::hpet::{self, Hpet};
+use osmium::sysdrv::lapic::{self, LocalApic};
+use osmium::sysdrv::pit::{self, Pit};
+use osmium::sysdrv::uart16550::{Pio, Uart16550};
 
 use osmium::proc::{AddressSpace, ExitStatus, Process, UserMemory};
 use osmium::sched::timer::TimerQueue;
@@ -119,6 +121,8 @@ const SHOOTDOWN_VECTOR: u8 = 34;
 const COM1_VECTOR: u8 = 40;
 /// COM1's ISA IRQ.
 const COM1_IRQ: u8 = 4;
+/// Vector for the HPET comparator demo, routed through the I/O APIC.
+const HPET_VECTOR: u8 = 41;
 const DOUBLE_FAULT: u8 = 8;
 /// IST slot for the double-fault handler's stack.
 const DOUBLE_FAULT_IST: u8 = 1;
@@ -164,6 +168,37 @@ fn load_cpu_tables() {
     unsafe { (&*ptr).enable_syscall() };
 }
 
+/// Checks that `FpState` keeps all 256 bits of `ymm0` when AVX is on: two
+/// patterns are captured and restored in turn.
+fn avx_selftest() {
+    use osmium::arch::fp::{self, FpState};
+    if !fp::avx_enabled() {
+        println!("[fp]    no AVX (or no XSAVE): FXSAVE switches x87 and SSE state");
+        return;
+    }
+    let a: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+    let b: [u8; 32] = core::array::from_fn(|i| 0xf0 - i as u8);
+    let mut out = [[0u8; 32]; 2];
+    irq::without(|| {
+        // SAFETY: fp::enable ran on this CPU (load_cpu_tables) and returned
+        // true with AVX on, so the VEX loads and stores are legal; the
+        // kernel does not use ymm0 itself, and the pointers cover 32 bytes.
+        unsafe {
+            core::arch::asm!("vmovdqu ymm0, [{}]", in(reg) a.as_ptr(), out("xmm0") _);
+            let sa = FpState::capture();
+            core::arch::asm!("vmovdqu ymm0, [{}]", in(reg) b.as_ptr(), out("xmm0") _);
+            let sb = FpState::capture();
+            sa.restore();
+            core::arch::asm!("vmovdqu [{}], ymm0", in(reg) out[0].as_mut_ptr(), out("xmm0") _);
+            sb.restore();
+            core::arch::asm!("vmovdqu [{}], ymm0", in(reg) out[1].as_mut_ptr(), out("xmm0") _);
+            FpState::new().restore();
+        }
+    });
+    let ok = out[0] == a && out[1] == b;
+    println!("[fp]    ymm0 kept across XSAVE/XRSTOR: {}", if ok { "ok" } else { "FAILED" });
+}
+
 /// Application processors' first stacks (`AP_STACKS[cpu - 1]`; the boot CPU
 /// has its own), where each stays as its CPU's bootstrap task.
 #[repr(align(16))]
@@ -196,25 +231,40 @@ fn on_switch(next: &osmium::sched::Task) {
 
 /// CPUs that still owe an acknowledgement of the current shootdown.
 static SHOOT_PENDING: AtomicUsize = AtomicUsize::new(0);
-/// Page the current shootdown invalidates.
+/// First page the current shootdown invalidates, and how many pages.
 static SHOOT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SHOOT_PAGES: AtomicUsize = AtomicUsize::new(0);
 /// Held by the CPU running a shootdown.
 static SHOOT_BUSY: AtomicBool = AtomicBool::new(false);
 
-/// Invalidates this CPU's entry for the pending shootdown page, if it owes one.
+/// Invalidates this CPU's entries for the pending shootdown pages, if it owes them.
 fn shootdown_service() {
     let me = 1usize << cpu::current_id();
     if SHOOT_PENDING.load(Ordering::Acquire) & me != 0 {
-        osmium::arch::mmu::flush_page(SHOOT_ADDR.load(Ordering::Acquire));
+        let (va, pages) = (SHOOT_ADDR.load(Ordering::Acquire), SHOOT_PAGES.load(Ordering::Acquire));
+        if pages > 32 {
+            osmium::arch::mmu::flush_all();
+        } else {
+            for i in 0..pages {
+                osmium::arch::mmu::flush_page(va + i * PAGE_SIZE);
+            }
+        }
         SHOOT_PENDING.fetch_and(!me, Ordering::AcqRel);
     }
 }
 
 /// Invalidates `va` on every online CPU and returns once all have done so.
-/// Waiting CPUs keep servicing requests, so two initiators cannot deadlock
-/// even when interrupts are off.
 fn shootdown(va: usize) {
     osmium::arch::mmu::flush_page(va);
+    shootdown_others(va, 1);
+}
+
+/// Invalidates `pages` pages from `va` on every online CPU but this one, and
+/// returns once they have all done so (the hook behind
+/// `osmium::arch::mmu::flush_remote`, for user threads on several CPUs).
+/// Waiting CPUs keep servicing requests, so two initiators cannot deadlock
+/// even when interrupts are off.
+fn shootdown_others(va: usize, pages: usize) {
     let me = cpu::current_id();
     let others = ((1usize << ONLINE.load(Ordering::Acquire)) - 1) & !(1 << me);
     if others == 0 {
@@ -225,6 +275,7 @@ fn shootdown(va: usize) {
         core::hint::spin_loop();
     }
     SHOOT_ADDR.store(va, Ordering::Release);
+    SHOOT_PAGES.store(pages, Ordering::Release);
     SHOOT_PENDING.store(others, Ordering::Release);
     let apic = LAPIC.get().expect("LAPIC initialised");
     for cpu in (0..MAX_CPUS).filter(|c| others & (1 << c) != 0) {
@@ -274,7 +325,13 @@ static RX: osmium::sync::SpscRing<u8, 256> = osmium::sync::SpscRing::new();
 static RX_PRODUCER: IrqSpinLock<Option<osmium::sync::Producer<'static, u8, 256>>> = IrqSpinLock::new(None);
 static RX_READY: osmium::sched::WaitQueue = osmium::sched::WaitQueue::new();
 /// First I/O APIC (address, first GSI) and COM1's line, from the MADT.
-static IOAPIC_INFO: Once<(u64, u32, u32, osmium::drivers::ioapic::LineMode)> = Once::new();
+static IOAPIC_INFO: Once<(u64, u32, u32, osmium::sysdrv::ioapic::LineMode)> = Once::new();
+
+/// The HPET's registers (from the ACPI `HPET` table), once found.
+static HPET_BASE: Once<u64> = Once::new();
+static HPET: Once<Hpet> = Once::new();
+/// Comparator interrupts taken by the HPET demo.
+static HPET_FIRED: AtomicU32 = AtomicU32::new(0);
 
 static UART: Once<SerialConsole<Uart16550<Pio>>> = Once::new();
 static LAPIC: Once<LocalApic> = Once::new();
@@ -295,6 +352,9 @@ fn now_ns() -> u64 {
 
 /// Powers QEMU off: ACPI PM1a control (q35/i440fx), then isa-debug-exit.
 fn shutdown() -> ! {
+    // The firmware's own way first: \_S5_ from the DSDT, written to the register the FADT names.
+    aml::power_off();
+    // With no ACPI tables to say how (a guest of the x86_64-hyp example), QEMU's fixed PM1a control register.
     // SAFETY: QEMU's ACPI PM1a control register; SLP_TYP=0, SLP_EN.
     unsafe {
         x86::outw(0x604, 0x2000);
@@ -364,13 +424,16 @@ extern "C" fn kmain(start_info: usize) -> ! {
             .and_then(|a| a.find(b"IVRS"))
             .and_then(Ivrs::parse)
             .and_then(|i| i.units().find(|u| u.segment == 0));
+        if let Some(h) = acpi.as_ref().and_then(|a| a.find(b"HPET")).and_then(HpetTable::parse) {
+            HPET_BASE.call_once(|| h.base);
+        }
         let madt = acpi.and_then(|a| a.find(b"APIC")).and_then(Madt::parse);
         if let Some(m) = &madt
             && let Some(io) = m.io_apics().next()
         {
             let (gsi, active_low, level) = m.isa_irq(COM1_IRQ);
             IOAPIC_INFO
-                .call_once(|| (io.addr, io.gsi_base, gsi, osmium::drivers::ioapic::LineMode { active_low, level }));
+                .call_once(|| (io.addr, io.gsi_base, gsi, osmium::sysdrv::ioapic::LineMode { active_low, level }));
         }
         let enabled = madt.iter().flat_map(|m| m.local_apics()).filter(|c| c.enabled);
         for (slot, c) in madt_ids.iter_mut().zip(enabled) {
@@ -410,6 +473,12 @@ extern "C" fn kmain(start_info: usize) -> ! {
     let s: String = ["heap", "works"].join(" ");
     println!("[heap]  {s} (sum of squares {})", squares.iter().sum::<u64>());
 
+    // --- AML: the DSDT's devices, and the way to power off -------------------------
+    // Needs the heap, and the boot tables' identity map of the ACPI tables and of what AML touches.
+    if let Some(rsdp) = info.rsdp() {
+        aml::init(rsdp.0);
+    }
+
     // --- Paging (4-level, W^X, NX) -----------------------------------------
     let mut pt: PageTable<X86_64, &'static Frames> = PageTable::new(&FRAMES).expect("new failed");
     let k = |f| f | MapFlags::GLOBAL;
@@ -437,6 +506,10 @@ extern "C" fn kmain(start_info: usize) -> ! {
     .expect("map_range failed");
     if let Some(&(io, ..)) = IOAPIC_INFO.get() {
         pt.map_range(va(io), pa(io), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).expect("map_range failed");
+    }
+    if let Some(&base) = HPET_BASE.get() {
+        pt.map_range(va(base), pa(base), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE))
+            .expect("map_range failed");
     }
     // Writable so the boot CPU can install the AP trampoline there.
     pt.map_range(va(TRAMPOLINE), pa(TRAMPOLINE), PAGE_SIZE as u64, k(MapFlags::RW)).expect("map_range failed");
@@ -466,6 +539,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: the syscall handler treats every argument as untrusted.
     unsafe { trap::allow_from_user(trap::SYSCALL_VECTOR) };
     println!("[guard] task stacks get unmapped guard pages; double faults run on IST{DOUBLE_FAULT_IST}");
+    avx_selftest();
 
     // --- Displays: the VESA framebuffer, then PCI adapters (virtio-vga) -----
     display_demo(vesa, ecam);
@@ -506,6 +580,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     apic.start_timer(TIMER_VECTOR, u32::MAX, false);
     let apic_hz = pit.calibrate(10_000_000, || u32::MAX as u64 - apic.timer_remaining() as u64);
     apic.stop_timer();
+    hpet_init(&pit);
     println!(
         "[timer] TSC {} MHz, APIC timer {} MHz (divided by 16), measured with the PIT",
         tsc_hz / 1_000_000,
@@ -524,6 +599,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     osmium::sched::set_remote_wake_hook(|cpu| {
         LAPIC.get().expect("LAPIC initialised").send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, IPI_VECTOR)
     });
+    osmium::arch::mmu::set_remote_flush(shootdown_others);
     // SAFETY: the trampoline page is free low memory (reserved from the
     // allocator), mapped writable above; no AP is starting yet.
     unsafe { x86::smp::install() };
@@ -569,6 +645,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     demos::user::boot_vfs();
     user_demo();
     serial_demo();
+    hpet_demo();
     usb::demo(ecam);
     msi::demo(ecam);
     iommu::demo(ecam, iommus);
@@ -584,7 +661,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
 /// Sets a `width` by `height` 32-bit VESA mode through the video BIOS, and
 /// returns its framebuffer and the video memory size.
 fn vesa(width: u16, height: u16) -> Option<(PhysAddr, FramebufferInfo, usize)> {
-    use osmium::drivers::display::vbe::{RealModeBios, Vbe};
+    use osmium::display::vbe::{RealModeBios, Vbe};
     // SAFETY: 0x5000..0x8000 is free low memory, kept from the frame
     // allocator and identity-mapped (and executable) in the boot tables,
     // whose root is below 4 GiB. Only this CPU runs, and nothing has
@@ -619,7 +696,7 @@ fn vesa(width: u16, height: u16) -> Option<(PhysAddr, FramebufferInfo, usize)> {
 /// Draws on the VESA framebuffer, reading the mode back from the Bochs
 /// DISPI registers the BIOS programmed, then on every PCI display adapter.
 fn display_demo(vesa: Option<(PhysAddr, FramebufferInfo, usize)>, ecam: Option<EcamWindow>) {
-    use osmium::drivers::display::bochs::BochsVbe;
+    use osmium::display::bochs::BochsVbe;
     let mut guard = PT.lock();
     let pt = guard.as_mut().expect("as_mut returned None");
     // Identity-maps device memory (the pages not mapped yet); returns a
@@ -744,6 +821,84 @@ fn overflow_demo() {
     println!("[guard] the other tasks keep running: {}", alloc::format!("{} free frames", FRAMES.lock().free_frames()));
 }
 
+/// Starts the HPET found in the ACPI tables and checks its counter against the PIT.
+fn hpet_init(pit: &Pit<pit::Pio>) {
+    let Some(&base) = HPET_BASE.get() else {
+        println!("[hpet]  no HPET table; skipping");
+        return;
+    };
+    // SAFETY: the ACPI table says the register block lives here; mapped uncached above.
+    let io = unsafe { IoMem::new(base as *mut u8, hpet::REGISTER_BYTES) };
+    let Ok(h) = Hpet::new(io) else {
+        println!("[hpet]  the register block at {base:#x} is not an HPET");
+        return;
+    };
+    h.enable();
+    let h = HPET.call_once(|| h);
+    let t0 = h.now_ns();
+    pit.wait_ns(10_000_000);
+    let dt = h.now_ns().saturating_sub(t0);
+    println!(
+        "[hpet]  {} comparators, {} bit counter at {} MHz; legacy replacement {}",
+        h.timer_count(),
+        if h.counter_is_64bit() { 64 } else { 32 },
+        h.frequency() / 1_000_000,
+        if h.has_legacy_replacement() { "available" } else { "absent" }
+    );
+    // The PIT waited 10 ms of its own: the HPET should have seen about the same.
+    if (8_000_000..=50_000_000).contains(&dt) {
+        println!("[hpet]  main counter agrees with a 10 ms PIT wait");
+    } else {
+        println!("[hpet]  main counter disagrees with the PIT: {dt} ns for 10 ms");
+    }
+}
+
+/// Wires an HPET comparator through the I/O APIC to this CPU and takes a one-shot and a periodic
+/// interrupt from it.
+fn hpet_demo() {
+    let (Some(h), Some(&(io_addr, gsi_base, ..))) = (HPET.get(), IOAPIC_INFO.get()) else {
+        return;
+    };
+    // SAFETY: the MADT says the I/O APIC lives here; mapped uncached above.
+    let ioapic = osmium::sysdrv::ioapic::IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
+    // The highest I/O APIC input some comparator can drive, avoiding the ISA lines.
+    let pick = (0..h.timer_count())
+        .filter_map(|i| Some((i, h.caps(i).ok().filter(|c| c.periodic)?.routes)))
+        .flat_map(|(i, routes)| (16..32u8).rev().map(move |gsi| (i, gsi, routes)))
+        .find(|&(_, gsi, routes)| routes & (1 << gsi) != 0 && ioapic.handles(gsi as u32));
+    let Some((index, gsi, _)) = pick else {
+        println!("[hpet]  no comparator can drive an I/O APIC input; skipping");
+        return;
+    };
+    h.route(index, gsi, false).expect("route was in the capability mask");
+    let mode = osmium::sysdrv::ioapic::LineMode { active_low: false, level: false };
+    ioapic.route(gsi as u32, HPET_VECTOR, LAPIC.get().expect("LAPIC initialised").id() as u8, mode);
+    println!("[hpet]  comparator {index} -> I/O APIC input {gsi} -> vector {HPET_VECTOR}");
+
+    let wait = |what: &str, want: u32| {
+        let limit = h.now_ns() + 200_000_000;
+        while HPET_FIRED.load(Ordering::SeqCst) < want && h.now_ns() < limit {
+            core::hint::spin_loop();
+        }
+        HPET_FIRED.load(Ordering::SeqCst) >= want || {
+            println!("[hpet]  {what}: no interrupt within 200 ms");
+            false
+        }
+    };
+    let timer = h.timer(index).expect("index was valid");
+    osmium::hal::timer::OneShotTimer::set_deadline(&timer, h.now_ns() + 2_000_000);
+    if wait("one-shot", 1) {
+        println!("[hpet]  one-shot comparator interrupt taken");
+    }
+    osmium::hal::timer::OneShotTimer::cancel(&timer);
+    let base = HPET_FIRED.load(Ordering::SeqCst);
+    if h.start_periodic(index, 1_000_000).is_ok() && wait("periodic", base + 3) {
+        println!("[hpet]  periodic comparator interrupts taken");
+    }
+    let _ = h.stop(index);
+    ioapic.mask(gsi as u32);
+}
+
 /// Routes COM1's receive interrupt through the I/O APIC to this CPU and
 /// waits up to 300 ms for a line of input. To feed it under QEMU:
 /// `-chardev file,id=s0,path=out.log,input-path=in.txt -serial chardev:s0`.
@@ -755,7 +910,7 @@ fn serial_demo() {
         return;
     };
     // SAFETY: the MADT says the I/O APIC lives here; mapped uncached above.
-    let ioapic = osmium::drivers::ioapic::IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
+    let ioapic = osmium::sysdrv::ioapic::IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
     let (producer, mut rx) = RX.split().expect("split returned None");
     *RX_PRODUCER.lock() = Some(producer);
     ioapic.route(gsi, COM1_VECTOR, LAPIC.get().expect("LAPIC initialised").id() as u8, mode);
@@ -869,12 +1024,21 @@ fn platform() -> osmium::proc::Platform {
         // SAFETY: the table shares the kernel's root entry 0. Instruction
         // fetch is coherent with stores on x86, so nothing else is needed.
         activate: |root| unsafe { x86::write_cr3(root.0) },
-        // SAFETY: the child's task is running with its table active (the
-        // switch hook), and the frame is its parent's from a system call.
-        resume: |frame| unsafe { x86::resume_user(&frame) },
+        resume: |frame| {
+            // A new thread can start on another CPU before its creator has
+            // recorded its task id, so the switch hook that loaded FS.base
+            // did not know the thread pointer yet. Load it now.
+            let tls = osmium::proc::thread::tls_for(&osmium::sched::current()).unwrap_or(0);
+            // SAFETY: a base the thread itself set, checked canonical by `arch_prctl`.
+            unsafe { x86::wrmsr(x86::msr::IA32_FS_BASE, tls) };
+            // SAFETY: the child's task is running with its table active (the
+            // switch hook), and the frame is its parent's from a system call.
+            unsafe { x86::resume_user(&frame) }
+        },
         stack_top: 0xff_0000_0000,
         stack_size: 64 * 1024,
         mmap_area: 0xa0_0000_0000..0xa1_0000_0000,
+        load_base: 0xb0_0000_0000,
     }
 }
 
@@ -972,8 +1136,8 @@ fn on_trap(frame: &mut TrapFrame) {
 }
 
 fn handle_trap(frame: &mut TrapFrame) {
-    // A write to a page `fork` shares gets its own copy, and a touch of a
-    // file mapping's page loads it; retry.
+    // A write to a page `fork` shares gets its own copy, and the first touch of a
+    // demand-paged `mmap` page its frame; retry.
     if let Trap::PageFault { addr, access } = frame.cause()
         && frame.from_user()
         && osmium::proc::handle_page_fault(addr as u64, access == Access::Write)
@@ -1011,6 +1175,10 @@ fn handle_trap(frame: &mut TrapFrame) {
         }
         (SHOOTDOWN_VECTOR, _) => {
             shootdown_service();
+            LAPIC.get().expect("LAPIC initialised").eoi();
+        }
+        (HPET_VECTOR, _) => {
+            HPET_FIRED.fetch_add(1, Ordering::SeqCst);
             LAPIC.get().expect("LAPIC initialised").eoi();
         }
         (COM1_VECTOR, _) => {

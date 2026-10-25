@@ -4,10 +4,12 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddrV4};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, Stat};
-use osmium_net::{Error, Socket, SocketAddr, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket};
+use osmium_net::{
+    BindProtocol, Error, ReuseOptions, Socket, SocketAddr, SocketHandle, SocketSet, TcpSocket, TcpState, UdpSocket,
+};
 use osmium_sync::IrqSpinLock;
 use osmium_sync::fallible::{try_arc, try_zeroed};
 
@@ -16,11 +18,11 @@ use crate::fd::{Access, OpenFile};
 use crate::net::{NetStack, stack};
 use crate::oom;
 use crate::process::Process;
-use crate::unix::{self, UnixSocket};
+use crate::scm::{self, AF_UNIX};
+use crate::unix::{self, Addr, Anc, Outgoing, UnixSocket};
 
 type SysResult = Result<u64, Errno>;
 
-const AF_UNIX: u64 = 1;
 /// The IPv4 address of `a`. The socket layer is `AF_INET` only, so an IPv6
 /// address (which it never creates) reads as unspecified.
 fn v4(a: SocketAddr) -> SocketAddrV4 {
@@ -37,9 +39,11 @@ const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 const SOCKADDR_LEN: usize = 16;
 const MSG_PEEK: u64 = 0x2;
+const MSG_CTRUNC: u64 = 0x8;
 const MSG_TRUNC: u64 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_NOSIGNAL: u64 = 0x4000;
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 const SOL_SOCKET: u64 = 1;
 const IPPROTO_TCP: u64 = 6;
 const IPPROTO_UDP: u64 = 17;
@@ -47,6 +51,8 @@ const SO_TYPE: u64 = 3;
 const SO_ERROR: u64 = 4;
 const SO_REUSEADDR: u64 = 2;
 const SO_KEEPALIVE: u64 = 9;
+const SO_PASSCRED: u64 = 16;
+const SO_PEERCRED: u64 = 17;
 const SO_SNDBUF: u64 = 7;
 const SO_RCVBUF: u64 = 8;
 const SO_REUSEPORT: u64 = 15;
@@ -55,6 +61,10 @@ const SO_SNDTIMEO: u64 = 21;
 const TCP_NODELAY: u64 = 1;
 /// `O_NONBLOCK` in `fcntl` status flags.
 pub(crate) const O_NONBLOCK: u64 = 0o4000;
+
+/// The next group number for the listeners of a socket (see
+/// `TcpSocket::set_reuse_group`).
+static NEXT_GROUP: AtomicU32 = AtomicU32::new(1);
 
 /// Bytes a stream socket buffers in each direction.
 const TCP_BUFFER: usize = 16 * 1024;
@@ -78,9 +88,9 @@ type Backlog = [Option<SocketHandle>; MAX_BACKLOG];
 enum Tcp {
     /// Not connected or listening, possibly bound to an address.
     Unconnected(Option<SocketAddrV4>),
-    /// Waiting for connections on `port`: one listening socket per slot of
+    /// Waiting for connections to `addr`: one listening socket per slot of
     /// backlog.
-    Listening { port: u16, backlog: Backlog },
+    Listening { addr: SocketAddrV4, backlog: Backlog },
     /// Connecting or connected.
     Connected(SocketHandle),
 }
@@ -100,6 +110,10 @@ pub struct SocketFile {
     /// `SO_RCVTIMEO` and `SO_SNDTIMEO` in nanoseconds; 0 waits for ever.
     rcv_timeout: AtomicU64,
     snd_timeout: AtomicU64,
+    /// `SO_REUSEADDR` and `SO_REUSEPORT`. Processes have no user ids yet, so
+    /// every socket has the same owner for `SO_REUSEPORT`.
+    reuse_addr: AtomicBool,
+    reuse_port: AtomicBool,
 }
 
 /// What a receive took.
@@ -107,6 +121,9 @@ struct Received {
     copied: usize,
     truncated: bool,
     from: Option<SocketAddrV4>,
+    /// For a Unix socket: the sender's name and what rode along.
+    unix_from: Option<Arc<Addr>>,
+    anc: Option<Anc>,
 }
 
 fn net_errno(e: Error) -> Errno {
@@ -118,6 +135,7 @@ fn net_errno(e: Error) -> Errno {
         Error::ConnectionRefused => Errno::ECONNREFUSED,
         Error::ConnectionReset => Errno::ECONNRESET,
         Error::TimedOut => Errno::ETIMEDOUT,
+        Error::AddressInUse => Errno::EADDRINUSE,
         Error::OutOfMemory => Errno::ENOMEM,
     }
 }
@@ -149,6 +167,8 @@ impl SocketFile {
             nonblock: AtomicBool::new(nonblock),
             rcv_timeout: AtomicU64::new(0),
             snd_timeout: AtomicU64::new(0),
+            reuse_addr: AtomicBool::new(false),
+            reuse_port: AtomicBool::new(false),
         }
     }
 
@@ -187,7 +207,19 @@ impl SocketFile {
         a
     }
 
+    /// The socket's `SO_REUSEADDR` and `SO_REUSEPORT`.
+    fn reuse(&self) -> ReuseOptions {
+        ReuseOptions {
+            addr: self.reuse_addr.load(Ordering::Relaxed),
+            port: self.reuse_port.load(Ordering::Relaxed),
+            owner: 0,
+        }
+    }
+
     /// Checks that `a` can be bound here and picks a port if it has none.
+    /// A port that is named is checked against the other sockets with the
+    /// `SO_REUSEADDR` and `SO_REUSEPORT` rules; one that is chosen must be
+    /// free of every socket.
     fn bind_addr(&self, a: SocketAddrV4, udp: bool) -> Result<SocketAddrV4, Errno> {
         self.net.op(|iface, s| {
             if !a.ip().is_unspecified() && !a.ip().is_loopback() && iface.config().map(|c| c.address) != Some(*a.ip()) {
@@ -197,8 +229,10 @@ impl SocketFile {
             if port == 0 {
                 port =
                     (0..64).map(|_| iface.ephemeral_port()).find(|&p| !in_use(s, p, udp)).ok_or(Errno::EADDRINUSE)?;
-            } else if in_use(s, port, udp) {
-                return Err(Errno::EADDRINUSE);
+            } else {
+                let proto = if udp { BindProtocol::Udp } else { BindProtocol::Tcp };
+                s.check_bind(proto, SocketAddr::V4(SocketAddrV4::new(*a.ip(), port)), self.reuse(), None)
+                    .map_err(net_errno)?;
             }
             Ok(SocketAddrV4::new(*a.ip(), port))
         })
@@ -237,13 +271,21 @@ impl SocketFile {
             Some(a) => a,
             None => self.bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), false)?,
         };
-        let port = a.port();
         let n = backlog.clamp(1, MAX_BACKLOG);
+        let reuse = self.reuse();
+        // The listeners of this socket share an accept group, so that
+        // `SO_REUSEPORT` spreads connections over sockets, not listeners.
+        let group = NEXT_GROUP.fetch_add(1, Ordering::Relaxed).max(1);
         let backlog = self.net.op(|_, s| {
+            // Listening is a bind of its own: another socket may have come
+            // since `bind`.
+            s.check_bind(BindProtocol::Tcp, SocketAddr::V4(a), reuse, None).map_err(net_errno)?;
             let mut backlog: Backlog = [None; MAX_BACKLOG];
             for slot in backlog.iter_mut().take(n) {
                 let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
-                if let Err(e) = t.listen(port) {
+                t.set_reuse(reuse);
+                t.set_reuse_group(group);
+                if let Err(e) = t.listen_on(a) {
                     for h in backlog.iter().flatten() {
                         drop(s.remove(*h));
                     }
@@ -262,7 +304,7 @@ impl SocketFile {
             }
             Ok(backlog)
         })?;
-        *kind = Kind::Tcp(Tcp::Listening { port, backlog });
+        *kind = Kind::Tcp(Tcp::Listening { addr: a, backlog });
         Ok(())
     }
 
@@ -279,13 +321,20 @@ impl SocketFile {
             // (The order is kind, then net, as in `connect`.)
             let (taken, snapshot) = {
                 let mut kind = self.kind.lock();
-                let Kind::Tcp(Tcp::Listening { port, backlog }) = &mut *kind else { return Err(Errno::EINVAL) };
-                let port = *port;
+                let Kind::Tcp(Tcp::Listening { addr, backlog }) = &mut *kind else { return Err(Errno::EINVAL) };
+                let addr = *addr;
                 let taken = self.net.op(|_, s| {
                     let i = backlog.iter().position(|h| h.is_some_and(|h| ready(s, h)))?;
                     let h = backlog.get(i).copied().flatten()?;
                     let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
-                    if let Err(e) = t.listen(port) {
+                    // The replacement is one more listener of the same socket.
+                    let (reuse, group) = {
+                        let old = s.get::<TcpSocket>(h);
+                        (old.reuse(), old.reuse_group())
+                    };
+                    t.set_reuse(reuse);
+                    t.set_reuse_group(group);
+                    if let Err(e) = t.listen_on(addr) {
                         return Some(Err(net_errno(e)));
                     }
                     // Without a socket to replace it, the connection stays
@@ -337,6 +386,9 @@ impl SocketFile {
                 let port = bound.map_or(0, |a| a.port());
                 let h = self.net.op(|_, s| {
                     let mut t = TcpSocket::new(TCP_BUFFER, TCP_BUFFER);
+                    // A connection keeps the options, which decide whether a
+                    // bind may take its port while it lingers.
+                    t.set_reuse(self.reuse());
                     t.connect(to, port).map(|()| s.add(t))
                 });
                 let h = h.map_err(net_errno)?;
@@ -482,7 +534,13 @@ impl SocketFile {
                     }
                     Ok((full, from)) => {
                         let copied = full.min(buf.len());
-                        return Ok(Received { copied, truncated: full > copied, from: Some(v4(from)) });
+                        return Ok(Received {
+                            copied,
+                            truncated: full > copied,
+                            from: Some(v4(from)),
+                            unix_from: None,
+                            anc: None,
+                        });
                     }
                     Err(Error::WouldBlock)
                         if wait && self.net.wait(deadline, |s| s.get::<UdpSocket>(h).can_recv())? => {}
@@ -498,7 +556,7 @@ impl SocketFile {
                 self.net.op(|_, s| s.get_mut::<TcpSocket>(h).recv(buf))
             };
             match got {
-                Ok(n) => return Ok(Received { copied: n, truncated: false, from: None }),
+                Ok(n) => return Ok(Received { copied: n, truncated: false, from: None, unix_from: None, anc: None }),
                 Err(Error::WouldBlock) if wait && self.net.wait(deadline, |s| readable(s.get::<TcpSocket>(h)))? => {}
                 Err(Error::InvalidState) => return Err(Errno::ENOTCONN),
                 Err(e) => return Err(net_errno(e)),
@@ -564,11 +622,28 @@ impl SocketFile {
         }
     }
 
+    /// Sets `SO_REUSEPORT` (`port`) or `SO_REUSEADDR`. As on Linux they matter
+    /// to the binds made afterwards; a datagram socket that is bound already
+    /// takes the change at once, as its options live in the stack.
+    fn set_reuse_option(&self, port: bool, on: bool) {
+        if port { &self.reuse_port } else { &self.reuse_addr }.store(on, Ordering::Relaxed);
+        let reuse = self.reuse();
+        if let Kind::Udp { handle, .. } = &*self.kind.lock() {
+            let h = *handle;
+            self.net.op(|_, s| s.get_mut::<UdpSocket>(h).set_reuse(reuse));
+        }
+    }
+
+    /// The value of `SO_REUSEPORT` (`port`) or `SO_REUSEADDR`.
+    fn reuse_option(&self, port: bool) -> bool {
+        if port { &self.reuse_port } else { &self.reuse_addr }.load(Ordering::Relaxed)
+    }
+
     /// The local address, `getsockname`.
     pub fn local_addr(&self) -> SocketAddrV4 {
         let a = match &*self.kind.lock() {
             Kind::Tcp(Tcp::Unconnected(b)) => b.unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            Kind::Tcp(Tcp::Listening { port, .. }) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, *port),
+            Kind::Tcp(Tcp::Listening { addr, .. }) => *addr,
             Kind::Tcp(Tcp::Connected(h)) => self.net.peek(|_, s| v4(s.get::<TcpSocket>(*h).local_endpoint())),
             Kind::Udp { handle, .. } => self
                 .net
@@ -703,8 +778,8 @@ impl Any<'_> {
     fn send(&self, data: &[u8], to: Option<SocketAddrV4>, flags: u64) -> Result<usize, Errno> {
         match self {
             Any::Inet(s) => s.send(data, to, flags),
-            Any::Unix(_) if to.is_some() => Err(Errno::EISCONN),
-            Any::Unix(u) => u.send(data, !u.is_nonblocking() && flags & MSG_DONTWAIT == 0),
+            // Unix sockets send through `unix_send`, which knows the process.
+            Any::Unix(_) => Err(Errno::EINVAL),
         }
     }
 
@@ -714,7 +789,7 @@ impl Any<'_> {
             Any::Unix(u) => {
                 let wait = !u.is_nonblocking() && flags & MSG_DONTWAIT == 0;
                 let r = u.recv(buf, flags & MSG_PEEK != 0, wait)?;
-                Ok(Received { copied: r.copied, truncated: r.truncated, from: None })
+                Ok(Received { copied: r.copied, truncated: r.truncated, from: None, unix_from: r.from, anc: r.anc })
             }
         }
     }
@@ -755,7 +830,29 @@ fn put_addr(p: &Process, va: u64, lenp: u64, a: SocketAddrV4) -> Result<(), Errn
     p.memory().write(lenp, &(SOCKADDR_LEN as u32).to_ne_bytes())
 }
 
+/// Makes the descriptor for a new Unix socket file.
+fn install_unix(p: &Process, u: UnixSocket, cloexec: bool) -> SysResult {
+    let open = OpenFile::try_new(try_arc(u).map_err(oom)?, Access::RW)?;
+    p.files().lock().insert_from(0, open, cloexec).map(|fd| fd as u64)
+}
+
+fn unix_socket(p: &Process, ty: u64, protocol: u64) -> SysResult {
+    if protocol != 0 {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    let dgram = match ty & 0xf {
+        SOCK_STREAM => false,
+        SOCK_DGRAM => true,
+        _ => return Err(Errno::EPROTOTYPE),
+    };
+    let u = UnixSocket::new(dgram, ty & SOCK_NONBLOCK != 0, scm::cred(p))?;
+    install_unix(p, u, ty & SOCK_CLOEXEC != 0)
+}
+
 pub(crate) fn socket(p: &Process, domain: u64, ty: u64, protocol: u64) -> SysResult {
+    if domain == AF_UNIX {
+        return unix_socket(p, ty, protocol);
+    }
     if domain != AF_INET {
         return Err(Errno::EAFNOSUPPORT);
     }
@@ -774,13 +871,22 @@ pub(crate) fn socket(p: &Process, domain: u64, ty: u64, protocol: u64) -> SysRes
 
 pub(crate) fn bind(p: &Process, fd: i32, addr: u64, len: u64) -> SysResult {
     let of = open(p, fd)?;
-    let s = sock(&of)?;
-    s.bind(get_addr(p, addr, len)?).map(|()| 0)
+    match any(&of)? {
+        Any::Inet(s) => s.bind(get_addr(p, addr, len)?).map(|()| 0),
+        Any::Unix(u) => {
+            let name = scm::get_addr(p, addr, len)?;
+            u.bind(name, &p.try_cwd()?, p.umask()).map(|()| 0)
+        }
+    }
 }
 
 pub(crate) fn listen(p: &Process, fd: i32, backlog: u64) -> SysResult {
     let of = open(p, fd)?;
-    sock(&of)?.listen((backlog as i32).max(1) as usize).map(|()| 0)
+    let backlog = (backlog as i32).max(1) as usize;
+    match any(&of)? {
+        Any::Inet(s) => s.listen(backlog).map(|()| 0),
+        Any::Unix(u) => u.listen(backlog).map(|()| 0),
+    }
 }
 
 pub(crate) fn accept(p: &Process, fd: i32, addr: u64, lenp: u64, flags: u64) -> SysResult {
@@ -788,6 +894,11 @@ pub(crate) fn accept(p: &Process, fd: i32, addr: u64, lenp: u64, flags: u64) -> 
         return Err(Errno::EINVAL);
     }
     let of = open(p, fd)?;
+    if let Any::Unix(u) = any(&of)? {
+        let (conn, from) = u.accept(flags & SOCK_NONBLOCK != 0, !u.is_nonblocking())?;
+        scm::put_addr(p, addr, lenp, from.as_deref())?;
+        return install_unix(p, conn, flags & SOCK_CLOEXEC != 0);
+    }
     let s = sock(&of)?;
     let (conn, peer) = s.accept(flags & SOCK_NONBLOCK != 0, !s.is_nonblocking())?;
     put_addr(p, addr, lenp, peer)?;
@@ -798,17 +909,22 @@ pub(crate) fn accept(p: &Process, fd: i32, addr: u64, lenp: u64, flags: u64) -> 
 
 pub(crate) fn connect(p: &Process, fd: i32, addr: u64, len: u64) -> SysResult {
     let of = open(p, fd)?;
-    let s = sock(&of)?;
-    s.connect(get_addr(p, addr, len)?).map(|()| 0)
+    match any(&of)? {
+        Any::Inet(s) => s.connect(get_addr(p, addr, len)?).map(|()| 0),
+        Any::Unix(u) => {
+            let name = scm::get_addr(p, addr, len)?.ok_or(Errno::EINVAL)?;
+            let target = unix::lookup(&name, &p.try_cwd()?)?;
+            u.connect(&target, !u.is_nonblocking()).map(|()| 0)
+        }
+    }
 }
 
 pub(crate) fn sendto(p: &Process, fd: i32, buf: u64, len: u64, flags: u64, addr: u64, alen: u64) -> SysResult {
     let of = open(p, fd)?;
     let s = any(&of)?;
-    if addr != 0 && matches!(s, Any::Unix(_)) {
+    if addr != 0 && matches!(&s, Any::Unix(u) if !u.is_dgram()) {
         return Err(Errno::EISCONN);
     }
-    let to = if addr != 0 { Some(get_addr(p, addr, alen)?) } else { None };
     let n = len as usize;
     if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
         return Err(Errno::EOPNOTSUPP);
@@ -818,13 +934,32 @@ pub(crate) fn sendto(p: &Process, fd: i32, buf: u64, len: u64, flags: u64, addr:
     }
     let mut data = try_zeroed(n.min(IO_MAX)).map_err(oom)?;
     p.memory().read(buf, &mut data)?;
+    if let Any::Unix(u) = s {
+        let to = if addr != 0 { Some(scm::get_addr(p, addr, alen)?.ok_or(Errno::EINVAL)?) } else { None };
+        return unix_send(p, u, &data, None, to, flags);
+    }
+    let to = if addr != 0 { Some(get_addr(p, addr, alen)?) } else { None };
     s.send(&data, to, flags).map(|n| n as u64)
+}
+
+/// Sends `data` on a Unix socket, to the socket named `to` if given.
+fn unix_send(p: &Process, u: &UnixSocket, data: &[u8], anc: Option<Anc>, to: Option<Addr>, flags: u64) -> SysResult {
+    let to = match to {
+        Some(_) if !u.is_dgram() => return Err(Errno::EISCONN),
+        Some(name) => Some(unix::lookup(&name, &p.try_cwd()?)?),
+        None => None,
+    };
+    let wait = !u.is_nonblocking() && flags & MSG_DONTWAIT == 0;
+    u.send(Outgoing { data, anc, to, cred: scm::cred(p) }, wait).map(|n| n as u64)
 }
 
 /// Writes the address `recvfrom` and `recvmsg` report: the sender, or a zero
 /// length for a socket with no addresses.
-fn put_from(p: &Process, addr: u64, lenp: u64, from: Option<SocketAddrV4>) -> Result<(), Errno> {
-    match from {
+fn put_from(p: &Process, addr: u64, lenp: u64, r: &Received) -> Result<(), Errno> {
+    if let Some(name) = &r.unix_from {
+        return scm::put_addr(p, addr, lenp, Some(name));
+    }
+    match r.from {
         Some(from) => put_addr(p, addr, lenp, from),
         None if addr != 0 && lenp != 0 => p.memory().write(lenp, &0u32.to_ne_bytes()),
         None => Ok(()),
@@ -840,7 +975,7 @@ pub(crate) fn recvfrom(p: &Process, fd: i32, buf: u64, len: u64, flags: u64, add
     let mut data = try_zeroed((len as usize).min(IO_MAX)).map_err(oom)?;
     let r = s.recv(&mut data, flags)?;
     p.memory().write(buf, bytes::slice(&data, 0, r.copied)?)?;
-    put_from(p, addr, lenp, r.from)?;
+    put_from(p, addr, lenp, &r)?;
     Ok(r.copied as u64)
 }
 
@@ -871,6 +1006,7 @@ struct MsgHdr {
     name: u64,
     iov: u64,
     iovlen: u64,
+    control: u64,
     controllen: u64,
 }
 
@@ -881,6 +1017,7 @@ fn read_msghdr(p: &Process, msg: u64) -> Result<MsgHdr, Errno> {
         name: bytes::u64_at(&b, 0)?,
         iov: bytes::u64_at(&b, 16)?,
         iovlen: bytes::u64_at(&b, 24)?,
+        control: bytes::u64_at(&b, 32)?,
         controllen: bytes::u64_at(&b, 40)?,
     })
 }
@@ -889,19 +1026,15 @@ pub(crate) fn sendmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
     let of = open(p, fd)?;
     let s = any(&of)?;
     let h = read_msghdr(p, msg)?;
-    if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 || h.controllen != 0 {
+    if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 || (h.controllen != 0 && matches!(s, Any::Inet(_))) {
         return Err(Errno::EOPNOTSUPP);
     }
     let mut namelen = [0u8; 4];
     p.memory().read(msg.checked_add(8).ok_or(Errno::EFAULT)?, &mut namelen)?;
-    let to = if h.name != 0 {
-        if matches!(s, Any::Unix(_)) {
-            return Err(Errno::EISCONN);
-        }
-        Some(get_addr(p, h.name, u64::from(u32::from_ne_bytes(namelen)))?)
-    } else {
-        None
-    };
+    let namelen = u64::from(u32::from_ne_bytes(namelen));
+    if h.name != 0 && matches!(&s, Any::Unix(u) if !u.is_dgram()) {
+        return Err(Errno::EISCONN);
+    }
     let (iov, total) = read_iov(p, h.iov, h.iovlen)?;
     if total > IO_MAX && s.is_dgram() {
         return Err(Errno::EMSGSIZE);
@@ -916,6 +1049,12 @@ pub(crate) fn sendmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
             at += take;
         }
     }
+    if let Any::Unix(u) = s {
+        let to = if h.name != 0 { Some(scm::get_addr(p, h.name, namelen)?.ok_or(Errno::EINVAL)?) } else { None };
+        let anc = scm::read_control(p, h.control, h.controllen)?;
+        return unix_send(p, u, &data, anc, to, flags);
+    }
+    let to = if h.name != 0 { Some(get_addr(p, h.name, namelen)?) } else { None };
     s.send(&data, to, flags).map(|n| n as u64)
 }
 
@@ -923,12 +1062,12 @@ pub(crate) fn recvmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
     let of = open(p, fd)?;
     let s = any(&of)?;
     let h = read_msghdr(p, msg)?;
-    if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
+    if flags & !(MSG_DONTWAIT | MSG_PEEK | MSG_CMSG_CLOEXEC) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
     let (iov, total) = read_iov(p, h.iov, h.iovlen)?;
     let mut data = try_zeroed(total.min(IO_MAX)).map_err(oom)?;
-    let r = s.recv(&mut data, flags)?;
+    let r = s.recv(&mut data, flags & !MSG_CMSG_CLOEXEC)?;
     // Scatter what arrived over the buffers, in order.
     let mut at = 0;
     for (base, len) in iov {
@@ -939,10 +1078,12 @@ pub(crate) fn recvmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
         }
     }
     let namelen_at = msg.checked_add(8).ok_or(Errno::EFAULT)?;
-    put_from(p, h.name, namelen_at, r.from)?;
-    // No ancillary data is ever returned.
-    p.memory().write(msg.checked_add(40).ok_or(Errno::EFAULT)?, &0u64.to_ne_bytes())?;
-    let flags_out = if r.truncated { MSG_TRUNC as u32 } else { 0 };
+    put_from(p, h.name, namelen_at, &r)?;
+    let want_cred = matches!(&s, Any::Unix(u) if u.passcred());
+    let (used, ctrunc) =
+        scm::write_control(p, h.control, h.controllen, r.anc, flags & MSG_CMSG_CLOEXEC != 0, want_cred)?;
+    p.memory().write(msg.checked_add(40).ok_or(Errno::EFAULT)?, &(used as u64).to_ne_bytes())?;
+    let flags_out = if r.truncated { MSG_TRUNC as u32 } else { 0 } | if ctrunc { MSG_CTRUNC as u32 } else { 0 };
     p.memory().write(msg.checked_add(48).ok_or(Errno::EFAULT)?, &flags_out.to_ne_bytes())?;
     Ok(r.copied as u64)
 }
@@ -962,7 +1103,7 @@ pub(crate) fn socketpair(p: &Process, domain: u64, ty: u64, protocol: u64, sv: u
     if protocol != 0 {
         return Err(Errno::EPROTONOSUPPORT);
     }
-    let (a, b) = unix::socketpair(dgram, ty & SOCK_NONBLOCK != 0)?;
+    let (a, b) = unix::socketpair(dgram, ty & SOCK_NONBLOCK != 0, scm::cred(p))?;
     let (a, b) = (try_arc(a).map_err(oom)?, try_arc(b).map_err(oom)?);
     let (a, b) = (OpenFile::try_new(a, Access::RW)?, OpenFile::try_new(b, Access::RW)?);
     let cloexec = ty & SOCK_CLOEXEC != 0;
@@ -997,24 +1138,11 @@ pub(crate) fn shutdown(p: &Process, fd: i32, how: u64) -> SysResult {
     .map(|()| 0)
 }
 
-/// Writes an unnamed `AF_UNIX` address (just the family), as `socketpair`
-/// ends have.
-fn put_unix_addr(p: &Process, va: u64, lenp: u64) -> Result<(), Errno> {
-    if va == 0 {
-        return Ok(());
-    }
-    let mut cap = [0u8; 4];
-    p.memory().read(lenp, &mut cap)?;
-    let n = (u32::from_ne_bytes(cap) as usize).min(2);
-    p.memory().write(va, bytes::slice(&(AF_UNIX as u16).to_ne_bytes(), 0, n)?)?;
-    p.memory().write(lenp, &2u32.to_ne_bytes())
-}
-
 pub(crate) fn getsockname(p: &Process, fd: i32, addr: u64, lenp: u64) -> SysResult {
     let of = open(p, fd)?;
     match any(&of)? {
         Any::Inet(s) => put_addr(p, addr, lenp, s.local_addr()),
-        Any::Unix(_) => put_unix_addr(p, addr, lenp),
+        Any::Unix(u) => scm::put_addr(p, addr, lenp, u.local_addr().as_deref()),
     }
     .map(|()| 0)
 }
@@ -1023,7 +1151,7 @@ pub(crate) fn getpeername(p: &Process, fd: i32, addr: u64, lenp: u64) -> SysResu
     let of = open(p, fd)?;
     match any(&of)? {
         Any::Inet(s) => put_addr(p, addr, lenp, s.peer_addr()?),
-        Any::Unix(_) => put_unix_addr(p, addr, lenp),
+        Any::Unix(u) => scm::put_addr(p, addr, lenp, u.peer_addr()?.as_deref()),
     }
     .map(|()| 0)
 }
@@ -1060,26 +1188,63 @@ pub(crate) fn setsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, 
         }
         return Ok(0);
     }
+    if level == SOL_SOCKET && name == SO_PASSCRED {
+        let Any::Unix(u) = s else { return Err(Errno::ENOPROTOOPT) };
+        if len < 4 {
+            return Err(Errno::EINVAL);
+        }
+        let mut v = [0u8; 4];
+        p.memory().read(val, &mut v)?;
+        u.set_passcred(i32::from_ne_bytes(v) != 0);
+        return Ok(0);
+    }
     if !known_option(level, name) {
         return Err(Errno::ENOPROTOOPT);
     }
     if len < 4 {
         return Err(Errno::EINVAL);
     }
-    p.memory().read(val, &mut [0u8; 4])?;
+    let mut word = [0u8; 4];
+    p.memory().read(val, &mut word)?;
+    if level == SOL_SOCKET
+        && matches!(name, SO_REUSEADDR | SO_REUSEPORT)
+        && let Any::Inet(s) = s
+    {
+        s.set_reuse_option(name == SO_REUSEPORT, u32::from_ne_bytes(word) != 0);
+    }
     Ok(0)
 }
 
 pub(crate) fn getsockopt(p: &Process, fd: i32, level: u64, name: u64, val: u64, lenp: u64) -> SysResult {
     let of = open(p, fd)?;
     let s = any(&of)?;
+    if (level, name) == (SOL_SOCKET, SO_PEERCRED) {
+        let Any::Unix(u) = &s else { return Err(Errno::ENOPROTOOPT) };
+        // Not connected: nobody (the overflow ids).
+        let c = u.peer_cred().unwrap_or(unix::Cred { pid: 0, uid: 65534, gid: 65534 });
+        let mut cap = [0u8; 4];
+        p.memory().read(lenp, &mut cap)?;
+        let b = scm::ucred_bytes(c);
+        let n = (u32::from_ne_bytes(cap) as usize).min(b.len());
+        p.memory().write(val, bytes::slice(&b, 0, n)?)?;
+        p.memory().write(lenp, &(b.len() as u32).to_ne_bytes())?;
+        return Ok(0);
+    }
     let v: i32 = match (level, name) {
+        (SOL_SOCKET, SO_PASSCRED) => match &s {
+            Any::Unix(u) => i32::from(u.passcred()),
+            Any::Inet(_) => return Err(Errno::ENOPROTOOPT),
+        },
         (SOL_SOCKET, SO_TYPE) => s.type_code() as i32,
         (SOL_SOCKET, SO_ERROR) => match &s {
             Any::Inet(s) => s.pending_error(),
             Any::Unix(_) => 0,
         },
         (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => TCP_BUFFER as i32,
+        (SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT) => match &s {
+            Any::Inet(s) => i32::from(s.reuse_option(name == SO_REUSEPORT)),
+            Any::Unix(_) => 0,
+        },
         _ if known_option(level, name) => 0,
         _ => return Err(Errno::ENOPROTOOPT),
     };

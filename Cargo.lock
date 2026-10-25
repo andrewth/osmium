@@ -6,8 +6,10 @@ version = 4
 name = "osmium"
 version = "0.1.0"
 dependencies = [
+ "osmium-acpi",
  "osmium-arch",
  "osmium-boot",
+ "osmium-display",
  "osmium-drivers",
  "osmium-exec",
  "osmium-fs",
@@ -18,10 +20,21 @@ dependencies = [
  "osmium-iscsi",
  "osmium-mm",
  "osmium-net",
+ "osmium-netdev",
  "osmium-proc",
  "osmium-sched",
+ "osmium-storage",
  "osmium-sync",
+ "osmium-sysdrv",
+ "osmium-usb",
  "osmium-virt",
+]
+
+[[package]]
+name = "osmium-acpi"
+version = "0.1.0"
+dependencies = [
+ "osmium-boot",
 ]
 
 [[package]]
@@ -37,13 +50,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "osmium-display"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-drivers",
+ "osmium-hal",
+ "osmium-mm",
+]
+
+[[package]]
 name = "osmium-drivers"
 version = "0.1.0"
 dependencies = [
  "osmium-arch",
  "osmium-hal",
  "osmium-mm",
- "osmium-sync",
 ]
 
 [[package]]
@@ -121,6 +143,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "osmium-netdev"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-drivers",
+ "osmium-hal",
+]
+
+[[package]]
 name = "osmium-proc"
 version = "0.1.0"
 dependencies = [
@@ -143,10 +174,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "osmium-storage"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-drivers",
+ "osmium-hal",
+ "osmium-mm",
+ "osmium-sync",
+]
+
+[[package]]
 name = "osmium-sync"
 version = "0.1.0"
 dependencies = [
  "osmium-arch",
+]
+
+[[package]]
+name = "osmium-sysdrv"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-hal",
+ "osmium-mm",
+ "osmium-sync",
+]
+
+[[package]]
+name = "osmium-usb"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-hal",
+ "osmium-mm",
 ]
 
 [[package]]

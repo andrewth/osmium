@@ -20,6 +20,9 @@ pub enum Error {
     ConnectionReset,
     /// The peer stopped acknowledging data.
     TimedOut,
+    /// The address and port are already bound by another socket, and the
+    /// `SO_REUSEADDR` / `SO_REUSEPORT` rules do not let both share them.
+    AddressInUse,
     /// There was no memory to queue the data or add the socket.
     OutOfMemory,
 }
@@ -34,6 +37,7 @@ impl fmt::Display for Error {
             Error::ConnectionRefused => "connection refused",
             Error::ConnectionReset => "connection reset",
             Error::TimedOut => "connection timed out",
+            Error::AddressInUse => "address already in use",
             Error::OutOfMemory => "out of memory",
         })
     }

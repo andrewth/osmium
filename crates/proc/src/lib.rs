@@ -50,6 +50,11 @@
 //!   (`resume_user` in `osmium_arch::riscv64` / `aarch64`), and where a new
 //!   program's stack and `mmap` area go.
 //!
+//! - [`osmium_arch::mmu::set_remote_flush`] lets a process's threads run on
+//!   several CPUs at once (AArch64 needs nothing): unmapping and
+//!   copy-on-write changes then shoot down the other CPUs' TLB entries.
+//!   Without it `clone` pins a process's threads to one CPU. See [`thread`].
+//!
 //! A process is a group of [`Thread`]s, each with its own task: `clone` makes
 //! processes (`fork`, `vfork`) or, with `CLONE_THREAD`, threads (see
 //! [`thread`]), and [`signal`] delivers signals to user handlers. Forked
@@ -68,25 +73,31 @@ mod epoll;
 mod exec;
 pub mod fd;
 pub mod futex;
+mod futex_pi;
 mod memory;
 mod mmap;
 pub mod net;
 mod pipe;
 pub mod poll;
 mod process;
+mod reloc;
+mod restart;
+mod scm;
 pub mod signal;
 pub mod socket;
 pub mod syscall;
 pub mod thread;
+mod thread_ext;
 mod unix;
 mod uregs;
 
-pub use exec::{ARG_MAX, Platform, UserEntry, set_platform};
+pub use exec::{ARG_MAX, INTERP_OFFSET, Platform, UserEntry, set_platform};
 pub use fd::{FdTable, OpenFile, set_console};
 pub use memory::{AddressSpace, FileMapping, UserMemory};
 pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for};
 pub use syscall::{Outcome, Sys, dispatch, dispatch_as};
 pub use thread::Thread;
+pub use unix::{MAX_IN_FLIGHT, UnixSocket, in_flight};
 
 use osmium_fs::Vfs;
 use osmium_sync::Once;

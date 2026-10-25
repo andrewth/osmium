@@ -1,10 +1,10 @@
 //! Display demos: find a PCI display adapter, set a mode and draw colour
 //! bars that `scripts/screen.py` can check in a QEMU screendump.
 
-use osmium::drivers::display::PciDisplay;
-use osmium::drivers::display::bochs::BochsVbe;
+use osmium::display::PciDisplay;
+use osmium::display::bochs::BochsVbe;
 use osmium::drivers::virtio::Transport;
-use osmium::drivers::virtio::gpu::VirtioGpu;
+use osmium::display::virtio_gpu::VirtioGpu;
 use osmium::drivers::virtio::pci::PciTransport;
 use osmium::hal::display::{Display, Rect, Rgb};
 use osmium::hal::dma::DmaAllocator;
@@ -186,6 +186,7 @@ pub fn virtio_gpu<T: Transport, D: DmaAllocator + ?Sized>(tag: &str, transport: 
     match gpu.set_mode(scanout, mode.width / 2, mode.height / 2) {
         Ok(_) => {
             let ok = show(tag, &mut gpu);
+            cursor_and_edid(tag, &mut gpu);
             // Leave the device running so the picture stays up.
             core::mem::forget(gpu);
             ok
@@ -194,5 +195,22 @@ pub fn virtio_gpu<T: Transport, D: DmaAllocator + ?Sized>(tag: &str, transport: 
             println!("[{tag}] set_mode: {e:?}");
             false
         }
+    }
+}
+
+/// Reads the monitor's EDID and, if the device has a cursor queue, shows a
+/// 64 by 64 striped cursor and moves it.
+fn cursor_and_edid<T: Transport, D: DmaAllocator + ?Sized>(tag: &str, gpu: &mut VirtioGpu<'_, T, D>) {
+    match gpu.edid(0) {
+        Ok(e) => {
+            let (w, h) = e.preferred_size().unwrap_or((0, 0));
+            println!("[{tag}] EDID: {} {}, prefers {w}x{h}", e.manufacturer(), e.name().unwrap_or("?"));
+        }
+        Err(e) => println!("[{tag}] EDID: {e:?}"),
+    }
+    let image: [u32; 4096] = core::array::from_fn(|i| if (i % 64 + i / 64) % 8 < 6 { 0xffff_ffff } else { 0 });
+    match gpu.set_cursor(&image, 0, 0).and_then(|()| gpu.move_cursor(40, 40)) {
+        Ok(()) => println!("[{tag}] cursor image set and moved"),
+        Err(e) => println!("[{tag}] cursor: {e:?}"),
     }
 }

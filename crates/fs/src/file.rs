@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::ops::{BitAnd, BitOr, BitOrAssign};
 
-use crate::Errno;
+use crate::{Errno, Timestamp};
 
 /// What kind of node a [`File`] is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -71,6 +71,13 @@ pub struct Stat {
     pub size: u64,
     /// Device number for character and block devices (`st_rdev`).
     pub rdev: u64,
+    /// Last access (`st_atime`). A file system that does not track it
+    /// reports its modification time, or the epoch.
+    pub atime: Timestamp,
+    /// Last modification of the contents (`st_mtime`).
+    pub mtime: Timestamp,
+    /// Last change of the contents or the metadata (`st_ctime`).
+    pub ctime: Timestamp,
 }
 
 /// One directory entry, returned by [`File::readdir`].
@@ -190,6 +197,27 @@ pub trait File: Send + Sync {
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
         let _ = (name, dir);
         Err(Errno::ENOTDIR)
+    }
+
+    /// Adds a hard link: the entry `name` in this directory for the existing
+    /// non-directory `target`, which must belong to the same file system
+    /// (`EXDEV` otherwise). `EEXIST` if `name` exists, `EPERM` for a
+    /// directory or a file system without hard links (the default).
+    fn link(&self, name: &str, target: &dyn File) -> Result<(), Errno> {
+        let _ = (name, target);
+        Err(Errno::EPERM)
+    }
+
+    /// Moves the entry `old_name` of this directory to `new_name` in
+    /// `new_dir` (which may be this one), atomically replacing an existing
+    /// target the way `rename(2)` does: a file replaces a file, a directory
+    /// an empty directory (`ENOTDIR`, `EISDIR`, `ENOTEMPTY` otherwise); the
+    /// same node under both names is a no-op. `EXDEV` if `new_dir` is on
+    /// another file system, `EINVAL` for a directory into itself. The default
+    /// is `EPERM`: a file system without rename.
+    fn rename(&self, old_name: &str, new_dir: &dyn File, new_name: &str) -> Result<(), Errno> {
+        let _ = (old_name, new_dir, new_name);
+        Err(Errno::EPERM)
     }
 
     /// The target of a symbolic link.

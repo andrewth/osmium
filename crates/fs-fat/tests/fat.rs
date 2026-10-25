@@ -231,6 +231,107 @@ fn full_cycle(image: &str, fat: &str, kib: &str) {
     let _ = std::fs::remove_file(&path);
 }
 
+#[test]
+fn fat32_rename_and_timestamps() {
+    rename_cycle("fat32r.img", "32", "40000");
+}
+
+#[test]
+fn fat16_rename_and_timestamps() {
+    rename_cycle("fat16r.img", "16", "16000");
+}
+
+#[test]
+fn fat12_rename_and_timestamps() {
+    rename_cycle("fat12r.img", "12", "1440");
+}
+
+fn rename_cycle(image: &str, fat: &str, kib: &str) {
+    use osmium_fs::{ManualClock, Timestamp};
+    let Some((path, disk)) = mkfs(image, fat, kib) else { return };
+    let fs = FatFs::mount(disk.clone(), 7).unwrap();
+    let clock = Arc::new(ManualClock::new(Timestamp::from_civil(2024, 5, 6, 7, 8, 10)));
+    fs.set_clock(clock.clone());
+    let vfs = Vfs::new(fs.root());
+
+    // Times follow the clock (to DOS's two seconds), and a write moves the
+    // write and access times but not the creation time.
+    let f = vfs.open("/first.txt", NEW, 0o644).unwrap();
+    f.write(0, b"payload").unwrap();
+    let st = vfs.stat("/first.txt", true).unwrap();
+    assert_eq!(st.mtime, Timestamp::from_civil(2024, 5, 6, 7, 8, 10));
+    assert_eq!(st.atime, Timestamp::from_civil(2024, 5, 6, 0, 0, 0));
+    clock.advance(3600);
+    f.write(0, b"PAYLOAD").unwrap();
+    assert_eq!(vfs.stat("/first.txt", true).unwrap().mtime, Timestamp::from_civil(2024, 5, 6, 8, 8, 10));
+    clock.advance(86_400);
+    f.truncate(3).unwrap();
+    assert_eq!(vfs.stat("/first.txt", true).unwrap().mtime, Timestamp::from_civil(2024, 5, 7, 8, 8, 10));
+    assert_eq!(vfs.stat("/first.txt", true).unwrap().atime, Timestamp::from_civil(2024, 5, 7, 0, 0, 0));
+
+    // Hard links do not exist on FAT.
+    assert_eq!(vfs.link("/first.txt", "/second.txt").err(), Some(Errno::EPERM));
+
+    // A rename within a directory (short to long name) keeps the node, the
+    // data and the times, and an open handle follows it.
+    vfs.rename("/first.txt", "/A Much Longer Name.text").unwrap();
+    assert_eq!(vfs.lookup("/first.txt").err(), Some(Errno::ENOENT));
+    let moved = vfs.lookup("/a much longer name.TEXT").unwrap();
+    assert_eq!(read_all(&*moved), b"PAY");
+    assert!(Arc::ptr_eq(&moved, &f), "the open node is the renamed file");
+    assert_eq!(moved.stat().mtime, Timestamp::from_civil(2024, 5, 7, 8, 8, 10));
+    f.write(3, b"!").unwrap();
+    assert_eq!(read_all(&*vfs.lookup("/A Much Longer Name.text").unwrap()), b"PAY!");
+
+    // Case-only change, across directories, and over an existing file.
+    vfs.rename("/A Much Longer Name.text", "/a much longer name.text").unwrap();
+    assert_eq!(names(&*vfs.lookup("/").unwrap()), ["a much longer name.text"]);
+    vfs.mkdir("/dir", 0o755).unwrap();
+    vfs.mkdir("/dir/inner", 0o755).unwrap();
+    vfs.open("/dir/inner/deep.txt", NEW, 0o644).unwrap().write(0, b"deep").unwrap();
+    vfs.open("/other.txt", NEW, 0o644).unwrap().write(0, &pattern(3000, 4)).unwrap();
+    vfs.rename("/a much longer name.text", "/dir/x.txt").unwrap();
+    vfs.rename("/dir/x.txt", "/other.txt").unwrap();
+    assert_eq!(read_all(&*vfs.lookup("/other.txt").unwrap()), b"PAY!");
+    assert_eq!(names(&*vfs.lookup("/").unwrap()), ["dir", "other.txt"]);
+
+    // Directories: moved with their contents, `..` follows, and nothing
+    // moves into itself or over something it cannot replace.
+    vfs.mkdir("/dest", 0o755).unwrap();
+    vfs.rename("/dir/inner", "/dest/inner2").unwrap();
+    assert_eq!(read_all(&*vfs.lookup("/dest/inner2/deep.txt").unwrap()), b"deep");
+    assert_eq!(vfs.canonicalize("/dest/inner2/..").unwrap(), "/dest");
+    assert_eq!(vfs.rename("/dest", "/dest/inner2/dest").err(), Some(Errno::EINVAL));
+    assert_eq!(vfs.rename("/dest", "/other.txt").err(), Some(Errno::ENOTDIR));
+    assert_eq!(vfs.rename("/other.txt", "/dest").err(), Some(Errno::EISDIR));
+    assert_eq!(vfs.rename("/dir", "/dest").err(), Some(Errno::ENOTEMPTY));
+    vfs.rename("/dest/inner2", "/inner3").unwrap();
+    assert_eq!(vfs.canonicalize("/inner3/..").unwrap(), "/");
+    vfs.rename("/dest", "/dir").unwrap(); // over the now empty /dir
+    assert_eq!(names(&*vfs.lookup("/").unwrap()), ["dir", "inner3", "other.txt"]);
+    assert_eq!(vfs.rename("/nope", "/x").err(), Some(Errno::ENOENT));
+
+    // A removed-while-open file replaced by a rename keeps its data.
+    let held = vfs.open("/other.txt", OpenFlags::READ, 0).unwrap();
+    vfs.open("/new.txt", NEW, 0o644).unwrap().write(0, b"new").unwrap();
+    vfs.rename("/new.txt", "/other.txt").unwrap();
+    assert_eq!(read_all(&*held), b"PAY!");
+    assert_eq!(read_all(&*vfs.lookup("/other.txt").unwrap()), b"new");
+    drop((held, moved, f));
+
+    vfs.lookup("/").unwrap().sync().unwrap();
+    drop(vfs);
+    let report = fsck(&path, &disk);
+    assert!(!report.contains("Free cluster summary wrong"), "{report}");
+    // Everything is where it was left after a fresh mount, with its times.
+    let fs2 = FatFs::mount(disk.clone(), 8).unwrap();
+    let vfs = Vfs::new(fs2.root());
+    assert_eq!(read_all(&*vfs.lookup("/other.txt").unwrap()), b"new");
+    assert_eq!(read_all(&*vfs.lookup("/inner3/deep.txt").unwrap()), b"deep");
+    assert_eq!(vfs.stat("/other.txt", true).unwrap().mtime, Timestamp::from_civil(2024, 5, 7, 8, 8, 10));
+    let _ = std::fs::remove_file(&path);
+}
+
 // --- Crafted volumes -------------------------------------------------------
 
 /// A disk in memory that stores only the sectors written to it (the rest

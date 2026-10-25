@@ -18,8 +18,10 @@
 //! Inode numbers are disk positions: a directory's is that of its extent,
 //! anything else's that of its directory record.
 //!
-//! Not supported: timestamps (`osmium_fs::Stat` has no fields for them),
-//! owners, multi-session discs beyond the first session's descriptors, and
+//! Timestamps: every time is the directory record's recording date (Rock
+//! Ridge `TF` entries are not read).
+//!
+//! Not supported: owners, multi-session discs beyond the first session's descriptors, and
 //! UDF.
 #![no_std]
 
@@ -37,7 +39,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::mem::offset_of;
 
-use osmium_fs::{DirEntry, Errno, File, FileKind, Stat};
+use osmium_fs::{DirEntry, Errno, File, FileKind, Stat, Timestamp};
 use osmium_hal::block::BlockDevice;
 use osmium_sync::fallible::{OutOfMemory, try_arc, try_push, try_string, try_to_vec, try_zeroed};
 use osmium_sync::intrusive::{Adapter, KeyAdapter, Registry, Shared as SharedLink, TreeLink};
@@ -127,6 +129,7 @@ struct Entry {
     nlink: u32,
     rdev: u64,
     size: u64,
+    mtime: Timestamp,
     extents: Vec<Extent>,
     link: Option<String>,
 }
@@ -204,6 +207,7 @@ impl Entry {
             nlink: self.nlink,
             rdev: self.rdev,
             size: self.size,
+            mtime: self.mtime,
             extents: try_to_vec(&self.extents)?,
             link: self.link.as_deref().map(try_string).transpose()?,
         })
@@ -301,6 +305,7 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
             nlink: 2,
             rdev: 0,
             size: root.size as u64,
+            mtime: root.date,
             extents: one_extent(Extent::contiguous(start, root.size as u64))?,
             link: None,
         };
@@ -397,6 +402,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             nlink: if dir { 2 } else { 1 },
             rdev: 0,
             size: rec.size as u64,
+            mtime: rec.date,
             extents: one_extent(Extent::of(rec, self.lbs))?,
             link: None,
         };
@@ -574,6 +580,9 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             nlink: e.nlink,
             size: e.size,
             rdev: e.rdev,
+            atime: e.mtime,
+            mtime: e.mtime,
+            ctime: e.mtime,
         }
     }
 

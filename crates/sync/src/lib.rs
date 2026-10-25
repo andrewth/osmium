@@ -5,6 +5,8 @@
 //!   scheduler from switching tasks while the lock is held; [`IrqDisabled`]
 //!   additionally masks local interrupts, which a lock shared with an
 //!   interrupt handler needs.
+//! - [`McsLock`]: an MCS queued spin lock; each waiter spins on its own cache line.
+//! - [`Rcu`] and `RcuCell` (feature `alloc`): sleepable read-copy-update.
 //! - [`RwSpinLock`]: a writer-preferring reader/writer spin lock.
 //! - [`SeqLock`]: a sequence lock; readers retry instead of blocking the writer.
 //! - [`Once`] and [`Lazy`]: one-time initialization.
@@ -33,17 +35,23 @@ pub mod arc;
 pub mod fallible;
 mod guard;
 pub mod intrusive;
+mod mcs;
 mod once;
 mod percpu;
 pub mod preempt;
+mod rcu;
 mod ring;
 mod rwlock;
 mod seqlock;
 mod spin;
 
 pub use guard::{Guardian, IrqDisabled, NoGuard, PreemptDisabled};
+pub use mcs::{IrqMcsLock, McsLock, RawMcsLock};
 pub use once::{Lazy, Once};
 pub use percpu::{PerCpu, PerCpuCell};
+#[cfg(feature = "alloc")]
+pub use rcu::RcuCell;
+pub use rcu::{Rcu, RcuReadGuard};
 pub use ring::{Consumer, Producer, SpscRing};
 pub use rwlock::{RwSpinLock, RwSpinLockReadGuard, RwSpinLockWriteGuard};
 pub use seqlock::{NoPadding, SeqLock};

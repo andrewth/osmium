@@ -179,6 +179,11 @@ fn descriptor_creating_calls_fail_cleanly_and_leak_no_descriptor() {
         );
         assert!(n >= 3, "{n}");
     }
+    // socket(AF_UNIX), stream and datagram
+    for ty in [1, 2] {
+        let n = sweep(|| call(&p, Sys::Socket, &[1, ty, 0]), |r, injected| closing(r, injected, &[r as u64]));
+        assert!(n >= 2, "{n}");
+    }
     // epoll_create1
     let epfd = std::cell::Cell::new(0);
     let n = sweep(

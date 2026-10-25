@@ -1,6 +1,6 @@
 //! Directory records (ECMA-119 section 9.1).
 
-use osmium_fs::Errno;
+use osmium_fs::{Errno, Timestamp};
 
 /// File flags.
 pub mod flag {
@@ -29,6 +29,8 @@ pub struct Record<'src> {
     /// File unit size and interleave gap size, in logical blocks (both
     /// non-zero for an interleaved file).
     pub interleave: (u8, u8),
+    /// The recording date and time.
+    pub date: Timestamp,
     /// The raw file identifier.
     pub name: &'src [u8],
     /// The system use area (SUSP and Rock Ridge entries).
@@ -58,6 +60,7 @@ impl<'src> Record<'src> {
             size: le32(10)?,
             flags: byte(25)?,
             interleave: (byte(26)?, byte(27)?),
+            date: date(r.get(18..25).ok_or(Errno::EIO)?),
             name: r.get(33..name_end).ok_or(Errno::EIO)?,
             system_use: r.get(su..).ok_or(Errno::EIO)?,
         })
@@ -72,6 +75,26 @@ impl<'src> Record<'src> {
     pub fn is_dotdot(&self) -> bool {
         self.name == [1]
     }
+}
+
+/// The 7-byte recording date of a directory record (years since 1900,
+/// month, day, hour, minute, second, offset from GMT in 15 minute units).
+/// Out-of-range fields are clamped rather than rejected: a bad date on a
+/// disc is not a reason to refuse the file.
+fn date(d: &[u8]) -> Timestamp {
+    let [year, month, day, hour, min, sec, zone] = *d else { return Timestamp::ZERO };
+    if year == 0 && month == 0 && day == 0 {
+        return Timestamp::ZERO;
+    }
+    let local = Timestamp::from_civil(
+        1900 + year as i64,
+        (month as i64).clamp(1, 12),
+        (day as i64).clamp(1, 31),
+        hour.min(23) as i64,
+        min.min(59) as i64,
+        sec.min(59) as i64,
+    );
+    Timestamp::from_secs(local.sec - (zone as i8 as i64) * 900)
 }
 
 /// The records of a directory read into memory, with their byte offsets.
@@ -109,5 +132,19 @@ impl<'src> Iterator for Records<'src> {
             self.pos = at + len;
             return Some(Record::parse(r).map(|rec| (at, rec)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_dates() {
+        // 2021-02-03 04:05:06 at GMT+1 (4 units of 15 minutes).
+        let d = date(&[121, 2, 3, 4, 5, 6, 4]);
+        assert_eq!(d.sec, 1_612_325_106 - 3600);
+        assert_eq!(date(&[0; 7]), Timestamp::ZERO);
+        assert_eq!(date(&[1, 2]), Timestamp::ZERO);
     }
 }

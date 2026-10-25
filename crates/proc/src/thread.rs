@@ -9,8 +9,34 @@
 //! other threads the next time each is in the kernel (a timer interrupt is
 //! enough, if the kernel calls `signal::deliver` on it).
 //!
-//! All of a process's threads run on one CPU: unmapping memory does not shoot
-//! down other CPUs' TLB entries yet. Joining uses `CLONE_CHILD_CLEARTID` and
+//! # Several CPUs
+//!
+//! Where the kernel has a way to invalidate other CPUs' TLB entries (AArch64
+//! always; elsewhere [`osmium_arch::mmu::set_remote_flush`]), the threads of
+//! a process run on different CPUs at once, placed and moved by the
+//! scheduler. Otherwise `clone` pins each new thread to its parent's CPU.
+//! Unmapping and the sharing and un-sharing of copy-on-write pages shoot down
+//! the other CPUs after the address space's lock is released. A thread
+//! whose TLB still holds a read-only entry for a page another CPU has since
+//! made writable takes a spurious write fault, which `handle_page_fault`
+//! absorbs. Pages mapped for the first time need no shootdown on the
+//! architectures that never cache absent translations (x86-64; RISC-V hardware
+//! may, and then relies on the retried fault).
+//!
+//! ## Locking order
+//!
+//! A process's state is split over small spin locks (`memory`, `brk`,
+//! `mmap`, `cwd`, signal actions, a thread's `fault`), the file table's
+//! mutex and the thread group's list. Each is held briefly and none is held
+//! while calling into another of them; `Process::memory` clones the space's
+//! `Arc` out of its lock, so the address space's own lock is always taken
+//! with no other process lock held. That lock is the innermost: nothing is
+//! called under it except the page-table code and frame allocator. A TLB
+//! shootdown runs after it is released and under no spin lock, because a CPU
+//! spinning on a lock with interrupts off cannot acknowledge it. All of a
+//! thread's fields are atomics or such leaf locks, so any CPU may read them.
+//!
+//! Joining uses `CLONE_CHILD_CLEARTID` and
 //! `futex`, as `pthread_join` does.
 #![cfg_attr(
     not(any(test, target_arch = "riscv64", target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64"))),
@@ -54,6 +80,12 @@ pub struct Thread {
     tls: AtomicU64,
     fault: IrqSpinLock<Option<(u8, u64)>>,
     alive: AtomicBool,
+    /// The page of the last write fault taken for a stale TLB entry, plus
+    /// one, and how many in a row hit it: see [`stale_write_fault`].
+    stale_page: AtomicU64,
+    stale_count: AtomicU32,
+    /// Restart block and priority-inheritance state.
+    pub(crate) ext: crate::thread_ext::ThreadExt,
     /// Links the thread into its group's list.
     group_link: Shared<Link>,
     /// Links a non-leader thread into [`TIDS`], keyed by `key`.
@@ -112,6 +144,9 @@ impl Thread {
             tls: AtomicU64::new(0),
             fault: IrqSpinLock::new(None),
             alive: AtomicBool::new(true),
+            stale_page: AtomicU64::new(0),
+            stale_count: AtomicU32::new(0),
+            ext: crate::thread_ext::ThreadExt::new(),
             group_link: Shared::new(Link::new()),
             tid_link: Shared::new(TreeLink::new()),
             key: tid,
@@ -243,17 +278,41 @@ pub(crate) fn find(tid: u32) -> Option<(Arc<Process>, Arc<Thread>)> {
 /// A new process's first task claims the leader thread the first time it
 /// asks.
 pub(crate) fn current_thread(p: &Process) -> Arc<Thread> {
-    let id = osmium_sched::current().id().0 + 1;
+    let task = osmium_sched::current();
+    let id = task.id().0 + 1;
     let threads = p.group.threads.lock();
     if let Some(t) = threads.clone_first_where(|t| t.task.load(Ordering::SeqCst) == id) {
+        t.ext.bind(&task);
         return t;
     }
     let leader = ThreadGroup::leader_in(&threads);
     // The first thread's task is spawned before it can run and cannot be
     // named until then, so it is recognised by being the first to ask.
     let _ = leader.task.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst);
+    leader.ext.bind(&task);
     leader
 }
+
+/// Retries a write fault at `addr` that was not copy-on-write, if the page
+/// is writable and so the fault was this CPU's stale TLB entry (another
+/// thread of the process, on another CPU, changed the mapping). A fault
+/// that really is not stale would recur forever, so the same page is
+/// retried at most [`STALE_RETRIES`] times in a row.
+pub(crate) fn stale_write_fault(p: &Process, addr: u64) -> bool {
+    let th = current_thread(p);
+    let page = (addr >> 12) + 1;
+    if th.stale_page.swap(page, Ordering::Relaxed) != page {
+        th.stale_count.store(0, Ordering::Relaxed);
+    }
+    if th.stale_count.fetch_add(1, Ordering::Relaxed) >= STALE_RETRIES {
+        return false;
+    }
+    p.memory().stale_fault(addr)
+}
+
+/// How many times in a row one page's write fault may be taken for a stale
+/// TLB entry before it is taken for a real fault.
+const STALE_RETRIES: u32 = 3;
 
 /// The thread pointer for the thread running `task`, if it is one of a
 /// process's threads. For a kernel's switch hook on architectures where it
@@ -398,13 +457,19 @@ pub(crate) fn start(
     } else {
         osmium_arch::fp::FpState::new()
     };
-    // Threads share one CPU until unmapping shoots down TLBs elsewhere.
-    let me = osmium_sched::current();
-    let cpu = me.cpu();
-    me.pin(cpu);
-    drop(me);
+    // Where the kernel can shoot down other CPUs' TLB entries, the new
+    // thread goes wherever the scheduler puts it, and may be moved. Without
+    // that, page-table changes reach only the CPU that makes them, so the
+    // threads of the process share one CPU.
+    let mut builder = osmium_sched::TaskBuilder::new(p.name());
+    if !osmium_arch::mmu::remote_flush_supported() {
+        let me = osmium_sched::current();
+        let cpu = me.cpu();
+        me.pin(cpu);
+        builder = builder.cpu(cpu);
+    }
     let t = th.clone();
-    let spawned = p.try_spawn_with_fp(osmium_sched::TaskBuilder::new(p.name()).cpu(cpu), fp, move || {
+    let spawned = p.try_spawn_with_fp(builder, fp, move || {
         // The spawner records the task's id as soon as it has it.
         while t.task.load(Ordering::SeqCst) == 0 {
             osmium_sched::yield_now();

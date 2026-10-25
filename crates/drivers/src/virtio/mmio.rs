@@ -1,7 +1,7 @@
 //! The virtio-mmio transport (device tree `virtio,mmio`), versions 1
 //! (legacy) and 2.
 
-use crate::ioext::IoMemExt;
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::virtio::mmio::*;
 use osmium_hal::virtio::queue::LEGACY_ALIGN;

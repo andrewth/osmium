@@ -1,6 +1,6 @@
 [package]
 name = "osmium-drivers"
-description = "Osmium: reference drivers (16550, PL011, PLIC, GICv2, local APIC, RAM disk)"
+description = "Osmium: the virtio core (MMIO and PCI transports, split virtqueue)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,4 +13,7 @@ workspace = true
 osmium-arch.workspace = true
 osmium-hal.workspace = true
 osmium-mm.workspace = true
-osmium-sync.workspace = true
+
+[features]
+## Exposes the virtio test doubles (`virtio::testing`, `virtio::queue::tests`) to other crates.
+testing = []

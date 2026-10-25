@@ -22,18 +22,19 @@ use osmium::arch::riscv64::{self, SatpMode, sbi};
 use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::{Fdt, Node};
-use osmium::drivers::ahci::{self, Ahci};
-use osmium::drivers::ehci::Ehci;
-use osmium::drivers::iommu::riscv::RiscvIommu;
-use osmium::drivers::nvme::{self, Nvme};
-use osmium::drivers::ohci::Ohci;
-use osmium::drivers::plic::Plic;
-use osmium::drivers::uart16550::{Mmio, Uart16550};
-use osmium::drivers::virtio::blk::VirtioBlk;
+use osmium::storage::ahci::{self, Ahci};
+use osmium::usb::ehci::Ehci;
+use osmium::sysdrv::iommu::riscv::RiscvIommu;
+use osmium::storage::nvme::{self, Nvme};
+use osmium::usb::ohci::Ohci;
+use osmium::sysdrv::plic::Plic;
+use osmium::sysdrv::uart16550::{Mmio, Uart16550};
+use osmium::storage::virtio_blk::VirtioBlk;
+use osmium::drivers::virtio::console::VirtioConsole;
 use osmium::drivers::virtio::mmio::MmioTransport;
-use osmium::drivers::virtio::net::VirtioNet;
+use osmium::netdev::virtio_net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
-use osmium::drivers::xhci::Xhci;
+use osmium::usb::xhci::Xhci;
 use osmium::hal::block::BlockDevice;
 use osmium::hal::console::{Console, SerialConsole, set_console};
 use osmium::hal::dma::DmaAllocator;
@@ -490,6 +491,7 @@ impl<B: BlockDevice> BlockDevice for Before<'_, B> {
 /// a block round trip on it, calling `before` ahead of each transfer.
 fn nvme_demo<D: DmaAllocator>(addr: pci::Address, io: IoMem, dma: &D, before: &dyn Fn()) {
     let (b, d, f) = (addr.bus, addr.device, addr.function);
+    let more = io.clone();
     match Nvme::new(io, dma, &Uptime) {
         Ok(disk) => {
             let (model, nsid) = (alloc::string::String::from(disk.model()), disk.namespace());
@@ -499,6 +501,19 @@ fn nvme_demo<D: DmaAllocator>(addr: pci::Address, io: IoMem, dma: &D, before: &d
             println!("[nvme]  {b:02x}:{d:02x}.{f} \"{model}\" namespace {nsid}: {n} blocks of {bs}; round trip {r:?}");
         }
         Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: init failed: {e:?}"),
+    }
+    // Again with several I/O queue pairs, each given a round trip of its own.
+    match Nvme::with_queues(more, dma, &Uptime, None, 4) {
+        Ok(disk) => {
+            let n = disk.io_queues();
+            let mut ok = 0;
+            for mut handle in (0..n).filter_map(|q| disk.queue(q)) {
+                before();
+                ok += demos::block_roundtrip(&mut handle).is_ok() as usize;
+            }
+            println!("[nvme]  {b:02x}:{d:02x}.{f} {n} I/O queues; round trip on each: {ok} ok");
+        }
+        Err(e) => println!("[nvme]  {b:02x}:{d:02x}.{f}: multi-queue init failed: {e:?}"),
     }
 }
 
@@ -657,6 +672,8 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     osmium::sched::set_remote_wake_hook(|cpu| {
         let _ = sbi::send_ipi(1, HARTS[cpu].load(Ordering::Relaxed));
     });
+    // User threads run on any hart: address-space changes shoot the others down.
+    osmium::arch::mmu::set_remote_flush(|start, pages| remote_sfence_vma(start, pages * PAGE_SIZE));
     let cpus = fdt.find_node("/cpus").expect("no /cpus");
     let harts = cpus
         .children()
@@ -727,6 +744,36 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             }
         }
         None => println!("[blk]   no virtio-blk device"),
+    }
+
+    // --- virtio-console ------------------------------------------------------
+    let vcon = virtio_slots(&fdt).find_map(|(base, len)| {
+        // SAFETY: the device tree puts a virtio-mmio slot here, mapped above;
+        // nothing else uses it (earlier probes' transports were dropped).
+        let t = MmioTransport::new(unsafe { IoMem::new(base as *mut u8, len as usize) }).ok()?;
+        (t.device_type() == DeviceType::Console).then_some((base, t))
+    });
+    match vcon {
+        Some((base, t)) => {
+            let legacy = if t.is_legacy() { "legacy" } else { "1.x" };
+            let mut con = VirtioConsole::new(t, &FRAMES).expect("virtio-console init failed");
+            // With multiport the device announces its ports through the control queue.
+            for _ in 0..50_000_000u32 {
+                con.poll();
+                if con.port_present(0) {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            let msg = b"hello from osmium over virtio-console\n";
+            match con.write(0, msg) {
+                Ok(()) => {
+                    println!("[vcon]  virtio-console ({legacy}) at {base:#x}: wrote {} bytes to port 0", msg.len())
+                }
+                Err(e) => println!("[vcon]  virtio-console ({legacy}) at {base:#x}: write failed: {e:?}"),
+            }
+        }
+        None => println!("[vcon]  no virtio-console device"),
     }
 
     // --- IOMMU behind PCIe ------------------------------------------------------
@@ -920,7 +967,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         }
         None => println!("[usb]   no EHCI controller"),
     }
-    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, osmium::drivers::ohci::CLASS, 0)) {
+    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, osmium::usb::ohci::CLASS, 0)) {
         Some((addr, base, len, pin)) => {
             // SAFETY: BAR 0 was just assigned this range inside the mapped
             // window; nothing else uses it.
@@ -1146,6 +1193,7 @@ fn platform() -> osmium::proc::Platform {
         stack_top: 0x11_0000_0000,
         stack_size: 64 * 1024,
         mmap_area: 0x12_0000_0000..0x13_0000_0000,
+        load_base: 0x14_0000_0000,
     }
 }
 
@@ -1171,6 +1219,39 @@ fn fork_exec_demo(cpu: usize) {
     drop(task);
     let freed = demos::user::freed(&[init]);
     println!("[user]  init and its children reaped; {freed} of 1 init address space torn down");
+}
+
+/// Position-independent programs, from `examples/user/pie.rs` (twice) and
+/// `ld.rs`.
+static PIE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pie.elf"));
+static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
+static LD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ld.elf"));
+
+/// Runs `/bin/pie`, a static PIE that the kernel relocates, and `/bin/dyn`,
+/// the same program linked against the interpreter `/bin/ld`, which
+/// relocates it.
+fn pie_demo() {
+    demos::user::install("pie", PIE_ELF);
+    demos::user::install("dyn", DYN_ELF);
+    demos::user::install("ld", LD_ELF);
+    for name in ["pie", "dyn"] {
+        let process =
+            Process::new_boxed(name, (platform().new_memory)().expect("out of memory for an address space"), 0);
+        let path = alloc::format!("/bin/{name}");
+        let task = process.spawn(TaskBuilder::new(name), move || {
+            let entry = osmium::proc::current()
+                .expect("current returned None")
+                .exec(&path, &[path.as_bytes()], &[])
+                .expect("exec of a position-independent program failed");
+            // SAFETY: exec activated the new table; traps are installed and
+            // the switch hook keeps TrapCpu's kernel stack on this task.
+            unsafe { riscv64::enter_user(entry.pc as usize, entry.sp as usize) }
+        });
+        drop(process);
+        task.join();
+        drop(task);
+    }
+    println!("[user]  position-independent programs exited");
 }
 
 fn user_demo() {
@@ -1199,6 +1280,7 @@ fn user_demo() {
     let freed = demos::user::freed(&processes);
     println!("[user]  {freed} of 4 address spaces torn down with their tasks");
     fork_exec_demo(cpu);
+    pie_demo();
     socket_demo();
 }
 
@@ -1302,11 +1384,9 @@ fn handle_trap(frame: &mut TrapFrame) {
         match frame.cause() {
             Trap::Syscall => return syscall(frame),
             Trap::Interrupt(_) => {}
-            // A write to a page `fork` shares gets its own copy, and a touch of
-            // a file mapping's page loads it; retry.
-            Trap::PageFault { addr, access }
-                if osmium::proc::handle_page_fault(addr as u64, access == Access::Write) =>
-            {
+            // A write to a page `fork` shares gets its own copy, and the first touch of a
+            // demand-paged `mmap` page its frame; retry.
+            Trap::PageFault { addr, access } if osmium::proc::handle_page_fault(addr as u64, access == Access::Write) => {
                 return;
             }
             cause => return user_fault(frame, cause),

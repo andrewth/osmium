@@ -41,7 +41,16 @@ pub struct Platform {
     pub stack_size: u64,
     /// Where `mmap` places anonymous memory for it.
     pub mmap_area: Range<u64>,
+    /// Where a position-independent (`ET_DYN`) program is loaded: its
+    /// lowest address goes here (page-aligned). Its interpreter, if it has
+    /// one, goes [`INTERP_OFFSET`] above. Both must be in the user half,
+    /// clear of `stack_top`, the stack and `mmap_area`.
+    pub load_base: u64,
 }
+
+/// How far above [`Platform::load_base`] a position-independent interpreter
+/// is loaded. A program image may not span more than this.
+pub const INTERP_OFFSET: u64 = 1 << 30;
 
 static PLATFORM: Once<Platform> = Once::new();
 
@@ -82,6 +91,7 @@ const MACHINE: Machine = Machine::RISCV;
 mod at {
     pub const NULL: u64 = 0;
     pub const PHDR: u64 = 3;
+    pub const BASE: u64 = 7;
     pub const PHENT: u64 = 4;
     pub const PHNUM: u64 = 5;
     pub const PAGESZ: u64 = 6;
@@ -96,7 +106,7 @@ mod at {
 }
 
 impl Process {
-    /// `execve`: replaces the program with the static ELF executable at the
+    /// `execve`: replaces the program with the ELF executable at the
     /// absolute `path`, with arguments `argv` and environment `envp`, and
     /// returns where it starts. Descriptors marked close-on-exec are closed,
     /// and the break and `mmap` area start afresh. Call it on the process's
@@ -122,21 +132,75 @@ impl Process {
         }
         let image = read_executable(path)?;
         let elf = Elf::new(&image).map_err(|_| Errno::ENOEXEC)?;
-        if elf.machine() != MACHINE || elf.is_pie() {
+        if elf.machine() != MACHINE {
             return Err(Errno::ENOEXEC);
         }
-        let brk_limit = brk_limit(&elf, platform)?;
+        // A dynamically linked program names an interpreter, which the
+        // kernel loads beside it and starts first.
+        let interp_image = match elf.interp().map_err(|_| Errno::ENOEXEC)? {
+            Some(interp) => {
+                let interp = core::str::from_utf8(interp).map_err(|_| Errno::ENOEXEC)?;
+                if !interp.starts_with('/') {
+                    return Err(Errno::ENOEXEC);
+                }
+                Some(read_executable(interp)?)
+            }
+            None => None,
+        };
+        let interp_elf = match &interp_image {
+            Some(image) => {
+                let interp = Elf::new(image).map_err(|_| Errno::ENOEXEC)?;
+                // One level only: the interpreter is not itself interpreted.
+                if interp.machine() != MACHINE || interp.interp().map_err(|_| Errno::ENOEXEC)?.is_some() {
+                    return Err(Errno::ENOEXEC);
+                }
+                Some(interp)
+            }
+            None => None,
+        };
+        // Where each image goes: a position-independent one at the
+        // platform's base, any other where it says.
+        let place = |elf: &Elf<'_>, at: u64| -> Result<u64, Errno> {
+            if elf.is_pie() { at.checked_sub(elf.lowest_address()).ok_or(Errno::ENOEXEC) } else { Ok(0) }
+        };
+        let bias = place(&elf, platform.load_base)?;
+        let interp_bias = match &interp_elf {
+            Some(i) => place(i, platform.load_base.checked_add(INTERP_OFFSET).ok_or(Errno::ENOEXEC)?)?,
+            None => 0,
+        };
+        let span = elf.span_at(bias).ok_or(Errno::ENOEXEC)?;
+        let interp_span = match &interp_elf {
+            Some(i) => i.span_at(interp_bias).ok_or(Errno::ENOEXEC)?,
+            None => 0..0,
+        };
+        let brk_limit = brk_limit_for(span, interp_span, platform)?;
+        let entry = elf.entry().checked_add(bias).ok_or(Errno::ENOEXEC)?;
+        let phdr = match phdr_address(&image, &elf) {
+            0 => 0,
+            at => at.checked_add(bias).ok_or(Errno::ENOEXEC)?,
+        };
+        let pc = match &interp_elf {
+            Some(i) => i.entry().checked_add(interp_bias).ok_or(Errno::ENOEXEC)?,
+            None => entry,
+        };
         // Build the new image completely before touching the process.
         let memory = (platform.new_memory)()?;
-        let brk = memory.load_elf(&elf)?;
+        let brk = memory.load_elf_at(&elf, bias)?;
+        if let Some(i) = &interp_elf {
+            memory.load_elf_at(i, interp_bias)?;
+        } else if elf.is_pie() {
+            // Nobody else will relocate it.
+            crate::reloc::apply(&*memory, &elf, MACHINE, bias)?;
+        }
         let stack_lo = platform.stack_top.checked_sub(platform.stack_size).ok_or(Errno::ENOEXEC)?;
         memory.map_anon(stack_lo, platform.stack_size, MapFlags::RW)?;
         let aux = [
-            (at::PHDR, phdr_address(&image, &elf)),
+            (at::PHDR, phdr),
             (at::PHENT, u64::from(le16(&image, 54))),
             (at::PHNUM, u64::from(le16(&image, 56))),
             (at::PAGESZ, 4096),
-            (at::ENTRY, elf.entry()),
+            (at::BASE, interp_bias),
+            (at::ENTRY, entry),
             (at::HWCAP, hwcap()),
             (at::UID, 0),
             (at::EUID, 0),
@@ -152,15 +216,7 @@ impl Process {
         // is an error.
         let name = intern(name).map_err(|_| Errno::ENOMEM)?;
         let mmap = MmapArea::new(platform.mmap_area.clone()).map_err(|_| Errno::ENOMEM)?;
-        Ok(Prepared {
-            name,
-            memory,
-            mmap,
-            brk,
-            brk_limit,
-            activate: platform.activate,
-            entry: UserEntry { pc: elf.entry(), sp },
-        })
+        Ok(Prepared { name, memory, mmap, brk, brk_limit, activate: platform.activate, entry: UserEntry { pc, sp } })
     }
 
     /// The second half of [`exec`](Self::exec): switches the process to the
@@ -203,17 +259,24 @@ fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
 /// Checks that the ELF image, the stack and the `mmap` area are disjoint
 /// (`ENOEXEC` if not), and returns where the program break must stop: at
 /// its usual limit above the image, or at the next of those that is in the
-/// way.
+/// way. For an image loaded without a bias.
+#[cfg(test)]
 pub(crate) fn brk_limit(elf: &Elf<'_>, platform: &Platform) -> Result<u64, Errno> {
-    let loaded = || elf.segments().filter(|s| s.mem_size != 0);
-    let lo = loaded().map(|s| s.vaddr).min().unwrap_or(0) & !0xfff;
-    let hi = loaded().map(|s| s.vaddr.saturating_add(s.mem_size)).max().unwrap_or(0);
-    let hi = hi.checked_next_multiple_of(4096).ok_or(Errno::ENOEXEC)?;
+    brk_limit_for(elf.span_at(0).ok_or(Errno::ENOEXEC)?, 0..0, platform)
+}
+
+/// [`brk_limit`] for a program covering `span` (and an interpreter covering
+/// `interp`, empty if none), as loaded.
+fn brk_limit_for(span: Range<u64>, interp: Range<u64>, platform: &Platform) -> Result<u64, Errno> {
     let stack_lo = platform.stack_top.checked_sub(platform.stack_size).ok_or(Errno::ENOEXEC)?;
-    let others = [stack_lo..platform.stack_top, platform.mmap_area.clone()];
-    if overlaps(&others[0], &others[1]) || others.iter().any(|r| overlaps(r, &(lo..hi))) {
-        return Err(Errno::ENOEXEC);
+    let others = [stack_lo..platform.stack_top, platform.mmap_area.clone(), interp];
+    let all = [span.clone(), others[0].clone(), others[1].clone(), others[2].clone()];
+    for (i, a) in all.iter().enumerate() {
+        if all.iter().skip(i + 1).any(|b| overlaps(a, b)) {
+            return Err(Errno::ENOEXEC);
+        }
     }
+    let hi = span.end;
     let limit = hi.saturating_add(crate::process::BRK_MAX);
     Ok(others.iter().filter(|r| r.start >= hi && !r.is_empty()).map(|r| r.start).fold(limit, u64::min))
 }

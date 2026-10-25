@@ -29,10 +29,16 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 |---|---|---|
 | `osmium-arch` | IRQ flag control, CPU id, trap entry with a portable `Trap` cause, per-task FP/SIMD state, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
-| `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2, IOMMU formats), slab heap as `#[global_allocator]` | no |
+| `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64 4/5-level, AArch64, Sv39/Sv48/Sv57, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2, IOMMU formats), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA, display), IOMMU domains and `IommuDma`, linear framebuffers with pixel formats, `IrqTable`, global console with `println!` | no |
-| `osmium-drivers` | NS16550A, PL011, RISC-V PLIC and CLINT, GICv2, x86 local APIC (with INIT/SIPI), x86 I/O APIC, i8254 PIT, RAM disk, Mellanox ConnectX-3 (mlx4) Ethernet (polled or MSI-X, checksum and segmentation offload; no RSS or steering) and InfiniBand (subnet management, unreliable datagrams, multicast, reliable connections with RDMA, IPoIB; no SR-IOV; both simulator-tested only), virtio-net and virtio-blk (MMIO, legacy and 1.x), xHCI USB host controller (interrupt-driven), UHCI, OHCI and EHCI (polled), USB mass storage, HID boot keyboards, CDC-ECM and CDC-NCM Ethernet (NCM simulator-tested only), AHCI (SATA) and NVMe disks, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers, virtio-pci transport, virtio-gpu (also as virtio-vga), QEMU `fw_cfg` (ports or MMIO, DMA), Bochs DISPI (QEMU std VGA, bochs-display) and VESA BIOS (VBE) mode setting | no |
+| `osmium-drivers` | virtio core: MMIO and PCI transports (legacy and 1.x) and the split virtqueue, and the virtio-console driver | no |
+| `osmium-display` | virtio-gpu (also as virtio-vga), Bochs DISPI (QEMU std VGA, bochs-display) and VESA BIOS (VBE) mode setting | no |
+| `osmium-sysdrv` | NS16550A, PL011, i8254 PIT, QEMU `fw_cfg` (ports or MMIO, DMA), RISC-V PLIC and CLINT, GICv2, GICv3, x86 local APIC (with INIT/SIPI), x86 I/O APIC, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers | no |
+| `osmium-storage` | RAM disk, virtio-blk (MMIO, legacy and 1.x), AHCI (SATA) and NVMe disks | no |
+| `osmium-usb` | xHCI USB host controller (interrupt-driven), UHCI, OHCI and EHCI (polled or interrupt-driven), hubs, isochronous endpoints, USB mass storage and HID boot keyboards | no |
+| `osmium-netdev` | virtio-net (MMIO or PCI, legacy and 1.x), Mellanox ConnectX-3 (mlx4) Ethernet (polled or MSI-X, checksum and segmentation offload; no RSS or steering) and InfiniBand (subnet management, unreliable datagrams, multicast, reliable connections with RDMA, IPoIB; no SR-IOV; both simulator-tested only), USB CDC-ECM and CDC-NCM Ethernet (NCM simulator-tested only) | no |
 | `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG/DMAR/IVRS reader, ELF64 loader, PE32+ loader and relocator, UEFI system table and GOP | writer only |
+| `osmium-acpi` | ACPI: FADT, an AML interpreter (namespace, control methods, operation regions and fields), `_CRS` resource decoding, `_PRT` PCI interrupt routing, sleep states and power off, reset, SCI fixed events and GPEs | yes |
 | `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
 | `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension, AArch64 EL2 and AMD SVM vCPUs with SBI and PSCI (multi-vCPU guests), emulated PLIC, GICv2, 8259 PIC, 8254 PIT and local APIC, virtio-net | yes |
 | `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
@@ -142,8 +148,8 @@ features.
   Isochronous transfers are limited to 4 KiB per service interval, SuperSpeed
   burst sizes from companion descriptors are ignored, and a SuperSpeed hub
   port needing a warm reset is not recovered.
-- UHCI, OHCI and EHCI are polled only, without isochronous endpoints, and
-  EHCI supports no hubs.
+- UHCI, OHCI and EHCI have no isochronous endpoints, and EHCI supports no
+  hubs.
 
 ## License
 

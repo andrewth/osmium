@@ -22,11 +22,11 @@ mod sys {
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
     pub const LSEEK: u64 = 62;
-    pub const READ: u64 = 63;
     pub const MMAP: u64 = 222;
     pub const MUNMAP: u64 = 215;
     pub const MPROTECT: u64 = 226;
     pub const MSYNC: u64 = 227;
+    pub const GETCPU: u64 = 168;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
         call6(nr, [a[0], a[1], a[2], a[3], a[4], 0])
@@ -52,6 +52,9 @@ mod sys {
     pub const GETTID: u64 = 178;
     pub const FUTEX: u64 = 98;
     pub const EXIT_GROUP: u64 = 94;
+    pub const READ: u64 = 63;
+    pub const PIPE2: u64 = 59;
+    pub const TKILL: u64 = 130;
 
     /// `sigaction` as the kernel reads it: no restorer, the kernel supplies one.
     #[repr(C)]
@@ -144,11 +147,11 @@ mod sys {
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
     pub const LSEEK: u64 = 62;
-    pub const READ: u64 = 63;
     pub const MMAP: u64 = 222;
     pub const MUNMAP: u64 = 215;
     pub const MPROTECT: u64 = 226;
     pub const MSYNC: u64 = 227;
+    pub const GETCPU: u64 = 168;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
         call6(nr, [a[0], a[1], a[2], a[3], a[4], 0])
@@ -174,6 +177,9 @@ mod sys {
     pub const GETTID: u64 = 178;
     pub const FUTEX: u64 = 98;
     pub const EXIT_GROUP: u64 = 94;
+    pub const READ: u64 = 63;
+    pub const PIPE2: u64 = 59;
+    pub const TKILL: u64 = 130;
 
     /// `sigaction` as the kernel reads it: no restorer, the kernel supplies one.
     #[repr(C)]
@@ -266,11 +272,11 @@ mod sys {
     pub const OPENAT: u64 = 257;
     pub const CLOSE: u64 = 3;
     pub const LSEEK: u64 = 8;
-    pub const READ: u64 = 0;
     pub const MMAP: u64 = 9;
     pub const MUNMAP: u64 = 11;
     pub const MPROTECT: u64 = 10;
     pub const MSYNC: u64 = 26;
+    pub const GETCPU: u64 = 309;
 
     pub fn call(nr: u64, a: [u64; 5]) -> i64 {
         call6(nr, [a[0], a[1], a[2], a[3], a[4], 0])
@@ -296,6 +302,9 @@ mod sys {
     pub const GETTID: u64 = 186;
     pub const FUTEX: u64 = 202;
     pub const EXIT_GROUP: u64 = 231;
+    pub const READ: u64 = 0;
+    pub const PIPE2: u64 = 293;
+    pub const TKILL: u64 = 200;
 
     /// `sigaction` as the kernel reads it; without `SA_RESTORER` the kernel
     /// supplies the return trampoline.
@@ -535,6 +544,39 @@ extern "C" fn waiter(_: u64) -> ! {
     exit(0)
 }
 
+/// A page of its own, for the threads on other CPUs to read until one
+/// thread unmaps it.
+#[repr(align(4096))]
+struct OwnPage([u8; 4096]);
+static mut SMP_PAGE: OwnPage = OwnPage([1; 4096]);
+static SMP_READY: AtomicU32 = AtomicU32::new(0);
+static SMP_FAULTED: AtomicU32 = AtomicU32::new(0);
+/// Bit `n` is set once a thread was seen running on CPU `n`.
+static SMP_CPUS: AtomicU32 = AtomicU32::new(0);
+
+fn note_cpu() {
+    let mut cpu = 0u32;
+    sys::call(sys::GETCPU, [&mut cpu as *mut u32 as u64, 0, 0, 0, 0]);
+    SMP_CPUS.fetch_or(1 << (cpu & 31), Ordering::SeqCst);
+}
+
+/// Reads the shared page until it is unmapped under it.
+extern "C" fn page_reader(_: u64) -> ! {
+    note_cpu();
+    SMP_READY.fetch_add(1, Ordering::SeqCst);
+    loop {
+        // SAFETY: a mapped byte until the leader unmaps it; then the fault
+        // reaches `on_smp_segv`.
+        unsafe { core::ptr::read_volatile((&raw const SMP_PAGE) as *const u8) };
+    }
+}
+
+/// Counts the fault and ends this thread only.
+extern "C" fn on_smp_segv(_sig: i32, _info: *const u8, _ctx: *const u8) {
+    SMP_FAULTED.fetch_add(1, Ordering::SeqCst);
+    exit(0)
+}
+
 extern "C" fn spinner(_: u64) -> ! {
     loop {
         core::hint::spin_loop();
@@ -733,6 +775,173 @@ fn signals_and_threads() {
         "threads: exit_group ended a spinning thread, process {reaped} status {code}: {}",
         if code == 9 { "ok" } else { "FAILED" }
     );
+
+    // The threads of one process run on several CPUs at once, and unmapping
+    // a page in one of them reaches the TLBs of the others: the readers fault.
+    if sys::fork() == 0 {
+        catch(11, on_smp_segv);
+        for i in 0..3u64 {
+            // SAFETY: statics only this program uses; each thread has its own stack.
+            unsafe {
+                let top = (&raw mut WAITER_STACKS) as u64 + (i + 1) * 16384;
+                sys::clone_thread(THREAD, top, 0, 0, 0, page_reader, 0);
+            }
+        }
+        let mut spins = 0u64;
+        while SMP_READY.load(Ordering::SeqCst) < 3 && spins < 20_000_000 {
+            sys::call(sys::SCHED_YIELD, [0; 5]);
+            spins += 1;
+        }
+        note_cpu();
+        let cpus = SMP_CPUS.load(Ordering::SeqCst).count_ones();
+        sys::call(sys::MUNMAP, [(&raw const SMP_PAGE) as u64, 4096, 0, 0, 0]);
+        spins = 0;
+        while SMP_FAULTED.load(Ordering::SeqCst) < 3 && spins < 20_000_000 {
+            sys::call(sys::SCHED_YIELD, [0; 5]);
+            spins += 1;
+        }
+        let ok = SMP_READY.load(Ordering::SeqCst) == 3 && cpus >= 2 && SMP_FAULTED.load(Ordering::SeqCst) == 3;
+        say!(
+            "smp: 3 threads of process {pid} read a page on several CPUs; munmap faulted them all: {}",
+            if ok { "ok" } else { "FAILED" }
+        );
+        exit(if ok { 0 } else { 1 });
+    }
+    wait(-1);
+}
+
+/// Written by the signal handler of the restart demonstration.
+static RESTART_HANDLED: AtomicU32 = AtomicU32::new(0);
+static PIPE_FDS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static MAIN_TID: AtomicU32 = AtomicU32::new(0);
+static mut RESTART_STACK: Stack = Stack([0; 16384]);
+static mut RESTART_CTID: u32 = 0;
+static mut PI_STACK: Stack = Stack([0; 16384]);
+static mut PI_CTID: u32 = 0;
+/// The priority-inheritance futex word: 0, or the owner's thread id.
+static PI_WORD: AtomicU32 = AtomicU32::new(0);
+static PI_GOT: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn on_restart_signal(_sig: i32, _info: *const u8, _ctx: *const u8) {
+    RESTART_HANDLED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Sends the main thread a signal while it is blocked in `read`, then the
+/// byte it waits for.
+extern "C" fn interrupter(_: u64) -> ! {
+    for _ in 0..20 {
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+    }
+    sys::call(sys::TKILL, [MAIN_TID.load(Ordering::SeqCst) as u64, 12, 0, 0, 0]);
+    for _ in 0..20 {
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+    }
+    let b = b"x";
+    sys::call(sys::WRITE, [PIPE_FDS[1].load(Ordering::SeqCst) as u64, b.as_ptr() as u64, 1, 0, 0]);
+    exit(0)
+}
+
+/// Locks the priority-inheritance futex the main thread holds, with
+/// `FUTEX_LOCK_PI`, then unlocks it.
+extern "C" fn pi_locker(_: u64) -> ! {
+    let me = sys::call(sys::GETTID, [0; 5]) as u32;
+    if PI_WORD.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        // FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG: the kernel queues us and hands the lock over.
+        let r = sys::call(sys::FUTEX, [PI_WORD.as_ptr() as u64, 128 | 6, 0, 0, 0]);
+        PI_GOT.store((r == 0 && PI_WORD.load(Ordering::SeqCst) & 0x3fff_ffff == me) as u32, Ordering::SeqCst);
+    }
+    // Userspace unlock fails if the waiters bit is set; then UNLOCK_PI.
+    if PI_WORD.compare_exchange(me, 0, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        sys::call(sys::FUTEX, [PI_WORD.as_ptr() as u64, 128 | 7, 0, 0, 0]);
+    }
+    exit(0)
+}
+
+/// Reads one byte from the pipe while a signal arrives; returns the result
+/// of `read`.
+fn read_through_signal(flags: u64) -> i64 {
+    let mut act = sys::sigaction(on_restart_signal as usize as u64);
+    act.flags |= flags;
+    sys::call(sys::RT_SIGACTION, [12, &act as *const sys::SigAction as u64, 0, 8, 0]);
+    RESTART_HANDLED.store(0, Ordering::SeqCst);
+    // SAFETY: statics only this program uses; the stack is the thread's own.
+    unsafe {
+        let top = (&raw mut RESTART_STACK) as u64 + 16384;
+        sys::clone_thread(
+            THREAD | CHILD_SETTID | CHILD_CLEARTID,
+            top,
+            0,
+            (&raw mut RESTART_CTID) as u64,
+            0,
+            interrupter,
+            0,
+        )
+    };
+    let mut byte = [0u8; 1];
+    let r = sys::call(sys::READ, [PIPE_FDS[0].load(Ordering::SeqCst) as u64, byte.as_mut_ptr() as u64, 1, 0, 0]);
+    // SAFETY: the kernel clears the word when the thread ends.
+    while unsafe { core::ptr::read_volatile(&raw const RESTART_CTID) } != 0 {
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+    }
+    if r == -4 {
+        // The interrupted read left the byte in the pipe.
+        sys::call(sys::READ, [PIPE_FDS[0].load(Ordering::SeqCst) as u64, byte.as_mut_ptr() as u64, 1, 0, 0]);
+    }
+    r
+}
+
+/// `SA_RESTART` and priority-inheritance futexes.
+fn restarts_and_pi() {
+    let mut fds = [0u32; 2];
+    let r = sys::call(sys::PIPE2, [fds.as_mut_ptr() as u64, 0, 0, 0, 0]);
+    PIPE_FDS[0].store(fds[0], Ordering::SeqCst);
+    PIPE_FDS[1].store(fds[1], Ordering::SeqCst);
+    MAIN_TID.store(sys::call(sys::GETTID, [0; 5]) as u32, Ordering::SeqCst);
+    // A handler without SA_RESTART interrupts the blocked read (EINTR).
+    let plain = read_through_signal(0);
+    let ran_plain = RESTART_HANDLED.load(Ordering::SeqCst);
+    // With SA_RESTART the read continues after the handler and gets the byte.
+    let restarted = read_through_signal(0x1000_0000);
+    let ran_restart = RESTART_HANDLED.load(Ordering::SeqCst);
+    let ok = r == 0 && plain == -4 && ran_plain == 1 && restarted == 1 && ran_restart == 1;
+    say!(
+        "restart: read gave EINTR without SA_RESTART and was restarted transparently with it ({restarted} byte): {}",
+        if ok { "ok" } else { "FAILED" }
+    );
+
+    // The main thread owns the lock; a second thread waits for it in the
+    // kernel with FUTEX_LOCK_PI, and is handed it by FUTEX_UNLOCK_PI.
+    let me = MAIN_TID.load(Ordering::SeqCst);
+    PI_WORD.store(me, Ordering::SeqCst);
+    // SAFETY: statics only this program uses; the stack is the thread's own.
+    let tid = unsafe {
+        let top = (&raw mut PI_STACK) as u64 + 16384;
+        sys::clone_thread(THREAD | CHILD_SETTID | CHILD_CLEARTID, top, 0, (&raw mut PI_CTID) as u64, 0, pi_locker, 0)
+    };
+    // FUTEX_WAITERS (bit 31) says the thread is queued in the kernel.
+    let mut spins = 0;
+    while PI_WORD.load(Ordering::SeqCst) != 0x8000_0000 | me && spins < 10_000 {
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+        spins += 1;
+    }
+    let queued = PI_WORD.load(Ordering::SeqCst) == 0x8000_0000 | me;
+    // The owner trying to lock again is a deadlock (EDEADLK).
+    let trylock = sys::call(sys::FUTEX, [PI_WORD.as_ptr() as u64, 128 | 8, 0, 0, 0]);
+    let unlock = sys::call(sys::FUTEX, [PI_WORD.as_ptr() as u64, 128 | 7, 0, 0, 0]);
+    // SAFETY: the kernel clears the word when the thread ends.
+    while unsafe { core::ptr::read_volatile(&raw const PI_CTID) } != 0 {
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+    }
+    let ok = tid > 0
+        && queued
+        && trylock == -35
+        && unlock == 0
+        && PI_GOT.load(Ordering::SeqCst) == 1
+        && PI_WORD.load(Ordering::SeqCst) == 0;
+    say!(
+        "futex: FUTEX_LOCK_PI waited, was handed the lock by FUTEX_UNLOCK_PI, and released it: {}",
+        if ok { "ok" } else { "FAILED" }
+    );
 }
 
 /// # Safety
@@ -817,6 +1026,7 @@ unsafe extern "C" fn main(sp: *const u64) -> ! {
     }
     file_maps();
     signals_and_threads();
+    restarts_and_pi();
     exit(0)
 }
 

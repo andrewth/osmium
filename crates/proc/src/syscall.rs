@@ -41,6 +41,7 @@ pub enum Sys {
     Getpid,
     Getppid,
     Gettid,
+    Getcpu,
     Brk,
     Mmap,
     Munmap,
@@ -98,6 +99,8 @@ pub enum Sys {
     Tkill,
     Tgkill,
     Futex,
+    /// Continues a call a signal interrupted (see `crate::restart`).
+    RestartSyscall,
     SetTidAddress,
     SetRobustList,
     GetRobustList,
@@ -139,6 +142,7 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (80, Sys::Chdir),
     (110, Sys::Getppid),
     (186, Sys::Gettid),
+    (309, Sys::Getcpu),
     (217, Sys::Getdents64),
     (231, Sys::ExitGroup),
     (257, Sys::Openat),
@@ -180,6 +184,7 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (200, Sys::Tkill),
     (234, Sys::Tgkill),
     (202, Sys::Futex),
+    (219, Sys::RestartSyscall),
     (218, Sys::SetTidAddress),
     (158, Sys::ArchPrctl),
     (273, Sys::SetRobustList),
@@ -217,6 +222,7 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (172, Sys::Getpid),
     (173, Sys::Getppid),
     (178, Sys::Gettid),
+    (168, Sys::Getcpu),
     (214, Sys::Brk),
     (215, Sys::Munmap),
     (226, Sys::Mprotect),
@@ -252,6 +258,7 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (130, Sys::Tkill),
     (131, Sys::Tgkill),
     (98, Sys::Futex),
+    (128, Sys::RestartSyscall),
     (96, Sys::SetTidAddress),
     (99, Sys::SetRobustList),
     (100, Sys::GetRobustList),
@@ -375,6 +382,7 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Unlinkat => unlinkat(p, fd, a[1], a[2]),
         Sys::Getpid => Ok(p.pid().0 as u64),
         Sys::Gettid => Ok(th.tid() as u64),
+        Sys::Getcpu => getcpu(p, a[0], a[1]),
         Sys::Getppid => Ok(p.parent().map_or(0, |pid| pid.0 as u64)),
         Sys::Brk => Ok(p.brk(a[0])),
         Sys::Mmap => mmap(p, a[1], a[2], a[3], a[4] as i32, a[5]),
@@ -440,6 +448,7 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Tkill => crate::signal::tkill(p, fd, a[1]),
         Sys::Tgkill => crate::signal::tgkill(p, fd, a[1] as i32, a[2]),
         Sys::Futex => crate::futex::futex(p, th, a),
+        Sys::RestartSyscall => crate::restart::restart_syscall(p, th),
         Sys::SetRobustList => crate::futex::set_robust_list(th, a[0], a[1]),
         Sys::GetRobustList => crate::futex::get_robust_list(p, th, a[0], a[1], a[2]),
         Sys::SetTidAddress => {
@@ -869,7 +878,7 @@ fn mmap(p: &Process, len: u64, prot: u64, flags: u64, fd: i32, off: u64) -> SysR
         if shared || fd != -1 {
             return Err(Errno::EINVAL);
         }
-        return p.mmap_anon(len, mf);
+        return p.mmap_demand(len, mf);
     }
     let f = open_file(p, fd)?;
     p.mmap_file(len, mf, shared, &f, off)
@@ -1098,6 +1107,18 @@ fn fcntl(p: &Process, fd: i32, cmd: u64, arg: u64) -> SysResult {
     }
 }
 
+/// `getcpu(&cpu, &node)`: the CPU the calling thread runs on (it may move at
+/// once) and node 0. A null pointer is skipped.
+fn getcpu(p: &Process, cpu: u64, node: u64) -> SysResult {
+    if cpu != 0 {
+        p.memory().write(cpu, &(osmium_arch::cpu::current_id() as u32).to_ne_bytes())?;
+    }
+    if node != 0 {
+        p.memory().write(node, &0u32.to_ne_bytes())?;
+    }
+    Ok(0)
+}
+
 fn uname(p: &Process, buf: u64) -> SysResult {
     let machine = if cfg!(target_arch = "x86_64") {
         "x86_64"
@@ -1135,8 +1156,14 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
         // The saved registers include the interrupted call's result.
         return crate::signal::sigreturn(&p, &th, frame).or_else(|| crate::signal::deliver_to(&p, &th, frame));
     }
+    let mut restart = None;
     match dispatch_as(&p, &th, nr, args) {
-        Outcome::Return(v) => frame.set_return(v as u64),
+        Outcome::Return(v) => {
+            frame.set_return(v as u64);
+            if v == -i64::from(Errno::EINTR.0) {
+                restart = crate::restart::plan(&th, nr, &args);
+            }
+        }
         Outcome::Exit(status) => return Some(status),
         Outcome::Fork { child, stack } => {
             let mut regs = frame.clone();
@@ -1176,7 +1203,7 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
             }
         }
     }
-    crate::signal::deliver_to(&p, &th, frame)
+    crate::signal::deliver_with(&p, &th, frame, restart)
 }
 
 /// Points `frame` at a new program's entry and stack, other registers clear.

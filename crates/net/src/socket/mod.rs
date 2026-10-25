@@ -34,6 +34,8 @@ pub(crate) struct Cx<'cx> {
     pub(crate) mss: u16,
     /// The same over IPv6.
     pub(crate) mss6: u16,
+    /// What the path MTU cache has learned, if the caller keeps one.
+    pub(crate) pmtu: Option<&'cx crate::pmtu::PathMtuCache>,
     pub(crate) rng: &'cx mut Rng,
 }
 
@@ -49,9 +51,16 @@ impl Cx<'_> {
         }
     }
 
-    /// The TCP maximum segment size for a connection to `remote`.
+    /// The TCP maximum segment size for a connection to `remote`: the
+    /// interface's, or less if a router has reported a smaller path MTU.
     pub(crate) fn mss_for(&self, remote: &SocketAddr) -> u16 {
-        if remote.is_ipv6() { self.mss6 } else { self.mss }
+        let link = if remote.is_ipv6() { self.mss6 } else { self.mss };
+        let overhead = if remote.is_ipv6() { crate::ipv6::IPV6_HEADER_LEN } else { crate::wire::IPV4_HEADER_LEN }
+            + crate::wire::TCP_HEADER_LEN;
+        match self.pmtu.and_then(|c| c.lookup(remote.ip(), self.now)) {
+            Some(mtu) => link.min(mtu.saturating_sub(overhead).clamp(1, usize::from(u16::MAX)) as u16),
+            None => link,
+        }
     }
 }
 
@@ -151,6 +160,93 @@ any_socket!(TcpSocket, Tcp);
 any_socket!(UdpSocket, Udp);
 any_socket!(IcmpSocket, Icmp);
 any_socket!(DhcpClient, Dhcp);
+
+/// `SO_REUSEADDR` and `SO_REUSEPORT` of a socket, with the Linux meaning.
+///
+/// Two sockets of one protocol conflict when they are bound to the same
+/// port and their addresses overlap (the same address, or either one
+/// unspecified, in one address family). Overlapping sockets may coexist
+/// when
+///
+/// * both have `addr` set, unless the other one is a listening TCP socket.
+///   For TCP this lets a server bind a port that still has connections in
+///   TIME-WAIT or ESTABLISHED (those sockets must have had `addr` set too,
+///   as accepted connections inherit it), and a listener on a specific
+///   address share the port with one on the wildcard address only if the
+///   other does not listen. For UDP any two sockets that both have `addr`
+///   set may share an address; a unicast datagram then goes to the
+///   socket with the most specific address (the lowest handle among
+///   equals, where Linux takes the newest), and broadcasts and multicasts
+///   to all of them; or
+/// * both have `port` set and the same `owner` (Linux requires an equal
+///   effective uid). The sockets form a group: a TCP connection request or
+///   a unicast UDP datagram goes to one of them, chosen by a hash of the
+///   flow, so the packets of a flow always reach the same one. The choice
+///   is among the sockets of the most specific matching address, so a
+///   specific address still wins over the wildcard.
+///
+/// Both sockets must have set the option before they bind; one that did
+/// not cannot be shared with later. The check is made by
+/// [`SocketSet::bind_udp`] and [`SocketSet::listen_tcp`]. The sockets' own
+/// `bind_addr` and `listen_on` do not look at other sockets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReuseOptions {
+    /// `SO_REUSEADDR`.
+    pub addr: bool,
+    /// `SO_REUSEPORT`.
+    pub port: bool,
+    /// Who owns the socket, for `SO_REUSEPORT`.
+    pub owner: u32,
+}
+
+impl ReuseOptions {
+    /// Neither option set.
+    pub const NONE: Self = Self { addr: false, port: false, owner: 0 };
+}
+
+/// Which protocol a bind is for: TCP and UDP ports are separate spaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindProtocol {
+    /// TCP.
+    Tcp,
+    /// UDP.
+    Udp,
+}
+
+/// Returns true if two bound addresses (of one protocol) overlap.
+fn overlaps(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() == b.port()
+        && a.is_ipv4() == b.is_ipv4()
+        && (a.ip().is_unspecified() || b.ip().is_unspecified() || a.ip() == b.ip())
+}
+
+/// Whether a socket that binds may share its address with one that has it.
+fn may_share(proto: BindProtocol, new: ReuseOptions, other: ReuseOptions, other_listening: bool) -> bool {
+    (new.addr && other.addr && !(proto == BindProtocol::Tcp && other_listening))
+        || (new.port && other.port && new.owner == other.owner)
+}
+
+/// A hash of a flow, the same for all its packets, that picks among the
+/// sockets of a `SO_REUSEPORT` group (FNV-1a over both endpoints).
+fn flow_hash(src: SocketAddr, dst: SocketAddr) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    let mut mix = |b: u8| {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    };
+    for a in [src, dst] {
+        match a.ip() {
+            IpAddr::V4(ip) => ip.octets().into_iter().for_each(&mut mix),
+            IpAddr::V6(ip) => ip.octets().into_iter().for_each(&mut mix),
+        }
+        a.port().to_be_bytes().into_iter().for_each(&mut mix);
+    }
+    // A last mix, so that ports that differ in the low bits spread.
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    h ^= h >> 12;
+    h
+}
 
 /// Identifies a socket in a [`SocketSet`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -266,6 +362,127 @@ impl SocketSet {
     /// Returns true if a TCP or UDP socket of the set is bound to `port`.
     pub(crate) fn port_in_use(&self, port: u16) -> bool {
         self.iter().any(|(_, s)| s.local_port() == Some(port))
+    }
+
+    /// Checks that a socket may bind `addr` with `reuse`, against every other socket of the set for `proto`
+    /// except `except`; see [`ReuseOptions`] for the rules. TCP sockets in
+    /// any state but closed, TIME-WAIT included, hold their address.
+    pub fn check_bind(
+        &self,
+        proto: BindProtocol,
+        addr: SocketAddr,
+        reuse: ReuseOptions,
+        except: Option<SocketHandle>,
+    ) -> Result<(), Error> {
+        if addr.port() == 0 {
+            return Err(Error::InvalidAddress);
+        }
+        for (h, s) in self.iter() {
+            if Some(h) == except {
+                continue;
+            }
+            let (other, other_reuse, listening) = match (proto, s) {
+                (BindProtocol::Tcp, Socket::Tcp(t)) => match t.bound() {
+                    Some((a, l)) => (a, t.reuse(), l),
+                    None => continue,
+                },
+                (BindProtocol::Udp, Socket::Udp(u)) => match u.local_endpoint() {
+                    Some(a) => (a, u.reuse(), false),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if overlaps(addr, other) && !may_share(proto, reuse, other_reuse, listening) {
+                return Err(Error::AddressInUse);
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds the UDP socket `handle` to `addr` if no other socket holds it
+    /// (see [`ReuseOptions`]), failing with [`Error::AddressInUse`] if one
+    /// does. The socket's options are those of
+    /// [`UdpSocket::set_reuse`].
+    pub fn bind_udp(&mut self, handle: SocketHandle, addr: SocketAddr) -> Result<(), Error> {
+        let reuse = self.try_get::<UdpSocket>(handle).ok_or(Error::InvalidState)?.reuse();
+        self.check_bind(BindProtocol::Udp, addr, reuse, Some(handle))?;
+        self.try_get_mut::<UdpSocket>(handle).ok_or(Error::InvalidState)?.bind_addr(addr)
+    }
+
+    /// Makes the TCP socket `handle` listen on `addr` if no other socket
+    /// holds it (see [`ReuseOptions`]), failing with
+    /// [`Error::AddressInUse`] if one does. The socket's options are those
+    /// of [`TcpSocket::set_reuse`].
+    pub fn listen_tcp(&mut self, handle: SocketHandle, addr: SocketAddr) -> Result<(), Error> {
+        let reuse = self.try_get::<TcpSocket>(handle).ok_or(Error::InvalidState)?.reuse();
+        self.check_bind(BindProtocol::Tcp, addr, reuse, Some(handle))?;
+        self.try_get_mut::<TcpSocket>(handle).ok_or(Error::InvalidState)?.listen_on(addr)
+    }
+
+    /// The UDP sockets a datagram `src` -> `dst` goes to. A unicast one
+    /// goes to a single socket: of those bound to `dst` exactly, if any,
+    /// otherwise of those bound to the wildcard, and among several with
+    /// `SO_REUSEPORT` the one the flow hashes to. Broadcasts and multicasts
+    /// go to every socket that takes them.
+    pub(crate) fn udp_targets(&self, src: SocketAddr, dst: SocketAddr) -> Vec<SocketHandle> {
+        let mut all: Vec<(SocketHandle, bool, bool)> = Vec::new();
+        for (h, s) in self.iter() {
+            if let Socket::Udp(u) = s
+                && u.accepts(dst)
+            {
+                let exact = u.local_endpoint().is_some_and(|l| l.ip() == dst.ip());
+                all.push((h, exact, u.reuse().port));
+            }
+        }
+        let many = match dst.ip() {
+            IpAddr::V4(a) => a.is_broadcast() || a.is_multicast(),
+            IpAddr::V6(a) => a.is_multicast(),
+        };
+        if many {
+            return all.into_iter().map(|(h, ..)| h).collect();
+        }
+        let tier: Vec<_> = if all.iter().any(|c| c.1) { all.into_iter().filter(|c| c.1).collect() } else { all };
+        let pick = match tier.as_slice() {
+            [] => None,
+            [only] => Some(only.0),
+            many if many.iter().all(|c| c.2) => many.get(flow_hash(src, dst) as usize % many.len()).map(|c| c.0),
+            [first, ..] => Some(first.0),
+        };
+        pick.into_iter().collect()
+    }
+
+    /// The listening TCP socket a SYN `src` -> `dst` goes to: of the
+    /// listeners on `dst` exactly, if any, otherwise on the wildcard. When
+    /// the candidates all have `SO_REUSEPORT`, the SYN is spread over their
+    /// groups (see [`TcpSocket::set_reuse_group`]) by flow hash and goes to
+    /// the first listener of the group it picks.
+    pub(crate) fn tcp_listener(&self, src: SocketAddr, dst: SocketAddr) -> Option<SocketHandle> {
+        let mut all: Vec<(SocketHandle, bool, &TcpSocket)> = Vec::new();
+        for (h, s) in self.iter() {
+            if let Socket::Tcp(t) = s
+                && t.accepts_listen(dst)
+            {
+                all.push((h, t.local_endpoint().ip() == dst.ip(), t));
+            }
+        }
+        let specific = all.iter().any(|c| c.1);
+        all.retain(|c| c.1 == specific);
+        let (first, rest) = all.split_first()?;
+        if rest.is_empty() || !all.iter().all(|c| c.2.reuse().port) {
+            return Some(first.0);
+        }
+        // A socket without a group is a group of one.
+        let key = |c: &(SocketHandle, bool, &TcpSocket)| match c.2.reuse_group() {
+            0 => (1u64 << 32) | c.0.0 as u64,
+            g => u64::from(g),
+        };
+        let mut groups: Vec<(u64, SocketHandle)> = Vec::new();
+        for c in &all {
+            if !groups.iter().any(|g| g.0 == key(c)) {
+                groups.push((key(c), c.0));
+            }
+        }
+        groups.get(flow_hash(src, dst) as usize % groups.len()).map(|g| g.1)
     }
 
     /// A random ephemeral port that no socket of the set is bound to (or,

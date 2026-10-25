@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use osmium_boot::elf::Elf;
 use osmium_mm::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
 use osmium_mm::paging::{MapError, MapFlags, PageSize, PageTable, PageTableFormat, TableAlloc};
+use osmium_mm::vma::{VmaError, VmaSpare, VmaTree};
 use osmium_sync::IrqSpinLock;
 use osmium_sync::arc::ArcTree;
 use osmium_sync::fallible::{OutOfMemory, try_arc};
@@ -52,6 +53,12 @@ pub trait UserMemory: Send + Sync {
     /// allows that from here (AArch64); RISC-V still needs a `fence.i` on
     /// the hart that runs it.
     fn load_elf(&self, elf: &Elf<'_>) -> Result<u64, Errno>;
+    /// Like [`load_elf`](UserMemory::load_elf), with `bias` added to every
+    /// address, for a position-independent image. Relocations are not
+    /// applied. The default supports only a bias of 0.
+    fn load_elf_at(&self, elf: &Elf<'_>, bias: u64) -> Result<u64, Errno> {
+        if bias == 0 { self.load_elf(elf) } else { Err(Errno::ENOSYS) }
+    }
     /// A copy of this space for `fork`: the same kernel mappings, and every
     /// page this space owns shared copy-on-write: writable pages become
     /// read-only in both spaces until one of them writes (see
@@ -63,6 +70,32 @@ pub trait UserMemory: Send + Sync {
     /// other space still shares it) and returns true, so the faulting
     /// instruction can be retried. Returns false for any other fault.
     fn cow_fault(&self, va: u64) -> bool;
+    /// Reserves `va..va + len` (page-aligned) as an area of zeroed,
+    /// user-accessible pages with `flags`, without allocating any: each page
+    /// gets its frame the first time something touches it (a page fault, see
+    /// [`UserMemory::page_fault`], or a kernel copy through `read` or
+    /// `write`). Fails with `EINVAL` if the range overlaps an area or a page
+    /// that is already there, or is not in the user half.
+    fn map_lazy(&self, _va: u64, _len: u64, _flags: MapFlags) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+    /// Handles a user page fault at `va`, a write if `write`: a page of a
+    /// [`map_lazy`](UserMemory::map_lazy) area that has no frame yet gets
+    /// one, zeroed; a write to a copy-on-write page is handled as by
+    /// [`UserMemory::cow_fault`]. Returns true if the faulting instruction
+    /// can be retried, false for any other fault (including an access the
+    /// area's flags do not allow).
+    fn page_fault(&self, va: u64, write: bool) -> bool {
+        write && self.cow_fault(va)
+    }
+    /// Handles a user write fault at `va` that [`UserMemory::cow_fault`]
+    /// refused, on a space whose threads run on several CPUs: if the page is
+    /// writable after all, this CPU's TLB held a stale read-only entry for it
+    /// (another CPU broke the page's sharing since). Drops that entry and
+    /// returns true, so the instruction can be retried.
+    fn stale_fault(&self, _va: u64) -> bool {
+        false
+    }
     /// Maps fresh read-only, executable pages at `va` (page-aligned) holding
     /// `code`; the kernel's own stubs, such as the signal return trampoline.
     fn map_code(&self, _va: u64, _code: &[u8]) -> Result<(), Errno> {
@@ -71,24 +104,9 @@ pub trait UserMemory: Send + Sync {
 
     /// Records a file mapping over `va..va + len` (page-aligned, inside the
     /// user half and clear of every other mapping). Nothing is read yet: the
-    /// pages are loaded when first touched (see [`UserMemory::file_fault`]).
+    /// pages are loaded when first touched (see [`UserMemory::page_fault`]).
     fn map_file(&self, _va: u64, _len: u64, _map: FileMapping) -> Result<(), Errno> {
         Err(Errno::ENODEV)
-    }
-    /// Reserves `va..va + len` (page-aligned) with no access: anonymous
-    /// memory that [`UserMemory::mprotect`] can later make usable. The
-    /// default does nothing, since an unmapped range already faults.
-    fn reserve(&self, _va: u64, _len: u64) -> Result<(), Errno> {
-        Ok(())
-    }
-    /// Handles a user fault at `va` in a file mapping or reservation: loads
-    /// the page (a read, or a write to a private mapping), or makes a clean
-    /// page of a shared mapping writable and records it as dirty. Returns
-    /// true if the instruction can be retried; false if `va` is in no
-    /// mapping, the access is not allowed, or the page is past the end of
-    /// the file.
-    fn file_fault(&self, _va: u64, _write: bool) -> bool {
-        false
     }
     /// [`UserMemory::unmap`] for `munmap`: also writes back the dirty pages
     /// of shared file mappings and drops the mappings, and reports a failure
@@ -252,22 +270,26 @@ struct Inner<F: PageTableFormat, A: TableAlloc> {
     /// The pages this space maps, by user address. A frame is freed when no
     /// space's pages refer to it.
     pages: ArcTree<ByVa<A>>,
-    /// The file mappings and reservations, and which pages of shared ones
-    /// are dirty.
+    /// The file mappings, and which pages of shared ones are dirty.
     maps: FileMaps,
+    /// The areas reserved with `map_lazy`, whether or not their pages exist
+    /// yet. Pages that were mapped any other way are in no area.
+    vmas: VmaTree,
 }
 
 impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
     /// Gives the copy-on-write page at `va` (page-aligned) its own writable
     /// frame. Returns false if it is not one, or memory ran out.
-    fn break_cow(&self, inner: &mut Inner<F, A>, va: u64) -> bool {
-        let Inner { pt, pages, maps } = inner;
+    fn break_cow(&self, inner: &mut Inner<F, A>, va: u64, deferred: &mut Deferred<A>) -> bool {
+        let Inner { pt, pages, maps, vmas } = inner;
         let Some(page) = pages.find(&va) else { return false };
         if !page.is_cow() {
             return false;
         }
         // A mapping made read-only after the fork stays so.
-        if maps.find(va).is_some_and(|v| !v.prot().contains(MapFlags::WRITE)) {
+        if maps.find(va).is_some_and(|v| !v.prot().contains(MapFlags::WRITE))
+            || vmas.find(va).is_some_and(|v| !v.flags.contains(MapFlags::WRITE))
+        {
             return false;
         }
         let vaddr = VirtAddr::new(va);
@@ -297,7 +319,11 @@ impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
             }
             // SAFETY: under the space's lock, which `inner` proves.
             let old = unsafe { core::mem::replace(&mut *page.frame.get(), copy) };
-            drop(old);
+            // Other CPUs may still map the old frame: keep it until they
+            // have been shot down, or the last owner's free could hand it to
+            // someone else while a thread of ours can still read it.
+            deferred.stale(va);
+            deferred.keep_frame(old);
             if flags.contains(MapFlags::EXEC) {
                 sync_icache(self.alloc.phys_to_virt(new));
             }
@@ -312,43 +338,121 @@ impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
     }
 }
 
+impl<F: PageTableFormat, A: TableAlloc + Clone + Send + Sync> AddressSpace<F, A> {
+    /// Maps a zeroed page at `page` (aligned) with `flags` plus `USER` and
+    /// records it. Any page already recorded there is replaced.
+    fn install_zeroed(&self, inner: &mut Inner<F, A>, page: u64, flags: MapFlags) -> Result<(), Errno> {
+        let pa = self.alloc.alloc_table().ok_or(Errno::ENOMEM)?;
+        // The page owns the frame from here, and frees it if anything
+        // below fails.
+        let node = Page::new(pa, self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
+        // SAFETY: a fresh frame, reachable through the allocator's mapping.
+        unsafe { self.alloc.phys_to_virt(pa).write_bytes(0, PAGE_SIZE) };
+        match inner.pt.map(VirtAddr::new(page), pa, PageSize::Size4K, flags | MapFlags::USER) {
+            // The space may be active here, and RISC-V may cache invalid entries.
+            Ok(flush) => flush.flush(),
+            Err(e) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
+        }
+        node.place(page);
+        // A page that is not mapped has no node: see `unmap`.
+        drop(inner.pages.take_key(&page));
+        assert!(inner.pages.insert(node).is_ok(), "the page's slot was just emptied");
+        Ok(())
+    }
+
+    /// Gives the pages of `map_lazy` areas in `va..va + len` that have no
+    /// frame one, for a kernel copy that is about to go through the page
+    /// table. Pages whose area does not allow the access are left, so the
+    /// copy fails on them as it would on any unmapped page.
+    fn populate(&self, inner: &mut Inner<F, A>, va: u64, len: usize, write: bool) -> Result<(), Errno> {
+        let Some(end) = va.checked_add(len as u64) else { return Ok(()) };
+        let first = va & !(PAGE - 1);
+        let mut from = first;
+        while let Some(area) = inner.vmas.first_overlap(from, end) {
+            from = area.end;
+            if !area.flags.contains(if write { MapFlags::WRITE } else { MapFlags::READ }) {
+                continue;
+            }
+            for page in (area.start.max(first)..area.end.min(end)).step_by(PAGE_SIZE) {
+                if inner.pages.find(&page).is_none() {
+                    self.install_zeroed(inner, page, area.flags)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + Sync + 'static> AddressSpace<F, A> {
     /// Unmaps and frees the pages of `va..va + len`, and drops the file
     /// mappings there after writing back what shared ones hold. With
     /// `strict`, running out of memory to split a mapping fails the call
     /// before anything is changed; otherwise the pages go regardless.
     fn unmap_range(&self, va: u64, len: u64, strict: bool) -> Result<(), Errno> {
-        debug_assert_threads_pinned();
         let end = va.saturating_add(len);
         // Before the pages go: this is the last chance to save them.
         let saved = self.writeback(va, end);
-        let mut inner = self.inner.lock();
-        let Inner { pt, pages, maps } = &mut *inner;
-        if strict {
-            maps.carve(va, end, filemap::Edit::Remove)?;
-        } else {
-            maps.remove(va, end);
-        }
-        maps.clear_dirty(va, end);
-        // Every user page is one of ours, so visit those rather than each
-        // page of a range that may span most of the address space.
-        let mut from = va & !(PAGE - 1);
-        while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&at| at < end) {
-            from = at + PAGE;
-            match pt.unmap(VirtAddr::new(at)) {
-                // The flush is local to this CPU. That is enough because all
-                // of a process's threads share one CPU (`clone` pins them),
-                // so no other CPU holds a stale TLB entry.
-                Ok((_, flush)) => flush.flush(),
-                // Mapped, yet it cannot be unmapped: leave it, and its frame.
-                Err(_) if pt.translate(VirtAddr::new(at)).is_some() => continue,
-                // Not mapped: nothing refers to the frame.
-                Err(_) => {}
+        {
+            let mut inner = self.inner.lock();
+            if strict {
+                inner.maps.carve(va, end, filemap::Edit::Remove)?;
+            } else {
+                inner.maps.remove(va, end);
             }
-            // The frame goes with the page, unless a relative still maps it.
-            drop(pages.take_key(&at));
+            inner.maps.clear_dirty(va, end);
+            // Made first, so the areas can be cut without failing. If there is
+            // no memory for it, the part of an area above the range is lost,
+            // and its untouched pages will fault instead of appearing.
+            let spare = if inner.vmas.needs_spare(va, end) { VmaSpare::new().ok() } else { None };
+            inner.vmas.remove(va & !(PAGE - 1), end, spare);
         }
+        self.drop_pages(va, end);
         saved
+    }
+
+    /// Unmaps and frees the pages in `va..end`, shooting down other CPUs.
+    fn drop_pages(&self, va: u64, end: u64) {
+        let mut from = va & !(PAGE - 1);
+        loop {
+            // Dropped after the lock: shoots down the other CPUs, then frees.
+            let mut deferred = Deferred::<A>::new();
+            let mut more = false;
+            {
+                let mut inner = self.inner.lock();
+                let Inner { pt, pages, .. } = &mut *inner;
+                // Every user page is one of ours, so visit those rather than each
+                // page of a range that may span most of the address space.
+                while let Some(at) = pages.lower_bound(&from).map(Page::va).filter(|&at| at < end) {
+                    if deferred.full() {
+                        more = true;
+                        break;
+                    }
+                    from = at + PAGE;
+                    match pt.unmap(VirtAddr::new(at)) {
+                        // Flush this CPU now, so a thread preempted into this
+                        // space here cannot use the page; the others follow
+                        // once the lock is released.
+                        Ok((_, flush)) => {
+                            flush.flush();
+                            deferred.stale(at);
+                        }
+                        // Mapped, yet it cannot be unmapped: leave it, and its frame.
+                        Err(_) if pt.translate(VirtAddr::new(at)).is_some() => continue,
+                        // Not mapped: nothing refers to the frame.
+                        Err(_) => {}
+                    }
+                    // The frame goes with the page, unless a relative still
+                    // maps it, and not before the shootdown.
+                    if let Some(page) = pages.take_key(&at) {
+                        deferred.keep_page(page);
+                    }
+                }
+            }
+            drop(deferred);
+            if !more {
+                break;
+            }
+        }
     }
 }
 
@@ -370,7 +474,12 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             root: pt.root(),
             alloc,
             shared,
-            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new(), maps: FileMaps::default() }),
+            inner: IrqSpinLock::new(Inner {
+                pt,
+                pages: ArcTree::new(),
+                maps: FileMaps::default(),
+                vmas: VmaTree::new(),
+            }),
         })
     }
 
@@ -412,7 +521,8 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
 
     fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Errno> {
         self.fault_in(va, buf.len(), false)?;
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        self.populate(&mut inner, va, buf.len(), false)?;
         walk(&inner.pt, va, buf.len(), MapFlags::READ, |src, off, n| {
             let to = buf.get_mut(off..off.saturating_add(n)).ok_or(Errno::EFAULT)?;
             // SAFETY: `src` points at `n` bytes of a user-readable frame.
@@ -422,9 +532,12 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Errno> {
+        // Declared first so it is dropped (and the shootdown sent) after the lock.
+        let mut deferred = Deferred::<A>::new();
         self.fault_in(va, data.len(), true)?;
         let mut inner = self.inner.lock();
         let end = va.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
+        self.populate(&mut inner, va, data.len(), true)?;
         let mut from = va & !(PAGE - 1);
         while from < end
             && let Some(page) = inner.pages.lower_bound(&from)
@@ -432,7 +545,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         {
             let (at, cow) = (page.va(), page.is_cow());
             from = at + PAGE;
-            if cow && !self.break_cow(&mut inner, at) {
+            if cow && !self.break_cow(&mut inner, at, &mut deferred) {
                 return Err(Errno::EFAULT);
             }
         }
@@ -454,21 +567,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             if inner.pt.translate(VirtAddr::new(page)).is_some() {
                 continue;
             }
-            let pa = self.alloc.alloc_table().ok_or(Errno::ENOMEM)?;
-            // The page owns the frame from here, and frees it if anything
-            // below fails.
-            let node = Page::new(pa, self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
-            // SAFETY: a fresh frame, reachable through the allocator's mapping.
-            unsafe { self.alloc.phys_to_virt(pa).write_bytes(0, PAGE_SIZE) };
-            match inner.pt.map(VirtAddr::new(page), pa, PageSize::Size4K, flags | MapFlags::USER) {
-                // The space may be active here, and RISC-V may cache invalid entries.
-                Ok(flush) => flush.flush(),
-                Err(e) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
-            }
-            node.place(page);
-            // A page that is not mapped has no node: see `unmap`.
-            drop(inner.pages.take_key(&page));
-            assert!(inner.pages.insert(node).is_ok(), "the page's slot was just emptied");
+            self.install_zeroed(&mut inner, page, flags)?;
         }
         Ok(())
     }
@@ -486,14 +585,6 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         self.map_file_impl(va, len, map)
     }
 
-    fn reserve(&self, va: u64, len: u64) -> Result<(), Errno> {
-        self.reserve_impl(va, len)
-    }
-
-    fn file_fault(&self, va: u64, write: bool) -> bool {
-        self.file_fault_impl(va, write)
-    }
-
     fn mprotect(&self, va: u64, len: u64, prot: MapFlags) -> Result<(), Errno> {
         self.mprotect_impl(va, len, prot)
     }
@@ -507,11 +598,16 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn load_elf(&self, elf: &Elf<'_>) -> Result<u64, Errno> {
+        self.load_elf_at(elf, 0)
+    }
+
+    fn load_elf_at(&self, elf: &Elf<'_>, bias: u64) -> Result<u64, Errno> {
         // The loader writes into any page already mapped, and the kernel's
         // are, through the shared root entries: keep every segment out of
         // them, and bound the total so loading cannot exhaust memory.
         let mut total = 0u64;
-        for seg in elf.segments().filter(|s| s.mem_size != 0) {
+        elf.span_at(bias).ok_or(Errno::ENOEXEC)?;
+        for seg in elf.segments_at(bias).filter(|s| s.mem_size != 0) {
             let end = seg.vaddr.checked_add(seg.mem_size).ok_or(Errno::ENOEXEC)?;
             if !self.is_user_range(seg.vaddr, end) {
                 return Err(Errno::ENOEXEC);
@@ -525,7 +621,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         let Inner { pt, pages, .. } = &mut *inner;
         // The frames the loader allocates, until we know which page each is.
         let mut fresh: Fresh<A> = ArcTree::new();
-        let loaded = elf.load_into(pt, MapFlags::USER, || {
+        let loaded = elf.load_into_at(pt, MapFlags::USER, bias, || {
             let pa = self.alloc.alloc_table()?;
             // The page owns the frame from here, and frees it if the loader
             // then fails to map it.
@@ -535,7 +631,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         });
         // Record where each new frame went, so `unmap` and `fork` find it,
         // even after a failure part-way.
-        for seg in elf.segments().filter(|s| s.mem_size != 0) {
+        for seg in elf.segments_at(bias).filter(|s| s.mem_size != 0) {
             let end = seg.vaddr.saturating_add(seg.mem_size);
             for page in (seg.vaddr & !(PAGE - 1)..end).step_by(PAGE_SIZE) {
                 let Some(t) = pt.translate(VirtAddr::new(page)) else { continue };
@@ -554,16 +650,18 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         drop(fresh);
         loaded.map_err(|e| if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::ENOEXEC })?;
         // Every non-empty segment was checked to end inside the user half above.
-        let end = elf.segments().filter(|s| s.mem_size != 0).map(|s| s.vaddr.saturating_add(s.mem_size)).max();
+        let end = elf.segments_at(bias).filter(|s| s.mem_size != 0).map(|s| s.vaddr.saturating_add(s.mem_size)).max();
         end.unwrap_or(0).checked_next_multiple_of(PAGE).ok_or(Errno::ENOEXEC)
     }
 
     fn fork(&self) -> Result<Arc<dyn UserMemory>, Errno> {
-        // Making pages read-only flushes this CPU only: see `unmap`.
-        debug_assert_threads_pinned();
+        // Making pages read-only flushes this CPU at once and the others
+        // when `deferred` is dropped, after the lock (see `Deferred`).
+        let mut deferred = Deferred::<A>::new();
         let mut guard = self.inner.lock();
-        let Inner { pt: parent_pt, pages: parent_pages, maps: parent_maps } = &mut *guard;
+        let Inner { pt: parent_pt, pages: parent_pages, maps: parent_maps, vmas: parent_vmas } = &mut *guard;
         let maps = parent_maps.try_clone()?;
+        let vmas = parent_vmas.try_clone().map_err(|_| Errno::ENOMEM)?;
         let mut pt = PageTable::new(self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
         // SAFETY: our shared root entries are the kernel's, which outlive
         // this space (see `new`) and so the copy, made under the same terms.
@@ -572,7 +670,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             root: pt.root(),
             alloc: self.alloc.clone(),
             shared: self.shared.clone(),
-            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new(), maps }),
+            inner: IrqSpinLock::new(Inner { pt, pages: ArcTree::new(), maps, vmas }),
         };
         {
             let mut copy = child.inner.lock();
@@ -591,6 +689,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                     }
                     // The parent may be running on this table.
                     parent_pt.protect(va, flags).map_err(|_| Errno::EINVAL)?.flush();
+                    deferred.stale(page.va());
                     cow = true;
                     // Record it now, so if the child's map below fails the
                     // parent can still write the page (a lone share breaks
@@ -613,8 +712,68 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 
     fn cow_fault(&self, va: u64) -> bool {
+        let va = va & !(PAGE - 1);
+        // Declared first so it is dropped (and the shootdown sent) after the lock.
+        let mut deferred = Deferred::<A>::new();
         let mut inner = self.inner.lock();
-        self.break_cow(&mut inner, va & !(PAGE - 1))
+        self.break_cow(&mut inner, va, &mut deferred)
+    }
+
+    fn stale_fault(&self, va: u64) -> bool {
+        let va = va & !(PAGE - 1);
+        let writable = self
+            .inner
+            .lock()
+            .pt
+            .translate(VirtAddr::new(va))
+            .is_some_and(|t| t.flags.contains(MapFlags::WRITE | MapFlags::USER));
+        if writable {
+            osmium_arch::mmu::flush_page(va as usize);
+        }
+        writable
+    }
+
+    fn map_lazy(&self, va: u64, len: u64, flags: MapFlags) -> Result<(), Errno> {
+        if !va.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
+            return Err(Errno::EINVAL);
+        }
+        let end = va.checked_add(len).ok_or(Errno::EINVAL)?;
+        if !self.is_user_range(va, end) {
+            return Err(Errno::EINVAL);
+        }
+        let mut inner = self.inner.lock();
+        if inner.pages.lower_bound(&va).is_some_and(|p| p.va() < end) {
+            return Err(Errno::EINVAL);
+        }
+        inner
+            .vmas
+            .insert(va, end, flags)
+            .map_err(|e| if e == VmaError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL })
+    }
+
+    fn page_fault(&self, va: u64, write: bool) -> bool {
+        let page = va & !(PAGE - 1);
+        if self.inner.lock().maps.find(page).is_some() {
+            // A file mapping: a private page that is shared by `fork` is copied
+            // as any is; otherwise the page is loaded, or a clean shared page
+            // made writable, which reads the file without the lock.
+            return write && self.cow_fault(va) || self.file_fault_impl(va, write);
+        }
+        // Declared first so it is dropped (and the shootdown sent) after the lock.
+        let mut deferred = Deferred::<A>::new();
+        let mut inner = self.inner.lock();
+        if inner.pages.find(&page).is_some() {
+            // Already has a frame: only a write to a shared one is ours to fix.
+            return write && self.break_cow(&mut inner, page, &mut deferred);
+        }
+        let Some(area) = inner.vmas.find(page) else { return false };
+        // A read or fetch may use any readable or executable area.
+        let allowed = if write {
+            area.flags.contains(MapFlags::WRITE)
+        } else {
+            area.flags.contains(MapFlags::READ) || area.flags.contains(MapFlags::EXEC)
+        };
+        allowed && self.install_zeroed(&mut inner, page, area.flags).is_ok()
     }
 
     fn map_code(&self, va: u64, code: &[u8]) -> Result<(), Errno> {
@@ -629,19 +788,64 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
     }
 }
 
-/// Page-table changes flush the TLB of this CPU only, which is enough while
-/// every thread of a process runs on one CPU. Checks that the calling task,
-/// if it is one of several threads of a process, is pinned to one CPU. Only
-/// in kernels: the host tests run without a scheduler.
-fn debug_assert_threads_pinned() {
-    if cfg!(all(debug_assertions, target_os = "none"))
-        && let Some(p) = crate::process::current()
-        && p.group.live() > 1
-    {
-        debug_assert!(
-            osmium_sched::current().affinity().count_ones() == 1,
-            "threads of one process must be pinned to one CPU: page-table flushes are local"
-        );
+/// Most pages one [`Deferred`] holds back.
+const BATCH: usize = 32;
+
+/// What a page-table change leaves to do once the space's lock is released.
+///
+/// Page-table writes flush the TLB of the CPU that makes them, under the
+/// lock. The process's threads may be running on other CPUs, though, with
+/// stale entries; dropping the `Deferred` shoots those down
+/// ([`osmium_arch::mmu::flush_remote`]) and only then frees the frames the
+/// changes released. The shootdown must not run under the space's lock: a
+/// CPU waiting for that lock with interrupts off could never acknowledge it.
+/// So declare a `Deferred` before the guard it accompanies, which drops it
+/// after the guard.
+struct Deferred<A: TableAlloc> {
+    /// The lowest and highest pages whose mappings changed.
+    stale: Option<(u64, u64)>,
+    pages: [Option<Arc<Page<A>>>; BATCH],
+    used: usize,
+    frame: Option<Arc<Frame<A>>>,
+}
+
+impl<A: TableAlloc> Deferred<A> {
+    fn new() -> Self {
+        Self { stale: None, pages: [const { None }; BATCH], used: 0, frame: None }
+    }
+
+    /// Whether another page would not fit.
+    fn full(&self) -> bool {
+        self.used == BATCH
+    }
+
+    /// Notes that the mapping of the page at `va` changed.
+    fn stale(&mut self, va: u64) {
+        self.stale = Some(match self.stale {
+            Some((lo, hi)) => (lo.min(va), hi.max(va)),
+            None => (va, va),
+        });
+    }
+
+    /// Holds `page` (a page that was unmapped) until the shootdown is done.
+    fn keep_page(&mut self, page: Arc<Page<A>>) {
+        if let Some(slot) = self.pages.get_mut(self.used) {
+            *slot = Some(page);
+            self.used += 1;
+        }
+    }
+
+    /// Holds a frame that is no longer mapped here until the shootdown is done.
+    fn keep_frame(&mut self, frame: Arc<Frame<A>>) {
+        self.frame = Some(frame);
+    }
+}
+
+impl<A: TableAlloc> Drop for Deferred<A> {
+    fn drop(&mut self) {
+        if let Some((lo, hi)) = self.stale {
+            osmium_arch::mmu::flush_remote(lo as usize, ((hi - lo) / PAGE) as usize + 1);
+        }
     }
 }
 

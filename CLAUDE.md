@@ -32,7 +32,7 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
 
 ## Architecture
 
-**Layering.** `osmium-arch` sits at the bottom: IRQ flags, traps, CPU id, MMU and system registers for x86_64, AArch64 and RISC-V. `osmium-sync` and `osmium-mm` build on it, then `osmium-hal` (MMIO, device traits, console) and `osmium-drivers`, and then the higher components: `sched`, `proc`, `fs*`, `net`, `iscsi`, `virt`, `exec`. The `osmium` crate is a facade that re-exports each component behind a feature of the same name; `full` enables all of them. Dependencies only point downward, so keep a new component in the lowest layer that can hold it.
+**Layering.** `osmium-arch` sits at the bottom: IRQ flags, traps, CPU id, MMU and system registers for x86_64, AArch64 and RISC-V. `osmium-sync` and `osmium-mm` build on it, then `osmium-hal` (MMIO, device traits, console), `osmium-drivers`, `osmium-sysdrv` (interrupt controllers and IOMMUs), `osmium-storage` (block device drivers), `osmium-display` (display drivers), `osmium-usb` (host controllers and class drivers) and `osmium-netdev` (network device drivers, including the USB ones), and then the higher components: `sched`, `proc`, `fs*`, `net`, `iscsi`, `virt`, `exec`, `acpi` (which also builds on `boot`). The `osmium` crate is a facade that re-exports each component behind a feature of the same name; `full` enables all of them. Dependencies only point downward, so keep a new component in the lowest layer that can hold it.
 
 **Library, not a kernel.** No crate defines an entry point, panic handler or global allocator. Each example kernel (`examples/*-virt`, `x86_64-pc`, `riscv-firmware`, `uefi`) supplies those and assembles the components it needs. The examples are the integration tests for the library.
 
@@ -48,6 +48,7 @@ Each example's serial output is grepped against a list of expected lines in `scr
 
 ## Things that will bite
 
+- `crates/acpi/tests/asl/*.aml` are checked in, compiled from the `.asl` beside them. After editing an `.asl`, run `crates/acpi/tests/asl/build.sh` (needs `iasl`) and commit both.
 - Release profiles do not enable `overflow-checks`, so arithmetic wraps silently in release kernels while debug builds panic. Use explicit checked operations on values that come from untrusted sources (hardware registers, disk images, network packets).
 - `missing_docs` is a warning and `undocumented_unsafe_blocks` is a clippy warning. `check.sh` promotes clippy warnings to errors, so both need to be clean.
 - Only QEMU has been used. Nothing has run on physical hardware. The Intel VMX backend has only run under nested KVM, because QEMU's TCG does not emulate VMX. The mlx4 driver and the xHCI hub and isochronous code have only run against simulated devices.

@@ -202,8 +202,14 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `sync` | osmium-sync | no | Spin locks, `Once`, `Lazy`, per-CPU data, SPSC ring, `SeqLock` |
 | `mm` | osmium-mm | no | Addresses, memory maps, frame allocators, page tables, the heap |
 | `hal` | osmium-hal | no | MMIO and port I/O, device traits (including `Display` and `Framebuffer`), `IrqTable`, the console and `println!` |
-| `drivers` | osmium-drivers | no | UARTs, interrupt controllers, timers, virtio (MMIO and PCI), xHCI/USB, AHCI, NVMe, displays, mlx4, RAM disk |
+| `usb` | osmium-usb | no | xHCI, EHCI, OHCI and UHCI host controllers, USB class drivers |
+| `netdev` | osmium-netdev | no | virtio-net, mlx4, USB CDC-ECM and CDC-NCM network drivers |
+| `drivers` | osmium-drivers | no | virtio core: MMIO and PCI transports, virtqueue |
+| `display` | osmium-display | no | virtio-gpu, Bochs DISPI, VESA BIOS Extensions |
+| `sysdrv` | osmium-sysdrv | no | UARTs, PIT, `fw_cfg`, interrupt controllers (PLIC, CLINT, GICv2, local APIC, I/O APIC) and IOMMUs (VT-d, AMD-Vi, SMMUv3, RISC-V) |
+| `storage` | osmium-storage | no | virtio-blk, AHCI, NVMe and RAM disk (enables `drivers`) |
 | `boot` | osmium-boot | `FdtWriter` only | FDT, Multiboot2, PVH, UEFI (system table, GOP), ACPI, ELF loading |
+| `acpi` | osmium-acpi | yes | FADT, an AML interpreter, `_CRS`, `_PRT`, sleep states, power off, SCI and GPEs (enables `boot`) |
 | `exec` | osmium-exec | no | A heap-free async executor |
 | `sched` | osmium-sched | yes | Tasks, context switch, scheduler, `Mutex`, `WaitQueue`, timers |
 | `fs` | osmium-fs | yes | VFS, RamFs, `/dev`, cpio, ext2/ext3/ext4 |
@@ -214,7 +220,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `iscsi` | osmium-iscsi | yes | iSCSI initiator: a remote disk over TCP as a `BlockDevice` (enables `net`) |
 | `virt` | osmium-virt | yes | Hypervisor building blocks |
 
-`default` is `sync`, `mm`, `hal`, `drivers` and `boot`. `full` turns on all
+`default` is `sync`, `mm`, `hal`, `drivers`, `sysdrv`, `storage`, `display`, `usb`, `netdev` and `boot`. `full` turns on all
 of the above.
 
 Three features choose the privilege level the arch code runs at:
@@ -320,6 +326,37 @@ map.page_align_usable();
 To find devices, use `fdt.find_compatible(&["ns16550a"])` together with `Node::reg()` and
 `Node::interrupts()`. On ACPI machines, use `acpi::Acpi::new(rsdp, read)`
 followed by `Madt::parse` (CPUs, I/O APICs) and `Mcfg::parse` (PCIe ECAM).
+
+The `acpi` feature adds an AML interpreter for what the static tables do not say: which devices there
+are, what resources they use, how PCI interrupts are wired, and how to power off. You supply a `Host`
+that reaches memory, ports and PCI configuration space (every method has a refusing default, so
+implement what your machine has), then load the tables and ask:
+
+```rust
+use osmium::acpi::aml::{Config, Interpreter};
+use osmium::acpi::fadt::Fadt;
+use osmium::acpi::pm::Pm;
+
+let acpi = Acpi::new(rsdp, read).unwrap();
+let mut aml = Interpreter::new(MyHost::new(), Config::default());
+aml.load_tables(&acpi).unwrap();          // the DSDT from the FADT, then every SSDT
+let report = aml.initialize();            // _REG, _INI, _STA
+for bridge in aml.find_devices("PNP0A08") {
+    let windows = aml.current_resources(bridge).unwrap();               // _CRS
+    let irq = aml.route_pci_irq(bridge, 3, 0, 0).unwrap();              // _PRT: device 3, INTA
+}
+let pm = Pm::new(Fadt::parse(acpi.find(b"FACP").unwrap()).unwrap());
+pm.enable(aml.host_mut()).unwrap();       // switch the chipset to ACPI mode
+// ... from the SCI handler: pm.handle_sci(&mut aml) runs _Exx/_Lxx and reports fixed events
+pm.power_off(&mut aml).unwrap();          // _PTS(5), then SLP_TYP and SLP_EN from \_S5_
+```
+
+AML is firmware's code, so the interpreter treats it as untrusted: a call that loops, recurses or
+sleeps without end is cut off by the limits in `Config` (`max_depth`, `max_steps`, `max_sleep_us`), and
+objects have size limits. The interpreter recurses once per nesting level and needs about 0.65 KiB of
+stack for each in a release build (the default `max_depth` of 96 fits in 64 KiB; a debug build needs
+about eight times that), and `Interpreter::peak_depth` says how deep your firmware actually goes (QEMU's
+q35 DSDT peaks at 8).
 
 ### 5.4 Frames, heap and page tables
 
@@ -539,10 +576,10 @@ port I/O.
 | Serial | `uart16550::Uart16550` (MMIO or `Pio`), `pl011::Pl011` |
 | Interrupt controllers | `plic::Plic`, `gicv2::GicV2`, `lapic::LocalApic`, `ioapic::IoApic` |
 | Timers | `clint::Clint`, `pit::Pit` |
-| Block | `ramdisk::RamDisk`, `virtio::blk::VirtioBlk`, `usb::storage::UsbStorage` (fewer than 2^32 blocks, so under 2 TiB at 512 B; block sizes a power of two from 512 B to 64 KiB), `ahci::Ahci`, `nvme::Nvme`; iSCSI in `osmium::iscsi` |
-| Network | `virtio::net::VirtioNet`, `usb::ecm::UsbEthernet`, `usb::ncm::UsbNcm`, `mlx4::Mlx4` (polled, or MSI-X via `enable_msix`; checksum and segmentation offloads are inherent `EthPort` methods, since `NetDevice` has no offload flags; InfiniBand ports are `IbPort` (UD datagrams, reliable connections, which needs `service` called regularly), and `Mlx4::open_ipoib` makes one a `NetDevice`) |
-| USB | `xhci::Xhci` (polled, INTx, MSI or MSI-X via `enable_message_interrupts`), `ehci::Ehci` (high-speed only; low- and full-speed devices go to the companion), `ohci::Ohci` and `uhci::Uhci` (low/full speed, hubs; all three polled, no isochronous), `usb::hid::BootKeyboard`, `usb::hub::Hub`, `usb::isoch::{IsochIn, IsochOut}` |
-| Display | `virtio::gpu::VirtioGpu` (virtio-gpu and virtio-vga, MMIO or PCI), `display::bochs::BochsVbe` (QEMU std VGA, bochs-display, virtio-vga in VGA mode), `display::vbe::Vbe` (VESA BIOS Extensions, x86) |
+| Block | `storage::ramdisk::RamDisk`, `storage::virtio_blk::VirtioBlk`, `osmium::usb::class::storage::UsbStorage` (fewer than 2^32 blocks, so under 2 TiB at 512 B; block sizes a power of two from 512 B to 64 KiB), `storage::ahci::Ahci`, `storage::nvme::Nvme`; iSCSI in `osmium::iscsi` |
+| Network (`osmium::netdev`) | `virtio_net::VirtioNet`, `usb::ecm::UsbEthernet`, `usb::ncm::UsbNcm`, `mlx4::Mlx4` (polled, or MSI-X via `enable_msix`; checksum and segmentation offloads are inherent `EthPort` methods, since `NetDevice` has no offload flags; InfiniBand ports are `IbPort` (UD datagrams, reliable connections, which needs `service` called regularly), and `Mlx4::open_ipoib` makes one a `NetDevice`) |
+| USB (`osmium::usb`) | `xhci::Xhci` (polled, INTx, MSI or MSI-X via `enable_message_interrupts`), `ehci::Ehci` (high-speed only; low- and full-speed devices go to the companion), `ohci::Ohci` and `uhci::Uhci` (low/full speed, hubs; all three polled or interrupt-driven via `enable_interrupts`, no isochronous), `class::hid::BootKeyboard`, `class::hub::Hub`, `class::isoch::{IsochIn, IsochOut}` |
+| Display | `display::virtio_gpu::VirtioGpu` (virtio-gpu and virtio-vga, MMIO or PCI), `display::bochs::BochsVbe` (QEMU std VGA, bochs-display, virtio-vga in VGA mode), `display::vbe::Vbe` (VESA BIOS Extensions, x86) |
 
 Drivers that do DMA take a `DmaAllocator`, and `LockedFrames` is one.
 Its `free_coherent` is `unsafe`: free a buffer only once the device can no
@@ -578,7 +615,7 @@ For their timeouts they take an `osmium::hal::timer::Clock` (anything with
 | Driver | Finds | Use |
 |---|---|---|
 | `ahci::Ahci` | class 01/06/01, registers in BAR 5 | `Ahci::new(io, &dma, Some(&clock))` brings the ports up; with `None`, its timeouts count polls instead of time. `disks()` lists the SATA disk ports, and `take_disk(port)` returns an `AhciDisk`, a `BlockDevice` with `model()` and `serial()` that outlives the HBA. With both the HBA and the disk supporting it, NCQ keeps up to 8 commands in flight per call. `Ahci::enable_interrupts()` and `AhciDisk::enable_interrupts(idle)` wait for completions by sleeping in `idle` instead of spinning; the kernel's IRQ handler (INTx or MSI) calls `Ahci::irq().handle()`. `atapi_drives()` and `take_atapi(port)` give an `AhciAtapi`, a read-only `BlockDevice` over a disc (2048-byte blocks, `reload()` after a disc change) that `osmium_fs_iso9660` can mount. Not supported: port multipliers, hot plug, queued or interrupt-driven ATAPI. |
-| `nvme::Nvme` | class 01/08/02, BAR 0 (64-bit) | `Nvme::new(io, &dma, &clock)` is a `BlockDevice` on the first active namespace. Use `select_namespace(nsid)` to pick another. It has `model()`, `serial()` and `firmware()`, uses one I/O queue pair with up to four commands in flight for transfers that split, and shuts the controller down on drop. `Nvme::with_interrupts(io, &dma, &clock, Interrupts { vector, signal, idle })` creates the I/O completion queue on an MSI-X table entry you have set up; your handler calls `IrqSignal::notify()` and the driver sleeps in `idle` between completions (admin commands are still polled). |
+| `nvme::Nvme` | class 01/08/02, BAR 0 (64-bit) | `Nvme::new(io, &dma, &clock)` is a `BlockDevice` on the first active namespace. Use `select_namespace(nsid)` to pick another. It has `model()`, `serial()` and `firmware()`, uses one I/O queue pair (or up to eight with `Nvme::with_queues(io, &dma, &clock, irq, n)`, which negotiates the count and falls back to one) with up to four commands in flight per queue for transfers that split, and shuts the controller down on drop. `Nvme::with_interrupts(io, &dma, &clock, Interrupts { vector, signal, idle })` creates the I/O completion queue on an MSI-X table entry you have set up; your handler calls `IrqSignal::notify()` and the driver sleeps in `idle` between completions (admin commands are still polled; every queue shares that one vector). With several queues, `Nvme` is `Sync` for I/O: `queue(i)` returns a `BlockDevice` handle and `read_blocks_on`/`write_blocks_on`/`flush_on` take `&self`, so CPUs on different queues (`queue_for_cpu(cpu)`) do not contend; users of one queue take turns. |
 
 ### Displays
 
@@ -991,14 +1028,14 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
   opt-in (`with_fp_switching`: x87 and SSE, not AVX), and SVE is not
   switched on AArch64. See HYPERVISOR.md's
   [current limits](HYPERVISOR.md#current-limits).
-- USB hubs (`usb::hub`) and isochronous endpoints (`IsochHost`, `usb::isoch`)
+- USB hubs (`usb::class::hub`) and isochronous endpoints (`IsochHost`, `usb::class::isoch`)
   have only been tested against a simulated xHCI controller. Isochronous
   transfers carry at most 4 KiB per service interval, SuperSpeed burst sizes
   from companion descriptors are ignored, and a SuperSpeed hub port that
   needs a warm reset is not recovered.
-- UHCI, OHCI and EHCI are polled only, without isochronous endpoints, and
-  EHCI supports no hubs.
-- CDC-NCM Ethernet (`usb::ncm`) has only been tested against a simulated
+- UHCI, OHCI and EHCI have no isochronous endpoints, and EHCI supports no
+  hubs.
+- CDC-NCM Ethernet (`netdev::usb::ncm`) has only been tested against a simulated
   device, since QEMU's `usb-net` offers only ECM and RNDIS. It uses 16-bit
   NTBs of at most 4 KiB without CRCs and sends one frame per NTB.
 
