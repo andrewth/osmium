@@ -1,10 +1,24 @@
-//! USB HID keyboards, through the boot protocol (class 03/01/01).
+//! USB HID: report descriptors and the devices driven through them, plus
+//! boot-protocol keyboards (class 03/01/01).
+//!
+//! - [`descriptor`] parses a report descriptor into a table of fields,
+//! - [`report`] reads and writes those fields in reports,
+//! - [`device`] fetches the descriptor from a device ([`HidDevice`]) and
+//!   decodes keyboards ([`HidKeyboard`]) and pointers ([`HidMouse`]).
 //!
 //! The boot protocol fixes the report format, so no report descriptor
 //! parsing is needed: 8 bytes of modifier bits, a reserved byte and up to six
 //! pressed keys' usage IDs (HID 1.11 appendix B.1). [`BootKeyboard::poll`]
 //! keeps one interrupt IN transfer outstanding and turns each new report
 //! into key press and release events by comparing it with the last.
+
+#[cfg(test)]
+mod desc_tests;
+pub mod descriptor;
+pub mod device;
+pub mod report;
+
+pub use device::{HidDevice, HidKeyboard, HidMouse, PointerEvent};
 
 use osmium_hal::usb::find_interface;
 use osmium_hal::usb::{DeviceId, Direction, Recipient, RequestKind, SetupPacket, TransferType, UsbError, UsbHost};
