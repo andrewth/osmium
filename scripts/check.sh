@@ -204,6 +204,7 @@ EXPECT=(
     'net: TCP read after the server closed: 0'
     'net: UDP TFTP from 10.0.2.2:[0-9]*: opcode 3 block 1: "hello over UDP"'
     'net: socketpair: epoll idle 0, ready 1 with data 42; sendmsg 9, recvmsg 9: "ping-pong"'
+    'net: unix: bind 0, listen 0, connect 0; sendmsg 1, recvmsg 1: descriptor read "via-fd"'
     'net: UDP loopback: bind 0, sent 5, peeked 5 then read 5 from 127.0.0.1:[0-9]*: "local"'
     '\[sock\]  net exited'
     ${fat_expect[@]+"${fat_expect[@]}"}
