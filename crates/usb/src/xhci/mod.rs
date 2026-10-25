@@ -1571,10 +1571,7 @@ mod tests {
     /// reset sequence) with one slot whose endpoint 3 has a `submit_in`
     /// transfer outstanding at TRB address 0x1000. Nothing answers commands
     /// or transfers.
-    fn fake<'dma>(
-        dma: &'dma crate::testing::HostDma,
-        regs: &mut [u32],
-    ) -> Xhci<'dma, crate::testing::HostDma> {
+    fn fake<'dma>(dma: &'dma crate::testing::HostDma, regs: &mut [u32]) -> Xhci<'dma, crate::testing::HostDma> {
         // SAFETY: the window covers the caller's array, which outlives the controller.
         let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), regs.len() * 4) };
         let mut endpoints = [const { None }; MAX_ENDPOINTS];
@@ -2019,12 +2016,7 @@ mod tests {
     /// Runs `attach_hub_port` against a controller that enables slot `new`
     /// and then rejects Address Device, which leaves the new slot's input
     /// context behind (dead) to inspect.
-    fn attach_and_inspect(
-        hc: &mut Xhci<'_, crate::testing::HostDma>,
-        port: u8,
-        speed: Speed,
-        new: u8,
-    ) -> Topology {
+    fn attach_and_inspect(hc: &mut Xhci<'_, crate::testing::HostDma>, port: u8, speed: Speed, new: u8) -> Topology {
         let enable = hc.commands.enqueue_addr();
         hc.events.inject(command_completion(enable, completion::SUCCESS, new));
         let address = PhysAddr::new(enable.as_u64() + 16);
