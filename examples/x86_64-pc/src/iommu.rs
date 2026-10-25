@@ -6,11 +6,11 @@
 //! translation off again.
 
 use osmium::boot::acpi::{AmdIommuUnit, DmaRemapUnit, EcamWindow};
-use osmium::sysdrv::iommu::amdvi::AmdVi;
-use osmium::sysdrv::iommu::vtd::Vtd;
 use osmium::hal::iommu::{DeviceId, Iommu};
 use osmium::hal::pci;
 use osmium::hal::println;
+use osmium::sysdrv::iommu::amdvi::AmdVi;
+use osmium::sysdrv::iommu::vtd::Vtd;
 
 /// The IOMMUs the ACPI tables describe on PCI segment 0.
 #[derive(Clone, Copy, Default)]
@@ -104,7 +104,7 @@ pub fn demo(ecam: Option<EcamWindow>, units: Units) {
 /// entry cache and the entry. Compatibility-format interrupts stay allowed
 /// so the kernel's own interrupts keep arriving.
 fn interrupt_remapping(vtd: &Vtd<'_, impl osmium::hal::dma::DmaAllocator + Sync>) {
-    use osmium::drivers::iommu::vtd::remap::{Irte, Source};
+    use osmium::sysdrv::iommu::vtd::remap::{Irte, Source};
     if !vtd.supports_interrupt_remapping() {
         println!("[iommu] VT-d interrupt remapping not supported; skipping");
         return;
