@@ -15,9 +15,9 @@
 //! but are not kept in the table.
 
 /// Capacity of the field table.
-pub const MAX_FIELDS: usize = 64;
+pub const MAX_FIELDS: usize = 40;
 /// Capacity of the pool of explicitly listed usages.
-pub const MAX_USAGES: usize = 256;
+pub const MAX_USAGES: usize = 128;
 /// Capacity of the table of distinct (kind, report ID) pairs.
 pub const MAX_REPORTS: usize = 32;
 /// Capacity of the list of top-level collections.
@@ -227,15 +227,16 @@ pub struct Field {
     /// Number of elements.
     pub report_count: u16,
     /// Smallest value an element can hold. Fields whose minimum is negative
-    /// are signed, the rest unsigned.
-    pub logical_min: i64,
+    /// are signed, the rest unsigned. Ranges are clamped to `i32`, so an
+    /// unsigned 32-bit maximum reads as `i32::MAX`.
+    pub logical_min: i32,
     /// Largest value an element can hold.
-    pub logical_max: i64,
+    pub logical_max: i32,
     /// What `logical_min` means in `unit`s (equal to the logical range if the
     /// descriptor gave none).
-    pub physical_min: i64,
+    pub physical_min: i32,
     /// What `logical_max` means in `unit`s.
-    pub physical_max: i64,
+    pub physical_max: i32,
     /// The unit, as the descriptor's nibble-encoded word.
     pub unit: u32,
     /// Power of ten the physical range is scaled by, -8 to 7.
@@ -546,6 +547,7 @@ impl ReportDescriptor {
         } else {
             (g.physical_min, resolve_max(g.physical_max, g.physical_min))
         };
+        let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         let usages = match (local.min, local.max) {
             (Some(min), Some(max)) if min <= max => Usages::Range { min, max },
             (None, None) if local.n == 0 => Usages::None,
@@ -567,10 +569,10 @@ impl ReportDescriptor {
             bit_offset: offset as u16,
             report_size: g.report_size as u8,
             report_count: g.report_count.min(u16::MAX as u32) as u16,
-            logical_min: g.logical_min,
-            logical_max,
-            physical_min,
-            physical_max,
+            logical_min: clamp(g.logical_min),
+            logical_max: clamp(logical_max),
+            physical_min: clamp(physical_min),
+            physical_max: clamp(physical_max),
             unit: g.unit,
             unit_exponent: g.unit_exponent,
             usages,
@@ -637,7 +639,7 @@ impl ReportDescriptor {
 
     /// The usage array value `value` selects in an array `field`.
     pub fn array_usage(&self, field: &Field, value: i64) -> Option<u32> {
-        let index = u32::try_from(value.checked_sub(field.logical_min)?).ok()?;
+        let index = u32::try_from(value.checked_sub(i64::from(field.logical_min))?).ok()?;
         match field.usages {
             Usages::List { len, .. } if index >= len as u32 => None,
             _ => self.field_usage(field, index),
@@ -660,7 +662,7 @@ impl ReportDescriptor {
                 list.iter().position(|&u| u == usage)? as u32
             }
         };
-        field.logical_min.checked_add(i64::from(index))
+        i64::from(field.logical_min).checked_add(i64::from(index))
     }
 
     /// The logical range of the first input field that has `usage`.
@@ -669,6 +671,6 @@ impl ReportDescriptor {
             .iter()
             .filter(|f| f.kind == ReportKind::Input && f.flags.is_variable())
             .find(|f| (0..f.report_count as u32).any(|i| self.field_usage(f, i) == Some(usage)))
-            .map(|f| (f.logical_min, f.logical_max))
+            .map(|f| (i64::from(f.logical_min), i64::from(f.logical_max)))
     }
 }

@@ -448,6 +448,12 @@ fn config(len: usize) -> Vec<u8> {
     c
 }
 
+/// Drivers hold a descriptor and are moved by value on kernel stacks.
+#[test]
+fn the_descriptor_table_stays_small() {
+    assert!(core::mem::size_of::<ReportDescriptor>() <= 3072);
+}
+
 #[test]
 fn class_descriptor_lookup() {
     let c = config(63);

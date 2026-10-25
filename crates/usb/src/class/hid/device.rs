@@ -17,7 +17,7 @@ const SET_PROTOCOL: u8 = 0x0b;
 const HID_DESCRIPTOR: u8 = 0x21;
 const REPORT_DESCRIPTOR: u8 = 0x22;
 /// The longest report descriptor fetched (it lives on the stack).
-pub const MAX_DESCRIPTOR_LEN: usize = 2048;
+pub const MAX_DESCRIPTOR_LEN: usize = 1024;
 /// The longest input report read.
 pub const MAX_REPORT_LEN: usize = 128;
 

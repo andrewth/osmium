@@ -72,7 +72,7 @@ impl Field {
 
     /// Whether `value` is inside the logical range.
     pub fn in_range(&self, value: i64) -> bool {
-        (self.logical_min..=self.logical_max).contains(&value)
+        (i64::from(self.logical_min)..=i64::from(self.logical_max)).contains(&value)
     }
 
     /// Maps a logical `value` to the physical range, as
@@ -81,7 +81,7 @@ impl Field {
     pub fn physical(&self, value: i64) -> Option<i64> {
         let l = i128::from(self.logical_max) - i128::from(self.logical_min);
         if l == 0 {
-            return Some(self.physical_min);
+            return Some(i64::from(self.physical_min));
         }
         let p = i128::from(self.physical_max) - i128::from(self.physical_min);
         let scaled = (i128::from(value) - i128::from(self.logical_min)).checked_mul(p)? / l;
