@@ -183,7 +183,7 @@ impl State {
     }
 
     /// True for an address of ours that has passed duplicate detection.
-    fn is_ours(&self, a: Ipv6Addr) -> bool {
+    pub(super) fn is_ours(&self, a: Ipv6Addr) -> bool {
         self.usable_addrs().any(|x| x.addr == a)
     }
 
@@ -444,7 +444,8 @@ impl Interface {
     /// address first if it is not cached.
     pub(super) fn send_ip6(&mut self, now: Instant, p: Packet) {
         let (IpAddr::V6(src), IpAddr::V6(dst)) = (p.src, p.dst) else { return };
-        if !self.v6.enabled || IPV6_HEADER_LEN + p.payload.len() > self.v6.mtu(self.mtu) {
+        let mtu = self.pmtu.path_mtu(p.dst, self.v6.mtu(self.mtu), now);
+        if !self.v6.enabled || IPV6_HEADER_LEN + p.payload.len() > mtu {
             return;
         }
         // ::1 never goes on the link, as a destination or a source.
@@ -536,6 +537,7 @@ impl Interface {
             mac: self.mac,
             mss: self.mss(),
             mss6: self.mss6(),
+            pmtu: Some(&self.pmtu),
             rng: &mut self.rng,
         }
     }
@@ -630,6 +632,7 @@ impl Interface {
                     }
                 }
             }
+            ICMPV6_PACKET_TOO_BIG if to_us && icmp.code == 0 => self.process_packet_too_big(now, body, sockets),
             ICMPV6_NEIGHBOR_SOLICIT if nd => self.process_ns(now, ip, body),
             ICMPV6_NEIGHBOR_ADVERT if nd => self.process_na(now, ip, body),
             ICMPV6_ROUTER_ADVERT if nd && is_link_local(ip.src) => self.process_ra(now, ip, body),

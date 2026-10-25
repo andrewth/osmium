@@ -10,6 +10,8 @@
 //! - [`DnsClient`]: a resolver for IPv4 (`A`) and IPv6 (`AAAA`) addresses
 //!   over a UDP socket, with retries and a cache.
 //! - [`ipv6`]: the IPv6 and ICMPv6 packet formats, usable on their own.
+//! - [`pmtu`]: the path MTU cache, learned from ICMP "fragmentation needed"
+//!   and ICMPv6 "packet too big"; TCP shrinks its segments and resends.
 //! - [`wire`]: the packet formats, usable on their own.
 //!
 //! The stack keeps no globals and never blocks or reads a clock: the caller
@@ -50,6 +52,7 @@ mod iface;
 pub mod igmp;
 pub mod ipopt;
 pub mod ipv6;
+pub mod pmtu;
 mod rng;
 mod socket;
 mod time;
