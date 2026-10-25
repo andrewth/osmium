@@ -6,7 +6,10 @@ mod buddy;
 pub use bitmap::BitmapAllocator;
 pub use buddy::BuddyAllocator;
 
+use core::fmt;
+
 use crate::addr::{PAGE_SIZE, PhysAddr};
+use crate::paging::TableAlloc;
 
 /// Turns physical addresses into pointers the CPU can dereference.
 ///
@@ -85,6 +88,133 @@ pub unsafe trait FrameAllocator {
     /// Allocates one frame.
     fn alloc_frame(&mut self) -> Option<PhysAddr> {
         self.alloc(0)
+    }
+
+    /// The kind recorded for the frame at `pa`, or `None` if this allocator
+    /// does not keep per-frame metadata or does not manage the frame.
+    fn kind(&self, _pa: PhysAddr) -> Option<FrameKind> {
+        None
+    }
+
+    /// Records the kind of the frame at `pa`. Returns false if this allocator
+    /// keeps no per-frame metadata or does not manage the frame.
+    fn set_kind(&mut self, _pa: PhysAddr, _kind: FrameKind) -> bool {
+        false
+    }
+
+    /// The number of references to the frame at `pa`, or `None` if this
+    /// allocator keeps no per-frame metadata or does not manage the frame.
+    fn refs(&self, _pa: PhysAddr) -> Option<u32> {
+        None
+    }
+
+    /// Takes the first reference to the allocated frame at `pa`, moving its
+    /// count from zero to one. Returns false if the frame already has one, or
+    /// this allocator keeps no per-frame metadata or does not manage it.
+    fn claim(&self, _pa: PhysAddr) -> bool {
+        false
+    }
+
+    /// Adds a reference to a frame that has one. Returns the new count, or
+    /// `None` if the frame has none (free, or never claimed).
+    fn retain(&self, _pa: PhysAddr) -> Option<u32> {
+        None
+    }
+
+    /// Drops a reference. Returns the remaining count, or `None` if the frame
+    /// had none. The frame is not freed here: the caller frees it at zero.
+    fn release(&self, _pa: PhysAddr) -> Option<u32> {
+        None
+    }
+}
+
+/// One reference to a user frame. A page table that owns its leaves holds one
+/// for each mapping, and a kernel path can hold one to keep a frame alive past
+/// its mapping. The frame is freed when the last reference is dropped.
+pub struct OwnedFrame<A: TableAlloc> {
+    pa: PhysAddr,
+    alloc: A,
+}
+
+impl<A: TableAlloc> fmt::Debug for OwnedFrame<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedFrame").field("pa", &self.pa).finish_non_exhaustive()
+    }
+}
+
+impl<A: TableAlloc> OwnedFrame<A> {
+    /// Takes the first reference to `pa`, a frame that `alloc` just returned
+    /// from `alloc_table`. If `alloc` does not count references, the frame is
+    /// freed and `None` returned.
+    pub fn claim(alloc: A, pa: PhysAddr) -> Option<Self> {
+        if alloc.claim_frame(pa) {
+            Some(Self { pa, alloc })
+        } else {
+            // SAFETY: `pa` came from `alloc_table` and was never mapped, so nothing refers to it.
+            unsafe { alloc.free_table(pa) };
+            None
+        }
+    }
+
+    /// The frame's physical address.
+    pub fn pa(&self) -> PhysAddr {
+        self.pa
+    }
+
+    /// Wraps a reference that a table already holds for `pa`.
+    pub(crate) fn adopt(alloc: A, pa: PhysAddr) -> Self {
+        Self { pa, alloc }
+    }
+
+    /// Gives up this handle without releasing its reference, returning the
+    /// frame's address. The reference now belongs to whoever mapped it.
+    pub(crate) fn leak(self) -> PhysAddr {
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so its allocator handle is moved out exactly once here.
+        drop(unsafe { core::ptr::read(&this.alloc) });
+        this.pa
+    }
+}
+
+impl<A: TableAlloc + Clone> OwnedFrame<A> {
+    /// Takes another reference to the same frame, if the allocator counts them.
+    pub fn share(&self) -> Option<Self> {
+        self.alloc.retain_frame(self.pa).then(|| Self { pa: self.pa, alloc: self.alloc.clone() })
+    }
+}
+
+impl<A: TableAlloc> Drop for OwnedFrame<A> {
+    fn drop(&mut self) {
+        // SAFETY: this handle held a reference, which it now gives up; the frame is no longer mapped
+        // through it (a table that maps it holds a reference of its own).
+        unsafe { self.alloc.release_frame(self.pa) };
+    }
+}
+
+/// What a frame is used for, as recorded in the allocator's per-frame metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameKind {
+    /// On a free list.
+    Free = 0,
+    /// Allocated, and not yet given a use.
+    Allocated = 1,
+    /// A page-table page.
+    Table = 2,
+    /// A user page, which address spaces map and reference.
+    User = 3,
+}
+
+impl FrameKind {
+    /// Decodes a stored kind byte; `None` for a byte no kind was stored as.
+    pub(crate) const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Free),
+            1 => Some(Self::Allocated),
+            2 => Some(Self::Table),
+            3 => Some(Self::User),
+            _ => None,
+        }
     }
 }
 
@@ -198,7 +328,35 @@ unsafe impl<A, M: PhysMapper> PhysMapper for LockedFrames<A, M> {
 // mapped by `mapper` per `new`'s contract.
 unsafe impl<A: FrameAllocator, M: PhysMapper> crate::paging::TableAlloc for LockedFrames<A, M> {
     fn alloc_table(&self) -> Option<PhysAddr> {
-        self.alloc.lock().alloc(0)
+        let mut alloc = self.alloc.lock();
+        let pa = alloc.alloc(0)?;
+        alloc.set_kind(pa, FrameKind::Table);
+        Some(pa)
+    }
+
+    fn claim_frame(&self, pa: PhysAddr) -> bool {
+        let mut alloc = self.alloc.lock();
+        let claimed = alloc.claim(pa);
+        if claimed {
+            alloc.set_kind(pa, FrameKind::User);
+        }
+        claimed
+    }
+
+    fn retain_frame(&self, pa: PhysAddr) -> bool {
+        self.alloc.lock().retain(pa).is_some()
+    }
+
+    unsafe fn release_frame(&self, pa: PhysAddr) {
+        let mut alloc = self.alloc.lock();
+        if alloc.release(pa) == Some(0) {
+            // SAFETY: the last reference is gone, and the frame came from `alloc`.
+            unsafe { alloc.dealloc(pa, 0) };
+        }
+    }
+
+    fn frame_refs(&self, pa: PhysAddr) -> Option<u32> {
+        self.alloc.lock().refs(pa)
     }
 
     unsafe fn free_table(&self, pa: PhysAddr) {

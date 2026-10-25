@@ -1,9 +1,16 @@
-use super::{FrameAllocator, PhysMapper};
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use super::{FrameAllocator, FrameKind, PhysMapper};
 use crate::addr::{PAGE_SIZE, PhysAddr};
 
 const NIL: u64 = u64::MAX;
 const NOT_HEAD: u8 = 0xff;
 const MAX_ZONES: usize = 16;
+/// Bytes of metadata per managed frame: the order byte at offset 0, the kind
+/// byte at `KIND`, two spare bytes, then the reference count at `REFS`.
+const SLOT: u64 = 8;
+const KIND: usize = 1;
+const REFS: usize = 4;
 
 /// Link stored in the first frame of every free block.
 #[repr(C)]
@@ -18,8 +25,8 @@ struct Zone {
     first: u64,
     /// One past the last managed frame number.
     end: u64,
-    /// One byte per managed frame: the order of the free block that starts
-    /// there, or `NOT_HEAD`.
+    /// One `SLOT` per managed frame: the order of the free block that starts
+    /// there (or `NOT_HEAD`), the frame's kind and its reference count.
     meta: PhysAddr,
 }
 
@@ -28,8 +35,9 @@ struct Zone {
 /// Blocks of `2^k` frames (`k < ORDERS`) are aligned to their size in
 /// physical address space, so order 9 blocks back 2 MiB pages and order 18
 /// blocks back 1 GiB pages. Free lists are intrusive (stored in the free
-/// frames themselves through `M`); per-frame metadata takes one byte per
-/// frame, carved from the start of each region.
+/// frames themselves through `M`); per-frame metadata takes eight bytes per
+/// frame (its order, kind and reference count), carved from the start of
+/// each region.
 pub struct BuddyAllocator<M: PhysMapper, const ORDERS: usize = 19> {
     mapper: M,
     heads: [u64; ORDERS],
@@ -69,16 +77,23 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
             return false;
         }
         let frames = end_pfn - start_pfn;
-        let meta_frames = frames.div_ceil(PAGE_SIZE as u64 + 1);
+        // `m` metadata frames hold `m * PAGE_SIZE / SLOT` slots, and `frames - m` of them are needed.
+        let meta_frames = frames.div_ceil(PAGE_SIZE as u64 / SLOT + 1);
         if frames <= meta_frames {
             return false;
         }
         let zone =
             Zone { first: start_pfn + meta_frames, end: end_pfn, meta: PhysAddr::new(start_pfn * PAGE_SIZE as u64) };
-        // SAFETY: the metadata frames are part of the caller-provided free range.
-        unsafe {
-            core::ptr::write_bytes(self.mapper.phys_to_virt(zone.meta), NOT_HEAD, (zone.end - zone.first) as usize)
-        };
+        for i in 0..zone.end - zone.first {
+            let slot = self.mapper.phys_to_virt(zone.meta + i * SLOT);
+            // SAFETY: the metadata frames are part of the caller-provided free range,
+            // and hold a slot for every managed frame.
+            unsafe {
+                slot.write(NOT_HEAD);
+                slot.add(KIND).write(FrameKind::Free as u8);
+                slot.add(REFS).cast::<u32>().write(0);
+            }
+        }
         let Some(slot) = self.zones.get_mut(self.nzones) else { return false };
         *slot = zone;
         self.nzones += 1;
@@ -101,10 +116,33 @@ impl<M: PhysMapper, const ORDERS: usize> BuddyAllocator<M, ORDERS> {
         self.zones.iter().take(self.nzones).find(|z| (z.first..z.end).contains(&pfn)).copied()
     }
 
-    /// The metadata byte of `pfn`, or `None` if the frame is not managed.
+    /// The metadata slot of `pfn`, or `None` if the frame is not managed.
+    /// Its first byte is the order byte.
     fn meta(&self, pfn: u64) -> Option<*mut u8> {
         let z = self.zone_of(pfn)?;
-        Some(self.mapper.phys_to_virt(z.meta + (pfn - z.first)))
+        Some(self.mapper.phys_to_virt(z.meta + (pfn - z.first) * SLOT))
+    }
+
+    fn kind_at(&self, pfn: u64) -> Option<FrameKind> {
+        // SAFETY: `meta` only returns pointers to the metadata of managed frames.
+        FrameKind::from_u8(unsafe { *self.meta(pfn)?.add(KIND) })
+    }
+
+    fn set_kind_at(&mut self, pfn: u64, kind: FrameKind) -> bool {
+        match self.meta(pfn) {
+            Some(m) => {
+                // SAFETY: `meta` only returns pointers to the metadata of managed frames.
+                unsafe { *m.add(KIND) = kind as u8 };
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn refs_at(&self, pfn: u64) -> Option<&AtomicU32> {
+        // SAFETY: `meta` only returns pointers to the metadata of managed frames. The
+        // count is 4-byte aligned and only ever accessed atomically.
+        self.meta(pfn).map(|m| unsafe { &*m.add(REFS).cast::<AtomicU32>() })
     }
 
     /// Reads the metadata byte of `pfn`; `NOT_HEAD` for an unmanaged frame.
@@ -191,6 +229,9 @@ unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocato
             self.push(pfn + (1 << k), k);
         }
         self.free -= 1 << order;
+        for f in pfn..pfn + (1 << order) {
+            self.set_kind_at(f, FrameKind::Allocated);
+        }
         Some(PhysAddr::new(pfn * PAGE_SIZE as u64))
     }
 
@@ -215,6 +256,10 @@ unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocato
             "free of {pa:?} with the wrong order {order}"
         );
         assert!(!self.is_free(zone, pfn, order), "double free of {pa:?} (order {order})");
+        for f in pfn..pfn + (1 << order) {
+            assert!(self.refs_at(f).is_some_and(|r| r.load(Ordering::Acquire) == 0), "free of {pa:?} while referenced");
+            self.set_kind_at(f, FrameKind::Free);
+        }
         let mut k = order;
         while (k as usize) + 1 < ORDERS {
             let buddy = pfn ^ (1 << k);
@@ -235,6 +280,43 @@ unsafe impl<M: PhysMapper, const ORDERS: usize> FrameAllocator for BuddyAllocato
     fn free_frames(&self) -> usize {
         self.free
     }
+
+    fn kind(&self, pa: PhysAddr) -> Option<FrameKind> {
+        self.kind_at(pa.0 / PAGE_SIZE as u64)
+    }
+
+    fn set_kind(&mut self, pa: PhysAddr, kind: FrameKind) -> bool {
+        self.set_kind_at(pa.0 / PAGE_SIZE as u64, kind)
+    }
+
+    fn refs(&self, pa: PhysAddr) -> Option<u32> {
+        self.refs_at(pa.0 / PAGE_SIZE as u64).map(|r| r.load(Ordering::Acquire))
+    }
+
+    fn claim(&self, pa: PhysAddr) -> bool {
+        self.refs_at(pa.0 / PAGE_SIZE as u64)
+            .is_some_and(|r| r.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok())
+    }
+
+    fn retain(&self, pa: PhysAddr) -> Option<u32> {
+        step_refs(self.refs_at(pa.0 / PAGE_SIZE as u64)?, |n| if n == 0 { None } else { n.checked_add(1) })
+    }
+
+    fn release(&self, pa: PhysAddr) -> Option<u32> {
+        step_refs(self.refs_at(pa.0 / PAGE_SIZE as u64)?, |n| n.checked_sub(1))
+    }
+}
+
+/// Moves a reference count to `next(count)` atomically, returning the new count, or `None` if `next` refuses.
+fn step_refs(refs: &AtomicU32, next: impl Fn(u32) -> Option<u32>) -> Option<u32> {
+    let mut n = refs.load(Ordering::Acquire);
+    loop {
+        let to = next(n)?;
+        match refs.compare_exchange_weak(n, to, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(to),
+            Err(now) => n = now,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,7 +332,7 @@ mod tests {
         // SAFETY: simulated RAM, owned by this test.
         assert!(unsafe { b.add_region(ram.base, ram.end()) });
         let initial = b.free_frames();
-        assert_eq!(initial, 1024 - 1, "one metadata frame");
+        assert_eq!(initial, 1024 - 2, "two metadata frames: 8 bytes of metadata per frame");
 
         let a = b.alloc(0).unwrap();
         let c = b.alloc(4).unwrap();
@@ -324,5 +406,56 @@ mod tests {
             unsafe { b.dealloc(*f, 0) };
         }
         assert_eq!(b.free_frames(), n);
+    }
+
+    #[test]
+    fn references_count_up_and_down() {
+        let ram = SimRam::new(0x8000_0000, 1 << 20);
+        let mut b: BuddyAllocator<_, 12> = BuddyAllocator::new(&ram);
+        // SAFETY: simulated RAM, owned by this test.
+        unsafe { b.add_region(ram.base, ram.end()) };
+        let a = b.alloc(0).unwrap();
+        assert_eq!(b.refs(a), Some(0), "allocated, not yet referenced");
+        assert_eq!(b.retain(a), None, "only a claimed frame can gain references");
+        assert!(b.claim(a));
+        assert!(!b.claim(a), "the first reference is taken once");
+        assert_eq!(b.retain(a), Some(2));
+        assert_eq!(b.release(a), Some(1));
+        assert_eq!(b.release(a), Some(0), "the frame stays allocated at zero");
+        assert_eq!(b.release(a), None, "nothing left to drop");
+        assert_eq!(b.refs(PhysAddr::new(0x1234_0000)), None, "not managed");
+        // SAFETY: returning our allocation, which has no references.
+        unsafe { b.dealloc(a, 0) };
+    }
+
+    #[test]
+    fn kinds_follow_allocation() {
+        let ram = SimRam::new(0x8000_0000, 1 << 20);
+        let mut b: BuddyAllocator<_, 12> = BuddyAllocator::new(&ram);
+        // SAFETY: simulated RAM, owned by this test.
+        unsafe { b.add_region(ram.base, ram.end()) };
+        let a = b.alloc(2).unwrap();
+        for i in 0..4 {
+            assert_eq!(b.kind(a + i * PAGE_SIZE as u64), Some(FrameKind::Allocated));
+        }
+        assert!(b.set_kind(a, FrameKind::Table));
+        assert_eq!(b.kind(a), Some(FrameKind::Table));
+        // SAFETY: returning our allocation, which has no references.
+        unsafe { b.dealloc(a, 2) };
+        assert_eq!(b.kind(a), Some(FrameKind::Free));
+        assert!(!b.set_kind(PhysAddr::new(0x1234_0000), FrameKind::User), "not managed");
+    }
+
+    #[test]
+    #[should_panic(expected = "while referenced")]
+    fn freeing_a_referenced_frame_is_caught() {
+        let ram = SimRam::new(0x8000_0000, 1 << 20);
+        let mut b: BuddyAllocator<_, 12> = BuddyAllocator::new(&ram);
+        // SAFETY: simulated RAM, owned by this test.
+        unsafe { b.add_region(ram.base, ram.end()) };
+        let a = b.alloc(0).unwrap();
+        assert!(b.claim(a));
+        // SAFETY: the bug under test: the frame still has a reference.
+        unsafe { b.dealloc(a, 0) };
     }
 }

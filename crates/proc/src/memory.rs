@@ -1,6 +1,7 @@
 //! User address spaces.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::offset_of;
 use core::ops::Range;
@@ -8,7 +9,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use osmium_boot::elf::Elf;
 use osmium_mm::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
-use osmium_mm::paging::{MapError, MapFlags, PageSize, PageTable, PageTableFormat, TableAlloc};
+use osmium_mm::frame::OwnedFrame;
+use osmium_mm::paging::{MapError, MapFlags, PageTable, PageTableFormat, TableAlloc};
 use osmium_mm::vma::{VmaError, VmaSpare, VmaTree};
 use osmium_sync::IrqSpinLock;
 use osmium_sync::arc::ArcTree;
@@ -132,25 +134,13 @@ pub trait UserMemory: Send + Sync {
     }
 }
 
-/// A physical frame holding one user page, freed when the last space that
-/// maps it lets go. Spaces share frames only with their forks, so the
-/// reference count is the number of spaces mapping it.
-struct Frame<A: TableAlloc> {
-    pa: PhysAddr,
-    alloc: A,
-}
-
-impl<A: TableAlloc> Drop for Frame<A> {
-    fn drop(&mut self) {
-        // SAFETY: the last owner's frame, no longer mapped by anyone.
-        unsafe { self.alloc.free_table(self.pa) };
-    }
-}
-
 /// A page of a space: where it is, the frame behind it, and whether a write
 /// must copy that frame first. It is linked into its space's [`Inner::pages`]
 /// by address, and while a page is being loaded into a new space, into a
 /// [`Fresh`] tree by frame.
+///
+/// The page does not own its frame: the space's page table holds the frame's
+/// reference, and the page only records where the frame is.
 ///
 /// The fields other than the link are only touched under the lock around
 /// the space's [`Inner`], or by whoever holds a page that no space holds yet.
@@ -158,8 +148,8 @@ struct Page<A: TableAlloc> {
     /// The user address, page-aligned. Set before the page is linked by
     /// address, and not changed while it is.
     va: UnsafeCell<u64>,
-    /// Replaced when a write copies the frame.
-    frame: UnsafeCell<Arc<Frame<A>>>,
+    /// The frame behind the page, replaced when a write copies it.
+    frame: UnsafeCell<PhysAddr>,
     /// Set when a fork made a writable page read-only: a write fault copies
     /// the frame, or makes it writable again if no one else shares it.
     cow: AtomicBool,
@@ -167,6 +157,7 @@ struct Page<A: TableAlloc> {
     /// kernel copy must not give it back.
     ro: AtomicBool,
     link: Shared<TreeLink>,
+    _alloc: core::marker::PhantomData<A>,
 }
 
 // SAFETY: see the type's documentation: all access is serialized by the
@@ -174,20 +165,15 @@ struct Page<A: TableAlloc> {
 unsafe impl<A: TableAlloc + Send + Sync> Sync for Page<A> {}
 
 impl<A: TableAlloc> Page<A> {
-    /// A page over a new frame `pa` (taking ownership of it, even if this
-    /// fails), not at any address yet.
-    fn new(pa: PhysAddr, alloc: A) -> Result<Arc<Self>, OutOfMemory> {
-        Self::sharing(try_arc(Frame { pa, alloc })?, false)
-    }
-
-    /// A page over a frame that others map too.
-    fn sharing(frame: Arc<Frame<A>>, cow: bool) -> Result<Arc<Self>, OutOfMemory> {
+    /// A page over frame `pa`, not at any address yet.
+    fn new(pa: PhysAddr, cow: bool) -> Result<Arc<Self>, OutOfMemory> {
         try_arc(Self {
             va: UnsafeCell::new(0),
-            frame: UnsafeCell::new(frame),
+            frame: UnsafeCell::new(pa),
             cow: AtomicBool::new(cow),
             ro: AtomicBool::new(false),
             link: Shared::new(TreeLink::new()),
+            _alloc: core::marker::PhantomData,
         })
     }
 
@@ -202,9 +188,9 @@ impl<A: TableAlloc> Page<A> {
         unsafe { *self.va.get() }
     }
 
-    fn frame(&self) -> &Arc<Frame<A>> {
+    fn set_frame(&self, pa: PhysAddr) {
         // SAFETY: as above.
-        unsafe { &*self.frame.get() }
+        unsafe { *self.frame.get() = pa };
     }
 
     fn is_cow(&self) -> bool {
@@ -255,7 +241,8 @@ impl<A: TableAlloc> KeyAdapter<TreeLink> for ByFrame<A> {
     type Key = PhysAddr;
 
     fn key(page: &Page<A>) -> &PhysAddr {
-        &page.frame().pa
+        // SAFETY: see the type's documentation; only used to compare.
+        unsafe { &*page.frame.get() }
     }
 }
 
@@ -309,33 +296,29 @@ impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
         let flags = t.flags | MapFlags::WRITE;
         // Only this space can add a reference to its frame (by forking, which
         // takes the lock we hold), so a count of one stays one.
-        if Arc::strong_count(page.frame()) > 1 {
+        if self.alloc.frame_refs(t.pa).unwrap_or(1) > 1 {
+            // A frame the batch can hold, reserved before anything changes: the
+            // old one is released only once the other CPUs have been shot down.
+            if deferred.reserve().is_err() {
+                return false;
+            }
             let Some(new) = self.alloc.alloc_table() else { return false };
-            // The frame is the copy's from here on; dropping it frees it.
-            let Ok(copy) = try_arc(Frame { pa: new, alloc: self.alloc.clone() }) else { return false };
-            // SAFETY: both are whole frames reached through the allocator's
-            // mapping; `new` is fresh and exclusively ours.
+            // The copy's reference is the table's from the moment it is mapped.
+            let Some(copy) = OwnedFrame::claim(self.alloc.clone(), new) else { return false };
+            // SAFETY: both are whole frames reached through the allocator's mapping; `new` is fresh
+            // and exclusively ours.
             unsafe {
                 core::ptr::copy_nonoverlapping(self.alloc.phys_to_virt(t.pa), self.alloc.phys_to_virt(new), PAGE_SIZE)
             };
-            let Ok((_, flush)) = pt.unmap(vaddr) else { return false };
+            // Swaps the mapping in one step, so a failure leaves the old one in place.
+            let Ok((old, flush)) = pt.replace_owned(vaddr, copy, flags) else { return false };
             flush.flush();
-            match pt.map(vaddr, new, PageSize::Size4K, flags) {
-                Ok(flush) => flush.flush(),
-                Err(_) => {
-                    if let Ok(flush) = pt.map(vaddr, t.pa, PageSize::Size4K, t.flags) {
-                        flush.flush();
-                    }
-                    return false;
-                }
-            }
-            // SAFETY: under the space's lock, which `inner` proves.
-            let old = unsafe { core::mem::replace(&mut *page.frame.get(), copy) };
-            // Other CPUs may still map the old frame: keep it until they
-            // have been shot down, or the last owner's free could hand it to
-            // someone else while a thread of ours can still read it.
+            page.set_frame(new);
+            // Other CPUs may still map the old frame: keep its reference until they have been shot
+            // down, or the last owner's release could hand it to someone else while a thread of ours
+            // can still read it.
             deferred.stale(va);
-            deferred.keep_frame(old);
+            deferred.keep(old);
             if flags.contains(MapFlags::EXEC) {
                 sync_icache(self.alloc.phys_to_virt(new));
             }
@@ -355,15 +338,15 @@ impl<F: PageTableFormat, A: TableAlloc + Clone + Send + Sync> AddressSpace<F, A>
     /// records it. Any page already recorded there is replaced.
     fn install_zeroed(&self, inner: &mut Inner<F, A>, page: u64, flags: MapFlags) -> Result<(), Errno> {
         let pa = self.alloc.alloc_table().ok_or(Errno::ENOMEM)?;
-        // The page owns the frame from here, and frees it if anything
-        // below fails.
-        let node = Page::new(pa, self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
+        // The frame frees itself if anything below fails, until the table takes it.
+        let frame = OwnedFrame::claim(self.alloc.clone(), pa).ok_or(Errno::ENOMEM)?;
+        let node = Page::new(pa, false).map_err(|_| Errno::ENOMEM)?;
         // SAFETY: a fresh frame, reachable through the allocator's mapping.
         unsafe { self.alloc.phys_to_virt(pa).write_bytes(0, PAGE_SIZE) };
-        match inner.pt.map(VirtAddr::new(page), pa, PageSize::Size4K, flags | MapFlags::USER) {
+        match inner.pt.map_owned(VirtAddr::new(page), frame, flags | MapFlags::USER) {
             // The space may be active here, and RISC-V may cache invalid entries.
             Ok(flush) => flush.flush(),
-            Err(e) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
+            Err((e, _frame)) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
         }
         node.place(page);
         // A page that is not mapped has no node: see `unmap`.
@@ -418,17 +401,19 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             let spare = if inner.vmas.needs_spare(va, end) { VmaSpare::new().ok() } else { None };
             inner.vmas.remove(va & !(PAGE - 1), end, spare);
         }
-        self.drop_pages(va, end);
-        saved
+        let dropped = self.drop_pages(va, end);
+        saved.and(dropped)
     }
 
     /// Unmaps and frees the pages in `va..end`, shooting down other CPUs.
-    fn drop_pages(&self, va: u64, end: u64) {
+    /// Fails, leaving the rest mapped, if there is no memory to hold the frames.
+    fn drop_pages(&self, va: u64, end: u64) -> Result<(), Errno> {
         let mut from = va & !(PAGE - 1);
         loop {
             // Dropped after the lock: shoots down the other CPUs, then frees.
             let mut deferred = Deferred::<A>::new();
             let mut more = false;
+            let mut result = Ok(());
             {
                 let mut inner = self.inner.lock();
                 let Inner { pt, pages, .. } = &mut *inner;
@@ -439,30 +424,33 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                         more = true;
                         break;
                     }
+                    if let Err(e) = deferred.reserve() {
+                        result = Err(e);
+                        break;
+                    }
                     from = at + PAGE;
-                    match pt.unmap(VirtAddr::new(at)) {
+                    match pt.unmap_owned(VirtAddr::new(at)) {
                         // Flush this CPU now, so a thread preempted into this
                         // space here cannot use the page; the others follow
                         // once the lock is released.
-                        Ok((_, flush)) => {
+                        Ok((frame, flush)) => {
                             flush.flush();
                             deferred.stale(at);
+                            // The reference goes with the shootdown.
+                            deferred.keep(frame);
                         }
                         // Mapped, yet it cannot be unmapped: leave it, and its frame.
                         Err(_) if pt.translate(VirtAddr::new(at)).is_some() => continue,
                         // Not mapped: nothing refers to the frame.
                         Err(_) => {}
                     }
-                    // The frame goes with the page, unless a relative still
-                    // maps it, and not before the shootdown.
-                    if let Some(page) = pages.take_key(&at) {
-                        deferred.keep_page(page);
-                    }
+                    drop(pages.take_key(&at));
                 }
             }
             drop(deferred);
+            result?;
             if !more {
-                break;
+                return Ok(());
             }
         }
     }
@@ -479,7 +467,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         kernel: &PageTable<F, B>,
         shared: Range<usize>,
     ) -> Result<Self, MapError> {
-        let mut pt = PageTable::new(alloc.clone())?;
+        let mut pt = PageTable::new_owned(alloc.clone())?;
         // SAFETY: forwarded contract.
         unsafe { pt.share_root_entries(kernel, shared.clone()) };
         Ok(Self {
@@ -635,11 +623,11 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         let mut fresh: Fresh<A> = ArcTree::new();
         let loaded = elf.load_into_at(pt, MapFlags::USER, bias, || {
             let pa = self.alloc.alloc_table()?;
-            // The page owns the frame from here, and frees it if the loader
-            // then fails to map it.
-            let node = Page::new(pa, self.alloc.clone()).ok()?;
+            // The frame frees itself if the loader then fails to map it.
+            let frame = OwnedFrame::claim(self.alloc.clone(), pa)?;
+            let node = Page::new(pa, false).ok()?;
             assert!(fresh.insert(node).is_ok(), "frames are distinct");
-            Some(pa)
+            Some(frame)
         });
         // Record where each new frame went, so `unmap` and `fork` find it,
         // even after a failure part-way.
@@ -657,8 +645,8 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                 }
             }
         }
-        // What is left in `fresh` was allocated for a page the loader then
-        // failed to map: dropping it frees the frame.
+        // What is left in `fresh` is for frames the loader failed to map,
+        // which have been released already: the nodes only record addresses.
         drop(fresh);
         loaded.map_err(|e| if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::ENOEXEC })?;
         // Every non-empty segment was checked to end inside the user half above.
@@ -674,7 +662,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         let Inner { pt: parent_pt, pages: parent_pages, maps: parent_maps, vmas: parent_vmas } = &mut *guard;
         let maps = parent_maps.try_clone()?;
         let vmas = parent_vmas.try_clone().map_err(|_| Errno::ENOMEM)?;
-        let mut pt = PageTable::new(self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
+        let mut pt = PageTable::new_owned(self.alloc.clone()).map_err(|_| Errno::ENOMEM)?;
         // SAFETY: our shared root entries are the kernel's, which outlive
         // this space (see `new`) and so the copy, made under the same terms.
         unsafe { pt.share_root_entries(parent_pt, self.shared.clone()) };
@@ -709,12 +697,14 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                     page.set_cow(true);
                 }
                 // On failure, dropping `child` releases the pages shared so far.
-                let node = Page::sharing(page.frame().clone(), cow).map_err(|_| Errno::ENOMEM)?;
+                let node = Page::new(t.pa, cow).map_err(|_| Errno::ENOMEM)?;
                 node.set_ro(page.is_ro());
-                match copy.pt.map(va, t.pa, PageSize::Size4K, flags) {
+                // The copy maps the same frame, through a reference of its own.
+                let frame = parent_pt.share_owned(va).ok_or(Errno::ENOMEM)?;
+                match copy.pt.map_owned(va, frame, flags) {
                     // The copy is not active anywhere yet.
                     Ok(flush) => flush.ignore(),
-                    Err(e) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
+                    Err((e, _)) => return Err(if e == MapError::OutOfMemory { Errno::ENOMEM } else { Errno::EINVAL }),
                 }
                 node.place(page.va());
                 assert!(copy.pages.insert(node).is_ok(), "a new space has no pages yet");
@@ -817,19 +807,19 @@ const BATCH: usize = 32;
 struct Deferred<A: TableAlloc> {
     /// The lowest and highest pages whose mappings changed.
     stale: Option<(u64, u64)>,
-    pages: [Option<Arc<Page<A>>>; BATCH],
-    used: usize,
-    frame: Option<Arc<Frame<A>>>,
+    /// References to frames that are no longer mapped here, released with this.
+    frames: Vec<OwnedFrame<A>>,
 }
 
 impl<A: TableAlloc> Deferred<A> {
     fn new() -> Self {
-        Self { stale: None, pages: [const { None }; BATCH], used: 0, frame: None }
+        Self { stale: None, frames: Vec::new() }
     }
 
-    /// Whether another page would not fit.
+    /// Whether a batch is full: drop it before unmapping more, so that its
+    /// shootdown and frees stay bounded.
     fn full(&self) -> bool {
-        self.used == BATCH
+        self.frames.len() >= BATCH
     }
 
     /// Notes that the mapping of the page at `va` changed.
@@ -840,17 +830,16 @@ impl<A: TableAlloc> Deferred<A> {
         });
     }
 
-    /// Holds `page` (a page that was unmapped) until the shootdown is done.
-    fn keep_page(&mut self, page: Arc<Page<A>>) {
-        if let Some(slot) = self.pages.get_mut(self.used) {
-            *slot = Some(page);
-            self.used += 1;
-        }
+    /// Makes room for one more frame, so that [`Deferred::keep`] does not
+    /// allocate. Fails only when out of memory.
+    fn reserve(&mut self) -> Result<(), Errno> {
+        self.frames.try_reserve(1).map_err(|_| Errno::ENOMEM)
     }
 
-    /// Holds a frame that is no longer mapped here until the shootdown is done.
-    fn keep_frame(&mut self, frame: Arc<Frame<A>>) {
-        self.frame = Some(frame);
+    /// Holds a reference to a frame that is no longer mapped here until the
+    /// shootdown is done. Call [`Deferred::reserve`] first.
+    fn keep(&mut self, frame: OwnedFrame<A>) {
+        self.frames.push(frame);
     }
 }
 

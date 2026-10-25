@@ -346,3 +346,66 @@ fn map_range_rejects_wrap() {
     assert_eq!(pt.map_range(va(0x1000), pa(top), 0x2000, MapFlags::RW), Err(MapError::InvalidAddress));
     assert!(pt.translate(va(0)).is_none());
 }
+
+#[test]
+fn owned_leaves_are_released_with_their_table() {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let before = frames.lock().free_frames();
+    {
+        let mut pt: PageTable<Sv39, _> = PageTable::new_owned(&frames).unwrap();
+        let frame = OwnedFrame::claim(&frames, frames.alloc_table().unwrap()).unwrap();
+        let leaf = frame.pa();
+        pt.map_owned(va(0x40_0000), frame, MapFlags::RW).unwrap().ignore();
+        assert_eq!(frames.frame_refs(leaf), Some(1), "the table holds the only reference");
+        let refused = pt.map(va(0x40_1000), pa(0x1000), PageSize::Size4K, MapFlags::RW);
+        assert_eq!(refused.err(), Some(MapError::OwnedLeaves));
+        assert_eq!(pt.unmap(va(0x40_0000)).map(|_| ()), Err(UnmapError::OwnedLeaves));
+
+        let shared = pt.share_owned(va(0x40_0000)).unwrap();
+        assert_eq!(frames.frame_refs(leaf), Some(2));
+        drop(shared);
+        assert_eq!(frames.frame_refs(leaf), Some(1));
+        // Dropping the table releases its leaf: the frame goes back to the allocator.
+    }
+    assert_eq!(frames.lock().free_frames(), before);
+}
+
+#[test]
+fn owned_maps_hand_back_what_they_refuse() {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let mut pt: PageTable<Sv39, _> = PageTable::new_owned(&frames).unwrap();
+    let first = OwnedFrame::claim(&frames, frames.alloc_table().unwrap()).unwrap();
+    let second = OwnedFrame::claim(&frames, frames.alloc_table().unwrap()).unwrap();
+    let second_pa = second.pa();
+    pt.map_owned(va(0x40_0000), first, MapFlags::RW).unwrap().ignore();
+    let (err, back) = pt.map_owned(va(0x40_0000), second, MapFlags::RW).unwrap_err();
+    assert_eq!(err, MapError::AlreadyMapped);
+    assert_eq!(back.pa(), second_pa, "the refused frame comes back intact");
+    assert_eq!(frames.frame_refs(second_pa), Some(1));
+
+    // Replacing swaps the leaf and hands back the old reference.
+    let fresh = OwnedFrame::claim(&frames, frames.alloc_table().unwrap()).unwrap();
+    let fresh_pa = fresh.pa();
+    let (old, flush) = pt.replace_owned(va(0x40_0000), fresh, MapFlags::RW).unwrap();
+    flush.ignore();
+    assert_eq!(pt.translate(va(0x40_0000)).unwrap().pa, fresh_pa);
+    assert_ne!(old.pa(), fresh_pa, "the old frame is returned");
+    drop(old);
+    let (unmapped, flush) = pt.unmap_owned(va(0x40_0000)).unwrap();
+    flush.ignore();
+    assert_eq!(unmapped.pa(), fresh_pa);
+    assert!(pt.translate(va(0x40_0000)).is_none());
+}
+
+#[test]
+fn unowned_tables_refuse_owned_operations() {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let mut pt: PageTable<Sv39, _> = PageTable::new(&frames).unwrap();
+    let frame = OwnedFrame::claim(&frames, frames.alloc_table().unwrap()).unwrap();
+    let (err, _frame) = pt.map_owned(va(0x40_0000), frame, MapFlags::RW).unwrap_err();
+    assert_eq!(err, MapError::UnownedLeaves);
+    assert_eq!(pt.unmap_owned(va(0x40_0000)).map(|_| ()), Err(UnmapError::UnownedLeaves));
+}

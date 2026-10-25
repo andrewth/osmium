@@ -16,6 +16,8 @@ use super::*;
 #[derive(Default)]
 struct HeapFrames {
     live: StdMutex<usize>,
+    /// Reference counts of the user frames claimed so far, by address.
+    refs: StdMutex<std::collections::BTreeMap<u64, u32>>,
 }
 
 const PAGE_LAYOUT: Layout = match Layout::from_size_align(4096, 4096) {
@@ -45,6 +47,34 @@ unsafe impl TableAlloc for HeapFrames {
         *self.live.lock().unwrap() -= 1;
         // SAFETY: allocated by `alloc_table` with the same layout.
         unsafe { dealloc(pa.0 as *mut u8, PAGE_LAYOUT) }
+    }
+    fn claim_frame(&self, pa: PhysAddr) -> bool {
+        let mut refs = self.refs.lock().unwrap();
+        refs.insert(pa.0, 1).is_none()
+    }
+    fn retain_frame(&self, pa: PhysAddr) -> bool {
+        match self.refs.lock().unwrap().get_mut(&pa.0) {
+            Some(n) => {
+                *n += 1;
+                true
+            }
+            None => false,
+        }
+    }
+    unsafe fn release_frame(&self, pa: PhysAddr) {
+        let last = {
+            let mut refs = self.refs.lock().unwrap();
+            let n = refs.get_mut(&pa.0).expect("a released frame was claimed");
+            *n -= 1;
+            *n == 0 && refs.remove(&pa.0).is_some()
+        };
+        if last {
+            // SAFETY: the last reference is gone, and the frame came from `alloc_table`.
+            unsafe { self.free_table(pa) };
+        }
+    }
+    fn frame_refs(&self, pa: PhysAddr) -> Option<u32> {
+        self.refs.lock().unwrap().get(&pa.0).copied()
     }
 }
 

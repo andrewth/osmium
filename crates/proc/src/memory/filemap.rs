@@ -36,9 +36,10 @@ use alloc::vec::Vec;
 
 use osmium_fs::{Errno, File};
 use osmium_mm::addr::{PAGE_SIZE, VirtAddr};
-use osmium_mm::paging::{MapFlags, PageSize, PageTableFormat, TableAlloc};
+use osmium_mm::frame::OwnedFrame;
+use osmium_mm::paging::{MapFlags, PageTableFormat, TableAlloc};
 
-use super::{AddressSpace, Deferred, Frame, Inner, PAGE, Page, sync_icache};
+use super::{AddressSpace, Deferred, Inner, PAGE, Page, sync_icache};
 
 /// What `mmap` asks of the space for a file.
 #[derive(Clone)]
@@ -240,7 +241,8 @@ struct Job<A: TableAlloc> {
     /// Where in the file.
     off: u64,
     va: u64,
-    frame: Arc<Frame<A>>,
+    /// A reference to the frame, so the write does not race with its unmapping.
+    frame: OwnedFrame<A>,
 }
 
 impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + Sync + 'static> AddressSpace<F, A> {
@@ -326,8 +328,9 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         };
 
         let Some(pa) = self.alloc.alloc_table() else { return false };
-        // The page owns the frame from here, and frees it on every path out.
-        let Ok(node) = Page::new(pa, self.alloc.clone()) else { return false };
+        // The frame frees itself on every path out, until the table takes it.
+        let Some(frame) = OwnedFrame::claim(self.alloc.clone(), pa) else { return false };
+        let Ok(node) = Page::new(pa, false) else { return false };
         // SAFETY: a fresh whole frame, reachable through the allocator's
         // mapping, that nothing else refers to yet.
         let buf = unsafe { core::slice::from_raw_parts_mut(self.alloc.phys_to_virt(pa), PAGE_SIZE) };
@@ -372,7 +375,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         if !flags.contains(MapFlags::WRITE) && !flags.contains(MapFlags::READ) && !flags.contains(MapFlags::EXEC) {
             return false;
         }
-        match pt.map(vaddr, pa, PageSize::Size4K, flags | MapFlags::USER) {
+        match pt.map_owned(vaddr, frame, flags | MapFlags::USER) {
             Ok(flush) => flush.flush(),
             Err(_) => return false,
         }
@@ -454,7 +457,10 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                         p.set_ro(!prot.contains(MapFlags::WRITE));
                         // A frame a fork relative still maps must be copied
                         // before it is written, whatever it was before.
-                        if prot.contains(MapFlags::WRITE) && !shared && Arc::strong_count(p.frame()) > 1 {
+                        let shares = pt
+                            .translate(VirtAddr::new(at))
+                            .is_some_and(|t| pt.allocator().frame_refs(t.pa).unwrap_or(1) > 1);
+                        if prot.contains(MapFlags::WRITE) && !shared && shares {
                             p.set_cow(true);
                         }
                         cow = p.is_cow();
@@ -473,7 +479,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         }
         if none {
             // Every page left is shared and was saved above; they reload on a later grant.
-            self.drop_pages(va, end);
+            self.drop_pages(va, end)?;
         }
         Ok(())
     }
@@ -519,8 +525,13 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             }
             jobs.try_reserve_exact(count).map_err(|_| Errno::ENOMEM)?;
             for &d in maps.dirty_in(from, to) {
-                let (Some(v), Some(page)) = (maps.find(d), pages.find(&d)) else { continue };
+                let Some(v) = maps.find(d) else { continue };
+                if pages.find(&d).is_none() {
+                    continue;
+                }
                 let Some(file) = v.file.clone() else { continue };
+                // Taken before anything changes: a failure leaves the rest dirty for the next sync.
+                let Some(frame) = pt.share_owned(VirtAddr::new(d)) else { return Err(Errno::ENOMEM) };
                 // Clean from here on: a store after this faults and marks it again.
                 if let Some(t) = pt.translate(VirtAddr::new(d))
                     && let Ok(flush) = pt.protect(VirtAddr::new(d), t.flags.difference(MapFlags::WRITE))
@@ -528,7 +539,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
                     flush.flush();
                     deferred.stale(d);
                 }
-                jobs.push(Job { file, off: v.off.saturating_add(d - v.start), va: d, frame: page.frame().clone() });
+                jobs.push(Job { file, off: v.off.saturating_add(d - v.start), va: d, frame });
             }
             maps.clear_dirty(from, to);
         }
@@ -555,7 +566,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         // SAFETY: a whole frame, kept alive by `job`, reachable through the
         // allocator's mapping. A user store may race with the read, as it may
         // with any write-back; the bytes are plain data.
-        let data = unsafe { core::slice::from_raw_parts(self.alloc.phys_to_virt(job.frame.pa), PAGE_SIZE) };
+        let data = unsafe { core::slice::from_raw_parts(self.alloc.phys_to_virt(job.frame.pa()), PAGE_SIZE) };
         let mut done = 0;
         while done < n {
             let Some(src) = data.get(done..n) else { break };
