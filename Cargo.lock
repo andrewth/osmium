@@ -18,6 +18,7 @@ dependencies = [
  "osmium-iscsi",
  "osmium-mm",
  "osmium-net",
+ "osmium-netdev",
  "osmium-proc",
  "osmium-sched",
  "osmium-sync",
@@ -118,6 +119,15 @@ dependencies = [
 name = "osmium-net"
 version = "0.1.0"
 dependencies = [
+ "osmium-hal",
+]
+
+[[package]]
+name = "osmium-netdev"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-drivers",
  "osmium-hal",
 ]
 

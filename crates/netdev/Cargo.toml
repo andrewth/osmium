@@ -1,0 +1,18 @@
+[package]
+name = "osmium-netdev"
+description = "Osmium: network device drivers (virtio-net, Mellanox mlx4 Ethernet, InfiniBand and IPoIB, USB CDC-ECM and CDC-NCM)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-arch.workspace = true
+osmium-drivers.workspace = true
+osmium-hal.workspace = true
+
+[dev-dependencies]
+osmium-drivers = { workspace = true, features = ["testing"] }

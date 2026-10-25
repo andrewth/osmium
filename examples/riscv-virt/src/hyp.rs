@@ -337,7 +337,7 @@ extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     use osmium::drivers::virtio::Transport;
     use osmium::drivers::virtio::blk::VirtioBlk;
     use osmium::drivers::virtio::mmio::MmioTransport;
-    use osmium::drivers::virtio::net::VirtioNet;
+    use osmium::netdev::virtio_net::VirtioNet;
     use osmium::hal::block::BlockDevice;
     use osmium::hal::irq::InterruptController;
     use osmium::hal::mmio::IoMem;

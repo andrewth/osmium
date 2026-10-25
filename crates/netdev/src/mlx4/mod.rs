@@ -1115,7 +1115,7 @@ mod tests {
 
     use super::fake::{self, FakeHca, PortKind};
     use super::*;
-    use crate::virtio::testing::HostDma;
+    use osmium_drivers::virtio::testing::HostDma;
 
     const ETH: [Option<PortKind>; 2] = [Some(PortKind::Ethernet), Some(PortKind::Ethernet)];
 

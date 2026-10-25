@@ -16,6 +16,7 @@ osmium-mm = { path = "crates/mm", version = "0.1.0" }
 osmium-hal = { path = "crates/hal", version = "0.1.0" }
 osmium-drivers = { path = "crates/drivers", version = "0.1.0" }
 osmium-usb = { path = "crates/usb", version = "0.1.0" }
+osmium-netdev = { path = "crates/netdev", version = "0.1.0" }
 osmium-sched = { path = "crates/sched", version = "0.1.0" }
 osmium-boot = { path = "crates/boot", version = "0.1.0" }
 osmium-virt = { path = "crates/virt", version = "0.1.0" }

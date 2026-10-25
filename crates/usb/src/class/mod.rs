@@ -5,9 +5,7 @@
 //! `&mut` borrow for one driver at a time, or `&SpinLock<H>` to share a
 //! controller among several.
 
-pub mod ecm;
 pub mod hid;
 pub mod hub;
 pub mod isoch;
-pub mod ncm;
 pub mod storage;

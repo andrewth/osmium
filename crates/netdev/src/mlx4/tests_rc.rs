@@ -8,7 +8,7 @@ use osmium_hal::net::NetError;
 use super::fake::FakeHca;
 use super::tests_ib::{IB, QKEY, bring_up};
 use super::*;
-use crate::virtio::testing::HostDma;
+use osmium_drivers::virtio::testing::HostDma;
 
 type Port<'h, 'd> = IbPort<'h, 'd, HostDma>;
 

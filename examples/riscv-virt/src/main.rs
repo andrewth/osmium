@@ -31,7 +31,7 @@ use osmium::drivers::plic::Plic;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
 use osmium::drivers::virtio::blk::VirtioBlk;
 use osmium::drivers::virtio::mmio::MmioTransport;
-use osmium::drivers::virtio::net::VirtioNet;
+use osmium::netdev::virtio_net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
 use osmium::usb::xhci::Xhci;
 use osmium::hal::block::BlockDevice;

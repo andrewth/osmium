@@ -12,8 +12,6 @@
 //! | [`clint::Clint`] | RISC-V CLINT (M-mode timer, software IRQs) | firmware timers |
 //! | [`ioapic::IoApic`] | x86 I/O APIC | GSI routing |
 //! | [`ramdisk::RamDisk`] | Memory-backed disk | `BlockDevice` |
-//! | [`virtio::net::VirtioNet`] | virtio network card (MMIO, legacy and 1.x) | `NetDevice` |
-//! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet, InfiniBand and IPoIB (PCI, polled or MSI-X) | `NetDevice` per Ethernet port or IPoIB interface; UD datagrams and reliable connections per InfiniBand port |
 //! | [`nvme::Nvme`] | NVM Express SSD (PCI, polled) | `BlockDevice` |
 //! | [`virtio::gpu::VirtioGpu`] | virtio GPU, 2D (MMIO, or PCI as `virtio-gpu-pci` and `virtio-vga`) | `Display` |
 //! | [`display::bochs::BochsVbe`] | Bochs DISPI: QEMU std VGA, `bochs-display`, `virtio-vga` in VGA mode | `Display` |
@@ -29,7 +27,7 @@
 //! against ordinary memory.
 #![no_std]
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 extern crate std;
 
 pub mod ahci;
@@ -40,7 +38,6 @@ pub mod gicv2;
 pub mod ioapic;
 pub mod iommu;
 pub mod lapic;
-pub mod mlx4;
 pub mod nvme;
 pub mod pit;
 pub mod pl011;

@@ -10,7 +10,7 @@ use super::ipoib::broadcast_gid;
 use super::mad::{self, MAD_LEN, QP1_QKEY};
 use super::tests_ib::{IB, bring_up, grh_bytes};
 use super::*;
-use crate::virtio::testing::HostDma;
+use osmium_drivers::virtio::testing::HostDma;
 
 type Ip<'h, 'd> = IpoibPort<'h, 'd, HostDma>;
 

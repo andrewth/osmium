@@ -3,7 +3,7 @@
 //! A virtio driver is split the way the specification is: a [`Transport`]
 //! ([`mmio::MmioTransport`] or [`pci::PciTransport`]) reaches the device's registers, a
 //! [`queue::VirtQueue`] shares buffers with it through DMA memory, and the
-//! device driver ([`net::VirtioNet`]) speaks the device type's protocol over
+//! device driver (such as `osmium_netdev::virtio_net::VirtioNet`) speaks the device type's protocol over
 //! both.
 //!
 //! Both the legacy (0.9.5) and modern (1.x) interfaces are supported, since
@@ -17,7 +17,6 @@ use osmium_mm::PhysAddr;
 pub mod blk;
 pub mod gpu;
 pub mod mmio;
-pub mod net;
 pub mod pci;
 pub mod queue;
 
@@ -183,10 +182,12 @@ pub fn driver_ok<T: Transport + ?Sized>(t: &T) {
     t.set_status(t.status() | status::DRIVER_OK);
 }
 
-#[cfg(test)]
-pub(crate) mod testing {
+#[cfg(any(test, feature = "testing"))]
+#[allow(missing_docs, dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+pub mod testing {
     //! A host-memory DMA allocator and a scriptable transport, so tests can
-    //! play the device's side of a virtqueue.
+    //! play the device's side of a virtqueue. Other crates get it through the
+    //! `testing` feature.
 
     use core::cell::{Cell, RefCell};
     use core::ptr::NonNull;
