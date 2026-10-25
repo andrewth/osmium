@@ -2563,7 +2563,7 @@ mod tests {
     }
 
     /// Configures `eps` on slot 1 at SuperSpeed, completing the command.
-    fn configure_ss(hc: &mut Xhci<'_, crate::virtio::testing::HostDma>, eps: &[SsEndpoint]) -> Result<(), UsbError> {
+    fn configure_ss(hc: &mut Xhci<'_, crate::testing::HostDma>, eps: &[SsEndpoint]) -> Result<(), UsbError> {
         hc.slot(DeviceId(1)).unwrap().speed = Speed::Super;
         let configure = hc.commands.enqueue_addr();
         hc.events.inject(command_completion(configure, completion::SUCCESS, 1));
@@ -2572,7 +2572,7 @@ mod tests {
 
     #[test]
     fn superspeed_burst_sizes_come_from_the_companion() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         let iso = EndpointDescriptor { address: 0x84, attributes: 1, max_packet_size_raw: 1024, interval: 1 };
@@ -2602,7 +2602,7 @@ mod tests {
 
     #[test]
     fn stream_endpoint_context_and_arrays() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         // The device supports 2^5 streams; 6 asked for gives an 8-context array.
@@ -2654,7 +2654,7 @@ mod tests {
 
     #[test]
     fn streams_are_refused_where_they_cannot_work() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         // The device advertises none, or the endpoint is not bulk.
@@ -2684,23 +2684,20 @@ mod tests {
     }
 
     /// Slot 1 at SuperSpeed with streams 1 to 4 on bulk IN 2 (DCI 5) and bulk OUT 3 (DCI 6).
-    fn stream_setup<'dma>(
-        dma: &'dma crate::virtio::testing::HostDma,
-        regs: &mut [u32],
-    ) -> Xhci<'dma, crate::virtio::testing::HostDma> {
+    fn stream_setup<'dma>(dma: &'dma crate::testing::HostDma, regs: &mut [u32]) -> Xhci<'dma, crate::testing::HostDma> {
         let mut hc = fake(dma, regs);
         configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 4), ss_ep(bulk(0x03), 0, 5, 4)]).unwrap();
         hc
     }
 
-    fn stream_trb(hc: &Xhci<'_, crate::virtio::testing::HostDma>, dci: usize, stream: usize, i: usize) -> (Trb, u64) {
+    fn stream_trb(hc: &Xhci<'_, crate::testing::HostDma>, dci: usize, stream: usize, i: usize) -> (Trb, u64) {
         let ring = hc.streams.iter().flatten().find(|s| s.dci == dci).unwrap().rings[stream - 1].as_ref().unwrap();
         (ring.get(i), ring.base().as_u64() + 16 * i as u64)
     }
 
     #[test]
     fn stream_transfers_use_their_own_rings_and_doorbells() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = stream_setup(&dma, &mut regs);
         let dev = DeviceId(1);
@@ -2762,7 +2759,7 @@ mod tests {
 
     #[test]
     fn failed_stream_transfer_is_skipped_and_other_streams_restart() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = stream_setup(&dma, &mut regs);
         let dev = DeviceId(1);
@@ -2792,7 +2789,7 @@ mod tests {
 
     #[test]
     fn stream_error_with_unanswered_recovery_kills_the_slot() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = stream_setup(&dma, &mut regs);
         let dev = DeviceId(1);
@@ -2808,7 +2805,7 @@ mod tests {
 
     #[test]
     fn detaching_frees_the_streams() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = stream_setup(&dma, &mut regs);
         let live = dma.live.get();
