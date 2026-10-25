@@ -25,8 +25,9 @@ use core::ptr::NonNull;
 use osmium::arch::trap::{self, Access, Trap, TrapFrame};
 use osmium::arch::x86_64 as x86;
 use osmium::arch::{MAX_CPUS, cpu, irq};
-use osmium::boot::acpi::{Acpi, Dmar, EcamWindow, Ivrs, Madt, Mcfg};
+use osmium::boot::acpi::{Acpi, Dmar, EcamWindow, HpetTable, Ivrs, Madt, Mcfg};
 use osmium::boot::pvh::StartInfo;
+use osmium::sysdrv::hpet::{self, Hpet};
 use osmium::sysdrv::lapic::{self, LocalApic};
 use osmium::sysdrv::pit::{self, Pit};
 use osmium::sysdrv::uart16550::{Pio, Uart16550};
@@ -34,7 +35,7 @@ use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::display::{Display, FramebufferInfo};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
-use osmium::hal::timer::TickRate;
+use osmium::hal::timer::{Clock, TickRate};
 use osmium::mm::frame::order_for;
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::PageSize;
@@ -120,6 +121,8 @@ const SHOOTDOWN_VECTOR: u8 = 34;
 const COM1_VECTOR: u8 = 40;
 /// COM1's ISA IRQ.
 const COM1_IRQ: u8 = 4;
+/// Vector for the HPET comparator demo, routed through the I/O APIC.
+const HPET_VECTOR: u8 = 41;
 const DOUBLE_FAULT: u8 = 8;
 /// IST slot for the double-fault handler's stack.
 const DOUBLE_FAULT_IST: u8 = 1;
@@ -277,6 +280,12 @@ static RX_READY: osmium::sched::WaitQueue = osmium::sched::WaitQueue::new();
 /// First I/O APIC (address, first GSI) and COM1's line, from the MADT.
 static IOAPIC_INFO: Once<(u64, u32, u32, osmium::sysdrv::ioapic::LineMode)> = Once::new();
 
+/// The HPET's registers (from the ACPI `HPET` table), once found.
+static HPET_BASE: Once<u64> = Once::new();
+static HPET: Once<Hpet> = Once::new();
+/// Comparator interrupts taken by the HPET demo.
+static HPET_FIRED: AtomicU32 = AtomicU32::new(0);
+
 static UART: Once<SerialConsole<Uart16550<Pio>>> = Once::new();
 static LAPIC: Once<LocalApic> = Once::new();
 static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
@@ -368,6 +377,9 @@ extern "C" fn kmain(start_info: usize) -> ! {
             .and_then(|a| a.find(b"IVRS"))
             .and_then(Ivrs::parse)
             .and_then(|i| i.units().find(|u| u.segment == 0));
+        if let Some(h) = acpi.as_ref().and_then(|a| a.find(b"HPET")).and_then(HpetTable::parse) {
+            HPET_BASE.call_once(|| h.base);
+        }
         let madt = acpi.and_then(|a| a.find(b"APIC")).and_then(Madt::parse);
         if let Some(m) = &madt
             && let Some(io) = m.io_apics().next()
@@ -448,6 +460,10 @@ extern "C" fn kmain(start_info: usize) -> ! {
     if let Some(&(io, ..)) = IOAPIC_INFO.get() {
         pt.map_range(va(io), pa(io), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE)).expect("map_range failed");
     }
+    if let Some(&base) = HPET_BASE.get() {
+        pt.map_range(va(base), pa(base), PAGE_SIZE as u64, k(MapFlags::RW | MapFlags::DEVICE))
+            .expect("map_range failed");
+    }
     // Writable so the boot CPU can install the AP trampoline there.
     pt.map_range(va(TRAMPOLINE), pa(TRAMPOLINE), PAGE_SIZE as u64, k(MapFlags::RW)).expect("map_range failed");
     // SAFETY: the new table maps the running code, its stack, the heap and the APIC.
@@ -516,6 +532,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     apic.start_timer(TIMER_VECTOR, u32::MAX, false);
     let apic_hz = pit.calibrate(10_000_000, || u32::MAX as u64 - apic.timer_remaining() as u64);
     apic.stop_timer();
+    hpet_init(&pit);
     println!(
         "[timer] TSC {} MHz, APIC timer {} MHz (divided by 16), measured with the PIT",
         tsc_hz / 1_000_000,
@@ -579,6 +596,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     demos::user::boot_vfs();
     user_demo();
     serial_demo();
+    hpet_demo();
     usb::demo(ecam);
     msi::demo(ecam);
     iommu::demo(ecam, iommus);
@@ -752,6 +770,84 @@ fn overflow_demo() {
     });
     t.join();
     println!("[guard] the other tasks keep running: {}", alloc::format!("{} free frames", FRAMES.lock().free_frames()));
+}
+
+/// Starts the HPET found in the ACPI tables and checks its counter against the PIT.
+fn hpet_init(pit: &Pit<pit::Pio>) {
+    let Some(&base) = HPET_BASE.get() else {
+        println!("[hpet]  no HPET table; skipping");
+        return;
+    };
+    // SAFETY: the ACPI table says the register block lives here; mapped uncached above.
+    let io = unsafe { IoMem::new(base as *mut u8, hpet::REGISTER_BYTES) };
+    let Ok(h) = Hpet::new(io) else {
+        println!("[hpet]  the register block at {base:#x} is not an HPET");
+        return;
+    };
+    h.enable();
+    let h = HPET.call_once(|| h);
+    let t0 = h.now_ns();
+    pit.wait_ns(10_000_000);
+    let dt = h.now_ns().saturating_sub(t0);
+    println!(
+        "[hpet]  {} comparators, {} bit counter at {} MHz; legacy replacement {}",
+        h.timer_count(),
+        if h.counter_is_64bit() { 64 } else { 32 },
+        h.frequency() / 1_000_000,
+        if h.has_legacy_replacement() { "available" } else { "absent" }
+    );
+    // The PIT waited 10 ms of its own: the HPET should have seen about the same.
+    if (8_000_000..=50_000_000).contains(&dt) {
+        println!("[hpet]  main counter agrees with a 10 ms PIT wait");
+    } else {
+        println!("[hpet]  main counter disagrees with the PIT: {dt} ns for 10 ms");
+    }
+}
+
+/// Wires an HPET comparator through the I/O APIC to this CPU and takes a one-shot and a periodic
+/// interrupt from it.
+fn hpet_demo() {
+    let (Some(h), Some(&(io_addr, gsi_base, ..))) = (HPET.get(), IOAPIC_INFO.get()) else {
+        return;
+    };
+    // SAFETY: the MADT says the I/O APIC lives here; mapped uncached above.
+    let ioapic = osmium::sysdrv::ioapic::IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
+    // The highest I/O APIC input some comparator can drive, avoiding the ISA lines.
+    let pick = (0..h.timer_count())
+        .filter_map(|i| Some((i, h.caps(i).ok().filter(|c| c.periodic)?.routes)))
+        .flat_map(|(i, routes)| (16..32u8).rev().map(move |gsi| (i, gsi, routes)))
+        .find(|&(_, gsi, routes)| routes & (1 << gsi) != 0 && ioapic.handles(gsi as u32));
+    let Some((index, gsi, _)) = pick else {
+        println!("[hpet]  no comparator can drive an I/O APIC input; skipping");
+        return;
+    };
+    h.route(index, gsi, false).expect("route was in the capability mask");
+    let mode = osmium::sysdrv::ioapic::LineMode { active_low: false, level: false };
+    ioapic.route(gsi as u32, HPET_VECTOR, LAPIC.get().expect("LAPIC initialised").id() as u8, mode);
+    println!("[hpet]  comparator {index} -> I/O APIC input {gsi} -> vector {HPET_VECTOR}");
+
+    let wait = |what: &str, want: u32| {
+        let limit = h.now_ns() + 200_000_000;
+        while HPET_FIRED.load(Ordering::SeqCst) < want && h.now_ns() < limit {
+            core::hint::spin_loop();
+        }
+        HPET_FIRED.load(Ordering::SeqCst) >= want || {
+            println!("[hpet]  {what}: no interrupt within 200 ms");
+            false
+        }
+    };
+    let timer = h.timer(index).expect("index was valid");
+    osmium::hal::timer::OneShotTimer::set_deadline(&timer, h.now_ns() + 2_000_000);
+    if wait("one-shot", 1) {
+        println!("[hpet]  one-shot comparator interrupt taken");
+    }
+    osmium::hal::timer::OneShotTimer::cancel(&timer);
+    let base = HPET_FIRED.load(Ordering::SeqCst);
+    if h.start_periodic(index, 1_000_000).is_ok() && wait("periodic", base + 3) {
+        println!("[hpet]  periodic comparator interrupts taken");
+    }
+    let _ = h.stop(index);
+    ioapic.mask(gsi as u32);
 }
 
 /// Routes COM1's receive interrupt through the I/O APIC to this CPU and
@@ -1020,6 +1116,10 @@ fn handle_trap(frame: &mut TrapFrame) {
         }
         (SHOOTDOWN_VECTOR, _) => {
             shootdown_service();
+            LAPIC.get().expect("LAPIC initialised").eoi();
+        }
+        (HPET_VECTOR, _) => {
+            HPET_FIRED.fetch_add(1, Ordering::SeqCst);
             LAPIC.get().expect("LAPIC initialised").eoi();
         }
         (COM1_VECTOR, _) => {
