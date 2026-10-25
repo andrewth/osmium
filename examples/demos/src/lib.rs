@@ -332,9 +332,9 @@ where
     H: osmium::hal::usb::UsbHost + Send + 'static,
     G: osmium::sync::Guardian + 'static,
 {
-    use osmium::drivers::usb::ecm::{EcmFunction, UsbEthernet};
-    use osmium::drivers::usb::hid::BootKeyboard;
-    use osmium::drivers::usb::storage::UsbStorage;
+    use osmium::usb::class::ecm::{EcmFunction, UsbEthernet};
+    use osmium::usb::class::hid::BootKeyboard;
+    use osmium::usb::class::storage::UsbStorage;
     use osmium::hal::block::BlockDevice;
     use osmium::hal::usb::{Descriptor, Descriptors, UsbHost, enumerate, read_configuration, set_configuration};
 

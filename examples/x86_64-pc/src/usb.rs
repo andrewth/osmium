@@ -14,9 +14,9 @@
 use alloc::vec::Vec;
 
 use osmium::boot::acpi::EcamWindow;
-use osmium::drivers::ehci::{self, Ehci};
+use osmium::usb::ehci::{self, Ehci};
 use osmium::drivers::ioapic::{IoApic, LineMode};
-use osmium::drivers::uhci::{self, Uhci, UhciRegs};
+use osmium::usb::uhci::{self, Uhci, UhciRegs};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci::{self, BarKind, Function, command};
 use osmium::hal::println;

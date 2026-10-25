@@ -19,7 +19,7 @@
 //! port and, for a low- or full-speed device below a high-speed hub, the
 //! transaction translator's slot and port. [`UsbHost::configure_hub`] marks a
 //! slot as a hub (port count, think time, multi-TT). The hub class driver is
-//! in [`crate::usb::hub`].
+//! in [`crate::class::hub`].
 //!
 //! Isochronous endpoints ([`IsochHost`]) get a transfer ring like any other
 //! endpoint plus up to [`ISOCH_DEPTH`] queued one-TRB transfers of at most
@@ -1563,7 +1563,7 @@ mod tests {
         // A 31-entry table of rings and pending transfers per slot made the
         // controller ~30 KiB, which overflowed the 64 KiB boot stack of the
         // riscv-virt example when built and returned by value.
-        let size = size_of::<Xhci<'_, crate::virtio::testing::HostDma>>();
+        let size = size_of::<Xhci<'_, crate::testing::HostDma>>();
         assert!(size < 16 * 1024, "Xhci is {size} bytes");
     }
 
@@ -1572,9 +1572,9 @@ mod tests {
     /// transfer outstanding at TRB address 0x1000. Nothing answers commands
     /// or transfers.
     fn fake<'dma>(
-        dma: &'dma crate::virtio::testing::HostDma,
+        dma: &'dma crate::testing::HostDma,
         regs: &mut [u32],
-    ) -> Xhci<'dma, crate::virtio::testing::HostDma> {
+    ) -> Xhci<'dma, crate::testing::HostDma> {
         // SAFETY: the window covers the caller's array, which outlives the controller.
         let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), regs.len() * 4) };
         let mut endpoints = [const { None }; MAX_ENDPOINTS];
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn interrupt_enable_sets_ie_and_inte() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         hc.enable_interrupts();
@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn interrupt_not_ours_is_ignored() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         hc.events.controller_write(0, transfer_event(1, 3, 0x1000));
@@ -1648,7 +1648,7 @@ mod tests {
 
     #[test]
     fn interrupt_files_events_and_acks() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = vec![0u32; 0x400];
         regs[(0x20 + USBSTS) / 4] = STS_EINT;
         let mut hc = fake(&dma, &mut regs);
@@ -1674,7 +1674,7 @@ mod tests {
         let mut regs = [0u32; 64];
         // SAFETY: the window covers a local array.
         let io = unsafe { IoMem::new(regs.as_mut_ptr().cast(), 256) };
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         assert_eq!(Xhci::new(io, &dma).err(), Some(XhciError::BadRegisters));
         assert_eq!(dma.live.get(), 0);
     }
@@ -1692,7 +1692,7 @@ mod tests {
 
     #[test]
     fn rejects_windows_missing_ports_or_doorbells() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = [0u32; 0x110];
         // Four ports end at 0x460, past the 0x440-byte window.
         caps(&mut regs, 4, 0x100, true);
@@ -1709,7 +1709,7 @@ mod tests {
 
     #[test]
     fn registers_outside_the_window_do_not_panic() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let hc = fake(&dma, &mut regs);
         assert_eq!(hc.r32(0x10_0000), 0);
@@ -1719,7 +1719,7 @@ mod tests {
 
     /// Hands out memory the device sees above 4 GiB.
     #[derive(Default)]
-    struct HighDma(crate::virtio::testing::HostDma);
+    struct HighDma(crate::testing::HostDma);
 
     impl DmaAllocator for HighDma {
         fn alloc_coherent(&self, len: usize) -> Option<DmaBuffer> {
@@ -1785,7 +1785,7 @@ mod tests {
 
     #[test]
     fn timed_out_command_is_aborted() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         regs[(0x20 + CRCR) / 4] = CRCR_CRR;
         let mut hc = fake(&dma, &mut regs);
@@ -1802,7 +1802,7 @@ mod tests {
 
     #[test]
     fn stale_event_does_not_complete_a_control_transfer() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         // A late completion for an earlier transfer on endpoint 0.
@@ -1820,7 +1820,7 @@ mod tests {
 
     #[test]
     fn failed_detach_keeps_the_slot() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         hc.detach(DeviceId(1));
@@ -1834,11 +1834,11 @@ mod tests {
 
     #[test]
     fn drop_leaks_memory_of_a_controller_that_will_not_halt() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         drop(fake(&dma, &mut regs));
         assert!(dma.live.get() > 0);
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         regs[(0x20 + USBSTS) / 4] = STS_HALTED;
         drop(fake(&dma, &mut regs));
         assert_eq!(dma.live.get(), 0);
@@ -1846,7 +1846,7 @@ mod tests {
 
     #[test]
     fn enable_slot_returning_a_slot_in_use() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         // Port 1: connected, enabled, full speed.
         regs[(0x20 + PORTSC) / 4] = PORT_CONNECTED | PORT_ENABLED | 1 << 10;
@@ -1864,7 +1864,7 @@ mod tests {
 
     #[test]
     fn endpoint_context_types_and_bursts() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         hc.slot(DeviceId(1)).unwrap().speed = Speed::High;
@@ -1945,7 +1945,7 @@ mod tests {
     fn msix_interrupts_service_every_message() {
         let cfg = FakeConfig::with(true, true);
         let f = Function::new(&cfg, A).unwrap();
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         let mut table = [0u32; 0x80]; // the BAR: table at 0x100 is word 0x40
@@ -1975,7 +1975,7 @@ mod tests {
     fn msi_is_the_fallback_without_msix() {
         let cfg = FakeConfig::with(false, true);
         let f = Function::new(&cfg, A).unwrap();
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         assert_eq!(hc.enable_message_interrupts(&f, MSG, |_| None), InterruptMode::Msi);
@@ -1989,7 +1989,7 @@ mod tests {
     fn no_message_capability_leaves_intx() {
         let cfg = FakeConfig::with(false, false);
         let f = Function::new(&cfg, A).unwrap();
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         assert_eq!(hc.enable_message_interrupts(&f, MSG, |_| None), InterruptMode::Intx);
@@ -2009,7 +2009,7 @@ mod tests {
     // ---- hubs ----
 
     /// Makes slot 1 a hub with `ports` ports of speed `speed` at `topo`.
-    fn make_hub(hc: &mut Xhci<'_, crate::virtio::testing::HostDma>, speed: Speed, topo: Topology, ports: u8) {
+    fn make_hub(hc: &mut Xhci<'_, crate::testing::HostDma>, speed: Speed, topo: Topology, ports: u8) {
         let slot = hc.slot(DeviceId(1)).unwrap();
         slot.speed = speed;
         slot.topo = topo;
@@ -2020,7 +2020,7 @@ mod tests {
     /// and then rejects Address Device, which leaves the new slot's input
     /// context behind (dead) to inspect.
     fn attach_and_inspect(
-        hc: &mut Xhci<'_, crate::virtio::testing::HostDma>,
+        hc: &mut Xhci<'_, crate::testing::HostDma>,
         port: u8,
         speed: Speed,
         new: u8,
@@ -2045,7 +2045,7 @@ mod tests {
 
     #[test]
     fn hub_slot_context_fields() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         // Not a hub yet.
@@ -2073,7 +2073,7 @@ mod tests {
 
     #[test]
     fn device_behind_a_high_speed_hub_uses_its_translator() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         make_hub(&mut hc, Speed::High, Topology { route: 0, root_port: 3, parent: 0, tt: (0, 0) }, 4);
@@ -2086,7 +2086,7 @@ mod tests {
 
     #[test]
     fn nested_hubs_extend_the_route_string() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         // A full-speed hub on port 1 of a hub on port 2: its translator is the grandparent's.
@@ -2103,7 +2103,7 @@ mod tests {
 
     #[test]
     fn detaching_a_hub_detaches_what_hangs_off_it() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         make_hub(&mut hc, Speed::High, Topology::default(), 4);
@@ -2136,21 +2136,21 @@ mod tests {
     }
 
     /// Configures `eps` on the high-speed slot 1, completing the command.
-    fn configure_iso(hc: &mut Xhci<'_, crate::virtio::testing::HostDma>, eps: &[EndpointDescriptor]) {
+    fn configure_iso(hc: &mut Xhci<'_, crate::testing::HostDma>, eps: &[EndpointDescriptor]) {
         hc.slot(DeviceId(1)).unwrap().speed = Speed::High;
         let configure = hc.commands.enqueue_addr();
         hc.events.inject(command_completion(configure, completion::SUCCESS, 1));
         hc.configure_endpoints(DeviceId(1), eps).unwrap();
     }
 
-    fn ring_trb(hc: &mut Xhci<'_, crate::virtio::testing::HostDma>, dci: usize, i: usize) -> (Trb, u64) {
+    fn ring_trb(hc: &mut Xhci<'_, crate::testing::HostDma>, dci: usize, i: usize) -> (Trb, u64) {
         let ring = &hc.slot(DeviceId(1)).unwrap().endpoint(dci).unwrap().ring;
         (ring.get(i), ring.base().as_u64() + 16 * i as u64)
     }
 
     #[test]
     fn isochronous_endpoint_context() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         // High-bandwidth isochronous IN (3 x 512 per microframe, every 4th) and a full-speed-style OUT.
@@ -2176,7 +2176,7 @@ mod tests {
 
     #[test]
     fn isochronous_in_schedules_and_completes() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         regs[0x200 / 4 + MFINDEX / 4] = 80 << 3 | 5; // frame 80
         let mut hc = fake(&dma, &mut regs);
@@ -2228,7 +2228,7 @@ mod tests {
 
     #[test]
     fn isochronous_out_copies_data_and_frames_sub_millisecond_intervals_asap() {
-        let dma = crate::virtio::testing::HostDma::default();
+        let dma = crate::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
         // bInterval 1 at high speed: every microframe, which a frame number cannot express.

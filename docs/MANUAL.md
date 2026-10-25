@@ -202,7 +202,8 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `sync` | osmium-sync | no | Spin locks, `Once`, `Lazy`, per-CPU data, SPSC ring, `SeqLock` |
 | `mm` | osmium-mm | no | Addresses, memory maps, frame allocators, page tables, the heap |
 | `hal` | osmium-hal | no | MMIO and port I/O, device traits (including `Display` and `Framebuffer`), `IrqTable`, the console and `println!` |
-| `drivers` | osmium-drivers | no | UARTs, interrupt controllers, timers, virtio (MMIO and PCI), xHCI/USB, AHCI, NVMe, displays, mlx4, RAM disk |
+| `usb` | osmium-usb | no | xHCI, EHCI, OHCI and UHCI host controllers, USB class drivers |
+| `drivers` | osmium-drivers | no | UARTs, interrupt controllers, timers, virtio (MMIO and PCI), AHCI, NVMe, displays, mlx4, RAM disk |
 | `boot` | osmium-boot | `FdtWriter` only | FDT, Multiboot2, PVH, UEFI (system table, GOP), ACPI, ELF loading |
 | `exec` | osmium-exec | no | A heap-free async executor |
 | `sched` | osmium-sched | yes | Tasks, context switch, scheduler, `Mutex`, `WaitQueue`, timers |
@@ -214,7 +215,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `iscsi` | osmium-iscsi | yes | iSCSI initiator: a remote disk over TCP as a `BlockDevice` (enables `net`) |
 | `virt` | osmium-virt | yes | Hypervisor building blocks |
 
-`default` is `sync`, `mm`, `hal`, `drivers` and `boot`. `full` turns on all
+`default` is `sync`, `mm`, `hal`, `drivers`, `usb` and `boot`. `full` turns on all
 of the above.
 
 Three features choose the privilege level the arch code runs at:

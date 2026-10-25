@@ -21,6 +21,7 @@ dependencies = [
  "osmium-proc",
  "osmium-sched",
  "osmium-sync",
+ "osmium-usb",
  "osmium-virt",
 ]
 
@@ -147,6 +148,15 @@ name = "osmium-sync"
 version = "0.1.0"
 dependencies = [
  "osmium-arch",
+]
+
+[[package]]
+name = "osmium-usb"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-hal",
+ "osmium-mm",
 ]
 
 [[package]]

@@ -32,7 +32,7 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
 
 ## Architecture
 
-**Layering.** `osmium-arch` sits at the bottom: IRQ flags, traps, CPU id, MMU and system registers for x86_64, AArch64 and RISC-V. `osmium-sync` and `osmium-mm` build on it, then `osmium-hal` (MMIO, device traits, console) and `osmium-drivers`, and then the higher components: `sched`, `proc`, `fs*`, `net`, `iscsi`, `virt`, `exec`. The `osmium` crate is a facade that re-exports each component behind a feature of the same name; `full` enables all of them. Dependencies only point downward, so keep a new component in the lowest layer that can hold it.
+**Layering.** `osmium-arch` sits at the bottom: IRQ flags, traps, CPU id, MMU and system registers for x86_64, AArch64 and RISC-V. `osmium-sync` and `osmium-mm` build on it, then `osmium-hal` (MMIO, device traits, console), `osmium-drivers` and `osmium-usb` (host controllers and class drivers), and then the higher components: `sched`, `proc`, `fs*`, `net`, `iscsi`, `virt`, `exec`. The `osmium` crate is a facade that re-exports each component behind a feature of the same name; `full` enables all of them. Dependencies only point downward, so keep a new component in the lowest layer that can hold it.
 
 **Library, not a kernel.** No crate defines an entry point, panic handler or global allocator. Each example kernel (`examples/*-virt`, `x86_64-pc`, `riscv-firmware`, `uefi`) supplies those and assembles the components it needs. The examples are the integration tests for the library.
 

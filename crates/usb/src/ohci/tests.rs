@@ -370,7 +370,7 @@ fn rejects_windows_that_are_not_ohci() {
 #[test]
 fn memory_above_4g_is_refused() {
     let mut rig = Rig::new(false);
-    let (dma, clock) = (crate::virtio::testing::HostDma::default(), TickClock::default());
+    let (dma, clock) = (crate::testing::HostDma::default(), TickClock::default());
     assert_eq!(Ohci::new(rig.io(), &dma, &clock).err(), Some(OhciError::HighMemory));
     assert_eq!(dma.live.get(), 0, "nothing leaks");
 }

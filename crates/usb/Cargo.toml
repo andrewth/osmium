@@ -1,0 +1,15 @@
+[package]
+name = "osmium-usb"
+description = "Osmium: USB host controllers (xHCI, EHCI, OHCI, UHCI) and class drivers (mass storage, HID, CDC-ECM/NCM, hubs, isochronous)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+osmium-arch.workspace = true
+osmium-hal.workspace = true
+osmium-mm.workspace = true

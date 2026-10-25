@@ -174,7 +174,7 @@ impl<'d, D: DmaAllocator + ?Sized> EventRing<'d, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::testing::HostDma;
+    use crate::testing::HostDma;
 
     fn raw(mem: &OwnedDma<'_, HostDma>, i: usize) -> Trb {
         let off = i * TRB_SIZE;

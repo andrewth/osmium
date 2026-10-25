@@ -11,6 +11,7 @@
 //! | `mm` | `osmium-mm` | addresses, memory maps, frame allocators, page tables, heap |
 //! | `hal` | `osmium-hal` | MMIO/port I/O, device traits, IRQ dispatch, console |
 //! | `drivers` | `osmium-drivers` | 16550, PL011, PLIC, GICv2, local APIC, RAM disk |
+//! | `usb` | `osmium-usb` | xHCI, EHCI, OHCI and UHCI host controllers, USB class drivers |
 //! | `boot` | `osmium-boot` | FDT and Multiboot2 parsing, FDT writer |
 //! | `sched` | `osmium-sched` | tasks, context switch, schedulers, wait queues, timers |
 //! | `virt` | `osmium-virt` | guest memory, stage-2 tables, device buses, VM exits |
@@ -32,6 +33,8 @@ pub use osmium_arch as arch;
 pub use osmium_boot as boot;
 #[cfg(feature = "drivers")]
 pub use osmium_drivers as drivers;
+#[cfg(feature = "usb")]
+pub use osmium_usb as usb;
 #[cfg(feature = "exec")]
 pub use osmium_exec as exec;
 #[cfg(feature = "fs")]
