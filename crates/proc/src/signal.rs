@@ -3,7 +3,7 @@
 //!
 //! Standard signals do not queue: each signal number is pending or not.
 //! Real-time signals (32 and up) and `rt_sigqueueinfo` queue with their
-//! `siginfo` (see [`crate::sigqueue`]). Process-wide
+//! `siginfo` (the `sigqueue` module). Process-wide
 //! state (dispositions, the process-directed pending set) lives in
 //! `Signals`; each thread has a mask and a pending set of its own
 //! ([`crate::thread::Thread`]). Delivery happens when a thread returns to
@@ -20,7 +20,7 @@
 //!
 //! `sigaltstack` and `SA_ONSTACK`, `rt_sigsuspend`, and stopping and
 //! continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT`, reported by `wait4`; see
-//! [`crate::jobctl`]) are implemented.
+//! the `jobctl` module) are implemented.
 //!
 //! Not implemented: a credential model for `kill` (see its documentation),
 //! `sigtimedwait`/`sigwaitinfo`, and restarting
@@ -257,7 +257,7 @@ pub fn send_to_thread(p: &Process, th: &Thread, sig: u8, from: Pid) -> Result<()
 
 /// The one way a signal is sent: to thread `th`, or to the process if
 /// `None`. `info` is a `siginfo` to deliver with it, which queues the
-/// signal (see [`crate::sigqueue`]); `strict` makes a full queue an `EAGAIN`
+/// signal (the `sigqueue` module); `strict` makes a full queue an `EAGAIN`
 /// error instead of a signal that is pending without an entry.
 pub(crate) fn post(
     p: &Process,
