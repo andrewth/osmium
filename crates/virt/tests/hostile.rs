@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use osmium_virt::devices::{
-    Pl011, Uart16550, VirtualGicV2, VirtualIoApic, VirtualLapic, VirtualPic, VirtualPit, VirtualPlic,
+    Pl011, Uart16550, VirtualGicV2, VirtualGicV3, VirtualIoApic, VirtualLapic, VirtualPic, VirtualPit, VirtualPlic,
 };
 use osmium_virt::memory::GuestMemory;
 use osmium_virt::virtio::{VirtioConsole, VirtioMmio};
@@ -39,6 +39,29 @@ fn devices_survive_any_access() {
     // A window for a CPU that does not exist.
     hammer(&*gic.distributor_for(9), 0x1000);
     hammer(&*gic.cpu_interface_for(99), 0x1000);
+
+    let gic3 = Arc::new(VirtualGicV3::new(2, 64, |_, _| {}));
+    hammer(&*gic3.distributor(), 0x1_0000);
+    hammer(&*gic3.redistributors(), 0x4_0000);
+    // The register arrays past hammer's sweep: priorities, SGI frame, IROUTER.
+    for dev in [gic3.distributor(), gic3.redistributors()] {
+        for off in (0x400..0x500).chain(0x1_0000..0x1_0500).chain(0x6000..0x6400).chain(0xffe0..0x1_0000) {
+            for size in [1usize, 4, 8] {
+                let mut buf = vec![0u8; size];
+                dev.read(off, &mut buf);
+                dev.write(off, &vec![0xffu8; size]);
+            }
+        }
+    }
+    let (mut lr, mut small) = ([0u64; 4], [0u64; 0]);
+    gic3.fill_list_registers(0, &mut lr);
+    gic3.fill_list_registers(7, &mut small);
+    // List registers a guest or hardware filled with junk.
+    gic3.sync_list_registers(0, &[u64::MAX; 9], u64::MAX);
+    gic3.sync_list_registers(7, &lr, 0);
+    gic3.send_sgi(0, u64::MAX);
+    gic3.send_sgi(99, 0);
+    gic3.set_private_level(9, 1000, true);
 
     hammer(&VirtualPlic::new(32, 2, |_, _| {}), 0x40_0000);
     hammer(&VirtualPlic::new(0, 0, |_, _| {}), 0x40_0000);
