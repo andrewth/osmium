@@ -13,6 +13,8 @@ workspace = true
 osmium-arch.workspace = true
 osmium-drivers.workspace = true
 osmium-hal.workspace = true
+osmium-sync.workspace = true
 
 [dev-dependencies]
 osmium-drivers = { workspace = true, features = ["testing"] }
+osmium-mm.workspace = true
