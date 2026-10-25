@@ -79,6 +79,7 @@ pub mod net;
 mod pipe;
 pub mod poll;
 mod process;
+mod reloc;
 pub mod signal;
 pub mod socket;
 pub mod syscall;
@@ -86,7 +87,7 @@ pub mod thread;
 mod unix;
 mod uregs;
 
-pub use exec::{ARG_MAX, Platform, UserEntry, set_platform};
+pub use exec::{ARG_MAX, INTERP_OFFSET, Platform, UserEntry, set_platform};
 pub use fd::{FdTable, OpenFile, set_console};
 pub use memory::{AddressSpace, UserMemory};
 pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for};

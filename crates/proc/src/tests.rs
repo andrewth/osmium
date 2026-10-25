@@ -151,7 +151,9 @@ fn console() -> &'static Arc<Console> {
         let c = Arc::new(Console::default());
         set_console(c.clone());
         let etc: Arc<dyn File> = Arc::new(Dir(alloc::vec![("motd", Arc::new(Text("welcome\n", 3)) as Arc<dyn File>)]));
-        let bin: Arc<dyn File> = Arc::new(Dir(alloc::vec![("prog", Arc::new(Bytes(program(), 5)) as Arc<dyn File>)]));
+        let mut programs = alloc::vec![("prog", Arc::new(Bytes(program(), 5)) as Arc<dyn File>)];
+        programs.extend(pie::images());
+        let bin: Arc<dyn File> = Arc::new(Dir(programs));
         let root = Dir(alloc::vec![
             ("hello.txt", Arc::new(Text("hello, file\n", 2)) as Arc<dyn File>),
             ("etc", etc),
@@ -459,6 +461,7 @@ fn platform() {
             stack_top: STACK_TOP,
             stack_size: 0x4000,
             mmap_area: 0x200_0000..0x210_0000,
+            load_base: 0x1000_0000,
         })
     });
 }
@@ -834,5 +837,6 @@ fn a_child_that_never_got_a_task_can_be_forgotten() {
 mod blocked;
 mod hostile;
 mod oom;
+mod pie;
 mod sigthread;
 mod smp;

@@ -4,6 +4,12 @@
 //! loadable segments with their file bytes, memory size and permissions.
 //! The caller maps memory and copies [`Segment::data`], zero-filling up to
 //! [`Segment::mem_size`].
+//!
+//! Position-independent images (`ET_DYN`) are loaded at a bias the caller
+//! chooses ([`Elf::load_into_at`], [`Elf::segments_at`]); [`Elf::interp`]
+//! names the program interpreter of a dynamically linked one, and
+//! [`Elf::dynamic`] reads the relocation tables a loader has to apply. Every
+//! field is untrusted: offsets, sizes and addresses are checked arithmetic.
 
 use osmium_mm::paging::{MapError, MapFlags, PageSize, PageTable, PageTableFormat, TableAlloc};
 use osmium_mm::{PAGE_SIZE, PhysAddr, VirtAddr};
@@ -67,6 +73,41 @@ pub struct Segment<'src> {
 }
 
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const PT_INTERP: u32 = 3;
+
+/// Longest interpreter path accepted (Linux's `PATH_MAX`).
+const INTERP_MAX: usize = 4096;
+/// Most `PT_DYNAMIC` entries read.
+const DYNAMIC_MAX: usize = 4096;
+
+/// What the `PT_DYNAMIC` segment says about relocation, as virtual
+/// addresses and sizes in the image (before any load bias).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dynamic {
+    /// `DT_RELA`: address of the relocation table with addends.
+    pub rela: u64,
+    /// `DT_RELASZ`: its size in bytes.
+    pub rela_size: u64,
+    /// `DT_RELAENT`: the size of an entry (24 when absent).
+    pub rela_ent: u64,
+    /// `DT_JMPREL`: address of the PLT relocations, which are `Rela` when
+    /// `DT_PLTREL` says so.
+    pub jmprel: u64,
+    /// `DT_PLTRELSZ`: their size in bytes.
+    pub jmprel_size: u64,
+    /// `DT_SYMTAB`: address of the symbol table.
+    pub symtab: u64,
+    /// `DT_SYMENT`: the size of a symbol (24 when absent).
+    pub sym_ent: u64,
+    /// Whether the image needs shared libraries (`DT_NEEDED`).
+    pub needed: bool,
+    /// Whether it has relocations without addends (`DT_REL`, or `DT_PLTREL`
+    /// naming them), which this crate's users do not apply.
+    pub rel: bool,
+    /// Whether it uses packed relative relocations (`DT_RELR`), likewise.
+    pub relr: bool,
+}
 
 impl<'src> Elf<'src> {
     /// Validates `data` as a little-endian ELF64 executable.
@@ -153,8 +194,7 @@ impl<'src> Elf<'src> {
     /// copied in, so `.bss` reads as zero. Pages shared by two segments get
     /// both segments' permissions.
     ///
-    /// Only absolute (non-PIE) images are supported; relocations are not
-    /// applied. On error, pages mapped so far stay mapped; drop the table.
+    /// Relocations are not applied. On error, pages mapped so far stay mapped; drop the table.
     ///
     /// Every page the image touches is mapped by this call: a page that is
     /// already mapped (other than by an earlier segment of this image) is
@@ -165,15 +205,30 @@ impl<'src> Elf<'src> {
         &self,
         pt: &mut PageTable<F, A>,
         extra: MapFlags,
+        alloc_frame: impl FnMut() -> Option<PhysAddr>,
+    ) -> Result<(), MapError> {
+        self.load_into_at(pt, extra, 0, alloc_frame)
+    }
+
+    /// Like [`load_into`](Self::load_into), with `bias` added to every
+    /// segment's address (for a position-independent image). The addresses
+    /// must not overflow ([`MapError::InvalidAddress`]). Relocations are not
+    /// applied: that is the caller's job, after the pages exist.
+    pub fn load_into_at<F: PageTableFormat, A: TableAlloc>(
+        &self,
+        pt: &mut PageTable<F, A>,
+        extra: MapFlags,
+        bias: u64,
         mut alloc_frame: impl FnMut() -> Option<PhysAddr>,
     ) -> Result<(), MapError> {
+        self.span_at(bias).ok_or(MapError::InvalidAddress)?;
         let page = PAGE_SIZE as u64;
         // The pages a segment covers; None if its end overflows.
         let pages = |s: &Segment<'_>| {
             let end = s.vaddr.checked_add(s.mem_size)?.checked_next_multiple_of(page)?;
             Some(s.vaddr & !(page - 1)..end)
         };
-        for (i, seg) in self.segments().enumerate() {
+        for (i, seg) in self.segments_at(bias).enumerate() {
             let mut flags = extra | MapFlags::READ;
             if seg.flags.write {
                 flags = flags | MapFlags::WRITE;
@@ -188,7 +243,7 @@ impl<'src> Elf<'src> {
                 let pa = match pt.translate(VirtAddr::new(va)) {
                     // A page this segment shares with an earlier one of this
                     // image, which this call mapped: add our permissions.
-                    Some(t) if self.segments().take(i).any(|s| pages(&s).is_some_and(|r| r.contains(&va))) => {
+                    Some(t) if self.segments_at(bias).take(i).any(|s| pages(&s).is_some_and(|r| r.contains(&va))) => {
                         pt.protect(VirtAddr::new(va), t.flags | flags).map_err(|_| MapError::InvalidAddress)?.ignore();
                         t.pa
                     }
@@ -220,6 +275,114 @@ impl<'src> Elf<'src> {
             }
         }
         Ok(())
+    }
+
+    /// The loadable segments as they appear when the image is loaded with
+    /// `bias` added to every address. A segment whose address would overflow
+    /// is left out; [`Elf::span_at`] reports that.
+    pub fn segments_at(&self, bias: u64) -> impl Iterator<Item = Segment<'src>> + use<'src> {
+        self.segments().filter_map(move |s| Some(Segment { vaddr: s.vaddr.checked_add(bias)?, ..s }))
+    }
+
+    /// The page-aligned addresses the non-empty segments cover when loaded
+    /// at `bias`: from the first page of the lowest to the end of the
+    /// highest, rounded up. `None` if any address overflows. An image with
+    /// no memory yields `0..0`.
+    pub fn span_at(&self, bias: u64) -> Option<core::ops::Range<u64>> {
+        let page = PAGE_SIZE as u64;
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for s in self.segments().filter(|s| s.mem_size != 0) {
+            let start = s.vaddr.checked_add(bias)?;
+            lo = lo.min(start & !(page - 1));
+            hi = hi.max(start.checked_add(s.mem_size)?.checked_next_multiple_of(page)?);
+        }
+        Some(if lo > hi { 0..0 } else { lo..hi })
+    }
+
+    /// The lowest page-aligned virtual address any non-empty segment starts
+    /// at, before any bias (0 for a typical `ET_DYN`).
+    pub fn lowest_address(&self) -> u64 {
+        let lo = self.segments().filter(|s| s.mem_size != 0).map(|s| s.vaddr).min();
+        lo.unwrap_or(0) & !(PAGE_SIZE as u64 - 1)
+    }
+
+    fn program_header(&self, kind: u32) -> Option<(usize, usize)> {
+        let (off, size, n) = self.ph_table().ok()?;
+        (0..n).find_map(|i| {
+            let ph = off.checked_add(i.checked_mul(size)?)?;
+            if le32(self.data, ph)? != kind {
+                return None;
+            }
+            let offset = usize::try_from(le64(self.data, ph.checked_add(8)?)?).ok()?;
+            let filesz = usize::try_from(le64(self.data, ph.checked_add(32)?)?).ok()?;
+            Some((offset, filesz))
+        })
+    }
+
+    /// The program interpreter's path (`PT_INTERP`) without its NUL, if the
+    /// image names one. It must be non-empty, NUL-terminated, free of other
+    /// NULs, at most 4096 bytes and inside the file.
+    pub fn interp(&self) -> Result<Option<&'src [u8]>, ElfError> {
+        let Some((offset, filesz)) = self.program_header(PT_INTERP) else { return Ok(None) };
+        if !(2..=INTERP_MAX).contains(&filesz) {
+            return Err(ElfError::Truncated);
+        }
+        let end = offset.checked_add(filesz).ok_or(ElfError::Truncated)?;
+        let bytes = self.data.get(offset..end).ok_or(ElfError::Truncated)?;
+        match bytes.split_last() {
+            Some((0, path)) if !path.contains(&0) => Ok(Some(path)),
+            _ => Err(ElfError::Truncated),
+        }
+    }
+
+    /// The file bytes the loadable segments put at `vaddr..vaddr + len`
+    /// (before any bias), if one segment's file data covers all of them.
+    pub fn bytes_at(&self, vaddr: u64, len: u64) -> Option<&'src [u8]> {
+        let end = vaddr.checked_add(len)?;
+        self.segments().find_map(|s| {
+            let seg_end = s.vaddr.checked_add(s.data.len() as u64)?;
+            if vaddr < s.vaddr || end > seg_end {
+                return None;
+            }
+            let from = usize::try_from(vaddr - s.vaddr).ok()?;
+            s.data.get(from..from.checked_add(usize::try_from(len).ok()?)?)
+        })
+    }
+
+    /// Reads the `PT_DYNAMIC` segment: where the relocation and symbol
+    /// tables are. An image without one yields the empty [`Dynamic`].
+    pub fn dynamic(&self) -> Result<Dynamic, ElfError> {
+        let mut d = Dynamic { rela_ent: 24, sym_ent: 24, ..Dynamic::default() };
+        let Some((offset, filesz)) = self.program_header(PT_DYNAMIC) else { return Ok(d) };
+        let end = offset.checked_add(filesz).ok_or(ElfError::Truncated)?;
+        let bytes = self.data.get(offset..end).ok_or(ElfError::Truncated)?;
+        let mut pltrel = 0;
+        for entry in bytes.as_chunks::<16>().0.iter().take(DYNAMIC_MAX) {
+            let tag = le64(entry, 0).ok_or(ElfError::Truncated)?;
+            let val = le64(entry, 8).ok_or(ElfError::Truncated)?;
+            match tag {
+                0 => break,
+                1 => d.needed = true,
+                2 => d.jmprel_size = val,
+                5 => {}
+                6 => d.symtab = val,
+                7 => d.rela = val,
+                8 => d.rela_size = val,
+                9 => d.rela_ent = val,
+                11 => d.sym_ent = val,
+                17 | 18 => d.rel |= val != 0,
+                20 => pltrel = val,
+                23 => d.jmprel = val,
+                35 | 36 => d.relr |= val != 0,
+                _ => {}
+            }
+        }
+        // DT_PLTREL: 17 is DT_REL, 7 is DT_RELA.
+        if d.jmprel_size != 0 && pltrel == 17 {
+            d.rel = true;
+            d.jmprel_size = 0;
+        }
+        Ok(d)
     }
 
     /// The loadable segments, in file order.
@@ -351,6 +514,107 @@ mod tests {
         let elf = Elf::new(&g).unwrap();
         let mut pt: PageTable<X86_64, &Host> = PageTable::new(&host).unwrap();
         assert_eq!(elf.load_into(&mut pt, MapFlags::USER, || Some(page())), Err(MapError::InvalidAddress));
+    }
+
+    /// A PIE with `PT_INTERP` and `PT_DYNAMIC` for the bias and dynamic tests.
+    fn pie() -> Vec<u8> {
+        let mut f = sample();
+        f[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        f[56..58].copy_from_slice(&4u16.to_le_bytes());
+        // Segments at 0 and 0x2000.
+        f[64 + 16..64 + 24].copy_from_slice(&0u64.to_le_bytes());
+        f[120 + 16..120 + 24].copy_from_slice(&0x2000u64.to_le_bytes());
+        // PT_INTERP: "/ld\0" at 0x190.
+        f[0x190..0x194].copy_from_slice(b"/ld\0");
+        let at = 176;
+        f[at..at + 4].copy_from_slice(&3u32.to_le_bytes());
+        f[at + 8..at + 16].copy_from_slice(&0x190u64.to_le_bytes());
+        f[at + 32..at + 40].copy_from_slice(&4u64.to_le_bytes());
+        // Dynamic entries at 0x1a0: RELA 0x180, RELASZ 24, NULL.
+        for (i, (tag, val)) in [(7u64, 0x180u64), (8, 24), (0, 0)].into_iter().enumerate() {
+            f[0x1a0 + i * 16..0x1a8 + i * 16].copy_from_slice(&tag.to_le_bytes());
+            f[0x1a8 + i * 16..0x1b0 + i * 16].copy_from_slice(&val.to_le_bytes());
+        }
+        let at = 232;
+        f[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+        f[at + 8..at + 16].copy_from_slice(&0x1a0u64.to_le_bytes());
+        f[at + 32..at + 40].copy_from_slice(&48u64.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn bias_interpreter_and_dynamic_section() {
+        let f = pie();
+        let elf = Elf::new(&f).unwrap();
+        assert!(elf.is_pie());
+        assert_eq!(elf.interp(), Ok(Some(&b"/ld"[..])));
+        let d = elf.dynamic().unwrap();
+        assert_eq!((d.rela, d.rela_size, d.rela_ent, d.needed), (0x180, 24, 24, false));
+        assert_eq!(elf.bytes_at(0, 4), Some(&[0x90, 0x90, 0x0f, 0x05][..]));
+        assert_eq!(elf.bytes_at(2, 4), None, "past the segment's file data");
+        assert_eq!(elf.bytes_at(u64::MAX, 2), None);
+        assert_eq!(elf.span_at(0x10_0000), Some(0x10_0000..0x10_3000));
+        assert_eq!(elf.span_at(u64::MAX - 0xfff), None, "overflow");
+        assert_eq!(elf.segments_at(0x10_0000).map(|s| s.vaddr).collect::<Vec<_>>(), [0x10_0000, 0x10_2000]);
+        assert_eq!(elf.segments_at(u64::MAX - 0x1000).count(), 1, "the one that overflows is left out");
+        assert_eq!(elf.lowest_address(), 0);
+        // No interpreter or dynamic section in a plain executable.
+        let g = sample();
+        let plain = Elf::new(&g).unwrap();
+        assert_eq!(
+            (plain.interp(), plain.dynamic()),
+            (Ok(None), Ok(Dynamic { rela_ent: 24, sym_ent: 24, ..Dynamic::default() }))
+        );
+        // Hostile interpreter paths.
+        let mut h = pie();
+        h[176 + 32..176 + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(Elf::new(&h).unwrap().interp(), Err(ElfError::Truncated));
+        let mut h = pie();
+        h[0x193] = b'x';
+        assert_eq!(Elf::new(&h).unwrap().interp(), Err(ElfError::Truncated), "not terminated");
+        let mut h = pie();
+        h[176 + 8..176 + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(Elf::new(&h).unwrap().interp(), Err(ElfError::Truncated), "offset overflow");
+        let mut h = pie();
+        h[232 + 32..232 + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(Elf::new(&h).unwrap().dynamic(), Err(ElfError::Truncated));
+    }
+
+    #[test]
+    fn loads_at_a_bias() {
+        use osmium_mm::paging::formats::X86_64;
+        use osmium_mm::{PhysMapper, paging::TableAlloc};
+        use std::alloc::{Layout, alloc_zeroed};
+
+        struct Host;
+        // SAFETY: host addresses are directly dereferenceable.
+        unsafe impl PhysMapper for Host {
+            fn phys_to_virt(&self, pa: PhysAddr) -> *mut u8 {
+                pa.0 as *mut u8
+            }
+        }
+        fn page() -> PhysAddr {
+            // SAFETY: non-zero size; leaked for the test's duration.
+            PhysAddr::new(unsafe { alloc_zeroed(Layout::from_size_align(4096, 4096).unwrap()) } as u64)
+        }
+        // SAFETY: fresh, exclusive, page-aligned host pages.
+        unsafe impl TableAlloc for Host {
+            fn alloc_table(&self) -> Option<PhysAddr> {
+                Some(page())
+            }
+            unsafe fn free_table(&self, _: PhysAddr) {}
+        }
+        let f = pie();
+        let elf = Elf::new(&f).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&Host).unwrap();
+        elf.load_into_at(&mut pt, MapFlags::USER, 0x10_0000, || Some(page())).unwrap();
+        assert!(pt.translate(VirtAddr::new(0x10_0000)).is_some() && pt.translate(VirtAddr::new(0x10_2000)).is_some());
+        assert!(pt.translate(VirtAddr::new(0x0)).is_none() && pt.translate(VirtAddr::new(0x2000)).is_none());
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&Host).unwrap();
+        assert_eq!(
+            elf.load_into_at(&mut pt, MapFlags::USER, u64::MAX - 0xfff, || Some(page())),
+            Err(MapError::InvalidAddress)
+        );
     }
 
     #[test]
