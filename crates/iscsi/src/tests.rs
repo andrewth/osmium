@@ -14,22 +14,22 @@ use crate::scsi::{self, Sense, op, sense_key};
 use crate::testing::{Corrupt, Fault, INITIATOR_NAME, PORTAL, TARGET_NAME, TargetChap, TargetConfig, TestNet};
 use crate::{Data, IscsiDisk, IscsiError, Options, discover};
 
-const BLOCKS: usize = 2048;
+pub(crate) const BLOCKS: usize = 2048;
 
-fn options() -> Options {
+pub(crate) fn options() -> Options {
     Options::new(INITIATOR_NAME, TARGET_NAME)
 }
 
-fn connect(net: &mut TestNet) -> IscsiDisk<&mut TestNet> {
+pub(crate) fn connect(net: &mut TestNet) -> IscsiDisk<&mut TestNet> {
     IscsiDisk::connect(net, PORTAL, &options()).unwrap()
 }
 
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
+pub(crate) fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| (i as u8).wrapping_mul(31) ^ seed ^ (i >> 9) as u8).collect()
 }
 
 /// Sockets left in the initiator's set.
-fn sockets(net: &TestNet) -> usize {
+pub(crate) fn sockets(net: &TestNet) -> usize {
     net.a.sockets.iter().count()
 }
 

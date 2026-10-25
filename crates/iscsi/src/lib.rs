@@ -27,11 +27,34 @@
 //! By default the session negotiates no authentication (AuthMethod=None)
 //! and no digests. [`Options::chap`] ([`Chap`]) logs in with CHAP-MD5,
 //! one-way or mutual, and [`Offer::header_digest`] / [`Offer::data_digest`]
-//! ([`DigestPolicy`]) ask for CRC32C digests. It uses
-//! error recovery level 0, one connection and one outstanding R2T, and
-//! runs one command at a time. Writes send immediate and unsolicited data
-//! as `ImmediateData`, `InitialR2T` and `FirstBurstLength` allow, and the
-//! rest in answer to R2Ts.
+//! ([`DigestPolicy`]) ask for CRC32C digests. Writes send immediate and
+//! unsolicited data as `ImmediateData`, `InitialR2T` and `FirstBurstLength`
+//! allow, and the rest in answer to R2Ts (one outstanding at a time).
+//!
+//! A target that answers a login with Target Moved Temporarily or
+//! Permanently is followed to the address it names, a few times over
+//! ([`IscsiDisk::portal`] says where the session ended up, and
+//! [`IscsiDisk::moved_permanently`] whether to use that address from now on).
+//!
+//! [`Offer::max_connections`] asks for several connections in the session
+//! (MC/S). Reads and writes larger than `MaxBurstLength` then run as
+//! commands in parallel over the free connections: CmdSN numbers them as
+//! one sequence, each connection keeps its own StatSN and ExpStatSN, and a
+//! command's PDUs stay on the connection it was sent on.
+//!
+//! [`Offer::error_recovery_level`] asks to recover from failures instead of
+//! dropping the session. At level 1 a Data-In, R2T or status that is lost or
+//! fails its data digest is requested again (SNACK, including DataACK and
+//! R-Data), a quiet connection is nudged (and a command the target never
+//! acknowledged is sent again), and a command the target rejects for a digest
+//! error is retried. At level 2 a lost connection is replaced by a new login
+//! with the same CID, and each task that was on it is reassigned (TASK
+//! REASSIGN) or, if the target never got the command, sent again. Level 0,
+//! the default, drops the session on any failure.
+//!
+//! [`IscsiSession`] shares one session between the block devices of all of
+//! a target's logical units (REPORT LUNS lists them, [`IscsiSession::disk`]
+//! opens one).
 //!
 //! The PDU codec ([`pdu`]), text keys ([`text`]) and SCSI command set
 //! ([`scsi`]) are usable on their own, e.g. to write a target.
@@ -59,6 +82,10 @@ mod fuzz;
 mod testing;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_recovery;
+#[cfg(test)]
+mod tests_session;
 
 pub use chap::{Chap, Mutual};
 pub use disk::{IscsiDisk, IscsiSession};

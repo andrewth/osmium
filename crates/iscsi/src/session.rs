@@ -388,6 +388,8 @@ struct Task {
     tmf: Option<u32>,
     /// Times the command was sent again.
     retries: u32,
+    /// A NOP-Out is out to learn whether the target has the command.
+    probed: bool,
 }
 
 /// The running of a batch of jobs.
@@ -801,7 +803,6 @@ impl<N: Net> Session<N> {
                 Ok(Some(Incoming::Pdu(m))) => {
                     self.next_conn = ci + 1;
                     c.quiet_since = self.now;
-                    c.nudges = 0;
                     self.since_poll += 1;
                     if self.since_poll >= CLOCK_EVERY {
                         self.poll_net();
@@ -998,6 +999,7 @@ impl<N: Net> Session<N> {
                 seen: false,
                 tmf: None,
                 retries: 0,
+                probed: false,
             };
             self.plan(ci, run.jobs.get(job).ok_or(IscsiError::Protocol("no such job"))?, &mut task)?;
             run.tasks.push(task);
@@ -1027,6 +1029,7 @@ impl<N: Net> Session<N> {
             (0, 0)
         };
         *t = Task {
+            probed: false,
             read,
             write,
             expected,
@@ -1206,7 +1209,15 @@ impl<N: Net> Session<N> {
                 return Ok(());
             }
         }
+        let progress =
+            matches!(m, Message::DataIn(_) | Message::R2t(_) | Message::ScsiResponse(_) | Message::TmfResponse(_));
         let accepted = self.dispatch(ci, m, run)?;
+        if accepted
+            && progress
+            && let Some(c) = self.conns.get_mut(ci)
+        {
+            c.nudges = 0;
+        }
         if accepted {
             if let Some(sn) = sn
                 && let Some(c) = self.conns.get_mut(ci)
@@ -1465,6 +1476,7 @@ impl<N: Net> Session<N> {
             if c.nudges > MAX_RETRIES {
                 return Err(IscsiError::TimedOut.into());
             }
+            let mut status_due = false;
             for ti in 0..run.tasks.len() {
                 let Some(t) = run.tasks.get(ti) else { continue };
                 if t.conn != ci || t.tmf.is_some() {
@@ -1473,23 +1485,46 @@ impl<N: Net> Session<N> {
                 let lun = run.jobs.get(t.job).map_or([0; 8], |j| j.lun);
                 let (itt, cmd_sn, read, write, data_sn, r2t_sn) =
                     (t.itt, t.cmd_sn, t.read, t.write, t.data_sn, t.r2t_sn);
+                let probed = t.probed;
                 if sn_lt(cmd_sn, self.exp_cmd_sn) {
                     // The target has the command. A read may be missing
                     // data, a write an R2T; a missing status is asked for
                     // below.
                     if read {
                         self.send_snack(ci, snack::DATA_R2T, lun, itt, RESERVED_TAG, data_sn, 0, run.deadline)?;
+                        status_due = true;
                     } else if write && t.sent < t.expected {
                         self.send_snack(ci, snack::DATA_R2T, lun, itt, RESERVED_TAG, r2t_sn, 1, run.deadline)?;
+                    } else {
+                        status_due = true;
                     }
+                } else if !probed {
+                    // The target has not acknowledged the command: it may not
+                    // have arrived, or its answer may be lost. A ping gets
+                    // the target's ExpCmdSN, which tells the two apart; the
+                    // command is sent again only if the next round still finds
+                    // it unacknowledged.
+                    let probe = Message::NopOut(NopOut {
+                        immediate: true,
+                        lun: [0; 8],
+                        itt: self.next_itt(),
+                        ttt: RESERVED_TAG,
+                        cmd_sn: self.cmd_sn,
+                        exp_stat_sn: self.exp_stat_sn(ci),
+                        data: Vec::new(),
+                    });
+                    if let Some(t) = run.tasks.get_mut(ti) {
+                        t.probed = true;
+                    }
+                    self.send_on(ci, probe, run.deadline)?;
                 } else {
-                    // The target never acknowledged the command: it may not
-                    // have arrived.
                     self.retry_command(run, ti, ci)?;
                 }
             }
-            let sn = conn_mut(&mut self.conns, ci)?.exp_stat_sn;
-            self.send_snack(ci, snack::STATUS, [0; 8], RESERVED_TAG, RESERVED_TAG, sn, 0, run.deadline)?;
+            if status_due {
+                let sn = conn_mut(&mut self.conns, ci)?.exp_stat_sn;
+                self.send_snack(ci, snack::STATUS, [0; 8], RESERVED_TAG, RESERVED_TAG, sn, 0, run.deadline)?;
+            }
         }
         Ok(())
     }

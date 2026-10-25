@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::format;
 use std::rc::Rc;
 use std::string::{String, ToString};
 use std::vec;
@@ -188,6 +189,27 @@ pub(crate) struct TargetConfig {
     /// The HeaderDigest and DataDigest value the target answers with (`Omit`: no answer to either).
     pub(crate) header_digest: &'static str,
     pub(crate) data_digest: &'static str,
+    /// The most connections and the highest error recovery level it agrees to.
+    pub(crate) max_connections: u16,
+    pub(crate) erl: u8,
+    /// Serve the connections of a step in reverse order of arrival.
+    pub(crate) reverse_conns: bool,
+    /// Answer a leading login on port 3260 with a redirection.
+    pub(crate) redirect: Option<Redirect>,
+    /// Ports besides 3260 to listen on.
+    pub(crate) extra_ports: Vec<u16>,
+    /// Ask for a DataACK after this many Data-In PDUs (once recovery is on).
+    pub(crate) ack_every: Option<usize>,
+    /// Refuse the login of every connection after the first.
+    pub(crate) refuse_additional: bool,
+}
+
+/// A login redirection.
+#[derive(Clone)]
+pub(crate) struct Redirect {
+    /// The `TargetAddress` value; empty for no key at all.
+    pub(crate) address: String,
+    pub(crate) permanent: bool,
 }
 
 /// The target's side of CHAP.
@@ -241,6 +263,13 @@ impl Default for TargetConfig {
             chap: None,
             header_digest: "None",
             data_digest: "None",
+            max_connections: 8,
+            erl: 2,
+            reverse_conns: false,
+            redirect: None,
+            extra_ports: Vec::new(),
+            ack_every: None,
+            refuse_additional: false,
         }
     }
 }
@@ -270,6 +299,43 @@ pub(crate) enum Fault {
     R2tGap,
 }
 
+/// A PDU the target sends but the network loses (it is still remembered,
+/// as a target keeps what it has not seen acknowledged).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Loss {
+    /// The Data-In with this DataSN.
+    DataIn(u32),
+    /// The Data-In that carries the status.
+    DataInWithStatus,
+    /// The next R2T.
+    R2t,
+    /// The next SCSI Response.
+    Response,
+}
+
+impl Loss {
+    fn hits(self, m: &Message) -> bool {
+        match (self, m) {
+            (Loss::DataIn(n), Message::DataIn(d)) => d.data_sn == n && !d.data.is_empty(),
+            (Loss::DataInWithStatus, Message::DataIn(d)) => d.status.is_some(),
+            (Loss::R2t, Message::R2t(_)) => true,
+            (Loss::Response, Message::ScsiResponse(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// How the target drops a connection (TCP reset, nothing sent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kill {
+    /// On the next read or write, before it is looked at.
+    BeforeCommand,
+    /// On the next read or write, after the target did all it does for it.
+    AfterCommand,
+    /// After this many more Data-Out PDUs.
+    DataOut(usize),
+}
+
 /// A write waiting for its data.
 struct Write {
     itt: u32,
@@ -282,6 +348,8 @@ struct Write {
     r2t_end: Option<usize>,
     next_offset: usize,
     r2t_sn: u32,
+    /// Data-Out PDUs of this TTT are dropped (one failed its digest).
+    discarding: Option<u32>,
 }
 
 /// What a connection waits for before it carries on.
@@ -297,10 +365,15 @@ enum Pending {
 
 struct Conn {
     socket: SocketHandle,
+    id: usize,
+    port: u16,
+    cid: u16,
+    dead: bool,
+    abort: bool,
+    last_exp_stat: u32,
     reader: PduReader,
     out: Vec<u8>,
     stat_sn: u32,
-    exp_cmd_sn: u32,
     /// The initiator's declared MaxRecvDataSegmentLength.
     initiator_mrdsl: usize,
     initial_r2t: bool,
@@ -338,6 +411,24 @@ pub(crate) struct Stats {
     pub(crate) unexpected_nop_outs: usize,
     /// The initiator's answers to keys the target offered.
     pub(crate) answers: Vec<(String, String)>,
+    /// Logins that joined an existing session.
+    pub(crate) additional_logins: usize,
+    /// Command retries the target dropped as already seen.
+    pub(crate) duplicate_commands: usize,
+    /// The most commands held back waiting for an earlier CmdSN.
+    pub(crate) held_max: usize,
+    /// ExpStatSN values that went backwards or acknowledged what was never sent.
+    pub(crate) exp_stat_sn_violations: usize,
+    /// SNACKs received: kind, BegRun, RunLength.
+    pub(crate) snacks: Vec<(u8, u32, u32)>,
+    pub(crate) data_acks: usize,
+    pub(crate) reassigns: usize,
+    pub(crate) redirects: usize,
+    /// The CmdSN of each command, in the order it was executed.
+    pub(crate) cmd_sns: Vec<u32>,
+    /// The CID of the connection each read or write arrived on.
+    pub(crate) rw_cids: Vec<u16>,
+    pub(crate) rejects: usize,
 }
 
 /// A fake iSCSI target on port 3260 of whichever host steps it.
@@ -359,18 +450,58 @@ pub(crate) struct Target {
     /// Corrupt the next PDU with data (or any, for a header) once digests
     /// are on.
     pub(crate) corrupt: Option<Corrupt>,
+    /// Logical units besides 0: the number and the RAM disk.
+    pub(crate) extra_luns: Vec<(u16, Vec<u8>)>,
+    /// PDUs to lose, in turn.
+    pub(crate) lose: Vec<Loss>,
+    /// Drop a connection.
+    pub(crate) kill: Option<Kill>,
+    /// Drop the next read or write command without a trace.
+    pub(crate) drop_next_command: bool,
+    /// Reject the next read or write command for a data digest error.
+    pub(crate) reject_next_command: bool,
+    /// Reject the next solicited Data-Out for a data digest error.
+    pub(crate) reject_next_data_out: bool,
+    /// After the next command, send an asynchronous "drop the connection"
+    /// event (Time2Wait 0) and close.
+    pub(crate) async_drop: bool,
+    /// Before the next SCSI Response, send an asynchronous event that is lost.
+    pub(crate) lost_async: bool,
+    /// Answer TASK REASSIGN with "task does not exist".
+    pub(crate) forget_tasks: bool,
+    /// The error recovery level agreed in the leading login.
+    erl: u8,
+    /// InitialR2T, ImmediateData, FirstBurstLength and MaxBurstLength as the
+    /// leading login settled them, which other connections inherit.
+    neg: (bool, bool, usize, usize),
+    /// The CmdSN expected next, session-wide.
+    exp_cmd_sn: u32,
+    /// Commands that arrived early: the connection and the command.
+    held: Vec<(usize, Message)>,
+    /// Everything sent that a SNACK or reassignment may ask for again.
+    log: Vec<(u16, Message)>,
+    /// Writes whose connection was dropped.
+    orphans: Vec<Write>,
+    /// The StatSN each CID has reached.
+    cid_stat: std::collections::BTreeMap<u16, u32>,
+    next_conn_id: usize,
     attention_sent: bool,
-    listener: Option<SocketHandle>,
+    listeners: Vec<(u16, SocketHandle)>,
     conns: Vec<Conn>,
 }
 
 const BLOCK: usize = 512;
 
+/// The RAM disk a LUN starts with.
+fn ram_disk(blocks: usize, seed: u8) -> Vec<u8> {
+    (0..blocks * BLOCK).map(|i| (i / BLOCK) as u8 ^ (i % 251) as u8 ^ seed).collect()
+}
+
 impl Target {
     fn new(cfg: TargetConfig, blocks: usize) -> Self {
         Self {
             cfg,
-            disk: (0..blocks * BLOCK).map(|i| (i / BLOCK) as u8 ^ (i % 251) as u8).collect(),
+            disk: ram_disk(blocks, 0),
             stats: Stats::default(),
             fail_next: None,
             ping: None,
@@ -378,61 +509,101 @@ impl Target {
             fault: None,
             skip_stat_sn: false,
             corrupt: None,
+            extra_luns: Vec::new(),
+            lose: Vec::new(),
+            kill: None,
+            drop_next_command: false,
+            reject_next_command: false,
+            reject_next_data_out: false,
+            async_drop: false,
+            lost_async: false,
+            forget_tasks: false,
+            erl: 0,
+            neg: (true, true, 65536, 262_144),
+            exp_cmd_sn: 0,
+            held: Vec::new(),
+            log: Vec::new(),
+            orphans: Vec::new(),
+            cid_stat: Default::default(),
+            next_conn_id: 0,
             attention_sent: false,
-            listener: None,
+            listeners: Vec::new(),
             conns: Vec::new(),
+        }
+    }
+
+    /// Adds logical unit `lun`, a RAM disk of `blocks` blocks.
+    pub(crate) fn add_lun(&mut self, lun: u16, blocks: usize) {
+        self.extra_luns.push((lun, ram_disk(blocks, (lun as u8).wrapping_mul(7))));
+    }
+
+    fn lun_id(field: &[u8; 8]) -> u16 {
+        u16::from(field[0] & 0x3f) << 8 | u16::from(field[1])
+    }
+
+    fn disk_of(&self, lun: u16) -> Option<&Vec<u8>> {
+        if lun == 0 { Some(&self.disk) } else { self.extra_luns.iter().find(|(n, _)| *n == lun).map(|(_, d)| d) }
+    }
+
+    fn disk_mut_of(&mut self, lun: u16) -> Option<&mut Vec<u8>> {
+        if lun == 0 {
+            Some(&mut self.disk)
+        } else {
+            self.extra_luns.iter_mut().find(|(n, _)| *n == lun).map(|(_, d)| d)
         }
     }
 
     /// Accepts connections and serves every PDU that has arrived.
     fn step(&mut self, sockets: &mut SocketSet) {
-        match self.listener {
-            Some(h) if sockets.get::<TcpSocket>(h).state() != TcpState::Listen => {
-                self.conns.push(Conn {
-                    socket: h,
-                    reader: PduReader::new(1 << 24),
-                    out: Vec::new(),
-                    stat_sn: 0x1000,
-                    exp_cmd_sn: 0,
-                    initiator_mrdsl: 8192,
-                    initial_r2t: true,
-                    immediate_data: true,
-                    first_burst: 65536,
-                    max_burst: 262_144,
-                    security_rounds: 0,
-                    operational_rounds: 0,
-                    pending: Pending::None,
-                    closing: false,
-                    paced: VecDeque::new(),
-                    pace_wait: 0,
-                    header_digest: false,
-                    data_digest: false,
-                    agreed: (false, false),
-                    corrupt: None,
-                });
-                self.listener = None;
+        let ports: Vec<u16> = std::iter::once(3260).chain(self.cfg.extra_ports.iter().copied()).collect();
+        for port in ports {
+            if let Some(i) = self.listeners.iter().position(|(p, _)| *p == port) {
+                let h = self.listeners[i].1;
+                if sockets.get::<TcpSocket>(h).state() != TcpState::Listen {
+                    self.accept(h, port);
+                    self.listeners.remove(i);
+                }
             }
-            Some(_) => {}
-            None => {}
-        }
-        if self.listener.is_none() {
-            let h = sockets.add(TcpSocket::new(65535, 1 << 20));
-            sockets.get_mut::<TcpSocket>(h).listen(3260).unwrap();
-            self.listener = Some(h);
+            if !self.listeners.iter().any(|(p, _)| *p == port) {
+                let h = sockets.add(TcpSocket::new(65535, 1 << 20));
+                sockets.get_mut::<TcpSocket>(h).listen(port).unwrap();
+                self.listeners.push((port, h));
+            }
         }
         let mut conns = core::mem::take(&mut self.conns);
-        for c in &mut conns {
+        let mut order: Vec<usize> = (0..conns.len()).collect();
+        if self.cfg.reverse_conns {
+            order.reverse();
+        }
+        for ci in order {
+            let c = &mut conns[ci];
+            if c.dead {
+                continue;
+            }
             let s = sockets.get_mut::<TcpSocket>(c.socket);
             let mut buf = [0u8; 4096];
             while let Ok(n @ 1..) = s.recv(&mut buf) {
                 c.reader.push(&buf[..n]);
             }
-            while let Some(pdu) = c.reader.next_pdu().expect("initiator digests are valid") {
+            while !c.abort
+                && let Some(pdu) = c.reader.next_pdu().expect("initiator digests are valid")
+            {
                 if (c.header_digest || c.data_digest) && self.corrupt.is_some() {
                     c.corrupt = self.corrupt.take();
                 }
                 let m = Message::decode(pdu).expect("initiator sent an unknown PDU");
                 self.handle(c, m);
+            }
+        }
+        self.drain_held(&mut conns);
+        for c in &mut conns {
+            if c.dead {
+                continue;
+            }
+            if c.abort {
+                sockets.get_mut::<TcpSocket>(c.socket).abort();
+                c.dead = true;
+                continue;
             }
             if !c.paced.is_empty() {
                 if c.pace_wait == 0 {
@@ -455,7 +626,86 @@ impl Target {
         self.conns = conns;
     }
 
-    fn send(c: &mut Conn, m: Message) {
+    fn accept(&mut self, socket: SocketHandle, port: u16) {
+        self.next_conn_id += 1;
+        self.conns.push(Conn {
+            socket,
+            id: self.next_conn_id,
+            port,
+            cid: 0,
+            dead: false,
+            abort: false,
+            last_exp_stat: 0,
+            reader: PduReader::new(1 << 24),
+            out: Vec::new(),
+            stat_sn: 0x1000,
+            initiator_mrdsl: 8192,
+            initial_r2t: true,
+            immediate_data: true,
+            first_burst: 65536,
+            max_burst: 262_144,
+            security_rounds: 0,
+            operational_rounds: 0,
+            pending: Pending::None,
+            closing: false,
+            paced: VecDeque::new(),
+            pace_wait: 0,
+            header_digest: false,
+            data_digest: false,
+            agreed: (false, false),
+            corrupt: None,
+        });
+    }
+
+    /// Runs the commands that were held for an earlier CmdSN and now can go.
+    fn drain_held(&mut self, conns: &mut [Conn]) {
+        while let Some(i) =
+            self.held.iter().position(|(_, m)| matches!(m, Message::ScsiCommand(cmd) if cmd.cmd_sn == self.exp_cmd_sn))
+        {
+            let (id, m) = self.held.remove(i);
+            let Message::ScsiCommand(cmd) = m else { panic!("held commands are SCSI commands") };
+            if let Some(c) = conns.iter_mut().find(|c| c.id == id && !c.dead) {
+                self.command(c, cmd);
+            } else {
+                // Its connection is gone: the command is lost with it.
+                self.exp_cmd_sn = cmd.cmd_sn.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Checks an initiator's ExpStatSN: never backwards, never past what
+    /// this connection has sent.
+    fn check_exp_stat(&mut self, c: &mut Conn, exp: u32) {
+        if sn_lt(c.stat_sn, exp) || sn_lt(exp, c.last_exp_stat) {
+            self.stats.exp_stat_sn_violations += 1;
+        } else {
+            c.last_exp_stat = exp;
+        }
+    }
+
+    /// Drops the connection as a crash would: nothing more is sent, the
+    /// socket is reset, and a write in progress is remembered.
+    fn kill_conn(&mut self, c: &mut Conn) {
+        if let Pending::Write(w) = core::mem::replace(&mut c.pending, Pending::None) {
+            self.orphans.push(w);
+        }
+        c.out.clear();
+        c.paced.clear();
+        c.abort = true;
+    }
+
+    /// Sends `m` and remembers it; the network may lose it (see [`Loss`]).
+    fn send(&mut self, c: &mut Conn, m: Message) {
+        self.log.push((c.cid, m.clone()));
+        if let Some(i) = self.lose.iter().position(|l| l.hits(&m)) {
+            self.lose.remove(i);
+            return;
+        }
+        self.send_raw(c, m);
+    }
+
+    /// Sends `m` without remembering it again or losing it.
+    fn send_raw(&mut self, c: &mut Conn, m: Message) {
         let pdu = m.encode();
         let mut bytes = pdu.to_bytes_with(c.header_digest, c.data_digest);
         let hit = match c.corrupt {
@@ -477,49 +727,251 @@ impl Target {
     }
 
     /// The next StatSN for a status-bearing PDU.
-    fn stat_sn(c: &mut Conn) -> u32 {
+    fn next_stat_sn(&mut self, c: &mut Conn) -> u32 {
         c.stat_sn += 1;
+        self.cid_stat.insert(c.cid, c.stat_sn);
         c.stat_sn - 1
     }
 
-    fn window(c: &Conn) -> (u32, u32) {
-        (c.exp_cmd_sn, c.exp_cmd_sn.wrapping_add(7))
+    fn window(&self) -> (u32, u32) {
+        (self.exp_cmd_sn, self.exp_cmd_sn.wrapping_add(7))
+    }
+
+    /// Brings the command window of a PDU being sent again up to date.
+    fn refresh(&self, m: &mut Message) {
+        let (e, x) = self.window();
+        match m {
+            Message::DataIn(d) => (d.exp_cmd_sn, d.max_cmd_sn) = (e, x),
+            Message::ScsiResponse(d) => (d.exp_cmd_sn, d.max_cmd_sn) = (e, x),
+            Message::R2t(d) => (d.exp_cmd_sn, d.max_cmd_sn) = (e, x),
+            Message::AsyncMessage(d) => (d.exp_cmd_sn, d.max_cmd_sn) = (e, x),
+            _ => {}
+        }
+    }
+
+    /// How many Data-In PDUs were sent for `itt`.
+    fn data_in_count(&self, itt: u32) -> u32 {
+        self.log.iter().filter(|(_, m)| matches!(m, Message::DataIn(d) if d.itt == itt)).count() as u32
+    }
+
+    /// A status-bearing PDU as the SCSI Response a status SNACK is answered
+    /// with: a Data-In with status becomes one.
+    fn as_status(&self, m: &Message) -> Message {
+        match m {
+            Message::DataIn(d) if d.status.is_some() => Message::ScsiResponse(ScsiResponse {
+                overflow: d.overflow,
+                underflow: d.underflow,
+                response: 0,
+                status: d.status.unwrap(),
+                itt: d.itt,
+                stat_sn: d.stat_sn,
+                exp_cmd_sn: d.exp_cmd_sn,
+                max_cmd_sn: d.max_cmd_sn,
+                exp_data_sn: self.data_in_count(d.itt),
+                residual: d.residual,
+                data: vec![],
+            }),
+            m => m.clone(),
+        }
+    }
+
+    fn reject(&mut self, c: &mut Conn, reason: u8, header: Vec<u8>) {
+        self.stats.rejects += 1;
+        let (exp, max) = self.window();
+        let stat_sn = self.next_stat_sn(c);
+        self.send_raw(
+            c,
+            Message::Reject(Reject { reason, stat_sn, exp_cmd_sn: exp, max_cmd_sn: max, data_sn: 0, data: header }),
+        );
+    }
+
+    fn snack(&mut self, c: &mut Conn, s: SnackRequest) {
+        self.check_exp_stat(c, s.exp_stat_sn);
+        self.stats.snacks.push((s.kind, s.beg_run, s.run_length));
+        let in_run =
+            |sn: u32| !sn_lt(sn, s.beg_run) && (s.run_length == 0 || sn_lt(sn, s.beg_run.wrapping_add(s.run_length)));
+        let mut out: Vec<Message> = Vec::new();
+        match s.kind {
+            snack::DATA_R2T => {
+                for (_, m) in &self.log {
+                    match m {
+                        Message::DataIn(d) if d.itt == s.itt && in_run(d.data_sn) => out.push(m.clone()),
+                        Message::R2t(r) if r.itt == s.itt && in_run(r.r2t_sn) => out.push(m.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            snack::STATUS => {
+                for (cid, m) in &self.log {
+                    if *cid == c.cid
+                        && let Some(sn) = m.stat_sn()
+                        && !matches!(m, Message::LoginResponse(_))
+                        && in_run(sn)
+                    {
+                        out.push(self.as_status(m));
+                    }
+                }
+                out.sort_by_key(|m| m.stat_sn().unwrap().wrapping_sub(s.beg_run));
+            }
+            snack::DATA_ACK => {
+                self.stats.data_acks += 1;
+                return;
+            }
+            snack::R_DATA => {
+                for (_, m) in &self.log {
+                    match m {
+                        Message::DataIn(d) if d.itt == s.itt && in_run(d.data_sn) => {
+                            let mut d = d.clone();
+                            d.status = None;
+                            d.stat_sn = 0;
+                            d.residual = 0;
+                            d.underflow = false;
+                            out.push(Message::DataIn(d));
+                        }
+                        _ => {}
+                    }
+                }
+                let status = self
+                    .log
+                    .iter()
+                    .find(|(_, m)| match m {
+                        Message::DataIn(d) => d.itt == s.itt && d.status.is_some(),
+                        Message::ScsiResponse(r) => r.itt == s.itt,
+                        _ => false,
+                    })
+                    .map(|(_, m)| self.as_status(m));
+                out.extend(status);
+            }
+            k => panic!("SNACK type {k}"),
+        }
+        if out.is_empty() {
+            // Nothing to send again: a target rejects what it cannot do.
+            let header = Message::SnackRequest(s).encode().bhs.to_vec();
+            return self.reject(c, 0x03, header);
+        }
+        for mut m in out {
+            self.refresh(&mut m);
+            self.send_raw(c, m);
+        }
+    }
+
+    /// TASK REASSIGN: the task goes on `c`.
+    fn task_reassign(&mut self, c: &mut Conn, t: TmfRequest) {
+        self.check_exp_stat(c, t.exp_stat_sn);
+        assert_eq!(t.function, tmf::TASK_REASSIGN);
+        self.stats.reassigns += 1;
+        let respond = |this: &mut Self, c: &mut Conn, response: u8| {
+            let (exp, max) = this.window();
+            let stat_sn = this.next_stat_sn(c);
+            this.send_raw(
+                c,
+                Message::TmfResponse(TmfResponse { response, itt: t.itt, stat_sn, exp_cmd_sn: exp, max_cmd_sn: max }),
+            );
+        };
+        if self.forget_tasks {
+            return respond(self, c, 5);
+        }
+        if let Some(i) = self.orphans.iter().position(|w| w.itt == t.ref_task_tag) {
+            // A write that was in progress: ask for what is missing.
+            let mut w = self.orphans.remove(i);
+            respond(self, c, 0);
+            w.r2t_end = None;
+            w.unsolicited_done = true;
+            w.next_offset = w.got;
+            w.discarding = None;
+            self.advance(c, w);
+            return;
+        }
+        let itt = t.ref_task_tag;
+        let mut status = None;
+        let mut data = Vec::new();
+        for (_, m) in &self.log {
+            match m {
+                Message::DataIn(d) if d.itt == itt => {
+                    if d.data_sn >= t.exp_data_sn {
+                        let mut d = d.clone();
+                        d.status = None;
+                        d.stat_sn = 0;
+                        d.residual = 0;
+                        d.underflow = false;
+                        data.push(Message::DataIn(d));
+                    }
+                    if d.status.is_some() {
+                        status = Some(m.clone());
+                    }
+                }
+                Message::ScsiResponse(r) if r.itt == itt => status = Some(m.clone()),
+                _ => {}
+            }
+        }
+        let Some(status) = status else {
+            return respond(self, c, 5);
+        };
+        respond(self, c, 0);
+        for mut m in data {
+            self.refresh(&mut m);
+            self.send_raw(c, m);
+        }
+        let mut m = self.as_status(&status);
+        let sn = self.next_stat_sn(c);
+        if let Message::ScsiResponse(r) = &mut m {
+            r.stat_sn = sn;
+        }
+        self.refresh(&mut m);
+        self.send_raw(c, m);
     }
 
     fn handle(&mut self, c: &mut Conn, m: Message) {
         match m {
             Message::LoginRequest(r) => self.login(c, r),
             Message::ScsiCommand(cmd) => {
-                assert_eq!(cmd.cmd_sn, c.exp_cmd_sn, "CmdSN in order");
-                assert!(matches!(c.pending, Pending::None), "one command at a time");
-                c.exp_cmd_sn = cmd.cmd_sn.wrapping_add(1);
-                if core::mem::take(&mut self.ignore_next) {
+                self.check_exp_stat(c, cmd.exp_stat_sn);
+                let rw = matches!(cmd.cdb[0], op::READ_10 | op::READ_16 | op::WRITE_10 | op::WRITE_16);
+                if rw && core::mem::take(&mut self.drop_next_command) {
                     return;
                 }
-                match self.ping.take() {
-                    Some(ttt) => {
-                        let (exp, max) = Self::window(c);
-                        let stat_sn = c.stat_sn;
-                        Self::send(
-                            c,
-                            Message::NopIn(NopIn {
-                                lun: cmd.lun,
-                                itt: RESERVED_TAG,
-                                ttt,
-                                stat_sn,
-                                exp_cmd_sn: exp,
-                                max_cmd_sn: max,
-                                data: if ttt == RESERVED_TAG { vec![] } else { b"ping".to_vec() },
-                            }),
-                        );
-                        if ttt == RESERVED_TAG {
-                            self.execute(c, cmd);
-                        } else {
-                            c.pending = Pending::Pong { ttt, cmd };
-                        }
-                    }
-                    None => self.execute(c, cmd),
+                if rw && self.kill == Some(Kill::BeforeCommand) {
+                    self.kill = None;
+                    return self.kill_conn(c);
                 }
+                if rw && core::mem::take(&mut self.reject_next_command) {
+                    let header = Message::ScsiCommand(cmd).encode().bhs.to_vec();
+                    return self.reject(c, 0x02, header);
+                }
+                if sn_lt(cmd.cmd_sn, self.exp_cmd_sn) {
+                    // A command we have, sent again.
+                    self.stats.duplicate_commands += 1;
+                    return;
+                }
+                if cmd.cmd_sn != self.exp_cmd_sn {
+                    // Early: on another connection an earlier one is still on
+                    // its way.
+                    assert!(!sn_lt(self.exp_cmd_sn.wrapping_add(7), cmd.cmd_sn), "CmdSN within the window");
+                    self.held.push((c.id, Message::ScsiCommand(cmd)));
+                    self.stats.held_max = self.stats.held_max.max(self.held.len());
+                    return;
+                }
+                self.command(c, cmd);
+            }
+            Message::SnackRequest(s) => self.snack(c, s),
+            Message::TmfRequest(t) => self.task_reassign(c, t),
+            Message::NopOut(n) if n.itt != RESERVED_TAG => {
+                // A ping from the initiator: answer with the window.
+                self.check_exp_stat(c, n.exp_stat_sn);
+                let (exp, max) = self.window();
+                let stat_sn = self.next_stat_sn(c);
+                self.send_raw(
+                    c,
+                    Message::NopIn(NopIn {
+                        lun: n.lun,
+                        itt: n.itt,
+                        ttt: RESERVED_TAG,
+                        stat_sn,
+                        exp_cmd_sn: exp,
+                        max_cmd_sn: max,
+                        data: n.data,
+                    }),
+                );
             }
             Message::NopOut(n) => {
                 assert_eq!(n.itt, RESERVED_TAG, "answers carry no ITT");
@@ -535,10 +987,14 @@ impl Target {
                     }
                 }
             }
-            Message::DataOut(d) => self.data_out(c, d),
+            Message::DataOut(d) => {
+                self.check_exp_stat(c, d.exp_stat_sn);
+                self.data_out(c, d)
+            }
             Message::TextRequest(t) => {
-                assert_eq!(t.cmd_sn, c.exp_cmd_sn);
-                c.exp_cmd_sn = t.cmd_sn.wrapping_add(1);
+                self.check_exp_stat(c, t.exp_stat_sn);
+                assert_eq!(t.cmd_sn, self.exp_cmd_sn);
+                self.exp_cmd_sn = t.cmd_sn.wrapping_add(1);
                 let flood = self.cfg.text_flood;
                 let mut data = Vec::new();
                 if flood {
@@ -551,9 +1007,9 @@ impl Target {
                     text::push(&mut data, "TargetName", "iqn.2026-10.org.osmium:other");
                     text::push(&mut data, "TargetAddress", "10.9.8.7,1");
                 }
-                let (exp, max) = Self::window(c);
-                let stat_sn = Self::stat_sn(c);
-                Self::send(
+                let (exp, max) = self.window();
+                let stat_sn = self.next_stat_sn(c);
+                self.send(
                     c,
                     Message::TextResponse(TextResponse {
                         final_pdu: !flood,
@@ -569,10 +1025,11 @@ impl Target {
                 );
             }
             Message::LogoutRequest(l) => {
+                self.check_exp_stat(c, l.exp_stat_sn);
                 self.stats.logouts += 1;
-                let (exp, max) = Self::window(c);
-                let stat_sn = Self::stat_sn(c);
-                Self::send(
+                let (exp, max) = self.window();
+                let stat_sn = self.next_stat_sn(c);
+                self.send(
                     c,
                     Message::LogoutResponse(LogoutResponse {
                         response: 0,
@@ -590,6 +1047,65 @@ impl Target {
         }
     }
 
+    /// Runs `cmd`, which has the CmdSN expected next.
+    fn command(&mut self, c: &mut Conn, cmd: ScsiCommand) {
+        assert!(matches!(c.pending, Pending::None), "one command at a time");
+        self.exp_cmd_sn = cmd.cmd_sn.wrapping_add(1);
+        self.stats.cmd_sns.push(cmd.cmd_sn);
+        let rw = matches!(cmd.cdb[0], op::READ_10 | op::READ_16 | op::WRITE_10 | op::WRITE_16);
+        if rw {
+            self.stats.rw_cids.push(c.cid);
+        }
+        if core::mem::take(&mut self.ignore_next) {
+            return;
+        }
+        match self.ping.take() {
+            Some(ttt) => {
+                let (exp, max) = self.window();
+                let stat_sn = c.stat_sn;
+                self.send(
+                    c,
+                    Message::NopIn(NopIn {
+                        lun: cmd.lun,
+                        itt: RESERVED_TAG,
+                        ttt,
+                        stat_sn,
+                        exp_cmd_sn: exp,
+                        max_cmd_sn: max,
+                        data: if ttt == RESERVED_TAG { vec![] } else { b"ping".to_vec() },
+                    }),
+                );
+                if ttt == RESERVED_TAG {
+                    self.execute(c, cmd);
+                } else {
+                    c.pending = Pending::Pong { ttt, cmd };
+                }
+            }
+            None => self.execute(c, cmd),
+        }
+        if rw && self.kill == Some(Kill::AfterCommand) {
+            self.kill = None;
+            self.kill_conn(c);
+        } else if core::mem::take(&mut self.async_drop) {
+            let (exp, max) = self.window();
+            let stat_sn = self.next_stat_sn(c);
+            self.send(
+                c,
+                Message::AsyncMessage(AsyncMessage {
+                    lun: [0; 8],
+                    stat_sn,
+                    exp_cmd_sn: exp,
+                    max_cmd_sn: max,
+                    event: 2,
+                    vcode: 0,
+                    params: [0, 0, 5],
+                    data: vec![],
+                }),
+            );
+            c.closing = true;
+        }
+    }
+
     fn login(&mut self, c: &mut Conn, r: LoginRequest) {
         let keys: Vec<(String, String)> =
             text::parse(&r.data).unwrap().into_iter().map(|(k, v)| (k.into(), v.into())).collect();
@@ -599,13 +1115,62 @@ impl Target {
         let mut detail = 3;
         let mut transit = r.transit;
         let mut nsg = r.nsg;
+        let leading = r.tsih == 0;
         if r.csg == stage::SECURITY && c.security_rounds == 0 {
-            c.exp_cmd_sn = r.cmd_sn;
+            c.cid = r.cid;
+            if leading {
+                self.exp_cmd_sn = r.cmd_sn;
+            }
+            // Each connection numbers its statuses from its own base, and a
+            // replacement for a lost one carries on from where it was.
+            c.stat_sn = match self.cid_stat.get(&c.cid) {
+                Some(sn) if !leading => *sn,
+                _ => 0x1000 + 0x100 * u32::from(c.cid),
+            };
+            c.last_exp_stat = c.stat_sn;
+            if !leading {
+                (c.initial_r2t, c.immediate_data, c.first_burst, c.max_burst) = self.neg;
+            }
             assert_eq!(get("InitiatorName"), Some(INITIATOR_NAME));
             match get("SessionType") {
                 Some("Discovery") => {}
                 _ if get("TargetName") != Some(TARGET_NAME) => class = 2,
                 _ => {}
+            }
+            if !leading && r.tsih != 7 {
+                (class, detail) = (2, 10); // session does not exist
+            }
+            if !leading && self.cfg.refuse_additional {
+                (class, detail) = (3, 1); // out of resources
+            }
+            if leading
+                && let Some(red) = self.cfg.redirect.clone()
+                && c.port == 3260
+            {
+                self.stats.redirects += 1;
+                let mut data = Vec::new();
+                if !red.address.is_empty() {
+                    text::push(&mut data, "TargetAddress", &red.address);
+                }
+                let (exp, max) = self.window();
+                let stat_sn = self.next_stat_sn(c);
+                self.send(
+                    c,
+                    Message::LoginResponse(LoginResponse {
+                        csg: r.csg,
+                        isid: r.isid,
+                        itt: r.itt,
+                        stat_sn,
+                        exp_cmd_sn: exp,
+                        max_cmd_sn: max,
+                        status_class: 1,
+                        status_detail: if red.permanent { 2 } else { 1 },
+                        data,
+                        ..LoginResponse::default()
+                    }),
+                );
+                c.closing = true;
+                return;
             }
         }
         match r.csg {
@@ -690,6 +1255,14 @@ impl Target {
                             c.immediate_data = yes() && cfg.immediate_data;
                             text::yes_no(c.immediate_data).into()
                         }
+                        "MaxConnections" => num().min(cfg.max_connections as usize).to_string(),
+                        "ErrorRecoveryLevel" => {
+                            let erl = num().min(cfg.erl as usize);
+                            if leading {
+                                self.erl = erl as u8;
+                            }
+                            erl.to_string()
+                        }
                         "MaxBurstLength" => {
                             c.max_burst = num().min(cfg.max_burst as usize);
                             c.max_burst.to_string()
@@ -709,6 +1282,9 @@ impl Target {
                 if c.operational_rounds == 1 {
                     text::push(&mut out, "MaxRecvDataSegmentLength", &cfg.mrdsl.to_string());
                 }
+                if leading {
+                    self.neg = (c.initial_r2t, c.immediate_data, c.first_burst, c.max_burst);
+                }
                 if self.cfg.extra_operational_round && c.operational_rounds == 1 {
                     text::push(&mut out, "X-org.osmium.Probe", "1");
                     (transit, nsg) = (false, 0);
@@ -724,10 +1300,13 @@ impl Target {
         }
         if transit && nsg == stage::FULL_FEATURE {
             self.stats.logins += 1;
+            if !leading {
+                self.stats.additional_logins += 1;
+            }
         }
-        let (exp, max) = Self::window(c);
-        let stat_sn = Self::stat_sn(c);
-        Self::send(
+        let (exp, max) = self.window();
+        let stat_sn = self.next_stat_sn(c);
+        self.send_raw(
             c,
             Message::LoginResponse(LoginResponse {
                 transit: transit && class == 0,
@@ -753,12 +1332,13 @@ impl Target {
         }
     }
 
-    fn blocks(&self) -> u64 {
-        (self.disk.len() / BLOCK) as u64
+    fn blocks_of(&self, lun: u16) -> u64 {
+        self.disk_of(lun).map_or(0, |d| (d.len() / BLOCK) as u64)
     }
 
     fn execute(&mut self, c: &mut Conn, cmd: ScsiCommand) {
         let opcode = cmd.cdb[0];
+        let lun = Self::lun_id(&cmd.lun);
         self.stats.commands.push(opcode);
         if let Some((op, sense)) = self.fail_next
             && op == opcode
@@ -766,20 +1346,49 @@ impl Target {
             self.fail_next = None;
             return self.respond(c, cmd.itt, scsi::status::CHECK_CONDITION, Some(sense), 0);
         }
-        if self.cfg.unit_attention && !self.attention_sent {
+        if self.cfg.unit_attention && !self.attention_sent && opcode != op::REPORT_LUNS {
             self.attention_sent = true;
             let sense = Sense { key: sense_key::UNIT_ATTENTION, asc: 0x29, ascq: 0 };
             return self.respond(c, cmd.itt, scsi::status::CHECK_CONDITION, Some(sense), 0);
         }
-        let reported = self.cfg.reported_blocks.unwrap_or(self.blocks());
+        let reported = self.cfg.reported_blocks.unwrap_or(self.blocks_of(lun));
         let block_size = self.cfg.reported_block_size.unwrap_or(BLOCK as u32);
+        if opcode == op::REPORT_LUNS {
+            let mut luns = vec![0u16];
+            luns.extend(self.extra_luns.iter().map(|(n, _)| *n));
+            let mut d = ((luns.len() * 8) as u32).to_be_bytes().to_vec();
+            d.extend_from_slice(&[0; 4]);
+            for l in luns {
+                d.extend_from_slice(&lun_field(l));
+            }
+            let len = u32::from_be_bytes([cmd.cdb[6], cmd.cdb[7], cmd.cdb[8], cmd.cdb[9]]) as usize;
+            d.truncate(len);
+            return self.data_in(c, &cmd, d);
+        }
+        if self.disk_of(lun).is_none() {
+            if opcode == op::INQUIRY {
+                let mut d = vec![0; 36];
+                d[0] = 0x7f; // peripheral qualifier 3: not supported
+                d[4] = 31;
+                let len = u16::from_be_bytes([cmd.cdb[3], cmd.cdb[4]]) as usize;
+                d.truncate(len);
+                return self.data_in(c, &cmd, d);
+            }
+            let sense = Sense { key: sense_key::ILLEGAL_REQUEST, asc: 0x25, ascq: 0 };
+            return self.respond(c, cmd.itt, scsi::status::CHECK_CONDITION, Some(sense), 0);
+        }
         match opcode {
             op::TEST_UNIT_READY => self.respond(c, cmd.itt, 0, None, 0),
             op::INQUIRY => {
                 let mut d = vec![b' '; 36];
                 d[..8].copy_from_slice(&[0, 0, 5, 2, 31, 0, 0, 0]);
                 d[8..14].copy_from_slice(b"OSMIUM");
-                d[16..25].copy_from_slice(b"FAKE DISK");
+                if lun == 0 {
+                    d[16..25].copy_from_slice(b"FAKE DISK");
+                } else {
+                    let name = format!("FAKE LUN {lun}");
+                    d[16..16 + name.len()].copy_from_slice(name.as_bytes());
+                }
                 d[32..36].copy_from_slice(b"0001");
                 let len = u16::from_be_bytes([cmd.cdb[3], cmd.cdb[4]]) as usize;
                 d.truncate(len);
@@ -799,7 +1408,7 @@ impl Target {
             }
             op::READ_10 | op::READ_16 | op::WRITE_10 | op::WRITE_16 => {
                 let (lba, n) = scsi::rw_range(&cmd.cdb).unwrap();
-                if lba + n as u64 > self.blocks() {
+                if lba + n as u64 > self.blocks_of(lun) {
                     let sense = Sense { key: sense_key::ILLEGAL_REQUEST, asc: scsi::ASC_LBA_OUT_OF_RANGE, ascq: 0 };
                     return self.respond(c, cmd.itt, scsi::status::CHECK_CONDITION, Some(sense), 0);
                 }
@@ -807,7 +1416,7 @@ impl Target {
                 assert_eq!(cmd.expected_len as usize, len);
                 assert!(len <= c.max_burst, "commands split to MaxBurstLength");
                 if cmd.read {
-                    let mut d = self.disk[at..at + len].to_vec();
+                    let mut d = self.disk_of(lun).unwrap()[at..at + len].to_vec();
                     if self.fault == Some(Fault::DataInUnderflow) {
                         self.fault = None;
                         d.truncate(len - BLOCK);
@@ -833,6 +1442,7 @@ impl Target {
                     unsolicited_done: cmd.final_pdu,
                     r2t_end: None,
                     r2t_sn: 0,
+                    discarding: None,
                 };
                 self.advance(c, w);
             }
@@ -849,6 +1459,27 @@ impl Target {
             panic!("Data-Out without a write");
         };
         assert_eq!(d.itt, w.itt);
+        if w.discarding.is_some() && w.discarding == Some(d.ttt) {
+            // The rest of a sequence one PDU of which failed its digest.
+            if d.final_pdu {
+                w.discarding = None;
+                w.r2t_end = None;
+                return self.advance(c, w);
+            }
+            c.pending = Pending::Write(w);
+            return;
+        }
+        if d.ttt != RESERVED_TAG && core::mem::take(&mut self.reject_next_data_out) {
+            let header = Message::DataOut(d.clone()).encode().bhs.to_vec();
+            self.reject(c, 0x02, header);
+            if d.final_pdu {
+                w.r2t_end = None;
+                return self.advance(c, w);
+            }
+            w.discarding = Some(d.ttt);
+            c.pending = Pending::Write(w);
+            return;
+        }
         assert!(d.data.len() <= self.cfg.mrdsl as usize, "Data-Out within the target's MRDSL");
         let at = d.offset as usize;
         assert_eq!(at, w.next_offset, "Data-Out in order");
@@ -871,12 +1502,21 @@ impl Target {
             }
         }
         self.advance(c, w);
+        if let Some(Kill::DataOut(n)) = self.kill {
+            if n <= 1 {
+                self.kill = None;
+                self.kill_conn(c);
+            } else {
+                self.kill = Some(Kill::DataOut(n - 1));
+            }
+        }
     }
 
     /// Asks for more of a write's data, or completes it.
     fn advance(&mut self, c: &mut Conn, mut w: Write) {
         if w.got == w.buf.len() && w.r2t_end.is_none() {
-            self.disk[w.at..w.at + w.buf.len()].copy_from_slice(&w.buf);
+            let lun = Self::lun_id(&w.lun);
+            self.disk_mut_of(lun).unwrap()[w.at..w.at + w.buf.len()].copy_from_slice(&w.buf);
             let residual = if self.fault == Some(Fault::WriteUnderflow) {
                 self.fault = None;
                 BLOCK as u32
@@ -896,9 +1536,9 @@ impl Target {
                 Some(Fault::R2tGap) => (offset, desired) = (offset + BLOCK, len - BLOCK),
                 f => self.fault = f,
             }
-            let (exp, max) = Self::window(c);
+            let (exp, max) = self.window();
             let stat_sn = c.stat_sn;
-            Self::send(
+            self.send(
                 c,
                 Message::R2t(R2t {
                     lun: w.lun,
@@ -943,10 +1583,10 @@ impl Target {
         let count = d.len().div_ceil(seg).max(1);
         if fault == Some(Fault::DataInLastOnly) {
             // Just the last block, claiming the command is done.
-            let (exp, max) = Self::window(c);
-            let stat_sn = Self::stat_sn(c);
+            let (exp, max) = self.window();
+            let stat_sn = self.next_stat_sn(c);
             let at = d.len() - BLOCK;
-            Self::send(
+            self.send(
                 c,
                 Message::DataIn(DataIn {
                     final_pdu: true,
@@ -968,20 +1608,21 @@ impl Target {
             let chunk = &d[(i * seg).min(d.len())..((i + 1) * seg).min(d.len())];
             let last = i + 1 == count;
             let with_status = last && self.cfg.status_in_data_in;
-            let (exp, max) = Self::window(c);
-            let stat_sn = if with_status { Self::stat_sn(c) } else { 0 };
+            let ack = !last && self.erl >= 1 && self.cfg.ack_every.is_some_and(|k| (i + 1) % k == 0);
+            let (exp, max) = self.window();
+            let stat_sn = if with_status { self.next_stat_sn(c) } else { 0 };
             let before = c.out.len();
-            Self::send(
+            self.send(
                 c,
                 Message::DataIn(DataIn {
                     final_pdu: last,
-                    ack: false,
+                    ack,
                     overflow: false,
                     underflow: with_status && residual > 0,
                     status: with_status.then_some(0),
                     lun: cmd.lun,
                     itt: cmd.itt,
-                    ttt: RESERVED_TAG,
+                    ttt: if ack { 0x200 + i as u32 } else { RESERVED_TAG },
                     stat_sn,
                     exp_cmd_sn: exp,
                     max_cmd_sn: max,
@@ -1015,9 +1656,26 @@ impl Target {
             }
             None => vec![],
         };
-        let (exp, max) = Self::window(c);
-        let stat_sn = Self::stat_sn(c);
-        Self::send(
+        if core::mem::take(&mut self.lost_async) {
+            // An event that never arrives, and takes a StatSN with it.
+            let (exp, max) = self.window();
+            let stat_sn = self.next_stat_sn(c);
+            let m = Message::AsyncMessage(AsyncMessage {
+                lun: [0; 8],
+                stat_sn,
+                exp_cmd_sn: exp,
+                max_cmd_sn: max,
+                event: 255,
+                vcode: 0,
+                params: [0; 3],
+                data: vec![],
+            });
+            self.log.push((c.cid, m));
+        }
+        let (exp, max) = self.window();
+        let stat_sn = self.next_stat_sn(c);
+        let exp_data_sn = self.data_in_count(itt);
+        self.send(
             c,
             Message::ScsiResponse(ScsiResponse {
                 overflow: false,
@@ -1028,7 +1686,7 @@ impl Target {
                 stat_sn,
                 exp_cmd_sn: exp,
                 max_cmd_sn: max,
-                exp_data_sn: 0,
+                exp_data_sn,
                 residual,
                 data,
             }),
