@@ -8,7 +8,7 @@
 #![no_main]
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "riscv64")]
 mod sys {
@@ -40,6 +40,10 @@ mod sys {
     pub const GETTID: u64 = 178;
     pub const FUTEX: u64 = 98;
     pub const EXIT_GROUP: u64 = 94;
+    pub const RT_SIGPROCMASK: u64 = 135;
+    pub const RT_SIGSUSPEND: u64 = 133;
+    pub const SIGALTSTACK: u64 = 132;
+    pub const RT_SIGQUEUEINFO: u64 = 138;
 
     /// `sigaction` as the kernel reads it: no restorer, the kernel supplies one.
     #[repr(C)]
@@ -150,6 +154,10 @@ mod sys {
     pub const GETTID: u64 = 178;
     pub const FUTEX: u64 = 98;
     pub const EXIT_GROUP: u64 = 94;
+    pub const RT_SIGPROCMASK: u64 = 135;
+    pub const RT_SIGSUSPEND: u64 = 133;
+    pub const SIGALTSTACK: u64 = 132;
+    pub const RT_SIGQUEUEINFO: u64 = 138;
 
     /// `sigaction` as the kernel reads it: no restorer, the kernel supplies one.
     #[repr(C)]
@@ -260,6 +268,10 @@ mod sys {
     pub const GETTID: u64 = 186;
     pub const FUTEX: u64 = 202;
     pub const EXIT_GROUP: u64 = 231;
+    pub const RT_SIGPROCMASK: u64 = 14;
+    pub const RT_SIGSUSPEND: u64 = 130;
+    pub const SIGALTSTACK: u64 = 131;
+    pub const RT_SIGQUEUEINFO: u64 = 129;
 
     /// `sigaction` as the kernel reads it; without `SA_RESTORER` the kernel
     /// supplies the return trampoline.
@@ -630,6 +642,177 @@ fn signals_and_threads() {
     );
 }
 
+const SIGUSR2: u64 = 12;
+const SIGRT1: u64 = 33;
+const SIGRT2: u64 = 34;
+const SA_SIGINFO: u64 = 4;
+const SA_ONSTACK: u64 = 0x0800_0000;
+const WUNTRACED: u64 = 2;
+const WCONTINUED: u64 = 8;
+const EINTR: i64 = -4;
+
+/// How many queued signals the handler has seen, and each as `signo << 8 | si_value`.
+static NQUEUED: AtomicU32 = AtomicU32::new(0);
+static QUEUED: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+/// Set if a queued signal did not say `SI_QUEUE` (-1).
+static BAD_CODE: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn on_queued(sig: i32, info: *const u8, _ctx: *const u8) {
+    // SAFETY: the kernel put a `siginfo` there; `si_code` is at offset 8 and `si_value` at 24.
+    let (code, value) = unsafe { ((info.add(8) as *const i32).read(), (info.add(24) as *const u64).read()) };
+    if code != -1 {
+        BAD_CODE.store(1, Ordering::SeqCst);
+    }
+    let n = NQUEUED.fetch_add(1, Ordering::SeqCst) as usize;
+    if let Some(slot) = QUEUED.get(n) {
+        slot.store((sig as u32) << 8 | value as u32, Ordering::SeqCst);
+    }
+}
+
+/// An address inside the handler's stack frame.
+static HANDLER_SP: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn on_altstack(_sig: i32, _info: *const u8, _ctx: *const u8) {
+    let marker = 0u8;
+    HANDLER_SP.store(core::hint::black_box(&marker) as *const u8 as usize, Ordering::SeqCst);
+}
+
+static GOT_USR2: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn on_usr2(_sig: i32, _info: *const u8, _ctx: *const u8) {
+    GOT_USR2.fetch_add(1, Ordering::SeqCst);
+}
+
+#[repr(align(16))]
+struct AltStack([u8; 16384]);
+static mut ALT_STACK: AltStack = AltStack([0; 16384]);
+
+/// `struct stack_t`.
+#[repr(C)]
+struct StackT {
+    sp: u64,
+    flags: i32,
+    size: u64,
+}
+
+/// `struct siginfo` as `rt_sigqueueinfo` takes it: 128 bytes.
+#[repr(C)]
+struct SigInfo {
+    signo: i32,
+    errno: i32,
+    code: i32,
+    _pad: i32,
+    pid: i32,
+    uid: i32,
+    value: u64,
+    _rest: [u64; 12],
+}
+
+fn catch_with(sig: u64, handler: extern "C" fn(i32, *const u8, *const u8), flags: u64) {
+    let mut act = sys::sigaction(handler as usize as u64);
+    act.flags = flags;
+    let r = sys::call(sys::RT_SIGACTION, [sig, &act as *const sys::SigAction as u64, 0, 8, 0]);
+    assert!(r == 0);
+}
+
+/// `rt_sigprocmask(how, &set, &old)`: the old mask. `how` 0 blocks, 1 unblocks, 2 sets.
+fn sigprocmask(how: u64, set: u64) -> u64 {
+    let mut old = 0u64;
+    sys::call(sys::RT_SIGPROCMASK, [how, &set as *const u64 as u64, &mut old as *mut u64 as u64, 8, 0]);
+    // SAFETY: the kernel wrote through the pointer.
+    unsafe { core::ptr::read_volatile(&old) }
+}
+
+/// `wait4(pid, &status, options, NULL)` that retries when a signal interrupts it: the child
+/// reaped (or `-errno`) and the whole status word.
+fn wait_opts(pid: i64, options: u64) -> (i64, i32) {
+    loop {
+        let mut status = 0i32;
+        let r = sys::call(sys::WAIT4, [pid as u64, &mut status as *mut i32 as u64, options, 0, 0]);
+        if r != EINTR {
+            // SAFETY: the kernel wrote through the pointer.
+            return (r, unsafe { core::ptr::read_volatile(&status) });
+        }
+    }
+}
+
+/// Queued signals, the alternate signal stack, `sigsuspend`, and stopping and continuing.
+fn queued_signals_and_job_control() {
+    let pid = sys::call(sys::GETPID, [0; 5]);
+
+    // Real-time signals queue, with the value `rt_sigqueueinfo` passed, lowest number first.
+    catch_with(SIGRT1, on_queued, SA_SIGINFO);
+    catch_with(SIGRT2, on_queued, SA_SIGINFO);
+    sigprocmask(2, 1 << (SIGRT1 - 1) | 1 << (SIGRT2 - 1));
+    for (sig, value) in [(SIGRT2, 1u64), (SIGRT1, 2), (SIGRT2, 3)] {
+        let info =
+            SigInfo { signo: sig as i32, errno: 0, code: -1, _pad: 0, pid: pid as i32, uid: 0, value, _rest: [0; 12] };
+        let r = sys::call(sys::RT_SIGQUEUEINFO, [pid as u64, sig, &info as *const SigInfo as u64, 0, 0]);
+        assert!(r == 0);
+    }
+    let held = NQUEUED.load(Ordering::SeqCst) == 0;
+    // Unblocking delivers all three before the call returns.
+    sigprocmask(2, 0);
+    let order = [(SIGRT1 as u32) << 8 | 2, (SIGRT2 as u32) << 8 | 1, (SIGRT2 as u32) << 8 | 3];
+    let got = [0, 1, 2].map(|i| QUEUED[i].load(Ordering::SeqCst));
+    let ok = held && NQUEUED.load(Ordering::SeqCst) == 3 && got == order && BAD_CODE.load(Ordering::SeqCst) == 0;
+    say!(
+        "signals: 3 queued real-time signals arrived in order with si_value and SI_QUEUE: {}",
+        if ok { "ok" } else { "FAILED" }
+    );
+
+    // A handler with SA_ONSTACK runs on the stack `sigaltstack` named.
+    // SAFETY: a static only this program uses.
+    let base = unsafe { (&raw mut ALT_STACK) as u64 };
+    let ss = StackT { sp: base, flags: 0, size: 16384 };
+    let r = sys::call(sys::SIGALTSTACK, [&ss as *const StackT as u64, 0, 0, 0, 0]);
+    catch_with(10, on_altstack, SA_SIGINFO | SA_ONSTACK);
+    sys::call(sys::KILL, [pid as u64, 10, 0, 0, 0]);
+    let sp = HANDLER_SP.load(Ordering::SeqCst) as u64;
+    let ok = r == 0 && sp > base && sp < base + 16384;
+    say!("signals: SA_ONSTACK handler ran on the sigaltstack: {}", if ok { "ok" } else { "FAILED" });
+
+    // sigsuspend waits for a signal the caller had blocked, and gives the mask back.
+    catch_with(SIGUSR2, on_usr2, SA_SIGINFO);
+    sigprocmask(0, 1 << (SIGUSR2 - 1));
+    if sys::fork() == 0 {
+        for _ in 0..5 {
+            sys::call(sys::SCHED_YIELD, [0; 5]);
+        }
+        sys::call(sys::KILL, [pid as u64, SIGUSR2, 0, 0, 0]);
+        exit(0);
+    }
+    let nothing = 0u64;
+    let r = sys::call(sys::RT_SIGSUSPEND, [&nothing as *const u64 as u64, 8, 0, 0, 0]);
+    let mask = sigprocmask(0, 0);
+    wait(-1);
+    let ok = r == EINTR && GOT_USR2.load(Ordering::SeqCst) == 1 && mask & (1 << (SIGUSR2 - 1)) != 0;
+    say!(
+        "signals: sigsuspend returned EINTR after SIGUSR2 from the child and kept the mask: {}",
+        if ok { "ok" } else { "FAILED" }
+    );
+
+    // SIGSTOP stops a child, which wait4 reports with WUNTRACED; SIGCONT resumes it, reported with WCONTINUED.
+    let child = sys::fork();
+    if child == 0 {
+        loop {
+            sys::call(sys::SCHED_YIELD, [0; 5]);
+        }
+    }
+    sys::call(sys::KILL, [child as u64, 19, 0, 0, 0]);
+    let (r1, stopped) = wait_opts(child, WUNTRACED);
+    sys::call(sys::KILL, [child as u64, 18, 0, 0, 0]);
+    let (r2, continued) = wait_opts(child, WCONTINUED);
+    sys::call(sys::KILL, [child as u64, 9, 0, 0, 0]);
+    let (r3, killed) = wait_opts(child, 0);
+    let ok =
+        r1 == child && stopped == 19 << 8 | 0x7f && r2 == child && continued == 0xffff && r3 == child && killed == 9;
+    say!(
+        "signals: SIGSTOP stopped child {child} (WUNTRACED), SIGCONT continued it (WCONTINUED), SIGKILL ended it: {}",
+        if ok { "ok" } else { "FAILED" }
+    );
+}
+
 /// # Safety
 /// `sp` must be the initial stack pointer the kernel set up.
 unsafe extern "C" fn main(sp: *const u64) -> ! {
@@ -711,6 +894,7 @@ unsafe extern "C" fn main(sp: *const u64) -> ! {
         say!("fp: the kernel does not offer FP (AT_HWCAP)");
     }
     signals_and_threads();
+    queued_signals_and_job_control();
     exit(0)
 }
 
