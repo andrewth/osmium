@@ -217,9 +217,9 @@ EXPECT=(
 boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -machine virt -bios default -smp 4 -accel tcg,thread=multi \
     -netdev user,id=n0,tftp="$tftp",guestfwd=tcp:10.0.2.100:7-cmd:cat,guestfwd=tcp:10.0.2.100:3260-cmd:"python3 scripts/iscsi-target.py $iscsi" -device virtio-net-device,netdev=n0 \
-    -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0 \
+    -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
     -device usb-ehci,id=ehci -drive if=none,id=stick-ehci,format=raw,file="$stick_ehci" -device usb-storage,bus=ehci.0,drive=stick-ehci \
-    -device pci-ohci,id=ohci -drive if=none,id=stick-ohci,format=raw,file="$stick_ohci" -device usb-storage,bus=ohci.0,drive=stick-ohci \
+    -device pci-ohci,id=ohci -device usb-mouse,bus=ohci.0 -drive if=none,id=stick-ohci,format=raw,file="$stick_ohci" -device usb-storage,bus=ohci.0,drive=stick-ohci \
     -drive if=none,id=vd0,format=raw,file="$vdisk" -device virtio-blk-device,drive=vd0 \
     -netdev user,id=n1 -device usb-net,netdev=n1,bus=xhci.0 \
     -drive if=none,id=stick,format=raw,file="$stick" -device usb-storage,bus=xhci.0,drive=stick \
