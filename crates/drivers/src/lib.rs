@@ -6,6 +6,7 @@
 //! | [`pl011::Pl011`] | Arm PrimeCell UART | `SerialPort` |
 //! | [`plic::Plic`] | RISC-V Platform-Level Interrupt Controller | `InterruptController` |
 //! | [`gicv2::GicV2`] | Arm Generic Interrupt Controller v2 | `InterruptController` |
+//! | [`gicv3::GicV3`] | Arm Generic Interrupt Controller v3 (system-register CPU interface; no ITS) | `InterruptController` |
 //! | [`lapic::LocalApic`] | x86 local APIC (xAPIC MMIO) | EOI, IPIs, timer, MSI messages |
 //! | [`fwcfg::FwCfg`] | QEMU `fw_cfg` (ports or MMIO, optional DMA) | named blobs: tables, kernel, ramfb |
 //! | [`pit::Pit`] | Intel 8254 PIT | calibration delays |
@@ -46,6 +47,7 @@ pub mod display;
 pub mod ehci;
 pub mod fwcfg;
 pub mod gicv2;
+pub mod gicv3;
 pub mod ioapic;
 pub mod iommu;
 pub mod lapic;
