@@ -5,6 +5,8 @@
 //! shorter CDB is zero padded, and the target knows its length from the
 //! opcode.
 
+use alloc::vec::Vec;
+
 /// A command descriptor block, zero padded to 16 bytes.
 pub type Cdb = [u8; 16];
 
@@ -281,9 +283,53 @@ impl Capacity {
     }
 }
 
+/// The logical units in REPORT LUNS data, and the size the whole list
+/// needs (so a caller can ask again with a bigger buffer if `d` was cut
+/// short). Entries are the single-level LUNs [`lun_field`](crate::pdu::lun_field)
+/// can address, peripheral (below 256) or flat space (up to 16383); an
+/// entry of another form is skipped. A list length claiming more than `d`
+/// holds yields the entries present.
+pub fn parse_report_luns(d: &[u8]) -> Option<(Vec<u16>, usize)> {
+    let list_len = u32::from_be_bytes(chunk(d, 0)?) as usize;
+    let needed = list_len.saturating_add(8);
+    let mut luns = Vec::new();
+    let mut at = 8usize;
+    while at.saturating_add(8) <= needed.min(d.len()) {
+        let e = chunk::<8>(d, at)?;
+        let [a, b, rest @ ..] = e;
+        if rest == [0; 6] {
+            match a >> 6 {
+                0 if a == 0 => luns.push(b as u16),
+                1 => luns.push(u16::from(a & 0x3f) << 8 | u16::from(b)),
+                _ => {}
+            }
+        }
+        at += 8;
+    }
+    Some((luns, needed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_luns_lists() {
+        let mut d = std::vec![0, 0, 0, 24, 0, 0, 0, 0];
+        d.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        d.extend_from_slice(&[0, 5, 0, 0, 0, 0, 0, 0]);
+        d.extend_from_slice(&[0x41, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(parse_report_luns(&d), Some((std::vec![0, 5, 258], 32)));
+        // Cut short: the entries present, and the size to ask for.
+        assert_eq!(parse_report_luns(&d[..20]), Some((std::vec![0], 32)));
+        // A hostile length changes nothing it does not have.
+        d[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_report_luns(&d).map(|(l, _)| l), Some(std::vec![0, 5, 258]));
+        // Other address forms and subsidiary levels are skipped.
+        let odd = [0, 0, 0, 16, 0, 0, 0, 0, 0x80, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 1];
+        assert_eq!(parse_report_luns(&odd).map(|(l, _)| l), Some(std::vec![]));
+        assert_eq!(parse_report_luns(&[0, 0]), None);
+    }
 
     #[test]
     fn read_write_pick_the_cdb_size() {

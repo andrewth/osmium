@@ -42,11 +42,11 @@ extern crate alloc;
 extern crate std;
 
 pub mod chap;
+pub mod crc32c;
 mod disk;
 mod error;
-mod net;
-pub mod crc32c;
 pub mod md5;
+mod net;
 pub mod params;
 pub mod pdu;
 pub mod scsi;
@@ -54,15 +54,15 @@ mod session;
 pub mod text;
 
 #[cfg(test)]
-mod testing;
-#[cfg(test)]
 mod fuzz;
+#[cfg(test)]
+mod testing;
 #[cfg(test)]
 mod tests;
 
-pub use disk::IscsiDisk;
+pub use chap::{Chap, Mutual};
+pub use disk::{IscsiDisk, IscsiSession};
 pub use error::IscsiError;
 pub use net::{Net, Stack};
-pub use chap::{Chap, Mutual};
 pub use params::{DigestPolicy, Offer, Params};
 pub use session::{Data, DiscoveredTarget, Options, discover};

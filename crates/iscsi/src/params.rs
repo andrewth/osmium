@@ -69,6 +69,13 @@ pub struct Offer {
     pub header_digest: DigestPolicy,
     /// CRC32C over each data segment.
     pub data_digest: DigestPolicy,
+    /// The most connections to ask for in one session (`MaxConnections`);
+    /// the session opens as many as the target agrees to.
+    pub max_connections: u16,
+    /// The error recovery level to ask for: 0 drops the session on any
+    /// failure, 1 adds recovery within a connection (SNACK, command
+    /// retry), 2 adds recovery of a lost connection (task reassignment).
+    pub error_recovery_level: u8,
 }
 
 impl Default for Offer {
@@ -81,6 +88,8 @@ impl Default for Offer {
             immediate_data: true,
             header_digest: DigestPolicy::Off,
             data_digest: DigestPolicy::Off,
+            max_connections: 1,
+            error_recovery_level: 0,
         }
     }
 }
@@ -107,7 +116,7 @@ pub struct Params {
     pub data_digest: bool,
     /// R2Ts outstanding per command; always 1 here.
     pub max_outstanding_r2t: u32,
-    /// Always 0: a failure ends the session.
+    /// The error recovery level agreed (see [`Offer::error_recovery_level`]).
     pub error_recovery_level: u8,
     /// Seconds to wait before reconnecting after a logout or failure.
     pub default_time2wait: u16,
@@ -117,7 +126,7 @@ pub struct Params {
     pub data_pdu_in_order: bool,
     /// Data sequences arrive in increasing offset order.
     pub data_sequence_in_order: bool,
-    /// Connections per session; always 1 here.
+    /// The most connections the session may have.
     pub max_connections: u16,
     /// The target's `TargetAlias`, if it sent one.
     pub target_alias: Option<String>,
@@ -152,7 +161,10 @@ impl Default for Params {
 
 /// Values the initiator sends for keys that are not in [`Offer`].
 const TIME2WAIT: u16 = 2;
+/// Seconds the target keeps a dropped connection's tasks: none, unless
+/// error recovery level 2 needs them.
 const TIME2RETAIN: u16 = 0;
+const TIME2RETAIN_ERL2: u16 = 20;
 
 /// The smallest and largest data segment lengths allowed (RFC 7143 §13.12).
 const MIN_DSL: u64 = 512;
@@ -189,11 +201,32 @@ pub(crate) struct Negotiator {
     chap: bool,
     /// The [`ONCE`] keys the target has answered or offered already.
     settled: Vec<&'static str>,
+    /// Logging in an additional connection to a session whose parameters
+    /// are settled: only the connection's own keys are negotiated.
+    additional: bool,
 }
 
 impl Negotiator {
     pub(crate) fn new(offer: Offer) -> Self {
-        Self { offer, params: Params::default(), offered: Vec::new(), chap: false, settled: Vec::new() }
+        Self {
+            offer,
+            params: Params::default(),
+            offered: Vec::new(),
+            chap: false,
+            settled: Vec::new(),
+            additional: false,
+        }
+    }
+
+    /// A negotiation for another connection of a session whose `params`
+    /// are agreed: it offers only the digests and segment length, and the
+    /// caller takes just those from the result.
+    pub(crate) fn additional(offer: Offer, params: Params) -> Self {
+        Self { params, additional: true, ..Self::new(offer) }
+    }
+
+    fn time2retain(&self) -> u16 {
+        if self.offer.error_recovery_level >= 2 { TIME2RETAIN_ERL2 } else { TIME2RETAIN }
     }
 
     fn offer(&mut self, out: &mut Vec<u8>, key: &'static str, value: &str) {
@@ -229,7 +262,7 @@ impl Negotiator {
         let mrdsl = (o.max_recv_data_segment_length as u64).clamp(MIN_DSL, MAX_DSL) as u32;
         text::push(&mut out, "MaxRecvDataSegmentLength", &mrdsl.to_string());
         self.params.max_recv_data_segment_length = mrdsl;
-        if discovery {
+        if discovery || self.additional {
             return out;
         }
         self.offer(&mut out, "InitialR2T", yes_no(o.initial_r2t));
@@ -237,10 +270,11 @@ impl Negotiator {
         self.offer(&mut out, "MaxBurstLength", &o.max_burst_length.to_string());
         self.offer(&mut out, "FirstBurstLength", &o.first_burst_length.to_string());
         self.offer(&mut out, "MaxOutstandingR2T", "1");
-        self.offer(&mut out, "MaxConnections", "1");
-        self.offer(&mut out, "ErrorRecoveryLevel", "0");
+        self.offer(&mut out, "MaxConnections", &o.max_connections.clamp(1, u16::MAX).to_string());
+        self.offer(&mut out, "ErrorRecoveryLevel", &o.error_recovery_level.min(2).to_string());
         self.offer(&mut out, "DefaultTime2Wait", &TIME2WAIT.to_string());
-        self.offer(&mut out, "DefaultTime2Retain", &TIME2RETAIN.to_string());
+        let retain = self.time2retain();
+        self.offer(&mut out, "DefaultTime2Retain", &retain.to_string());
         self.offer(&mut out, "DataPDUInOrder", "Yes");
         self.offer(&mut out, "DataSequenceInOrder", "Yes");
         out
@@ -315,6 +349,7 @@ impl Negotiator {
                 }
                 continue;
             }
+            let retain = self.time2retain();
             let p = &mut self.params;
             let o = &self.offer;
             let num =
@@ -378,12 +413,12 @@ impl Negotiator {
                     Some("1".into())
                 }
                 "MaxConnections" => {
-                    p.max_connections = least(1, 65535, 1)? as u16;
-                    Some("1".into())
+                    p.max_connections = least(1, 65535, o.max_connections.clamp(1, u16::MAX).into())? as u16;
+                    Some(p.max_connections.to_string())
                 }
                 "ErrorRecoveryLevel" => {
-                    p.error_recovery_level = least(0, 2, 0)? as u8;
-                    Some("0".into())
+                    p.error_recovery_level = least(0, 2, o.error_recovery_level.min(2).into())? as u8;
+                    Some(p.error_recovery_level.to_string())
                 }
                 "DefaultTime2Wait" => {
                     // The maximum function: the answer may not be below ours.
@@ -394,7 +429,7 @@ impl Negotiator {
                     Some(p.default_time2wait.to_string())
                 }
                 "DefaultTime2Retain" => {
-                    p.default_time2retain = least(0, 3600, TIME2RETAIN.into())? as u16;
+                    p.default_time2retain = least(0, 3600, retain.into())? as u16;
                     Some(p.default_time2retain.to_string())
                 }
                 "InitialR2T" => {
