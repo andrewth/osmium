@@ -701,6 +701,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             println!("[net]   virtio-net ({legacy}) at {base:#x}");
             demos::arp(&mut net, now_ns);
             demos::net(&mut net, now_ns);
+            demos::net6();
             demos::iscsi(&mut net, now_ns);
             *NETDEV.lock() = Some(alloc::boxed::Box::new(net));
         }

@@ -111,7 +111,10 @@ screen_wait() {
 # Multi-threaded TCG runs the four CPUs in parallel on host threads.
 # QEMU's user network answers the kernel's ARP request over virtio-net, then
 # osmium-net gets a DHCP lease, pings the gateway, resolves a name through
-# the user network's DNS and round-trips a TCP echo through a guestfwd to cat. Behind
+# the user network's DNS and round-trips a TCP echo through a guestfwd to cat.
+# It then runs the IPv6 extras over in-memory links: fragmentation and
+# reassembly, stable opaque and temporary addresses, and DHCPv6 against a
+# server played by the demo. Behind
 # the xHCI controller (and likewise EHCI and OHCI, each with its own stick), a USB stick on a scratch image answers a SCSI INQUIRY and
 # takes a block write while the keyboard's interrupt transfer stays pending. A
 # guest runs in VS-mode under the H extension. With dosfstools installed the
@@ -145,6 +148,10 @@ EXPECT=(
     'DHCP: 10.0.2.15/24 via 10.0.2.2'
     'ping 10.0.2.2: seq 1 in'
     'TCP echo from 10.0.2.100:7: "hello over TCP"'
+    'IPv6 fragmentation: 4000 bytes sent in [0-9]* fragments and reassembled'
+    'IPv6 privacy: stable opaque address 2001:db8:1:2:'
+    'DHCPv6: information request answered, DNS 2001:db8::53'
+    'DHCPv6: leased 2001:db8:1:2::1234, DNS 2001:db8::53'
     '\[blk\]   virtio-blk .*: 16384 sectors'
     'wrote and read back sector 8192'
     'INQUIRY "QEMU" "QEMU HARDDISK"'
@@ -437,6 +444,9 @@ if command -v qemu-system-riscv64 >/dev/null; then
         '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
         '| \[net\]   DHCP: 10.0.2.15/24 via 10.0.2.2' '| \[net\]   ping 10.0.2.2: seq 1 in' \
         '| \[net\]   TCP echo from 10.0.2.100:7: "hello over TCP"' \
+        '| \[net\]   IPv6 fragmentation: 4000 bytes sent in [0-9]* fragments and reassembled' \
+        '| \[net\]   IPv6 privacy: stable opaque address 2001:db8:1:2:' \
+        '| \[net\]   DHCPv6: leased 2001:db8:1:2::1234, DNS 2001:db8::53' \
         '| \[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512' \
         '| \[iscsi\] wrote and read back block 8192' \
         '| \[blk\]   virtio-blk (1.x) at 0x10001000: 8192 sectors; wrote and read back sector 4096' \
