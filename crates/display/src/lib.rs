@@ -6,6 +6,8 @@
 //! - [`bochs::BochsVbe`]: the Bochs VBE ("DISPI") registers of QEMU's
 //!   standard VGA, `bochs-display` and `virtio-vga`, which set VESA modes
 //!   without the BIOS.
+//! - [`edid`]: EDID parsing (preferred mode, physical size), for virtio-gpu's
+//!   `GET_EDID`.
 //! - [`vbe`]: VESA BIOS Extensions mode lists and mode information, for
 //!   kernels that can call the video BIOS.
 //! - [`VirtioGpu`](virtio_gpu::VirtioGpu): virtio-gpu.
@@ -22,6 +24,7 @@ extern crate std;
 use osmium_hal::pci::{ConfigAccess, Function};
 
 pub mod bochs;
+pub mod edid;
 pub mod vbe;
 pub mod virtio_gpu;
 

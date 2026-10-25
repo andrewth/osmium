@@ -361,6 +361,17 @@ pub mod gpu {
     /// `resource_unref` and `resource_detach_backing`: header,
     /// resource_id, padding.
     pub const RESOURCE_UNREF_LEN: usize = HDR_LEN + 8;
+    /// `get_edid`: header, scanout, padding.
+    pub const GET_EDID_LEN: usize = HDR_LEN + 8;
+    /// Bytes of EDID data in a `resp_edid`.
+    pub const EDID_MAX: usize = 1024;
+    /// `resp_edid`: header, size le32, padding, then [`EDID_MAX`] bytes.
+    pub const RESP_EDID_LEN: usize = HDR_LEN + 8 + EDID_MAX;
+    /// `update_cursor` and `move_cursor` (cursor queue): header, pos
+    /// (scanout_id, x, y, padding), resource_id, hot_x, hot_y, padding.
+    pub const CURSOR_CMD_LEN: usize = HDR_LEN + 16 + 16;
+    /// Side of a cursor image, in pixels (the spec's only size).
+    pub const CURSOR_SIDE: u32 = 64;
 }
 
 #[cfg(test)]

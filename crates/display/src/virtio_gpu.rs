@@ -13,15 +13,34 @@
 //! works until the first `SET_SCANOUT` (see [`crate::bochs`]).
 //! Commands are synchronous, like the block driver's requests: one is in
 //! flight at a time and the driver polls for its response.
+//!
+//! Beyond the 2D path the driver offers:
+//!
+//! - a hardware cursor on the cursor queue ([`VirtioGpu::set_cursor`],
+//!   [`VirtioGpu::move_cursor`], [`VirtioGpu::hide_cursor`]): a 64 by 64
+//!   ARGB image the host composites, so moving it costs one small
+//!   fire-and-forget command and no framebuffer redraw;
+//! - the monitor's EDID (`VIRTIO_GPU_F_EDID`, [`VirtioGpu::edid`]), parsed by
+//!   [`crate::edid`];
+//! - interrupts ([`VirtioGpu::enable_interrupts`] and
+//!   [`VirtioGpu::handle_interrupt`]). Cursor commands complete
+//!   asynchronously and the interrupt handler reaps them; it also notes a
+//!   display change (the configuration-change interrupt). Control commands
+//!   are still waited for by polling, which works with interrupts on or
+//!   off: a caller holding the driver in an `IrqSpinLock` has the interrupt
+//!   held off until the command is done.
 
 use osmium_hal::display::{Display, DisplayError, Framebuffer, FramebufferInfo, PixelFormat, Rect};
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
 use osmium_hal::mmio::IoMem;
 use osmium_hal::virtio::gpu::*;
+use osmium_mm::PhysAddr;
 
 use core::mem::ManuallyDrop;
 use osmium_drivers::virtio::queue::{Segment, VirtQueue};
 
+use crate::edid::{Edid, EdidError};
+use core::sync::atomic::{AtomicU32, Ordering};
 use osmium_drivers::virtio::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
 
 /// Entries used in the control queue, at most (a command needs two).
@@ -29,6 +48,15 @@ pub const MAX_QUEUE_SIZE: u16 = 4;
 
 /// Bytes of the request and response buffers.
 const CMD_LEN: usize = 4096;
+
+/// Entries used in the cursor queue, at most.
+pub const MAX_CURSOR_QUEUE_SIZE: u16 = 4;
+
+/// Bytes of each cursor request slot (a command is [`CURSOR_CMD_LEN`]).
+const CURSOR_SLOT: usize = 64;
+
+/// Bytes of a cursor image: [`CURSOR_SIDE`] squared ARGB pixels.
+pub const CURSOR_BYTES: usize = (CURSOR_SIDE * CURSOR_SIDE) as usize * 4;
 
 /// Largest framebuffer side the driver asks for.
 pub const MAX_SIDE: u32 = 16384;
@@ -61,6 +89,17 @@ impl DisplayInfo {
     }
 }
 
+/// Why [`VirtioGpu::edid`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdidFetchError {
+    /// The device did not offer `VIRTIO_GPU_F_EDID`, or has no such scanout.
+    Unsupported,
+    /// The command failed.
+    Device,
+    /// The device answered with an EDID that does not parse.
+    Invalid(EdidError),
+}
+
 /// A virtio GPU driving one scanout. Dropping it resets the device and
 /// frees the framebuffer.
 pub struct VirtioGpu<'d, T: Transport, D: DmaAllocator + ?Sized> {
@@ -76,6 +115,25 @@ pub struct VirtioGpu<'d, T: Transport, D: DmaAllocator + ?Sized> {
     backing: ManuallyDrop<Option<OwnedDma<'d, D>>>,
     resource: u32,
     scanout: u32,
+    // Resource IDs handed out so far (modes and cursor images share them).
+    last_id: u32,
+    edid: bool,
+    cursor: Option<Cursor<'d, D>>,
+    irqs: AtomicU32,
+    config_changed: bool,
+}
+
+/// The cursor queue, its request slots and the current cursor image.
+struct Cursor<'d, D: DmaAllocator + ?Sized> {
+    queue: ManuallyDrop<VirtQueue<'d, D>>,
+    // One `CURSOR_SLOT` per descriptor: a request lives in the slot of its head.
+    slots: ManuallyDrop<OwnedDma<'d, D>>,
+    // The image's resource (0 for none), its memory, and where it shows.
+    resource: u32,
+    backing: ManuallyDrop<Option<OwnedDma<'d, D>>>,
+    pos: (u32, u32),
+    hot: (u32, u32),
+    visible: bool,
 }
 
 /// Little-endian request builder.
@@ -125,7 +183,7 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         if transport.device_type() != DeviceType::Gpu {
             return Err(VirtioError::WrongDevice);
         }
-        negotiate(&transport, 0, 0)?;
+        let features = negotiate(&transport, 0, F_EDID)?;
         let size = match transport.max_queue_size(CONTROL_QUEUE).min(MAX_QUEUE_SIZE) {
             // Split queues come in powers of two.
             n if n >= 2 => 1 << n.ilog2(),
@@ -135,6 +193,24 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
             u32::from_le_bytes(core::array::from_fn(|i| transport.config_read8(CONFIG_NUM_SCANOUTS + i)));
         // Plain values until all succeed, so a failure frees the others.
         let queue = VirtQueue::new(dma, CONTROL_QUEUE, size)?;
+        // The cursor queue is optional: without it there is no hardware cursor.
+        let cursor = match transport.max_queue_size(CURSOR_QUEUE).min(MAX_CURSOR_QUEUE_SIZE) {
+            n if n >= 2 => {
+                let size = 1 << n.ilog2();
+                let queue = VirtQueue::new(dma, CURSOR_QUEUE, size)?;
+                let slots = OwnedDma::new(dma, CURSOR_SLOT * size as usize).ok_or(VirtioError::NoMemory)?;
+                Some(Cursor {
+                    queue: ManuallyDrop::new(queue),
+                    slots: ManuallyDrop::new(slots),
+                    resource: 0,
+                    backing: ManuallyDrop::new(None),
+                    pos: (0, 0),
+                    hot: (0, 0),
+                    visible: false,
+                })
+            }
+            _ => None,
+        };
         let req = OwnedDma::new(dma, CMD_LEN).ok_or(VirtioError::NoMemory)?;
         let resp = OwnedDma::new(dma, CMD_LEN).ok_or(VirtioError::NoMemory)?;
         // SAFETY: an empty window touches no memory.
@@ -149,11 +225,20 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
             backing: ManuallyDrop::new(None),
             resource: 0,
             scanout: 0,
+            last_id: 0,
+            edid: features & F_EDID != 0,
+            cursor,
+            irqs: AtomicU32::new(0),
+            config_changed: false,
             dma,
             transport,
         };
         gpu.transport.setup_queue(CONTROL_QUEUE, size, gpu.queue.addrs());
-        // Responses are polled.
+        if let Some(c) = &gpu.cursor {
+            gpu.transport.setup_queue(CURSOR_QUEUE, c.queue.size(), c.queue.addrs());
+            c.queue.set_interrupts(false);
+        }
+        // Responses are polled until `enable_interrupts`.
         gpu.queue.set_interrupts(false);
         driver_ok(&gpu.transport);
         Ok(gpu)
@@ -167,6 +252,91 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
     /// Number of scanouts (display outputs) the device has.
     pub fn num_scanouts(&self) -> u32 {
         self.num_scanouts
+    }
+
+    /// True if the device offers `GET_EDID`.
+    pub fn has_edid(&self) -> bool {
+        self.edid
+    }
+
+    /// True if the device has a cursor queue.
+    pub fn has_cursor(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    /// Asks the device to interrupt when it completes commands. Call this
+    /// after routing the device's interrupt to [`VirtioGpu::handle_interrupt`].
+    /// Polling for control responses still works.
+    pub fn enable_interrupts(&mut self) {
+        self.queue.set_interrupts(true);
+        if let Some(c) = &self.cursor {
+            c.queue.set_interrupts(true);
+        }
+    }
+
+    /// Goes back to polling: the device is asked not to interrupt.
+    pub fn disable_interrupts(&mut self) {
+        self.queue.set_interrupts(false);
+        if let Some(c) = &self.cursor {
+            c.queue.set_interrupts(false);
+        }
+    }
+
+    /// Handles the device's interrupt: acknowledges it, reaps finished
+    /// cursor commands and notes a display configuration change. Returns
+    /// true if the interrupt was this device's.
+    pub fn handle_interrupt(&mut self) -> bool {
+        let isr = self.transport.ack_interrupt();
+        if isr == 0 {
+            return false;
+        }
+        self.irqs.fetch_add(1, Ordering::Relaxed);
+        if let Some(c) = &mut self.cursor {
+            while c.queue.pop_used().is_some() {}
+        }
+        if isr & u32::from(osmium_hal::virtio::pci::ISR_CONFIG) != 0 {
+            self.config_changed = true;
+        }
+        true
+    }
+
+    /// How many interrupts [`VirtioGpu::handle_interrupt`] has taken as the
+    /// device's.
+    pub fn interrupts_handled(&self) -> u32 {
+        self.irqs.load(Ordering::Relaxed)
+    }
+
+    /// True once if the host reported a display change (new size, a monitor
+    /// plugged in) since the last call. Fetch [`VirtioGpu::display_info`]
+    /// and [`VirtioGpu::edid`] to see what changed.
+    pub fn take_display_changed(&mut self) -> bool {
+        core::mem::take(&mut self.config_changed)
+    }
+
+    fn next_id(&mut self) -> u32 {
+        self.last_id = self.last_id.wrapping_add(1).max(1);
+        self.last_id
+    }
+
+    /// Fetches and parses the EDID of `scanout`'s monitor.
+    pub fn edid(&mut self, scanout: u32) -> Result<Edid, EdidFetchError> {
+        if !self.edid || scanout >= self.num_scanouts {
+            return Err(EdidFetchError::Unsupported);
+        }
+        let cmd = Cmd::new(CMD_GET_EDID).u32(scanout).u32(0);
+        let (ty, written) = self.command(cmd, &[], RESP_EDID_LEN).map_err(|_| EdidFetchError::Device)?;
+        if ty != RESP_OK_EDID || written < HDR_LEN + 8 {
+            return Err(EdidFetchError::Device);
+        }
+        // The device says how many bytes it wrote; it may lie. Take no more
+        // than it wrote, than a buffer holds, and than it claims is EDID.
+        let claimed = self.resp.load::<u32>(HDR_LEN) as usize;
+        let len = claimed.min(EDID_MAX).min(written - HDR_LEN - 8);
+        let mut buf = [0u8; EDID_MAX];
+        if let Some(dst) = buf.get_mut(..len) {
+            self.resp.read(HDR_LEN + 8, dst);
+        }
+        Edid::parse(buf.get(..len).unwrap_or(&[])).map_err(EdidFetchError::Invalid)
     }
 
     /// Sends the request built in `cmd` (with `extra` bytes appended) and
@@ -235,7 +405,7 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         let fb = Framebuffer::new(unsafe { IoMem::new(backing.cpu_ptr().as_ptr(), info.size()) }, info)?;
         fb.clear(osmium_hal::display::Rgb::BLACK);
 
-        let id = self.resource.wrapping_add(1).max(1);
+        let id = self.next_id();
         let full = info.bounds();
         self.command_nodata(
             Cmd::new(CMD_RESOURCE_CREATE_2D).u32(id).u32(FORMAT_B8G8R8X8_UNORM).u32(width).u32(height),
@@ -284,6 +454,126 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
         }
         Ok(())
     }
+
+    /// Queues one cursor command on the cursor queue; it has no response.
+    /// Finished commands are reaped here and by [`VirtioGpu::handle_interrupt`].
+    fn cursor_command(&mut self, ty: u32) -> Result<(), DisplayError> {
+        let scanout = self.scanout;
+        let notify = {
+            let c = self.cursor.as_mut().ok_or(DisplayError::Unsupported)?;
+            while c.queue.pop_used().is_some() {}
+            if c.queue.is_broken() {
+                return Err(DisplayError::Device);
+            }
+            // A full ring: wait for the device to take one.
+            if c.queue.next_head().is_none() {
+                c.queue.wait_used(POLL_LIMIT).ok_or(DisplayError::Device)?;
+            }
+            let head = c.queue.next_head().ok_or(DisplayError::Device)?;
+            let (id, visible) = (c.resource, c.visible);
+            let cmd = Cmd::new(ty)
+                .u32(scanout)
+                .u32(c.pos.0)
+                .u32(c.pos.1)
+                .u32(0)
+                // Hidden means no image.
+                .u32(if visible { id } else { 0 })
+                .u32(c.hot.0)
+                .u32(c.hot.1)
+                .u32(0);
+            c.slots.write(usize::from(head) * CURSOR_SLOT, cmd.bytes());
+            let seg = Segment {
+                addr: PhysAddr::new(c.slots.device_addr().as_u64() + usize::from(head) as u64 * CURSOR_SLOT as u64),
+                len: cmd.len as u32,
+                device_writes: false,
+            };
+            c.queue.add(&[seg]).map_err(|_| DisplayError::Device)?;
+            c.queue.needs_notify()
+        };
+        if notify {
+            self.transport.notify(CURSOR_QUEUE);
+        }
+        Ok(())
+    }
+
+    /// Sets the cursor image to `argb`, [`CURSOR_SIDE`] by [`CURSOR_SIDE`]
+    /// pixels of `0xAARRGGBB`, row by row, with the hot spot (the pixel that
+    /// sits on the pointer position) at `(hot_x, hot_y)`, and shows it at
+    /// its current position. The previous image is released.
+    pub fn set_cursor(&mut self, argb: &[u32], hot_x: u32, hot_y: u32) -> Result<(), DisplayError> {
+        if self.cursor.is_none() || argb.len() != (CURSOR_SIDE * CURSOR_SIDE) as usize {
+            return Err(DisplayError::Unsupported);
+        }
+        if hot_x >= CURSOR_SIDE || hot_y >= CURSOR_SIDE {
+            return Err(DisplayError::Unsupported);
+        }
+        let backing = OwnedDma::new(self.dma, CURSOR_BYTES).ok_or(DisplayError::NoMemory)?;
+        for (i, px) in argb.iter().enumerate() {
+            backing.write(i * 4, &px.to_le_bytes());
+        }
+        let id = self.next_id();
+        self.command_nodata(
+            Cmd::new(CMD_RESOURCE_CREATE_2D).u32(id).u32(FORMAT_B8G8R8A8_UNORM).u32(CURSOR_SIDE).u32(CURSOR_SIDE),
+            &[],
+        )?;
+        let mut entry = [0u8; MEM_ENTRY_LEN];
+        let (addr, len) = (backing.device_addr().as_u64().to_le_bytes(), (CURSOR_BYTES as u32).to_le_bytes());
+        for (dst, src) in entry.iter_mut().zip(addr.iter().chain(len.iter())) {
+            *dst = *src;
+        }
+        let full = Rect::new(0, 0, CURSOR_SIDE, CURSOR_SIDE);
+        let ready = self.command_nodata(Cmd::new(CMD_RESOURCE_ATTACH_BACKING).u32(id).u32(1), &entry).and_then(|()| {
+            self.command_nodata(Cmd::new(CMD_TRANSFER_TO_HOST_2D).rect(full).u64(0).u32(id).u32(0), &[])
+        });
+        if let Err(e) = ready {
+            // As in `set_mode`: if the host may still hold the backing, leak it.
+            if self.command_nodata(Cmd::new(CMD_RESOURCE_UNREF).u32(id).u32(0), &[]).is_err() {
+                core::mem::forget(backing);
+            }
+            return Err(e);
+        }
+        let Some(c) = self.cursor.as_mut() else { return Err(DisplayError::Unsupported) };
+        let old = core::mem::replace(&mut c.resource, id);
+        let old_backing = c.backing.replace(backing);
+        (c.hot, c.visible) = ((hot_x, hot_y), true);
+        let shown = self.cursor_command(CMD_UPDATE_CURSOR);
+        // The host no longer uses the old image once the update is done;
+        // unreferencing detaches its backing, which is freed only if that
+        // worked.
+        if old != 0 {
+            match self.command_nodata(Cmd::new(CMD_RESOURCE_UNREF).u32(old).u32(0), &[]) {
+                Ok(()) => drop(old_backing),
+                Err(_) => core::mem::forget(old_backing),
+            }
+        }
+        shown
+    }
+
+    /// Moves the cursor to `(x, y)` on the scanout. Fire and forget: the
+    /// command completes asynchronously.
+    pub fn move_cursor(&mut self, x: u32, y: u32) -> Result<(), DisplayError> {
+        let c = self.cursor.as_mut().ok_or(DisplayError::Unsupported)?;
+        c.pos = (x, y);
+        self.cursor_command(CMD_MOVE_CURSOR)
+    }
+
+    /// Hides the cursor; [`VirtioGpu::move_cursor`] does not show it again,
+    /// [`VirtioGpu::show_cursor`] does.
+    pub fn hide_cursor(&mut self) -> Result<(), DisplayError> {
+        let c = self.cursor.as_mut().ok_or(DisplayError::Unsupported)?;
+        c.visible = false;
+        self.cursor_command(CMD_UPDATE_CURSOR)
+    }
+
+    /// Shows the cursor image again after [`VirtioGpu::hide_cursor`].
+    pub fn show_cursor(&mut self) -> Result<(), DisplayError> {
+        let c = self.cursor.as_mut().ok_or(DisplayError::Unsupported)?;
+        if c.resource == 0 {
+            return Err(DisplayError::Unsupported);
+        }
+        c.visible = true;
+        self.cursor_command(CMD_UPDATE_CURSOR)
+    }
 }
 
 impl<T: Transport, D: DmaAllocator + ?Sized> Display for VirtioGpu<'_, T, D> {
@@ -316,6 +606,11 @@ impl<T: Transport, D: DmaAllocator + ?Sized> Drop for VirtioGpu<'_, T, D> {
                 ManuallyDrop::drop(&mut self.req);
                 ManuallyDrop::drop(&mut self.resp);
                 ManuallyDrop::drop(&mut self.backing);
+                if let Some(c) = &mut self.cursor {
+                    ManuallyDrop::drop(&mut c.queue);
+                    ManuallyDrop::drop(&mut c.slots);
+                    ManuallyDrop::drop(&mut c.backing);
+                }
             }
         }
     }
@@ -362,6 +657,11 @@ mod tests {
         log: Vec<u32>,
         /// Fails the unreference of this resource.
         fail_unref: Option<u32>,
+        /// The EDID `GET_EDID` returns, and the size it claims for it.
+        edid: Vec<u8>,
+        edid_claim: u32,
+        /// Cursor commands seen: (type, scanout, x, y, resource, hot_x, hot_y).
+        cursor: Vec<(u32, u32, u32, u32, u32, u32, u32)>,
     }
 
     impl Host {
@@ -380,8 +680,17 @@ mod tests {
                     }
                     (RESP_OK_DISPLAY_INFO, body)
                 }
+                CMD_GET_EDID => {
+                    if w(0) != 0 {
+                        return (RESP_ERR_INVALID_SCANOUT_ID, vec![]);
+                    }
+                    let mut body = self.edid_claim.to_le_bytes().to_vec();
+                    body.extend_from_slice(&[0; 4]);
+                    body.extend_from_slice(&self.edid);
+                    (RESP_OK_EDID, body)
+                }
                 CMD_RESOURCE_CREATE_2D => {
-                    assert_eq!(w(1), FORMAT_B8G8R8X8_UNORM);
+                    assert!(w(1) == FORMAT_B8G8R8X8_UNORM || w(1) == FORMAT_B8G8R8A8_UNORM);
                     let (width, height) = (w(2), w(3));
                     let r = Resource { width, height, backing: None, pixels: vec![0; (width * height) as usize] };
                     self.resources.insert(w(0), r);
@@ -437,8 +746,18 @@ mod tests {
         }
     }
 
-    fn serve(mut dev: DeviceSide, host: &mut Host, stop: &AtomicBool) {
+    fn serve(mut dev: DeviceSide, mut cursor: DeviceSide, host: &mut Host, stop: &AtomicBool) {
         while !stop.load(Ordering::Acquire) {
+            if let Some((head, chain)) = cursor.pop_avail() {
+                assert_eq!(chain.len(), 1, "cursor commands have no response");
+                assert_eq!(chain[0].2 & DESC_F_WRITE, 0);
+                assert_eq!(chain[0].1 as usize, CURSOR_CMD_LEN);
+                let req = mem(chain[0].0, chain[0].1 as usize);
+                let w = |n: usize| le(req, HDR_LEN + 4 * n);
+                assert_eq!(w(3), 0);
+                host.cursor.push((le(req, 0), w(0), w(1), w(2), w(4), w(5), w(6)));
+                cursor.push_used(head, 0);
+            }
             let Some((head, chain)) = dev.pop_avail() else {
                 std::thread::yield_now();
                 continue;
@@ -473,9 +792,11 @@ mod tests {
         let dma = HostDma::default();
         let mut gpu = VirtioGpu::new(device(), &dma).unwrap();
         let (size, addrs) = gpu.transport().queue(CONTROL_QUEUE);
+        let (csize, caddrs) = gpu.transport().queue(CURSOR_QUEUE);
         let stop = AtomicBool::new(false);
         std::thread::scope(|s| {
-            let server = s.spawn(|| serve(DeviceSide::new(size, addrs), &mut host, &stop));
+            let server =
+                s.spawn(|| serve(DeviceSide::new(size, addrs), DeviceSide::new(csize, caddrs), &mut host, &stop));
             // Stop the device even if `body` panics, so the scope can end.
             struct Stop<'flag>(&'flag AtomicBool);
             impl Drop for Stop<'_> {
@@ -498,7 +819,9 @@ mod tests {
         let gpu = VirtioGpu::new(device(), &dma).unwrap();
         let t = gpu.transport();
         assert_eq!(t.status() & status::DRIVER_OK, status::DRIVER_OK);
-        assert_eq!(t.accepted.get(), feature::VERSION_1, "no optional features taken");
+        assert_eq!(t.accepted.get(), feature::VERSION_1 | F_EDID, "only EDID taken");
+        assert_eq!(t.queue(CURSOR_QUEUE).0, MAX_CURSOR_QUEUE_SIZE);
+        assert!(gpu.has_edid() && gpu.has_cursor());
         assert_eq!(t.queue(CONTROL_QUEUE).0, MAX_QUEUE_SIZE);
         assert_eq!(gpu.num_scanouts(), 1);
         assert_eq!(gpu.info().width, 0, "no mode yet");
@@ -589,5 +912,122 @@ mod tests {
             gpu.flush_all().unwrap();
             gpu.disable().unwrap();
         });
+    }
+
+    fn host_with_edid() -> Host {
+        let edid = crate::edid::tests::sample().to_vec();
+        Host { edid_claim: edid.len() as u32, edid, ..Host::default() }
+    }
+
+    #[test]
+    fn edid_is_fetched_and_parsed() {
+        let (_, live) = run_host(host_with_edid(), |gpu| {
+            let e = gpu.edid(0).unwrap();
+            assert_eq!(e.preferred_size(), Some((1920, 1080)));
+            assert_eq!(e.size_mm(), Some((527, 296)));
+            assert_eq!(gpu.edid(1), Err(EdidFetchError::Unsupported), "no such scanout");
+        });
+        assert_eq!(live, 0);
+    }
+
+    #[test]
+    fn hostile_edid_is_rejected() {
+        let mut host = host_with_edid();
+        host.edid[100] ^= 0xff;
+        run_host(host, |gpu| {
+            assert_eq!(gpu.edid(0), Err(EdidFetchError::Invalid(EdidError::BadChecksum)));
+        });
+        // Claims more than it sent, and more than the protocol allows.
+        for claim in [u32::MAX, 5000, 64] {
+            let host = Host { edid_claim: claim, ..host_with_edid() };
+            run_host(host, |gpu| {
+                let r = gpu.edid(0);
+                if claim == 64 {
+                    assert_eq!(r, Err(EdidFetchError::Invalid(EdidError::TooShort)));
+                } else {
+                    assert!(r.is_ok(), "clamped to what was sent");
+                }
+            });
+        }
+        // A device that did not offer EDID.
+        let dma = HostDma::default();
+        let mut t = device();
+        t.offered &= !F_EDID;
+        let mut gpu = VirtioGpu::new(t, &dma).unwrap();
+        assert!(!gpu.has_edid());
+        assert_eq!(gpu.edid(0), Err(EdidFetchError::Unsupported));
+    }
+
+    #[test]
+    fn cursor_image_move_hide() {
+        let mut image = std::vec![0u32; 64 * 64];
+        image[65] = 0x80ff_0000;
+        let (host, live) = run_host(Host::default(), |gpu| {
+            assert_eq!(gpu.set_cursor(&image[..10], 0, 0), Err(DisplayError::Unsupported), "wrong size");
+            assert_eq!(gpu.set_cursor(&image, 64, 0), Err(DisplayError::Unsupported), "hot spot outside");
+            gpu.set_mode(0, 32, 32).unwrap();
+            gpu.move_cursor(5, 6).unwrap();
+            gpu.set_cursor(&image, 2, 3).unwrap();
+            gpu.move_cursor(10, 20).unwrap();
+            gpu.hide_cursor().unwrap();
+            gpu.move_cursor(11, 21).unwrap();
+            gpu.show_cursor().unwrap();
+            // More commands than the ring holds: completions are reaped.
+            for i in 0..20 {
+                gpu.move_cursor(i, i).unwrap();
+            }
+            // A new image replaces and releases the old one.
+            gpu.set_cursor(&image, 0, 0).unwrap();
+            assert!(gpu.cursor.as_ref().unwrap().queue.in_flight() <= MAX_CURSOR_QUEUE_SIZE);
+            // Let the fake device finish before the test body ends.
+            while gpu.cursor.as_ref().unwrap().queue.in_flight() > 0 {
+                gpu.handle_interrupt();
+                std::thread::yield_now();
+            }
+        });
+        assert_eq!(live, 0);
+        let c = &host.cursor;
+        // Resource 1 is the mode, 2 the first cursor image, 3 the second.
+        assert_eq!(c[0], (CMD_MOVE_CURSOR, 0, 5, 6, 0, 0, 0), "no image yet");
+        assert_eq!(c[1], (CMD_UPDATE_CURSOR, 0, 5, 6, 2, 2, 3));
+        assert_eq!(c[2], (CMD_MOVE_CURSOR, 0, 10, 20, 2, 2, 3));
+        assert_eq!(c[3], (CMD_UPDATE_CURSOR, 0, 10, 20, 0, 2, 3), "hidden: resource 0");
+        assert_eq!(c[4].4, 0, "moving a hidden cursor keeps it hidden");
+        assert_eq!(c[5], (CMD_UPDATE_CURSOR, 0, 11, 21, 2, 2, 3));
+        assert_eq!(c.last().copied(), Some((CMD_UPDATE_CURSOR, 0, 19, 19, 3, 0, 0)));
+        assert_eq!(host.resources.len(), 2, "mode and the new cursor image; the old one was unreferenced");
+        let img = &host.resources[&3];
+        assert_eq!((img.width, img.height), (64, 64));
+        assert_eq!(img.pixels[65], 0x80ff_0000, "the image reached the host");
+    }
+
+    #[test]
+    fn interrupts_ack_and_flag_display_changes() {
+        let dma = HostDma::default();
+        let mut gpu = VirtioGpu::new(device(), &dma).unwrap();
+        assert!(!gpu.cursor.as_ref().unwrap().queue.has_used());
+        gpu.enable_interrupts();
+        // FakeTransport acknowledges queue interrupts only.
+        assert!(gpu.handle_interrupt());
+        assert_eq!(gpu.interrupts_handled(), 1);
+        assert!(!gpu.take_display_changed());
+        gpu.config_changed = true;
+        assert!(gpu.take_display_changed());
+        assert!(!gpu.take_display_changed(), "reported once");
+        gpu.disable_interrupts();
+    }
+
+    #[test]
+    fn no_cursor_queue_is_unsupported() {
+        let dma = HostDma::default();
+        let mut t = device();
+        t.max_queue = 1;
+        // A queue size of one is unusable for the control queue too.
+        assert_eq!(VirtioGpu::new(t, &dma).err(), Some(VirtioError::BadQueue));
+        let mut gpu = VirtioGpu::new(device(), &dma).unwrap();
+        gpu.cursor = None;
+        assert_eq!(gpu.move_cursor(0, 0), Err(DisplayError::Unsupported));
+        assert_eq!(gpu.hide_cursor(), Err(DisplayError::Unsupported));
+        assert_eq!(gpu.set_cursor(&[0; 4096], 0, 0), Err(DisplayError::Unsupported));
     }
 }
