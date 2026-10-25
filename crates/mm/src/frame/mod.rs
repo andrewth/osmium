@@ -6,7 +6,10 @@ mod buddy;
 pub use bitmap::BitmapAllocator;
 pub use buddy::BuddyAllocator;
 
+use core::fmt;
+
 use crate::addr::{PAGE_SIZE, PhysAddr};
+use crate::paging::TableAlloc;
 
 /// Turns physical addresses into pointers the CPU can dereference.
 ///
@@ -122,6 +125,69 @@ pub unsafe trait FrameAllocator {
     /// had none. The frame is not freed here: the caller frees it at zero.
     fn release(&self, _pa: PhysAddr) -> Option<u32> {
         None
+    }
+}
+
+/// One reference to a user frame. A page table that owns its leaves holds one
+/// for each mapping, and a kernel path can hold one to keep a frame alive past
+/// its mapping. The frame is freed when the last reference is dropped.
+pub struct OwnedFrame<A: TableAlloc> {
+    pa: PhysAddr,
+    alloc: A,
+}
+
+impl<A: TableAlloc> fmt::Debug for OwnedFrame<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedFrame").field("pa", &self.pa).finish_non_exhaustive()
+    }
+}
+
+impl<A: TableAlloc> OwnedFrame<A> {
+    /// Takes the first reference to `pa`, a frame that `alloc` just returned
+    /// from `alloc_table`. If `alloc` does not count references, the frame is
+    /// freed and `None` returned.
+    pub fn claim(alloc: A, pa: PhysAddr) -> Option<Self> {
+        if alloc.claim_frame(pa) {
+            Some(Self { pa, alloc })
+        } else {
+            // SAFETY: `pa` came from `alloc_table` and was never mapped, so nothing refers to it.
+            unsafe { alloc.free_table(pa) };
+            None
+        }
+    }
+
+    /// The frame's physical address.
+    pub fn pa(&self) -> PhysAddr {
+        self.pa
+    }
+
+    /// Wraps a reference that a table already holds for `pa`.
+    pub(crate) fn adopt(alloc: A, pa: PhysAddr) -> Self {
+        Self { pa, alloc }
+    }
+
+    /// Gives up this handle without releasing its reference, returning the
+    /// frame's address. The reference now belongs to whoever mapped it.
+    pub(crate) fn leak(self) -> PhysAddr {
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so its allocator handle is moved out exactly once here.
+        drop(unsafe { core::ptr::read(&this.alloc) });
+        this.pa
+    }
+}
+
+impl<A: TableAlloc + Clone> OwnedFrame<A> {
+    /// Takes another reference to the same frame, if the allocator counts them.
+    pub fn share(&self) -> Option<Self> {
+        self.alloc.retain_frame(self.pa).then(|| Self { pa: self.pa, alloc: self.alloc.clone() })
+    }
+}
+
+impl<A: TableAlloc> Drop for OwnedFrame<A> {
+    fn drop(&mut self) {
+        // SAFETY: this handle held a reference, which it now gives up; the frame is no longer mapped
+        // through it (a table that maps it holds a reference of its own).
+        unsafe { self.alloc.release_frame(self.pa) };
     }
 }
 
@@ -262,7 +328,35 @@ unsafe impl<A, M: PhysMapper> PhysMapper for LockedFrames<A, M> {
 // mapped by `mapper` per `new`'s contract.
 unsafe impl<A: FrameAllocator, M: PhysMapper> crate::paging::TableAlloc for LockedFrames<A, M> {
     fn alloc_table(&self) -> Option<PhysAddr> {
-        self.alloc.lock().alloc(0)
+        let mut alloc = self.alloc.lock();
+        let pa = alloc.alloc(0)?;
+        alloc.set_kind(pa, FrameKind::Table);
+        Some(pa)
+    }
+
+    fn claim_frame(&self, pa: PhysAddr) -> bool {
+        let mut alloc = self.alloc.lock();
+        let claimed = alloc.claim(pa);
+        if claimed {
+            alloc.set_kind(pa, FrameKind::User);
+        }
+        claimed
+    }
+
+    fn retain_frame(&self, pa: PhysAddr) -> bool {
+        self.alloc.lock().retain(pa).is_some()
+    }
+
+    unsafe fn release_frame(&self, pa: PhysAddr) {
+        let mut alloc = self.alloc.lock();
+        if alloc.release(pa) == Some(0) {
+            // SAFETY: the last reference is gone, and the frame came from `alloc`.
+            unsafe { alloc.dealloc(pa, 0) };
+        }
+    }
+
+    fn frame_refs(&self, pa: PhysAddr) -> Option<u32> {
+        self.alloc.lock().refs(pa)
     }
 
     unsafe fn free_table(&self, pa: PhysAddr) {

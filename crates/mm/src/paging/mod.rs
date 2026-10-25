@@ -11,7 +11,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
-use crate::frame::PhysMapper;
+use crate::frame::{OwnedFrame, PhysMapper};
 
 /// Entries per table on every supported format (4 KiB granule).
 pub const ENTRIES: usize = 512;
@@ -202,6 +202,38 @@ pub unsafe trait TableAlloc: PhysMapper {
             unsafe { self.free_table(pa + i * PAGE_SIZE as u64) }
         }
     }
+
+    /// Takes the first reference to `pa`, a user frame that `alloc_table`
+    /// just returned. Returns false if this allocator does not count
+    /// references, in which case its frames cannot be shared.
+    fn claim_frame(&self, _pa: PhysAddr) -> bool {
+        false
+    }
+
+    /// Adds a reference to a frame that has one. Returns false if this
+    /// allocator does not count references, or the frame has none.
+    fn retain_frame(&self, _pa: PhysAddr) -> bool {
+        false
+    }
+
+    /// Drops a reference taken by [`claim_frame`](TableAlloc::claim_frame) or
+    /// [`retain_frame`](TableAlloc::retain_frame), freeing the frame with the
+    /// last one. The default frees it outright, which is right for an
+    /// allocator that never shares frames.
+    ///
+    /// # Safety
+    /// The caller gives up a reference it holds to `pa`, and no table may
+    /// map the frame through that reference any more.
+    unsafe fn release_frame(&self, pa: PhysAddr) {
+        // SAFETY: forwarded contract: the last reference is gone.
+        unsafe { self.free_table(pa) }
+    }
+
+    /// The number of references to the frame at `pa`, if this allocator
+    /// counts them.
+    fn frame_refs(&self, _pa: PhysAddr) -> Option<u32> {
+        None
+    }
 }
 
 // SAFETY: forwards to `A`.
@@ -219,6 +251,19 @@ unsafe impl<A: TableAlloc + ?Sized> TableAlloc for &A {
     unsafe fn free_root(&self, pa: PhysAddr, pages: usize) {
         // SAFETY: forwarded contract.
         unsafe { (**self).free_root(pa, pages) }
+    }
+    fn claim_frame(&self, pa: PhysAddr) -> bool {
+        (**self).claim_frame(pa)
+    }
+    fn retain_frame(&self, pa: PhysAddr) -> bool {
+        (**self).retain_frame(pa)
+    }
+    unsafe fn release_frame(&self, pa: PhysAddr) {
+        // SAFETY: forwarded contract.
+        unsafe { (**self).release_frame(pa) }
+    }
+    fn frame_refs(&self, pa: PhysAddr) -> Option<u32> {
+        (**self).frame_refs(pa)
     }
 }
 
@@ -241,6 +286,12 @@ pub enum MapError {
     /// format can express such a leaf (on RISC-V it would read as a table
     /// pointer), so leave the page unmapped instead.
     NoAccess,
+    /// The table owns its leaves: map them with [`PageTable::map_owned`].
+    OwnedLeaves,
+    /// The table does not own its leaves: map them with [`PageTable::map`].
+    UnownedLeaves,
+    /// The size is not 4 KiB, which is all an owning table maps.
+    OwnedSize,
 }
 
 /// Why an existing mapping could not be changed.
@@ -252,6 +303,11 @@ pub enum UnmapError {
     InvalidAddress,
     /// The new flags grant no access; see [`MapError::NoAccess`].
     NoAccess,
+    /// The table owns its leaves: use [`PageTable::unmap_owned`] or
+    /// [`PageTable::replace_owned`].
+    OwnedLeaves,
+    /// The table does not own its leaves: use [`PageTable::unmap`].
+    UnownedLeaves,
 }
 
 /// Whether a leaf with `flags` permits any access.
@@ -261,6 +317,7 @@ fn grants_access(flags: MapFlags) -> bool {
 
 /// A TLB invalidation that the caller must perform or explicitly skip.
 #[must_use = "flush the TLB, or call `ignore` if this table is not active"]
+#[derive(Debug)]
 pub struct Flush(VirtAddr);
 
 impl Flush {
@@ -292,24 +349,47 @@ pub struct Translation {
 
 /// A page-table tree in format `F`, whose table pages come from `A`.
 ///
-/// The tree owns its intermediate tables and frees them on drop. It does not
-/// own the frames that leaves point at.
+/// The tree owns its intermediate tables and frees them on drop. What its
+/// leaves point at is decided by how the tree was made:
+///
+/// - [`PageTable::new`] makes a table that does not own its leaves. It maps
+///   frames it is handed with [`PageTable::map`], and never frees them. This
+///   is right for kernel, device and stage-2 tables.
+/// - [`PageTable::new_owned`] makes a table that owns one reference to each
+///   4 KiB frame it maps. It maps them with [`PageTable::map_owned`], gives
+///   them back with [`PageTable::unmap_owned`], and releases the rest on drop.
 pub struct PageTable<F: PageTableFormat, A: TableAlloc> {
     root: PhysAddr,
     alloc: A,
     /// Root entries borrowed from another table (bit `i` = root index `i`):
     /// never freed or modified through this table.
     shared: [u64; ENTRIES / 64],
+    /// Whether the leaves are owned references (see the type's documentation).
+    owned: bool,
     _format: PhantomData<F>,
 }
 
 impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
-    /// Allocates an empty root table.
+    /// Allocates an empty root table whose leaves are not owned.
     pub fn new(alloc: A) -> Result<Self, MapError> {
+        Self::create(alloc, false)
+    }
+
+    /// Allocates an empty root table whose leaves are owned references.
+    pub fn new_owned(alloc: A) -> Result<Self, MapError> {
+        Self::create(alloc, true)
+    }
+
+    fn create(alloc: A, owned: bool) -> Result<Self, MapError> {
         let root = alloc.alloc_root(F::ROOT_PAGES).ok_or(MapError::OutOfMemory)?;
         // SAFETY: a fresh, exclusively owned block of `ROOT_PAGES` frames.
         unsafe { alloc.phys_to_virt(root).write_bytes(0, PAGE_SIZE * F::ROOT_PAGES) };
-        Ok(Self { root, alloc, shared: [0; ENTRIES / 64], _format: PhantomData })
+        Ok(Self { root, alloc, shared: [0; ENTRIES / 64], owned, _format: PhantomData })
+    }
+
+    /// Whether the leaves are owned references (see [`PageTable::new_owned`]).
+    pub fn owns_leaves(&self) -> bool {
+        self.owned
     }
 
     /// Physical address of the root table, for CR3, TTBR, satp, EPTP or VTTBR.
@@ -361,8 +441,37 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         self.shared.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
     }
 
-    /// Maps the page at `va` to `pa`.
+    /// Maps the page at `va` to `pa`, which the table does not own. Refused
+    /// by a table that owns its leaves.
     pub fn map(&mut self, va: VirtAddr, pa: PhysAddr, size: PageSize, flags: MapFlags) -> Result<Flush, MapError> {
+        if self.owned {
+            return Err(MapError::OwnedLeaves);
+        }
+        self.map_pa(va, pa, size, flags)
+    }
+
+    /// Maps the 4 KiB page at `va` to the frame `frame`, whose reference the
+    /// table takes over. On failure the frame is handed back, and nothing is
+    /// mapped. Refused by a table that does not own its leaves.
+    pub fn map_owned(
+        &mut self,
+        va: VirtAddr,
+        frame: OwnedFrame<A>,
+        flags: MapFlags,
+    ) -> Result<Flush, (MapError, OwnedFrame<A>)> {
+        if !self.owned {
+            return Err((MapError::UnownedLeaves, frame));
+        }
+        match self.map_pa(va, frame.pa(), PageSize::Size4K, flags) {
+            Ok(flush) => {
+                frame.leak();
+                Ok(flush)
+            }
+            Err(e) => Err((e, frame)),
+        }
+    }
+
+    fn map_pa(&mut self, va: VirtAddr, pa: PhysAddr, size: PageSize, flags: MapFlags) -> Result<Flush, MapError> {
         if self.is_shared(va) {
             return Err(MapError::InvalidAddress);
         }
@@ -430,8 +539,83 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         Ok(())
     }
 
-    /// Removes the leaf that maps `va` and returns what it mapped.
+    /// Removes the leaf that maps `va` and returns what it mapped. Refused by
+    /// a table that owns its leaves.
     pub fn unmap(&mut self, va: VirtAddr) -> Result<(Translation, Flush), UnmapError> {
+        if self.owned {
+            return Err(UnmapError::OwnedLeaves);
+        }
+        self.unmap_pa(va)
+    }
+
+    /// Removes the 4 KiB leaf that maps `va` and returns its frame's
+    /// reference. Refused by a table that does not own its leaves.
+    pub fn unmap_owned(&mut self, va: VirtAddr) -> Result<(OwnedFrame<A>, Flush), UnmapError>
+    where
+        A: Clone,
+    {
+        if !self.owned {
+            return Err(UnmapError::UnownedLeaves);
+        }
+        // Checked before anything is cleared: a larger leaf is not one frame.
+        if self.find_leaf(va)?.1 != 0 {
+            return Err(UnmapError::NotMapped);
+        }
+        let (t, flush) = self.unmap_pa(va)?;
+        Ok((OwnedFrame::adopt(self.alloc.clone(), t.pa), flush))
+    }
+
+    /// Replaces the 4 KiB leaf that maps `va` with `frame`, and returns the
+    /// reference the old leaf held. Nothing needs allocating, so once `va`
+    /// is mapped this cannot run out of memory. On failure `frame` is dropped
+    /// (and released). Refused by a table that does not own its leaves.
+    pub fn replace_owned(
+        &mut self,
+        va: VirtAddr,
+        frame: OwnedFrame<A>,
+        flags: MapFlags,
+    ) -> Result<(OwnedFrame<A>, Flush), UnmapError>
+    where
+        A: Clone,
+    {
+        if !self.owned {
+            return Err(UnmapError::UnownedLeaves);
+        }
+        if self.is_shared(va) {
+            return Err(UnmapError::InvalidAddress);
+        }
+        if !grants_access(flags) {
+            return Err(UnmapError::NoAccess);
+        }
+        let (e, level) = self.find_leaf(va)?;
+        if level != 0 {
+            return Err(UnmapError::NotMapped);
+        }
+        let old = e.swap(F::leaf(frame.pa(), flags, 0), Ordering::AcqRel);
+        frame.leak();
+        Ok((OwnedFrame::adopt(self.alloc.clone(), F::addr(old, 0)), Flush(va.align_down(PAGE_SIZE as u64))))
+    }
+
+    /// Takes another reference to the 4 KiB frame that `va` maps, for a
+    /// kernel path that must keep the frame past its mapping. Returns `None`
+    /// if `va` is not mapped that way, or the allocator does not count
+    /// references.
+    pub fn share_owned(&self, va: VirtAddr) -> Option<OwnedFrame<A>>
+    where
+        A: Clone,
+    {
+        if !self.owned || self.is_shared(va) {
+            return None;
+        }
+        let (e, level) = self.find_leaf(va).ok()?;
+        if level != 0 {
+            return None;
+        }
+        let pa = F::addr(e.load(Ordering::Acquire), 0);
+        self.alloc.retain_frame(pa).then(|| OwnedFrame::adopt(self.alloc.clone(), pa))
+    }
+
+    fn unmap_pa(&mut self, va: VirtAddr) -> Result<(Translation, Flush), UnmapError> {
         if self.is_shared(va) {
             return Err(UnmapError::InvalidAddress);
         }
@@ -596,15 +780,26 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     }
 
     fn free_subtree(&self, table: PhysAddr, level: usize) {
-        if level > 0 {
+        // Leaves are visited only where something may need freeing: tables
+        // always, and the leaves of a table that owns them.
+        if level > 0 || self.owned {
             for i in 0..Self::entries(level) {
                 let va = VirtAddr::new((i as u64) << (12 + 9 * level));
                 if level == F::LEVELS - 1 && self.is_shared(va) {
                     continue;
                 }
                 let pte = self.entry(table, va, level).load(Ordering::Relaxed);
-                if F::is_valid(pte) && !F::is_leaf(pte, level) {
-                    self.free_subtree(F::addr(pte, level), level - 1);
+                if !F::is_valid(pte) {
+                    continue;
+                }
+                if !F::is_leaf(pte, level) {
+                    if level > 0 {
+                        self.free_subtree(F::addr(pte, level), level - 1);
+                    }
+                } else if self.owned && level == 0 {
+                    // SAFETY: the table is being dropped, so this leaf's reference is given up
+                    // here, and nothing maps the frame through it any more.
+                    unsafe { self.alloc.release_frame(F::addr(pte, level)) };
                 }
             }
         }

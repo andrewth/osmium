@@ -11,8 +11,9 @@
 //! [`Elf::dynamic`] reads the relocation tables a loader has to apply. Every
 //! field is untrusted: offsets, sizes and addresses are checked arithmetic.
 
-use osmium_mm::paging::{MapError, MapFlags, PageSize, PageTable, PageTableFormat, TableAlloc};
-use osmium_mm::{PAGE_SIZE, PhysAddr, VirtAddr};
+use osmium_mm::frame::OwnedFrame;
+use osmium_mm::paging::{MapError, MapFlags, PageTable, PageTableFormat, TableAlloc};
+use osmium_mm::{PAGE_SIZE, VirtAddr};
 
 use crate::{le32, le64};
 
@@ -189,8 +190,10 @@ impl<'src> Elf<'src> {
 
     /// Maps and fills every loadable segment into `pt`, with each page's
     /// permissions taken from its segments (plus `extra`, e.g.
-    /// `MapFlags::USER`). Pages come from `alloc_frame`, are reached through
-    /// `pt`'s allocator mapping, and are zeroed before the file data is
+    /// `MapFlags::USER`). Pages come from `alloc_frame`, which hands over a
+    /// reference to each frame; `pt` must own its leaves (see
+    /// [`PageTable::new_owned`]). Frames are reached through `pt`'s allocator
+    /// mapping, and are zeroed before the file data is
     /// copied in, so `.bss` reads as zero. Pages shared by two segments get
     /// both segments' permissions.
     ///
@@ -205,7 +208,7 @@ impl<'src> Elf<'src> {
         &self,
         pt: &mut PageTable<F, A>,
         extra: MapFlags,
-        alloc_frame: impl FnMut() -> Option<PhysAddr>,
+        alloc_frame: impl FnMut() -> Option<OwnedFrame<A>>,
     ) -> Result<(), MapError> {
         self.load_into_at(pt, extra, 0, alloc_frame)
     }
@@ -219,7 +222,7 @@ impl<'src> Elf<'src> {
         pt: &mut PageTable<F, A>,
         extra: MapFlags,
         bias: u64,
-        mut alloc_frame: impl FnMut() -> Option<PhysAddr>,
+        mut alloc_frame: impl FnMut() -> Option<OwnedFrame<A>>,
     ) -> Result<(), MapError> {
         self.span_at(bias).ok_or(MapError::InvalidAddress)?;
         let page = PAGE_SIZE as u64;
@@ -249,11 +252,12 @@ impl<'src> Elf<'src> {
                     }
                     Some(_) => return Err(MapError::AlreadyMapped),
                     None => {
-                        let pa = alloc_frame().ok_or(MapError::OutOfMemory)?;
+                        let frame = alloc_frame().ok_or(MapError::OutOfMemory)?;
+                        let pa = frame.pa();
                         // SAFETY: a fresh frame from the caller, reachable
                         // through the table allocator's mapping.
                         unsafe { pt.allocator().phys_to_virt(pa).write_bytes(0, PAGE_SIZE) };
-                        pt.map(VirtAddr::new(va), pa, PageSize::Size4K, flags)?.ignore();
+                        pt.map_owned(VirtAddr::new(va), frame, flags).map_err(|(e, _)| e)?.ignore();
                         pa
                     }
                 };
@@ -395,6 +399,7 @@ impl<'src> Elf<'src> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use osmium_mm::PhysAddr;
     use std::vec::Vec;
 
     /// A minimal ELF64 executable: one RX segment with 4 bytes of code and
@@ -466,15 +471,18 @@ mod tests {
                 Some(page())
             }
             unsafe fn free_table(&self, _: PhysAddr) {}
+            fn claim_frame(&self, _: PhysAddr) -> bool {
+                true
+            }
         }
         let host = Host(RefCell::new(Vec::new()));
         let f = sample();
         let elf = Elf::new(&f).unwrap();
-        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&host).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&host).unwrap();
         elf.load_into(&mut pt, MapFlags::USER, || {
             let p = page();
             host.0.borrow_mut().push(p.0);
-            Some(p)
+            OwnedFrame::claim(&host, p)
         })
         .unwrap();
         assert_eq!(host.0.borrow().len(), 2, "one page per segment");
@@ -490,9 +498,13 @@ mod tests {
         // A page that is already mapped (here standing in for kernel memory
         // in a shared root entry) is refused, not written through.
         let victim = page();
-        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&host).unwrap();
-        pt.map(VirtAddr::new(0x40_2000), victim, PageSize::Size4K, MapFlags::READ | MapFlags::WRITE).unwrap().ignore();
-        assert_eq!(elf.load_into(&mut pt, MapFlags::USER, || Some(page())), Err(MapError::AlreadyMapped));
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&host).unwrap();
+        let victim_frame = OwnedFrame::claim(&host, victim).unwrap();
+        pt.map_owned(VirtAddr::new(0x40_2000), victim_frame, MapFlags::READ | MapFlags::WRITE).unwrap().ignore();
+        assert_eq!(
+            elf.load_into(&mut pt, MapFlags::USER, || OwnedFrame::claim(&host, page())),
+            Err(MapError::AlreadyMapped)
+        );
         // SAFETY: the host page mapped above.
         assert_eq!(unsafe { *(victim.0 as *const [u8; 2]) }, [0, 0], "nothing copied into it");
 
@@ -500,8 +512,8 @@ mod tests {
         let mut g = sample();
         g[120 + 16..120 + 24].copy_from_slice(&0x40_1800u64.to_le_bytes());
         let elf = Elf::new(&g).unwrap();
-        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&host).unwrap();
-        elf.load_into(&mut pt, MapFlags::USER, || Some(page())).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&host).unwrap();
+        elf.load_into(&mut pt, MapFlags::USER, || OwnedFrame::claim(&host, page())).unwrap();
         let t = pt.translate(VirtAddr::new(0x40_1000)).unwrap();
         assert!(t.flags.contains(MapFlags::WRITE | MapFlags::EXEC));
         // SAFETY: the translated host page.
@@ -512,8 +524,11 @@ mod tests {
         let mut g = sample();
         g[120 + 16..120 + 24].copy_from_slice(&0xffff_ffff_ffff_f000u64.to_le_bytes());
         let elf = Elf::new(&g).unwrap();
-        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&host).unwrap();
-        assert_eq!(elf.load_into(&mut pt, MapFlags::USER, || Some(page())), Err(MapError::InvalidAddress));
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&host).unwrap();
+        assert_eq!(
+            elf.load_into(&mut pt, MapFlags::USER, || OwnedFrame::claim(&host, page())),
+            Err(MapError::InvalidAddress)
+        );
     }
 
     /// A PIE with `PT_INTERP` and `PT_DYNAMIC` for the bias and dynamic tests.
@@ -603,16 +618,19 @@ mod tests {
                 Some(page())
             }
             unsafe fn free_table(&self, _: PhysAddr) {}
+            fn claim_frame(&self, _: PhysAddr) -> bool {
+                true
+            }
         }
         let f = pie();
         let elf = Elf::new(&f).unwrap();
-        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&Host).unwrap();
-        elf.load_into_at(&mut pt, MapFlags::USER, 0x10_0000, || Some(page())).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&Host).unwrap();
+        elf.load_into_at(&mut pt, MapFlags::USER, 0x10_0000, || OwnedFrame::claim(&Host, page())).unwrap();
         assert!(pt.translate(VirtAddr::new(0x10_0000)).is_some() && pt.translate(VirtAddr::new(0x10_2000)).is_some());
         assert!(pt.translate(VirtAddr::new(0x0)).is_none() && pt.translate(VirtAddr::new(0x2000)).is_none());
-        let mut pt: PageTable<X86_64, &Host> = PageTable::new(&Host).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&Host).unwrap();
         assert_eq!(
-            elf.load_into_at(&mut pt, MapFlags::USER, u64::MAX - 0xfff, || Some(page())),
+            elf.load_into_at(&mut pt, MapFlags::USER, u64::MAX - 0xfff, || OwnedFrame::claim(&Host, page())),
             Err(MapError::InvalidAddress)
         );
     }
