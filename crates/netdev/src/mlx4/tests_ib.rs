@@ -12,7 +12,7 @@ use super::ib::MadDest;
 use super::mad::{self, GrhFields, MAD_LEN, QP1_QKEY};
 use super::queue;
 use super::*;
-use crate::virtio::testing::HostDma;
+use osmium_drivers::virtio::testing::HostDma;
 
 pub(super) const IB: [Option<PortKind>; 2] = [Some(PortKind::InfiniBand), Some(PortKind::InfiniBand)];
 pub(super) const QKEY: u32 = 0x1234_5678;

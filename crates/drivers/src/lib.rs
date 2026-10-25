@@ -12,21 +12,11 @@
 //! | [`clint::Clint`] | RISC-V CLINT (M-mode timer, software IRQs) | firmware timers |
 //! | [`ioapic::IoApic`] | x86 I/O APIC | GSI routing |
 //! | [`ramdisk::RamDisk`] | Memory-backed disk | `BlockDevice` |
-//! | [`virtio::net::VirtioNet`] | virtio network card (MMIO, legacy and 1.x) | `NetDevice` |
-//! | [`xhci::Xhci`] | xHCI USB host controller | `UsbHost` |
-//! | [`ehci::Ehci`] | EHCI USB 2.0 host controller (high-speed devices; polled) | `UsbHost` |
-//! | [`ohci::Ohci`] | OHCI USB 1.1 host controller (polled) | `UsbHost` |
-//! | [`uhci::Uhci`] | UHCI USB 1.1 host controller (I/O ports or MMIO; polled) | `UsbHost` |
-//! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet, InfiniBand and IPoIB (PCI, polled or MSI-X) | `NetDevice` per Ethernet port or IPoIB interface; UD datagrams and reliable connections per InfiniBand port |
 //! | [`nvme::Nvme`] | NVM Express SSD (PCI, polled) | `BlockDevice` |
 //! | [`virtio::gpu::VirtioGpu`] | virtio GPU, 2D (MMIO, or PCI as `virtio-gpu-pci` and `virtio-vga`) | `Display` |
 //! | [`display::bochs::BochsVbe`] | Bochs DISPI: QEMU std VGA, `bochs-display`, `virtio-vga` in VGA mode | `Display` |
 //! | [`display::vbe::Vbe`] | VESA BIOS Extensions through a [`display::vbe::VideoBios`] | mode list and mode setting |
 //! | [`ahci::AhciDisk`] | SATA disk on an AHCI HBA (PCI, polled) | `BlockDevice` per port |
-//! | [`usb::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
-//! | [`usb::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
-//! | [`usb::ecm::UsbEthernet`] | USB Ethernet (CDC-ECM) on any `UsbHost` | `NetDevice` |
-//! | [`usb::ncm::UsbNcm`] | USB Ethernet (CDC-NCM; simulator-tested only) on any `UsbHost` | `NetDevice` |
 //! | [`iommu::vtd::Vtd`] | Intel VT-d DMA remapping unit | `Iommu` |
 //! | [`iommu::amdvi::AmdVi`] | AMD-Vi (AMD IOMMU) unit | `Iommu` |
 //! | [`iommu::smmuv3::Smmuv3`] | Arm SMMUv3 | `Iommu` |
@@ -37,31 +27,24 @@
 //! against ordinary memory.
 #![no_std]
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 extern crate std;
 
 pub mod ahci;
 pub mod clint;
 pub mod display;
-pub mod ehci;
 pub mod fwcfg;
 pub mod gicv2;
 pub mod ioapic;
 pub mod iommu;
 pub mod lapic;
-pub mod mlx4;
 pub mod nvme;
-pub mod ohci;
 pub mod pit;
 pub mod pl011;
 pub mod plic;
 pub mod ramdisk;
 pub mod uart16550;
-pub mod uhci;
-pub mod usb;
-pub(crate) mod usbhc;
 pub mod virtio;
-pub mod xhci;
 
 /// Panic-free register access for drivers: an access outside the window
 /// reads as all ones and a write is dropped, as on a bus with no device.

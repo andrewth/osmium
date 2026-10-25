@@ -10,10 +10,10 @@ use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
 use osmium_hal::virtio::net;
 
-use super::queue::{Segment, VirtQueue};
 use core::mem::ManuallyDrop;
+use osmium_drivers::virtio::queue::{Segment, VirtQueue};
 
-use super::{DeviceType, Transport, VirtioError, driver_ok, feature, negotiate, reset};
+use osmium_drivers::virtio::{DeviceType, Transport, VirtioError, driver_ok, feature, negotiate, reset};
 
 const RX: u16 = net::RX_QUEUE;
 const TX: u16 = net::TX_QUEUE;
@@ -207,9 +207,9 @@ impl<T: Transport, D: DmaAllocator + ?Sized> Drop for VirtioNet<'_, T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::queue::tests::DeviceSide;
-    use crate::virtio::status;
-    use crate::virtio::testing::{FakeTransport, HostDma};
+    use osmium_drivers::virtio::queue::tests::DeviceSide;
+    use osmium_drivers::virtio::status;
+    use osmium_drivers::virtio::testing::{FakeTransport, HostDma};
 
     const MAC: [u8; 8] = [0x52, 0x54, 0, 0x12, 0x34, 0x56, 1, 0]; // + status: link up
 

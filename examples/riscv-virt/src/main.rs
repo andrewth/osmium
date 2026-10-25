@@ -23,17 +23,17 @@ use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::{Fdt, Node};
 use osmium::drivers::ahci::{self, Ahci};
-use osmium::drivers::ehci::Ehci;
+use osmium::usb::ehci::Ehci;
 use osmium::drivers::iommu::riscv::RiscvIommu;
 use osmium::drivers::nvme::{self, Nvme};
-use osmium::drivers::ohci::Ohci;
+use osmium::usb::ohci::Ohci;
 use osmium::drivers::plic::Plic;
 use osmium::drivers::uart16550::{Mmio, Uart16550};
 use osmium::drivers::virtio::blk::VirtioBlk;
 use osmium::drivers::virtio::mmio::MmioTransport;
-use osmium::drivers::virtio::net::VirtioNet;
+use osmium::netdev::virtio_net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
-use osmium::drivers::xhci::Xhci;
+use osmium::usb::xhci::Xhci;
 use osmium::hal::block::BlockDevice;
 use osmium::hal::console::{Console, SerialConsole, set_console};
 use osmium::hal::dma::DmaAllocator;
@@ -920,7 +920,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         }
         None => println!("[usb]   no EHCI controller"),
     }
-    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, osmium::drivers::ohci::CLASS, 0)) {
+    match pcie.as_ref().zip(bars.as_mut()).and_then(|(h, b)| find_pci(h, b, osmium::usb::ohci::CLASS, 0)) {
         Some((addr, base, len, pin)) => {
             // SAFETY: BAR 0 was just assigned this range inside the mapped
             // window; nothing else uses it.

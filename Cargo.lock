@@ -19,9 +19,11 @@ dependencies = [
  "osmium-iscsi",
  "osmium-mm",
  "osmium-net",
+ "osmium-netdev",
  "osmium-proc",
  "osmium-sched",
  "osmium-sync",
+ "osmium-usb",
  "osmium-virt",
 ]
 
@@ -129,6 +131,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "osmium-netdev"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-drivers",
+ "osmium-hal",
+]
+
+[[package]]
 name = "osmium-proc"
 version = "0.1.0"
 dependencies = [
@@ -155,6 +166,15 @@ name = "osmium-sync"
 version = "0.1.0"
 dependencies = [
  "osmium-arch",
+]
+
+[[package]]
+name = "osmium-usb"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-hal",
+ "osmium-mm",
 ]
 
 [[package]]

@@ -314,8 +314,11 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Test support: [`DeviceSide`](tests::DeviceSide) plays the device's end of a queue. Enabled by the
+/// `testing` feature.
+#[cfg(any(test, feature = "testing"))]
+#[allow(missing_docs, dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+pub mod tests {
     use super::*;
     use crate::virtio::testing::HostDma;
 
