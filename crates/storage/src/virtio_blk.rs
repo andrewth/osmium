@@ -10,10 +10,10 @@ use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
 use osmium_hal::virtio::blk;
 
-use super::queue::{Segment, VirtQueue};
+use osmium_drivers::virtio::queue::{Segment, VirtQueue};
 use core::mem::ManuallyDrop;
 
-use super::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
+use osmium_drivers::virtio::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
 
 /// Bytes of DMA bounce buffer, and so the most one request transfers.
 pub const DATA_LEN: usize = 64 * 1024;
@@ -182,9 +182,9 @@ impl<T: Transport, D: DmaAllocator + ?Sized> Drop for VirtioBlk<'_, T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::queue::tests::DeviceSide;
-    use crate::virtio::testing::{FakeTransport, HostDma};
-    use crate::virtio::{feature, status};
+    use osmium_drivers::virtio::queue::tests::DeviceSide;
+    use osmium_drivers::virtio::testing::{FakeTransport, HostDma};
+    use osmium_drivers::virtio::{feature, status};
     use core::sync::atomic::{AtomicBool, Ordering};
     use osmium_hal::virtio::queue::DESC_F_WRITE;
     use std::vec;

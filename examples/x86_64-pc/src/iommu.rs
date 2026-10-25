@@ -6,8 +6,8 @@
 //! translation off again.
 
 use osmium::boot::acpi::{AmdIommuUnit, DmaRemapUnit, EcamWindow};
-use osmium::drivers::iommu::amdvi::AmdVi;
-use osmium::drivers::iommu::vtd::Vtd;
+use osmium::sysdrv::iommu::amdvi::AmdVi;
+use osmium::sysdrv::iommu::vtd::Vtd;
 use osmium::hal::iommu::{DeviceId, Iommu};
 use osmium::hal::pci;
 use osmium::hal::println;

@@ -12,6 +12,7 @@ dependencies = [
  "osmium-hal",
  "osmium-mm",
  "osmium-sync",
+ "osmium-sysdrv",
 ]
 
 [[package]]
@@ -25,7 +26,6 @@ dependencies = [
  "osmium-arch",
  "osmium-hal",
  "osmium-mm",
- "osmium-sync",
 ]
 
 [[package]]
@@ -58,6 +58,16 @@ name = "osmium-sync"
 version = "0.1.0"
 dependencies = [
  "osmium-arch",
+]
+
+[[package]]
+name = "osmium-sysdrv"
+version = "0.1.0"
+dependencies = [
+ "osmium-arch",
+ "osmium-hal",
+ "osmium-mm",
+ "osmium-sync",
 ]
 
 [[package]]

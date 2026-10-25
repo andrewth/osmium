@@ -211,7 +211,7 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     let lapic = LAPIC.get().expect("LAPIC initialised");
     lapic.start_timer(HOST_TICK_VECTOR, u32::MAX, false);
     // SAFETY: nothing else uses the host's PIT.
-    let pit = osmium::drivers::pit::Pit::new(unsafe { osmium::drivers::pit::Pio::new() });
+    let pit = osmium::sysdrv::pit::Pit::new(unsafe { osmium::sysdrv::pit::Pio::new() });
     let hz = pit.calibrate(10_000_000, || u32::MAX as u64 - lapic.timer_remaining() as u64);
     lapic.stop_timer();
     let tick = if crate::backend::backend() == crate::backend::Backend::Vmx { HOST_TICK_NS_VMX } else { HOST_TICK_NS };

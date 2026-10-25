@@ -1,6 +1,6 @@
 //! x86 local APIC in xAPIC (MMIO) mode.
 
-use crate::ioext::IoMemExt;
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::pci::MsiMessage;
 

@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use osmium::boot::fdt::Fdt;
-use osmium::drivers::iommu::smmuv3::Smmuv3;
+use osmium::sysdrv::iommu::smmuv3::Smmuv3;
 use osmium::hal::iommu::{DeviceId, Iommu};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci;

@@ -36,8 +36,8 @@ mod testing;
 
 use core::ptr::NonNull;
 
-use crate::ioext::IoMemExt;
 use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::iommu::IommuError;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::timer::Clock;

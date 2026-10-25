@@ -43,10 +43,10 @@ use core::mem::ManuallyDrop;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::ioext::IoMemExt;
 use osmium_arch::barrier;
 use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_hal::timer::Clock;
 
@@ -876,8 +876,8 @@ impl<D: DmaAllocator + ?Sized> Drop for Nvme<'_, D> {
 mod tests {
     use super::fake::{Cmd, Config, FIRMWARE, Fake, MODEL, Ns, SERIAL};
     use super::*;
-    use crate::virtio::testing::HostDma;
     use core::sync::atomic::Ordering::Relaxed;
+    use osmium_drivers::virtio::testing::HostDma;
     use std::vec;
     use std::vec::Vec;
 

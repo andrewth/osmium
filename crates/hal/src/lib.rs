@@ -32,6 +32,7 @@ pub mod console;
 pub mod display;
 pub mod dma;
 pub mod iommu;
+pub mod ioext;
 pub mod irq;
 pub mod mmio;
 pub mod net;

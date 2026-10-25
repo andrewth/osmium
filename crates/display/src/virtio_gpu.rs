@@ -10,8 +10,8 @@
 //!
 //! The same driver serves `virtio-gpu-device` (MMIO), `virtio-gpu-pci` and
 //! `virtio-vga`, whose PCI function adds a VGA-compatible framebuffer that
-//! works until the first `SET_SCANOUT` (see [`crate::display::bochs`]).
-//! Commands are synchronous, like [`super::blk`]'s requests: one is in
+//! works until the first `SET_SCANOUT` (see [`crate::bochs`]).
+//! Commands are synchronous, like the block driver's requests: one is in
 //! flight at a time and the driver polls for its response.
 
 use osmium_hal::display::{Display, DisplayError, Framebuffer, FramebufferInfo, PixelFormat, Rect};
@@ -19,10 +19,10 @@ use osmium_hal::dma::{DmaAllocator, OwnedDma};
 use osmium_hal::mmio::IoMem;
 use osmium_hal::virtio::gpu::*;
 
-use super::queue::{Segment, VirtQueue};
 use core::mem::ManuallyDrop;
+use osmium_drivers::virtio::queue::{Segment, VirtQueue};
 
-use super::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
+use osmium_drivers::virtio::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
 
 /// Entries used in the control queue, at most (a command needs two).
 pub const MAX_QUEUE_SIZE: u16 = 4;
@@ -324,10 +324,10 @@ impl<T: Transport, D: DmaAllocator + ?Sized> Drop for VirtioGpu<'_, T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::queue::tests::DeviceSide;
-    use crate::virtio::testing::{FakeTransport, HostDma};
-    use crate::virtio::{feature, status};
     use core::sync::atomic::{AtomicBool, Ordering};
+    use osmium_drivers::virtio::queue::tests::DeviceSide;
+    use osmium_drivers::virtio::testing::{FakeTransport, HostDma};
+    use osmium_drivers::virtio::{feature, status};
     use osmium_hal::display::Rgb;
     use osmium_hal::virtio::queue::DESC_F_WRITE;
     use std::collections::BTreeMap;

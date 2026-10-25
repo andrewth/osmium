@@ -1,6 +1,6 @@
 //! RISC-V Platform-Level Interrupt Controller.
 
-use crate::ioext::IoMemExt;
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::irq::InterruptController;
 use osmium_hal::mmio::IoMem;
 

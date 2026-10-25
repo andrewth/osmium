@@ -11,7 +11,7 @@ use super::disk::{FLUSH_CACHE_EXT, READ_DMA_EXT, READ_FPDMA_QUEUED, READ_LOG_EXT
 use super::fake::{self, Cmd, FakeDev, FakeHba};
 use super::port::{IE, IS, MAX_SLOTS, SERR};
 use super::{Ahci, AhciDisk, AhciError, AhciIrq, GHC_IE, cap};
-use crate::virtio::testing::HostDma;
+use osmium_drivers::virtio::testing::HostDma;
 
 const SECTORS: u64 = 1000;
 

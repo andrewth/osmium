@@ -1,7 +1,7 @@
 //! x86 I/O APIC: routes external interrupt lines (global system interrupts)
 //! to local-APIC vectors.
 
-use crate::ioext::IoMemExt;
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 use osmium_sync::{IrqDisabled, IrqSpinLock, SpinLockGuard};
 

@@ -247,7 +247,7 @@ mod tests {
     use super::super::port::{CMD, CMD_FRE, CMD_ST, SERR};
     use super::super::{Ahci, cap};
     use super::*;
-    use crate::virtio::testing::HostDma;
+    use osmium_drivers::virtio::testing::HostDma;
     use std::vec;
     use std::vec::Vec;
 

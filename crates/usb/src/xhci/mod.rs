@@ -552,7 +552,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     /// failing that, MSI with one vector, then calls
     /// [`enable_interrupts`](Self::enable_interrupts). `msg` is what the
     /// interrupt controller wants written (on x86,
-    /// `osmium_drivers::lapic::msi_message`). With neither capability, or a
+    /// `osmium_sysdrv::lapic::msi_message`). With neither capability, or a
     /// message the capability cannot hold, the legacy line is used and
     /// [`InterruptMode::Intx`] returned. The kernel's handler must call
     /// [`handle_interrupt`](Self::handle_interrupt) as for INTx.

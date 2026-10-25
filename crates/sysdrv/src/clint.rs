@@ -1,7 +1,7 @@
 //! RISC-V Core-Local Interruptor (CLINT / ACLINT MTIMER + MSWI): the
 //! machine-mode timer and software interrupts, for M-mode firmware.
 
-use crate::ioext::IoMemExt;
+use osmium_hal::ioext::IoMemExt;
 use osmium_hal::mmio::IoMem;
 
 const MSIP: usize = 0x0000;

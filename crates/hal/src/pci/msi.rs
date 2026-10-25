@@ -2,7 +2,7 @@
 //!
 //! A function raises a message-signalled interrupt by writing
 //! [`MsiMessage::data`] to [`MsiMessage::address`]. The interrupt controller
-//! decides both (on x86, `osmium_drivers::lapic::msi_message`); this module
+//! decides both (on x86, `osmium_sysdrv::lapic::msi_message`); this module
 //! only programs them into the function.
 //!
 //! [`Msi`] is the MSI capability: up to 32 vectors sharing one address,
