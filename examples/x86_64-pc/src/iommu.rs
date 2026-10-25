@@ -51,15 +51,15 @@ pub fn demo(ecam: Option<EcamWindow>, units: Units) {
     let id = DeviceId::new(0, func.address());
 
     if let Some(unit) = units.vtd {
+        // Scalable mode if the unit has it (`x-scalable-mode=on`), else legacy.
+        let map = || crate::msi::map(unit.base, 0x1000);
         // SAFETY: QEMU's VT-d reports ECAP.C clear, but its memory is always coherent.
-        let vtd = unsafe {
-            Vtd::new_assuming_coherent(
-                crate::msi::map(unit.base, 0x1000),
-                &crate::FRAMES,
-                &crate::msi::Uptime,
-                unit.segment,
-            )
-        };
+        let scalable =
+            unsafe { Vtd::new_scalable_assuming_coherent(map(), &crate::FRAMES, &crate::msi::Uptime, unit.segment) };
+        let vtd = scalable.or_else(|_| {
+            // SAFETY: as above.
+            unsafe { Vtd::new_assuming_coherent(map(), &crate::FRAMES, &crate::msi::Uptime, unit.segment) }
+        });
         match vtd {
             Ok(vtd) => {
                 println!(
@@ -67,7 +67,17 @@ pub fn demo(ecam: Option<EcamWindow>, units: Units) {
                     unit.base,
                     vtd.iova_limit().trailing_zeros()
                 );
-                demos::iommu::testdev(&vtd, id, regs(), &crate::FRAMES, "vt-d");
+                if vtd.scalable() {
+                    println!("[iommu] VT-d scalable mode: PASID directory and table per device, queued invalidation");
+                }
+                interrupt_remapping(&vtd);
+                demos::iommu::testdev(
+                    &vtd,
+                    id,
+                    regs(),
+                    &crate::FRAMES,
+                    if vtd.scalable() { "vt-d-scalable" } else { "vt-d" },
+                );
             }
             Err(e) => println!("[iommu] VT-d unit at {:#x}: init failed: {e:?}", unit.base),
         }
@@ -85,5 +95,34 @@ pub fn demo(ecam: Option<EcamWindow>, units: Units) {
             }
             Err(e) => println!("[iommu] AMD-Vi unit at {:#x}: init failed: {e:?}", unit.base),
         }
+    }
+}
+
+/// Turns VT-d interrupt remapping on and off again, programming one table
+/// entry in between. Nothing here raises a remapped interrupt, so this
+/// checks that the unit accepts the table, the queued invalidation of its
+/// entry cache and the entry. Compatibility-format interrupts stay allowed
+/// so the kernel's own interrupts keep arriving.
+fn interrupt_remapping(vtd: &Vtd<'_, impl osmium::hal::dma::DmaAllocator + Sync>) {
+    use osmium::drivers::iommu::vtd::remap::{Irte, Source};
+    if !vtd.supports_interrupt_remapping() {
+        println!("[iommu] VT-d interrupt remapping not supported; skipping");
+        return;
+    }
+    if let Err(e) = vtd.enable_interrupt_remapping(256, false, true) {
+        println!("[iommu] VT-d interrupt remapping: enabling failed: {e:?}");
+        return;
+    }
+    let entry = Irte::fixed(0x55, 0, Source::Any);
+    let programmed = vtd.set_irte(7, &entry).is_ok() && vtd.irte(7) == Some(entry);
+    let cleared = vtd.clear_irte(7).is_ok() && vtd.irte(7).is_none();
+    println!(
+        "[iommu] VT-d interrupt remapping on with {} entries; entry programmed {}, invalidated and cleared {}",
+        vtd.interrupt_entries(),
+        programmed,
+        cleared
+    );
+    if let Err(e) = vtd.disable_interrupt_remapping() {
+        println!("[iommu] VT-d interrupt remapping: disabling failed: {e:?}");
     }
 }
