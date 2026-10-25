@@ -2,9 +2,23 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::ops::{BitAnd, BitOr, BitOrAssign};
 
 use crate::{Errno, Timestamp};
+
+/// Whether [`File::xattr_set`] may create an attribute, replace one, or
+/// either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum XattrSet {
+    /// Create the attribute, or replace its value if it exists.
+    #[default]
+    Any,
+    /// Create the attribute; `EEXIST` if it exists.
+    Create,
+    /// Replace the attribute's value; `ENODATA` if it does not exist.
+    Replace,
+}
 
 /// What kind of node a [`File`] is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -223,6 +237,36 @@ pub trait File: Send + Sync {
     /// The target of a symbolic link.
     fn readlink(&self) -> Result<String, Errno> {
         Err(Errno::EINVAL)
+    }
+
+    /// The value of the extended attribute `name` (its full name, such as
+    /// `user.comment`, as bytes); `ENODATA` if the node has none by that
+    /// name. A file system without extended attributes (the default)
+    /// returns `EOPNOTSUPP`.
+    fn xattr_get(&self, name: &[u8]) -> Result<Vec<u8>, Errno> {
+        let _ = name;
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// Sets the extended attribute `name` to `value`, as `how` says.
+    /// `EOPNOTSUPP` for a name the file system cannot store (or, by default,
+    /// any), `ENOSPC` if there is no room for it, `E2BIG` for a value over
+    /// what it keeps, `ERANGE` for a name too long.
+    fn xattr_set(&self, name: &[u8], value: &[u8], how: XattrSet) -> Result<(), Errno> {
+        let _ = (name, value, how);
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// Removes the extended attribute `name`; `ENODATA` if the node has none
+    /// by that name.
+    fn xattr_remove(&self, name: &[u8]) -> Result<(), Errno> {
+        let _ = name;
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// The full names of the node's extended attributes.
+    fn xattr_list(&self) -> Result<Vec<Vec<u8>>, Errno> {
+        Err(Errno::EOPNOTSUPP)
     }
 }
 

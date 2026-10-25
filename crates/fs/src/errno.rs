@@ -59,6 +59,7 @@ errnos! {
     ENOSYS = 38, "Function not implemented.";
     ENOTEMPTY = 39, "Directory not empty.";
     ELOOP = 40, "Too many symbolic links encountered.";
+    ENODATA = 61, "No data available.";
     EOVERFLOW = 75, "Value too large for defined data type.";
     EOPNOTSUPP = 95, "Operation not supported.";
     ENOTSOCK = 88, "Socket operation on non-socket.";

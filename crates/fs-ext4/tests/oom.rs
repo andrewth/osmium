@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use osmium_fs::{Errno, FileKind, OpenFlags, Vfs};
+use osmium_fs::{Errno, FileKind, OpenFlags, Vfs, XattrSet};
 use osmium_fs_ext4::Ext2;
 use osmium_hal::block::{BlockDevice, BlockError};
 
@@ -56,8 +56,12 @@ fn scratch(name: &str) -> PathBuf {
 fn mkfs(kind: &str, mib: usize) -> Option<(PathBuf, MemDisk)> {
     let path = scratch(&format!("{kind}.img"));
     std::fs::write(&path, vec![0u8; mib << 20]).unwrap();
-    let status =
-        Command::new(format!("mkfs.{kind}")).args(["-q", "-F", "-b", "1024", "-I", "256"]).arg(&path).status().ok()?;
+    let status = Command::new(format!("mkfs.{kind}"))
+        // A fixed hash seed, so that a directory grows after the same names every time.
+        .args(["-q", "-F", "-b", "1024", "-I", "256", "-E", "hash_seed=01234567-89ab-cdef-0123-456789abcdef"])
+        .arg(&path)
+        .status()
+        .ok()?;
     assert!(status.success());
     Some((path.clone(), MemDisk(Arc::new(Mutex::new(std::fs::read(&path).unwrap())))))
 }
@@ -211,6 +215,99 @@ fn run(kind: &str) {
         },
     );
     assert!(n >= 1, "{kind} unlink: {n}");
+
+    // Extended attributes: in the inode, in a block, and removed again.
+    for (what, value) in [("inode", vec![3u8; 30]), ("block", vec![4u8; 300])] {
+        let n = every_failure(
+            || f.xattr_set(b"user.k", &value, XattrSet::Any),
+            |r, injected| {
+                if ok_or_enomem(&r, injected) {
+                    assert_eq!(f.xattr_get(b"user.k").unwrap(), value);
+                    f.xattr_remove(b"user.k").unwrap();
+                } else {
+                    assert_eq!(f.xattr_get(b"user.k").unwrap_err(), Errno::ENODATA, "a failed set stores nothing");
+                }
+            },
+        );
+        assert!(n >= 1, "{kind} xattr {what}: {n}");
+    }
+    f.xattr_set(b"user.k", &[5u8; 300], XattrSet::Any).unwrap();
+    let n = every_failure(
+        || f.xattr_remove(b"user.k"),
+        |r, injected| {
+            if ok_or_enomem(&r, injected) {
+                f.xattr_set(b"user.k", &[5u8; 300], XattrSet::Any).unwrap();
+            } else {
+                assert_eq!(f.xattr_get(b"user.k").unwrap(), [5u8; 300], "a failed remove keeps the value");
+            }
+        },
+    );
+    assert!(n >= 1, "{kind} xattr remove: {n}");
+    let n = every_failure(
+        || f.xattr_get(b"user.k"),
+        |r, injected| {
+            if ok_or_enomem(&r, injected) {
+                assert_eq!(r.unwrap(), [5u8; 300]);
+            }
+        },
+    );
+    assert!(n >= 1, "{kind} xattr get: {n}");
+    let n = every_failure(
+        || f.xattr_list(),
+        |r, injected| {
+            if ok_or_enomem(&r, injected) {
+                assert_eq!(r.unwrap(), [b"user.k".to_vec()]);
+            }
+        },
+    );
+    assert!(n >= 1, "{kind} xattr list: {n}");
+
+    // Growing a directory: the creation that gives it an index, the one that
+    // splits a leaf, and the one that adds a level to the index. A directory
+    // like it is made first to find the creations by the size it jumps to.
+    let name = |d: &str, i: usize| format!("/{d}/entry-with-a-longish-name-{i:04}");
+    let size = |d: &str| vfs.stat(&format!("/{d}"), true).unwrap().size;
+    vfs.mkdir("/probe", 0o755).unwrap();
+    let mut growth = Vec::new();
+    let mut last = size("probe");
+    for i in 0..3000 {
+        vfs.mkdir(&name("probe", i), 0o755).unwrap();
+        let now = size("probe");
+        if now > last {
+            growth.push((i, (now - last) / 1024));
+            last = now;
+        }
+    }
+    let first = growth.iter().position(|g| g.1 == 1).expect("a leaf split");
+    let by = growth.iter().skip(first).find(|g| g.1 == 2).expect("a new index level");
+    for (what, brink) in [("index", growth[0].0), ("split", growth[first].0), ("level", by.0)] {
+        let d = format!("grow-{what}");
+        vfs.mkdir(&format!("/{d}"), 0o755).unwrap();
+        for i in 0..brink {
+            vfs.mkdir(&name(&d, i), 0o755).unwrap();
+        }
+        let before = size(&d);
+        let path_ = name(&d, brink);
+        let n = every_failure(
+            || vfs.mkdir(&path_, 0o755),
+            |r, injected| {
+                if ok_or_enomem(&r, injected) {
+                    // (The last failure injected may be one it got through.)
+                    if injected {
+                        vfs.rmdir(&path_).unwrap();
+                    }
+                } else {
+                    assert_eq!(vfs.stat(&path_, false).unwrap_err(), Errno::ENOENT, "{what} is not there");
+                    assert_eq!(size(&d), before, "{what}: a failed creation leaves the directory as it was");
+                }
+            },
+        );
+        assert!(n >= 3, "{kind} {what}: {n}");
+        assert!(size(&d) > before, "{kind} {what}: the directory did not grow");
+        for i in (0..=brink).step_by(5) {
+            assert!(vfs.stat(&name(&d, i), true).is_ok(), "{kind} {what}: {i} lost");
+        }
+    }
 
     // Unmount cleanly, and the file system must still be consistent.
     drop((f, root, vfs));

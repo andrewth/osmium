@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use osmium_fs::{Errno, File, FileKind};
+use osmium_fs::{Errno, File, FileKind, XattrSet};
 use osmium_fs_ext4::Ext2;
 use osmium_hal::block::{BlockDevice, BlockError};
 
@@ -94,6 +94,13 @@ fn populate(disk: &MemDisk, clean: bool) {
     let sub = many.create("sub", FileKind::Directory, 0o755).unwrap();
     file(&sub, "inner", 5000, 0);
     many.remove("file-number-0003-with-a-longish-name", false).unwrap();
+    // Attributes in an inode and in a block.
+    for (dir, name) in [(&root, "small"), (&root, "big"), (&many, "file-number-0007-with-a-longish-name")] {
+        let node = dir.lookup(name).unwrap();
+        node.xattr_set(b"user.short", b"value", XattrSet::Any).unwrap();
+        node.xattr_set(b"security.long", &[6; 200], XattrSet::Any).unwrap();
+    }
+    many.xattr_set(b"user.dir", &[7; 50], XattrSet::Any).unwrap();
     drop((root, many, sub));
     if clean {
         let Ok(_) = fs.into_device() else { panic!("a node is still open") };
@@ -114,6 +121,9 @@ fn walk(dir: &Arc<dyn File>, depth: usize, budget: &mut usize) {
         *budget -= 1;
         let Ok(node) = dir.lookup(&entry.name) else { continue };
         let _ = node.try_stat();
+        for attr in node.xattr_list().unwrap_or_default() {
+            let _ = node.xattr_get(&attr);
+        }
         match entry.kind {
             FileKind::Directory if depth < 8 => walk(&node, depth + 1, budget),
             FileKind::Symlink => {
@@ -145,6 +155,9 @@ fn mutate(root: &Arc<dyn File>, budget: &mut usize) {
         }
         *budget -= 1;
         let Ok(node) = root.lookup(&entry.name) else { continue };
+        let _ = node.xattr_set(b"user.fuzz", &[5; 700], XattrSet::Any);
+        let _ = node.xattr_set(b"user.short", b"replaced", XattrSet::Replace);
+        let _ = node.xattr_remove(b"security.long");
         match entry.kind {
             FileKind::Regular => {
                 let _ = node.write(0, &[1; 3000]);
