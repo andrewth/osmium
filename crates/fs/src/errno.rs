@@ -72,8 +72,10 @@ errnos! {
     EADDRNOTAVAIL = 99, "Cannot assign requested address.";
     ENETUNREACH = 101, "Network is unreachable.";
     ECONNRESET = 104, "Connection reset by peer.";
+    ENOBUFS = 105, "No buffer space available.";
     EISCONN = 106, "Transport endpoint is already connected.";
     ENOTCONN = 107, "Transport endpoint is not connected.";
+    ETOOMANYREFS = 109, "Too many references: cannot splice.";
     ETIMEDOUT = 110, "Connection timed out.";
     ECONNREFUSED = 111, "Connection refused.";
     EALREADY = 114, "Operation already in progress.";
