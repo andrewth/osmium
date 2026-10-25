@@ -29,7 +29,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 |---|---|---|
 | `osmium-arch` | IRQ flag control, CPU id, trap entry with a portable `Trap` cause, per-task FP/SIMD state, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
-| `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64, AArch64, Sv39/Sv48, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2, IOMMU formats), slab heap as `#[global_allocator]` | no |
+| `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64 4/5-level, AArch64, Sv39/Sv48/Sv57, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2, IOMMU formats), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA, display), IOMMU domains and `IommuDma`, linear framebuffers with pixel formats, `IrqTable`, global console with `println!` | no |
 | `osmium-drivers` | virtio core: MMIO and PCI transports (legacy and 1.x) and the split virtqueue, and the virtio-console driver | no |
 | `osmium-display` | virtio-gpu (also as virtio-vga), Bochs DISPI (QEMU std VGA, bochs-display) and VESA BIOS (VBE) mode setting | no |

@@ -123,6 +123,32 @@ fn sv48() {
 }
 
 #[test]
+fn sv57() {
+    exercise::<Sv57>(0xffff_ffff_ffff_f000);
+}
+
+#[test]
+fn x86_64_la57() {
+    exercise::<X86_64La57>(0xffff_ffff_ffff_f000);
+}
+
+#[test]
+fn five_levels_reach_beyond_48_bits() {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let mut pt: PageTable<Sv57, _> = PageTable::new(&frames).unwrap();
+    // Differs from a 4-level address only in bits 48..57.
+    let high = 0x0001_0000_0040_0000;
+    pt.map(va(high), pa(0x1234_5000), PageSize::Size4K, MapFlags::RW).unwrap().ignore();
+    assert_eq!(pt.translate(va(high)).unwrap().pa, pa(0x1234_5000));
+    assert!(pt.translate(va(0x40_0000)).is_none(), "the aliases at 4 levels are distinct");
+    // A canonical negative address maps through the top root entry.
+    let neg = 0xff00_0000_0000_0000;
+    pt.map(va(neg), pa(0x2000), PageSize::Size4K, MapFlags::RW).unwrap().ignore();
+    assert_eq!(pt.translate(va(neg)).unwrap().pa, pa(0x2000));
+}
+
+#[test]
 fn sv39x4() {
     // The top of the 41-bit space lands in the fourth root page.
     exercise::<Sv39x4>(0x0000_01ff_ffff_f000);

@@ -368,11 +368,12 @@ impl Process {
     }
 
     /// Handles a user page fault at `addr`. A write to a copy-on-write page
-    /// (shared by `fork`) gets its own copy and returns true: return to user
-    /// mode and the instruction runs again. Any other fault returns false,
+    /// (shared by `fork`) gets its own copy, and the first touch of a page in
+    /// a demand-paged `mmap` area gets a zeroed one. Both return true: return
+    /// to user mode and the instruction runs again. Any other fault returns false,
     /// and ends the process (see [`handle_page_fault`]).
     pub fn handle_page_fault(&self, addr: u64, write: bool) -> bool {
-        write && self.memory().cow_fault(addr)
+        self.memory().page_fault(addr, write)
     }
 
     /// The root page table to activate when switching to this process.
@@ -476,6 +477,24 @@ impl Process {
     /// pages and returns their address. With no access at all (`PROT_NONE`)
     /// the range is only reserved: left unmapped, any access faults.
     pub fn mmap_anon(&self, len: u64, flags: MapFlags) -> Result<u64, Errno> {
+        self.mmap_with(len, flags, |memory, va, len| memory.map_anon(va, len, flags))
+    }
+
+    /// [`mmap_anon`](Self::mmap_anon) with demand paging: reserves the
+    /// range as an area ([`UserMemory::map_lazy`]) and allocates no page
+    /// until it is touched, so a large mapping costs nothing until used and
+    /// cannot fail for lack of memory up front. This is what the `mmap`
+    /// system call uses.
+    pub fn mmap_demand(&self, len: u64, flags: MapFlags) -> Result<u64, Errno> {
+        self.mmap_with(len, flags, |memory, va, len| memory.map_lazy(va, len, flags))
+    }
+
+    fn mmap_with(
+        &self,
+        len: u64,
+        flags: MapFlags,
+        map: impl FnOnce(&dyn UserMemory, u64, u64) -> Result<(), Errno>,
+    ) -> Result<u64, Errno> {
         let len = len.checked_next_multiple_of(PAGE).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         // For giving the range back if the mapping fails.
         let spare = FreeRange::spare().map_err(|_| Errno::ENOMEM)?;
@@ -483,7 +502,7 @@ impl Process {
         let va = area.alloc(len)?;
         if flags != MapFlags::NONE {
             let memory = self.memory();
-            if let Err(e) = memory.map_anon(va, len, flags) {
+            if let Err(e) = map(&*memory, va, len) {
                 // Give back what was mapped before it ran out.
                 memory.unmap(va, len);
                 area.release(va, va + len, spare);
