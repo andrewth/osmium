@@ -27,6 +27,7 @@
 //!   window (x86 `0xfee0_0000..0xfef0_0000`).
 
 pub mod amdvi;
+pub mod ats;
 pub mod riscv;
 pub mod smmuv3;
 pub mod vtd;

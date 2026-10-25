@@ -730,6 +730,12 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Stage1<'_, '_, D> {
         1 << S1_VA_BITS
     }
 
+    fn max_leaf_size(&self) -> osmium_mm::paging::PageSize {
+        // The unit requires the 4 KiB granule (IDR5.GRAN4K), which has 2 MiB
+        // and 1 GiB block descriptors at levels 2 and 1.
+        osmium_mm::paging::PageSize::Size1G
+    }
+
     unsafe fn attach(&self, device: DeviceId, domain: DomainId, root: PhysAddr) -> Result<(), IommuError> {
         self.unit.attach_with(device, domain, root, Mode::S1)
     }
@@ -827,6 +833,12 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Smmuv3<'_, D> {
 
     fn iova_limit(&self) -> u64 {
         1 << self.ia_bits
+    }
+
+    fn max_leaf_size(&self) -> osmium_mm::paging::PageSize {
+        // The unit requires the 4 KiB granule (IDR5.GRAN4K), which has 2 MiB
+        // and 1 GiB block descriptors at levels 2 and 1.
+        osmium_mm::paging::PageSize::Size1G
     }
 
     unsafe fn attach(&self, device: DeviceId, domain: DomainId, root: PhysAddr) -> Result<(), IommuError> {

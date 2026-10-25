@@ -272,6 +272,17 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         self.iova_limit
     }
 
+    fn max_leaf_size(&self) -> osmium_mm::paging::PageSize {
+        // CAP.SLLPS: bit 34 for 2 MiB second-level pages, bit 35 for 1 GiB. A
+        // 1 GiB-only unit (2) is treated as pages only: the generic code uses
+        // 2 MiB wherever it does not use 1 GiB, so it needs both.
+        match (self.cap >> 34) & 3 {
+            3 => osmium_mm::paging::PageSize::Size1G,
+            1 => osmium_mm::paging::PageSize::Size2M,
+            _ => osmium_mm::paging::PageSize::Size4K,
+        }
+    }
+
     unsafe fn attach(&self, device: DeviceId, domain: DomainId, root: PhysAddr) -> Result<(), IommuError> {
         if device.segment() != self.segment {
             return Err(IommuError::InvalidDevice);
@@ -560,6 +571,18 @@ mod tests {
         assert_eq!(vtd.iova_limit(), 1 << 48);
         drop(vtd);
         assert_eq!(dma.live(), 0);
+    }
+
+    #[test]
+    fn large_page_support_follows_sllps() {
+        use osmium_mm::paging::PageSize;
+        let (clock, dma) = (StdClock::default(), HostDma::default());
+        let cases = [(0, PageSize::Size4K), (1, PageSize::Size2M), (2, PageSize::Size4K), (3, PageSize::Size1G)];
+        for (sllps, want) in cases {
+            let f = fake(sllps << 34, 0);
+            let vtd = Vtd::new(f.regs.io(), &dma, &clock, 0).unwrap();
+            assert_eq!(vtd.max_leaf_size(), want, "SLLPS {sllps}");
+        }
     }
 
     #[test]
