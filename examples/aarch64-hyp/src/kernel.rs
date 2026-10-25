@@ -14,7 +14,7 @@ use osmium::hal::irq::InterruptController;
 use osmium::hal::println;
 use osmium::mm::{FrameAllocator, PAGE_SIZE, PageTable, PhysAddr};
 use osmium::sync::IrqSpinLock;
-use osmium::virt::aarch64::fdt::ArmMachine;
+use osmium::virt::aarch64::fdt::{ArmGic, ArmMachine};
 use osmium::virt::aarch64::{self as vm, Aarch64Vcpu};
 use osmium::virt::devices::{GIC_WINDOW, PL011_WINDOW, Pl011, VirtualGicV2};
 use osmium::virt::smp::GuestCpus;
@@ -175,7 +175,7 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
     let dtb = ArmMachine {
         cpus: ncpus as u32,
         memory: &[(GUEST_RAM, len)],
-        gic: (GICD, GICC),
+        gic: ArmGic::V2 { distributor: GICD, cpu_interface: GICC },
         uarts: &[(UART, UART_SPI)],
         virtio: &[],
         bootargs: "",

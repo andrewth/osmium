@@ -9,6 +9,14 @@
 //! emulated GICv2 like a kernel would and takes its virtual timer interrupt
 //! and then a UART receive interrupt, acknowledging each through the
 //! virtual CPU interface.
+//!
+//! On a GICv3 host (`-machine virt,virtualization=on,gic-version=3`) the
+//! hypervisor drives the physical GICv3 and also runs GICv3 guests: a
+//! distributor and redistributors emulated by `VirtualGicV3`, with the
+//! guest using the system-register CPU interface through the host's list
+//! registers. One guest takes an SGI it sends itself (`ICC_SGI1R_EL1` traps),
+//! its virtual timer and a UART interrupt; another has two vCPUs on two host
+//! CPUs and sends an SGI from one to the other.
 #![no_std]
 #![no_main]
 
@@ -19,13 +27,14 @@ mod kernel;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use osmium::arch::aarch64::{self, psci};
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::arch::{cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
 use osmium::drivers::gicv2::GicV2;
+use osmium::drivers::gicv3::GicV3;
 use osmium::drivers::pl011::Pl011;
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::irq::InterruptController;
@@ -37,7 +46,7 @@ use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryM
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
 use osmium::virt::aarch64::{self as vm, Aarch64Vcpu};
-use osmium::virt::devices::{GIC_WINDOW, Uart16550, VirtualGicV2};
+use osmium::virt::devices::{GIC_WINDOW, GICD_V3_WINDOW, Uart16550, VirtualGicV2, VirtualGicV3};
 use osmium::virt::smp::GuestCpus;
 use osmium::virt::stage2::{Stage2Table, map_guest_memory, vttbr};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
@@ -248,6 +257,204 @@ smp_guest_end:
 "#
 );
 
+// The GICv3 counterparts of the two guests above. Nothing here is visible to
+// a GICv2 guest: the CPU interface is the system registers (ICC_*), spelled
+// by encoding, and each CPU has its own redistributor (128 KiB apart, found
+// by Aff0 from MPIDR_EL1). ICC_SRE_EL1 S3_0_C12_C12_5, ICC_PMR_EL1
+// S3_0_C4_C6_0, ICC_BPR1_EL1 S3_0_C12_C12_3, ICC_IGRPEN1_EL1 S3_0_C12_C12_7,
+// ICC_IAR1_EL1 S3_0_C12_C12_0, ICC_EOIR1_EL1 S3_0_C12_C12_1, ICC_SGI1R_EL1
+// S3_0_C12_C11_5.
+//
+// One vCPU: bring the GIC up, send itself SGI 3 (the write traps to the
+// hypervisor), take the virtual timer, then a UART receive interrupt, each
+// by reading ICC_IAR1_EL1 and completing with ICC_EOIR1_EL1.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .globl gicv3_guest, gicv3_guest_end
+gicv3_guest:
+    movz x9, #0x0800, lsl #16       // GICD
+    movz x10, #0x080a, lsl #16      // GICR region
+    movz x0, #0x1000, lsl #16       // 16550
+    mrs x24, mpidr_el1
+    and x1, x24, #0xff
+    lsl x1, x1, #17
+    add x10, x10, x1                // this CPU's redistributor
+    mov w1, #0x13
+    str w1, [x9]                    // GICD_CTLR: ARE, Group 0 and 1
+    str wzr, [x10, #0x14]           // GICR_WAKER: ProcessorSleep = 0
+1:  ldr w1, [x10, #0x14]
+    tbnz w1, #2, 1b                 // until ChildrenAsleep clears
+    add x12, x10, #0x10000          // the SGI frame
+    mov w1, #-1
+    str w1, [x12, #0x80]            // GICR_IGROUPR0: Group 1
+    movz w1, #0x0800, lsl #16
+    orr w1, w1, #8                  // SGI 3 and PPI 27 (the virtual timer)
+    str w1, [x12, #0x100]           // GICR_ISENABLER0
+    mov w1, #2                      // INTID 33: the UART
+    str w1, [x9, #0x104]            // GICD_ISENABLER1
+    mrs x1, S3_0_C12_C12_5
+    orr x1, x1, #1
+    msr S3_0_C12_C12_5, x1          // ICC_SRE_EL1.SRE
+    isb
+    mov x1, #0xff
+    msr S3_0_C4_C6_0, x1            // ICC_PMR_EL1
+    msr S3_0_C12_C12_3, xzr         // ICC_BPR1_EL1
+    mov x1, #1
+    msr S3_0_C12_C12_7, x1          // ICC_IGRPEN1_EL1
+    isb
+    mov x1, #3
+    lsl x1, x1, #24
+    orr x1, x1, #1                  // SGI 3, TargetList = Aff0 0
+    msr S3_0_C12_C11_5, x1          // ICC_SGI1R_EL1: traps to EL2
+    mrs x20, S3_0_C12_C12_0         // ICC_IAR1_EL1: the SGI
+    msr S3_0_C12_C12_1, x20         // ICC_EOIR1_EL1
+    mrs x1, cntvct_el0              // timer: about 1 ms from now
+    mrs x2, cntfrq_el0
+    add x1, x1, x2, lsr #10
+    msr cntv_cval_el0, x1
+    add x5, x1, x2, lsr #10         // spin until 1 ms past the deadline
+    mov x1, #1
+    msr cntv_ctl_el0, x1
+8:  mrs x6, cntvct_el0
+    cmp x6, x5
+    b.lo 8b
+2:  wfi
+    mrs x3, S3_0_C12_C12_0
+    cmp w3, #1023
+    b.eq 2b
+    mov x1, #2
+    msr cntv_ctl_el0, x1            // mask the timer, then complete
+    msr S3_0_C12_C12_1, x3
+    mov w21, w3
+    mov w1, #1
+    strb w1, [x0, #1]               // 16550 IER: receive interrupt
+3:  wfi
+    mrs x3, S3_0_C12_C12_0
+    cmp w3, #1023
+    b.eq 3b
+    mov w22, w3
+    adr x1, 6f
+4:  ldrb w2, [x1], #1               // prefix
+    cbz w2, 5f
+    strb w2, [x0]
+    b 4b
+5:  ldrb w4, [x0, #5]               // LSR: echo while data is ready
+    tbz w4, #0, 7f
+    ldrb w4, [x0]
+    strb w4, [x0]
+    b 5b
+7:  msr S3_0_C12_C12_1, x3
+    movz x0, #0x0008
+    movk x0, #0x8400, lsl #16       // PSCI SYSTEM_OFF
+    hvc #0
+9:  b 9b
+6:  .asciz "[guest] GICv3 UART interrupt, received: "
+    .balign 4
+gicv3_guest_end:
+"#
+);
+
+// A two-vCPU GICv3 guest, the counterpart of smp_guest: CPU 0 brings the
+// distributor and its redistributor up and starts CPU 1; CPU 1 wakes its
+// own redistributor, sends CPU 0 SGI 1 with ICC_SGI1R_EL1 and turns itself
+// off. CPU 0 spins in guest code with IRQs unmasked until its handler has
+// acknowledged the SGI.
+core::arch::global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 0x800
+    .globl smp_guest_v3, smp_guest_v3_end
+smp_guest_v3:
+    movz x9, #0x0800, lsl #16       // GICD
+    movz x10, #0x080a, lsl #16      // GICR region
+    movz x11, #0x1000, lsl #16      // 16550
+    mrs x24, mpidr_el1
+    and x1, x24, #0xff
+    lsl x1, x1, #17
+    add x10, x10, x1                // this CPU's redistributor
+    str wzr, [x10, #0x14]           // GICR_WAKER: wake it
+1:  ldr w1, [x10, #0x14]
+    tbnz w1, #2, 1b
+    mrs x1, S3_0_C12_C12_5
+    orr x1, x1, #1
+    msr S3_0_C12_C12_5, x1          // ICC_SRE_EL1.SRE
+    isb
+    mov x1, #0xff
+    msr S3_0_C4_C6_0, x1            // ICC_PMR_EL1
+    msr S3_0_C12_C12_3, xzr         // ICC_BPR1_EL1
+    mov x1, #1
+    msr S3_0_C12_C12_7, x1          // ICC_IGRPEN1_EL1
+    isb
+    cbnz x0, 5f
+    adr x1, 10f
+    bl 20f
+    mov w1, #0x13
+    str w1, [x9]                    // GICD_CTLR: ARE, Group 0 and 1
+    add x12, x10, #0x10000
+    mov w1, #-1
+    str w1, [x12, #0x80]            // GICR_IGROUPR0
+    mov w1, #2
+    str w1, [x12, #0x100]           // GICR_ISENABLER0: SGI 1
+    movz x0, #0x0003
+    movk x0, #0xc400, lsl #16       // PSCI CPU_ON(1, smp_guest_v3, 0x1234)
+    mov x1, #1
+    adr x2, smp_guest_v3
+    movz x3, #0x1234
+    hvc #0
+    mov x20, x0
+    adr x1, 30f
+    msr vbar_el1, x1
+    isb
+    mov x23, #0
+    msr daifclr, #2                 // IRQs on
+2:  cbz x23, 2b                     // no exits: only a kick gets the SGI in
+    msr daifset, #2
+3:  movz x0, #0x0004
+    movk x0, #0xc400, lsl #16       // PSCI AFFINITY_INFO(1) until OFF
+    mov x1, #1
+    mov x2, #0
+    hvc #0
+    cmp x0, #1
+    b.ne 3b
+    adr x1, 12f
+    bl 20f
+    movz x0, #0x0008
+    movk x0, #0x8400, lsl #16       // PSCI SYSTEM_OFF
+    hvc #0
+4:  b 4b
+5:  mov x22, x0                     // CPU 1: x0 = the CPU_ON context
+    adr x1, 11f
+    bl 20f
+    mov x1, #1
+    lsl x1, x1, #24
+    orr x1, x1, #1                  // SGI 1, TargetList = Aff0 0
+    msr S3_0_C12_C11_5, x1          // ICC_SGI1R_EL1: traps to EL2
+    movz x0, #0x0002
+    movk x0, #0x8400, lsl #16       // PSCI CPU_OFF
+    hvc #0
+6:  b 6b
+20: ldrb w2, [x1], #1               // print the string at x1
+    cbz w2, 21f
+    strb w2, [x11]
+    b 20b
+21: ret
+10: .asciz "[smp-guest] cpu 0: GICv3 up, starting cpu 1 with PSCI CPU_ON\n"
+11: .asciz "[smp-guest] cpu 1: up, sending cpu 0 SGI 1 with ICC_SGI1R_EL1, turning off\n"
+12: .asciz "[smp-guest] cpu 0: got the SGI in guest code; cpu 1 is off\n"
+    .balign 0x800
+30: .space 0x280                    // VBAR_EL1: IRQ from EL1h at 0x280
+    mrs x3, S3_0_C12_C12_0          // ICC_IAR1_EL1
+    msr S3_0_C12_C12_1, x3          // ICC_EOIR1_EL1
+    mov w21, w3
+    mov x23, #1
+    eret
+    .balign 4
+smp_guest_v3_end:
+"#
+);
+
 // Two copies run interleaved on one host CPU, each with its own x0: turn
 // FP on, compute x0 + 10 in d3, yield (hvc with x0 = 0xc6000000), add x0
 // again and report the result (hvc with x0 = 0xc6000001, result in x1).
@@ -290,6 +497,10 @@ unsafe extern "C" {
     static gic_guest_end: u8;
     static smp_guest: u8;
     static smp_guest_end: u8;
+    static gicv3_guest: u8;
+    static gicv3_guest_end: u8;
+    static smp_guest_v3: u8;
+    static smp_guest_v3_end: u8;
     static fp_guest: u8;
     static fp_guest_end: u8;
 }
@@ -315,7 +526,8 @@ static UART: Once<SerialConsole<Pl011>> = Once::new();
 static PSCI: Once<psci::Conduit> = Once::new();
 static TTBR0: AtomicU64 = AtomicU64::new(0);
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
-static SMP_VM: Once<SmpVm> = Once::new();
+/// The multi-vCPU demo guest being run; leaked, so never freed.
+static SMP_VM: AtomicPtr<SmpVm> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Handed to a secondary CPU through `x0`.
 #[repr(C)]
@@ -340,7 +552,8 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     ONLINE.fetch_add(1, Ordering::Release);
     // Wait for a guest, then run its vCPU with our index while it lives.
     loop {
-        if let Some(vm) = SMP_VM.get() {
+        // SAFETY: smp_guest_demo publishes leaked guests, which are never freed.
+        if let Some(vm) = unsafe { SMP_VM.load(Ordering::Acquire).as_ref() } {
             vcpu_loop(vm, boot.cpu);
         }
         // SAFETY: kernel::boot publishes the VM only while it lives, and
@@ -354,7 +567,63 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
         core::hint::spin_loop();
     }
 }
-static PHYS_GIC: Once<GicV2> = Once::new();
+
+/// The host's interrupt controller, whichever version QEMU provides.
+#[allow(clippy::large_enum_variant)] // one static value: boxing buys nothing
+enum PhysGic {
+    V2(GicV2),
+    V3(GicV3),
+}
+
+impl PhysGic {
+    /// Readies the calling CPU's interface (at EL2 for a GICv3).
+    fn init_cpu(&self) {
+        match self {
+            PhysGic::V2(g) => g.init_cpu(),
+            PhysGic::V3(g) => assert!(g.init_cpu(true), "no GICv3 redistributor for this CPU"),
+        }
+    }
+
+    /// Sends SGI `sgi` to the host CPUs in the `cpus` mask.
+    fn send_sgi(&self, cpus: u64, sgi: u32) {
+        match self {
+            PhysGic::V2(g) => g.send_sgi(cpus as u8, sgi),
+            PhysGic::V3(g) => g.send_sgi(cpus, sgi),
+        }
+    }
+}
+
+impl InterruptController for PhysGic {
+    fn enable(&self, irq: u32) {
+        match self {
+            PhysGic::V2(g) => g.enable(irq),
+            PhysGic::V3(g) => g.enable(irq),
+        }
+    }
+
+    fn disable(&self, irq: u32) {
+        match self {
+            PhysGic::V2(g) => g.disable(irq),
+            PhysGic::V3(g) => g.disable(irq),
+        }
+    }
+
+    fn claim(&self) -> Option<u32> {
+        match self {
+            PhysGic::V2(g) => g.claim(),
+            PhysGic::V3(g) => g.claim(),
+        }
+    }
+
+    fn complete(&self, irq: u32) {
+        match self {
+            PhysGic::V2(g) => g.complete(irq),
+            PhysGic::V3(g) => g.complete(irq),
+        }
+    }
+}
+
+static PHYS_GIC: Once<PhysGic> = Once::new();
 /// The physical SGI one host CPU sends another to kick its vCPU out of
 /// guest code.
 const KICK_SGI: u32 = 0;
@@ -428,10 +697,12 @@ extern "C" fn kmain(x0: usize) -> ! {
     id(&mut pt, etext, erodata, MapFlags::READ | MapFlags::GLOBAL);
     id(&mut pt, erodata, ram_end, rw);
     id(&mut pt, EARLY_UART as u64, EARLY_UART as u64 + 0x1000, rw | MapFlags::DEVICE);
-    let gic_node = fdt.find_compatible(&["arm,cortex-a15-gic", "arm,gic-400"]).expect("no GICv2");
+    let gic_node = fdt.find_compatible(&["arm,gic-v3", "arm,cortex-a15-gic", "arm,gic-400"]).expect("no GIC");
+    let gic_v3 = gic_node.compatible().any(|c| c == "arm,gic-v3");
     let mut regs = gic_node.reg();
     let (gicd, gicd_len) =
         regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
+    // The CPU interface (GICv2) or the redistributor region (GICv3).
     let (gicc, gicc_len) =
         regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
     id(&mut pt, gicd, gicd + gicd_len, rw | MapFlags::DEVICE);
@@ -446,13 +717,18 @@ extern "C" fn kmain(x0: usize) -> ! {
     // keeps IRQs masked and never takes it.
     // SAFETY: the GIC's windows from the device tree, mapped above.
     let gic = PHYS_GIC.call_once(|| unsafe {
-        GicV2::new(IoMem::new(gicd as *mut u8, gicd_len as usize), IoMem::new(gicc as *mut u8, gicc_len as usize))
+        let (d, c) = (IoMem::new(gicd as *mut u8, gicd_len as usize), IoMem::new(gicc as *mut u8, gicc_len as usize));
+        if gic_v3 { PhysGic::V3(GicV3::new(d, c)) } else { PhysGic::V2(GicV2::new(d, c)) }
     });
-    gic.init_distributor();
+    match gic {
+        PhysGic::V2(g) => g.init_distributor(),
+        PhysGic::V3(g) => g.init_distributor(),
+    }
     gic.init_cpu();
     gic.enable(VTIMER_INTID);
     gic.enable(KICK_SGI);
-    println!("[gic]   physical GICv2 at {gicd:#x}/{gicc:#x}; INTID {VTIMER_INTID} forces exits");
+    let version = if gic_v3 { "GICv3 (distributor/redistributors)" } else { "GICv2" };
+    println!("[gic]   physical {version} at {gicd:#x}/{gicc:#x}; INTID {VTIMER_INTID} forces exits");
 
     vm::init_cpu();
 
@@ -487,9 +763,15 @@ extern "C" fn kmain(x0: usize) -> ! {
         None => {
             guest_demo();
             gic_guest_demo();
+            if matches!(gic, PhysGic::V3(_)) {
+                gicv3_guest_demo();
+            }
             fp_demo();
             if ncpus >= 2 {
-                smp_guest_demo();
+                smp_guest_demo(false);
+                if matches!(gic, PhysGic::V3(_)) {
+                    smp_guest_demo(true);
+                }
             }
         }
     }
@@ -525,6 +807,8 @@ const GUEST_RAM: GuestPhysAddr = GuestPhysAddr(0x4000_0000);
 const VTIMER_INTID: u32 = 27;
 const GUEST_GICD: u64 = 0x0800_0000;
 const GUEST_GICC: u64 = 0x0801_0000;
+/// Where GICv3 guests find their redistributors (QEMU virt's address).
+const GUEST_GICR: u64 = 0x080a_0000;
 const GUEST_UART_INTID: u32 = 33;
 const GUEST_RAM_ORDER: u32 = 9; // 2 MiB
 const GUEST_UART: u64 = 0x1000_0000;
@@ -689,6 +973,111 @@ fn gic_guest_demo() {
     unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
 }
 
+/// Runs a guest that programs an emulated GICv3 through its system
+/// registers and redistributor: an SGI it sends itself, its virtual timer
+/// and a 16550 receive interrupt, arriving through the list registers.
+fn gicv3_guest_demo() {
+    let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
+    let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
+    let mut mem = GuestMemory::new();
+    // SAFETY: a fresh block owned by this demo, reached only through `mem`
+    // and the guest until it is freed below.
+    unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
+    // SAFETY: linker symbols bounding the guest image in .rodata.
+    let image = unsafe {
+        let start = &raw const gicv3_guest;
+        core::slice::from_raw_parts(start, (&raw const gicv3_guest_end).offset_from(start) as usize)
+    };
+    mem.write(GUEST_RAM, image).expect("write failed");
+    let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
+    map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
+
+    let vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 6));
+    let irq = vcpu.irq_line();
+    let vgic = Arc::new(VirtualGicV3::new(1, 64, move |_, level| irq.store(level, Ordering::Release)));
+    let mut vcpu = vcpu.with_vgic_v3(vgic.clone(), 0);
+    let g = vgic.clone();
+    let masked = AtomicBool::new(false);
+    vcpu.connect_timer(move |level| {
+        g.set_private_level(0, VTIMER_INTID, level);
+        // As with the GICv2 guest: keep the physical timer interrupt from
+        // exiting the guest again while the virtual one is up.
+        if masked.swap(level, Ordering::Relaxed) != level {
+            let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
+            if level { gic.disable(VTIMER_INTID) } else { gic.enable(VTIMER_INTID) }
+        }
+    });
+
+    let line = Arc::new(IrqSpinLock::new(Vec::new()));
+    let out = line.clone();
+    let g = vgic.clone();
+    let uart = Arc::new(
+        Uart16550::new(move |b| {
+            let mut l = out.lock();
+            l.push(b);
+            if b == b'\n' {
+                print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
+                l.clear();
+            }
+        })
+        .with_irq(move |level| g.set_level(GUEST_UART_INTID, level)),
+    );
+    let mmio = Bus::new();
+    mmio.insert(GUEST_GICD, GICD_V3_WINDOW, vgic.distributor()).expect("insert failed");
+    mmio.insert(GUEST_GICR, VirtualGicV3::redistributor_window(1), vgic.redistributors()).expect("insert failed");
+    mmio.insert(GUEST_UART, 8, uart.clone()).expect("insert failed");
+    let pio = Bus::new();
+
+    let (mut halts, mut interrupts, mut typed) = (0, 0, false);
+    let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
+        VmExit::Hypercall { .. } => match vm::psci::handle(v, exit) {
+            Some(vm::psci::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
+            _ => ControlFlow::Continue(()),
+        },
+        VmExit::Halt => {
+            halts += 1;
+            if v.state.x[21] != 0 && !typed {
+                // The timer is handled and the guest waits for the UART:
+                // "type" a line.
+                typed = true;
+                for &b in b"ping\n" {
+                    uart.push_input(b);
+                }
+            }
+            let deadline = vm::counter() + aarch64::counter_frequency();
+            while !v.interrupt_pending(vm::counter()) {
+                if vm::counter() > deadline {
+                    return ControlFlow::Break(VmExit::Halt);
+                }
+                core::hint::spin_loop();
+            }
+            ControlFlow::Continue(())
+        }
+        VmExit::ExternalInterrupt => {
+            interrupts += 1;
+            // The physical timer PPI (or a maintenance interrupt): acknowledge it.
+            let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
+            if let Some(irq) = gic.claim() {
+                gic.complete(irq);
+            }
+            ControlFlow::Continue(())
+        }
+        other => ControlFlow::Break(other),
+    });
+    println!(
+        "[hyp]   vGICv3 guest exit {exit:?}: MPIDR {:#x}, INTID {} (SGI via ICC_SGI1R), INTID {} (timer) then INTID {} (UART), {halts} halts, {interrupts} host interrupts",
+        vcpu.state.x[24], vcpu.state.x[20], vcpu.state.x[21], vcpu.state.x[22]
+    );
+    // Leave the physical timer PPI as the next guest expects it.
+    PHYS_GIC.get().expect("PHYS_GIC initialised").enable(VTIMER_INTID);
+
+    drop(mmio);
+    drop(s2);
+    drop(mem);
+    // SAFETY: the guest has stopped and nothing references its RAM.
+    unsafe { FRAMES.lock().dealloc(ram, GUEST_RAM_ORDER) };
+}
+
 const YIELD: u64 = 0xc600_0000;
 const REPORT: u64 = 0xc600_0001;
 
@@ -739,12 +1128,16 @@ fn fp_demo() {
 /// A guest shared by the host CPUs that run its vCPUs.
 struct SmpVm {
     cpus: Arc<GuestCpus>,
+    /// Keeps the guest's RAM alive.
+    #[allow(dead_code)]
     mem: GuestMemory,
     vttbr: u64,
     /// Per vCPU: its MMIO bus (its own vGIC views plus the shared UART)
     /// and its IRQ line.
     buses: Vec<Bus>,
     lines: Vec<Arc<AtomicBool>>,
+    /// The guest's virtual GICv3, if it has one instead of a GICv2.
+    gic3: Option<Arc<VirtualGicV3>>,
     done: AtomicBool,
     /// CPU_ON's result and the IAR value (vCPU 0), the context (vCPU 1).
     results: [AtomicU64; 3],
@@ -760,7 +1153,11 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             core::hint::spin_loop();
             continue;
         };
-        let mut vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr).with_irq_line(vm.lines[me].clone());
+        let vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr).with_irq_line(vm.lines[me].clone());
+        let mut vcpu = match &vm.gic3 {
+            Some(g) => vcpu.with_vgic_v3(g.clone(), me),
+            None => vcpu,
+        };
         vm.cpus.attach_arm(me, &mut vcpu);
         let mut stopped = false;
         let exit = run_vcpu(&mut vcpu, &vm.buses[me], &pio, |v, exit| match exit {
@@ -816,8 +1213,9 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
     }
 }
 
-/// Runs a two-vCPU guest: vCPU 0 on this CPU, vCPU 1 on host CPU 1.
-fn smp_guest_demo() {
+/// Runs a two-vCPU guest: vCPU 0 on this CPU, vCPU 1 on host CPU 1, under
+/// an emulated GICv2, or GICv3 if `v3`.
+fn smp_guest_demo(v3: bool) {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
     let mut mem = GuestMemory::new();
@@ -825,13 +1223,17 @@ fn smp_guest_demo() {
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
     let image = unsafe {
-        let start = &raw const smp_guest;
-        core::slice::from_raw_parts(start, (&raw const smp_guest_end).offset_from(start) as usize)
+        let (start, end) = if v3 {
+            (&raw const smp_guest_v3, &raw const smp_guest_v3_end)
+        } else {
+            (&raw const smp_guest, &raw const smp_guest_end)
+        };
+        core::slice::from_raw_parts(start, end.offset_from(start) as usize)
     };
     mem.write(GUEST_RAM, image).expect("write failed");
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
-    let vttbr = vttbr(s2.root(), 3);
+    let vttbr = vttbr(s2.root(), if v3 { 5 } else { 3 });
     core::mem::forget(s2); // in use by both CPUs until power-off
 
     // A vCPU's interrupt arriving while it runs guest code on another host
@@ -841,12 +1243,17 @@ fn smp_guest_demo() {
         GuestCpus::with_kick(2, |host| PHYS_GIC.get().expect("PHYS_GIC initialised").send_sgi(1 << host, KICK_SGI));
     let lines: Vec<Arc<AtomicBool>> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
     let (l, c) = (lines.clone(), cpus.clone());
-    let gic = Arc::new(VirtualGicV2::with_cpus(2, 64, move |cpu, level| {
+    let output = move |cpu: usize, level: bool| {
         l[cpu].store(level, Ordering::Release);
         if level {
             c.kick(cpu);
         }
-    }));
+    };
+    let (gic2, gic3) = if v3 {
+        (None, Some(Arc::new(VirtualGicV3::new(2, 64, output))))
+    } else {
+        (Some(Arc::new(VirtualGicV2::with_cpus(2, 64, output))), None)
+    };
     let line = Arc::new(IrqSpinLock::new(Vec::new()));
     let uart: Arc<Uart16550> = Arc::new(Uart16550::new(move |b| {
         let mut l = line.lock();
@@ -859,33 +1266,41 @@ fn smp_guest_demo() {
     let buses = (0..2)
         .map(|cpu| {
             let bus = Bus::new();
-            bus.insert(GUEST_GICD, GIC_WINDOW, gic.distributor_for(cpu)).expect("insert failed");
-            bus.insert(GUEST_GICC, GIC_WINDOW, gic.cpu_interface_for(cpu)).expect("insert failed");
+            if let Some(g) = &gic3 {
+                bus.insert(GUEST_GICD, GICD_V3_WINDOW, g.distributor()).expect("insert failed");
+                bus.insert(GUEST_GICR, VirtualGicV3::redistributor_window(2), g.redistributors())
+                    .expect("insert failed");
+            } else if let Some(g) = &gic2 {
+                bus.insert(GUEST_GICD, GIC_WINDOW, g.distributor_for(cpu)).expect("insert failed");
+                bus.insert(GUEST_GICC, GIC_WINDOW, g.cpu_interface_for(cpu)).expect("insert failed");
+            }
             bus.insert(GUEST_UART, 8, uart.clone()).expect("insert failed");
             bus
         })
         .collect();
     cpus.request_start(0, GUEST_RAM.0, 0).expect("request_start failed");
-    let vm = SMP_VM.call_once(|| SmpVm {
+    let vm: &'static SmpVm = alloc::boxed::Box::leak(alloc::boxed::Box::new(SmpVm {
         cpus,
         mem,
         vttbr,
         buses,
         lines,
+        gic3,
         done: AtomicBool::new(false),
         results: [AtomicU64::new(u64::MAX), AtomicU64::new(0), AtomicU64::new(0)],
         kicks: AtomicU64::new(0),
-    });
+    }));
+    SMP_VM.store(vm as *const SmpVm as *mut SmpVm, Ordering::Release);
     vcpu_loop(vm, 0);
     let r = |i: usize| vm.results[i].load(Ordering::Acquire);
+    let gic = if v3 { "GICv3 " } else { "" };
     println!(
-        "[hyp]   SMP guest: 2 vCPUs on host CPUs 0 and 1; CPU_ON returned {}, cpu 1 got context {:#x}, IAR {:#x}",
+        "[hyp]   SMP {gic}guest: 2 vCPUs on host CPUs 0 and 1; CPU_ON returned {}, cpu 1 got context {:#x}, IAR {:#x}",
         r(0) as i64,
         r(2),
         r(1)
     );
     println!("[hyp]   vCPU 0 kicked out of guest code by a host SGI {} time(s)", vm.kicks.load(Ordering::Relaxed));
-    let _ = &vm.mem;
 }
 
 fn on_trap(frame: &mut TrapFrame) {
