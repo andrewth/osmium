@@ -73,6 +73,8 @@ pub struct Thread {
     task: AtomicU64,
     pub(crate) mask: AtomicU64,
     pub(crate) pending: AtomicU64,
+    /// Queued signals, the alternate stack and `sigsuspend`'s saved mask.
+    pub(crate) sig: crate::sigqueue::ThreadSig,
     clear_tid: AtomicU64,
     robust_list: AtomicU64,
     /// Another thread's `execve` is ending this one.
@@ -138,6 +140,7 @@ impl Thread {
             task: AtomicU64::new(0),
             mask: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            sig: crate::sigqueue::ThreadSig::new(),
             clear_tid: AtomicU64::new(0),
             robust_list: AtomicU64::new(0),
             doomed: AtomicBool::new(false),
@@ -183,6 +186,12 @@ impl Thread {
 
     pub(crate) fn set_fault(&self, sig: u8, addr: u64) {
         *self.fault.lock() = Some((sig, addr));
+    }
+
+    /// Drops the pending signals in `mask`, with their queued `siginfo`.
+    pub(crate) fn discard_pending(&self, mask: u64) {
+        self.pending.fetch_and(!mask, Ordering::SeqCst);
+        self.sig.queue.discard(mask);
     }
 
     pub(crate) fn take_fault(&self, sig: u8) -> Option<u64> {
@@ -232,6 +241,11 @@ impl ThreadGroup {
     #[allow(clippy::expect_used)] // invariant: the leader is never removed from the list except by `promote`, which names the next one in the same critical section.
     fn leader_in(threads: &ArcList<ByGroup>) -> Arc<Thread> {
         threads.clone_first_where(|t| t.leader.load(Ordering::SeqCst)).expect("the leader is never removed")
+    }
+
+    /// Calls `f` on each thread.
+    pub(crate) fn each(&self, f: impl FnMut(&Thread)) {
+        self.threads.lock().iter().for_each(f);
     }
 
     pub(crate) fn find(&self, tid: u32) -> Option<Arc<Thread>> {
@@ -362,6 +376,7 @@ pub(crate) fn forked(p: &Process, th: &Thread, outcome: Outcome) -> Outcome {
         let leader = c.group.leader();
         leader.mask.store(th.signal_mask(), Ordering::SeqCst);
         leader.tls.store(th.tls(), Ordering::SeqCst);
+        leader.sig.inherit_alt(&th.sig);
     }
     outcome
 }

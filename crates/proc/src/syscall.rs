@@ -93,6 +93,10 @@ pub enum Sys {
     RtSigprocmask,
     RtSigreturn,
     RtSigpending,
+    RtSigsuspend,
+    Sigaltstack,
+    RtSigqueueinfo,
+    RtTgsigqueueinfo,
     Kill,
     Tkill,
     Tgkill,
@@ -176,6 +180,10 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (14, Sys::RtSigprocmask),
     (15, Sys::RtSigreturn),
     (127, Sys::RtSigpending),
+    (130, Sys::RtSigsuspend),
+    (131, Sys::Sigaltstack),
+    (129, Sys::RtSigqueueinfo),
+    (297, Sys::RtTgsigqueueinfo),
     (62, Sys::Kill),
     (200, Sys::Tkill),
     (234, Sys::Tgkill),
@@ -248,6 +256,10 @@ pub(crate) const NUMBERS: &[(u64, Sys)] = &[
     (135, Sys::RtSigprocmask),
     (139, Sys::RtSigreturn),
     (136, Sys::RtSigpending),
+    (133, Sys::RtSigsuspend),
+    (132, Sys::Sigaltstack),
+    (138, Sys::RtSigqueueinfo),
+    (240, Sys::RtTgsigqueueinfo),
     (129, Sys::Kill),
     (130, Sys::Tkill),
     (131, Sys::Tgkill),
@@ -434,6 +446,10 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::RtSigaction => crate::signal::sigaction(p, a[0], a[1], a[2], a[3]),
         Sys::RtSigprocmask => crate::signal::sigprocmask(p, th, a[0], a[1], a[2], a[3]),
         Sys::RtSigpending => crate::signal::sigpending(p, th, a[0], a[1]),
+        Sys::RtSigsuspend => crate::sigqueue::sigsuspend(p, th, a[0], a[1]),
+        Sys::Sigaltstack => crate::sigqueue::sigaltstack(p, th, a[0], a[1]),
+        Sys::RtSigqueueinfo => crate::sigqueue::rt_sigqueueinfo(p, fd, a[1], a[2]),
+        Sys::RtTgsigqueueinfo => crate::sigqueue::rt_tgsigqueueinfo(p, fd, a[1] as i32, a[2], a[3]),
         // `handle` restores the registers; there is nothing to return to here.
         Sys::RtSigreturn => Err(Errno::EINVAL),
         Sys::Kill => crate::signal::kill(p, fd, a[1]),
@@ -975,13 +991,21 @@ fn execve(p: &Process, th: &Thread, path: u64, argv: u64, envp: u64) -> Result<O
 }
 
 /// `wait4(pid, wstatus, options, rusage)`. Without process groups, `pid` 0
-/// and below -1 mean any child, like -1. Resource usage reads as zero.
+/// and below -1 mean any child, like -1. `WUNTRACED` also reports children
+/// stopped by a stop signal, and `WCONTINUED` ones continued by `SIGCONT`.
+/// Resource usage reads as zero.
 fn wait4(p: &Process, pid: i32, wstatus: u64, options: u64, rusage: u64) -> SysResult {
     const WNOHANG: u64 = 1;
+    const WUNTRACED: u64 = 2;
+    const WCONTINUED: u64 = 8;
     let which = (pid > 0).then_some(Pid(pid as u32));
-    let Some((pid, status)) = p.wait_child(which, options & WNOHANG != 0)? else { return Ok(0) };
+    let Some((pid, event)) =
+        p.wait_child_job(which, options & WNOHANG != 0, options & WUNTRACED != 0, options & WCONTINUED != 0)?
+    else {
+        return Ok(0);
+    };
     if wstatus != 0 {
-        p.memory().write(wstatus, &status.wait_status().to_ne_bytes())?;
+        p.memory().write(wstatus, &event.wait_status().to_ne_bytes())?;
     }
     if rusage != 0 {
         p.memory().write(rusage, &[0; 144])?;
@@ -1094,6 +1118,7 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
         return None;
     };
     let th = crate::thread::current_thread(&p);
+    th.sig.set_entry_sp(crate::uregs::UserRegs::user_sp(frame));
     if Sys::from_number(nr) == Some(Sys::RtSigreturn) {
         // The saved registers include the interrupted call's result.
         return crate::signal::sigreturn(&p, &th, frame).or_else(|| crate::signal::deliver_to(&p, &th, frame));

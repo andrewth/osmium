@@ -838,6 +838,7 @@ fn a_child_that_never_got_a_task_can_be_forgotten() {
 
 mod blocked;
 mod hostile;
+mod jobsig;
 mod oom;
 mod pie;
 mod restart;
