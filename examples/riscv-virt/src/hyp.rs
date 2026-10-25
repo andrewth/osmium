@@ -204,6 +204,7 @@ pub fn demo_irq() {
         timebase: 10_000_000,
         memory: &[(GUEST2_RAM.0, len)],
         plic: Some((PLIC_BASE, 32)),
+        aia: None,
         uarts: &[(GUEST_UART, UART_IRQ)],
         virtio: &[(NET_BASE, NET_IRQ), (BLK_BASE, BLK_IRQ)],
         bootargs: "",

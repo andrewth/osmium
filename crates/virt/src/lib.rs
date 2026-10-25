@@ -10,7 +10,7 @@
 //!   devices (as in rust-vmm's `vm-device`).
 //! - [`vcpu`]: a normalized [`VmExit`], the [`Vcpu`] trait that hardware
 //!   backends implement, and [`run_vcpu`], a loop that services device exits.
-//! - [`devices`]: emulated devices.
+//! - [`devices`]: emulated devices (including the GICv3, APLIC and IMSIC interrupt controllers).
 //! - [`riscv`]: a RISC-V H-extension vCPU and a minimal SBI for guests.
 //! - [`smp`]: start/stop state, IPIs and kicks for multi-vCPU guests.
 //! - [`aarch64`]: an AArch64 EL2 (non-VHE) vCPU and PSCI for guests.
