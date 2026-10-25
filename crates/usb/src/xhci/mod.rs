@@ -194,10 +194,11 @@ const ISOCH_LEAD_FRAMES: u16 = 3;
 const STREAM_CTX_BYTES: usize = 16;
 
 /// Streams (stream IDs 1 through this) per endpoint. The primary stream
-/// array then has 16 contexts: ID 0 is reserved.
-pub const MAX_STREAMS: usize = 15;
+/// array then has 8 contexts: ID 0 is reserved. (Kept small so that the
+/// controller, with its stream tables, still builds on a boot stack.)
+pub const MAX_STREAMS: usize = 7;
 /// Endpoints with streams at once, over all devices.
-pub const MAX_STREAM_ENDPOINTS: usize = 2;
+pub const MAX_STREAM_ENDPOINTS: usize = 4;
 
 /// Why the controller could not be brought up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2604,16 +2605,16 @@ mod tests {
         let dma = crate::virtio::testing::HostDma::default();
         let mut regs = std::vec![0u32; 0x400];
         let mut hc = fake(&dma, &mut regs);
-        // The device supports 2^5 streams; 8 asked for gives a 16-context array.
-        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 3, 5, 8), ss_ep(bulk(0x03), 3, 5, 8)]).unwrap();
+        // The device supports 2^5 streams; 6 asked for gives an 8-context array.
+        configure_ss(&mut hc, &[ss_ep(bulk(0x82), 3, 5, 6), ss_ep(bulk(0x03), 3, 5, 6)]).unwrap();
         let (dev, in_ep, out_ep) = (DeviceId(1), 0x82, 0x03);
-        assert_eq!((hc.stream_count(dev, in_ep), hc.stream_count(dev, out_ep), hc.stream_count(dev, 0x01)), (8, 8, 0));
+        assert_eq!((hc.stream_count(dev, in_ep), hc.stream_count(dev, out_ep), hc.stream_count(dev, 0x01)), (6, 6, 0));
         let s = hc.streams.iter().flatten().find(|s| s.dci == 5).unwrap();
         let (array, count) = (s.array_addr(), s.count);
-        assert_eq!(count, 8);
+        assert_eq!(count, 6);
         let input = &hc.slot(dev).unwrap().input;
         let dw0 = ctx_get(input, 6 * 32, 0);
-        assert_eq!(dw0 >> 10 & 0x1f, 3, "MaxPStreams: 2^(3+1) contexts");
+        assert_eq!(dw0 >> 10 & 0x1f, 2, "MaxPStreams: 2^(2+1) contexts");
         assert_eq!(dw0 >> 15 & 1, 1, "linear stream array");
         let deq = ctx_get(input, 6 * 32, 2) as u64 | (ctx_get(input, 6 * 32, 3) as u64) << 32;
         assert_eq!(deq, array, "the dequeue pointer names the array, with no cycle bit");
@@ -2623,16 +2624,16 @@ mod tests {
         let ctx = |n: usize| -> (u64, u64) { (s.array.load::<u64>(n * 16), s.array.load::<u64>(n * 16 + 8)) };
         assert_eq!(ctx(0), (0, 0));
         let mut bases = std::vec::Vec::new();
-        for n in 1..=8 {
+        for n in 1..=6 {
             let ring = s.rings[n - 1].as_ref().unwrap();
             assert_eq!(ctx(n), (ring.base().as_u64() | 1 << 1 | 1, 0), "stream {n}");
             bases.push(ring.base());
         }
         bases.sort();
         bases.dedup();
-        assert_eq!(bases.len(), 8);
-        assert_eq!(ctx(9), (0, 0));
-        assert!(s.rings[8].is_none());
+        assert_eq!(bases.len(), 6);
+        assert_eq!(ctx(7), (0, 0));
+        assert!(s.rings[6].is_none());
 
         // Smaller and larger requests round the array and clamp the count.
         configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 3)]).unwrap();
@@ -2672,8 +2673,8 @@ mod tests {
         assert_eq!(configure_ss(&mut hc, &[ss_ep(bulk(0x82), 0, 5, 4)]), Err(UsbError::Unsupported));
         // Only MAX_STREAM_ENDPOINTS at a time.
         hc.max_psa = 4;
-        let three = [ss_ep(bulk(0x81), 0, 5, 2), ss_ep(bulk(0x82), 0, 5, 2), ss_ep(bulk(0x83), 0, 5, 2)];
-        assert_eq!(configure_ss(&mut hc, &three), Err(UsbError::NoResources));
+        let five: [_; 5] = core::array::from_fn(|i| ss_ep(bulk(0x81 + i as u8), 0, 5, 2));
+        assert_eq!(configure_ss(&mut hc, &five), Err(UsbError::NoResources));
         assert_eq!(hc.streams.iter().flatten().count(), 0, "nothing half-built is left");
         // The plain trait method works on a controller with streams.
         let configure = hc.commands.enqueue_addr();
