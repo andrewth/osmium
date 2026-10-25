@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use osmium_virt::devices::{
-    Pl011, Uart16550, VirtualGicV2, VirtualGicV3, VirtualIoApic, VirtualLapic, VirtualPic, VirtualPit, VirtualPlic,
+    Pl011, Uart16550, VirtualAplic, VirtualGicV2, VirtualGicV3, VirtualImsic, VirtualIoApic, VirtualLapic, VirtualPic, VirtualPit, VirtualPlic,
 };
 use osmium_virt::memory::GuestMemory;
 use osmium_virt::virtio::{VirtioConsole, VirtioMmio};
@@ -62,6 +62,27 @@ fn devices_survive_any_access() {
     gic3.send_sgi(0, u64::MAX);
     gic3.send_sgi(99, 0);
     gic3.set_private_level(9, 1000, true);
+
+    let aplic = VirtualAplic::new(64, 2, |_, _| {}).with_msi(|_, _, _| {});
+    hammer(&aplic, 0x5000);
+    for off in (0x1b00..0x4100).step_by(4) {
+        aplic.write(off, &0xffff_ffffu32.to_le_bytes());
+        aplic.write(off, &0x104u32.to_le_bytes());
+        aplic.read(off, &mut [0u8; 4]);
+    }
+    let imsic = Arc::new(VirtualImsic::new(2, 255, |_, _| {}));
+    hammer(&*imsic.mmio(), 0x3000);
+    for reg in 0..0x200 {
+        imsic.write_reg(9, reg, !0);
+        imsic.write_reg(1, reg, !0);
+        imsic.read_reg(1, reg);
+        imsic.read_reg(9, reg);
+    }
+    imsic.write_reg(0, 0x70, 1);
+    imsic.claim(0);
+    imsic.claim(9);
+    imsic.topei(9);
+    imsic.set_pending(9, u32::MAX);
 
     hammer(&VirtualPlic::new(32, 2, |_, _| {}), 0x40_0000);
     hammer(&VirtualPlic::new(0, 0, |_, _| {}), 0x40_0000);
