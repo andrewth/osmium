@@ -60,10 +60,13 @@ fn fp_state_follows_its_task() {
         .map(|v| {
             let ok = ok.clone();
             builder("fp").fp_state(FpState::new()).spawn(move || {
+                host::use_fp();
                 assert_eq!(host::live(), 0, "a new task starts from FpState::new");
+                host::use_fp();
                 host::set_live(v);
                 for _ in 0..3 {
                     osmium_sched::yield_now();
+                    host::use_fp();
                     assert_eq!(host::live(), v);
                     // A task without FP state runs between the two.
                     builder("no-fp").spawn(|| {}).join();

@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use osmium_arch::fp::{self, FpState};
 use osmium_arch::{MAX_CPUS, cpu, irq};
 use osmium_sync::{Once, PerCpu, PerCpuCell, preempt};
 
@@ -113,10 +114,13 @@ struct CpuState {
     /// switch and released it.
     prev: Option<Arc<Task>>,
     idle: Option<Arc<Task>>,
+    /// Whether this CPU's FP/SIMD registers hold `current`'s values. Only
+    /// then does a switch away have to save them.
+    fp_loaded: bool,
 }
 
 static CPUS: PerCpuCell<CpuState> =
-    PerCpuCell::new([const { CpuState { current: None, prev: None, idle: None } }; MAX_CPUS]);
+    PerCpuCell::new([const { CpuState { current: None, prev: None, idle: None, fp_loaded: false } }; MAX_CPUS]);
 static NEED_RESCHED: PerCpu<AtomicBool> = PerCpu::new([const { AtomicBool::new(false) }; MAX_CPUS]);
 
 const IDLE_STACK: usize = 16 * 1024;
@@ -127,6 +131,7 @@ const SPIN_LIMIT: u32 = 1 << 20;
 /// creates the CPU's idle task. Call once per CPU, after its CPU id is set
 /// and before using any other function in this crate on it.
 pub fn init_cpu() {
+    fp::set_lazy_load(load_fp_trap);
     let cpu = cpu::current_id();
     let boot = Arc::new(Task::bootstrap(cpu));
     let idle = Task::idle(cpu, IDLE_STACK);
@@ -300,25 +305,18 @@ fn schedule(requeue: Option<EnqueueReason>) {
     next.set_cpu_unpinned(cpu);
     next.state.store(TaskState::Running as u8, Ordering::Release);
     NEED_RESCHED.for_cpu(cpu).store(false, Ordering::Relaxed);
-    // The kernel never uses FP, so the registers still hold `cur`'s user
-    // values. `finish_switch` publishes the saved copy (`on_cpu`) before
-    // another CPU may load it.
+    // The kernel never uses FP, so the registers hold the values of the task
+    // that loaded them last. `finish_switch` publishes the saved copy
+    // (`on_cpu`) before another CPU may load it.
     // SAFETY: IRQs are off and only the CPU switching a task touches its
-    // `fp`. If FP is off on this CPU (`fp_state` misused), the instructions
-    // trap; they cannot touch other memory.
+    // `fp` and `sve`. If FP is off on this CPU (`fp_state` misused), the
+    // instructions trap; they cannot touch other memory.
     unsafe {
-        if let Some(fp) = &cur.fp {
-            (*fp.get()).save();
-        }
+        fp_switch_out(st, cur);
         if let Some(sve) = &cur.sve {
             (*sve.get()).save();
         }
-        if let Some(fp) = &next.fp {
-            (*fp.get()).restore();
-        }
-        if let Some(sve) = &next.sve {
-            (*sve.get()).restore();
-        }
+        fp_switch_in(st, &next);
     }
     if let Some(hook) = SWITCH_HOOK.get() {
         hook(&next);
@@ -340,6 +338,118 @@ fn schedule(requeue: Option<EnqueueReason>) {
 
 /// Releases the task we switched away from. Runs first thing after every
 /// switch, on the new task's stack, with IRQs disabled.
+/// Saves the outgoing task's FP/SIMD registers if they are loaded on this
+/// CPU. A task that never used them after its last switch has nothing to save.
+///
+/// # Safety
+/// IRQs must be off, and `st` must be this CPU's state.
+unsafe fn fp_switch_out(st: *mut CpuState, cur: &Task) {
+    // SAFETY: as above.
+    unsafe {
+        if (*st).fp_loaded {
+            (*st).fp_loaded = false;
+            if let Some(fp) = &cur.fp {
+                (*fp.get()).save();
+            }
+        }
+    }
+}
+
+/// Makes the incoming task's FP/SIMD registers ready. A lazy build arms the
+/// trap and loads them at the task's first FP/SIMD instruction; an eager one
+/// loads them now.
+///
+/// # Safety
+/// As for [`fp_switch_out`], which must have run first.
+unsafe fn fp_switch_in(st: *mut CpuState, next: &Task) {
+    // SAFETY: as above.
+    unsafe {
+        if let Some(sve) = &next.sve {
+            // The SVE registers include the FP ones, which must not trap.
+            (*sve.get()).restore();
+            fp::disarm_lazy();
+            (*st).fp_loaded = false;
+        } else if !fp::enabled() {
+            (*st).fp_loaded = false;
+        } else if fp::LAZY {
+            fp::arm_lazy();
+            (*st).fp_loaded = false;
+        } else if let Some(fp) = &next.fp {
+            (*fp.get()).restore();
+            (*st).fp_loaded = true;
+        } else {
+            (*st).fp_loaded = false;
+        }
+    }
+}
+
+/// The lazy FP trap's loader: gives the running task its FP/SIMD registers.
+/// Runs in trap context with IRQs off, on the CPU the task runs on.
+fn load_fp_trap() {
+    let st = CPUS.as_ptr();
+    // SAFETY: IRQs are off in trap context, so nothing else on this CPU
+    // touches its state; the current task stays alive while referenced there.
+    let cur = unsafe { &*current_ptr() };
+    // SAFETY: the trap was armed on a CPU where `fp::enable` ran. Disarming
+    // comes first, since the restore is made of FP/SIMD instructions.
+    unsafe {
+        fp::disarm_lazy();
+        match &cur.fp {
+            Some(fp) => (*fp.get()).restore(),
+            None => FpState::new().restore(),
+        }
+        (*st).fp_loaded = true;
+    }
+}
+
+/// The calling task's FP/SIMD registers, as a `fork` child starts with them.
+pub fn current_fp_state() -> FpState {
+    if !fp::enabled() {
+        return FpState::new();
+    }
+    irq::without(|| {
+        let st = CPUS.as_ptr();
+        // SAFETY: IRQs are off, so the task stays on this CPU.
+        let cur = unsafe { &*current_ptr() };
+        // SAFETY: as above; `capture` is valid because FP is enabled.
+        unsafe {
+            if (*st).fp_loaded {
+                FpState::capture()
+            } else {
+                cur.fp.as_ref().map_or_else(FpState::new, |fp| (*fp.get()).clone())
+            }
+        }
+    })
+}
+
+/// Clears the calling task's FP/SIMD registers, as a new program starts with
+/// them.
+pub fn reset_current_fp() {
+    if !fp::enabled() {
+        return;
+    }
+    irq::without(|| {
+        let st = CPUS.as_ptr();
+        // SAFETY: IRQs are off, so the task stays on this CPU.
+        let cur = unsafe { &*current_ptr() };
+        let fresh = FpState::new();
+        // SAFETY: as above; the task is running here, so no other CPU touches its `fp`.
+        unsafe {
+            if let Some(fp) = &cur.fp {
+                *fp.get() = fresh.clone();
+            }
+            if fp::LAZY {
+                // Whatever the registers hold is discarded; the next FP/SIMD instruction loads `fresh`.
+                (*st).fp_loaded = false;
+                fp::arm_lazy();
+            } else {
+                fresh.restore();
+                (*st).fp_loaded = cur.fp.is_some();
+            }
+        }
+    })
+}
+
 fn finish_switch() {
     // SAFETY: IRQs are disabled across every switch.
     let prev = unsafe { (*CPUS.as_ptr()).prev.take() };

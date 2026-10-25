@@ -229,12 +229,8 @@ impl Process {
         // Shared file mappings are saved before the image goes. A failure has nowhere to be reported.
         let _ = old.sync_files();
         drop(old);
-        if osmium_arch::fp::enabled() {
-            // The new program starts with cleared FP/SIMD registers.
-            // SAFETY: we run on the process's own task, whose registers these
-            // are; a kernel that enabled FP enables it on every CPU.
-            unsafe { osmium_arch::fp::FpState::new().restore() };
-        }
+        // The new program starts with cleared FP/SIMD registers.
+        osmium_sched::reset_current_fp();
         entry
     }
 }

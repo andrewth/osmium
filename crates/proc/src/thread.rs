@@ -465,13 +465,7 @@ pub(crate) fn start(
         return Err(Errno::ENOSYS);
     };
     let resume = platform.resume;
-    let fp = if osmium_arch::fp::enabled() {
-        // SAFETY: a kernel that enables FP enables it on every CPU; the
-        // registers are the caller's, still live.
-        unsafe { osmium_arch::fp::FpState::capture() }
-    } else {
-        osmium_arch::fp::FpState::new()
-    };
+    let fp = osmium_sched::current_fp_state();
     // Where the kernel can shoot down other CPUs' TLB entries, the new
     // thread goes wherever the scheduler puts it, and may be moved. Without
     // that, page-table changes reach only the CPU that makes them, so the

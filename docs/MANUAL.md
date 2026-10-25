@@ -760,10 +760,12 @@ pub struct Platform {
 
 Without a platform, fork and execve return `ENOSYS`.
 
-If your kernel is soft-float, nothing saves FP/SIMD registers between
-processes. On x86_64 and AArch64, call `osmium::arch::x86_64::trap_fp()` or
-`osmium::arch::aarch64::trap_fp()` on every CPU so that user FP/SIMD
-instructions fault instead. The kernel itself must not use them afterwards.
+If your kernel is soft-float and does not give tasks an `FpState`, nothing
+saves FP/SIMD registers between processes. On x86_64 and AArch64, call
+`osmium::arch::x86_64::trap_fp()` or `osmium::arch::aarch64::trap_fp()` on
+every CPU so that user FP/SIMD instructions fault instead. The kernel itself
+must not use them afterwards. A kernel that calls `osmium::arch::fp::enable`
+and gives tasks an `FpState` needs neither.
 
 Your switch hook also has to load each task's page table:
 
@@ -1019,7 +1021,14 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
 - FP/SIMD registers are switched per task only when the kernel calls
   `osmium_arch::fp::enable` on every CPU and gives user tasks an `FpState`
   (`TaskBuilder::fp_state`). Kernels are soft-float and never touch them.
-  AVX stays off on x86_64, and SVE and SME are not enabled on AArch64.
+  On x86_64 and AArch64 the switch is lazy: it arms the FP trap, and a task's
+  registers are saved only if it used them since its last switch and loaded
+  at its first FP/SIMD instruction. RISC-V and the AArch64 EL2 build switch
+  eagerly. AVX stays off on x86_64, and SVE and SME are not enabled on
+  AArch64.
+- Lazy switching assumes that nothing outside the scheduler loads FP/SIMD
+  registers, so a hypervisor's guest FP switching (`osmium-virt`) is not safe
+  alongside lazily switched host tasks that use FP.
 - The heap can return large blocks to the frame allocator only if the
   mapper implements `virt_to_phys` (`OffsetMapper` does).
 - The Intel VMX backend has only run under nested KVM, and x86 MMIO emulation does not

@@ -1203,14 +1203,8 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
                 return crate::signal::deliver_to(&p, &th, frame);
             };
             let resume = platform.resume;
-            // The child continues with the parent's FP registers, which are
-            // still live: the kernel never uses them.
-            let fp = if osmium_arch::fp::enabled() {
-                // SAFETY: a kernel that enables FP enables it on every CPU.
-                unsafe { osmium_arch::fp::FpState::capture() }
-            } else {
-                osmium_arch::fp::FpState::new()
-            };
+            // The child continues with the parent's FP registers.
+            let fp = osmium_sched::current_fp_state();
             let spawned =
                 child.try_spawn_with_fp(osmium_sched::TaskBuilder::new(child.name()), fp, move || resume(regs));
             if spawned.is_err() {

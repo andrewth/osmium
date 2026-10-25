@@ -6,7 +6,9 @@
 //! use FP turns it on with [`enable`] on every CPU and gives each user task
 //! an [`FpState`] (see `osmium_sched::TaskBuilder::fp_state`); the context
 //! switch then saves the outgoing task's registers and loads the incoming
-//! task's.
+//! task's. Where [`LAZY`] is set, the switch loads nothing: it arms a trap
+//! ([`arm_lazy`]), and the incoming task's first FP/SIMD instruction loads
+//! its registers. A task that never uses them is never saved or restored.
 //!
 //! What is switched:
 //! - x86_64: x87, MMX and SSE (`FXSAVE` format). When the CPU has XSAVE and
@@ -20,11 +22,17 @@
 //!
 //! On hosted targets a per-thread variable stands in for the registers.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// x86_64: the switch uses XSAVE/XRSTOR (set by [`enable`]).
 static XSAVE_ON: AtomicBool = AtomicBool::new(false);
+/// The scheduler's loader for the first FP/SIMD instruction after a lazy switch.
+static LAZY_LOAD: AtomicUsize = AtomicUsize::new(0);
+
+/// `ESR_EL1` for the trap of a simulated FP/SIMD instruction on hosted builds: class 0x07, then a marker.
+#[cfg(not(bare))]
+const HOST_FP_TRAP: u64 = 0x07 << 26 | 0x46_50;
 
 /// Returns true if [`enable`] turned on AVX (`XCR0.YMM`) and the context
 /// switch therefore keeps the upper halves of the `ymm` registers. Always
@@ -42,6 +50,108 @@ const XSAVE_AREA: usize = 1024;
 /// user code should then get an [`FpState`].
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether this build switches FP/SIMD registers lazily (see the module
+/// docs). RISC-V and the AArch64 EL2 build switch eagerly: their trap for a
+/// disabled FPU is an illegal instruction, which the kernel cannot tell from
+/// a real one without decoding it.
+pub const LAZY: bool = cfg!(any(
+    not(bare),
+    all(bare, target_arch = "x86_64"),
+    all(bare, target_arch = "aarch64", not(feature = "aarch64-el2")),
+));
+
+/// Registers `hook`, which loads the current task's FP/SIMD registers. A
+/// lazy switch leaves the trap armed ([`arm_lazy`]); the first FP/SIMD
+/// instruction on the CPU then calls `hook` with interrupts disabled. The
+/// hook must call [`disarm_lazy`] before it touches the registers. Setting
+/// the same hook again is harmless.
+pub fn set_lazy_load(hook: fn()) {
+    LAZY_LOAD.store(hook as usize, Ordering::Release);
+}
+
+/// Makes FP/SIMD instructions trap on this CPU, so the next one runs the
+/// hook of [`set_lazy_load`]. Does nothing unless [`LAZY`].
+///
+/// # Safety
+/// [`enable`] must have returned true on this CPU, and the task that runs
+/// next must not depend on the FP/SIMD registers holding its own values.
+pub unsafe fn arm_lazy() {
+    #[cfg(all(bare, target_arch = "x86_64"))]
+    // SAFETY: the caller's contract; setting CR0.TS only adds faults.
+    unsafe {
+        core::arch::asm!("mov {t}, cr0", "or {t}, 8", "mov cr0, {t}", t = out(reg) _, options(nomem, nostack, preserves_flags))
+    }
+    #[cfg(all(bare, target_arch = "aarch64", not(feature = "aarch64-el2")))]
+    // SAFETY: the caller's contract; clearing FPEN only adds traps.
+    unsafe {
+        crate::aarch64::write_cpacr_el1(crate::aarch64::read_cpacr_el1() & !(0b11 << 20));
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+    #[cfg(not(bare))]
+    host::set_trapping(true);
+}
+
+/// Lets FP/SIMD instructions run on this CPU again, undoing [`arm_lazy`].
+///
+/// # Safety
+/// [`enable`] must have returned true on this CPU.
+pub unsafe fn disarm_lazy() {
+    #[cfg(all(bare, target_arch = "x86_64"))]
+    // SAFETY: the caller's contract; CLTS only removes faults.
+    unsafe {
+        core::arch::asm!("clts", options(nomem, nostack, preserves_flags))
+    }
+    #[cfg(all(bare, target_arch = "aarch64", not(feature = "aarch64-el2")))]
+    // SAFETY: the caller's contract; setting FPEN only removes traps.
+    unsafe {
+        crate::aarch64::write_cpacr_el1(crate::aarch64::read_cpacr_el1() | 0b11 << 20);
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+    #[cfg(not(bare))]
+    host::set_trapping(false);
+}
+
+/// Runs the lazy loader if `frame` is the FP/SIMD trap an armed CPU took.
+/// Returns true if it ran, so the trap must not reach the trap handler.
+pub(crate) fn handle_lazy_trap(frame: &crate::trap::TrapFrame) -> bool {
+    if !is_lazy_trap(frame) {
+        return false;
+    }
+    let hook = LAZY_LOAD.load(Ordering::Acquire);
+    if hook == 0 {
+        return false;
+    }
+    // SAFETY: only `set_lazy_load` stores here, and it stores `fn()`s.
+    let hook = unsafe { core::mem::transmute::<usize, fn()>(hook) };
+    hook();
+    true
+}
+
+/// Returns true if `frame` is the FP/SIMD trap that [`arm_lazy`] causes.
+#[cfg(not(bare))]
+fn is_lazy_trap(frame: &crate::trap::TrapFrame) -> bool {
+    frame.cause() == crate::trap::Trap::Other { raw: HOST_FP_TRAP }
+}
+
+/// `#NM`, raised by x87, MMX and SSE instructions while `CR0.TS` is set.
+#[cfg(all(bare, target_arch = "x86_64"))]
+fn is_lazy_trap(frame: &crate::trap::TrapFrame) -> bool {
+    const DEVICE_NOT_AVAILABLE: u8 = 7;
+    frame.vector() == DEVICE_NOT_AVAILABLE
+}
+
+/// `ESR_EL1.EC` 0x07: an access to SIMD or FP registers that `CPACR_EL1.FPEN` trapped.
+#[cfg(all(bare, target_arch = "aarch64", not(feature = "aarch64-el2")))]
+fn is_lazy_trap(frame: &crate::trap::TrapFrame) -> bool {
+    matches!(frame.cause(), crate::trap::Trap::Other { raw } if (raw >> 26) & 0x3f == 0x07)
+}
+
+/// Eager-switching builds never arm the trap.
+#[cfg(all(bare, not(any(target_arch = "x86_64", all(target_arch = "aarch64", not(feature = "aarch64-el2"))))))]
+fn is_lazy_trap(_frame: &crate::trap::TrapFrame) -> bool {
+    false
 }
 
 /// One task's FP/SIMD registers, saved while the task is switched out.
@@ -536,6 +646,7 @@ pub mod host {
 
     std::thread_local! {
         static LIVE: Cell<u64> = const { Cell::new(0) };
+        static TRAPPING: Cell<bool> = const { Cell::new(false) };
     }
 
     /// The calling thread's simulated FP registers.
@@ -546,6 +657,21 @@ pub mod host {
     /// Sets the calling thread's simulated FP registers.
     pub fn set_live(v: u64) {
         LIVE.with(|l| l.set(v));
+    }
+
+    /// Arms or disarms the simulated FP trap of the calling thread.
+    pub(super) fn set_trapping(on: bool) {
+        TRAPPING.with(|t| t.set(on));
+    }
+
+    /// Stands for one FP/SIMD instruction of the calling task. While the trap
+    /// is armed it is taken as the hardware would take it, so the scheduler
+    /// loads the task's registers first. Call it before reading or writing
+    /// [`live`] or [`set_live`] in a task that may have been switched.
+    pub fn use_fp() {
+        if TRAPPING.with(Cell::get) {
+            let _ = crate::trap::simulate(crate::trap::Trap::Other { raw: super::HOST_FP_TRAP }, 0);
+        }
     }
 }
 

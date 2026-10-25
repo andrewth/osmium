@@ -83,6 +83,9 @@ pub fn set_handler(handler: Handler) {
 
 #[allow(clippy::panic)] // invariant: integrator misuse; a trap with no registered handler cannot be recovered.
 fn dispatch(frame: &mut TrapFrame) {
+    if crate::fp::handle_lazy_trap(frame) {
+        return;
+    }
     match HANDLER.load(Ordering::Acquire) {
         0 => panic!("unhandled trap {:?} at pc {:#x} (no handler registered)", frame.cause(), frame.pc()),
         h => {
