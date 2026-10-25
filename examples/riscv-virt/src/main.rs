@@ -657,6 +657,8 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     osmium::sched::set_remote_wake_hook(|cpu| {
         let _ = sbi::send_ipi(1, HARTS[cpu].load(Ordering::Relaxed));
     });
+    // User threads run on any hart: address-space changes shoot the others down.
+    osmium::arch::mmu::set_remote_flush(|start, pages| remote_sfence_vma(start, pages * PAGE_SIZE));
     let cpus = fdt.find_node("/cpus").expect("no /cpus");
     let harts = cpus
         .children()
