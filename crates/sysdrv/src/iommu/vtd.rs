@@ -1,31 +1,55 @@
-//! Intel VT-d DMA remapping.
+//! Intel VT-d DMA and interrupt remapping.
 //!
-//! [`Vtd`] drives one remapping unit (a DRHD in the ACPI DMAR table) in
-//! legacy mode: a root table of 256 bus entries, each pointing at a context
-//! table of 256 device/function entries, each pointing at a second-level
-//! page table in [`VtdSecondLevel`] format with a 48-bit, four-level walk.
-//! Invalidation uses the register interface (context-command and IOTLB
-//! registers), so no invalidation queue is needed; a queue the firmware left
-//! enabled is switched off.
+//! [`Vtd`] drives one remapping unit (a DRHD in the ACPI DMAR table) in one
+//! of two translation modes.
+//!
+//! **Legacy mode** ([`Vtd::new`]): a root table of 256 bus entries, each
+//! pointing at a context table of 256 device/function entries, each pointing
+//! at a second-level page table in [`VtdSecondLevel`] format with a 48-bit,
+//! four-level walk. Invalidation uses the register interface (context-command
+//! and IOTLB registers).
+//!
+//! **Scalable mode** ([`Vtd::new_scalable`]): the root entry of a bus points
+//! at two context tables (functions 0 to 127 and 128 to 255) of 256-bit
+//! entries; each entry points at a PASID directory, whose first PASID table
+//! has an entry for PASID 0 (the `RID_PASID` that requests without a PASID
+//! use) of type second-level-only, pointing at the same
+//! [`VtdSecondLevel`] table. The directory and table are allocated on a
+//! device's first attach and reused until the driver is dropped. The unit
+//! must report `ECAP.SMTS` and `ECAP.SLTS`. Scalable mode invalidates through
+//! the queue only (context-cache, PASID-cache and IOTLB descriptors); first-level
+//! and nested translation and PASIDs other than 0 are not used yet.
+//!
+//! **Queued invalidation** is on in scalable mode and when interrupt
+//! remapping is enabled (see [`remap`]): a one-page ring of descriptors, each
+//! submission followed by an invalidation-wait descriptor that writes a status
+//! word. A queue the firmware left enabled is switched off at start-up.
+//!
+//! **Interrupt remapping** (`ECAP.IR`) is in [`remap`]: the interrupt remapping
+//! table, [`remap::Irte`] programming with entry-cache invalidation,
+//! extended interrupt mode for x2APIC, and the remappable-format MSI message and
+//! I/O APIC entry.
 //!
 //! It needs `CAP.SAGAW` bit 2 (4-level tables) and, from [`Vtd::new`],
 //! `ECAP.C` (the unit's table walks snoop the CPU caches). A unit without it
-//! needs cache lines written back after every table change, which this tree
-//! has no way to do, so [`Vtd::new`] refuses it; QEMU's model reports the
-//! bit clear although its memory is always coherent, and
-//! [`Vtd::new_assuming_coherent`] is for that. With caching mode (`CAP.CM`, as in virtual machines) domain 0 is
+//! needs cache lines written back after every table change, including the
+//! caller's second-level tables, which this tree has no way to do, so
+//! [`Vtd::new`] refuses it; QEMU's model reports the bit clear although its
+//! memory is always coherent, and [`Vtd::new_assuming_coherent`] is for that.
+//! With caching mode (`CAP.CM`, as in virtual machines) domain 0 is
 //! reserved and the driver invalidates after every change, as it does anyway.
-//! Scalable mode, interrupt remapping, device IOTLBs and nested translation
-//! are not used. Pass-through is not offered: unattached devices are blocked
-//! once translation is on.
+//! Device IOTLBs and nested translation are not used. Pass-through is not
+//! offered: unattached devices are blocked once translation is on.
 //!
 //! Faults are read back from the fault-recording registers by
 //! [`Iommu::take_fault`]; the fault interrupt stays masked.
 
 use core::mem::ManuallyDrop;
+use core::ptr::NonNull;
+use core::sync::atomic::AtomicBool;
 
 use osmium_arch::barrier;
-use osmium_hal::dma::{DmaAllocator, OwnedDma};
+use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
 use osmium_hal::iommu::{DeviceId, DomainId, Fault, Iommu, IommuError};
 use osmium_hal::mmio::IoMem;
 use osmium_hal::timer::Clock;
@@ -34,6 +58,9 @@ use osmium_mm::paging::formats::VtdSecondLevel;
 use osmium_sync::IrqSpinLock;
 
 use super::{DEFAULT_TIMEOUT_NS, Pages, Regs, wait_until};
+
+mod qi;
+pub mod remap;
 
 // Registers.
 const VER: usize = 0x00;
@@ -44,6 +71,10 @@ const GSTS: usize = 0x1c;
 const RTADDR: usize = 0x20;
 const CCMD: usize = 0x28;
 const FSTS: usize = 0x34;
+const IQH: usize = 0x80;
+const IQT: usize = 0x88;
+const IQA: usize = 0x90;
+const IRTA: usize = 0xb8;
 
 // GCMD/GSTS bits (the command and its status share a position).
 const TE: u32 = 1 << 31;
@@ -51,6 +82,7 @@ const SRTP: u32 = 1 << 30;
 const WBF: u32 = 1 << 27;
 const QIE: u32 = 1 << 26;
 const IRE: u32 = 1 << 25;
+const SIRTP: u32 = 1 << 24;
 const CFI: u32 = 1 << 23;
 /// Bits of GSTS that persist and must be written back with every command.
 const PERSISTENT: u32 = TE | QIE | IRE | CFI;
@@ -60,7 +92,16 @@ const CAP_RWBF: u64 = 1 << 4;
 const CAP_CM: u64 = 1 << 7;
 const CAP_DWD: u64 = 1 << 54;
 const CAP_DRD: u64 = 1 << 55;
+// ECAP fields.
 const ECAP_C: u64 = 1 << 0;
+const ECAP_QI: u64 = 1 << 1;
+const ECAP_IR: u64 = 1 << 3;
+const ECAP_EIM: u64 = 1 << 4;
+const ECAP_SMTS: u64 = 1 << 43;
+const ECAP_SLTS: u64 = 1 << 46;
+
+/// `RTADDR.TTM` bit: the root table is in scalable mode.
+const RTADDR_SCALABLE: u64 = 1 << 10;
 
 // Command and IOTLB registers.
 const ICC: u64 = 1 << 63;
@@ -69,25 +110,83 @@ const CIRG_DEVICE: u64 = 3 << 61;
 const IVT: u64 = 1 << 63;
 const IIRG_GLOBAL: u64 = 1 << 60;
 const IIRG_DOMAIN: u64 = 2 << 60;
-const IOTLB_DW: u64 = 1 << 48;
-const IOTLB_DR: u64 = 1 << 49;
 
 // FSTS bits.
 const FSTS_PFO: u32 = 1 << 0;
 /// Primary pending fault: a record waits, and FRI says which.
 const FSTS_PPF: u32 = 1 << 1;
+/// Invalidation queue error, completion error and time-out error.
+const FSTS_QI_ERRORS: u32 = 1 << 4 | 1 << 5 | 1 << 6;
 
 /// Fault recording register: F (bit 127), read/write type and reason.
 const FRCD_F: u64 = 1 << 63;
 
-/// Legacy-mode entries.
+/// Present bit of root, context, PASID directory and PASID table entries.
 const PRESENT: u64 = 1;
-/// Context entry AW: 48-bit address width, 4-level table.
+/// Legacy context entry AW, and PASID table entry AW (bits 4:2): 48-bit address width, 4-level table.
 const AW_48: u64 = 2;
+/// PASID table entry translation type (bits 8:6): second level only.
+const PGTT_SECOND_LEVEL: u64 = 2;
+
+/// Bytes of one device's PASID structures: the directory page, then the first PASID table's page.
+const PASID_BUF_LEN: usize = 8192;
+/// Offset of the PASID table in that buffer.
+const PASID_TABLE: usize = 4096;
 
 struct Tables<'d, D: DmaAllocator + ?Sized> {
+    dma: &'d D,
     root: OwnedDma<'d, D>,
     context: Pages<'d, D>,
+    /// Scalable mode: per bus, a page of records (CPU pointer, device address) of
+    /// the devices' [`PASID_BUF_LEN`] buffers.
+    pasid: Option<Pages<'d, D>>,
+}
+
+/// The record in `aux` (a page of 256 records) for function `devfn`, as a buffer.
+fn pasid_record(aux: &DmaBuffer, devfn: usize) -> Option<DmaBuffer> {
+    let cpu = NonNull::new(aux.load::<u64>(devfn * 16) as *mut u8)?;
+    let device = PhysAddr::new(aux.load::<u64>(devfn * 16 + 8));
+    // SAFETY: recorded by `pasid_buf` from a buffer of this length that the
+    // owning `Tables` has not freed.
+    Some(unsafe { DmaBuffer::new(cpu, device, PASID_BUF_LEN) })
+}
+
+/// The PASID directory and table of `device`, allocating them if `create`.
+fn pasid_buf<D: DmaAllocator + ?Sized>(
+    tables: &Tables<'_, D>,
+    device: DeviceId,
+    create: bool,
+) -> Result<Option<DmaBuffer>, IommuError> {
+    let pasid = tables.pasid.as_ref().ok_or(IommuError::Unsupported)?;
+    let bus = device.bus() as usize;
+    let devfn = (device.bdf() & 0xff) as usize;
+    let aux = if create { pasid.get_or_alloc(bus)?.0 } else { pasid.get(bus).ok_or(IommuError::NotAttached)? };
+    if let Some(buf) = pasid_record(&aux, devfn) {
+        return Ok(Some(buf));
+    }
+    if !create {
+        return Ok(None);
+    }
+    let buf = tables.dma.alloc_coherent(PASID_BUF_LEN).ok_or(IommuError::OutOfMemory)?;
+    aux.store::<u64>(devfn * 16, buf.cpu_ptr().as_ptr() as u64);
+    aux.store::<u64>(devfn * 16 + 8, buf.device_addr().as_u64());
+    Ok(Some(buf))
+}
+
+impl<D: DmaAllocator + ?Sized> Drop for Tables<'_, D> {
+    fn drop(&mut self) {
+        let Some(pasid) = &self.pasid else { return };
+        for bus in 0..256 {
+            let Some(aux) = pasid.get(bus) else { continue };
+            for devfn in 0..256 {
+                if let Some(buf) = pasid_record(&aux, devfn) {
+                    // SAFETY: allocated from `dma` in `pasid_buf`, and the
+                    // owner stopped the hardware before dropping the tables.
+                    unsafe { self.dma.free_coherent(buf) };
+                }
+            }
+        }
+    }
 }
 
 struct State<'d, D: DmaAllocator + ?Sized> {
@@ -96,14 +195,20 @@ struct State<'d, D: DmaAllocator + ?Sized> {
     gcmd: u32,
     /// Next fault-recording register to read.
     next_fault: usize,
+    /// The interrupt remapping table, once enabled.
+    ir: Option<remap::Remap<'d, D>>,
 }
 
 /// An Intel VT-d remapping unit.
 pub struct Vtd<'d, D: DmaAllocator + Sync + ?Sized> {
     regs: Regs,
+    dma: &'d D,
     clock: &'d dyn Clock,
     segment: u16,
     cap: u64,
+    ecap: u64,
+    /// Scalable-mode tables rather than legacy.
+    scalable: bool,
     /// Offset of the IOTLB invalidate register.
     iotlb: usize,
     /// Offset of the first fault recording register.
@@ -112,16 +217,20 @@ pub struct Vtd<'d, D: DmaAllocator + Sync + ?Sized> {
     domains: u32,
     iova_limit: u64,
     timeout_ns: u64,
+    /// Lock order: `state`, then `qi`.
     state: IrqSpinLock<State<'d, D>>,
+    qi: IrqSpinLock<Option<qi::Queue<'d, D>>>,
+    /// Whether invalidations go through `qi`.
+    qi_on: AtomicBool,
 }
 
 impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
     /// Takes over the unit whose registers are `io`, serving PCI segment
-    /// `segment`. Translation stays off until the first device attaches.
-    /// Fails with [`IommuError::Unsupported`] if the unit does not snoop
-    /// the CPU caches when it walks tables (`ECAP.C`).
+    /// `segment`, in legacy mode. Translation stays off until the first
+    /// device attaches. Fails with [`IommuError::Unsupported`] if the unit
+    /// does not snoop the CPU caches when it walks tables (`ECAP.C`).
     pub fn new(io: IoMem, dma: &'d D, clock: &'d dyn Clock, segment: u16) -> Result<Self, IommuError> {
-        Self::build(io, dma, clock, segment, false)
+        Self::build(io, dma, clock, segment, false, false)
     }
 
     /// Like [`new`](Self::new), but accepts a unit that reports `ECAP.C`
@@ -137,7 +246,28 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         clock: &'d dyn Clock,
         segment: u16,
     ) -> Result<Self, IommuError> {
-        Self::build(io, dma, clock, segment, true)
+        Self::build(io, dma, clock, segment, true, false)
+    }
+
+    /// Like [`new`](Self::new), but in scalable mode. Fails with
+    /// [`IommuError::Unsupported`] unless the unit has scalable mode, second-level
+    /// translation in it and queued invalidation.
+    pub fn new_scalable(io: IoMem, dma: &'d D, clock: &'d dyn Clock, segment: u16) -> Result<Self, IommuError> {
+        Self::build(io, dma, clock, segment, false, true)
+    }
+
+    /// Like [`new_scalable`](Self::new_scalable), but accepts a unit that
+    /// reports `ECAP.C` clear.
+    ///
+    /// # Safety
+    /// As for [`new_assuming_coherent`](Self::new_assuming_coherent).
+    pub unsafe fn new_scalable_assuming_coherent(
+        io: IoMem,
+        dma: &'d D,
+        clock: &'d dyn Clock,
+        segment: u16,
+    ) -> Result<Self, IommuError> {
+        Self::build(io, dma, clock, segment, true, true)
     }
 
     fn build(
@@ -146,6 +276,7 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         clock: &'d dyn Clock,
         segment: u16,
         assume_coherent: bool,
+        scalable: bool,
     ) -> Result<Self, IommuError> {
         let regs = Regs::new(io, 0x100)?;
         let ver = regs.r32(VER);
@@ -154,6 +285,9 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         }
         let (cap, ecap) = (regs.r64(CAP), regs.r64(ECAP));
         if (ecap & ECAP_C == 0 && !assume_coherent) || (cap >> 8) & 0x4 == 0 {
+            return Err(IommuError::Unsupported);
+        }
+        if scalable && ecap & (ECAP_SMTS | ECAP_SLTS | ECAP_QI) != ECAP_SMTS | ECAP_SLTS | ECAP_QI {
             return Err(IommuError::Unsupported);
         }
         let nd = (cap & 7) as u32;
@@ -168,34 +302,44 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         }
         let mgaw = ((cap >> 16) & 0x3f) as u32 + 1;
         let root = OwnedDma::new(dma, 4096).ok_or(IommuError::OutOfMemory)?;
-        let tables = Tables { root, context: Pages::new(dma, 256)? };
+        // Scalable mode splits a bus's context table in two pages.
+        let context = Pages::new(dma, if scalable { 512 } else { 256 })?;
+        let pasid = if scalable { Some(Pages::new(dma, 256)?) } else { None };
+        let tables = Tables { dma, root, context, pasid };
         let gcmd = regs.r32(GSTS) & PERSISTENT;
         let vtd = Self {
             regs,
+            dma,
             clock,
             segment,
             cap,
+            ecap,
+            scalable,
             iotlb,
             frcd,
             nfr,
             domains: 1 << (4 + 2 * nd),
             iova_limit: 1 << mgaw.min(48),
             timeout_ns: DEFAULT_TIMEOUT_NS,
-            state: IrqSpinLock::new(State { tables: Some(tables), gcmd, next_fault: 0 }),
+            state: IrqSpinLock::new(State { tables: Some(tables), gcmd, next_fault: 0, ir: None }),
+            qi: IrqSpinLock::new(None),
+            qi_on: AtomicBool::new(false),
         };
         {
             let mut st = vtd.state.lock();
-            // Firmware may have left translation or queued invalidation on.
+            // Firmware may have left translation, interrupt remapping or queued invalidation on.
             vtd.set_enabled(&mut st, TE, false)?;
+            vtd.set_enabled(&mut st, IRE, false)?;
             vtd.set_enabled(&mut st, QIE, false)?;
+            if scalable {
+                vtd.enable_qi(&mut st)?;
+            }
             let root = st.tables.as_ref().ok_or(IommuError::Unsupported)?.root.device_addr();
-            vtd.regs.w64(RTADDR, root.as_u64());
+            vtd.regs.w64(RTADDR, root.as_u64() | if scalable { RTADDR_SCALABLE } else { 0 });
             vtd.regs.w32(GCMD, st.gcmd | SRTP);
             vtd.wait(|| vtd.regs.r32(GSTS) & SRTP != 0)?;
             vtd.flush_write_buffer(&st)?;
-            vtd.invalidate_context(CIRG_GLOBAL)?;
-            vtd.regs.w64(vtd.iotlb, IVT | IIRG_GLOBAL | vtd.drain_bits());
-            vtd.wait(|| vtd.regs.r64(vtd.iotlb) & IVT == 0)?;
+            vtd.invalidate_all()?;
         }
         Ok(vtd)
     }
@@ -208,6 +352,11 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
     /// Whether translation is switched on (after the first attach).
     pub fn translating(&self) -> bool {
         self.regs.r32(GSTS) & TE != 0
+    }
+
+    /// Whether the unit uses scalable-mode tables.
+    pub fn scalable(&self) -> bool {
+        self.scalable
     }
 
     fn wait(&self, done: impl FnMut() -> bool) -> Result<(), IommuError> {
@@ -235,13 +384,14 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         self.wait(|| self.regs.r32(GSTS) & WBF == 0)
     }
 
+    /// Drain-reads and drain-writes bits for the register IOTLB command.
     fn drain_bits(&self) -> u64 {
         let mut bits = 0;
         if self.cap & CAP_DWD != 0 {
-            bits |= IOTLB_DW;
+            bits |= 1 << 48;
         }
         if self.cap & CAP_DRD != 0 {
-            bits |= IOTLB_DR;
+            bits |= 1 << 49;
         }
         bits
     }
@@ -251,17 +401,71 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
         self.wait(|| self.regs.r64(CCMD) & ICC == 0)
     }
 
-    /// Flushes cached entries for `device` (context cache) and the IOTLB
-    /// entries of `domain`.
+    /// Flushes every cached context, PASID and IOTLB entry.
+    fn invalidate_all(&self) -> Result<(), IommuError> {
+        if self.qi_active() {
+            self.qi_context(qi::GRAN_GLOBAL, 0, 0)?;
+            if self.scalable {
+                self.qi_pasid_cache(0, None)?;
+            }
+            return self.qi_iotlb(qi::GRAN_GLOBAL, 0);
+        }
+        self.invalidate_context(CIRG_GLOBAL)?;
+        self.regs.w64(self.iotlb, IVT | IIRG_GLOBAL | self.drain_bits());
+        self.wait(|| self.regs.r64(self.iotlb) & IVT == 0)
+    }
+
+    /// Flushes cached entries for `device` (context cache, and in scalable
+    /// mode its PASID 0) and the IOTLB entries of `domain`.
     fn invalidate_device(&self, device: DeviceId, domain: u16) -> Result<(), IommuError> {
+        if self.qi_active() {
+            self.qi_context(qi::GRAN_DEVICE, domain, device.bdf())?;
+            if self.scalable {
+                self.qi_pasid_cache(domain, Some(0))?;
+            }
+            return self.qi_iotlb(qi::GRAN_DOMAIN, domain);
+        }
         let cmd = CIRG_DEVICE | (device.bdf() as u64) << 16 | domain as u64;
         self.invalidate_context(cmd)?;
         self.invalidate_domain(domain)
     }
 
     fn invalidate_domain(&self, domain: u16) -> Result<(), IommuError> {
+        if self.qi_active() {
+            return self.qi_iotlb(qi::GRAN_DOMAIN, domain);
+        }
         self.regs.w64(self.iotlb, IVT | IIRG_DOMAIN | self.drain_bits() | (domain as u64) << 32);
         self.wait(|| self.regs.r64(self.iotlb) & IVT == 0)
+    }
+
+    /// Where `device`'s context entry lives: the offset of the root-table
+    /// word that points at the context table, that table's slot in the
+    /// tables' index, and the entry's offset in it.
+    fn context_location(&self, device: DeviceId) -> (usize, usize, usize) {
+        let bus = device.bus() as usize;
+        let devfn = (device.bdf() & 0xff) as usize;
+        if self.scalable {
+            // Functions 0 to 127 use the low pointer, 128 to 255 the high one.
+            let half = devfn >> 7;
+            (bus * 16 + half * 8, bus * 2 + half, (devfn & 0x7f) * 32)
+        } else {
+            (bus * 16, bus, devfn * 16)
+        }
+    }
+
+    /// Takes `device`'s context entry (at `off` in `ctx`) and, in scalable
+    /// mode, its PASID 0 entry out of service. Caller invalidates.
+    fn unlink(&self, tables: &Tables<'d, D>, ctx: &DmaBuffer, off: usize, device: DeviceId) {
+        ctx.store::<u64>(off, 0);
+        barrier::dma_wmb();
+        if self.scalable {
+            if let Ok(Some(buf)) = pasid_buf(tables, device, false) {
+                buf.store::<u64>(PASID_TABLE, 0);
+            }
+            barrier::dma_wmb();
+        }
+        ctx.store::<u64>(off + 8, 0);
+        barrier::mb();
     }
 }
 
@@ -295,20 +499,39 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         }
         let mut st = self.state.lock();
         let tables = st.tables.as_mut().ok_or(IommuError::Unsupported)?;
-        let bus = device.bus() as usize;
-        let (ctx, created) = tables.context.get_or_alloc(bus)?;
+        let (root_off, slot, off) = self.context_location(device);
+        let (ctx, created) = tables.context.get_or_alloc(slot)?;
         if created {
             // Zeroed, so every entry is not-present until linked.
             barrier::dma_wmb();
-            tables.root.store::<u64>(bus * 16, ctx.device_addr().as_u64() | PRESENT);
+            tables.root.store::<u64>(root_off, ctx.device_addr().as_u64() | PRESENT);
         }
-        let off = (device.bdf() & 0xff) as usize * 16;
         if ctx.load::<u64>(off) & PRESENT != 0 {
             return Err(IommuError::Busy);
         }
-        ctx.store::<u64>(off + 8, AW_48 | (domain.0 as u64) << 8);
-        barrier::dma_wmb();
-        ctx.store::<u64>(off, root.as_u64() | PRESENT);
+        if self.scalable {
+            let pasid = pasid_buf(tables, device, true)?.ok_or(IommuError::OutOfMemory)?;
+            let table = pasid.device_addr().as_u64() + PASID_TABLE as u64;
+            // Directory entry 0 -> the table; its entry 0 (the RID_PASID) -> the domain's table.
+            pasid.store::<u64>(0, table | PRESENT);
+            for q in 1..8 {
+                pasid.store::<u64>(PASID_TABLE + q * 8, 0);
+            }
+            pasid.store::<u64>(PASID_TABLE + 8, domain.0 as u64);
+            barrier::dma_wmb();
+            pasid.store::<u64>(PASID_TABLE, root.as_u64() | PGTT_SECOND_LEVEL << 6 | AW_48 << 2 | PRESENT);
+            // Context entry: RID_PASID 0, no PASID-tagged requests, no device TLB, directory
+            // size field 0 (128 directory entries).
+            for q in 1..4 {
+                ctx.store::<u64>(off + q * 8, 0);
+            }
+            barrier::dma_wmb();
+            ctx.store::<u64>(off, pasid.device_addr().as_u64() | PRESENT);
+        } else {
+            ctx.store::<u64>(off + 8, AW_48 | (domain.0 as u64) << 8);
+            barrier::dma_wmb();
+            ctx.store::<u64>(off, root.as_u64() | PRESENT);
+        }
         // The next steps write registers: only a full barrier orders the entry before them.
         barrier::mb();
         let result = self
@@ -317,11 +540,10 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
             .and_then(|()| self.set_enabled(&mut st, TE, true));
         if result.is_err() {
             // Do not leave a half-attached device pointing at the caller's table.
-            if let Some(ctx) = st.tables.as_mut().and_then(|t| t.context.get(bus)) {
-                ctx.store::<u64>(off, 0);
-                barrier::dma_wmb();
-                ctx.store::<u64>(off + 8, 0);
-                barrier::mb();
+            if let Some(tables) = st.tables.as_ref()
+                && let Some(ctx) = tables.context.get(slot)
+            {
+                self.unlink(tables, &ctx, off, device);
             }
             let _ = self.invalidate_device(device, domain.0);
         }
@@ -332,19 +554,21 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for Vtd<'_, D> {
         if device.segment() != self.segment {
             return Err(IommuError::InvalidDevice);
         }
-        let mut st = self.state.lock();
-        let tables = st.tables.as_mut().ok_or(IommuError::NotAttached)?;
-        let off = (device.bdf() & 0xff) as usize * 16;
+        let st = self.state.lock();
+        let tables = st.tables.as_ref().ok_or(IommuError::NotAttached)?;
+        let (_, slot, off) = self.context_location(device);
         let ctx = tables
             .context
-            .get(device.bus() as usize)
+            .get(slot)
             .filter(|c| c.load::<u64>(off) & PRESENT != 0)
             .ok_or(IommuError::NotAttached)?;
-        let domain = (ctx.load::<u64>(off + 8) >> 8) as u16;
-        ctx.store::<u64>(off, 0);
-        barrier::dma_wmb();
-        ctx.store::<u64>(off + 8, 0);
-        barrier::mb();
+        let domain = if self.scalable {
+            let pasid = pasid_buf(tables, device, false)?.ok_or(IommuError::NotAttached)?;
+            (pasid.load::<u64>(PASID_TABLE + 8) & 0xffff) as u16
+        } else {
+            (ctx.load::<u64>(off + 8) >> 8) as u16
+        };
+        self.unlink(tables, &ctx, off, device);
         self.flush_write_buffer(&st)?;
         self.invalidate_device(device, domain)
     }
@@ -397,10 +621,17 @@ impl<D: DmaAllocator + Sync + ?Sized> Drop for Vtd<'_, D> {
     fn drop(&mut self) {
         let mut st = self.state.lock();
         let tables = ManuallyDrop::new(st.tables.take());
-        let off = self.set_enabled(&mut st, TE, false).is_ok();
-        // If translation would not stop the unit may still read the tables.
-        if off {
+        let ir = ManuallyDrop::new(st.ir.take());
+        // If remapping or translation would not stop the unit may still read the tables.
+        let ir_off = self.set_enabled(&mut st, IRE, false).is_ok();
+        let te_off = self.set_enabled(&mut st, TE, false).is_ok();
+        // Frees the queue unless the unit does not stop.
+        let _ = self.disable_qi(&mut st);
+        if te_off {
             drop(ManuallyDrop::into_inner(tables));
+        }
+        if ir_off {
+            drop(ManuallyDrop::into_inner(ir));
         }
     }
 }
