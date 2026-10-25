@@ -119,7 +119,8 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Per-CPU storage: `PerCpu<T>` (shared, `Sync` data) and `PerCpuCell<T>` (CPU-private mutable data, IRQ-masked access, re-entrancy checked), plus a per-CPU preemption counter
 - ✅ Lock-free SPSC ring buffer (for IRQ-to-task data such as UART receive)
 - ✅ `SeqLock<T>`: readers retry instead of blocking the writer; byte-wise atomic copies keep racing reads sound
-- 🗺 RCU, MCS/queued spinlocks
+- ✅ `McsLock<T, G>` (also `IrqMcsLock`, `RawMcsLock`): an MCS queued spin lock, FIFO, each waiter spins on a flag in its own stack-allocated node; closure-based API (`with`, `try_with`) because nodes must not move, releases on unwind
+- ✅ `Rcu` domain with `RcuCell<T>` (`alloc`): sleepable (SRCU-style) RCU with per-CPU two-slot reader counters, so it needs no scheduler hooks and works under host threads; readers may be preempted, migrate or block; `synchronize`/`synchronize_with` (caller-supplied wait, e.g. a yield) are blocking and serialized. Not supported: `call_rcu` callbacks, expedited grace periods, RCU-protected lists, and classic non-counting read sides (a read lock costs a SeqCst fence and two atomic increments)
 
 ### `osmium-mm`: memory management
 - ✅ Typed `PhysAddr`/`VirtAddr` with alignment helpers and canonical-address checks
