@@ -7,7 +7,7 @@ use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use osmium_arch::fp::FpState;
+use osmium_arch::fp::{FpState, SveState};
 pub use osmium_sync::fallible::OutOfMemory;
 use osmium_sync::fallible::{try_arc, try_box, try_uninit_slice};
 
@@ -158,6 +158,9 @@ pub struct Task {
     /// FP/SIMD registers, saved while the task is switched out; see
     /// [`TaskBuilder::fp_state`].
     pub(crate) fp: Option<Box<UnsafeCell<FpState>>>,
+    /// SVE registers, used instead of `fp` by tasks that have them; see
+    /// [`TaskBuilder::sve_state`].
+    pub(crate) sve: Option<Box<UnsafeCell<SveState>>>,
 }
 
 // SAFETY: `ctx` and `fp` are only touched by the CPU switching the task in
@@ -394,6 +397,7 @@ impl Task {
             exit_waiters: WaitQueue::new(),
             data: osmium_sync::Once::new(),
             fp: None,
+            sve: None,
         })
     }
 }
@@ -415,6 +419,7 @@ pub struct TaskBuilder {
     period: u64,
     data: Option<Box<dyn Any + Send + Sync>>,
     fp: Option<FpState>,
+    sve: bool,
 }
 
 impl fmt::Debug for TaskBuilder {
@@ -439,6 +444,7 @@ impl TaskBuilder {
             period: 0,
             data: None,
             fp: None,
+            sve: false,
         }
     }
 
@@ -515,6 +521,17 @@ impl TaskBuilder {
         self
     }
 
+    /// Gives the task its own SVE registers (all zero to start), switched in
+    /// place of the FP/SIMD registers [`TaskBuilder::fp_state`] would give:
+    /// SVE's `z` registers contain `q0`..`q31`. For tasks that run user code
+    /// that may use SVE; every CPU that runs the task must have had
+    /// [`osmium_arch::fp::sve::enable`] return `Some` (with the same vector
+    /// length). Overrides `fp_state`.
+    pub fn sve_state(mut self) -> Self {
+        self.sve = true;
+        self
+    }
+
     /// Creates the task without making it runnable; see [`crate::spawn`].
     ///
     /// # Panics
@@ -534,7 +551,11 @@ impl TaskBuilder {
         }
         let entry: Entry = try_box(f)?;
         let mut t = Task::raw(self.name, Some(self.stack_size), Some(entry), cpu, false)?;
-        t.fp = self.fp.map(|s| try_box(UnsafeCell::new(s))).transpose()?;
+        if self.sve {
+            t.sve = Some(try_box(UnsafeCell::new(SveState::new()))?);
+        } else {
+            t.fp = self.fp.map(|s| try_box(UnsafeCell::new(s))).transpose()?;
+        }
         t.priority.store(self.priority, Ordering::Relaxed);
         t.affinity.store(self.affinity, Ordering::Relaxed);
         t.rel_deadline.store(self.deadline, Ordering::Relaxed);
