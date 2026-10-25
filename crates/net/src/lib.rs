@@ -31,11 +31,10 @@
 //! duplicate address detection, neighbor discovery instead of ARP, SLAAC from
 //! router advertisements, and UDP, TCP and ICMPv6 echo. Sockets are v4 or v6
 //! by the address they bind or connect to. IPv6 extension headers are walked
-//! on receipt; fragmented IPv6 packets are dropped rather than reassembled,
-//! and none are fragmented on send.
+//! on receipt; IPv6 datagrams larger than the MTU are fragmented on send and
+//! reassembled on receipt within bounded limits ([`frag6`]).
 //!
-//! Not supported: IPv6 fragmentation, privacy addresses, DHCPv6, IP
-//! forwarding, IGMPv3 reports.
+//! Not supported: IP forwarding, IGMPv3 reports.
 //!
 //! [`NetDevice`]: osmium_hal::net::NetDevice
 #![no_std]
@@ -46,6 +45,7 @@ extern crate std;
 
 mod arp;
 mod error;
+pub mod frag6;
 mod iface;
 pub mod igmp;
 pub mod ipopt;

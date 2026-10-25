@@ -3,9 +3,9 @@
 //! discovery for SLAAC, ICMPv6 echo, and UDP and TCP delivery.
 //!
 //! IPv6 is off until [`Interface::enable_ipv6`] is called, and then runs
-//! beside IPv4 on the same interface. Packets that arrive fragmented are
-//! dropped and those that are sent are not fragmented (a datagram larger
-//! than the MTU is dropped, which TCP avoids by its segment size).
+//! beside IPv4 on the same interface. Fragmented packets are put back
+//! together and large datagrams are fragmented on send (see [`frag`]); TCP
+//! avoids fragmentation by its segment size.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -21,6 +21,8 @@ use crate::socket::tcp::reset_for;
 use crate::socket::{Cx, Packet, Socket, SocketSet};
 use crate::wire::*;
 use crate::{Error, Instant};
+
+mod frag;
 
 /// Hop limit of the packets we originate.
 const HOP_LIMIT: u8 = 64;
@@ -129,6 +131,8 @@ pub(super) struct State {
     /// advertisement arrived or the attempts ran out.
     rs_sent: u8,
     rs_next: Option<Instant>,
+    /// Fragmented datagrams being put back together.
+    reasm: crate::frag6::Reassembler,
 }
 
 fn lifetime(now: Instant, secs: u32) -> Option<Instant> {
@@ -153,6 +157,7 @@ impl State {
             pending: VecDeque::new(),
             rs_sent: 0,
             rs_next: None,
+            reasm: frag::new_reassembler(),
         }
     }
 
@@ -209,7 +214,7 @@ impl State {
             .chain(self.routers.iter().map(|r| r.expires))
             .chain(self.dns_expires);
         let nd = self.requests.iter().map(|r| r.last + NS_RETRY);
-        dad.chain(self.rs_next).chain(expiry).chain(nd).min()
+        dad.chain(self.rs_next).chain(expiry).chain(nd).chain(self.reasm.poll_at()).min()
     }
 
     fn on_link(&self, dst: Ipv6Addr) -> bool {
@@ -372,6 +377,8 @@ impl Interface {
             self.v6.rs_next = (self.v6.rs_sent < RS_MAX).then(|| now + RS_INTERVAL);
         }
 
+        self.v6.expire_fragments(now);
+
         // Lifetimes.
         let v6 = &mut self.v6;
         v6.addrs.retain(|a| a.expires.is_none_or(|t| t > now));
@@ -444,7 +451,9 @@ impl Interface {
     /// address first if it is not cached.
     pub(super) fn send_ip6(&mut self, now: Instant, p: Packet) {
         let (IpAddr::V6(src), IpAddr::V6(dst)) = (p.src, p.dst) else { return };
-        if !self.v6.enabled || IPV6_HEADER_LEN + p.payload.len() > self.v6.mtu(self.mtu) {
+        // TCP sizes its segments to the MTU; everything else is fragmented.
+        let too_big = IPV6_HEADER_LEN + p.payload.len() > self.v6.mtu(self.mtu);
+        if !self.v6.enabled || p.payload.len() > crate::frag6::MAX_DATAGRAM || (too_big && p.protocol == PROTO_TCP) {
             return;
         }
         // ::1 never goes on the link, as a destination or a source.
@@ -458,13 +467,11 @@ impl Interface {
             return;
         }
         if dst.is_multicast() {
-            let frame = self.ip6_frame(multicast_mac(dst), src, dst, p.protocol, HOP_LIMIT, &p.payload);
-            return self.queue_frame(frame);
+            return self.queue_ip6(multicast_mac(dst), src, dst, p.protocol, HOP_LIMIT, &p.payload);
         }
         let Some(hop) = self.v6.next_hop(dst) else { return };
         if let Some(mac) = self.v6.lookup(hop, now) {
-            let frame = self.ip6_frame(mac, src, dst, p.protocol, HOP_LIMIT, &p.payload);
-            return self.queue_frame(frame);
+            return self.queue_ip6(mac, src, dst, p.protocol, HOP_LIMIT, &p.payload);
         }
         if self.v6.pending.len() >= PENDING {
             return;
@@ -484,8 +491,7 @@ impl Interface {
             if self.v6.pending.get(i).is_some_and(|(hop, _)| *hop == ip) {
                 let Some((_, p)) = self.v6.pending.remove(i) else { break };
                 if let (IpAddr::V6(src), IpAddr::V6(dst)) = (p.src, p.dst) {
-                    let frame = self.ip6_frame(mac, src, dst, p.protocol, HOP_LIMIT, &p.payload);
-                    self.queue_frame(frame);
+                    self.queue_ip6(mac, src, dst, p.protocol, HOP_LIMIT, &p.payload);
                 }
             } else {
                 i += 1;
@@ -493,16 +499,13 @@ impl Interface {
         }
     }
 
-    /// Handles an IPv6 packet from a frame addressed to us or to a group.
-    pub(super) fn process_ipv6(&mut self, now: Instant, bytes: &[u8], sockets: &mut SocketSet) {
+    /// Handles an IPv6 packet; `reassembled` if it was put together from
+    /// fragments, in which case it may not be fragmented again.
+    fn process_ipv6_with(&mut self, now: Instant, bytes: &[u8], sockets: &mut SocketSet, reassembled: bool) {
         if !self.v6.enabled {
             return;
         }
         let Some((ip, payload)) = Ipv6Header::parse(bytes) else { return };
-        // Reassembly is not supported.
-        if ip.fragment.is_some_and(|f| !f.is_whole()) {
-            return;
-        }
         // A source that is ours is forged, except that an advertisement
         // answering our duplicate address probe comes from the address.
         let own_source =
@@ -517,6 +520,14 @@ impl Interface {
         }
         // Only a duplicate address probe comes from the unspecified address.
         if ip.src.is_unspecified() && ip.next_header != PROTO_ICMPV6 {
+            return;
+        }
+        if let Some(fragment) = ip.fragment.filter(|f| !f.is_whole()) {
+            // Only unicast to us is worth holding pieces for, and a datagram
+            // that contains a fragment header of its own is nonsense.
+            if to_us && !reassembled {
+                self.reassemble6(now, &ip, fragment, payload, sockets);
+            }
             return;
         }
         match ip.next_header {

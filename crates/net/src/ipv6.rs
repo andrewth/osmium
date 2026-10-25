@@ -176,7 +176,8 @@ pub struct Ipv6Header {
     pub next_header: u8,
     /// Hop limit.
     pub hop_limit: u8,
-    /// Length of the upper-layer payload that follows the headers.
+    /// Length of the upper-layer payload that follows the headers (for a
+    /// piece of a fragmented datagram, of the piece).
     pub payload_len: usize,
     /// The fragment header, if the packet had one.
     pub fragment: Option<Ipv6Fragment>,
@@ -249,7 +250,17 @@ impl Ipv6Header {
                     if header.fragment.replace(fragment).is_some() {
                         return None;
                     }
-                    (*rest.first()?, 8)
+                    let inner = *rest.first()?;
+                    let after = rest.get(8..)?;
+                    // The bytes of a piece are not headers, so the walk stops
+                    // here: reassembly (see [`frag6`](crate::frag6)) puts the
+                    // pieces together and walks what is left.
+                    if !fragment.is_whole() {
+                        header.next_header = inner;
+                        header.payload_len = after.len();
+                        return Some((header, after));
+                    }
+                    (inner, 8)
                 }
                 PROTO_AH => (*rest.first()?, (usize::from(*rest.get(1)?) + 2) * 4),
                 PROTO_ROUTING => {

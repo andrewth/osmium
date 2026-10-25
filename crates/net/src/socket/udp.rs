@@ -14,8 +14,8 @@ use crate::{Error, Instant};
 pub const MAX_PAYLOAD: usize = 65535 - 20 - 8;
 
 /// Largest payload accepted to an IPv6 address: what the 16-bit payload
-/// length holds after the UDP header. IPv6 datagrams are not fragmented on
-/// the way out, so one larger than the MTU allows is dropped.
+/// length holds after the UDP header. The interface fragments what does not
+/// fit its MTU.
 pub const MAX_PAYLOAD_V6: usize = 65535 - 8;
 
 /// A UDP socket with bounded queues of datagrams in each direction.
