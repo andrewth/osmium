@@ -188,7 +188,7 @@ fn sockets_over_a_simulated_link() {
     assert_eq!(call(&p, Sys::Socket, &[2, 1, 0]), err(Errno::EAFNOSUPPORT), "no stack yet");
     let (net, mut peer) = setup();
 
-    assert_eq!(call(&p, Sys::Socket, &[1, 1, 0]), err(Errno::EAFNOSUPPORT));
+    assert_eq!(call(&p, Sys::Socket, &[10, 1, 0]), err(Errno::EAFNOSUPPORT));
     assert_eq!(call(&p, Sys::Socket, &[2, 3, 0]), err(Errno::EPROTOTYPE));
     assert_eq!(call(&p, Sys::Socket, &[2, 2, 6]), err(Errno::EPROTONOSUPPORT));
     assert_eq!(call(&p, Sys::Bind, &[9, ADDR, 16]), err(Errno::EBADF));

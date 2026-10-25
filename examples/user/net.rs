@@ -21,6 +21,8 @@ mod sys {
     pub const SHUTDOWN: u64 = 210;
     pub const READ: u64 = 63;
     pub const BIND: u64 = 200;
+    pub const LISTEN: u64 = 201;
+    pub const ACCEPT: u64 = 202;
     pub const SOCKETPAIR: u64 = 199;
     pub const SENDMSG: u64 = 211;
     pub const RECVMSG: u64 = 212;
@@ -59,6 +61,8 @@ mod sys {
     pub const SHUTDOWN: u64 = 210;
     pub const READ: u64 = 63;
     pub const BIND: u64 = 200;
+    pub const LISTEN: u64 = 201;
+    pub const ACCEPT: u64 = 202;
     pub const SOCKETPAIR: u64 = 199;
     pub const SENDMSG: u64 = 211;
     pub const RECVMSG: u64 = 212;
@@ -97,6 +101,8 @@ mod sys {
     pub const SHUTDOWN: u64 = 48;
     pub const READ: u64 = 0;
     pub const BIND: u64 = 49;
+    pub const LISTEN: u64 = 50;
+    pub const ACCEPT: u64 = 43;
     pub const SOCKETPAIR: u64 = 53;
     pub const SENDMSG: u64 = 46;
     pub const RECVMSG: u64 = 47;
@@ -316,6 +322,54 @@ fn pair_epoll() {
     }
 }
 
+/// A named `AF_UNIX` socket in `/tmp`: a client connects by path, the server
+/// accepts, and a descriptor travels between them as `SCM_RIGHTS` ancillary
+/// data.
+fn unix_fd_passing() {
+    let mut addr = [0u8; 2 + 20];
+    addr[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+    addr[2..2 + 16].copy_from_slice(b"/tmp/osmium.sock");
+    let (server, client) = (
+        sys::call(sys::SOCKET, [AF_UNIX, SOCK_STREAM, 0, 0, 0, 0]),
+        sys::call(sys::SOCKET, [AF_UNIX, SOCK_STREAM, 0, 0, 0, 0]),
+    );
+    let bound = sys::call(sys::BIND, [server as u64, addr.as_ptr() as u64, 2 + 16 + 1, 0, 0, 0]);
+    let listening = sys::call(sys::LISTEN, [server as u64, 1, 0, 0, 0, 0]);
+    let connected = sys::call(sys::CONNECT, [client as u64, addr.as_ptr() as u64, 2 + 16 + 1, 0, 0, 0]);
+    let conn = sys::call(sys::ACCEPT, [server as u64, 0, 0, 0, 0, 0]);
+    if conn < 0 || client < 0 {
+        say!("net: unix: bind {bound}, listen {listening}, connect {connected}, accept {conn}");
+        return;
+    }
+    let mut sv = [0i32; 2];
+    sys::call(sys::SOCKETPAIR, [AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64, 0, 0]);
+
+    // One byte and one descriptor: cmsg_len 20, SOL_SOCKET, SCM_RIGHTS.
+    let ctl = [20u64, 1 | (1 << 32), sv[0] as u32 as u64];
+    let out_iov = [[b"F".as_ptr() as u64, 1]];
+    let out_msg = [0, 0, out_iov.as_ptr() as u64, 1, ctl.as_ptr() as u64, 24, 0];
+    let sent = sys::call(sys::SENDMSG, [client as u64, out_msg.as_ptr() as u64, 0, 0, 0, 0]);
+    // The sender's copy goes away; the message holds the file.
+    sys::call(sys::CLOSE, [sv[0] as u64, 0, 0, 0, 0, 0]);
+
+    let mut byte = [0u8; 1];
+    let mut got_ctl = [0u64; 4];
+    let in_iov = [[byte.as_mut_ptr() as u64, 1]];
+    let in_msg = [0, 0, in_iov.as_ptr() as u64, 1, got_ctl.as_mut_ptr() as u64, 32, 0];
+    let got = sys::call(sys::RECVMSG, [conn as u64, in_msg.as_ptr() as u64, 0, 0, 0, 0]);
+    let received = got_ctl[2] as u32 as u64;
+    sys::call(sys::WRITE, [sv[1] as u64, b"via-fd".as_ptr() as u64, 6, 0, 0, 0]);
+    let mut text = [0u8; 8];
+    let n = sys::call(sys::READ, [received, text.as_mut_ptr() as u64, 8, 0, 0, 0]);
+    let text = core::str::from_utf8(&text[..n.clamp(0, 8) as usize]).unwrap_or("?");
+    say!(
+        "net: unix: bind {bound}, listen {listening}, connect {connected}; sendmsg {sent}, recvmsg {got}: descriptor read \"{text}\""
+    );
+    for fd in [server as u64, client as u64, conn as u64, sv[1] as u64, received] {
+        sys::call(sys::CLOSE, [fd, 0, 0, 0, 0, 0]);
+    }
+}
+
 /// UDP to the loopback address stays inside the kernel's stack; `MSG_PEEK`
 /// leaves the datagram to be read again.
 fn udp_loopback() {
@@ -351,6 +405,7 @@ extern "C" fn main() -> ! {
     tcp_echo();
     udp_tftp();
     pair_epoll();
+    unix_fd_passing();
     udp_loopback();
     exit(0)
 }
