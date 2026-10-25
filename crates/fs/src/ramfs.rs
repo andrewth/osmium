@@ -4,21 +4,24 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::offset_of;
+use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use osmium_sync::RwSpinLock;
 use osmium_sync::arc::ArcTree;
 use osmium_sync::fallible::{try_arc, try_string, try_to_vec};
 use osmium_sync::intrusive::{Adapter, KeyAdapter, Shared as SharedLink, TreeLink};
+use osmium_sync::{RwSpinLock, SpinLock};
 
-use crate::{DirEntry, Errno, File, FileKind, NAME_MAX, Stat};
+use crate::{Clock, ClockSlot, DirEntry, Errno, File, FileKind, NAME_MAX, Stat, Timestamp};
 
 /// Largest file the RAM file system holds.
 const MAX_SIZE: u64 = isize::MAX as u64;
 
 /// A file system kept in memory: directories, regular files, symbolic
-/// links and empty device, FIFO and socket nodes. Contents are lost when
-/// the last reference goes.
+/// links and empty device, FIFO and socket nodes, with hard links and
+/// `rename`. Contents are lost when the last reference goes. Times come from
+/// the clock given to [`RamFs::set_clock`] or else the global one; access
+/// times are set at creation and not updated by reads.
 pub struct RamFs {
     root: Arc<RamNode>,
 }
@@ -26,20 +29,46 @@ pub struct RamFs {
 struct Shared {
     dev: u64,
     next_ino: AtomicU64,
+    clock: ClockSlot,
+    /// Held across a `rename`, so that two of them never wait on each
+    /// other's directories and the loop check sees a still tree.
+    rename: SpinLock<()>,
 }
 
-struct RamNode {
+#[derive(Clone, Copy, Default)]
+struct Times {
+    atime: Timestamp,
+    mtime: Timestamp,
+    ctime: Timestamp,
+}
+
+/// What every name of a file shares.
+struct Inner {
     fs: Arc<Shared>,
-    ino: u64,
-    kind: FileKind,
     mode: AtomicU32,
-    /// 1 while linked into a directory, 0 once removed (no hard links).
+    /// Names it has in directories; 0 once all are removed.
     linked: AtomicU32,
     body: Body,
-    /// The name it has in its directory (it has no other links).
+    times: SpinLock<Times>,
+}
+
+/// One name of a file in a directory. Hard links and renames make new
+/// `RamNode`s around the same [`Inner`].
+struct RamNode {
+    ino: u64,
+    kind: FileKind,
+    /// The name it has in its directory.
     name: String,
     /// Links it into its directory by `name`.
     entry: SharedLink<TreeLink>,
+    inner: Arc<Inner>,
+}
+
+impl Deref for RamNode {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.inner
+    }
 }
 
 /// Where [`RamNode::entry`] sits in a [`RamNode`], and the key: the name.
@@ -82,8 +111,14 @@ impl RamFs {
 
     /// [`RamFs::new`], failing with `ENOMEM` instead of panicking.
     pub fn try_new(dev: u64) -> Result<Self, Errno> {
-        let fs = try_arc(Shared { dev, next_ino: AtomicU64::new(1) })?;
+        let fs =
+            try_arc(Shared { dev, next_ino: AtomicU64::new(1), clock: ClockSlot::new(), rename: SpinLock::new(()) })?;
         Ok(RamFs { root: RamNode::new(&fs, FileKind::Directory, 0o755, "")? })
+    }
+
+    /// Stamps files with `clock` instead of the global one.
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.root.fs.clock.set(clock);
     }
 
     /// The root directory, to pass to [`Vfs::new`](crate::Vfs::new) or
@@ -101,16 +136,64 @@ impl RamNode {
             _ => Body::Node,
         };
         let name = try_string(name)?;
-        Ok(try_arc(RamNode {
+        let now = fs.clock.now();
+        let inner = try_arc(Inner {
             fs: fs.clone(),
-            ino: fs.next_ino.fetch_add(1, Ordering::Relaxed),
-            kind,
             mode: AtomicU32::new(mode & 0o7777),
             linked: AtomicU32::new(1),
             body,
+            times: SpinLock::new(Times { atime: now, mtime: now, ctime: now }),
+        })?;
+        Ok(try_arc(RamNode {
+            ino: fs.next_ino.fetch_add(1, Ordering::Relaxed),
+            kind,
             name,
             entry: SharedLink::new(TreeLink::new()),
+            inner,
         })?)
+    }
+
+    /// Another name for the same file.
+    fn alias(&self, name: &str) -> Result<Arc<Self>, Errno> {
+        Ok(try_arc(RamNode {
+            ino: self.ino,
+            kind: self.kind,
+            name: try_string(name)?,
+            entry: SharedLink::new(TreeLink::new()),
+            inner: self.inner.clone(),
+        })?)
+    }
+
+    /// Records a change of the contents (`contents`) or only of the metadata.
+    fn touch(&self, contents: bool) {
+        let now = self.fs.clock.now();
+        let mut t = self.times.lock();
+        if contents {
+            t.mtime = now;
+        }
+        t.ctime = now;
+    }
+
+    /// A name of this file was removed.
+    #[allow(deprecated)] // `fetch_update` is the spelling the MSRV has
+    fn unlinked(&self) {
+        if self.kind == FileKind::Directory {
+            self.linked.store(0, Ordering::Relaxed);
+        } else {
+            let _ = self.linked.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            self.touch(false);
+        }
+    }
+
+    /// Whether `other` is this directory or somewhere below it.
+    fn contains(&self, other: &Inner) -> bool {
+        if core::ptr::eq(&*self.inner, other) {
+            return true;
+        }
+        match &self.body {
+            Body::Dir(entries) => entries.read().iter().any(|n| n.kind == FileKind::Directory && n.contains(other)),
+            _ => false,
+        }
     }
 
     fn dir(&self) -> Result<&RwSpinLock<Entries>, Errno> {
@@ -145,6 +228,10 @@ fn check_name(name: &str) -> Result<(), Errno> {
 }
 
 impl File for RamNode {
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
     fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, Errno> {
         let data = self.data()?.read();
         let Ok(off) = usize::try_from(off) else { return Ok(0) };
@@ -165,6 +252,8 @@ impl File for RamNode {
             data.resize(end, 0);
         }
         data.get_mut(off..end).ok_or(Errno::EIO)?.copy_from_slice(buf);
+        drop(guard);
+        self.touch(true);
         Ok(buf.len())
     }
 
@@ -180,7 +269,11 @@ impl File for RamNode {
             }
             Body::Node => (0, self.linked.load(Ordering::Relaxed)),
         };
+        let t = *self.times.lock();
         Stat {
+            atime: t.atime,
+            mtime: t.mtime,
+            ctime: t.ctime,
             dev: self.fs.dev,
             ino: self.ino,
             kind: self.kind,
@@ -205,6 +298,8 @@ impl File for RamNode {
             data.try_reserve(len - data.len()).map_err(|_| Errno::ENOMEM)?;
         }
         data.resize(len, 0);
+        drop(guard);
+        self.touch(true);
         Ok(())
     }
 
@@ -230,6 +325,8 @@ impl File for RamNode {
         if entries.insert(node.clone()).is_err() {
             return Err(Errno::EEXIST);
         }
+        drop(entries);
+        self.touch(true);
         Ok(node)
     }
 
@@ -243,7 +340,88 @@ impl File for RamNode {
             _ => {}
         }
         let node = entries.take_key(name).ok_or(Errno::ENOENT)?;
-        node.linked.store(0, Ordering::Relaxed);
+        drop(entries);
+        node.unlinked();
+        self.touch(true);
+        Ok(())
+    }
+
+    #[allow(deprecated)] // `fetch_update` is the spelling the MSRV has
+    fn link(&self, name: &str, target: &dyn File) -> Result<(), Errno> {
+        check_name(name)?;
+        let target = target.as_any().and_then(|a| a.downcast_ref::<RamNode>()).ok_or(Errno::EXDEV)?;
+        if !Arc::ptr_eq(&target.fs, &self.fs) {
+            return Err(Errno::EXDEV);
+        }
+        if target.kind == FileKind::Directory {
+            return Err(Errno::EPERM);
+        }
+        let alias = target.alias(name)?;
+        let mut entries = self.dir()?.write();
+        // A file with no names left cannot be given one again.
+        target
+            .linked
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| if n == 0 { None } else { n.checked_add(1) })
+            .map_err(|_| Errno::ENOENT)?;
+        if entries.insert(alias).is_err() {
+            target.linked.fetch_sub(1, Ordering::Relaxed);
+            return Err(Errno::EEXIST);
+        }
+        drop(entries);
+        target.touch(false);
+        self.touch(true);
+        Ok(())
+    }
+
+    fn rename(&self, old_name: &str, new_dir: &dyn File, new_name: &str) -> Result<(), Errno> {
+        check_name(new_name)?;
+        let dst = new_dir.as_any().and_then(|a| a.downcast_ref::<RamNode>()).ok_or(Errno::EXDEV)?;
+        if !Arc::ptr_eq(&dst.fs, &self.fs) {
+            return Err(Errno::EXDEV);
+        }
+        let same_dir = Arc::ptr_eq(&self.inner, &dst.inner);
+        let _serial = self.fs.rename.lock();
+        let moved = self.dir()?.read().clone_key(old_name).ok_or(Errno::ENOENT)?;
+        dst.dir()?;
+        if moved.kind == FileKind::Directory && moved.contains(dst) {
+            return Err(Errno::EINVAL);
+        }
+        // Made before anything changes.
+        let renamed = moved.alias(new_name)?;
+        let mut src_entries = self.dir()?.write();
+        let mut other_entries = if same_dir { None } else { Some(dst.dir()?.write()) };
+        let dst_entries = match &mut other_entries {
+            Some(guard) => &mut **guard,
+            None => &mut *src_entries,
+        };
+        let replaced = match dst_entries.find(new_name) {
+            None => None,
+            // Two names of one file: nothing to do.
+            Some(existing) if Arc::ptr_eq(&existing.inner, &moved.inner) => return Ok(()),
+            Some(existing) => {
+                match (moved.kind == FileKind::Directory, existing.kind == FileKind::Directory) {
+                    (true, false) => return Err(Errno::ENOTDIR),
+                    (false, true) => return Err(Errno::EISDIR),
+                    (true, true) if !existing.is_empty_dir() => return Err(Errno::ENOTEMPTY),
+                    _ => {}
+                }
+                dst_entries.take_key(new_name)
+            }
+        };
+        if let Some(old) = replaced {
+            old.unlinked();
+        }
+        if dst_entries.insert(renamed).is_err() {
+            return Err(Errno::EEXIST);
+        }
+        drop(src_entries.take_key(old_name));
+        drop(other_entries);
+        drop(src_entries);
+        moved.touch(false);
+        self.touch(true);
+        if !same_dir {
+            dst.touch(true);
+        }
         Ok(())
     }
 
@@ -495,5 +673,137 @@ mod tests {
         let f = racy(0).open("/f", RW | OpenFlags::CREATE, 0o644).unwrap();
         assert_eq!(f.stat().kind, FileKind::Regular);
         assert_eq!(racy(0).open("/f", RW | OpenFlags::CREATE | OpenFlags::EXCL, 0o644).err(), Some(Errno::EEXIST));
+    }
+
+    fn put(vfs: &Vfs, path: &str, data: &[u8]) {
+        let f = vfs.open(path, RW | OpenFlags::CREATE, 0o644).unwrap();
+        f.write(0, data).unwrap();
+    }
+
+    fn contents(vfs: &Vfs, path: &str) -> Vec<u8> {
+        read_all(&*vfs.open(path, OpenFlags::READ, 0).unwrap())
+    }
+
+    #[test]
+    fn hard_links_share_the_file() {
+        let vfs = vfs();
+        put(&vfs, "/a", b"one");
+        vfs.link("/a", "/b").unwrap();
+        let (a, b) = (vfs.stat("/a", true).unwrap(), vfs.stat("/b", true).unwrap());
+        assert_eq!((a.ino, a.nlink), (b.ino, 2));
+        vfs.open("/b", RW, 0).unwrap().write(0, b"two").unwrap();
+        assert_eq!(contents(&vfs, "/a"), b"two");
+        vfs.unlink("/a").unwrap();
+        assert_eq!(vfs.stat("/b", true).unwrap().nlink, 1);
+        assert_eq!(contents(&vfs, "/b"), b"two");
+        vfs.unlink("/b").unwrap();
+        assert_eq!(vfs.stat("/b", true).err(), Some(Errno::ENOENT));
+    }
+
+    #[test]
+    fn link_errors() {
+        let vfs = vfs();
+        put(&vfs, "/a", b"");
+        put(&vfs, "/b", b"");
+        vfs.mkdir("/d", 0o755).unwrap();
+        assert_eq!(vfs.link("/a", "/b").err(), Some(Errno::EEXIST));
+        assert_eq!(vfs.link("/d", "/e").err(), Some(Errno::EPERM));
+        assert_eq!(vfs.link("/nope", "/e").err(), Some(Errno::ENOENT));
+        // An open file with no names left cannot be linked again.
+        let held = vfs.lookup("/a").unwrap();
+        vfs.unlink("/a").unwrap();
+        let other = RamFs::new(2);
+        assert_eq!(other.root().link("x", &*held).err(), Some(Errno::EXDEV));
+        assert_eq!(vfs.lookup("/").unwrap().link("again", &*held).err(), Some(Errno::ENOENT));
+    }
+
+    #[test]
+    fn links_across_mounts_are_refused() {
+        let vfs = vfs();
+        vfs.mkdir("/m", 0o755).unwrap();
+        vfs.mount("/m", RamFs::new(2).root()).unwrap();
+        put(&vfs, "/a", b"");
+        assert_eq!(vfs.link("/a", "/m/a").err(), Some(Errno::EXDEV));
+        assert_eq!(vfs.rename("/a", "/m/a").err(), Some(Errno::EXDEV));
+        assert_eq!(vfs.rename("/m", "/n").err(), Some(Errno::EBUSY));
+    }
+
+    #[test]
+    fn rename_moves_and_replaces() {
+        let vfs = vfs();
+        put(&vfs, "/a", b"aa");
+        put(&vfs, "/b", b"bb");
+        vfs.mkdir("/d", 0o755).unwrap();
+        let open = vfs.open("/a", RW, 0).unwrap();
+        let ino = open.stat().ino;
+        vfs.rename("/a", "/d/c").unwrap();
+        assert_eq!(vfs.stat("/a", true).err(), Some(Errno::ENOENT));
+        assert_eq!(vfs.stat("/d/c", true).unwrap().ino, ino);
+        // The handle opened before still reaches the same file.
+        open.write(0, b"zz").unwrap();
+        assert_eq!(contents(&vfs, "/d/c"), b"zz");
+        // Over an existing file.
+        vfs.rename("/d/c", "/b").unwrap();
+        assert_eq!(contents(&vfs, "/b"), b"zz");
+        assert_eq!(names(&*vfs.lookup("/d").unwrap()), Vec::<String>::new());
+        // To itself, and by another name of the same file.
+        vfs.rename("/b", "/b").unwrap();
+        vfs.link("/b", "/b2").unwrap();
+        vfs.rename("/b", "/b2").unwrap();
+        assert_eq!(vfs.stat("/b", true).unwrap().nlink, 2);
+    }
+
+    #[test]
+    fn rename_directories() {
+        let vfs = vfs();
+        vfs.mkdir("/d", 0o755).unwrap();
+        vfs.mkdir("/d/sub", 0o755).unwrap();
+        put(&vfs, "/d/sub/f", b"x");
+        vfs.mkdir("/e", 0o755).unwrap();
+        vfs.mkdir("/full", 0o755).unwrap();
+        put(&vfs, "/full/f", b"");
+        put(&vfs, "/file", b"");
+        assert_eq!(vfs.rename("/d", "/d/sub/d").err(), Some(Errno::EINVAL));
+        assert_eq!(vfs.rename("/d", "/d/x").err(), Some(Errno::EINVAL));
+        assert_eq!(vfs.rename("/d", "/full").err(), Some(Errno::ENOTEMPTY));
+        assert_eq!(vfs.rename("/d", "/file").err(), Some(Errno::ENOTDIR));
+        assert_eq!(vfs.rename("/file", "/e").err(), Some(Errno::EISDIR));
+        assert_eq!(vfs.rename("/", "/x").err(), Some(Errno::EBUSY));
+        assert_eq!(vfs.rename("/d/.", "/x").err(), Some(Errno::EINVAL));
+        vfs.rename("/d", "/e").unwrap();
+        assert_eq!(contents(&vfs, "/e/sub/f"), b"x");
+        assert_eq!(vfs.stat("/d", true).err(), Some(Errno::ENOENT));
+        // Back and forth between two directories, in both orders.
+        vfs.rename("/e/sub", "/sub").unwrap();
+        vfs.rename("/sub", "/e/sub").unwrap();
+        assert_eq!(contents(&vfs, "/e/sub/f"), b"x");
+    }
+
+    #[test]
+    fn times_come_from_the_clock() {
+        use crate::{ManualClock, Timestamp};
+        let fs = RamFs::new(1);
+        let clock = Arc::new(ManualClock::new(Timestamp::from_secs(1000)));
+        fs.set_clock(clock.clone());
+        let vfs = Vfs::new(fs.root());
+        put(&vfs, "/a", b"x");
+        let st = vfs.stat("/a", true).unwrap();
+        assert_eq!((st.atime.sec, st.mtime.sec, st.ctime.sec), (1000, 1000, 1000));
+        clock.advance(5);
+        vfs.open("/a", RW, 0).unwrap().write(0, b"y").unwrap();
+        let st = vfs.stat("/a", true).unwrap();
+        assert_eq!((st.atime.sec, st.mtime.sec, st.ctime.sec), (1000, 1005, 1005));
+        let root = vfs.stat("/", true).unwrap();
+        assert_eq!(root.mtime.sec, 1000);
+        clock.advance(5);
+        vfs.link("/a", "/b").unwrap();
+        let st = vfs.stat("/a", true).unwrap();
+        assert_eq!((st.mtime.sec, st.ctime.sec), (1005, 1010));
+        assert_eq!(vfs.stat("/", true).unwrap().mtime.sec, 1010);
+        clock.advance(5);
+        vfs.rename("/b", "/c").unwrap();
+        assert_eq!(vfs.stat("/c", true).unwrap().ctime.sec, 1015);
+        vfs.open("/a", RW, 0).unwrap().truncate(0).unwrap();
+        assert_eq!(vfs.stat("/a", true).unwrap().mtime.sec, 1015);
     }
 }

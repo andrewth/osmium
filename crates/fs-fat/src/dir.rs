@@ -3,6 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use osmium_fs::Timestamp;
 use osmium_sync::fallible::{OutOfMemory, try_push};
 
 use crate::name::{LFN_CHARS, checksum, lfn_units, short_to_string};
@@ -40,6 +41,8 @@ pub struct Entry {
     pub first: u32,
     /// Size in bytes (0 for directories).
     pub size: u32,
+    /// When it was created, written and last accessed (the date only).
+    pub times: [Timestamp; 3],
     /// Offset of the short entry within the directory.
     pub offset: usize,
     /// Offset of the first long-name entry (= `offset` if none).
@@ -74,20 +77,106 @@ pub fn set_first_cluster(e: &mut [u8], c: u32) {
     }
 }
 
-/// A fixed timestamp for new entries, as osmium has no wall clock here:
-/// 2026-01-01 00:00. (Date bits: years since 1980, month, day.)
-const DATE: u16 = (2026 - 1980) << 9 | 1 << 5 | 1;
+/// A time as a short entry stores it: a DOS date and time (local time
+/// here is taken to be UTC) with 2 second resolution, plus tenths of
+/// seconds for the creation time. Times outside 1980 to 2107 are clamped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stamp {
+    /// Years since 1980 in bits 15..9, month in 8..5, day in 4..0.
+    pub date: u16,
+    /// Hours in bits 15..11, minutes in 10..5, seconds / 2 in 4..0.
+    pub time: u16,
+    /// Hundredths of a second past `time`, 0 to 199.
+    pub tenth: u8,
+}
+
+impl Stamp {
+    /// No time at all (a zero date, which readers show as the epoch).
+    #[cfg(test)]
+    pub const NONE: Stamp = Stamp { date: 0, time: 0, tenth: 0 };
+
+    /// The stamp for `t`.
+    pub fn of(t: Timestamp) -> Stamp {
+        let (year, month, day, hour, min, sec) = t.to_civil();
+        if year < 1980 {
+            return Stamp { date: 1 << 5 | 1, time: 0, tenth: 0 };
+        }
+        if year > 2107 {
+            return Stamp { date: 127 << 9 | 12 << 5 | 31, time: 23 << 11 | 59 << 5 | 29, tenth: 0 };
+        }
+        Stamp {
+            date: ((year - 1980) as u16) << 9 | (month as u16) << 5 | day as u16,
+            time: (hour as u16) << 11 | (min as u16) << 5 | (sec / 2) as u16,
+            tenth: ((sec % 2) as u32 * 100 + t.nsec / 10_000_000).min(199) as u8,
+        }
+    }
+
+    /// The creation, write and access times a fresh entry stamped with
+    /// this has.
+    pub fn times(self) -> [Timestamp; 3] {
+        let written = Stamp { tenth: 0, ..self };
+        [self.timestamp(), written.timestamp(), Stamp { time: 0, ..written }.timestamp()]
+    }
+
+    /// `times` after a write at this stamp: the creation time stays.
+    pub fn update(self, times: [Timestamp; 3]) -> [Timestamp; 3] {
+        let [_, written, accessed] = self.times();
+        [times[0], written, accessed]
+    }
+
+    /// The time it stands for; the epoch for a zero date.
+    pub fn timestamp(self) -> Timestamp {
+        if self.date == 0 {
+            return Timestamp::ZERO;
+        }
+        let (d, t) = (self.date as i64, self.time as i64);
+        let mut ts = Timestamp::from_civil(
+            1980 + (d >> 9),
+            (d >> 5 & 15).clamp(1, 12),
+            (d & 31).clamp(1, 31),
+            (t >> 11).min(23),
+            (t >> 5 & 63).min(59),
+            (t & 31).min(29) * 2,
+        );
+        ts.sec += self.tenth as i64 / 100;
+        ts.nsec = (self.tenth as u32 % 100) * 10_000_000;
+        ts
+    }
+}
+
+fn le16(e: &[u8], at: usize) -> u16 {
+    e.get(at..).and_then(|t| t.first_chunk::<2>()).map_or(0, |c| u16::from_le_bytes(*c))
+}
+
+/// The creation, write and access times recorded in short entry `e`.
+pub fn entry_times(e: &[u8]) -> [Timestamp; 3] {
+    let created = Stamp { date: le16(e, 16), time: le16(e, 14), tenth: e.get(13).copied().unwrap_or(0) };
+    let written = Stamp { date: le16(e, 24), time: le16(e, 22), tenth: 0 };
+    let accessed = Stamp { date: le16(e, 18), time: 0, tenth: 0 };
+    [created.timestamp(), written.timestamp(), accessed.timestamp()]
+}
+
+/// Records a write at `stamp` in short entry `e`: the write time, and the
+/// access date.
+pub fn set_written(e: &mut [u8], stamp: Stamp) {
+    for (at, v) in [(22, stamp.time), (24, stamp.date), (18, stamp.date)] {
+        if let Some(t) = e.get_mut(at..at + 2) {
+            t.copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
 
 /// Builds a short entry.
-pub fn short_entry(short: &[u8; 11], ntres: u8, attr: u8, first: u32, size: u32) -> [u8; ENTRY_SIZE] {
+pub fn short_entry(short: &[u8; 11], ntres: u8, attr: u8, first: u32, size: u32, at: Stamp) -> [u8; ENTRY_SIZE] {
     let mut e = [0u8; ENTRY_SIZE];
     e[..11].copy_from_slice(short);
     e[11] = attr;
     e[12] = ntres;
-    for at in [16, 18, 24] {
-        // Creation, access and write dates.
-        if let Some(t) = e.get_mut(at..at + 2) {
-            t.copy_from_slice(&DATE.to_le_bytes());
+    e[13] = at.tenth;
+    // Creation time and date, access date, write time and date.
+    for (off, v) in [(14, at.time), (16, at.date), (18, at.date), (22, at.time), (24, at.date)] {
+        if let Some(t) = e.get_mut(off..off + 2) {
+            t.copy_from_slice(&v.to_le_bytes());
         }
     }
     set_first_cluster(&mut e, first);
@@ -97,10 +186,10 @@ pub fn short_entry(short: &[u8; 11], ntres: u8, attr: u8, first: u32, size: u32)
 
 /// The `.` and `..` entries that start a new directory's first cluster.
 /// `parent` is the parent's first cluster, or 0 for the root.
-pub fn dot_entries(own: u32, parent: u32) -> [u8; 2 * ENTRY_SIZE] {
+pub fn dot_entries(own: u32, parent: u32, at: Stamp) -> [u8; 2 * ENTRY_SIZE] {
     let mut out = [0u8; 2 * ENTRY_SIZE];
-    out[..32].copy_from_slice(&short_entry(b".          ", 0, attr::DIRECTORY, own, 0));
-    out[32..].copy_from_slice(&short_entry(b"..         ", 0, attr::DIRECTORY, parent, 0));
+    out[..32].copy_from_slice(&short_entry(b".          ", 0, attr::DIRECTORY, own, 0, at));
+    out[32..].copy_from_slice(&short_entry(b"..         ", 0, attr::DIRECTORY, parent, 0, at));
     out
 }
 
@@ -257,6 +346,7 @@ impl Iterator for Entries<'_> {
                 attr: e[11],
                 first: first_cluster(e),
                 size: u32::from_le_bytes([e[28], e[29], e[30], e[31]]),
+                times: entry_times(e),
                 offset,
                 start,
             }));
@@ -340,10 +430,10 @@ mod tests {
     fn parse_long_and_short_names() {
         let short = generate_short("Long File Name.html", &[]).unwrap();
         let mut es = lfn_entries("Long File Name.html", checksum(&short)).unwrap();
-        es.push(short_entry(&short, 0, attr::ARCHIVE, 9, 1234));
-        es.push(short_entry(b"README  TXT", crate::name::LOWER_BASE, attr::ARCHIVE, 0, 0));
-        es.push(short_entry(b"SUB        ", 0, attr::DIRECTORY, 12, 0));
-        let mut v = dot_entries(5, 0).to_vec();
+        es.push(short_entry(&short, 0, attr::ARCHIVE, 9, 1234, Stamp::NONE));
+        es.push(short_entry(b"README  TXT", crate::name::LOWER_BASE, attr::ARCHIVE, 0, 0, Stamp::NONE));
+        es.push(short_entry(b"SUB        ", 0, attr::DIRECTORY, 12, 0, Stamp::NONE));
+        let mut v = dot_entries(5, 0, Stamp::NONE).to_vec();
         v.extend(dir(&es));
         let got = parse(&v).unwrap();
         assert_eq!(got.len(), 3);
@@ -359,7 +449,7 @@ mod tests {
     #[test]
     fn orphaned_long_name_is_ignored() {
         let mut es = lfn_entries("Something else", 0x42).unwrap();
-        es.push(short_entry(b"PLAIN   TXT", 0, 0, 0, 0));
+        es.push(short_entry(b"PLAIN   TXT", 0, 0, 0, 0, Stamp::NONE));
         let got = parse(&dir(&es)).unwrap();
         assert_eq!(got[0].name, "PLAIN.TXT", "checksum mismatch falls back to the short name");
         assert_eq!(got[0].slots(), 1);
@@ -371,7 +461,7 @@ mod tests {
         for name in ["", ".", "..", "a/b", &long] {
             let short = *b"SAFE    TXT";
             let mut es = lfn_entries(name, checksum(&short)).unwrap();
-            es.push(short_entry(&short, 0, 0, 0, 0));
+            es.push(short_entry(&short, 0, 0, 0, 0, Stamp::NONE));
             let got = parse(&dir(&es)).unwrap();
             assert_eq!((got[0].name.as_str(), got[0].slots()), ("SAFE.TXT", 1), "{name:?}");
         }
@@ -380,7 +470,7 @@ mod tests {
 
     #[test]
     fn free_slot_search() {
-        let a = short_entry(b"A          ", 0, 0, 0, 0);
+        let a = short_entry(b"A          ", 0, 0, 0, 0, Stamp::NONE);
         let mut free = a;
         free[0] = FREE;
         let v = dir(&[a, free, free, a, free]);
@@ -394,10 +484,10 @@ mod tests {
     #[test]
     fn unreachable_short_names_are_skipped() {
         let es = [
-            short_entry(b"A/B     TXT", 0, 0, 0, 0),
-            short_entry(b"           ", 0, 0, 0, 0),
-            short_entry(b"A\0B     TXT", 0, 0, 0, 0),
-            short_entry(b"OK      TXT", 0, 0, 0, 0),
+            short_entry(b"A/B     TXT", 0, 0, 0, 0, Stamp::NONE),
+            short_entry(b"           ", 0, 0, 0, 0, Stamp::NONE),
+            short_entry(b"A\0B     TXT", 0, 0, 0, 0, Stamp::NONE),
+            short_entry(b"OK      TXT", 0, 0, 0, 0, Stamp::NONE),
         ];
         let got = parse(&dir(&es)).unwrap();
         assert_eq!(got.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["OK.TXT"]);
@@ -405,16 +495,38 @@ mod tests {
 
     #[test]
     fn emptiness_is_judged_on_raw_slots() {
-        let mut free = short_entry(b"GONE       ", 0, 0, 0, 0);
+        let mut free = short_entry(b"GONE       ", 0, 0, 0, 0, Stamp::NONE);
         free[0] = FREE;
-        let dots = dot_entries(5, 0);
+        let dots = dot_entries(5, 0, Stamp::NONE);
         let dots: Vec<[u8; 32]> = dots.as_chunks::<32>().0.to_vec();
         assert!(is_empty(&dir(&dots)));
         assert!(is_empty(&dir(&[free])));
         // Hidden from `parse`, but still an entry.
-        let hidden = short_entry(b"A/B     TXT", 0, 0, 0, 0);
+        let hidden = short_entry(b"A/B     TXT", 0, 0, 0, 0, Stamp::NONE);
         assert!(parse(&dir(&[hidden])).unwrap().is_empty());
         assert!(!is_empty(&dir(&[hidden])));
         assert!(!is_empty(&dir(&lfn_entries("orphan", 1).unwrap())));
+    }
+
+    #[test]
+    fn stamps_round_trip() {
+        let t = Timestamp { sec: Timestamp::from_civil(2024, 2, 29, 13, 45, 31).sec, nsec: 250_000_000 };
+        let st = Stamp::of(t);
+        assert_eq!((st.date >> 9, st.date >> 5 & 15, st.date & 31), (44, 2, 29));
+        assert_eq!((st.time >> 11, st.time >> 5 & 63, st.time & 31), (13, 45, 15));
+        assert_eq!(st.tenth, 125);
+        assert_eq!(st.timestamp(), t);
+        let e = short_entry(b"A          ", 0, 0, 0, 0, st);
+        assert_eq!(
+            entry_times(&e),
+            [t, Timestamp::from_secs(t.sec - 1), Timestamp::from_secs(t.sec - 31 - 45 * 60 - 13 * 3600)]
+        );
+        // Out of range clamps; no date reads as the epoch.
+        assert_eq!(Stamp::of(Timestamp::from_secs(0)).timestamp(), Timestamp::from_civil(1980, 1, 1, 0, 0, 0));
+        assert_eq!(Stamp::of(Timestamp::from_civil(2200, 1, 1, 0, 0, 0)).timestamp().to_civil().0, 2107);
+        assert_eq!(Stamp::NONE.timestamp(), Timestamp::ZERO);
+        let mut e = short_entry(b"A          ", 0, 0, 0, 0, Stamp::NONE);
+        set_written(&mut e, st);
+        assert_eq!(entry_times(&e)[1], Timestamp::from_secs(t.sec - 1));
     }
 }

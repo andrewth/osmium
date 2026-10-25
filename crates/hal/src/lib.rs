@@ -24,13 +24,17 @@
 //!   an IOMMU.
 //! - [`display`]: linear framebuffers, pixel formats and the
 //!   [`display::Display`] trait.
+//! - [`block_cache`]: [`CachedDevice`](block_cache::CachedDevice), a
+//!   write-back or write-through cache for any block device.
 #![no_std]
 
+extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
 pub mod asynch;
 pub mod block;
+pub mod block_cache;
 pub mod console;
 pub mod display;
 pub mod fbcon;
