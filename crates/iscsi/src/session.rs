@@ -225,7 +225,7 @@ struct Conn {
 impl Conn {
     /// Connects to `target` and waits until the connection is established.
     fn open<N: Net>(net: &mut N, target: SocketAddrV4, opts: &Options) -> Result<Self, IscsiError> {
-        let socket = net.with_sockets(|s| s.add(TcpSocket::new(opts.rx_buffer, opts.tx_buffer)));
+        let socket = net.with_sockets(|s| s.add(TcpSocket::new(opts.rx_buffer.min(65535), opts.tx_buffer)));
         let mut c = Self {
             socket,
             reader: PduReader::new(LOGIN_DSL),
@@ -646,6 +646,9 @@ impl<N: Net> Session<N> {
                 exp_stat_sn: self.exp_stat_sn(ci),
                 data: core::mem::take(&mut keys),
             };
+            // The continuation requests below clear `req.transit`, but the target's
+            // final response answers this one.
+            let asked = transit;
             let mut text = Vec::new();
             let resp = loop {
                 // Continuations count too: a target that always has more
@@ -721,7 +724,7 @@ impl<N: Net> Session<N> {
                 // later stage than we asked for (RFC 7143 §6.3): never
                 // from SecurityNegotiation straight to the full feature
                 // phase, skipping operational negotiation.
-                if !req.transit || resp.nsg != next {
+                if !asked || resp.nsg != next {
                     return Err(IscsiError::Protocol("Login Response with a bad next stage"));
                 }
                 match resp.nsg {
@@ -841,6 +844,15 @@ impl<N: Net> Session<N> {
     /// caller: answers target pings, skips asynchronous events. StatSN
     /// must be in sequence. Returns `None` for a PDU it consumed.
     fn recv_plain_opt(&mut self, deadline: Instant) -> Result<Option<Message>, IscsiError> {
+        let m = self.recv_plain_step(deadline)?;
+        // A target that keeps sending PDUs we skip never leaves us idle.
+        if m.is_none() && self.now >= deadline {
+            return Err(IscsiError::TimedOut);
+        }
+        Ok(m)
+    }
+
+    fn recv_plain_step(&mut self, deadline: Instant) -> Result<Option<Message>, IscsiError> {
         let (ci, m) = loop {
             match self.poll_any() {
                 Polled::Pdu(ci, m) => break (ci, m),
@@ -952,6 +964,15 @@ impl<N: Net> Session<N> {
                 Polled::Lost(ci, e) => Err(Fail::Conn(ci, e)),
                 Polled::Idle(now) if now >= run.deadline => Err(Fail::Session(IscsiError::TimedOut)),
                 Polled::Idle(now) => self.on_idle(now, run),
+            });
+            // Not only an idle poll: a target that streams PDUs we ignore
+            // must not keep the call alive either.
+            let step = step.and_then(|()| {
+                if run.done < run.jobs.len() && self.now >= run.deadline {
+                    Err(Fail::Session(IscsiError::TimedOut))
+                } else {
+                    Ok(())
+                }
             });
             match step {
                 Ok(()) => {}

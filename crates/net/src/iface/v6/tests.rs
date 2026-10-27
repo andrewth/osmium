@@ -153,6 +153,32 @@ fn udp_both_families_on_one_interface() {
 }
 
 #[test]
+fn v6_delivery_prefers_the_specific_socket_over_the_wildcard() {
+    let (mut a, mut b, mut now) = pair6();
+    let b_ll = ll(&b);
+    let wild = b.sockets.add(UdpSocket::new(4, 4));
+    let spec = b.sockets.add(UdpSocket::new(4, 4));
+    b.sockets.get_mut::<UdpSocket>(wild).bind_addr(any6(2000)).unwrap();
+    b.sockets.get_mut::<UdpSocket>(spec).bind_addr(SocketAddr::new(b_ll.into(), 2000)).unwrap();
+    let tx = a.sockets.add(UdpSocket::new(4, 4));
+    a.sockets.get_mut::<UdpSocket>(tx).bind_addr(any6(1000)).unwrap();
+    a.sockets.get_mut::<UdpSocket>(tx).send_to(b"x", SocketAddr::new(b_ll.into(), 2000)).unwrap();
+    assert!(run(&mut a, &mut b, &mut now, 200, |_, b| b.sockets.get::<UdpSocket>(spec).can_recv()));
+    assert!(!b.sockets.get::<UdpSocket>(wild).can_recv());
+
+    // TCP likewise: the listener on the address beats the wildcard one.
+    let cw = b.sockets.add(TcpSocket::new(1024, 1024));
+    let cs = b.sockets.add(TcpSocket::new(1024, 1024));
+    b.sockets.get_mut::<TcpSocket>(cw).listen_on(any6(80)).unwrap();
+    b.sockets.get_mut::<TcpSocket>(cs).listen_on(SocketAddr::new(b_ll.into(), 80)).unwrap();
+    let ca = a.sockets.add(TcpSocket::new(1024, 1024));
+    a.sockets.get_mut::<TcpSocket>(ca).connect(SocketAddr::new(b_ll.into(), 80), 0).unwrap();
+    assert!(run(&mut a, &mut b, &mut now, 1000, |a, _| a.sockets.get::<TcpSocket>(ca).state() == TcpState::Established));
+    assert_eq!(b.sockets.get::<TcpSocket>(cs).state(), TcpState::Established);
+    assert_eq!(b.sockets.get::<TcpSocket>(cw).state(), TcpState::Listen);
+}
+
+#[test]
 fn udp_to_a_closed_port_gets_icmpv6_port_unreachable() {
     let (mut a, mut b, mut now) = pair6();
     let b_ll = ll(&b);
@@ -168,6 +194,23 @@ fn udp_to_a_closed_port_gets_icmpv6_port_unreachable() {
         (icmp.ty, icmp.code) == (ICMPV6_DEST_UNREACHABLE, ICMPV6_PORT_UNREACHABLE) && body.ends_with(b"knock")
     });
     assert!(found, "B sent port unreachable quoting the datagram");
+}
+
+#[test]
+fn icmpv6_port_unreachable_is_rate_limited() {
+    let (mut a, mut b, mut now) = pair6();
+    let b_ll = ll(&b);
+    let log = record(&mut b);
+    let h = a.sockets.add(UdpSocket::new(4, 64));
+    a.sockets.get_mut::<UdpSocket>(h).bind_addr(any6(1000)).unwrap();
+    for _ in 0..50 {
+        a.sockets.get_mut::<UdpSocket>(h).send_to(b"knock", SocketAddr::new(b_ll.into(), 9)).unwrap();
+        a.poll(now);
+        b.poll(now);
+    }
+    run(&mut a, &mut b, &mut now, 20, |_, _| false);
+    let n = icmp_sent(&log).iter().filter(|(ty, ..)| *ty == ICMPV6_DEST_UNREACHABLE).count();
+    assert!((1..=11).contains(&n), "{n} errors");
 }
 
 #[test]
@@ -557,4 +600,26 @@ fn unicast_solicitation_without_a_link_layer_option_is_answered() {
     a.inject(icmp_frame(a_mac, stranger, a_ll, 255, ICMPV6_NEIGHBOR_SOLICIT, &body));
     a.poll(now);
     assert_eq!(icmp_sent(&log), [(ICMPV6_NEIGHBOR_SOLICIT, 0, solicited_node(stranger))]);
+}
+
+#[test]
+fn unicast_solicitation_flood_cannot_grow_the_request_list() {
+    let (mut a, _b, now) = pair6();
+    let (a_ll, a_mac) = (ll(&a), a.iface.mac_address());
+    let body = NeighborSolicit { target: a_ll, source_ll: None }.emit();
+    for i in 0..200u16 {
+        let stranger = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 1, i + 1);
+        a.inject(icmp_frame(a_mac, stranger, a_ll, 255, ICMPV6_NEIGHBOR_SOLICIT, &body));
+        a.poll(now);
+    }
+    assert!(a.iface.v6.requests.len() <= crate::iface::PENDING, "{}", a.iface.v6.requests.len());
+}
+
+#[test]
+fn advertised_infinite_lifetimes_are_capped() {
+    let (mut a, _b, now) = pair6();
+    deliver_ra(&mut a, now, &advert(64, true, u32::MAX));
+    assert!(a.iface.v6.prefixes.iter().all(|p| p.expires.is_some()), "prefix expires");
+    assert!(a.iface.v6.addrs.iter().filter(|x| !is_link_local(x.addr)).all(|x| x.expires.is_some()));
+    assert!(a.iface.v6.addrs.iter().any(|x| !is_link_local(x.addr)));
 }

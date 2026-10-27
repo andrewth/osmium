@@ -176,6 +176,12 @@ pub(crate) struct TargetConfig {
     pub(crate) reported_block_size: Option<u32>,
     /// Every Login Response has the C bit, with this much more text.
     pub(crate) login_flood: Option<usize>,
+    /// Split the final Login Response in two: the first has the C bit, and
+    /// the second, answering an empty request, has T and the rest of the text.
+    pub(crate) split_final_login: bool,
+    /// After login, stream target pings (NOP-In with reserved ITT and TTT)
+    /// without end, and never run a command.
+    pub(crate) ping_flood: bool,
     /// Every Text Response has the C bit, with 8 KiB more text.
     pub(crate) text_flood: bool,
     /// Send Data-In one PDU per this many polls (0: all at once).
@@ -256,6 +262,8 @@ impl Default for TargetConfig {
             reported_blocks: None,
             reported_block_size: None,
             login_flood: None,
+            split_final_login: false,
+            ping_flood: false,
             text_flood: false,
             trickle: 0,
             ignore_mrdsl: false,
@@ -394,6 +402,8 @@ struct Conn {
     /// Digests agreed in login, switched on after its last response.
     agreed: (bool, bool),
     corrupt: Option<Corrupt>,
+    /// The second half of a split Login Response, awaiting the empty request.
+    held_login: Option<LoginResponse>,
 }
 
 /// Counts of what the target saw.
@@ -612,6 +622,20 @@ impl Target {
                 }
                 c.pace_wait -= 1;
             }
+            if self.cfg.ping_flood && self.stats.logins > 0 {
+                while c.out.len() < 1 << 16 {
+                    let (exp, max) = self.window();
+                    let ping = NopIn {
+                        itt: RESERVED_TAG,
+                        ttt: RESERVED_TAG,
+                        stat_sn: c.stat_sn,
+                        exp_cmd_sn: exp,
+                        max_cmd_sn: max,
+                        ..NopIn::default()
+                    };
+                    self.send_raw(c, Message::NopIn(ping));
+                }
+            }
             let s = sockets.get_mut::<TcpSocket>(c.socket);
             if !c.out.is_empty()
                 && let Ok(n) = s.send(&c.out)
@@ -645,6 +669,7 @@ impl Target {
             first_burst: 65536,
             max_burst: 262_144,
             security_rounds: 0,
+            held_login: None,
             operational_rounds: 0,
             pending: Pending::None,
             closing: false,
@@ -1107,6 +1132,16 @@ impl Target {
     }
 
     fn login(&mut self, c: &mut Conn, r: LoginRequest) {
+        if let Some(mut rest) = c.held_login.take() {
+            assert!(r.data.is_empty() && !r.transit, "an empty continuation request");
+            rest.stat_sn = self.next_stat_sn(c);
+            let (exp, max) = self.window();
+            (rest.exp_cmd_sn, rest.max_cmd_sn) = (exp, max);
+            self.send_raw(c, Message::LoginResponse(rest));
+            (c.header_digest, c.data_digest) = c.agreed;
+            c.reader.set_digests(c.header_digest, c.data_digest);
+            return;
+        }
         let keys: Vec<(String, String)> =
             text::parse(&r.data).unwrap().into_iter().map(|(k, v)| (k.into(), v.into())).collect();
         let get = |k: &str| keys.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
@@ -1306,11 +1341,15 @@ impl Target {
         }
         let (exp, max) = self.window();
         let stat_sn = self.next_stat_sn(c);
+        let split = self.cfg.split_final_login && class == 0 && transit && nsg == stage::FULL_FEATURE && out.len() >= 2;
+        let rest = split.then(|| out.split_off(out.len() / 2));
+        let transit = transit && !split;
+        let tail_nsg = nsg;
         self.send_raw(
             c,
             Message::LoginResponse(LoginResponse {
                 transit: transit && class == 0,
-                cont: flood.is_some() && class == 0,
+                cont: (flood.is_some() || split) && class == 0,
                 csg: r.csg,
                 nsg: if transit { nsg } else { 0 },
                 isid: r.isid,
@@ -1330,6 +1369,18 @@ impl Target {
             (c.header_digest, c.data_digest) = c.agreed;
             c.reader.set_digests(c.header_digest, c.data_digest);
         }
+        if let Some(data) = rest {
+            c.held_login = Some(LoginResponse {
+                transit: true,
+                csg: r.csg,
+                nsg: tail_nsg,
+                isid: r.isid,
+                tsih: 7,
+                itt: r.itt,
+                data,
+                ..LoginResponse::default()
+            });
+        }
     }
 
     fn blocks_of(&self, lun: u16) -> u64 {
@@ -1337,6 +1388,9 @@ impl Target {
     }
 
     fn execute(&mut self, c: &mut Conn, cmd: ScsiCommand) {
+        if self.cfg.ping_flood {
+            return;
+        }
         let opcode = cmd.cdb[0];
         let lun = Self::lun_id(&cmd.lun);
         self.stats.commands.push(opcode);

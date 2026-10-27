@@ -811,7 +811,7 @@ impl TcpSocket {
             // Only an exact match resets (RFC 5961 3.2); anything else in the
             // window gets a challenge ACK.
             if seg.seq != self.rcv_nxt {
-                self.ack_pending = self.challenge_ack(now);
+                self.ack_pending |= self.challenge_ack(now);
             } else if self.state == State::SynReceived && self.passive {
                 self.relisten();
             } else if self.state == State::TimeWait {
@@ -828,7 +828,7 @@ impl TcpSocket {
         if seg.has(TCP_SYN) {
             // A SYN in a synchronized state: challenge ACK (RFC 5961 4.2).
             // In SYN-RECEIVED this resends the SYN-ACK.
-            self.ack_pending = self.challenge_ack(now);
+            self.ack_pending |= self.challenge_ack(now);
             return None;
         }
 
@@ -877,7 +877,9 @@ impl TcpSocket {
         {
             self.on_dup_ack();
         }
-        if before(self.snd_wl1, seg.seq) || (self.snd_wl1 == seg.seq && before_eq(self.snd_wl2, seg.ack)) {
+        // RFC 9293 3.10.7.4: SND.UNA =< SEG.ACK =< SND.NXT, and the segment newer.
+        let newer = before(self.snd_wl1, seg.seq) || (self.snd_wl1 == seg.seq && before_eq(self.snd_wl2, seg.ack));
+        if before_eq(self.snd_una, seg.ack) && newer {
             self.snd_wnd = window;
             self.snd_wl1 = seg.seq;
             self.snd_wl2 = seg.ack;
@@ -1119,6 +1121,25 @@ impl TcpSocket {
         }
         if self.ooo.is_empty() {
             self.ooo_recent = None;
+        }
+    }
+
+    /// How many SACK blocks `fill_sack` attaches to the next segment.
+    fn sack_count(&self) -> usize {
+        if !self.sack_ok {
+            return 0;
+        }
+        // Timestamps leave room for three blocks.
+        let room = if self.ts_ok { MAX_SACK_BLOCKS - 1 } else { MAX_SACK_BLOCKS };
+        self.ooo.len().min(room)
+    }
+
+    /// The most payload one segment may carry now: `snd_mss` less the SACK
+    /// option an ACK-flagged segment carries while data is held past a gap.
+    fn payload_limit(&self) -> usize {
+        match self.sack_count() {
+            0 => self.snd_mss,
+            n => self.snd_mss.saturating_sub(4 + 8 * n).max(1),
         }
     }
 
@@ -1434,7 +1455,7 @@ impl TcpSocket {
         if offset > self.tx.len() || !before(seq, self.snd_max) {
             return 0;
         }
-        let len = sent.saturating_sub(offset).min(self.snd_mss).min(max);
+        let len = sent.saturating_sub(offset).min(self.payload_limit()).min(max);
         let fin = self.fin_queued
             && offset + len == self.tx.len()
             && before(self.tx_seq.wrapping_add(self.tx.len() as u32), self.snd_max);
@@ -1602,7 +1623,7 @@ impl TcpSocket {
                 break; // the FIN is out
             }
             let unsent = self.tx.len().saturating_sub(offset);
-            let len = unsent.min(self.window_left()).min(self.snd_mss);
+            let len = unsent.min(self.window_left()).min(self.payload_limit());
             let fin = self.fin_queued && offset + len == self.tx.len();
             if len == 0 && !fin {
                 break;
@@ -2529,6 +2550,50 @@ mod tests {
         let rcv_nxt_gap = tcp(&mut b, cb).ooo.len();
         assert!(rcv_nxt_gap <= 2);
         assert!(run(&mut a, &mut b, &mut now, 3000, |_, b| tcp(b, cb).recv_queue() == 5 * 1460));
+    }
+
+    #[test]
+    fn data_with_sack_blocks_still_fits_the_mtu() {
+        let (mut a, mut b, ca, cb, mut now) = connected(65535, 65535);
+        assert!(tcp(&mut a, ca).sack_ok && tcp(&mut a, ca).ts_ok);
+        // A holds data past a gap, so every ACK it sends carries a block.
+        let hole = tcp(&mut a, ca).rcv_nxt.wrapping_add(100);
+        tcp(&mut a, ca).ooo.push((hole, alloc::vec![0; 10]));
+        let biggest = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let seen = biggest.clone();
+        a.set_shaper(move |_, f| {
+            if tcp_segment(f).is_some_and(|(_, len)| len > 0) {
+                seen.set(seen.get().max(f.len()));
+            }
+            Fate::Deliver
+        });
+        tcp(&mut a, ca).send(&[7; 20_000]).unwrap();
+        assert!(run(&mut a, &mut b, &mut now, 3000, |_, b| tcp(b, cb).recv_queue() == 20_000));
+        assert!(biggest.get() <= 1514, "frame of {} bytes", biggest.get());
+    }
+
+    #[test]
+    fn old_ack_does_not_update_the_send_window() {
+        let (mut a, mut b, ca, _cb, mut now) = connected(8192, 8192);
+        tcp(&mut a, ca).send(b"hello").unwrap();
+        assert!(run(&mut a, &mut b, &mut now, 100, |a, _| tcp(a, ca).snd_una == tcp(a, ca).snd_max));
+        let x = tcp(&mut a, ca);
+        let before_wnd = x.snd_wnd;
+        x.snd_wl1 = x.rcv_nxt.wrapping_sub(1);
+        let seg = TcpHeader {
+            src_port: 80,
+            dst_port: x.local.port(),
+            seq: x.rcv_nxt,
+            ack: x.snd_una.wrapping_sub(1),
+            flags: TCP_ACK,
+            window: 3,
+            timestamps: Some((x.ts_recent.wrapping_add(1), 0)),
+            ..Default::default()
+        };
+        let (local, remote) = (x.local, x.remote);
+        let mut rng = crate::rng::Rng::new(1);
+        x.process(&mut test_cx(&mut rng, now), local, remote, &seg, &[]);
+        assert_eq!(x.snd_wnd, before_wnd, "SEG.ACK below SND.UNA must not move the window");
     }
 
     #[test]

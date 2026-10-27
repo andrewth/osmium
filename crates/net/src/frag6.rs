@@ -291,6 +291,10 @@ impl Reassembler {
             if entry.total.is_some_and(|t| t != end) {
                 return Err(Reject::Overlap);
             }
+            // Nor may it fall short of data already held (RFC 5722).
+            if entry.pieces.last().is_some_and(|(o, d)| o + d.len() > end) {
+                return Err(Reject::Overlap);
+            }
             entry.total = Some(end);
         }
         if entry.total.is_some_and(|t| end > t) {
@@ -451,6 +455,15 @@ mod tests {
         assert_eq!(r.add(Instant::ZERO, A, B, frag(8, false, 1), 17, &[1; 16]), Err(Reject::Overlap));
         assert_eq!(r.add(Instant::ZERO, A, B, frag(8, false, 2), 17, &[1; 8]), Ok(None));
         assert_eq!(r.add(Instant::ZERO, A, B, frag(16, true, 2), 17, &[1; 8]), Err(Reject::Overlap));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn a_last_piece_short_of_held_data_is_refused() {
+        let mut r = Reassembler::new();
+        assert_eq!(r.add(Instant::ZERO, A, B, frag(16, true, 1), 17, &[1; 16]), Ok(None));
+        // The datagram would end at 16, below the piece already held.
+        assert_eq!(r.add(Instant::ZERO, A, B, frag(8, false, 1), 17, &[1; 8]), Err(Reject::Overlap));
         assert!(r.is_empty());
     }
 

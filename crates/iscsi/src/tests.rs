@@ -202,6 +202,31 @@ fn login_refused() {
 }
 
 #[test]
+fn a_target_streaming_pings_cannot_hold_a_call_past_its_timeout() {
+    let mut net = TestNet::new(TargetConfig::default(), BLOCKS);
+    let opts = Options { timeout: core::time::Duration::from_millis(300), ..options() };
+    let mut disk = IscsiDisk::connect(&mut net, PORTAL, &opts).unwrap();
+    disk.net_mut().target.cfg.ping_flood = true;
+    let start = disk.net_mut().now;
+    let mut buf = [0u8; 512];
+    assert_eq!(disk.execute(&scsi::read(0, 1), Data::In(&mut buf)), Err(IscsiError::TimedOut));
+    assert!(disk.net_mut().now - start >= opts.timeout);
+    // Logging out waits on the target too, and gives up the same way.
+    drop(disk);
+    assert_eq!(sockets(&net), 0);
+}
+
+#[test]
+fn a_final_login_response_may_follow_a_continuation() {
+    let cfg = TargetConfig { split_final_login: true, ..TargetConfig::default() };
+    let mut net = TestNet::new(cfg, BLOCKS);
+    let disk = connect(&mut net);
+    assert!(disk.is_logged_in());
+    drop(disk);
+    assert_eq!(net.target.stats.logins, 1);
+}
+
+#[test]
 fn large_disk_needs_read_capacity_16() {
     let cfg = TargetConfig { reported_blocks: Some(1 << 33), ..TargetConfig::default() };
     let mut net = TestNet::new(cfg, BLOCKS);

@@ -189,9 +189,15 @@ pub enum DhcpEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Discovering,
-    Requesting { server: Ipv4Addr, addr: Ipv4Addr },
+    Requesting {
+        server: Ipv4Addr,
+        addr: Ipv4Addr,
+    },
     Bound,
+    /// Past T1: asking the leasing server by unicast.
     Renewing,
+    /// Past T2: asking any server by broadcast.
+    Rebinding,
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +205,8 @@ struct Lease {
     config: Config,
     server: Ipv4Addr,
     renew_at: Instant,
+    /// T2, when renewing gives way to rebinding.
+    rebind_at: Instant,
     expires_at: Instant,
 }
 
@@ -268,6 +276,7 @@ impl DhcpClient {
     pub(crate) fn poll_at(&self) -> Option<Instant> {
         match (self.phase, self.lease) {
             (Phase::Bound, Some(l)) => Some(l.renew_at),
+            (Phase::Renewing, Some(l)) => Some(self.next_send.min(l.rebind_at)),
             _ => Some(self.next_send),
         }
     }
@@ -286,6 +295,13 @@ impl DhcpClient {
             self.next_send = now;
         }
         if let (Phase::Renewing, Some(l)) = (self.phase, self.lease)
+            && now >= l.rebind_at
+        {
+            self.phase = Phase::Rebinding;
+            self.attempts = 0;
+            self.next_send = now;
+        }
+        if let (Phase::Renewing | Phase::Rebinding, Some(l)) = (self.phase, self.lease)
             && now >= l.expires_at
         {
             self.restart();
@@ -320,8 +336,16 @@ impl DhcpClient {
                 let Some(l) = self.lease else { return };
                 m.ty = REQUEST;
                 m.ciaddr = l.config.address;
-                self.next_send = now + self.backoff(Duration::from_secs(60));
+                // Never sleep past T2, when the request goes to everyone.
+                self.next_send = (now + self.backoff(Duration::from_secs(60))).min(l.rebind_at.max(now));
                 (l.config.address, l.server)
+            }
+            Phase::Rebinding => {
+                let Some(l) = self.lease else { return };
+                m.ty = REQUEST;
+                m.ciaddr = l.config.address;
+                self.next_send = now + self.backoff(Duration::from_secs(60));
+                (l.config.address, Ipv4Addr::BROADCAST)
             }
             Phase::Bound => return,
         };
@@ -347,7 +371,7 @@ impl DhcpClient {
                 self.attempts = 0;
                 self.next_send = now;
             }
-            (Phase::Requesting { .. } | Phase::Renewing, ACK | NAK) => self.answered(now, &m),
+            (Phase::Requesting { .. } | Phase::Renewing | Phase::Rebinding, ACK | NAK) => self.answered(now, &m),
             _ => {}
         }
     }
@@ -357,6 +381,8 @@ impl DhcpClient {
         // Only the server we chose may answer.
         let server = match (self.phase, self.lease) {
             (Phase::Requesting { server, .. }, _) | (Phase::Renewing, Some(Lease { server, .. })) => server,
+            // Any server may answer a broadcast; it becomes the lease's.
+            (Phase::Rebinding, Some(_)) => m.server.unwrap_or(Ipv4Addr::UNSPECIFIED),
             _ => return,
         };
         if m.server != Some(server) {
@@ -367,7 +393,12 @@ impl DhcpClient {
                 if !unicast(m.yiaddr) || matches!(self.phase, Phase::Requesting { addr, .. } if addr != m.yiaddr) {
                     return;
                 }
-                let prefix_len = m.mask.map_or(24, |mask| u32::from(mask).leading_ones() as u8);
+                // A mask is ones then zeros; anything else is no subnet.
+                let mask = m.mask.map_or(0xffff_ff00, u32::from);
+                if mask.count_ones() != mask.leading_ones() {
+                    return;
+                }
+                let prefix_len = mask.leading_ones() as u8;
                 if !(1..=30).contains(&prefix_len) {
                     return;
                 }
@@ -384,6 +415,8 @@ impl DhcpClient {
                     config,
                     server,
                     renew_at: now + Duration::from_secs(renewal.into()),
+                    // RFC 2131 4.5: 0.875 of the lease, but after T1.
+                    rebind_at: now + Duration::from_secs((u64::from(lease) * 7 / 8).max(renewal.into())),
                     expires_at: now + Duration::from_secs(lease.into()),
                 });
                 self.phase = Phase::Bound;
@@ -609,6 +642,48 @@ mod tests {
         let mut bad = wire[..FIXED_LEN].to_vec();
         bad.push(OPT_DNS);
         assert!(Message::parse(&bad).is_none());
+    }
+
+    #[test]
+    fn unanswered_renewals_become_a_broadcast_rebind_at_t2() {
+        let mut c = requesting(|m| (m.lease, m.renewal) = (Some(800), None));
+        let l = c.lease.unwrap();
+        assert_eq!((l.renew_at, l.rebind_at, l.expires_at), (secs(400), secs(700), secs(800)));
+        let sent = |c: &mut DhcpClient, at: Instant| {
+            let mut rng = crate::rng::Rng::new(1);
+            let mut cx = Cx {
+                now: at,
+                addr: Some(OFFERED),
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mss: 1460,
+                mss6: 1440,
+                pmtu: None,
+                addr6: None,
+                link_local6: None,
+                rng: &mut rng,
+            };
+            let mut out = Vec::new();
+            c.dispatch(&mut cx, &mut out);
+            out.iter().map(|p| p.dst).collect::<Vec<_>>()
+        };
+        assert_eq!(sent(&mut c, secs(400)), [core::net::IpAddr::from(SERVER)], "T1: unicast to the server");
+        assert_eq!(c.phase, Phase::Renewing);
+        assert_eq!(c.poll_at(), Some(c.next_send.min(secs(700))));
+        assert_eq!(sent(&mut c, secs(700)), [core::net::IpAddr::from(Ipv4Addr::BROADCAST)], "T2: broadcast");
+        assert_eq!(c.phase, Phase::Rebinding);
+        sent(&mut c, secs(800));
+        assert!(c.config().is_none(), "expired");
+    }
+
+    #[test]
+    fn rejects_masks_that_are_not_contiguous() {
+        for mask in [[255, 0, 255, 0], [255, 255, 0, 255], [255, 255, 253, 0]] {
+            assert!(requesting(|m| m.mask = Some(mask.into())).config().is_none(), "mask {mask:?}");
+        }
+    }
+
+    fn secs(n: u64) -> Instant {
+        Instant::from_millis(n * 1000)
     }
 
     #[test]

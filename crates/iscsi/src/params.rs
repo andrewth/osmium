@@ -291,6 +291,9 @@ impl Negotiator {
             "FirstBurstLength" => p.first_burst_length = p.first_burst_length.min(o.first_burst_length),
             "ImmediateData" => p.immediate_data &= o.immediate_data,
             "InitialR2T" => p.initial_r2t = true,
+            // No answer means no digest, whatever another connection agreed.
+            "HeaderDigest" => p.header_digest = false,
+            "DataDigest" => p.data_digest = false,
             _ => {}
         }
     }
@@ -479,6 +482,17 @@ mod tests {
 
     fn keys(data: &[u8]) -> Vec<(&str, &str)> {
         text::parse(data).unwrap()
+    }
+
+    #[test]
+    fn an_unanswered_digest_means_none_even_on_an_additional_connection() {
+        let first = Params { header_digest: true, data_digest: true, ..Params::default() };
+        let offer =
+            Offer { header_digest: DigestPolicy::Prefer, data_digest: DigestPolicy::Prefer, ..Offer::default() };
+        let mut n = Negotiator::additional(offer, first);
+        n.operational_keys(false);
+        n.finish().unwrap();
+        assert!(!n.params.header_digest && !n.params.data_digest);
     }
 
     #[test]

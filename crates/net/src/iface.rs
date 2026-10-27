@@ -111,6 +111,10 @@ impl Reassembly {
             if self.total.is_some_and(|t| t != end) {
                 return false;
             }
+            // Nor may it fall short of data already held.
+            if self.pieces.last().is_some_and(|(o, d)| o + d.len() > end) {
+                return false;
+            }
             self.total = Some(end);
         }
         if self.total.is_some_and(|t| end > t) {
@@ -181,6 +185,41 @@ pub struct Interface {
     looping: bool,
     /// A packet was looped back since [`loopback_pending`](Self::loopback_pending) last said so.
     looped: bool,
+    /// Limits the port-unreachable errors sent.
+    error_limit: ErrorLimit,
+}
+
+/// A token bucket for the ICMP errors the interface originates, so that a
+/// flood of stray packets cannot make it a source of traffic (RFC 1812
+/// 4.3.2.8, RFC 4443 2.4).
+struct ErrorLimit {
+    tokens: u32,
+    at: Instant,
+}
+
+impl ErrorLimit {
+    /// Errors allowed in a burst.
+    const BURST: u32 = 10;
+    /// One token returns this often.
+    const REFILL_MS: u64 = 100;
+
+    const fn new() -> Self {
+        Self { tokens: Self::BURST, at: Instant::ZERO }
+    }
+
+    /// Spends a token if there is one.
+    fn allow(&mut self, now: Instant) -> bool {
+        let steps = now.as_millis().saturating_sub(self.at.as_millis()) / Self::REFILL_MS;
+        if steps > 0 {
+            self.tokens = u32::try_from(steps).unwrap_or(u32::MAX).saturating_add(self.tokens).min(Self::BURST);
+            self.at = now;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
 }
 
 /// The part of an Ethernet frame after its header.
@@ -215,6 +254,7 @@ impl Interface {
             loopback: VecDeque::new(),
             looping: false,
             looped: false,
+            error_limit: ErrorLimit::new(),
         }
     }
 
@@ -843,7 +883,7 @@ impl Interface {
                     }
                 }
                 // No errors about frames that went to the whole link.
-                if !delivered && to_us && !link_multicast {
+                if !delivered && to_us && !link_multicast && self.error_limit.allow(now) {
                     // Port unreachable, quoting the IP header and the first
                     // eight bytes of the datagram (RFC 792).
                     // Not the frame's padding, which `bytes` may carry past
@@ -973,6 +1013,29 @@ mod tests {
         });
         run(&mut a, &mut b, &mut now, 20, |_, _| false);
         assert!(!a.sockets.get::<UdpSocket>(ha).can_recv());
+    }
+
+    #[test]
+    fn port_unreachable_is_rate_limited() {
+        let (mut a, mut b) = pair();
+        let ha = a.sockets.add(UdpSocket::new(4, 64));
+        a.sockets.get_mut::<UdpSocket>(ha).bind(1000).unwrap();
+        let errors = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = errors.clone();
+        b.set_filter(move |_, f| {
+            if f.len() > 34 && f[23] == PROTO_ICMP && f[34] == ICMP_DEST_UNREACHABLE {
+                seen.set(seen.get() + 1);
+            }
+            true
+        });
+        let mut now = Instant::ZERO;
+        for _ in 0..50 {
+            a.sockets.get_mut::<UdpSocket>(ha).send_to(b"x", sa(B_IP, 3000)).unwrap();
+            a.poll(now);
+            b.poll(now);
+        }
+        run(&mut a, &mut b, &mut now, 20, |_, _| false);
+        assert!(errors.get() >= 1 && errors.get() <= 11, "{} errors", errors.get());
     }
 
     /// Records every frame `host` sends.
@@ -1220,6 +1283,16 @@ mod tests {
         b.poll(Instant::ZERO);
         assert!(b.sockets.get::<UdpSocket>(hb).can_recv());
         assert!(b.iface.reassembling.len() <= 1);
+    }
+
+    #[test]
+    fn a_last_fragment_short_of_held_data_condemns_the_datagram() {
+        let (a, mut b) = pair();
+        let push = |f: Vec<u8>| a.dev.tx.borrow_mut().push_back(f);
+        push(fragment(1, 16, true, &[0; 16]));
+        push(fragment(1, 8, false, &[0; 8]));
+        b.poll(Instant::ZERO);
+        assert!(b.iface.reassembling.is_empty());
     }
 
     #[test]

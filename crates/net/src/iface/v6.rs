@@ -55,6 +55,9 @@ const INFINITE: u32 = u32::MAX;
 /// RFC 4862 section 5.5.3 e): a valid lifetime shorter than this does not
 /// shorten an address's remaining lifetime.
 const TWO_HOURS: u32 = 7200;
+/// The longest an address or prefix learned from a router advertisement
+/// lives, so a forged "infinite" lifetime cannot hold a table slot forever.
+const MAX_RA_LIFETIME: u32 = 30 * 24 * 3600;
 /// The most of an offending packet an ICMPv6 error quotes, so that the error
 /// fits the minimum MTU.
 const MAX_QUOTE: usize = IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMPV6_HEADER_LEN - 4;
@@ -578,17 +581,19 @@ impl Interface {
         let Some((udp, data)) = UdpHeader::parse(payload, ip.src, ip.dst) else { return };
         let dst = SocketAddr::new(ip.dst.into(), udp.dst_port);
         let src = SocketAddr::new(ip.src.into(), udp.src_port);
-        for (_, s) in sockets.iter_mut() {
-            if let Socket::Udp(s) = s
-                && s.accepts(dst)
-            {
+        let mut delivered = false;
+        for h in sockets.udp_targets(src, dst) {
+            if let Some(s) = sockets.try_get_mut::<crate::UdpSocket>(h) {
                 s.process(src, data);
-                return;
+                delivered = true;
             }
+        }
+        if delivered {
+            return;
         }
         // Port unreachable, quoting as much of the packet as fits the
         // minimum MTU. Nothing is said about packets sent to a group.
-        if to_us && !ip.src.is_unspecified() {
+        if to_us && !ip.src.is_unspecified() && self.error_limit.allow(now) {
             let mut body = alloc::vec![0; 4];
             body.extend_from_slice(bytes.get(..MAX_QUOTE).unwrap_or(bytes));
             let header = Icmpv6Header { ty: ICMPV6_DEST_UNREACHABLE, code: ICMPV6_PORT_UNREACHABLE };
@@ -603,7 +608,6 @@ impl Interface {
         let src = SocketAddr::new(ip.src.into(), tcp.src_port);
         let socket = {
             let mut exact = None;
-            let mut listen = None;
             let mut queued = None;
             for (h, s) in sockets.iter() {
                 if let Socket::Tcp(s) = s {
@@ -611,15 +615,12 @@ impl Interface {
                         exact = Some(h);
                         break;
                     }
-                    if listen.is_none() && s.accepts_listen(dst) {
-                        listen = Some(h);
-                    }
                     if queued.is_none() && s.accepts_queued(dst) {
                         queued = Some(h);
                     }
                 }
             }
-            exact.or(listen).or(queued)
+            exact.or_else(|| sockets.tcp_listener(src, dst)).or(queued)
         };
         let rst = match socket {
             Some(h) => {
@@ -715,7 +716,10 @@ impl Interface {
                     target_ll: Some(self.mac),
                 };
                 self.send_icmp6(ll, ns.target, ip.src, ICMPV6_NEIGHBOR_ADVERT, &advert.emit());
-            } else if ip.dst == ns.target && ns.source_ll.is_none() && !self.v6.requests.iter().any(|r| r.ip == ip.src)
+            } else if ip.dst == ns.target
+                && ns.source_ll.is_none()
+                && self.v6.requests.len() < PENDING
+                && !self.v6.requests.iter().any(|r| r.ip == ip.src)
             {
                 self.v6.requests.push(Request { ip: ip.src, first: now, last: now });
                 self.send_ns(ip.src, Some(IpAddr::V6(ns.target)));
@@ -812,7 +816,9 @@ impl Interface {
             if !sane {
                 continue;
             }
-            let expires = lifetime(now, p.valid_lifetime);
+            let valid = p.valid_lifetime.min(MAX_RA_LIFETIME);
+            let preferred = p.preferred_lifetime.min(valid);
+            let expires = lifetime(now, valid);
             if p.on_link {
                 if let Some(x) = self.v6.prefixes.iter_mut().find(|x| x.prefix == p.prefix && x.len == p.prefix_len) {
                     x.expires = expires;
@@ -824,18 +830,18 @@ impl Interface {
             if !p.autonomous || p.prefix_len != 64 {
                 continue;
             }
-            self.temp_for_prefix(now, p.prefix, p.valid_lifetime, p.preferred_lifetime);
+            self.temp_for_prefix(now, p.prefix, valid, preferred);
             let addr = self.slaac_address(p.prefix);
             if let Some(a) = self.v6.addrs.iter_mut().find(|a| a.addr == addr) {
                 // RFC 4862 section 5.5.3 e).
                 let Some(current) = a.expires else { continue };
                 let remaining = (current - now).as_secs();
-                if p.valid_lifetime > TWO_HOURS || u64::from(p.valid_lifetime) > remaining {
+                if valid > TWO_HOURS || u64::from(valid) > remaining {
                     a.expires = expires;
                 } else if remaining > u64::from(TWO_HOURS) {
                     a.expires = lifetime(now, TWO_HOURS);
                 }
-            } else if p.valid_lifetime > 0 && self.v6.addrs.len() < MAX_ADDRESSES {
+            } else if valid > 0 && self.v6.addrs.len() < MAX_ADDRESSES {
                 self.v6.addrs.push(Address { addr, prefix_len: 64, dad: Dad::Idle, expires });
             }
         }
