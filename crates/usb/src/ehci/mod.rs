@@ -239,6 +239,9 @@ enum Progress {
 struct Pending<'d, D: DmaAllocator + ?Sized> {
     xfer: Xfer<'d, D>,
     plan: Plan,
+    /// An abort was not confirmed: the controller may still own the queue head and its qTDs. The
+    /// slot is never reused and the memory is only freed once the controller has halted.
+    wedged: bool,
 }
 
 struct Mem<'d, D: DmaAllocator + ?Sized> {
@@ -462,6 +465,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
         if self.r32(HCCPARAMS) & HCC_64BIT != 0 {
             self.op_write(CTRLDSSEGMENT, 0);
         }
+        // The schedules must be visible before the controller is pointed at them.
+        osmium_arch::barrier::mb();
         self.op_write(USBSTS, STS_ALL);
         self.op_write(PERIODICLISTBASE, self.mem.frames.device_addr().as_u64() as u32);
         self.op_write(ASYNCLISTADDR, self.qh_addr(QH_ASYNC_HEAD));
@@ -583,6 +588,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
                 // data qTD itself is not active then.
                 return Progress::Running;
             }
+            // Completion is seen: only now may the received data be read.
+            osmium_arch::barrier::dma_rmb();
             if t & QTD_HALTED != 0 {
                 return Progress::Failed(if t & QTD_ERRORS == 0 { UsbError::Stall } else { UsbError::Transaction });
             }
@@ -594,6 +601,30 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
         Progress::Done(bytes)
     }
 
+    /// The queue head whose link points at `qh`, found by walking its list from the head. None if `qh`
+    /// is not linked (an earlier unlink of it was never confirmed).
+    fn predecessor(&self, qh: usize) -> Option<usize> {
+        let mut cur = if qh >= QH_PERIODIC { QH_PERIODIC_ROOT } else { QH_ASYNC_HEAD };
+        let target = self.qh_addr(qh);
+        for _ in 0..=QH_COUNT {
+            let link = self.qh_word(cur, 0);
+            if link & LINK_TERMINATE != 0 {
+                return None;
+            }
+            let addr = link & !0x1f;
+            if addr == target {
+                return Some(cur);
+            }
+            let base = self.qh_addr(0);
+            let index = (addr.wrapping_sub(base) as usize) / QH_SIZE;
+            if addr < base || index >= QH_COUNT {
+                return None;
+            }
+            cur = index;
+        }
+        None
+    }
+
     /// Takes the queue head `qh` off its list, waits until the controller
     /// cannot be reading it or its qTDs, and puts it back idle. If the
     /// controller does not confirm that, it may still be using the memory: the
@@ -601,9 +632,12 @@ impl<'d, D: DmaAllocator + ?Sized> Ehci<'d, D> {
     /// free or reuse the transfer's memory.
     fn abort(&self, qh: usize) -> bool {
         let periodic = qh >= QH_PERIODIC;
-        // Each list is in index order, so the one before is the previous queue head.
-        let (prev, next) = (qh.saturating_sub(1), self.qh_word(qh, 0));
+        let next = self.qh_word(qh, 0);
         let own = self.qh_addr(qh) | LINK_QH;
+        // Earlier unconfirmed aborts leave queue heads out of the chain, so find the real predecessor.
+        let Some(prev) = self.predecessor(qh) else {
+            return false;
+        };
         self.set_qh_word(prev, 0, next);
         osmium_arch::barrier::mb();
         if periodic {
@@ -768,21 +802,23 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
         let qh = if pipe.ttype == TransferType::Interrupt { QH_PERIODIC + slot } else { QH_ASYNC + slot };
         let plan = Self::build_bulk(&xfer, toggle, len, true, qh);
         self.start_transfer(&xfer, &plan, pipe);
-        *self.mem.pending.get_mut(slot).ok_or(UsbError::NoResources)? = Some(Pending { xfer, plan });
+        *self.mem.pending.get_mut(slot).ok_or(UsbError::NoResources)? = Some(Pending { xfer, plan, wedged: false });
         Ok(slot)
     }
 
     fn poll(&mut self, slot: usize, buf: &mut [u8]) -> Option<Result<usize, UsbError>> {
         let p = self.mem.pending.get(slot)?.as_ref()?;
+        if p.wedged {
+            return None;
+        }
         // Done or halted by the controller itself: either way it has let go.
         let result = match self.progress(&p.xfer, &p.plan) {
             Progress::Running => return None,
             Progress::Done(bytes) => {
-                let n = bytes.min(buf.len());
-                if let Some(dst) = buf.get_mut(..n) {
+                if let Some(dst) = buf.get_mut(..bytes.min(buf.len())) {
                     p.xfer.buf.read(0, dst);
                 }
-                Ok(n)
+                Ok(bytes)
             }
             Progress::Failed(e) => Err(e),
         };
@@ -793,11 +829,19 @@ impl<D: DmaAllocator + ?Sized> Hc for Ehci<'_, D> {
     }
 
     fn cancel(&mut self, slot: usize) {
-        // If the controller may still be using the memory, leak it.
-        if let Some(p) = self.mem.pending.get_mut(slot).and_then(Option::take)
-            && !self.abort(p.plan.qh)
-        {
-            core::mem::forget(p);
+        let Some(p) = self.mem.pending.get(slot).and_then(Option::as_ref) else {
+            return;
+        };
+        if p.wedged {
+            return;
+        }
+        if self.abort(p.plan.qh) {
+            if let Some(entry) = self.mem.pending.get_mut(slot) {
+                *entry = None;
+            }
+        } else if let Some(p) = self.mem.pending.get_mut(slot).and_then(Option::as_mut) {
+            // The controller may still use the memory: keep it, and the slot, out of reuse.
+            p.wedged = true;
         }
     }
 }

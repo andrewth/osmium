@@ -197,7 +197,8 @@ pub trait Hc {
     fn submit(&mut self, pipe: &Pipe, toggle: bool, len: usize) -> Result<usize, UsbError>;
 
     /// Collects the transfer in `slot`: `None` while it runs, else its
-    /// result, which frees the slot.
+    /// result, which frees the slot. The result is the number of bytes the
+    /// device sent, which may exceed `buf`: only what fits is copied.
     fn poll(&mut self, slot: usize, buf: &mut [u8]) -> Option<Result<usize, UsbError>>;
 
     /// Abandons the transfer in `slot`.
@@ -556,10 +557,11 @@ pub fn poll_in<H: Hc + ?Sized>(
     if let Some(e) = ep_mut(hc, dev, ep.address) {
         e.pending = None;
         if let Ok(n) = done {
+            // The toggle follows what the device sent, not what fitted in the caller's buffer.
             e.toggle = toggle_after(ep.toggle, n, ep.pending_len, ep.mps);
         }
     }
-    Some(done)
+    Some(done.map(|n| n.min(buf.len())))
 }
 
 /// A speed for the transfer direction's sake: low-speed devices take the

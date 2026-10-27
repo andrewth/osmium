@@ -399,6 +399,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
         if !usbhc::wait(self.clock, 10_000_000, || self.r32(COMMAND_STATUS) & CMD_HCR == 0) {
             return Err(timeout);
         }
+        // The HCCA and the lists must be visible before the controller is pointed at them.
+        osmium_arch::barrier::mb();
         // The controller is suspended and must be operational within 2 ms.
         self.w32(HCCA, self.mem.hcca.device_addr().as_u64() as u32);
         self.w32(CONTROL_HEAD_ED, self.ed_addr(ED_CONTROL_ROOT));
@@ -520,6 +522,8 @@ impl<'d, D: DmaAllocator + ?Sized> Ohci<'d, D> {
             if cc >= 0xe {
                 return Progress::Running;
             }
+            // Completion is seen: only now may the buffer pointer and the received data be read.
+            osmium_arch::barrier::dma_rmb();
             if cc != 0 {
                 return Progress::Failed(if cc == CC_STALL { UsbError::Stall } else { UsbError::Transaction });
             }
@@ -678,11 +682,10 @@ impl<D: DmaAllocator + ?Sized> Hc for Ohci<'_, D> {
             // A retired descriptor going back to running means the controller is not to be trusted.
             Progress::Running => Err(UsbError::Transaction),
             Progress::Done(bytes) => {
-                let n = bytes.min(buf.len());
-                if let Some(dst) = buf.get_mut(..n) {
+                if let Some(dst) = buf.get_mut(..bytes.min(buf.len())) {
                     p.xfer.buf.read(0, dst);
                 }
-                Ok(n)
+                Ok(bytes)
             }
             Progress::Failed(e) => Err(e),
         };

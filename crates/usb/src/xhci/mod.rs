@@ -582,6 +582,8 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
         hc.take_from_firmware((hccparams1 >> 16) as usize * 4);
         hc.reset()?;
 
+        // The structures built above must be visible before the controller is pointed at them.
+        osmium_arch::barrier::mb();
         hc.op_write(CONFIG, max_slots as u32);
         hc.op_write64(DCBAAP, hc.dcbaa.device_addr().as_u64());
         hc.op_write64(CRCR, hc.commands.base().as_u64() | hc.commands.cycle() as u64);
@@ -1356,6 +1358,10 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
             };
             if isoch {
                 if esit as usize > ISOCH_SLOT_LEN || mps == 0 {
+                    return Err(UsbError::BadEndpoint);
+                }
+                // The TD's burst count (TBC) is 2 bits: no more than four bursts of `burst + 1` packets.
+                if ss && esit.div_ceil(mps) > (burst + 1) * 4 {
                     return Err(UsbError::BadEndpoint);
                 }
                 let buf = new_dma(dma, ac64, ISOCH_DEPTH * ISOCH_SLOT_LEN).ok_or(UsbError::NoResources)?;
@@ -2598,6 +2604,12 @@ mod tests {
         let input = &hc.slot(DeviceId(1)).unwrap().input;
         assert_eq!(ctx_get(input, 6 * 32, 1) >> 8 & 0xff, 0);
         assert_eq!(configure_ss(&mut hc, &[ss_ep(iso, 0, 3, 0)]), Err(UsbError::BadEndpoint));
+        // 4096 bytes a interval in 64-byte packets with no burst would need a TBC of 63.
+        let small = EndpointDescriptor { address: 0x84, attributes: 1, max_packet_size_raw: 64, interval: 1 };
+        let mut too_many = ss_ep(small, 0, 0, 0);
+        too_many.companion.as_mut().unwrap().bytes_per_interval = 4096;
+        hc.slot(DeviceId(1)).unwrap().speed = Speed::Super;
+        assert_eq!(configure_ss(&mut hc, &[too_many]), Err(UsbError::BadEndpoint));
     }
 
     #[test]

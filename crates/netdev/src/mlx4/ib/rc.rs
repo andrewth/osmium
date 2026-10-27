@@ -233,6 +233,9 @@ impl<D: DmaAllocator + ?Sized> Drop for Rc<'_, '_, D> {
     }
 }
 
+/// The largest `log2_count` a context's 3-bit field holds.
+const MAX_LOG_RESOURCES: u32 = 7;
+
 /// `ceil(log2(n))` for the resource counts in a context.
 fn log2_count(n: u8) -> u32 {
     if n <= 1 { 0 } else { 8 - (n - 1).leading_zeros() }
@@ -311,7 +314,16 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         let window = OwnedDma::new(hca.dma, WINDOW_LEN).ok_or(Mlx4Error::NoMemory)?;
         let addr = window.device_addr().as_u64();
         let slot = n as u32 * MAX_PORTS as u32 + (port as u32 - 1);
-        let rkey = hca.register_window(slot, addr, WINDOW_LEN)?;
+        let rkey = match hca.register_window(slot, addr, WINDOW_LEN) {
+            Ok(rkey) => rkey,
+            Err(e) => {
+                if hca.hcr.is_wedged() {
+                    // The adapter may own the registration, with remote access to the window: leak it.
+                    core::mem::forget(window);
+                }
+                return Err(e);
+            }
+        };
         let mut rc = Rc {
             q,
             window: ManuallyDrop::new(window),
@@ -338,7 +350,9 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         let (hca, port, port_mtu, gids) = (self.ud.hca, self.ud.port, self.mtu, self.gids);
         let p = params;
         let route_ok = p.route.is_none_or(|r| (r.sgid_index as u16) < gids);
-        let fits = |n: u8, log: u32| 1u32.checked_shl(log).is_some_and(|max| u32::from(n) <= max);
+        // The context holds the count as a 3-bit log2, so at most 128 whatever the adapter reports.
+        let fits =
+            |n: u8, log: u32| 1u32.checked_shl(log.min(MAX_LOG_RESOURCES)).is_some_and(|max| u32::from(n) <= max);
         if p.path_mtu == 0
             || p.path_mtu > port_mtu
             || p.sl > 15
@@ -518,5 +532,17 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         if let Some(slot) = self.rc.get_mut(id.0 as usize) {
             *slot = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_counts_beyond_the_context_field_are_not_encoded_as_zero() {
+        assert_eq!(log2_count(128), MAX_LOG_RESOURCES);
+        assert!(log2_count(129) > MAX_LOG_RESOURCES, "129 needs a log the 3-bit field cannot hold");
+        assert!(log2_count(255) > MAX_LOG_RESOURCES);
     }
 }

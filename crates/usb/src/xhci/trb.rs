@@ -252,7 +252,7 @@ impl Trb {
             None => flag::SIA,
         };
         let isp = if dir_in { flag::ISP } else { 0 };
-        Self::new(kind::ISOCH, buf, len & 0x1_ffff, isp | flag::IOC | tbc << 7 | tlbpc << 16 | when)
+        Self::new(kind::ISOCH, buf, len & 0x1_ffff, isp | flag::IOC | (tbc & 0x3) << 7 | (tlbpc & 0xf) << 16 | when)
     }
 
     /// Normal TRB for a bulk or interrupt transfer of `len` bytes at `buf`.
@@ -289,6 +289,9 @@ mod tests {
         assert_eq!((ss.control >> 7 & 3, ss.control >> 16 & 0xf), (1, 2));
         assert_eq!(ss.control & (flag::SIA | flag::IOC | flag::ISP), flag::SIA | flag::IOC | flag::ISP);
 
+        // A burst count that does not fit TBC cannot spill into the neighbouring fields.
+        let wide = Trb::isoch(0x1000, 4096, 64, 0, true, None, false);
+        assert_eq!(wide.control & !(0x3 << 7 | 0xf << 16), flag::SIA | flag::IOC | (kind::ISOCH << 10));
         assert_eq!(Trb::link(0x3000).control, (kind::LINK << 10) | flag::TOGGLE_CYCLE);
     }
 }

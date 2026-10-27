@@ -367,3 +367,42 @@ fn failures_in_the_adapter_are_reported_and_unwound() {
         assert_eq!(hca.qps().len(), 3);
     }
 }
+
+#[test]
+fn a_window_registration_that_times_out_is_leaked_not_freed() {
+    let hca = FakeHca::new(IB);
+    let dma = HostDma::default();
+    let mlx = bring_up(&hca, &dma).unwrap();
+    let mut ib = mlx.open_ib(1, QKEY).unwrap();
+    let live = dma.live.get();
+    hca.state.borrow_mut().hang = Some(op::SW2HW_MPT);
+    assert_eq!(ib.rc_create().err(), Some(Mlx4Error::Timeout));
+    assert!(mlx.hcr.is_wedged());
+    // The window (and only it, the queues having been quarantined too) stays allocated.
+    assert!(dma.live.get() > live, "the adapter may still own the window");
+}
+
+#[test]
+fn window_keys_are_not_reissued_after_the_counter_is_used_up() {
+    let hca = FakeHca::new(IB);
+    let dma = HostDma::default();
+    let mlx = bring_up(&hca, &dma).unwrap();
+    let mut ib = mlx.open_ib(1, QKEY).unwrap();
+    let mut keys = std::collections::BTreeSet::new();
+    let mut refused = false;
+    for _ in 0..300 {
+        match ib.rc_create() {
+            Ok((id, info)) => {
+                assert!(keys.insert(info.window.rkey), "a revoked key came back");
+                ib.rc_destroy(id);
+            }
+            Err(e) => {
+                assert_eq!(e, Mlx4Error::NoMemory);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused, "the slot is retired once its keys are used up");
+    assert_eq!(keys.len(), 255);
+}

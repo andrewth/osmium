@@ -450,6 +450,39 @@ fn cancelling_an_interrupt_transfer_leaves_the_periodic_list_intact() {
 }
 
 #[test]
+fn an_unconfirmed_abort_wedges_the_slot_and_later_aborts_find_the_real_predecessor() {
+    let mut rig = Rig::new(Kind::High);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ehci::new(rig.io(), &dma, &clock).unwrap();
+    let mut cfg = [0u8; 128];
+    let dev = osmium_hal::usb::enumerate(&mut hc, 1, &mut cfg).unwrap();
+    let eps = [EndpointDescriptor { address: 0x83, attributes: 3, max_packet_size_raw: 8, interval: 4 }];
+    hc.submit_in(dev.id, 0x83, 8).unwrap();
+    // A controller that does not advance its frame index cannot confirm the unlink.
+    let cmd = hc.op_read(USBCMD);
+    hc.op_write(USBCMD, cmd & !CMD_RUN);
+    hc.configure_endpoints(dev.id, &eps).unwrap();
+    assert!(hc.mem.pending[0].as_ref().is_some_and(|p| p.wedged), "the memory stays, flagged");
+    assert_eq!(hc.poll(0, &mut [0u8; 8]), None);
+    hc.op_write(USBCMD, cmd);
+    // The next transfer takes another slot, and runs.
+    hc.submit_in(dev.id, 0x83, 8).unwrap();
+    assert!(hc.mem.pending[1].is_some());
+    rig.dev.borrow_mut().report = Some(std::vec![7; 8]);
+    let mut report = [0u8; 8];
+    let got = (0..1000).find_map(|_| {
+        sim::run();
+        hc.poll_in(dev.id, 0x83, &mut report)
+    });
+    assert_eq!(got, Some(Ok(8)));
+    // Cancelling it now: its predecessor is the root, not the wedged queue head before it.
+    hc.submit_in(dev.id, 0x83, 8).unwrap();
+    hc.configure_endpoints(dev.id, &eps).unwrap();
+    assert_eq!(hc.qh_word(QH_PERIODIC_ROOT, 0), hc.qh_addr(QH_PERIODIC + 1) | LINK_QH);
+    assert_eq!(hc.qh_word(QH_PERIODIC, 0), hc.qh_addr(QH_PERIODIC + 1) | LINK_QH, "the wedged one is left alone");
+}
+
+#[test]
 fn a_device_that_does_not_answer_fails_the_transfer_and_recovers() {
     let mut rig = Rig::new(Kind::High);
     let (dma, clock) = (LowDma::default(), TickClock::default());
@@ -580,6 +613,28 @@ fn a_bulk_in_ended_by_a_zero_length_packet_keeps_the_toggles_in_step() {
     let (dma, clock) = (LowDma::default(), TickClock::default());
     let mut hc = Ehci::new(rig.io(), &dma, &clock).unwrap();
     fakedev::zlp_terminated_in(&mut hc, &rig.dev, 1);
+}
+
+#[test]
+fn a_short_caller_buffer_does_not_desync_the_toggle() {
+    let mut rig = Rig::new(Kind::High);
+    let (dma, clock) = (LowDma::default(), TickClock::default());
+    let mut hc = Ehci::new(rig.io(), &dma, &clock).unwrap();
+    let mut cfg = [0u8; 128];
+    let dev = osmium_hal::usb::enumerate(&mut hc, 1, &mut cfg).unwrap();
+    // Two packets (64 + 36) come back, of which the caller's buffer takes 4 bytes.
+    hc.transfer_out(dev.id, 0x02, &[9; 100]).unwrap();
+    hc.submit_in(dev.id, 0x81, 128).unwrap();
+    let mut small = [0u8; 4];
+    let got = (0..1000).find_map(|_| {
+        sim::run();
+        hc.poll_in(dev.id, 0x81, &mut small)
+    });
+    assert_eq!(got, Some(Ok(4)));
+    hc.transfer_out(dev.id, 0x02, &[1, 2]).unwrap();
+    let mut buf = [0u8; 8];
+    assert_eq!(hc.transfer_in(dev.id, 0x81, &mut buf), Ok(2));
+    assert_eq!(rig.dev.borrow().toggle_errors, 0);
 }
 
 #[test]

@@ -370,6 +370,8 @@ impl<'d, D: DmaAllocator + ?Sized> Uhci<'d, D> {
         };
         hc.build_schedule();
         hc.reset()?;
+        // The schedule must be visible before the controller is pointed at it.
+        osmium_arch::barrier::mb();
         hc.regs.w16(USBINTR, 0);
         hc.regs.w16(FRNUM, 0);
         hc.regs.w32(FRBASEADD, hc.mem.frames.device_addr().as_u64() as u32);
@@ -573,6 +575,8 @@ impl<'d, D: DmaAllocator + ?Sized> Uhci<'d, D> {
             if st & TD_ACTIVE != 0 {
                 return Progress::Running;
             }
+            // Completion is seen: only now may the received data be read.
+            osmium_arch::barrier::dma_rmb();
             if st & TD_ERRORS != 0 {
                 return Progress::Failed(error_from(st));
             }
@@ -782,8 +786,8 @@ impl<D: DmaAllocator + ?Sized> Hc for Uhci<'_, D> {
             }
             Progress::Done { bytes, clean } => {
                 quiet = self.finish(&p.xfer, p.qh, &p.plan, clean);
-                let n = bytes.min(p.len).min(buf.len());
-                if let Some(dst) = buf.get_mut(..n) {
+                let n = bytes.min(p.len);
+                if let Some(dst) = buf.get_mut(..n.min(buf.len())) {
                     p.xfer.buf.read(0, dst);
                 }
                 Ok(n)

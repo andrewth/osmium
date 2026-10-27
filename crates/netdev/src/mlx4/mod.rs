@@ -675,7 +675,9 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
     /// was revoked stays dead.
     fn register_window(&self, slot: u32, addr: u64, len: usize) -> Result<u32, Mlx4Error> {
         let counter = self.window_variant.get(slot as usize).ok_or(Mlx4Error::BadParameter)?;
-        let variant = counter.get().wrapping_add(1);
+        // The variant is the key's top byte. Once all are used the slot is retired: wrapping would
+        // reissue the key of a revoked registration.
+        let variant = counter.get().checked_add(1).ok_or(Mlx4Error::NoMemory)?;
         counter.set(variant);
         let index = self.caps.reserved_mrws + 1 + slot;
         let key = (variant as u32) << 24 | index;
