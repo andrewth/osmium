@@ -36,7 +36,7 @@ use osmium_sched::Task;
 use osmium_sync::IrqSpinLock;
 use osmium_sync::intrusive::{Adapter, Link, List};
 
-use crate::futex::{OWNER_DIED, SLEEPERS, TID_MASK, WAITERS_BIT, read_u32};
+use crate::futex::{OWNER_DIED, SLEEPERS, TID_MASK, WAITERS_BIT, prefault, read_u32};
 use crate::process::{Pid, Process};
 use crate::thread::Thread;
 
@@ -174,6 +174,7 @@ fn try_acquire(p: &Process, pi: &PiList, addr: u64, tid: u32, cur: u32) -> Resul
 /// `FUTEX_TRYLOCK_PI`.
 pub(crate) fn trylock(p: &Process, th: &Thread, addr: u64) -> Result<u64, Errno> {
     let tid = th.tid();
+    prefault(p, addr, true);
     let pi = PI.lock();
     let cur = read_u32(p, addr)?;
     if cur & TID_MASK == tid {
@@ -195,6 +196,8 @@ pub(crate) fn lock(p: &Process, th: &Thread, addr: u64, deadline: Option<u64>) -
         granted: AtomicBool::new(false),
         _pinned: PhantomPinned,
     });
+    // The word is touched under the lock: make it resident first.
+    prefault(p, addr, true);
     let owner = {
         let mut pi = PI.lock();
         let cur = read_u32(p, addr)?;
@@ -228,6 +231,7 @@ pub(crate) fn lock(p: &Process, th: &Thread, addr: u64, deadline: Option<u64>) -
             return Ok(0);
         }
         // The owner no longer has this waiter's priority.
+        prefault(p, addr, false);
         let pi = PI.lock();
         recompute(p, &pi, owner);
         let now = owner_tid(p, addr);
@@ -242,6 +246,7 @@ pub(crate) fn lock(p: &Process, th: &Thread, addr: u64, deadline: Option<u64>) -
 /// `FUTEX_UNLOCK_PI`: hands the lock to the best waiter, or frees it.
 pub(crate) fn unlock(p: &Process, th: &Thread, addr: u64) -> Result<u64, Errno> {
     let tid = th.tid();
+    prefault(p, addr, true);
     let mut pi = PI.lock();
     let cur = read_u32(p, addr)?;
     if cur & TID_MASK != tid {

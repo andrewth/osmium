@@ -105,6 +105,7 @@ impl Waiter {
     /// Queues the waiter at its address if the word there still holds `val`:
     /// the check and the queueing cannot be separated by a wake.
     pub(crate) fn enqueue(self: Pin<&Self>, p: &Process, val: u32) -> Result<(), Errno> {
+        prefault(p, self.addr.load(Ordering::SeqCst), false);
         let mut waiters = WAITERS.lock();
         if read_u32(p, self.addr.load(Ordering::SeqCst))? != val {
             return Err(Errno::EAGAIN);
@@ -181,6 +182,13 @@ fn wake_bits(pid: Pid, addr: u64, n: u32, mask: u32) -> u32 {
         SLEEPERS.wake_all();
     }
     woken
+}
+
+/// Makes the word at `addr` resident (and writable if `write`) before a
+/// spin lock is taken for a read or write of it: see [`UserMemory::prefault`].
+/// A bad address is left for the access under the lock to report.
+pub(crate) fn prefault(p: &Process, addr: u64, write: bool) {
+    let _ = p.memory().prefault(addr, 4, write);
 }
 
 pub(crate) fn read_u32(p: &Process, addr: u64) -> Result<u32, Errno> {
@@ -306,6 +314,9 @@ fn requeue(
         return Err(Errno::EINVAL);
     }
     let pid = p.pid();
+    if expect.is_some() {
+        prefault(p, uaddr, false);
+    }
     let mut waiters = WAITERS.lock();
     if let Some(v) = expect
         && read_u32(p, uaddr)? != v
@@ -346,6 +357,7 @@ fn wake_op(p: &Process, [uaddr, uaddr2]: [u64; 2], [nr_wake, nr_wake2]: [u32; 2]
         oparg = u32::try_from(oparg).ok().and_then(|n| 1i32.checked_shl(n)).ok_or(Errno::EINVAL)?;
     }
     let pid = p.pid();
+    prefault(p, uaddr2, true);
     let mut waiters = WAITERS.lock();
     let old = read_u32(p, uaddr2)? as i32;
     let new = match op {
@@ -483,9 +495,11 @@ pub(crate) fn exit_robust_list(p: &Process, th: &Thread) {
 }
 
 fn owner_died(p: &Process, tid: u32, addr: u64) {
+    prefault(p, addr, true);
     if crate::futex_pi::owner_died(p, tid, addr) {
         return;
     }
+    prefault(p, addr, true);
     let mut waiters = WAITERS.lock();
     let Ok(v) = read_u32(p, addr) else { return };
     if v & TID_MASK != tid {

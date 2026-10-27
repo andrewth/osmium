@@ -395,7 +395,7 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Getpid => Ok(p.pid().0 as u64),
         Sys::Gettid => Ok(th.tid() as u64),
         Sys::Getcpu => getcpu(p, a[0], a[1]),
-        Sys::Getppid => Ok(p.parent().map_or(0, |pid| pid.0 as u64)),
+        Sys::Getppid => Ok(getppid(p)),
         Sys::Brk => Ok(p.brk(a[0])),
         Sys::Mmap => mmap(p, a[1], a[2], a[3], a[4] as i32, a[5]),
         Sys::Munmap => munmap(p, a[0], a[1]),
@@ -493,21 +493,31 @@ fn open_file(p: &Process, fd: i32) -> Result<alloc::sync::Arc<OpenFile>, Errno> 
 /// chunk's error, or a file with no more data ready (per `poll`), ends the
 /// call with the partial count instead of failing or blocking.
 fn read(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
+    read_after(p, fd, buf, len, 0)
+}
+
+/// [`read`] as one piece of a vectored read that has already delivered
+/// `already` bytes: with data delivered, nothing here may block or fail.
+fn read_after(p: &Process, fd: i32, buf: u64, len: u64, already: u64) -> SysResult {
     let f = open_file(p, fd)?;
-    let mut kbuf = try_zeroed((len as usize).min(CHUNK)).map_err(oom)?;
+    let mut kbuf = match try_zeroed((len as usize).min(CHUNK)) {
+        Ok(k) => k,
+        Err(_) if already > 0 => return Ok(0),
+        Err(e) => return Err(oom(e)),
+    };
     let mut done = 0;
     while done < len {
-        if done > 0 && f.file().poll() & osmium_fs::POLLIN == 0 {
+        if done + already > 0 && f.file().poll() & osmium_fs::POLLIN == 0 {
             break;
         }
         let want = ((len - done) as usize).min(CHUNK);
         let n = match bytes::slice_mut(&mut kbuf, 0, want).and_then(|k| f.read(k)) {
             Ok(n) => n,
-            Err(_) if done > 0 => break,
+            Err(_) if done + already > 0 => break,
             Err(e) => return Err(e),
         };
         if let Err(e) = user_add(buf, done).and_then(|va| p.memory().write(va, bytes::slice(&kbuf, 0, n)?)) {
-            if done > 0 {
+            if done + already > 0 {
                 break;
             }
             return Err(e);
@@ -583,7 +593,7 @@ fn iovecs(p: &Process, iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64
 fn readv(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
     let mut total = 0;
     for (base, len) in iovecs(p, iov, count)? {
-        let n = read(p, fd, base, len)?;
+        let n = read_after(p, fd, base, len, total)?;
         // Cannot overflow: the lengths sum to at most `isize::MAX`.
         total += n;
         if n < len {
@@ -599,10 +609,26 @@ fn writev(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
     const GATHER: usize = 64 * 1024;
     let f = p.files().lock().get(fd)?;
     let mut pending = alloc::vec::Vec::new();
-    let mut total = 0;
-    let mut flush = |pending: &mut alloc::vec::Vec<u8>| -> Result<bool, Errno> {
-        let n = if pending.is_empty() { 0 } else { f.write(pending).inspect_err(|&e| sigpipe(p, &f, e))? };
-        total += n as u64;
+    let mut total = 0u64;
+    // Writes the gathered bytes. `Ok(true)` when all of them were taken; an
+    // error after bytes were already written ends the call with that count.
+    let flush = |pending: &mut alloc::vec::Vec<u8>, total: &mut u64| -> Result<bool, Errno> {
+        let n = if pending.is_empty() {
+            0
+        } else {
+            match f.write(pending) {
+                Ok(n) => n,
+                Err(_) if *total > 0 => {
+                    pending.clear();
+                    return Ok(false);
+                }
+                Err(e) => {
+                    sigpipe(p, &f, e);
+                    return Err(e);
+                }
+            }
+        };
+        *total += n as u64;
         let complete = n == pending.len();
         pending.clear();
         Ok(complete)
@@ -614,14 +640,22 @@ fn writev(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
             let start = pending.len();
             pending.try_reserve(n).map_err(|_| Errno::ENOMEM)?;
             pending.resize(start + n, 0);
-            p.memory().read(user_add(base, done)?, bytes::slice_mut(&mut pending, start, n)?)?;
+            let read =
+                user_add(base, done).and_then(|va| p.memory().read(va, bytes::slice_mut(&mut pending, start, n)?));
+            if let Err(e) = read {
+                // Write what was gathered before the fault, then report it
+                // only if nothing at all was written.
+                pending.truncate(start);
+                let _ = flush(&mut pending, &mut total);
+                return if total > 0 { Ok(total) } else { Err(e) };
+            }
             done += n as u64;
-            if pending.len() == GATHER && !flush(&mut pending)? {
+            if pending.len() == GATHER && !flush(&mut pending, &mut total)? {
                 return Ok(total);
             }
         }
     }
-    flush(&mut pending)?;
+    flush(&mut pending, &mut total)?;
     Ok(total)
 }
 
@@ -648,6 +682,9 @@ fn user_cstr(p: &Process, va: u64, max: usize, too_long: Errno) -> Result<alloc:
         let piece = bytes::slice_mut(&mut chunk, 0, n)?;
         p.memory().read(addr, piece)?;
         if let Some(end) = piece.iter().position(|&b| b == 0) {
+            if out.len() + end >= max {
+                return Err(too_long);
+            }
             try_extend_from_slice(&mut out, bytes::slice(piece, 0, end)?).map_err(oom)?;
             break;
         }
@@ -666,7 +703,11 @@ fn vfs() -> Result<&'static osmium_fs::Vfs, Errno> {
 
 /// The absolute path for `path` relative to `dirfd`.
 fn path_at(p: &Process, dirfd: i32, path: u64) -> Result<String, Errno> {
-    let path = user_path(p, path)?;
+    resolve_at(p, dirfd, user_path(p, path)?)
+}
+
+/// [`path_at`] for a path already read from user memory.
+fn resolve_at(p: &Process, dirfd: i32, path: String) -> Result<String, Errno> {
     if path.is_empty() {
         return Err(Errno::ENOENT);
     }
@@ -746,14 +787,16 @@ fn lseek(p: &Process, fd: i32, off: i64, whence: u64) -> SysResult {
 }
 
 fn newfstatat(p: &Process, dirfd: i32, path: u64, buf: u64, flags: u64) -> SysResult {
-    let st = if flags & AT_EMPTY_PATH != 0 && user_path(p, path)?.is_empty() {
+    // The path is read once: a second read could see different contents.
+    let path = user_path(p, path)?;
+    let st = if flags & AT_EMPTY_PATH != 0 && path.is_empty() {
         let f = if dirfd == AT_FDCWD { None } else { Some(p.files().lock().get(dirfd)?) };
         match f {
             Some(f) => f.file().try_stat()?,
             None => vfs()?.stat(&p.cwd(), true)?,
         }
     } else {
-        vfs()?.stat(&path_at(p, dirfd, path)?, flags & AT_SYMLINK_NOFOLLOW == 0)?
+        vfs()?.stat(&resolve_at(p, dirfd, path)?, flags & AT_SYMLINK_NOFOLLOW == 0)?
     };
     put_stat(p, buf, &st)
 }
@@ -1040,7 +1083,7 @@ fn execve(p: &Process, th: &Thread, path: u64, argv: u64, envp: u64) -> Result<O
     // Everything that can fail for want of a good executable happens before
     // the other threads are ended: a failed execve leaves them running.
     let prepared = p.exec_prepare(&path, &argv, &envp)?;
-    if p.group.live() > 1 {
+    if p.group.live() > 1 || !th.is_leader() {
         crate::thread::exec_begin(p, th)?;
     }
     let entry = p.exec_commit(prepared);
@@ -1069,6 +1112,17 @@ fn wait4(p: &Process, pid: i32, wstatus: u64, options: u64, rusage: u64) -> SysR
         p.memory().write(rusage, &[0; 144])?;
     }
     Ok(pid.0 as u64)
+}
+
+/// The parent's id, or 1 (init) once the parent has ended: this crate has no
+/// reparenting, but a child must not keep reporting a dead parent. 0 for a
+/// process the kernel made.
+fn getppid(p: &Process) -> u64 {
+    match p.parent() {
+        None => 0,
+        Some(pid) if Process::find(pid).is_some_and(|parent| parent.exit_status().is_none()) => pid.0 as u64,
+        Some(_) => 1,
+    }
 }
 
 fn dup(p: &Process, fd: i32) -> SysResult {

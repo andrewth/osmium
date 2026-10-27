@@ -873,6 +873,7 @@ mod jobsig;
 mod oom;
 mod pie;
 mod restart;
+mod review;
 mod sigthread;
 mod smp;
 mod unix;

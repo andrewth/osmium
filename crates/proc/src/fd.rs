@@ -11,10 +11,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use osmium_sched::{Mutex, MutexGuard};
 use osmium_sync::Once;
 use osmium_sync::fallible::{OutOfMemory, try_arc};
 
-use osmium_fs::{Errno, File};
+use osmium_fs::{Errno, File, FileKind};
 
 /// Most descriptors a process may have open (Linux's default soft limit).
 pub const MAX_FDS: usize = 1024;
@@ -43,6 +44,9 @@ pub struct OpenFile {
     /// Shared by every descriptor duplicated from this open (including across
     /// `fork`), so it is only ever advanced with an atomic read-modify-write.
     offset: AtomicU64,
+    /// Held across a read or write of a seekable file, so two descriptors
+    /// sharing the description cannot both use the same offset.
+    io: Mutex<()>,
     /// The absolute path it was opened by, for `*at` calls relative to it.
     path: Option<String>,
 }
@@ -59,7 +63,7 @@ impl OpenFile {
 
     /// [`OpenFile::new`], failing with `ENOMEM` instead of panicking.
     pub fn try_new(file: Arc<dyn File>, access: Access) -> Result<Arc<Self>, Errno> {
-        try_arc(Self { file, access, offset: AtomicU64::new(0), path: None }).map_err(crate::oom)
+        try_arc(Self { file, access, offset: AtomicU64::new(0), io: Mutex::new(()), path: None }).map_err(crate::oom)
     }
 
     /// Opens `file`, found at the absolute `path`, at offset 0.
@@ -73,7 +77,8 @@ impl OpenFile {
 
     /// [`OpenFile::with_path`], failing with `ENOMEM` instead of panicking.
     pub fn try_with_path(file: Arc<dyn File>, access: Access, path: String) -> Result<Arc<Self>, Errno> {
-        try_arc(Self { file, access, offset: AtomicU64::new(0), path: Some(path) }).map_err(crate::oom)
+        try_arc(Self { file, access, offset: AtomicU64::new(0), io: Mutex::new(()), path: Some(path) })
+            .map_err(crate::oom)
     }
 
     /// The path it was opened by, if any.
@@ -113,11 +118,20 @@ impl OpenFile {
         }
     }
 
+    /// Serialises use of the offset, for a file that has one. Streams
+    /// (pipes, sockets, devices) can block indefinitely and ignore the
+    /// offset, so they are not serialised.
+    fn position_lock(&self) -> Result<Option<MutexGuard<'_, ()>>, Errno> {
+        let kind = self.file.try_stat()?.kind;
+        Ok((!matches!(kind, FileKind::CharDevice | FileKind::Fifo | FileKind::Socket)).then(|| self.io.lock()))
+    }
+
     /// Reads at the current position and advances it.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         if !self.access.read {
             return Err(Errno::EBADF);
         }
+        let _pos = self.position_lock()?;
         let n = self.file.read(self.offset(), buf)?;
         self.advance(n)?;
         Ok(n)
@@ -129,6 +143,7 @@ impl OpenFile {
         if !self.access.write {
             return Err(Errno::EBADF);
         }
+        let _pos = self.position_lock()?;
         if self.access.append {
             // An append lands at the end and leaves the position just past it.
             let off = self.file.try_stat()?.size;

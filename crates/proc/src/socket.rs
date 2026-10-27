@@ -1079,12 +1079,18 @@ pub(crate) fn recvmsg(p: &Process, fd: i32, msg: u64, flags: u64) -> SysResult {
     }
     let namelen_at = msg.checked_add(8).ok_or(Errno::EFAULT)?;
     put_from(p, h.name, namelen_at, &r)?;
+    // The last fields are written before any descriptor is installed, so a
+    // fault there cannot leave descriptors the program never learns of.
+    let (controllen_at, flags_at) =
+        (msg.checked_add(40).ok_or(Errno::EFAULT)?, msg.checked_add(48).ok_or(Errno::EFAULT)?);
+    p.memory().write(controllen_at, &0u64.to_ne_bytes())?;
+    p.memory().write(flags_at, &0u32.to_ne_bytes())?;
     let want_cred = matches!(&s, Any::Unix(u) if u.passcred());
     let (used, ctrunc) =
         scm::write_control(p, h.control, h.controllen, r.anc, flags & MSG_CMSG_CLOEXEC != 0, want_cred)?;
-    p.memory().write(msg.checked_add(40).ok_or(Errno::EFAULT)?, &(used as u64).to_ne_bytes())?;
+    p.memory().write(controllen_at, &(used as u64).to_ne_bytes())?;
     let flags_out = if r.truncated { MSG_TRUNC as u32 } else { 0 } | if ctrunc { MSG_CTRUNC as u32 } else { 0 };
-    p.memory().write(msg.checked_add(48).ok_or(Errno::EFAULT)?, &flags_out.to_ne_bytes())?;
+    p.memory().write(flags_at, &flags_out.to_ne_bytes())?;
     Ok(r.copied as u64)
 }
 

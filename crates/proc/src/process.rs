@@ -66,7 +66,9 @@ struct Brk {
 /// [`Process::wait_child`]. The address space is freed once both are gone:
 /// the task has exited and its CPU has switched away from it, and (for a
 /// forked process) the parent has reaped it or ended itself. Until then an
-/// exited child, a zombie, keeps its whole address space.
+/// exited child, a zombie, keeps its whole address space, but not its open
+/// files: those are closed when the last thread exits. If the parent ignores
+/// `SIGCHLD` or sets `SA_NOCLDWAIT`, an exiting child is reaped at once.
 pub struct Process {
     pid: Pid,
     parent: Option<Pid>,
@@ -74,6 +76,8 @@ pub struct Process {
     /// Replaced by `execve`, which is why it is shared and locked.
     memory: IrqSpinLock<Arc<dyn UserMemory>>,
     brk: IrqSpinLock<Brk>,
+    /// Serialises `brk` calls, which map and unmap outside the `brk` lock.
+    brk_serial: Mutex<()>,
     /// The address range `mmap` hands out, and which parts of it are free.
     mmap: IrqSpinLock<MmapArea>,
     files: Mutex<FdTable>,
@@ -184,6 +188,7 @@ impl Process {
             name: IrqSpinLock::new(name),
             memory: IrqSpinLock::new(memory),
             brk: IrqSpinLock::new(brk),
+            brk_serial: Mutex::new(()),
             mmap: IrqSpinLock::new(mmap),
             files: Mutex::new(files),
             cwd: IrqSpinLock::new(cwd),
@@ -486,6 +491,13 @@ impl Process {
         if let Some(parent) = self.parent.and_then(Process::find) {
             // Queue the signal first: a parent woken from `wait4` must already see it pending.
             crate::signal::child_exited(&parent, self.pid);
+            // `SIG_IGN` or `SA_NOCLDWAIT` for `SIGCHLD`: no zombie is left to wait for.
+            let act = parent.signals.action(crate::signal::sig::SIGCHLD);
+            if act.handler == crate::signal::SIG_IGN || act.flags & crate::signal::sa::NOCLDWAIT != 0 {
+                // Dropped after the lock is released: it may free the child.
+                let reaped = parent.children.lock().remove_first_where(|c| c.pid == self.pid);
+                drop(reaped);
+            }
             parent.child_exited.wake_all();
         }
     }
@@ -494,7 +506,11 @@ impl Process {
     /// bounds, mapping or unmapping whole pages, and returns the (possibly
     /// unchanged) break. `addr == 0` just queries it.
     pub fn brk(&self, addr: u64) -> u64 {
-        let mut brk = self.brk.lock();
+        // One `brk` at a time, but the spin lock below is only held to read
+        // and write the numbers: mapping and unmapping (which shoots down
+        // other CPUs' TLBs) happen with no spin lock held.
+        let _serial = self.brk_serial.lock();
+        let brk = *self.brk.lock();
         if addr < brk.start || addr > brk.limit {
             return brk.end;
         }
@@ -511,8 +527,8 @@ impl Process {
         } else if new < old {
             memory.unmap(new, old - new);
         }
-        brk.end = addr;
-        brk.end
+        self.brk.lock().end = addr;
+        addr
     }
 
     /// `mmap` for private anonymous memory: maps `len` bytes of zeroed
@@ -542,13 +558,14 @@ impl Process {
         let len = len.checked_next_multiple_of(PAGE).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         // For giving the range back if the mapping fails.
         let spare = FreeRange::spare().map_err(|_| Errno::ENOMEM)?;
-        let mut area = self.mmap.lock();
-        let va = area.alloc(len)?;
+        // The range is reserved in the area by `alloc`, so the lock is not
+        // held while mapping, or while unmapping on failure (a TLB shootdown).
+        let va = self.mmap.lock().alloc(len)?;
         let memory = self.memory();
         if let Err(e) = map(&*memory, va, len) {
             // Give back what was mapped before it ran out.
             memory.unmap(va, len);
-            area.release(va, va + len, spare);
+            self.mmap.lock().release(va, va + len, spare);
             return Err(e);
         }
         Ok(va)

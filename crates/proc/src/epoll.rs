@@ -272,11 +272,14 @@ pub(crate) fn ctl(p: &Process, epfd: i32, op: u64, fd: i32, event: u64) -> SysRe
     }
     // Made before the lock is taken, where memory running out is an error.
     let node = if op == EPOLL_CTL_ADD { Some(Watch::new(fd, Arc::downgrade(&target), events, data)?) } else { None };
+    // Looked up before the lock: a stat may do file I/O.
+    let always_ready = op == EPOLL_CTL_ADD
+        && matches!(target.file().try_stat()?.kind, FileKind::Regular | FileKind::Directory | FileKind::Symlink);
     let mut watches = ep.watches.lock();
     match op {
         EPOLL_CTL_ADD => {
             // Like Linux, refuse files that are always ready.
-            if matches!(target.file().try_stat()?.kind, FileKind::Regular | FileKind::Directory | FileKind::Symlink) {
+            if always_ready {
                 return Err(Errno::EPERM);
             }
             if watches.find(&fd).is_some_and(|w| w.file.strong_count() > 0) {

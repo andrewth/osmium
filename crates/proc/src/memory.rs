@@ -43,6 +43,16 @@ pub trait UserMemory: Send + Sync {
     fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), Errno>;
     /// Copies `data` to user address `va`.
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Errno>;
+    /// Makes `va..va + len` resident (and, if `write`, privately writable),
+    /// loading file pages and breaking copy-on-write, without copying. A
+    /// caller that must read or write user memory under a spin lock calls
+    /// this first, so the copy under the lock finds the pages present and
+    /// never has to allocate, do file I/O or shoot down other CPUs (a page
+    /// that is swapped out or unshared in between still can, rarely). The
+    /// default does nothing.
+    fn prefault(&self, _va: u64, _len: usize, _write: bool) -> Result<(), Errno> {
+        Ok(())
+    }
     /// Maps zeroed, user-accessible pages over `va..va + len` (page-aligned)
     /// with `flags`. Pages already mapped are left as they are.
     fn map_anon(&self, va: u64, len: u64, flags: MapFlags) -> Result<(), Errno>;
@@ -277,6 +287,29 @@ struct Inner<F: PageTableFormat, A: TableAlloc> {
 }
 
 impl<F: PageTableFormat, A: TableAlloc + Clone> AddressSpace<F, A> {
+    /// Gives every copy-on-write page in `va..va + len` its own frame.
+    fn break_cow_range(
+        &self,
+        inner: &mut Inner<F, A>,
+        va: u64,
+        len: usize,
+        deferred: &mut Deferred<A>,
+    ) -> Result<(), Errno> {
+        let end = va.checked_add(len as u64).ok_or(Errno::EFAULT)?;
+        let mut from = va & !(PAGE - 1);
+        while from < end
+            && let Some(page) = inner.pages.lower_bound(&from)
+            && page.va() < end
+        {
+            let (at, cow) = (page.va(), page.is_cow());
+            from = at + PAGE;
+            if cow && !self.break_cow(inner, at, deferred) {
+                return Err(Errno::EFAULT);
+            }
+        }
+        Ok(())
+    }
+
     /// Gives the copy-on-write page at `va` (page-aligned) its own writable
     /// frame. Returns false if it is not one, or memory ran out.
     fn break_cow(&self, inner: &mut Inner<F, A>, va: u64, deferred: &mut Deferred<A>) -> bool {
@@ -531,24 +564,25 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         })
     }
 
+    fn prefault(&self, va: u64, len: usize, write: bool) -> Result<(), Errno> {
+        // Declared first so it is dropped (and the shootdown sent) after the lock.
+        let mut deferred = Deferred::<A>::new();
+        self.fault_in(va, len, write)?;
+        let mut inner = self.inner.lock();
+        self.populate(&mut inner, va, len, write)?;
+        if write {
+            self.break_cow_range(&mut inner, va, len, &mut deferred)?;
+        }
+        Ok(())
+    }
+
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Errno> {
         // Declared first so it is dropped (and the shootdown sent) after the lock.
         let mut deferred = Deferred::<A>::new();
         self.fault_in(va, data.len(), true)?;
         let mut inner = self.inner.lock();
-        let end = va.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
         self.populate(&mut inner, va, data.len(), true)?;
-        let mut from = va & !(PAGE - 1);
-        while from < end
-            && let Some(page) = inner.pages.lower_bound(&from)
-            && page.va() < end
-        {
-            let (at, cow) = (page.va(), page.is_cow());
-            from = at + PAGE;
-            if cow && !self.break_cow(&mut inner, at, &mut deferred) {
-                return Err(Errno::EFAULT);
-            }
-        }
+        self.break_cow_range(&mut inner, va, data.len(), &mut deferred)?;
         walk(&inner.pt, va, data.len(), MapFlags::WRITE, |dst, off, n| {
             let from = data.get(off..off.saturating_add(n)).ok_or(Errno::EFAULT)?;
             // SAFETY: `dst` points at `n` bytes of a user-writable frame.

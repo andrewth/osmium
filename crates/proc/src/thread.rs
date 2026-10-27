@@ -157,6 +157,11 @@ impl Thread {
         }
     }
 
+    /// Whether this is the group leader (its id is the process id).
+    pub(crate) fn is_leader(&self) -> bool {
+        self.leader.load(Ordering::SeqCst)
+    }
+
     /// The thread id: the process id for the first thread.
     pub fn tid(&self) -> u32 {
         self.tid.load(Ordering::SeqCst)
@@ -405,6 +410,15 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
     }
     let me = Process::find(p.pid()).ok_or(ESRCH)?;
     let tid = crate::process::alloc_id();
+    // Written before the thread is registered, so a fault here leaves
+    // nothing behind to clean up.
+    let bytes = tid.to_ne_bytes();
+    if flags & PARENT_SETTID != 0 {
+        p.memory().write(ptid, &bytes)?;
+    }
+    if flags & CHILD_SETTID != 0 {
+        p.memory().write(ctid, &bytes)?;
+    }
     let th = try_arc(Thread::new(tid, false)).map_err(|_| Errno::ENOMEM)?;
     th.mask.store(caller.signal_mask(), Ordering::SeqCst);
     if flags & SETTLS != 0 {
@@ -431,13 +445,6 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
     let _ = th.owner.set(Arc::downgrade(&me));
     // SAFETY: `Thread`'s `Drop` takes it out again; the key never changes.
     unsafe { TIDS.lock().insert(&th) };
-    let bytes = tid.to_ne_bytes();
-    if flags & PARENT_SETTID != 0 {
-        p.memory().write(ptid, &bytes)?;
-    }
-    if flags & CHILD_SETTID != 0 {
-        p.memory().write(ctid, &bytes)?;
-    }
     Ok(Outcome::Thread { tid, stack, tls: if flags & SETTLS != 0 { tls } else { 0 } })
 }
 
@@ -534,6 +541,10 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
     if live == 0 {
         // Shared file mappings reach their files before anyone can see the process end.
         let _ = p.memory().sync_files();
+        // Close the descriptors now, not when the zombie is reaped: pipes
+        // must reach EOF and sockets must close for the peers.
+        let files = core::mem::take(&mut *p.files().lock());
+        drop(files);
         p.set_exited(status);
     } else if group_wide.is_some() {
         crate::signal::wake_blocked();
@@ -545,6 +556,12 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
 /// takes the process id as its thread id). `EINTR` if the process is ending
 /// anyway, or another thread's `execve` got there first.
 pub(crate) fn exec_begin(p: &Process, th: &Thread) -> Result<(), Errno> {
+    // A non-leader that is the last thread (the old leader already exited)
+    // still has to be promoted.
+    if !th.leader.load(Ordering::SeqCst) && p.group.live() == 1 {
+        promote(p, th);
+        return Ok(());
+    }
     if !doom_others(p, th) {
         return Err(Errno::EINTR);
     }

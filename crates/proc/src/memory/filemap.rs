@@ -391,11 +391,23 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         true
     }
 
-    /// Whether anything is mapped in `from..to`, by a file mapping or a page.
-    fn anything_in(inner: &Inner<F, A>, from: u64, to: u64) -> bool {
-        inner.maps.overlapping(from, to).next().is_some()
-            || inner.vmas.overlaps(from, to)
-            || inner.pages.lower_bound(&from).is_some_and(|p| p.va() < to)
+    /// Whether every page of `from..to` (page-aligned) is mapped, by a file
+    /// mapping, a lazy area or a page: a hole anywhere makes `mprotect` and
+    /// `msync` fail with `ENOMEM`, as on Linux.
+    fn fully_mapped(inner: &Inner<F, A>, from: u64, to: u64) -> bool {
+        let mut at = from;
+        while at < to {
+            at = if let Some(v) = inner.maps.find(at) {
+                v.end
+            } else if let Some(v) = inner.vmas.find(at) {
+                v.end
+            } else if inner.pages.find(&(at & !(PAGE - 1))).is_some() {
+                (at & !(PAGE - 1)).saturating_add(PAGE)
+            } else {
+                return false;
+            };
+        }
+        true
     }
 
     pub(super) fn mprotect_impl(&self, va: u64, len: u64, prot: MapFlags) -> Result<(), Errno> {
@@ -407,7 +419,10 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             return Ok(());
         }
         // Dropping pages loses what private ones hold, so those cannot lose
-        // all access; shared ones are saved first.
+        // all access (`EINVAL`): the page tables cannot keep a present page
+        // that no access reaches (RISC-V encodes that as a table pointer),
+        // so the only way to remove all access is to drop the page. Shared
+        // ones are saved first and reload from their file later.
         let none = prot == MapFlags::NONE;
         if none {
             self.writeback(va, end)?;
@@ -416,7 +431,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             // Declared first so it is dropped (and the shootdown sent) after the lock.
             let mut deferred = Deferred::<A>::new();
             let mut guard = self.inner.lock();
-            if !Self::anything_in(&guard, va, end) {
+            if !Self::fully_mapped(&guard, va, end) {
                 return Err(Errno::ENOMEM);
             }
             let Inner { pt, pages, maps, vmas } = &mut *guard;
@@ -489,7 +504,7 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         let mut files: Vec<Arc<dyn File>> = Vec::new();
         {
             let inner = self.inner.lock();
-            if !Self::anything_in(&inner, va, end) {
+            if !Self::fully_mapped(&inner, va, end) {
                 return Err(Errno::ENOMEM);
             }
             if sync {
