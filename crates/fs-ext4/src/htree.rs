@@ -441,6 +441,14 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 _ => return Ok(None),
             }
         }
+        // Entries must be in hash order (a run of equal hashes may continue
+        // over several): out of order, the binary search would send lookups
+        // to the wrong leaf and report names that exist as missing.
+        for i in 2..f.count() {
+            if f.hash(i) & !1 < f.hash(i - 1) & !1 {
+                return Err(Errno::EIO);
+            }
+        }
         Ok(Some(f))
     }
 

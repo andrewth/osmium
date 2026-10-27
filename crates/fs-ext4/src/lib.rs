@@ -82,6 +82,9 @@ const SUPERBLOCK_LEN: usize = 1024;
 const NDIR_BLOCKS: usize = 12;
 /// The most subdirectories' `..` links a directory counts; past it, with
 /// `dir_nlink`, the count stays at 1.
+/// The most a directory can hold without `largedir`.
+const MAX_DIR_BYTES: u64 = 1 << 31;
+
 const LINK_MAX: u16 = 65000;
 
 const COMPAT_HAS_JOURNAL: u32 = 0x0004;
@@ -472,6 +475,24 @@ struct Fs<D: BlockDevice + Send + 'static> {
     /// not allocate again: until the transaction commits, a crash brings
     /// them back as they were.
     tx_freed: ArcTree<ByStart>,
+    /// Counts every change to the disk (metadata or data) so that a cached
+    /// position in a directory can tell it is stale.
+    changes: u64,
+    /// Where the last `readdir` stopped, so that listing a directory by
+    /// ascending index does not rescan it from the start each time.
+    dir_cursor: Option<DirCursor>,
+}
+
+/// A resumable position in a directory listing.
+#[derive(Clone, Copy)]
+struct DirCursor {
+    ino: u32,
+    changes: u64,
+    /// Entries listed before this position.
+    seen: usize,
+    /// The directory block (logical) and byte offset to go on from.
+    lblk: u64,
+    off: usize,
 }
 
 /// A metadata block the operation in progress has changed.
@@ -649,6 +670,8 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
             journal: None,
             tx: ArcTree::new(),
             tx_freed: ArcTree::new(),
+            changes: 0,
+            dir_cursor: None,
         };
         fs.load()?;
         let mut journal = Journal::open(&mut fs)?;
@@ -887,6 +910,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     /// and re-reads the superblock and descriptors, which memory holds ahead
     /// of the disk. Allocates nothing, so it works when memory has run out.
     fn abort(&mut self) {
+        self.changes += 1;
         self.tx.clear();
         self.tx_freed.clear();
         if self.reload_metadata().is_err() {
@@ -962,6 +986,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     /// Writes metadata bytes at any offset, into the operation's
     /// transaction: they reach the disk when the operation ends.
     fn write_bytes(&mut self, off: u64, buf: &[u8]) -> Result<(), Errno> {
+        self.changes += 1;
         let bs = self.block_size as u64;
         let mut done = 0;
         while done < buf.len() {
@@ -1143,6 +1168,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     /// Writes a block of file data, in place even when journaled: the
     /// transaction that makes it reachable commits after it.
     fn write_data_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
+        self.changes += 1;
         if self.in_meta_zone(b) || b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
         }
@@ -1151,6 +1177,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
 
     /// Writes a metadata block, into the operation's transaction.
     fn write_raw_block(&mut self, b: u64, buf: &[u8]) -> Result<(), Errno> {
+        self.changes += 1;
         if b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
         }
@@ -2071,13 +2098,29 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         ino: u32,
         mut f: impl FnMut(&mut Self, u64, &mut Vec<u8>) -> Result<Option<T>, Errno>,
     ) -> Result<Option<T>, Errno> {
+        self.scan_dir_from(ino, 0, |fs, _, b, data| f(fs, b, data))
+    }
+
+    /// As [`scan_dir`](Self::scan_dir), starting at directory block `start`;
+    /// `f` also gets each block's number within the directory.
+    fn scan_dir_from<T>(
+        &mut self,
+        ino: u32,
+        start: u64,
+        mut f: impl FnMut(&mut Self, u64, u64, &mut Vec<u8>) -> Result<Option<T>, Errno>,
+    ) -> Result<Option<T>, Errno> {
         let mut inode = self.read_inode(ino)?;
         if inode.kind() != FileKind::Directory {
             return Err(Errno::ENOTDIR);
         }
         let seed = if self.csum == Csum::Crc32c { self.inode_seed(ino, &inode) } else { 0 };
         let blocks = inode.size().div_ceil(self.block_size as u64);
-        for lblk in 0..blocks {
+        // Without `largedir` a directory is at most 2 GiB; a size beyond that
+        // is damage, and walking its (sparse) blocks would take forever.
+        if blocks > MAX_DIR_BYTES / self.block_size as u64 {
+            return Err(Errno::EIO);
+        }
+        for lblk in start..blocks {
             let b = self.bmap(ino, &mut inode, lblk, false)?;
             if b == 0 {
                 continue;
@@ -2089,7 +2132,7 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                     return Err(Errno::EIO);
                 }
             }
-            if let Some(found) = f(self, b, &mut data)? {
+            if let Some(found) = f(self, lblk, b, &mut data)? {
                 return Ok(Some(found));
             }
         }
@@ -2144,9 +2187,16 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
     }
 
     fn dir_entry(&mut self, dir: u32, index: usize) -> Result<Option<DirEntry>, Errno> {
-        let mut seen = 0;
-        let found = self.scan_dir(dir, |fs, _, data| {
-            let (mut off, space) = (0, fs.dir_space(data));
+        // Resume where the last listing of this directory stopped, if
+        // nothing has changed since and it was not past `index`.
+        let (mut seen, start, resume_off) = match self.dir_cursor {
+            Some(c) if c.ino == dir && c.changes == self.changes && c.seen <= index => (c.seen, c.lblk, c.off),
+            _ => (0, 0, 0),
+        };
+        self.dir_cursor = None;
+        let first_block = start;
+        let found = self.scan_dir_from(dir, start, |fs, lblk, _, data| {
+            let (mut off, space) = (if lblk == first_block { resume_off } else { 0 }, fs.dir_space(data));
             while off < space {
                 let (ino, rec_len, name) = fs.record(data, off)?;
                 off += rec_len;
@@ -2164,13 +2214,14 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
                 if seen == index {
                     let name = lossy(name)?;
                     let ftype = if fs.filetype { byte(data, off - rec_len + 7) } else { 0 };
-                    return Ok(Some((ino, name, ftype)));
+                    return Ok(Some((ino, name, ftype, lblk, off)));
                 }
                 seen += 1;
             }
             Ok(None)
         })?;
-        let Some((ino, name, ftype)) = found else { return Ok(None) };
+        let Some((ino, name, ftype, lblk, off)) = found else { return Ok(None) };
+        self.dir_cursor = Some(DirCursor { ino: dir, changes: self.changes, seen: index + 1, lblk, off });
         let kind = match ftype {
             1 => FileKind::Regular,
             2 => FileKind::Directory,
@@ -2671,7 +2722,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
-        self.with(|fs| fs.transact(|fs| fs.remove(self.ino, name, dir)))
+        self.with(|fs| fs.transact_all(|fs| fs.remove(self.ino, name, dir)))
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
@@ -2683,7 +2734,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         if !Arc::ptr_eq(&target.shared, &self.shared) {
             return Err(Errno::EXDEV);
         }
-        self.with(|fs| fs.transact(|fs| fs.link(self.ino, name, target.ino)))
+        self.with(|fs| fs.transact_all(|fs| fs.link(self.ino, name, target.ino)))
     }
 
     fn rename(&self, old_name: &str, new_dir: &dyn File, new_name: &str) -> Result<(), Errno> {
@@ -2691,7 +2742,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         if !Arc::ptr_eq(&dst.shared, &self.shared) {
             return Err(Errno::EXDEV);
         }
-        self.with(|fs| fs.transact(|fs| fs.rename(self.ino, old_name, dst.ino, new_name)))
+        self.with(|fs| fs.transact_all(|fs| fs.rename(self.ino, old_name, dst.ino, new_name)))
     }
 
     fn xattr_get(&self, name: &[u8]) -> Result<Vec<u8>, Errno> {
@@ -2699,11 +2750,11 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn xattr_set(&self, name: &[u8], value: &[u8], how: XattrSet) -> Result<(), Errno> {
-        self.with(|fs| fs.transact(|fs| fs.xattr_set(self.ino, name, value, how)))
+        self.with(|fs| fs.transact_all(|fs| fs.xattr_set(self.ino, name, value, how)))
     }
 
     fn xattr_remove(&self, name: &[u8]) -> Result<(), Errno> {
-        self.with(|fs| fs.transact(|fs| fs.xattr_remove(self.ino, name)))
+        self.with(|fs| fs.transact_all(|fs| fs.xattr_remove(self.ino, name)))
     }
 
     fn xattr_list(&self) -> Result<Vec<Vec<u8>>, Errno> {
@@ -3701,6 +3752,8 @@ mod tests {
             // `.` claims 9 bytes, which no record can.
             put16(&mut data, 4, 9);
             fs.write_dir_block(dir, b, &mut data).unwrap();
+            // The edits above are pending; an operation that fails undoes what it changed.
+            fs.commit().unwrap();
         }
         assert_eq!(vfs.readlink("/fast").err(), Some(Errno::EIO));
         assert_eq!(vfs.open("/fast", OpenFlags::READ, 0).err(), Some(Errno::EIO));
@@ -4272,6 +4325,154 @@ mod tests {
                 }
             }
             assert!(checked > 100, "{checked}");
+        }
+    }
+
+    #[test]
+    fn a_failure_after_adding_a_name_leaves_nothing_behind() {
+        let scratch = Scratch::new("atomic");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        for kind in [EXT2, EXT4] {
+            let Some(image) = mkfs(&scratch, kind, 1024, 8 << 20, None) else { return };
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let vfs = Vfs::new(ext2.root().unwrap());
+            let a = vfs.open("/a", rw, 0o644).unwrap();
+            let (a_ino, k) = (a.stat().ino as u32, FileKind::Regular);
+            {
+                let mut fs = ext2.shared.fs.lock();
+                let r = fs.transact_all(|fs| {
+                    fs.add_entry(ROOT_INO, "second", a_ino, k)?;
+                    Err::<(), _>(Errno::EIO)
+                });
+                assert_eq!(r, Err(Errno::EIO));
+            }
+            assert_eq!(ext2.root().unwrap().lookup("second").err(), Some(Errno::ENOENT));
+            assert_eq!(a.stat().nlink, 1);
+            drop((a, vfs));
+            fsck(&scratch, &unmount(ext2), &[]);
+        }
+    }
+
+    #[test]
+    fn a_bogus_attribute_block_pointer_frees_nothing() {
+        let scratch = Scratch::new("bogus-acl");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        for kind in [EXT2, EXT4] {
+            let Some(image) = mkfs(&scratch, kind, 1024, 8 << 20, None) else { return };
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let vfs = Vfs::new(ext2.root().unwrap());
+            let a = vfs.open("/a", rw, 0o644).unwrap();
+            let a_ino = a.stat().ino as u32;
+            // A block in use by something else, without the attribute magic.
+            let mut fs = ext2.shared.fs.lock();
+            let b = fs.transact(|fs| fs.alloc_block(0)).unwrap();
+            fs.transact(|fs| {
+                let mut inode = fs.read_inode(a_ino)?;
+                put32(&mut inode.raw, ino::FILE_ACL, b as u32);
+                fs.write_inode(a_ino, &inode)
+            })
+            .unwrap();
+            let before = fs.free_blocks();
+            drop(fs);
+            drop(a);
+            vfs.unlink("/a").unwrap();
+            assert_eq!(ext2.shared.fs.lock().free_blocks(), before, "the block was freed");
+            // Out of range too: dropped, no error.
+            let c = vfs.open("/c", rw, 0o644).unwrap();
+            let c_ino = c.stat().ino as u32;
+            ext2.shared
+                .fs
+                .lock()
+                .transact(|fs| {
+                    let mut inode = fs.read_inode(c_ino)?;
+                    put32(&mut inode.raw, ino::FILE_ACL, u32::MAX);
+                    fs.write_inode(c_ino, &inode)
+                })
+                .unwrap();
+            drop(c);
+            vfs.unlink("/c").unwrap();
+            drop(vfs);
+            ext2.shared.fs.lock().transact(|fs| fs.free_block(b)).unwrap();
+            fsck(&scratch, &unmount(ext2), &[]);
+        }
+    }
+
+    #[test]
+    fn readdir_resumes_but_never_from_a_stale_position() {
+        let scratch = Scratch::new("cursor");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        let Some(image) = mkfs(&scratch, EXT4, 1024, 8 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root().unwrap());
+        vfs.mkdir("/d", 0o755).unwrap();
+        let name = |i: usize| format!("entry-with-a-longish-name-{i:04}");
+        for i in 0..200 {
+            vfs.open(&format!("/d/{}", name(i)), rw, 0o644).unwrap();
+        }
+        let d = vfs.lookup("/d").unwrap();
+        let all = names(&*d);
+        assert_eq!(all.len(), 200);
+        for i in [0, 1, 2, 150, 151, 50, 199] {
+            assert_eq!(d.readdir(i).unwrap().unwrap().name, all[i], "index {i}");
+        }
+        assert!(d.readdir(200).unwrap().is_none());
+        // A change in between: the listing goes on from the new state.
+        let (first, second) = (d.readdir(0).unwrap().unwrap().name, d.readdir(1).unwrap().unwrap().name);
+        vfs.unlink(&format!("/d/{first}")).unwrap();
+        assert_eq!(d.readdir(1).unwrap().unwrap().name, names(&*d)[1]);
+        assert_ne!(d.readdir(0).unwrap().unwrap().name, first);
+        assert_eq!(d.readdir(0).unwrap().unwrap().name, second);
+        drop((d, vfs));
+        fsck(&scratch, &unmount(ext2), &[]);
+    }
+
+    #[test]
+    fn a_directory_of_absurd_size_is_an_error_not_a_long_walk() {
+        let scratch = Scratch::new("hugedir");
+        let Some(image) = mkfs(&scratch, EXT4, 1024, 8 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root().unwrap());
+        vfs.mkdir("/d", 0o755).unwrap();
+        let ino = vfs.lookup("/d").unwrap().stat().ino as u32;
+        {
+            let mut fs = ext2.shared.fs.lock();
+            fs.transact(|fs| {
+                let mut inode = fs.read_inode(ino)?;
+                inode.set_size(3 << 30);
+                fs.write_inode(ino, &inode)
+            })
+            .unwrap();
+        }
+        assert_eq!(vfs.lookup("/d").unwrap().readdir(0).err(), Some(Errno::EIO));
+        assert_eq!(vfs.lookup("/d/nothing").err(), Some(Errno::EIO));
+    }
+
+    #[test]
+    fn an_index_out_of_hash_order_is_corruption_not_a_missing_name() {
+        let scratch = Scratch::new("dxorder");
+        let rw = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
+        let Some(image) = mkfs(&scratch, EXT3, 1024, 16 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root().unwrap());
+        vfs.mkdir("/d", 0o755).unwrap();
+        for i in 0..600 {
+            vfs.open(&format!("/d/entry-with-a-longish-name-{i:04}"), rw, 0o644).unwrap();
+        }
+        let (flags, phys, root) = dir_root(&ext2, &vfs, "/d");
+        assert!(flags & INDEX_FL != 0);
+        assert!(vfs.lookup("/d/entry-with-a-longish-name-0001").is_ok());
+        drop(vfs);
+        let mut image = unmount(ext2);
+        // Swap the hashes of entries 2 and 3 (entry 0 is the limit and count).
+        let base = phys as usize * 1024 + 32;
+        assert!(get16(&root, 32 + 2) > 4);
+        for k in 0..4 {
+            image.swap(base + 16 + k, base + 24 + k);
+        }
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let vfs = Vfs::new(ext2.root().unwrap());
+        for i in (0..600).step_by(50) {
+            assert_eq!(vfs.lookup(&format!("/d/entry-with-a-longish-name-{i:04}")).err(), Some(Errno::EIO));
         }
     }
 }

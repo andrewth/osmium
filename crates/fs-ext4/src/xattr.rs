@@ -56,13 +56,22 @@ struct Xattr {
 
 impl Xattr {
     /// The full name ("user.comment").
-    fn full_name(&self) -> Result<Vec<u8>, Errno> {
-        let prefix = PREFIXES.iter().find(|p| p.0 == self.index).map_or(&b""[..], |p| p.1);
+    ///
+    /// `None` for an index this driver has no prefix for: no name that
+    /// `get` or `remove` could take back to it exists, so it is not listed.
+    fn full_name(&self) -> Result<Option<Vec<u8>>, Errno> {
+        let Some(prefix) = PREFIXES.iter().find(|p| p.0 == self.index).map(|p| p.1) else { return Ok(None) };
         let mut full = Vec::new();
         full.try_reserve_exact(prefix.len() + self.name.len()).map_err(|_| Errno::ENOMEM)?;
         full.extend_from_slice(prefix);
         full.extend_from_slice(&self.name);
-        Ok(full)
+        // A name that `get` would resolve to some other attribute (an ACL
+        // index with extra bytes, or `system.` plus an ACL name) is a
+        // spoof, not listed.
+        if Self::split(&full) != Some((self.index, &self.name[..])) {
+            return Ok(None);
+        }
+        Ok(Some(full))
     }
 
     /// The index and the rest of a full name: by the longest prefix that
@@ -222,8 +231,17 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         if acl == 0 {
             return Ok(());
         }
-        let mut block = self.read_block(acl)?;
-        let refs = if get32(&block, 0) == XATTR_MAGIC { get32(&block, 4) } else { 1 };
+        // A pointer that does not lead to an attribute block (out of range, in
+        // the metadata zones, or to a block without the magic) is dropped
+        // without freeing anything: the block may belong to somebody else.
+        let block =
+            if acl >= self.blocks_count() || self.in_meta_zone(acl) { None } else { Some(self.read_block(acl)?) };
+        let Some(mut block) = block.filter(|b| get32(b, 0) == XATTR_MAGIC) else {
+            put32(&mut inode.raw, ino::FILE_ACL, 0);
+            put16(&mut inode.raw, ino::FILE_ACL_HIGH, 0);
+            return Ok(());
+        };
+        let refs = get32(&block, 4);
         if refs <= 1 {
             self.free_block(acl)?;
         } else {
@@ -323,7 +341,9 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let inode = self.read_inode(ino)?;
         let mut names = Vec::new();
         for x in self.xattrs(&inode)? {
-            try_push(&mut names, x.full_name()?)?;
+            if let Some(full) = x.full_name()? {
+                try_push(&mut names, full)?;
+            }
         }
         Ok(names)
     }
@@ -372,5 +392,26 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         let now = self.now();
         inode.set_times(now, &[ino::CTIME]);
         self.write_inode(ino, &inode)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn x(index: u8, name: &str) -> Xattr {
+        Xattr { index, name: name.as_bytes().to_vec(), value: Vec::new() }
+    }
+
+    #[test]
+    fn listed_names_are_the_ones_get_would_resolve() {
+        assert_eq!(x(1, "comment").full_name().unwrap().as_deref(), Some(&b"user.comment"[..]));
+        assert_eq!(x(2, "").full_name().unwrap().as_deref(), Some(&b"system.posix_acl_access"[..]));
+        // An index with no prefix would list as the bare name, which could be anything.
+        assert_eq!(x(9, "user.root").full_name().unwrap(), None);
+        assert_eq!(x(0, "security.capability").full_name().unwrap(), None);
+        // An ACL index with extra bytes, and the ACL name under `system.`, are not the ACL.
+        assert_eq!(x(2, "x").full_name().unwrap(), None);
+        assert_eq!(x(7, "posix_acl_access").full_name().unwrap(), None);
     }
 }

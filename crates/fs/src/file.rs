@@ -206,6 +206,18 @@ pub trait File: Send + Sync {
         Err(Errno::ENOTDIR)
     }
 
+    /// [`create`](File::create) for a device node with the device number
+    /// `rdev` (`st_rdev`; see [`makedev`](crate::dev::makedev)). The default
+    /// makes the node only if `rdev` is 0, and otherwise fails with `EPERM`:
+    /// a file system that cannot record a device number must not make a node
+    /// that reads back as another device (or, in an overlay, as a whiteout).
+    fn mknod(&self, name: &str, kind: FileKind, mode: u32, rdev: u64) -> Result<Arc<dyn File>, Errno> {
+        if rdev != 0 {
+            return Err(Errno::EPERM);
+        }
+        self.create(name, kind, mode)
+    }
+
     /// Removes the entry `name`. With `dir`, it must be an empty directory
     /// (`ENOTDIR`, `ENOTEMPTY`); without, it must not be one (`EISDIR`).
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {

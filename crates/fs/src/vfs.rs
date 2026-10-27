@@ -220,13 +220,19 @@ impl Vfs {
     /// as a FIFO or device node (`mknod`), or a regular file or directory.
     /// Symbolic links need a target: use [`symlink`](Vfs::symlink).
     pub fn mknod(&self, path: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
+        self.mknod_dev(path, kind, mode, 0)
+    }
+
+    /// [`mknod`](Vfs::mknod) for a device node with device number `rdev`
+    /// (see [`File::mknod`]).
+    pub fn mknod_dev(&self, path: &str, kind: FileKind, mode: u32, rdev: u64) -> Result<Arc<dyn File>, Errno> {
         if kind == FileKind::Symlink {
             return Err(Errno::EINVAL);
         }
         let parent = self.parent(path)?;
         match parent.name {
             Some(name) if name != "." && name != ".." && (!parent.trailing_slash || kind == FileKind::Directory) => {
-                parent.dir.create(name, kind, mode & 0o7777)
+                parent.dir.mknod(name, kind, mode & 0o7777, rdev)
             }
             _ => Err(Errno::EEXIST),
         }
@@ -304,7 +310,7 @@ impl Vfs {
     /// Moves `old` to `new` (`rename`), replacing `new` if it exists as
     /// [`File::rename`] describes.
     ///
-    /// `EBUSY` for `/` or a mount point, `EINVAL` for `.`, `..` or moving a
+    /// `EBUSY` for `/`, a mount point or a directory with one below it, `EINVAL` for `.`, `..` or moving a
     /// directory below itself, `EXDEV` across file systems, `EPERM` where the
     /// file system has no rename.
     pub fn rename(&self, old: &str, new: &str) -> Result<(), Errno> {
@@ -317,6 +323,11 @@ impl Vfs {
         let from_path = join(&from.path, from_name)?;
         let to_path = join(&to.path, to_name)?;
         if self.is_mount_point(&from_path) || self.is_mount_point(&to_path) {
+            return Err(Errno::EBUSY);
+        }
+        // A mount is recorded by the path it covers: moving a directory with
+        // one below it would leave that path pointing at nothing.
+        if self.snapshot().iter().any(|m| m.path != "/" && is_inside(&m.path, &from_path)) {
             return Err(Errno::EBUSY);
         }
         let kind = from.dir.lookup(from_name)?.try_stat()?.kind;

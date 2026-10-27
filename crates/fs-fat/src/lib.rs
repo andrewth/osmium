@@ -1127,6 +1127,11 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         let stamp = self.shared.stamp();
         let mut vol = self.shared.vol.lock();
         let dir_first = self.dir_cluster(&mut vol)?;
+        // A directory that was removed while open has no entry left, and its
+        // clusters go when the last handle drops: nothing may be put in them.
+        if self.state(&mut vol)?.orphan {
+            return Err(Errno::ENOENT);
+        }
         // A damaged directory (first cluster 0, say) has no chain to grow:
         // writing would start one that nothing links to.
         if dir_first != ROOT_FIXED && !vol.geo.is_data_cluster(dir_first) {
@@ -1274,11 +1279,19 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
                 (false, true) => return Err(Errno::EISDIR),
                 _ => {}
             }
-            vol.delete_entry(dst_first, x)?;
+            if x.is_dir() && !dir::is_empty(&vol.dir_bytes(x.first)?) {
+                return Err(Errno::ENOTEMPTY);
+            }
         }
 
-        // The new entries, with the old short entry's contents.
-        let bytes = vol.dir_bytes(dst_first)?;
+        // Everything that can fail short of the disk, before the target is
+        // destroyed: the new entries are laid out as if its slots were free.
+        let mut bytes = vol.dir_bytes(dst_first)?;
+        if let Some(x) = &existing {
+            for i in 0..x.slots() {
+                *bytes.get_mut(x.start + i * ENTRY_SIZE).ok_or(Errno::EIO)? = dir::FREE;
+            }
+        }
         let mut taken = dir::short_names(&bytes)?;
         if same {
             taken.retain(|t| *t != old.short);
@@ -1291,12 +1304,27 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             }
         };
         let at = dir::find_free(&bytes, slots.len() + 1);
-        if (at + (slots.len() + 1) * ENTRY_SIZE) as u64 > MAX_DIR {
+        let end = at + (slots.len() + 1) * ENTRY_SIZE;
+        if end as u64 > MAX_DIR {
             return Err(Errno::ENOSPC);
         }
         slots.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         let mut flat = Vec::new();
         flat.try_reserve_exact((slots.len() + 1) * ENTRY_SIZE).map_err(|_| Errno::ENOMEM)?;
+        if end > bytes.len() {
+            // The directory has to grow: do it now, while the target is
+            // still there. Zeroed clusters are just free space.
+            if dst_first == ROOT_FIXED {
+                return Err(Errno::ENOSPC);
+            }
+            let mut d = dst_first;
+            vol.write_chain(&mut d, (end - 1) as u64, &[0])?;
+        }
+        if let Some(x) = &existing {
+            vol.delete_entry(dst_first, x)?;
+        }
+
+        // The new entries, with the old short entry's contents.
         let mut entry = [0u8; ENTRY_SIZE];
         vol.read_chain(src_first, old.offset as u64, &mut entry, u64::MAX)?;
         entry.get_mut(..11).ok_or(Errno::EIO)?.copy_from_slice(&short);

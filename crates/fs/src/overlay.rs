@@ -33,14 +33,23 @@
 //!   Linux's overlayfs does without `redirect_dir`; the caller copies it.
 //! - There is no inode index: a hard link to a lower file comes apart when it
 //!   is copied up, and the link is made to the copy.
-//! - A copy-up cannot carry what [`File`] has no way to set: times, owners,
-//!   extended attributes, and the device number of a device node.
+//! - A copy-up cannot carry what [`File`] has no way to set: times, owners
+//!   and extended attributes. A device node's number is carried with
+//!   [`File::mknod`]; if the upper layer cannot record one, copying up fails
+//!   with `EPERM` rather than make a different device. With
+//!   [`DeviceMarkers`], device number 0 of a character device is a whiteout,
+//!   so such a node cannot be made through the overlay (`EPERM`).
 //! - Inode numbers are the topmost layer's, tagged with its position in the
 //!   top byte, so a node's number changes when it is copied up.
 //! - Removing, renaming over and making a name leaves the upper layer in
-//!   between states for a moment (a whiteout is made after the name is
-//!   removed). The layers are not changed atomically; a crash in the
-//!   middle of an operation can leave a name showing through.
+//!   between states for a moment. The layers are not changed atomically; a
+//!   crash in the middle of an operation can leave a name showing through.
+//!   An operation that fails cleanly puts the whiteouts and opaque markers it
+//!   moved aside back, so removed names stay removed.
+//! - Copy-ups are serialized by one spin lock, held while the file is copied
+//!   through the layers' own `File` operations. This crate sits below the
+//!   scheduler and has no lock that may be held across I/O, so a layer whose
+//!   operations sleep must not be copied up from several contexts at once.
 //! - A node opened before another handle copied the same file up keeps
 //!   reading the lower layer until it writes (its copy-up then adopts the
 //!   one that exists).
@@ -147,12 +156,17 @@ struct Shared {
     markers: Arc<dyn Markers>,
     writable: bool,
     /// Held while a node is copied up, so two copy-ups do not race for the
-    /// same name.
+    /// same name. (A spin lock across layer I/O: see the module docs.)
     copy_up: SpinLock<()>,
     next_tmp: AtomicU64,
 }
 
 impl Shared {
+    /// A name nobody else uses, for building a copy or setting a node aside.
+    fn tmp_name(&self) -> String {
+        format!("{TEMP_PREFIX}{}", self.next_tmp.fetch_add(1, Ordering::Relaxed))
+    }
+
     fn reserved(&self, name: &str) -> bool {
         name.starts_with(TEMP_PREFIX) || self.markers.is_hidden(name)
     }
@@ -438,7 +452,7 @@ impl NodeData {
         match self.kind {
             FileKind::Regular | FileKind::Symlink => {
                 // Put together under another name, so that nobody sees half a file.
-                let tmp = format!("{TEMP_PREFIX}{}", self.shared.next_tmp.fetch_add(1, Ordering::Relaxed));
+                let tmp = self.shared.tmp_name();
                 let copy = dir.create(&tmp, self.kind, stat.mode)?;
                 let done = self.fill(&*copy, source).and_then(|()| dir.rename(&tmp, dir, &self.name));
                 if let Err(e) = done {
@@ -447,6 +461,9 @@ impl NodeData {
                 }
                 dir.lookup(&self.name)
             }
+            // Device nodes carry their number, or fail: a node made without it
+            // would read as a different device (or as a whiteout).
+            kind @ (FileKind::CharDevice | FileKind::BlockDevice) => dir.mknod(&self.name, kind, stat.mode, stat.rdev),
             // Directories and nodes with nothing to copy but their kind.
             kind => dir.create(&self.name, kind, stat.mode),
         }
@@ -480,6 +497,30 @@ impl NodeData {
             dir.remove(&entry.name, entry.kind == FileKind::Directory)?;
         }
         Ok(())
+    }
+}
+
+/// What a rename took out of the way of the new name, to put back if the
+/// rename fails.
+enum Displaced {
+    None,
+    /// The name had a whiteout.
+    Whiteout,
+    /// The name's directory, moved to this temporary name.
+    Aside(String, Arc<dyn File>),
+}
+
+impl Displaced {
+    fn undo(self, to: &dyn File, new_name: &str, markers: &Arc<dyn Markers>) {
+        match self {
+            Displaced::None => {}
+            Displaced::Whiteout => {
+                let _ = markers.make_whiteout(to, new_name);
+            }
+            Displaced::Aside(tmp, _) => {
+                let _ = to.rename(&tmp, to, new_name);
+            }
+        }
     }
 }
 
@@ -538,6 +579,10 @@ impl File for OvNode {
     }
 
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
+        self.mknod(name, kind, mode, 0)
+    }
+
+    fn mknod(&self, name: &str, kind: FileKind, mode: u32, rdev: u64) -> Result<Arc<dyn File>, Errno> {
         let d = &self.0;
         d.require_dir()?;
         check_name(&d.shared, name)?;
@@ -548,9 +593,10 @@ impl File for OvNode {
             Err(e) => return Err(e),
         }
         let dir = d.upper_dir()?;
+        let markers = &d.shared.markers;
         // A whiteout in the way is replaced by the new node.
         let hid = match dir.lookup(name) {
-            Ok(entry) if d.shared.markers.is_whiteout(&*entry) => {
+            Ok(entry) if markers.is_whiteout(&*entry) => {
                 dir.remove(name, false)?;
                 true
             }
@@ -558,13 +604,33 @@ impl File for OvNode {
             Err(Errno::ENOENT) => false,
             Err(e) => return Err(e),
         };
-        let made = dir.create(name, kind, mode)?;
+        // If the new node cannot be had, the name must stay removed.
+        let restore = |dir: &dyn File| {
+            if hid {
+                let _ = markers.make_whiteout(dir, name);
+            }
+        };
+        let made = match dir.mknod(name, kind, mode, rdev) {
+            Ok(made) => made,
+            Err(e) => {
+                restore(&*dir);
+                return Err(e);
+            }
+        };
+        // A node that reads as a whiteout (a device numbered like one) would
+        // delete the name instead of making it.
+        if kind != FileKind::Directory && markers.is_whiteout(&*made) {
+            drop(made);
+            let _ = dir.remove(name, false);
+            restore(&*dir);
+            return Err(Errno::EPERM);
+        }
         // Over a removed directory a new one must not show the old contents.
         if hid && kind == FileKind::Directory {
-            let marked = d.shared.markers.set_opaque(&*made);
+            let marked = markers.set_opaque(&*made);
             if marked.is_err() {
                 let _ = dir.remove(name, true);
-                let _ = d.shared.markers.make_whiteout(&*dir, name);
+                restore(&*dir);
             }
             marked?;
         }
@@ -585,14 +651,32 @@ impl File for OvNode {
         }
         let shows = d.lower_shows(name)?;
         let parent = d.upper_dir()?;
-        if let Some(upper) = target.0.upper() {
-            if dir {
-                NodeData::clear(&*upper)?;
+        let markers = &d.shared.markers;
+        match target.0.upper() {
+            // The name must end up whited out, not just gone: the upper node
+            // is set aside, the whiteout made, and only then is it destroyed,
+            // so a failure to make the whiteout leaves the name as it was.
+            Some(upper) if shows => {
+                let tmp = d.shared.tmp_name();
+                parent.rename(name, &*parent, &tmp)?;
+                if let Err(e) = markers.make_whiteout(&*parent, name) {
+                    let _ = parent.rename(&tmp, &*parent, name);
+                    return Err(e);
+                }
+                // Out of sight either way (the prefix is reserved).
+                if dir {
+                    let _ = NodeData::clear(&*upper);
+                }
+                let _ = parent.remove(&tmp, dir);
             }
-            parent.remove(name, dir)?;
-        }
-        if shows {
-            d.shared.markers.make_whiteout(&*parent, name)?;
+            Some(upper) => {
+                if dir {
+                    NodeData::clear(&*upper)?;
+                }
+                parent.remove(name, dir)?;
+            }
+            None if shows => markers.make_whiteout(&*parent, name)?,
+            None => {}
         }
         Ok(())
     }
@@ -616,13 +700,21 @@ impl File for OvNode {
         }
         let dir = d.upper_dir()?;
         let upper = target.0.ensure_upper()?;
-        match dir.lookup(name) {
-            Ok(entry) if d.shared.markers.is_whiteout(&*entry) => dir.remove(name, false)?,
+        let hid = match dir.lookup(name) {
+            Ok(entry) if d.shared.markers.is_whiteout(&*entry) => {
+                dir.remove(name, false)?;
+                true
+            }
             Ok(_) => return Err(Errno::EEXIST),
-            Err(Errno::ENOENT) => {}
+            Err(Errno::ENOENT) => false,
             Err(e) => return Err(e),
+        };
+        let linked = dir.link(name, &*upper);
+        if linked.is_err() && hid {
+            // Still removed, as far as the merged tree goes.
+            let _ = d.shared.markers.make_whiteout(&*dir, name);
         }
-        dir.link(name, &*upper)
+        linked
     }
 
     fn rename(&self, old_name: &str, new_dir: &dyn File, new_name: &str) -> Result<(), Errno> {
@@ -674,27 +766,46 @@ impl File for OvNode {
         }
         let from = d.upper_dir()?;
         let to = nd.upper_dir()?;
-        src.0.ensure_upper()?;
+        let src_upper = src.0.ensure_upper()?;
         let markers = &d.shared.markers;
-        // Whatever the new name has in the upper layer (a whiteout, or the
-        // directory being replaced, which only holds markers) is cleared.
+        let shows_new = nd.lower_shows(new_name)?;
+        let shows_old = d.lower_shows(old_name)?;
+        // Whatever the new name has in the upper layer is cleared: a whiteout
+        // is removed, and the directory being replaced (which only holds
+        // markers) is set aside. Either comes back if the move fails.
+        let mut displaced = Displaced::None;
         match to.lookup(new_name) {
-            Ok(entry) if markers.is_whiteout(&*entry) => to.remove(new_name, false)?,
-            Ok(entry) if dst.is_some() && dst.as_ref().is_some_and(|dst| dst.0.kind == FileKind::Directory) => {
-                NodeData::clear(&*entry)?
+            Ok(entry) if markers.is_whiteout(&*entry) => {
+                drop(entry);
+                to.remove(new_name, false)?;
+                displaced = Displaced::Whiteout;
+            }
+            Ok(entry) if dst.as_ref().is_some_and(|dst| dst.0.kind == FileKind::Directory) => {
+                let tmp = d.shared.tmp_name();
+                to.rename(new_name, &*to, &tmp)?;
+                displaced = Displaced::Aside(tmp, entry);
             }
             Ok(_) | Err(Errno::ENOENT) => {}
             Err(e) => return Err(e),
         }
-        let shows_new = nd.lower_shows(new_name)?;
-        let shows_old = d.lower_shows(old_name)?;
-        from.rename(old_name, &*to, new_name)?;
-        if is_dir && shows_new {
-            let moved = to.lookup(new_name)?;
-            markers.set_opaque(&*moved)?;
+        // Marked before the move, while failing still changes nothing (the
+        // marker is harmless in a directory with nothing below it).
+        let moved = if is_dir && shows_new { markers.set_opaque(&*src_upper) } else { Ok(()) };
+        if let Err(e) = moved.and_then(|()| from.rename(old_name, &*to, new_name)) {
+            displaced.undo(&*to, new_name, markers);
+            return Err(e);
         }
-        if shows_old {
-            markers.make_whiteout(&*from, old_name)?;
+        if shows_old && let Err(e) = markers.make_whiteout(&*from, old_name) {
+            // Put it back: the old name would show what is below it.
+            if to.rename(new_name, &*from, old_name).is_ok() {
+                displaced.undo(&*to, new_name, markers);
+            }
+            return Err(e);
+        }
+        if let Displaced::Aside(tmp, entry) = displaced {
+            // Out of sight either way (the prefix is reserved).
+            let _ = NodeData::clear(&*entry);
+            let _ = to.remove(&tmp, true);
         }
         Ok(())
     }
@@ -955,9 +1066,14 @@ mod tests {
         // Open an existing lower file for create without EXCL: no copy-up.
         f.overlay.open("/b", OpenFlags::CREATE, 0o644).unwrap();
         assert_eq!(f.upper.lookup("/b").err(), Some(Errno::ENOENT));
-        // Devices keep their kind.
-        let dev = root.create("tty", FileKind::CharDevice, 0o600).unwrap();
-        assert_eq!(dev.stat().kind, FileKind::CharDevice);
+        // Devices keep their kind and number; one numbered 0 would be a whiteout.
+        let dev = root.mknod("tty", FileKind::CharDevice, 0o600, crate::dev::makedev(5, 0)).unwrap();
+        assert_eq!((dev.stat().kind, dev.stat().rdev), (FileKind::CharDevice, crate::dev::makedev(5, 0)));
+        assert_eq!(root.create("zero", FileKind::CharDevice, 0o600).err(), Some(Errno::EPERM));
+        assert_eq!(root.lookup("zero").err(), Some(Errno::ENOENT));
+        assert_eq!(f.upper.lookup("/zero").err(), Some(Errno::ENOENT));
+        let blk = root.create("blk", FileKind::BlockDevice, 0o600).unwrap();
+        assert_eq!(blk.stat().kind, FileKind::BlockDevice);
     }
 
     #[test]
@@ -1224,5 +1340,202 @@ mod tests {
         assert_eq!(markers.opaques.load(Ordering::SeqCst), 1);
         vfs.mkdir("/plain", 0o755).unwrap();
         assert_eq!(markers.opaques.load(Ordering::SeqCst), 1);
+    }
+
+    const NULL: u64 = crate::dev::makedev(1, 3);
+
+    /// A fixture whose lower layer also has the character device `/null`.
+    fn with_device() -> Fixture {
+        let f = fixture();
+        f.lower.mknod_dev("/null", FileKind::CharDevice, 0o666, NULL).unwrap();
+        f
+    }
+
+    #[test]
+    fn a_lower_device_is_not_a_whiteout() {
+        let f = with_device();
+        let st = f.overlay.stat("/null", true).unwrap();
+        assert_eq!((st.kind, st.rdev), (FileKind::CharDevice, NULL));
+        assert!(names(&f.overlay, "/").contains(&"null".to_string()));
+    }
+
+    #[test]
+    fn copying_up_a_device_keeps_its_number() {
+        // Rename.
+        let f = with_device();
+        f.overlay.rename("/null", "/moved").unwrap();
+        assert_eq!(f.overlay.stat("/moved", true).unwrap().rdev, NULL);
+        assert_eq!(f.upper.stat("/moved", false).unwrap().rdev, NULL);
+        assert_eq!(f.overlay.lookup("/null").err(), Some(Errno::ENOENT));
+        assert!(is_whiteout(&f.upper, "/null"));
+        assert!(names(&f.overlay, "/").contains(&"moved".to_string()));
+        // Link: the copy and the new name are the same device.
+        let f = with_device();
+        f.overlay.link("/null", "/alias").unwrap();
+        for p in ["/null", "/alias"] {
+            let st = f.overlay.stat(p, true).unwrap();
+            assert_eq!((st.kind, st.rdev), (FileKind::CharDevice, NULL), "{p}");
+        }
+        assert_eq!(f.upper.stat("/null", false).unwrap().rdev, NULL);
+        // Write and truncate copy it up, and are refused for a device.
+        let f = with_device();
+        assert!(f.overlay.lookup("/null").unwrap().write(0, b"x").is_err());
+        assert_eq!(f.upper.stat("/null", false).unwrap().rdev, NULL);
+        assert!(names(&f.overlay, "/").contains(&"null".to_string()));
+        let f = with_device();
+        assert!(f.overlay.lookup("/null").unwrap().truncate(0).is_err());
+        assert_eq!(f.overlay.stat("/null", true).unwrap().rdev, NULL);
+        assert!(names(&f.overlay, "/").contains(&"null".to_string()));
+    }
+
+    #[test]
+    fn a_device_cannot_be_copied_up_into_a_layer_that_cannot_number_it() {
+        /// An upper layer that only has the default `mknod`.
+        struct NoRdev(Arc<dyn File>);
+        impl File for NoRdev {
+            fn stat(&self) -> Stat {
+                self.0.stat()
+            }
+            fn readdir(&self, i: usize) -> Result<Option<DirEntry>, Errno> {
+                self.0.readdir(i)
+            }
+            fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
+                self.0.lookup(name)
+            }
+            fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
+                self.0.create(name, kind, mode)
+            }
+            fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
+                self.0.remove(name, dir)
+            }
+        }
+        let f = with_device();
+        let upper: Arc<dyn File> = Arc::new(NoRdev(f.upper.lookup("/").unwrap()));
+        let fs = OverlayFs::new(9, Some(upper), vec![f.lower.lookup("/").unwrap()]).unwrap();
+        let vfs = Vfs::new(fs.root());
+        assert_eq!(vfs.link("/null", "/alias").err(), Some(Errno::EPERM));
+        // Nothing was made that could be mistaken for a whiteout.
+        assert_eq!(vfs.stat("/null", true).unwrap().rdev, NULL);
+        assert_eq!(f.upper.lookup("/null").err(), Some(Errno::ENOENT));
+    }
+
+    /// Markers that fail on request.
+    struct Flaky {
+        inner: DeviceMarkers,
+        fail_whiteout: core::sync::atomic::AtomicBool,
+    }
+
+    impl Markers for Flaky {
+        fn is_whiteout(&self, entry: &dyn File) -> bool {
+            self.inner.is_whiteout(entry)
+        }
+        fn make_whiteout(&self, dir: &dyn File, name: &str) -> Result<(), Errno> {
+            if self.fail_whiteout.load(Ordering::Relaxed) {
+                return Err(Errno::EIO);
+            }
+            self.inner.make_whiteout(dir, name)
+        }
+        fn is_opaque(&self, dir: &dyn File) -> Result<bool, Errno> {
+            self.inner.is_opaque(dir)
+        }
+        fn set_opaque(&self, dir: &dyn File) -> Result<(), Errno> {
+            self.inner.set_opaque(dir)
+        }
+        fn is_hidden(&self, name: &str) -> bool {
+            self.inner.is_hidden(name)
+        }
+    }
+
+    fn flaky() -> (Fixture, Arc<Flaky>) {
+        let f = fixture();
+        let markers =
+            Arc::new(Flaky { inner: DeviceMarkers, fail_whiteout: core::sync::atomic::AtomicBool::new(false) });
+        let fs = OverlayFs::with_markers(
+            6,
+            Some(f.upper.lookup("/").unwrap()),
+            vec![f.lower.lookup("/").unwrap(), f.lower2.lookup("/").unwrap()],
+            markers.clone(),
+        )
+        .unwrap();
+        (Fixture { overlay: Vfs::new(fs.root()), ..f }, markers)
+    }
+
+    #[test]
+    fn a_failed_remove_keeps_the_upper_node() {
+        let (f, markers) = flaky();
+        f.overlay.lookup("/dir/y").unwrap().write(0, b"Y").unwrap();
+        markers.fail_whiteout.store(true, Ordering::Relaxed);
+        assert_eq!(f.overlay.unlink("/dir/y").err(), Some(Errno::EIO));
+        // Still the copied-up version, not the lower one coming back.
+        assert_eq!(read(&f.overlay, "/dir/y"), b"Y");
+        assert_eq!(read(&f.upper, "/dir/y"), b"Y");
+        markers.fail_whiteout.store(false, Ordering::Relaxed);
+        f.overlay.unlink("/dir/y").unwrap();
+        assert_eq!(f.overlay.lookup("/dir/y").err(), Some(Errno::ENOENT));
+        assert!(!names(&f.upper, "/dir").iter().any(|n| n.starts_with(TEMP_PREFIX)));
+    }
+
+    /// An upper directory whose next creation or link fails when asked to.
+    struct FailingDir {
+        inner: Arc<dyn File>,
+        fail: Arc<core::sync::atomic::AtomicBool>,
+    }
+
+    impl File for FailingDir {
+        fn stat(&self) -> Stat {
+            self.inner.stat()
+        }
+        fn readdir(&self, i: usize) -> Result<Option<DirEntry>, Errno> {
+            self.inner.readdir(i)
+        }
+        fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
+            self.inner.lookup(name)
+        }
+        fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
+            if self.fail.swap(false, Ordering::Relaxed) {
+                return Err(Errno::ENOSPC);
+            }
+            self.inner.create(name, kind, mode)
+        }
+        fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
+            self.inner.remove(name, dir)
+        }
+        fn link(&self, name: &str, target: &dyn File) -> Result<(), Errno> {
+            if self.fail.swap(false, Ordering::Relaxed) {
+                return Err(Errno::EMLINK);
+            }
+            self.inner.link(name, target)
+        }
+        fn rename(&self, old: &str, new_dir: &dyn File, new: &str) -> Result<(), Errno> {
+            self.inner.rename(old, new_dir, new)
+        }
+    }
+
+    #[test]
+    fn a_failed_create_link_or_rename_leaves_the_name_removed() {
+        let lower = Vfs::new(RamFs::new(1).root());
+        put(&lower, "/gone", b"lower");
+        put(&lower, "/other", b"o");
+        put(&lower, "/src", b"s");
+        let upper = RamFs::new(2);
+        let fail = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let top: Arc<dyn File> = Arc::new(FailingDir { inner: upper.root(), fail: fail.clone() });
+        let vfs = Vfs::new(OverlayFs::new(3, Some(top), vec![lower.lookup("/").unwrap()]).unwrap().root());
+        vfs.unlink("/gone").unwrap();
+        assert_eq!(vfs.lookup("/gone").err(), Some(Errno::ENOENT));
+        // Making the name fails: it stays removed.
+        fail.store(true, Ordering::Relaxed);
+        let root = vfs.lookup("/").unwrap();
+        assert_eq!(root.create("gone", FileKind::Regular, 0o644).err(), Some(Errno::ENOSPC));
+        assert_eq!(vfs.lookup("/gone").err(), Some(Errno::ENOENT));
+        // So does linking onto it.
+        fail.store(false, Ordering::Relaxed);
+        vfs.open("/mine", RW | OpenFlags::CREATE, 0o644).unwrap();
+        fail.store(true, Ordering::Relaxed);
+        assert_eq!(vfs.link("/mine", "/gone").err(), Some(Errno::EMLINK));
+        assert_eq!(vfs.lookup("/gone").err(), Some(Errno::ENOENT));
+        fail.store(false, Ordering::Relaxed);
+        vfs.open("/gone", RW | OpenFlags::CREATE, 0o644).unwrap().write(0, b"new").unwrap();
+        assert_eq!(read(&vfs, "/gone"), b"new");
     }
 }

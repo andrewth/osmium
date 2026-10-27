@@ -85,6 +85,8 @@ struct Inner {
     /// Whether it counts against [`Limits::max_inodes`] (all but the root).
     counted: bool,
     mode: AtomicU32,
+    /// The device number of a device node (`st_rdev`), else 0.
+    rdev: u64,
     /// Names it has in directories; 0 once all are removed.
     linked: AtomicU32,
     body: Body,
@@ -176,7 +178,7 @@ impl RamFs {
             clock: ClockSlot::new(),
             rename: SpinLock::new(()),
         })?;
-        Ok(RamFs { root: RamNode::new(&fs, FileKind::Directory, 0o755, "", false)? })
+        Ok(RamFs { root: RamNode::new(&fs, FileKind::Directory, 0o755, 0, "", false)? })
     }
 
     /// The caps this file system was made with.
@@ -202,7 +204,14 @@ impl RamFs {
 }
 
 impl RamNode {
-    fn new(fs: &Arc<Shared>, kind: FileKind, mode: u32, name: &str, counted: bool) -> Result<Arc<Self>, Errno> {
+    fn new(
+        fs: &Arc<Shared>,
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+        name: &str,
+        counted: bool,
+    ) -> Result<Arc<Self>, Errno> {
         let body = match kind {
             FileKind::Regular | FileKind::Symlink => Body::Data(RwSpinLock::new(Vec::new())),
             FileKind::Directory => Body::Dir(RwSpinLock::new(ArcTree::new())),
@@ -218,6 +227,7 @@ impl RamNode {
             fs: fs.clone(),
             counted,
             mode: AtomicU32::new(mode & 0o7777),
+            rdev,
             linked: AtomicU32::new(1),
             body,
             times: SpinLock::new(Times { atime: now, mtime: now, ctime: now }),
@@ -363,7 +373,7 @@ impl File for RamNode {
             mode: self.mode.load(Ordering::Relaxed),
             nlink,
             size,
-            rdev: 0,
+            rdev: self.rdev,
         }
     }
 
@@ -377,6 +387,7 @@ impl File for RamNode {
         let mut guard = self.data()?.write();
         let data = &mut *guard;
         let len = len as usize;
+        let shrinking = len < data.len();
         if len > data.len() {
             let grow = len - data.len();
             self.fs.charge_bytes(grow as u64)?;
@@ -388,6 +399,10 @@ impl File for RamNode {
             Shared::refund(&self.fs.bytes, (data.len() - len) as u64);
         }
         data.resize(len, 0);
+        if shrinking {
+            // The refund above is for memory that is really given back.
+            data.shrink_to_fit();
+        }
         drop(guard);
         self.touch(true);
         Ok(())
@@ -408,9 +423,16 @@ impl File for RamNode {
     }
 
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
+        self.mknod(name, kind, mode, 0)
+    }
+
+    fn mknod(&self, name: &str, kind: FileKind, mode: u32, rdev: u64) -> Result<Arc<dyn File>, Errno> {
         check_name(name)?;
+        if rdev != 0 && !matches!(kind, FileKind::CharDevice | FileKind::BlockDevice) {
+            return Err(Errno::EINVAL);
+        }
         // Made first: running out of memory then changes nothing.
-        let node = RamNode::new(&self.fs, kind, mode, name, true)?;
+        let node = RamNode::new(&self.fs, kind, mode, rdev, name, true)?;
         let mut entries = self.dir()?.write();
         if entries.insert(node.clone()).is_err() {
             return Err(Errno::EEXIST);
@@ -940,5 +962,46 @@ mod tests {
         assert_eq!(vfs.stat("/c", true).unwrap().ctime.sec, 1015);
         vfs.open("/a", RW, 0).unwrap().truncate(0).unwrap();
         assert_eq!(vfs.stat("/a", true).unwrap().mtime.sec, 1015);
+    }
+
+    #[test]
+    fn truncating_gives_the_memory_back_that_the_quota_does() {
+        let vfs = vfs();
+        let f = vfs.open("/big", RW | OpenFlags::CREATE, 0o644).unwrap();
+        f.write(0, &vec![1u8; 1 << 20]).unwrap();
+        f.truncate(10).unwrap();
+        let node = f.as_any().and_then(|a| a.downcast_ref::<RamNode>()).unwrap();
+        assert!(node.data().unwrap().read().capacity() < 4096);
+        assert_eq!(read_all(&*f), vec![1u8; 10]);
+    }
+
+    #[test]
+    fn device_numbers_are_recorded() {
+        let vfs = vfs();
+        let rdev = crate::dev::makedev(1, 3);
+        vfs.mknod_dev("/null", FileKind::CharDevice, 0o666, rdev).unwrap();
+        vfs.mknod_dev("/disk", FileKind::BlockDevice, 0o660, crate::dev::makedev(8, 0)).unwrap();
+        assert_eq!(vfs.stat("/null", false).unwrap().rdev, rdev);
+        assert_eq!(vfs.stat("/disk", false).unwrap().rdev, crate::dev::makedev(8, 0));
+        assert_eq!(vfs.mknod_dev("/f", FileKind::Regular, 0o644, rdev).err(), Some(Errno::EINVAL));
+        // A hard link is the same device.
+        vfs.link("/null", "/null2").unwrap();
+        assert_eq!(vfs.stat("/null2", false).unwrap().rdev, rdev);
+    }
+
+    #[test]
+    fn a_directory_with_a_mount_below_it_does_not_move() {
+        let vfs = vfs();
+        vfs.mkdir("/d", 0o755).unwrap();
+        vfs.mkdir("/d/sub", 0o755).unwrap();
+        vfs.mkdir("/d/sub/m", 0o755).unwrap();
+        vfs.mount("/d/sub/m", RamFs::new(2).root()).unwrap();
+        assert_eq!(vfs.rename("/d", "/e").err(), Some(Errno::EBUSY));
+        assert_eq!(vfs.rename("/d/sub", "/d/sub2").err(), Some(Errno::EBUSY));
+        // Unrelated directories, and siblings of the mount, still move.
+        vfs.mkdir("/d/other", 0o755).unwrap();
+        vfs.rename("/d/other", "/d/sub/other").unwrap();
+        vfs.unmount("/d/sub/m").unwrap();
+        vfs.rename("/d", "/e").unwrap();
     }
 }

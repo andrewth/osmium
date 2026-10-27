@@ -710,6 +710,20 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         committed.map(|()| value)
     }
 
+    /// Runs `f` as one transaction that is all or nothing: on any error what
+    /// it changed is undone, so a failure part way (a name added but the
+    /// link count not yet raised, a target removed but its replacement not
+    /// yet in place) cannot be committed.
+    pub(super) fn transact_all<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Errno>) -> Result<T, Errno> {
+        match f(self) {
+            Ok(value) => self.commit().map(|()| value),
+            Err(e) => {
+                self.abort();
+                Err(e)
+            }
+        }
+    }
+
     /// Commits what is pending and marks the journal clean.
     pub(super) fn close_journal(&mut self) {
         // Nowhere to report an error from an unmount: the journal then

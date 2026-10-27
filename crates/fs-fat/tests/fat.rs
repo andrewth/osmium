@@ -830,3 +830,41 @@ fn readdir_sees_changes_made_after_it_was_cached() {
     root.remove("one", false).unwrap();
     assert_eq!(names(&*root), ["two"]);
 }
+
+#[test]
+fn an_open_removed_directory_takes_no_new_entries() {
+    let fs = FatFs::mount(crafted(65535), 1).unwrap();
+    let root = fs.root();
+    let sub = root.create("sub", FileKind::Directory, 0o755).unwrap();
+    root.remove("sub", true).unwrap();
+    for kind in [FileKind::Regular, FileKind::Directory] {
+        assert_eq!(sub.create("x", kind, 0o644).err(), Some(Errno::ENOENT));
+    }
+    drop(sub);
+    // The clusters it held are free and unclaimed: a new file gets them whole.
+    let f = root.create("f", FileKind::Regular, 0o644).unwrap();
+    f.write(0, b"intact").unwrap();
+    assert_eq!(read_all(&*f), b"intact");
+}
+
+#[test]
+fn rename_over_a_file_in_a_full_fixed_root_reuses_its_slots() {
+    for small in [FLOPPY, DISK16] {
+        let fs = FatFs::mount(small.make(), 1).unwrap();
+        let root = fs.root();
+        let dir = root.create("d", FileKind::Directory, 0o755).unwrap();
+        let src = dir.create("source", FileKind::Regular, 0o644).unwrap();
+        src.write(0, b"source").unwrap();
+        let target = root.create("A Long Target Name.txt", FileKind::Regular, 0o644).unwrap();
+        target.write(0, b"target").unwrap();
+        let mut made = 0;
+        while root.create(&format!("f{made}"), FileKind::Regular, 0o644).is_ok() {
+            made += 1;
+        }
+        // The root is full; the target's slots are the only room.
+        dir.rename("source", &*root, "a long target name.TXT").unwrap();
+        assert_eq!(read_all(&*root.lookup("A LONG target name.txt").unwrap()), b"source");
+        assert_eq!(dir.lookup("source").err(), Some(Errno::ENOENT));
+        assert_eq!(names(&*root).len(), made + 2);
+    }
+}

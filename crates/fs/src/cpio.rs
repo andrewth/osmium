@@ -18,6 +18,9 @@ pub struct Entry<'src> {
     pub kind: FileKind,
     /// Permission bits (`0o7777`).
     pub mode: u32,
+    /// The device number of a character or block device (`st_rdev`, as
+    /// [`makedev`](crate::dev::makedev) encodes it), else 0.
+    pub rdev: u64,
     /// The file's contents, or a symbolic link's target.
     pub data: &'src [u8],
 }
@@ -51,7 +54,7 @@ fn align4(n: usize) -> Option<usize> {
 impl<'src> Entries<'src> {
     fn parse(&mut self) -> Result<Option<Entry<'src>>, Errno> {
         // A loop, not recursion: an archive may hold any number of trailers.
-        let (name, mode, data) = loop {
+        let (name, mode, rdev, data) = loop {
             // Several archives may be concatenated, with zero padding between.
             while let Some(([0, 0, 0, 0], tail)) = self.rest.split_first_chunk::<4>() {
                 self.rest = tail;
@@ -64,6 +67,7 @@ impl<'src> Entries<'src> {
                 return Err(Errno::EINVAL);
             }
             let mode = field(header, 1)?;
+            let rdev = crate::dev::makedev(field(header, 9)?, field(header, 10)?);
             let size = field(header, 6)? as usize;
             let name_size = field(header, 11)? as usize;
             let name_end = HEADER_LEN.checked_add(name_size).ok_or(Errno::EINVAL)?;
@@ -81,7 +85,7 @@ impl<'src> Entries<'src> {
                 // Another archive may follow (an early microcode cpio, say).
                 continue;
             }
-            break (name, mode, data);
+            break (name, mode, rdev, data);
         };
         let kind = match mode & 0o170000 {
             0o010000 => FileKind::Fifo,
@@ -95,7 +99,8 @@ impl<'src> Entries<'src> {
         };
         let name = name.trim_start_matches("./").trim_start_matches('/');
         let name = if name == "." { "" } else { name.trim_end_matches('/') };
-        Ok(Some(Entry { name, kind, mode: mode & 0o7777, data }))
+        let rdev = if matches!(kind, FileKind::CharDevice | FileKind::BlockDevice) { rdev } else { 0 };
+        Ok(Some(Entry { name, kind, mode: mode & 0o7777, rdev, data }))
     }
 }
 
@@ -117,8 +122,11 @@ impl<'src> Iterator for Entries<'src> {
 /// Unpacks `archive` into the existing directory `at` of `vfs`, creating
 /// missing parent directories and replacing existing files and symbolic
 /// links (a directory where a file belongs fails with `EISDIR`); returns the
-/// number of members. Device nodes get no device number: bind real devices
-/// with a [`DevDir`](crate::dev::DevDir) instead.
+/// number of members. A member below a symbolic link made by the archive (or
+/// found in place) fails with `ENOTDIR`: names are never followed out of the
+/// tree. Device nodes get their device number if the file system can record
+/// one ([`File::mknod`](crate::File::mknod)), else fail with `EPERM`; bind
+/// real devices with a [`DevDir`](crate::dev::DevDir) instead.
 pub fn unpack(vfs: &Vfs, at: &str, archive: &[u8]) -> Result<usize, Errno> {
     let mut count = 0;
     for entry in entries(archive) {
@@ -133,7 +141,7 @@ pub fn unpack(vfs: &Vfs, at: &str, archive: &[u8]) -> Result<usize, Errno> {
         let mut path = String::from(at.trim_end_matches('/'));
         path.push('/');
         path.push_str(entry.name);
-        mkdir_parents(vfs, &path)?;
+        mkdir_parents(vfs, &path, at.trim_end_matches('/').len())?;
         match entry.kind {
             FileKind::Directory => match vfs.mkdir(&path, entry.mode) {
                 Err(Errno::EEXIST) if vfs.stat(&path, false)?.kind == FileKind::Directory => {}
@@ -156,18 +164,27 @@ pub fn unpack(vfs: &Vfs, at: &str, archive: &[u8]) -> Result<usize, Errno> {
             }
             kind => {
                 remove_existing(vfs, &path)?;
-                vfs.mknod(&path, kind, entry.mode)?;
+                vfs.mknod_dev(&path, kind, entry.mode, entry.rdev)?;
             }
         }
     }
     Ok(count)
 }
 
-/// `mkdir -p` of everything above `path`'s last component.
-fn mkdir_parents(vfs: &Vfs, path: &str) -> Result<(), Errno> {
+/// `mkdir -p` of everything above `path`'s last component. Below the first
+/// `base` bytes (the directory the archive is unpacked into) every
+/// component must be a real directory, not a symbolic link.
+fn mkdir_parents(vfs: &Vfs, path: &str, base: usize) -> Result<(), Errno> {
     for (i, _) in path.match_indices('/').skip(1) {
-        match vfs.mkdir(path.get(..i).ok_or(Errno::EINVAL)?, 0o755) {
-            Ok(()) | Err(Errno::EEXIST) => {}
+        let prefix = path.get(..i).ok_or(Errno::EINVAL)?;
+        match vfs.mkdir(prefix, 0o755) {
+            Ok(()) => {}
+            Err(Errno::EEXIST) if i <= base => {}
+            Err(Errno::EEXIST) => {
+                if vfs.stat(prefix, false)?.kind != FileKind::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -191,6 +208,11 @@ mod tests {
 
     /// Appends a `newc` member.
     fn member(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
+        member_dev(out, name, mode, (0, 0), data);
+    }
+
+    /// A member with a device number.
+    fn member_dev(out: &mut Vec<u8>, name: &str, mode: u32, (major, minor): (u32, u32), data: &[u8]) {
         let header = format!(
             "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
             out.len(),
@@ -202,8 +224,8 @@ mod tests {
             data.len(),
             0,
             0,
-            0,
-            0,
+            major,
+            minor,
             name.len() + 1,
             0
         );
@@ -337,5 +359,41 @@ mod tests {
         let vfs = Vfs::new(RamFs::new(1).root());
         assert_eq!(unpack(&vfs, "/", &archive).unwrap(), 5);
         assert_eq!(read_all(&vfs, "/a/link"), b"from gnu cpio");
+    }
+
+    #[test]
+    fn device_numbers_are_kept() {
+        let mut archive = Vec::new();
+        member_dev(&mut archive, "dev/null", 0o020666, (1, 3), b"");
+        member_dev(&mut archive, "dev/sda", 0o060660, (8, 0), b"");
+        member(&mut archive, "dev/fifo", 0o010600, b"");
+        member(&mut archive, TRAILER, 0, b"");
+        let rdevs: Vec<u64> = entries(&archive).map(|e| e.unwrap().rdev).collect();
+        assert_eq!(rdevs, [crate::dev::makedev(1, 3), crate::dev::makedev(8, 0), 0]);
+        let vfs = Vfs::new(RamFs::new(1).root());
+        unpack(&vfs, "/", &archive).unwrap();
+        let null = vfs.stat("/dev/null", false).unwrap();
+        assert_eq!((null.kind, null.rdev), (FileKind::CharDevice, crate::dev::makedev(1, 3)));
+        assert_eq!(vfs.stat("/dev/sda", false).unwrap().rdev, crate::dev::makedev(8, 0));
+    }
+
+    #[test]
+    fn members_are_never_unpacked_through_a_symlink() {
+        let vfs = Vfs::new(RamFs::new(1).root());
+        vfs.mkdir("/etc", 0o755).unwrap();
+        let mut evil = Vec::new();
+        member(&mut evil, "x", 0o120777, b"/");
+        member(&mut evil, "x/etc/passwd", 0o100644, b"owned");
+        member(&mut evil, TRAILER, 0, b"");
+        assert_eq!(unpack(&vfs, "/root", &evil), Err(Errno::ENOTDIR));
+        assert_eq!(vfs.lookup("/etc/passwd").err(), Some(Errno::ENOENT));
+        assert!(vfs.lookup("/etc").unwrap().readdir(0).unwrap().is_none());
+        // The unpack directory itself may be reached through a link.
+        vfs.symlink("/root", "/link").unwrap();
+        let mut fine = Vec::new();
+        member(&mut fine, "a/b", 0o100644, b"ok");
+        member(&mut fine, TRAILER, 0, b"");
+        unpack(&vfs, "/link", &fine).unwrap();
+        assert_eq!(read_all(&vfs, "/root/a/b"), b"ok");
     }
 }

@@ -403,3 +403,42 @@ fn interleave_needs_both_fields_and_bounds() {
     assert_eq!(x.read(2048, &mut buf), Err(Errno::EIO));
     assert_eq!(x.read(39 * 2048, &mut buf), Err(Errno::EIO));
 }
+
+#[test]
+fn directories_sharing_an_extent_but_not_a_size_are_not_confused() {
+    const B: usize = 2048;
+    let mut img = vec![0u8; 64 * B];
+    let root = record(&[0], 18, B as u32, 2, 0, 0);
+    let pvd = &mut img[16 * B..17 * B];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(b"CD001");
+    pvd[6] = 1;
+    pvd[40..72].fill(b' ');
+    pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
+    pvd[156..156 + root.len()].copy_from_slice(&root);
+    let term = &mut img[17 * B..18 * B];
+    term[0] = 255;
+    term[1..6].copy_from_slice(b"CD001");
+    term[6] = 1;
+    // Two directories at one extent: "SHORT" is one block, "LONG" two.
+    let mut dir = record(&[0], 18, B as u32, 2, 0, 0);
+    dir.extend(record(&[1], 18, B as u32, 2, 0, 0));
+    dir.extend(record(b"SHORT", 19, B as u32, 2, 0, 0));
+    dir.extend(record(b"LONG", 19, 2 * B as u32, 2, 0, 0));
+    img[18 * B..18 * B + dir.len()].copy_from_slice(&dir);
+    let mut first = record(&[0], 19, B as u32, 2, 0, 0);
+    first.extend(record(&[1], 18, B as u32, 2, 0, 0));
+    first.extend(record(b"F.TXT;1", 21, 4, 0, 0, 0));
+    img[19 * B..19 * B + first.len()].copy_from_slice(&first);
+    let second = record(b"G.TXT;1", 21, 4, 0, 0, 0);
+    img[20 * B..20 * B + second.len()].copy_from_slice(&second);
+    img[21 * B..21 * B + 4].copy_from_slice(b"data");
+    let img = Arc::new(img);
+    let fs = mount(&img, 2048);
+    let root = fs.root();
+    let short = root.lookup("short").unwrap();
+    assert_eq!(names(&*short), ["f.txt"]);
+    let long = root.lookup("long").unwrap();
+    assert_eq!(names(&*long), ["f.txt", "g.txt"]);
+    assert_eq!(names(&*short), ["f.txt"]);
+}

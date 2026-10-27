@@ -152,12 +152,17 @@ struct Shared<D: BlockDevice + Send + 'static> {
 /// A directory's parsed entries, shared by every node of it.
 struct DirBlock<D: BlockDevice + Send + 'static> {
     shared: Arc<Shared<D>>,
-    ino: u64,
+    /// What the entries were parsed from: the directory's number, the start
+    /// of its extent and its size. A crafted image can give two different
+    /// directories the same number, so all three identify it.
+    key: DirKey,
     entries: Vec<Entry>,
     /// Itself, for the cache to hand out references without allocating.
     me: Once<Weak<DirBlock<D>>>,
     link: SharedLink<TreeLink>,
 }
+
+type DirKey = (u64, u64, u64);
 
 struct ByIno<D>(core::marker::PhantomData<D>);
 
@@ -168,10 +173,10 @@ unsafe impl<D: BlockDevice + Send + 'static> Adapter<TreeLink> for ByIno<D> {
 }
 
 impl<D: BlockDevice + Send + 'static> KeyAdapter<TreeLink> for ByIno<D> {
-    type Key = u64;
+    type Key = DirKey;
 
-    fn key(b: &DirBlock<D>) -> &u64 {
-        &b.ino
+    fn key(b: &DirBlock<D>) -> &DirKey {
+        &b.key
     }
 }
 
@@ -495,7 +500,8 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
         if let Some(c) = self.children.get() {
             return Ok(&c.entries);
         }
-        let ino = self.entry.ino;
+        let first = self.entry.extents.first().ok_or(Errno::EIO)?;
+        let ino = (self.entry.ino, first.start, self.entry.size);
         let cached = self.shared.dirs.lock().find(&ino).and_then(|b| b.me.get()?.upgrade());
         let c = match cached {
             Some(c) => c,
@@ -504,7 +510,7 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
                 let entries = self.shared.read_dir(&self.entry)?;
                 let block = try_arc(DirBlock {
                     shared: self.shared.clone(),
-                    ino,
+                    key: ino,
                     entries,
                     me: Once::new(),
                     link: SharedLink::new(TreeLink::new()),
