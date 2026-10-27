@@ -11,6 +11,9 @@ use super::interp::Interpreter;
 use super::name::NameString;
 use super::namespace::{Data, NodeId, Object, ROOT};
 use super::ops;
+
+/// How many steps through [`Ref::Index`] one lookup of a place may take (see `place_value_at`).
+const INDEX_FUEL: u32 = 256;
 use super::value::{Ref, Value};
 
 /// How a value is written to a place.
@@ -296,6 +299,13 @@ impl<H: Host> Interpreter<H> {
 
     /// The storage behind a place that holds plain data.
     pub(crate) fn place_value(&mut self, r: &Ref) -> Result<&mut Value, AmlError> {
+        self.place_value_at(r, &mut INDEX_FUEL.clone())
+    }
+
+    /// [`place_value`](Self::place_value) that takes at most `fuel` steps through [`Ref::Index`] in all. A
+    /// reference can lead back to itself through a local (`Index (Local0, 0, Local0)`), and a chain of them
+    /// is walked twice per level, so only a total count (not a depth) keeps the work small.
+    fn place_value_at(&mut self, r: &Ref, fuel: &mut u32) -> Result<&mut Value, AmlError> {
         match r {
             Ref::Node(id) => {
                 let id = self.ns.resolve_alias(*id);
@@ -312,8 +322,9 @@ impl<H: Host> Interpreter<H> {
                 self.frames.get_mut(*frame).and_then(|f| f.args.get_mut(usize::from(*n))).ok_or(AmlError::OutOfBounds)
             }
             Ref::Index { base, index } => {
-                let base = self.resolve_place(base.as_ref().clone())?;
-                match self.place_value(&base)? {
+                *fuel = fuel.checked_sub(1).ok_or(AmlError::TooDeep)?;
+                let base = self.resolve_place_at(base.as_ref().clone(), fuel)?;
+                match self.place_value_at(&base, fuel)? {
                     Value::Package(p) => p.get_mut(*index).ok_or(AmlError::OutOfBounds),
                     _ => Err(AmlError::TypeMismatch),
                 }
@@ -322,10 +333,15 @@ impl<H: Host> Interpreter<H> {
     }
 
     /// Follows references held in a place to the place that holds the data.
-    pub(crate) fn resolve_place(&mut self, mut r: Ref) -> Result<Ref, AmlError> {
+    pub(crate) fn resolve_place(&mut self, r: Ref) -> Result<Ref, AmlError> {
+        self.resolve_place_at(r, &mut INDEX_FUEL.clone())
+    }
+
+    fn resolve_place_at(&mut self, mut r: Ref, fuel: &mut u32) -> Result<Ref, AmlError> {
         for _ in 0..8 {
-            match self.place_value(&r) {
+            match self.place_value_at(&r, fuel) {
                 Ok(Value::Reference(inner)) => r = inner.clone(),
+                Err(AmlError::TooDeep) => return Err(AmlError::TooDeep),
                 _ => return Ok(r),
             }
         }
@@ -351,7 +367,12 @@ impl<H: Host> Interpreter<H> {
                             .ok_or(AmlError::OutOfBounds);
                     }
                     Ok(_) => return Err(AmlError::TypeMismatch),
-                    Err(_) => self.read_ref(&base)?,
+                    Err(_) => {
+                        self.descend()?;
+                        let whole = self.read_ref(&base);
+                        self.depth = self.depth.saturating_sub(1);
+                        whole?
+                    }
                 };
                 match whole {
                     Value::Buffer(b) => {
@@ -438,6 +459,7 @@ impl<H: Host> Interpreter<H> {
     fn write_index(&mut self, base: &Ref, index: usize, v: Value) -> Result<(), AmlError> {
         let base = self.resolve_place(base.clone())?;
         if matches!(self.place_value(&base)?, Value::Package(_)) {
+            self.check_nesting(&v)?;
             if let Value::Package(p) = self.place_value(&base)? {
                 *p.get_mut(index).ok_or(AmlError::OutOfBounds)? = v;
             }

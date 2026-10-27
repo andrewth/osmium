@@ -58,6 +58,22 @@ impl<H: Host> Interpreter<H> {
         }
     }
 
+    /// Counts `n` terms against the per-call and the batch budgets.
+    pub(crate) fn charge(&mut self, n: u64) -> Result<(), AmlError> {
+        self.steps = self.steps.saturating_add(n);
+        self.batch_steps = self.batch_steps.saturating_add(n);
+        if self.steps > self.config.max_steps || self.batch_steps > self.config.max_total_steps {
+            Err(AmlError::Timeout)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Counts the copying of `bytes` bytes: one term per 64.
+    pub(crate) fn charge_bytes(&mut self, bytes: usize) -> Result<(), AmlError> {
+        self.charge(bytes as u64 / 64)
+    }
+
     pub(crate) fn int_arg(&mut self, c: &mut Cursor<'_>) -> Result<u64, AmlError> {
         let v = self.arg(c)?;
         self.integer_from(v)
@@ -73,10 +89,7 @@ impl<H: Host> Interpreter<H> {
 
     /// Reads one term and runs it.
     pub(crate) fn term(&mut self, c: &mut Cursor<'_>) -> Result<Flow, AmlError> {
-        self.steps += 1;
-        if self.steps > self.config.max_steps {
-            return Err(AmlError::Timeout);
-        }
+        self.charge(1)?;
         self.descend()?;
         let r = self.term_inner(c);
         self.depth = self.depth.saturating_sub(1);
@@ -110,6 +123,7 @@ impl<H: Host> Interpreter<H> {
             0x70 => {
                 let v = self.arg(c)?;
                 let t = self.target(c)?;
+                self.charge_bytes(v.copy_size())?;
                 self.store_target(&t, v.clone())?;
                 v
             }
@@ -565,7 +579,12 @@ impl<H: Host> Interpreter<H> {
     /// Counts `us` microseconds of sleeping against the budget.
     fn spend(&mut self, us: u64) -> Result<(), AmlError> {
         self.sleep_us = self.sleep_us.saturating_add(us);
-        if self.sleep_us > self.config.max_sleep_us { Err(AmlError::Timeout) } else { Ok(()) }
+        self.batch_sleep_us = self.batch_sleep_us.saturating_add(us);
+        if self.sleep_us > self.config.max_sleep_us || self.batch_sleep_us > self.config.max_total_sleep_us {
+            Err(AmlError::Timeout)
+        } else {
+            Ok(())
+        }
     }
 
     fn cond_ref_of(&mut self, c: &mut Cursor<'_>) -> Result<Value, AmlError> {
@@ -599,6 +618,7 @@ impl<H: Host> Interpreter<H> {
         if size > MAX_OBJECT {
             return Err(AmlError::TooLarge);
         }
+        self.charge_bytes(size as usize)?;
         let mut buf = alloc::vec![0u8; size as usize];
         let init = b.data.get(b.pos..b.end).unwrap_or_default();
         let n = init.len().min(buf.len());
@@ -617,12 +637,21 @@ impl<H: Host> Interpreter<H> {
             return Err(AmlError::TooLarge);
         }
         let n = n as usize;
+        self.charge_bytes(n.saturating_mul(32))?;
         let mut items = Vec::with_capacity(n.min(64));
         while !b.at_end() && items.len() < n {
-            items.push(self.package_element(&mut b)?);
+            let item = self.package_element(&mut b)?;
+            self.check_nesting(&item)?;
+            items.push(item);
         }
         items.resize(n, Value::Uninit);
         Ok(Value::Package(items))
+    }
+
+    /// Fails with `TooDeep` if `v` could not be put inside another package or reference without nesting past
+    /// [`Config::max_depth`]. Loops that store a package into itself would otherwise nest without bound.
+    pub(crate) fn check_nesting(&self, v: &Value) -> Result<(), AmlError> {
+        if v.depth() >= self.config.max_depth { Err(AmlError::TooDeep) } else { Ok(()) }
     }
 
     /// A package element. A name stands for the object it names: data is copied, anything else (a device, a
@@ -749,6 +778,7 @@ impl<H: Host> Interpreter<H> {
                 if s.len() as u64 > MAX_OBJECT {
                     return Err(AmlError::TooLarge);
                 }
+                self.charge_bytes(s.len())?;
                 Value::String(s)
             }
             Value::Buffer(mut x) => {
@@ -756,6 +786,7 @@ impl<H: Host> Interpreter<H> {
                 if x.len() as u64 > MAX_OBJECT {
                     return Err(AmlError::TooLarge);
                 }
+                self.charge_bytes(x.len())?;
                 Value::Buffer(x)
             }
             _ => return Err(AmlError::TypeMismatch),
@@ -779,6 +810,7 @@ impl<H: Host> Interpreter<H> {
         if a.len() as u64 > MAX_OBJECT {
             return Err(AmlError::TooLarge);
         }
+        self.charge_bytes(a.len())?;
         let r = Value::Buffer(a);
         self.store_target(&t, r.clone())?;
         Ok(r)
@@ -904,6 +936,9 @@ impl<H: Host> Interpreter<H> {
         if index >= len as u64 {
             return Err(AmlError::OutOfBounds);
         }
+        if base.depth() >= self.config.max_depth {
+            return Err(AmlError::TooDeep);
+        }
         let r = Value::Reference(Ref::Index { base: alloc::boxed::Box::new(base), index: index as usize });
         self.store_target(&t, r.clone())?;
         Ok(r)
@@ -969,6 +1004,13 @@ impl<H: Host> Interpreter<H> {
     }
 
     fn type_of_ref(&mut self, r: &Ref) -> Result<u64, AmlError> {
+        // References can lead back to themselves, so each step down counts as nesting.
+        let res = self.descend().and_then(|()| self.type_of_ref_inner(r));
+        self.depth = self.depth.saturating_sub(1);
+        res
+    }
+
+    fn type_of_ref_inner(&mut self, r: &Ref) -> Result<u64, AmlError> {
         match r {
             Ref::Node(id) => self.type_of_node(*id),
             Ref::Index { base, .. } => {

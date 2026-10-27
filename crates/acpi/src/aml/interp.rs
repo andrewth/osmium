@@ -37,6 +37,13 @@ pub struct Config {
     pub max_steps: u64,
     /// How many microseconds of `Sleep` and `Stall` one call may request in total.
     pub max_sleep_us: u64,
+    /// How many terms all the methods run by one [`initialize`](Interpreter::initialize),
+    /// [`devices`](Interpreter::devices) or [`find_devices`](Interpreter::find_devices) may execute in total,
+    /// so that many methods each just under [`max_steps`](Self::max_steps) cannot add up to a hang. Copying
+    /// a buffer, string or package counts as one term per 64 bytes, in this limit and in `max_steps`.
+    pub max_total_steps: u64,
+    /// How many microseconds of `Sleep` and `Stall` such a batch may request in total.
+    pub max_total_sleep_us: u64,
 }
 
 impl Default for Config {
@@ -47,6 +54,8 @@ impl Default for Config {
             max_depth: 96,
             max_steps: 20_000_000,
             max_sleep_us: 10_000_000,
+            max_total_steps: 200_000_000,
+            max_total_sleep_us: 60_000_000,
         }
     }
 }
@@ -127,6 +136,11 @@ pub struct Interpreter<H> {
     peak_depth: usize,
     pub(crate) steps: u64,
     pub(crate) sleep_us: u64,
+    /// Terms and sleep of everything run since the current batch (`initialize`, `devices`) began.
+    pub(crate) batch_steps: u64,
+    pub(crate) batch_sleep_us: u64,
+    /// How many batches are open (they nest: `initialize` runs `evaluate_node`).
+    batches: u32,
     pub(crate) events: BTreeMap<NodeId, u64>,
     pub(crate) pci_cache: BTreeMap<NodeId, PciAddress>,
     tables: Vec<TableInfo>,
@@ -153,6 +167,9 @@ impl<H: Host> Interpreter<H> {
             peak_depth: 0,
             steps: 0,
             sleep_us: 0,
+            batch_steps: 0,
+            batch_sleep_us: 0,
+            batches: 0,
             events: BTreeMap::new(),
             pci_cache: BTreeMap::new(),
             tables: Vec::new(),
@@ -253,6 +270,22 @@ impl<H: Host> Interpreter<H> {
     /// region the [host serves](Host::serves_region), `\_SB_._INI`, and then `_STA` and `_INI` on every
     /// device, skipping the children of devices that are neither present nor functioning.
     pub fn initialize(&mut self) -> InitReport {
+        self.batch(|me| me.initialize_inner())
+    }
+
+    /// Runs `f` as one batch: the total budgets ([`Config::max_total_steps`]) start fresh and cover all of it.
+    fn batch<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        if self.batches == 0 {
+            self.batch_steps = 0;
+            self.batch_sleep_us = 0;
+        }
+        self.batches += 1;
+        let r = f(self);
+        self.batches -= 1;
+        r
+    }
+
+    fn initialize_inner(&mut self) -> InitReport {
         let mut report = InitReport::default();
         self.run_reg(&mut report);
         if let Some(sb) = self.ns.find("\\_SB_._INI") {
@@ -375,6 +408,10 @@ impl<H: Host> Interpreter<H> {
 
     /// Every `Device` with its identity. Evaluates `_HID`, `_UID`, `_ADR` and `_STA` of each.
     pub fn devices(&mut self) -> Vec<DeviceInfo> {
+        self.batch(|me| me.devices_inner())
+    }
+
+    fn devices_inner(&mut self) -> Vec<DeviceInfo> {
         let mut out = Vec::new();
         for id in self.ns.descendants(ROOT) {
             if self.ns.kind(id) != Some(ObjectKind::Device) {
@@ -394,6 +431,10 @@ impl<H: Host> Interpreter<H> {
 
     /// Devices whose `_HID` or any `_CID` is `hid`.
     pub fn find_devices(&mut self, hid: &str) -> Vec<NodeId> {
+        self.batch(|me| me.find_devices_inner(hid))
+    }
+
+    fn find_devices_inner(&mut self, hid: &str) -> Vec<NodeId> {
         let mut out = Vec::new();
         for id in self.ns.descendants(ROOT) {
             if self.ns.kind(id) == Some(ObjectKind::Device) && self.device_matches(id, hid) {
@@ -433,6 +474,10 @@ impl<H: Host> Interpreter<H> {
         if base == 0 {
             self.steps = 0;
             self.sleep_us = 0;
+            if self.batches == 0 {
+                self.batch_steps = 0;
+                self.batch_sleep_us = 0;
+            }
         }
         let r = f(self);
         self.unwind(base);

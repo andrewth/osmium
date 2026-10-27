@@ -227,7 +227,12 @@ impl<'src> Elf<'src> {
         self.span_at(bias).ok_or(MapError::InvalidAddress)?;
         let page = PAGE_SIZE as u64;
         // The pages a segment covers; None if its end overflows.
+        // An empty segment covers no page, whatever its address (callers
+        // such as `load_elf_at` skip it too, and never range-check it).
         let pages = |s: &Segment<'_>| {
+            if s.mem_size == 0 {
+                return Some(0..0);
+            }
             let end = s.vaddr.checked_add(s.mem_size)?.checked_next_multiple_of(page)?;
             Some(s.vaddr & !(page - 1)..end)
         };
@@ -633,6 +638,44 @@ mod tests {
             elf.load_into_at(&mut pt, MapFlags::USER, u64::MAX - 0xfff, || OwnedFrame::claim(&Host, page())),
             Err(MapError::InvalidAddress)
         );
+    }
+
+    #[test]
+    fn an_empty_segment_maps_no_page() {
+        use osmium_mm::paging::formats::X86_64;
+        use osmium_mm::{PhysMapper, paging::TableAlloc};
+        use std::alloc::{Layout, alloc_zeroed};
+
+        struct Host;
+        // SAFETY: host addresses are directly dereferenceable.
+        unsafe impl PhysMapper for Host {
+            fn phys_to_virt(&self, pa: PhysAddr) -> *mut u8 {
+                pa.0 as *mut u8
+            }
+        }
+        fn page() -> PhysAddr {
+            // SAFETY: non-zero size; leaked for the test's duration.
+            PhysAddr::new(unsafe { alloc_zeroed(Layout::from_size_align(4096, 4096).unwrap()) } as u64)
+        }
+        // SAFETY: fresh, exclusive, page-aligned host pages.
+        unsafe impl TableAlloc for Host {
+            fn alloc_table(&self) -> Option<PhysAddr> {
+                Some(page())
+            }
+            unsafe fn free_table(&self, _: PhysAddr) {}
+            fn claim_frame(&self, _: PhysAddr) -> bool {
+                true
+            }
+        }
+        // The second segment: no file data, no memory, an unaligned address.
+        let mut f = sample();
+        f[120 + 16..120 + 24].copy_from_slice(&0x90_0010u64.to_le_bytes());
+        f[120 + 32..120 + 48].fill(0);
+        let elf = Elf::new(&f).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&Host).unwrap();
+        elf.load_into(&mut pt, MapFlags::USER, || OwnedFrame::claim(&Host, page())).unwrap();
+        assert!(pt.translate(VirtAddr::new(0x40_1000)).is_some());
+        assert!(pt.translate(VirtAddr::new(0x90_0000)).is_none(), "an empty segment maps nothing");
     }
 
     #[test]

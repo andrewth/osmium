@@ -75,6 +75,79 @@ fn a_loop_of_sleeps_runs_out_of_sleep_budget() {
     assert!(aml.host().slept_ms <= 10_000 + 0xFFFF);
 }
 
+/// `Store (Package (1) {0}, Local0)`, then `body` in an endless `While`.
+fn nesting_loop(body: &[u8]) -> Vec<u8> {
+    let package = with_len(&[0x12], &[1, ZERO]);
+    let init = [&[0x70][..], &package, &[0x60]].concat();
+    let looped = with_len(&[0xA2], &[&[ONE][..], body].concat());
+    method(b"NEST", 0, &[init, looped].concat())
+}
+
+#[test]
+fn a_package_stored_into_itself_cannot_nest_without_bound() {
+    // While (One) { Store (Local0, Index (Local0, 0)) }
+    let body = [0x70, 0x60, 0x88, 0x60, ZERO, ZERO];
+    assert_eq!(run(&[nesting_loop(&body)], "\\NEST", &[]), Err(AmlError::TooDeep));
+}
+
+#[test]
+fn a_package_built_around_itself_cannot_nest_without_bound() {
+    // While (One) { Store (Package (1) { Local0 }, Local0) }
+    let body = [&[0x70][..], &with_len(&[0x12], &[1, 0x60]), &[0x60]].concat();
+    assert_eq!(run(&[nesting_loop(&body)], "\\NEST", &[]), Err(AmlError::TooDeep));
+}
+
+#[test]
+fn references_to_references_cannot_chain_without_bound() {
+    // While (One) { Index (Local0, 0, Local0) }
+    let body = [0x88, 0x60, ZERO, 0x60];
+    let r = run(&[nesting_loop(&body)], "\\NEST", &[]);
+    assert_eq!(r, Err(AmlError::TooDeep));
+}
+
+#[test]
+fn a_long_chain_of_index_fields_stops() {
+    // OperationRegion (REG_, SystemMemory, 0x1000, 8) and Field (REG_, ...) { A000, 8, DAT_, 8 }
+    let region = [&[0x5B, 0x80][..], b"REG_", &[0x00, 0x0B, 0x00, 0x10, 0x0A, 0x08]].concat();
+    let field = with_len(&[0x5B, 0x81], &[&b"REG_"[..], &[0x01], b"A000", &[0x08], b"DAT_", &[0x08]].concat());
+    let mut items = vec![region, field];
+    // IndexField (A000, DAT_, ...) { A001, 8 }, IndexField (A001, DAT_, ...) { A002, 8 }, ...: writing the
+    // last one writes the selector of the one before it, and so on down to the first.
+    const N: usize = 3000;
+    for i in 0..N {
+        let (sel, name) = (format!("A{i:03X}"), format!("A{:03X}", i + 1));
+        items.push(with_len(&[0x5B, 0x86], &[sel.as_bytes(), b"DAT_", &[0x01], name.as_bytes(), &[0x08]].concat()));
+    }
+    // Store (0x55, A_last)
+    let body = [&[0x70, 0x0A, 0x55][..], format!("A{N:03X}").as_bytes()].concat();
+    items.push(method(b"TEST", 0, &body));
+    let mut aml = Interpreter::new(TestHost::default(), Config::default());
+    aml.load_table(&dsdt(&items)).expect("loads");
+    assert_eq!(aml.evaluate("\\TEST", &[]), Err(AmlError::TooDeep));
+}
+
+#[test]
+fn many_methods_each_within_the_limit_still_run_out_of_the_batch_budget() {
+    // Method (_INI) { Local0 = 0; While (Local0 < 150) { Local0++ } }, in each of ten devices.
+    let looped = with_len(&[0xA2], &[&[0x95, 0x60, 0x0A, 150][..], &[0x75, 0x60]].concat());
+    let ini = method(b"_INI", 0, &[&[0x70, ZERO, 0x60][..], &looped].concat());
+    let devices: Vec<Vec<u8>> = (0..10)
+        .map(|i| {
+            let name = format!("DEV{i}");
+            with_len(&[0x5B, 0x82], &[name.as_bytes(), &ini[..]].concat())
+        })
+        .collect();
+    let timeouts = |config: Config| {
+        let mut aml = Interpreter::new(TestHost::default(), config);
+        aml.load_table(&dsdt(&devices)).expect("loads");
+        let report = aml.initialize();
+        report.errors.iter().filter(|(_, e)| *e == AmlError::Timeout).count()
+    };
+    let each = Config { max_steps: 1_000, ..Config::default() };
+    assert_eq!(timeouts(each.clone()), 0, "each _INI fits in its own limit");
+    assert!(timeouts(Config { max_total_steps: 3_000, ..each }) > 0, "but not all ten in the batch's");
+}
+
 #[test]
 fn recursion_stops() {
     // Method (REC) { Return (REC ()) }

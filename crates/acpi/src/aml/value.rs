@@ -53,6 +53,27 @@ pub enum Ref {
 }
 
 impl Value {
+    /// How many levels of package and reference this value nests. Scalars are 0. The interpreter keeps this
+    /// below [`Config::max_depth`](super::Config::max_depth), so the recursive `Clone`, `Drop`, `Debug` and
+    /// `PartialEq` cannot overflow the stack.
+    pub(crate) fn depth(&self) -> usize {
+        match self {
+            Value::Package(p) => 1 + p.iter().map(Value::depth).max().unwrap_or(0),
+            Value::Reference(r) => 1 + r.depth(),
+            _ => 0,
+        }
+    }
+
+    /// Roughly how many bytes cloning this value copies.
+    pub(crate) fn copy_size(&self) -> usize {
+        match self {
+            Value::String(s) => s.len(),
+            Value::Buffer(b) => b.len(),
+            Value::Package(p) => p.iter().map(|v| 32 + v.copy_size()).fold(0, usize::saturating_add),
+            _ => 0,
+        }
+    }
+
     /// The integer, if this is one.
     pub fn as_integer(&self) -> Option<u64> {
         match self {
@@ -83,6 +104,19 @@ impl Value {
             Value::Package(p) => Some(p),
             _ => None,
         }
+    }
+}
+
+impl Ref {
+    /// How many [`Ref::Index`] levels this reference nests.
+    pub(crate) fn depth(&self) -> usize {
+        let mut n = 0;
+        let mut r = self;
+        while let Ref::Index { base, .. } = r {
+            n += 1;
+            r = base;
+        }
+        n
     }
 }
 

@@ -111,35 +111,43 @@ impl<H: Host> Interpreter<H> {
         Ok(())
     }
 
+    /// Runs `f` one level deeper. A bank or index field reaches its selector registers through further field
+    /// accesses, which a hostile table can chain into a cycle.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, AmlError>) -> Result<T, AmlError> {
+        let r = self.descend().and_then(|()| f(self));
+        self.depth = self.depth.saturating_sub(1);
+        r
+    }
+
     fn unit_read(&mut self, f: &FieldUnit, byte_off: u64, bits: u64) -> Result<u64, AmlError> {
         match f.kind {
             FieldKind::Region(r) => self.region_read(r, byte_off, bits),
-            FieldKind::Bank { region, bank, value } => {
-                self.write_node(bank, Value::Integer(value), Mode::Store)?;
-                self.region_read(region, byte_off, bits)
-            }
-            FieldKind::Index { index, data } => {
-                self.write_node(index, Value::Integer(byte_off), Mode::Store)?;
-                match self.read_node(data)? {
+            FieldKind::Bank { region, bank, value } => self.nested(|me| {
+                me.write_node(bank, Value::Integer(value), Mode::Store)?;
+                me.region_read(region, byte_off, bits)
+            }),
+            FieldKind::Index { index, data } => self.nested(|me| {
+                me.write_node(index, Value::Integer(byte_off), Mode::Store)?;
+                match me.read_node(data)? {
                     Value::Integer(i) => Ok(i),
                     Value::Buffer(b) => Ok(ops::le_to_u64(&b)),
                     _ => Err(AmlError::TypeMismatch),
                 }
-            }
+            }),
         }
     }
 
     fn unit_write(&mut self, f: &FieldUnit, byte_off: u64, bits: u64, value: u64) -> Result<(), AmlError> {
         match f.kind {
             FieldKind::Region(r) => self.region_write(r, byte_off, bits, value),
-            FieldKind::Bank { region, bank, value: bank_value } => {
-                self.write_node(bank, Value::Integer(bank_value), Mode::Store)?;
-                self.region_write(region, byte_off, bits, value)
-            }
-            FieldKind::Index { index, data } => {
-                self.write_node(index, Value::Integer(byte_off), Mode::Store)?;
-                self.write_node(data, Value::Integer(value), Mode::Store)
-            }
+            FieldKind::Bank { region, bank, value: bank_value } => self.nested(|me| {
+                me.write_node(bank, Value::Integer(bank_value), Mode::Store)?;
+                me.region_write(region, byte_off, bits, value)
+            }),
+            FieldKind::Index { index, data } => self.nested(|me| {
+                me.write_node(index, Value::Integer(byte_off), Mode::Store)?;
+                me.write_node(data, Value::Integer(value), Mode::Store)
+            }),
         }
     }
 
