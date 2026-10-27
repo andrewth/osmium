@@ -255,6 +255,9 @@ pub const VTCR_48: u64 = 16 | 2 << 6 | 1 << 8 | 1 << 10 | 3 << 12 | 5 << 16 | 1 
 /// is optional.
 pub fn init_cpu() {
     msr!("vtcr_el2", VTCR_48);
+    // Guests read the host's MIDR_EL1 as their own.
+    let midr = mrs!("midr_el1");
+    msr!("vpidr_el2", midr);
     // EL1 may read the physical counter (EL1PCTEN) but not use the
     // physical timer, which is the host's: guests get the virtual one.
     msr!("cnthctl_el2", 1u64);
@@ -390,9 +393,10 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     let vi = v.vgic.is_none() && v.irq.load(core::sync::atomic::Ordering::Acquire);
     let hcr = HCR_GUEST | if vi { HCR_VI } else { 0 };
     msr!("hcr_el2", hcr);
-    if let Some(m) = v.vmpidr {
-        msr!("vmpidr_el2", m);
-    }
+    // Always written: a vCPU without its own value must not see the one
+    // the previous guest on this CPU left behind.
+    let vmpidr = v.vmpidr.unwrap_or_else(|| mrs!("mpidr_el1"));
+    msr!("vmpidr_el2", vmpidr);
     // A different vCPU than this CPU last ran (or a new VM that reuses an
     // old one's VMID and root): install its VTTBR and flush.
     let cpu = osmium_arch::cpu::current_id();

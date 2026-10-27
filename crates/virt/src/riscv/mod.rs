@@ -404,7 +404,9 @@ impl RiscvVcpu {
                     return VmExit::Unhandled { reason: cause };
                 }
                 // A fault on memory the guest owns (a permission fault on a
-                // mapped page) is not MMIO either.
+                // mapped page) is not MMIO either. This check needs the
+                // guest's memory map (`with_memory`); without one every
+                // guest-page fault is reported as MMIO.
                 if self.mem.as_ref().is_some_and(|m| m.host_ptr(addr, 1).is_some()) {
                     return VmExit::Unhandled { reason: cause };
                 }

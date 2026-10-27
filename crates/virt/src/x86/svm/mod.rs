@@ -437,10 +437,10 @@ impl SvmVcpu {
         if self.read64(vmcb::CR0) & (1 << 31) == 0 {
             return Some(linear);
         }
-        if self.read64(vmcb::EFER) & (1 << 10) == 0 {
-            return None; // 32-bit paging is not walked
-        }
         let mem = self.mem.as_ref()?;
+        if self.read64(vmcb::EFER) & (1 << 10) == 0 {
+            return self.translate_legacy(mem, linear);
+        }
         let mut table = self.read64(vmcb::CR3) & 0x000f_ffff_ffff_f000;
         for level in (0..4).rev() {
             let index = (linear >> (12 + 9 * level)) & 0x1ff;
@@ -457,6 +457,41 @@ impl SvmVcpu {
             table = addr;
         }
         None
+    }
+
+    /// Walks 32-bit paging (two levels, 4 MiB pages when CR4.PSE) or PAE
+    /// paging (three levels) for a guest that is not in long mode.
+    fn translate_legacy(&self, mem: &GuestMemory, linear: u64) -> Option<u64> {
+        let linear = linear & 0xffff_ffff;
+        let cr3 = self.read64(vmcb::CR3);
+        let cr4 = self.read64(vmcb::CR4);
+        if cr4 & (1 << 5) == 0 {
+            let pde: u32 = mem.read_obj(GuestPhysAddr((cr3 & 0xffff_f000) + (linear >> 22) * 4)).ok()?;
+            if pde & 1 == 0 {
+                return None;
+            }
+            if pde & (1 << 7) != 0 && cr4 & (1 << 4) != 0 {
+                // 4 MiB page; bits 20:13 of the PDE are address bits 39:32.
+                let base = (pde as u64 & 0xffc0_0000) | (pde as u64 >> 13 & 0xff) << 32;
+                return Some(base | (linear & 0x3f_ffff));
+            }
+            let pte: u32 = mem.read_obj(GuestPhysAddr((pde as u64 & 0xffff_f000) + (linear >> 12 & 0x3ff) * 4)).ok()?;
+            return (pte & 1 != 0).then_some((pte as u64 & 0xffff_f000) | (linear & 0xfff));
+        }
+        let pdpte: u64 = mem.read_obj(GuestPhysAddr((cr3 & 0xffff_ffe0) + (linear >> 30) * 8)).ok()?;
+        if pdpte & 1 == 0 {
+            return None;
+        }
+        let pde: u64 =
+            mem.read_obj(GuestPhysAddr((pdpte & 0x000f_ffff_ffff_f000) + (linear >> 21 & 0x1ff) * 8)).ok()?;
+        if pde & 1 == 0 {
+            return None;
+        }
+        if pde & (1 << 7) != 0 {
+            return Some((pde & 0x000f_ffff_ffe0_0000) | (linear & 0x1f_ffff));
+        }
+        let pte: u64 = mem.read_obj(GuestPhysAddr((pde & 0x000f_ffff_ffff_f000) + (linear >> 12 & 0x1ff) * 8)).ok()?;
+        (pte & 1 != 0).then_some((pte & 0x000f_ffff_ffff_f000) | (linear & 0xfff))
     }
 
     /// Lets the vCPU read instructions from guest memory to emulate MMIO
@@ -736,7 +771,15 @@ impl SvmVcpu {
             // Values VMRUN would reject raise #GP in the guest instead.
             const EFER_VALID: u64 = 1 | 1 << 8 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 15;
             let pat_ok = |v: u64| v.to_le_bytes().iter().all(|&t| matches!(t, 0 | 1 | 4 | 5 | 6 | 7));
-            let bad = (msr == 0xc000_0080 && v & !EFER_VALID != 0)
+            // LME cannot change while paging is on. LMA (bit 10) is set by the
+            // CPU: a guest write to it is ignored (see below), not a fault.
+            const EFER_LME: u64 = 1 << 8;
+            const EFER_LMA: u64 = 1 << 10;
+            let efer_bad = |v: u64| {
+                v & !EFER_VALID != 0
+                    || (self.read64(vmcb::CR0) & (1 << 31) != 0 && (v ^ self.read64(vmcb::EFER)) & EFER_LME != 0)
+            };
+            let bad = (msr == 0xc000_0080 && efer_bad(v))
                 || (msr == 0x277 && !pat_ok(v))
                 || (msr == 0x1b && !apic_base_write_ok(v));
             if bad {
@@ -744,7 +787,10 @@ impl SvmVcpu {
                 return;
             }
             match msr {
-                0xc000_0080 => self.write64(EFER, v | EFER_SVME),
+                0xc000_0080 => {
+                    let lma = self.read64(EFER) & EFER_LMA;
+                    self.write64(EFER, (v & !EFER_LMA) | lma | EFER_SVME)
+                }
                 0xc000_0103 => self.tsc_aux = v & 0xffff_ffff,
                 0x1b => self.apic_base = (v & !APIC_BASE_BSP) | (self.apic_base & APIC_BASE_BSP),
                 _ => {
@@ -771,6 +817,12 @@ impl SvmVcpu {
     /// Like the CPU retiring it, this ends an STI or MOV SS interrupt shadow
     /// (`sti; hlt` would otherwise never let an interrupt in).
     fn skip_to(&mut self, rip: u64) {
+        // Outside 64-bit mode the instruction pointer wraps at the code size.
+        let rip = match self.code_bits() {
+            64 => rip,
+            32 => rip & 0xffff_ffff,
+            _ => rip & 0xffff,
+        };
         self.write64(vmcb::RIP, rip);
         self.write64(vmcb::INT_STATE, 0);
     }
@@ -823,13 +875,22 @@ impl SvmVcpu {
                 // Decode assists write INSN_BYTES only for #NPF and #PF, so
                 // for a DR intercept it is stale: fetch from guest memory.
                 let Some((b, n)) = self.fetch_insn() else { return false };
-                // [REX] 0F 21/23 modrm: the GPR is modrm.rm (+ REX.B).
-                let (rex, i) = match b.first() {
-                    Some(&r) if n > 0 && r & 0xf0 == 0x40 => (r, 1),
-                    _ => (0, 0),
+                // [legacy prefixes] [REX] 0F 21/23 modrm: the GPR is modrm.rm
+                // (+ REX.B). REX only exists in 64-bit mode, right before the opcode.
+                let b = b.get(..n).unwrap_or(&[]);
+                let mut i = 0;
+                while matches!(b.get(i), Some(0x66 | 0x67 | 0x2e | 0x36 | 0x3e | 0x26 | 0x64 | 0x65 | 0xf2 | 0xf3)) {
+                    i += 1;
+                }
+                let rex = match b.get(i) {
+                    Some(&r) if r & 0xf0 == 0x40 && self.code_bits() == 64 => {
+                        i += 1;
+                        r
+                    }
+                    _ => 0,
                 };
                 let (Some(&op), Some(&modrm)) = (b.get(i), b.get(i + 2)) else { return false };
-                if n < i + 3 || op != 0x0f {
+                if op != 0x0f {
                     return false;
                 }
                 if read {

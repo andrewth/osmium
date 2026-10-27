@@ -973,6 +973,12 @@ impl VmxVcpu {
     /// Like the CPU retiring it, this ends an STI or MOV SS interrupt shadow
     /// (`sti; hlt` would otherwise never let an interrupt in).
     fn skip_to(&mut self, rip: u64) {
+        // Outside 64-bit mode the instruction pointer wraps at the code size.
+        let rip = match self.code_bits() {
+            64 => rip,
+            32 => rip & 0xffff_ffff,
+            _ => rip & 0xffff,
+        };
         self.vmcs.write(vmcs::GUEST_RIP, rip);
         let i = self.vmcs.read(vmcs::GUEST_INTERRUPTIBILITY);
         self.vmcs.write(vmcs::GUEST_INTERRUPTIBILITY, i & !3);

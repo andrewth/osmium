@@ -31,6 +31,9 @@ struct Slot {
     running: Arc<AtomicUsize>,
 }
 
+/// How long a remote fence waits for a running hart to take it.
+const FENCE_SPINS: u32 = 50_000_000;
+
 /// Not in the guest.
 pub(crate) const NOT_RUNNING: usize = usize::MAX;
 
@@ -41,8 +44,10 @@ type Kick = Box<dyn Fn(usize) + Send + Sync>;
 pub enum StartError {
     /// There is no such CPU.
     NoSuchCpu,
-    /// It is not stopped.
+    /// It is running.
     AlreadyOn,
+    /// A start was already requested and has not happened yet.
+    Pending,
 }
 
 /// Shared state for a guest's CPUs. Each vCPU's host task takes start
@@ -109,7 +114,7 @@ impl GuestCpus {
         let slot = self.slots.get(cpu).ok_or(StartError::NoSuchCpu)?;
         slot.state
             .compare_exchange(status::STOPPED, status::START_PENDING, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| StartError::AlreadyOn)?;
+            .map_err(|s| if s == status::START_PENDING { StartError::Pending } else { StartError::AlreadyOn })?;
         *slot.start.lock() = Some((entry, opaque));
         Ok(())
     }
@@ -186,21 +191,46 @@ impl GuestCpus {
     /// TLB (`hfence.vvma` for the VM) before it next runs guest code: SBI
     /// RFENCE `remote_fence_i` and `remote_sfence_vma[_asid]`, done
     /// conservatively for the whole address space.
+    ///
+    /// Returns once every target running guest code has taken the request
+    /// (it leaves the guest through the kick and flushes before re-entering),
+    /// as SBI requires the fence to be done on return. A target outside the
+    /// guest flushes before it next enters, so it is not waited for. The wait
+    /// is bounded, for a target that cannot be kicked.
     pub fn remote_fence(&self, mask: u64, base: u64) -> Result<(), i64> {
-        self.each(mask, base, |s| s.fence.store(true, Ordering::Release));
+        self.each(mask, base, |s| s.fence.store(true, Ordering::SeqCst));
+        // Pairs with the vCPU storing `running` and then taking the flag.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let me = osmium_arch::cpu::current_id();
+        for (i, s) in self.slots.iter().enumerate() {
+            if !self.selected(i, mask, base) {
+                continue;
+            }
+            let mut spins = 0u32;
+            while s.fence.load(Ordering::Acquire) {
+                let host = s.running.load(Ordering::SeqCst);
+                if host == NOT_RUNNING || host == me || spins >= FENCE_SPINS {
+                    break;
+                }
+                if spins % 1024 == 0 {
+                    self.kick(i);
+                }
+                spins += 1;
+                core::hint::spin_loop();
+            }
+        }
         Ok(())
+    }
+
+    fn selected(&self, i: usize, mask: u64, base: u64) -> bool {
+        base == u64::MAX || (i as u64).checked_sub(base).is_some_and(|b| b < 64 && mask & (1 << b) != 0)
     }
 
     /// Applies `f` to the harts selected by `mask`/`base`, kicking those
     /// running on another host CPU so they notice now.
     fn each(&self, mask: u64, base: u64, f: impl Fn(&Slot)) {
         for (i, s) in self.slots.iter().enumerate() {
-            let hit = if base == u64::MAX {
-                true
-            } else {
-                (i as u64).checked_sub(base).is_some_and(|b| b < 64 && mask & (1 << b) != 0)
-            };
-            if hit {
+            if self.selected(i, mask, base) {
                 f(s);
                 self.kick(i);
             }
@@ -219,9 +249,10 @@ mod tests {
         assert_eq!(h.take_start(1), None);
         h.request_start(1, 0x8000_0000, 7).unwrap();
         assert_eq!(h.status(1), Some(status::START_PENDING));
-        assert_eq!(h.request_start(1, 0, 0), Err(StartError::AlreadyOn));
+        assert_eq!(h.request_start(1, 0, 0), Err(StartError::Pending));
         assert_eq!(h.take_start(1), Some((0x8000_0000, 7)));
         assert_eq!(h.status(1), Some(status::STARTED));
+        assert_eq!(h.request_start(1, 0, 0), Err(StartError::AlreadyOn));
         h.stopped(1);
         assert_eq!(h.status(1), Some(status::STOPPED));
         assert_eq!(h.request_start(5, 0, 0), Err(StartError::NoSuchCpu));
@@ -249,5 +280,28 @@ mod tests {
         assert_eq!(kicked.load(Ordering::SeqCst), 3, "fences kick too");
         assert!(h.slots[1].fence.load(Ordering::SeqCst));
         assert!(!h.slots[0].fence.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn remote_fence_waits_for_a_running_hart() {
+        let h = GuestCpus::new(2);
+        // Not in the guest: returns at once, the request stays for the next entry.
+        h.remote_fence(0b10, 0).unwrap();
+        assert!(h.slots[1].fence.load(Ordering::SeqCst));
+        h.slots[1].fence.store(false, Ordering::SeqCst);
+
+        // Running on another host CPU: waits until it takes the request.
+        h.slots[1].running.store(usize::MAX - 1, Ordering::SeqCst);
+        let fence = h.slots[1].fence.clone();
+        let taken = Arc::new(AtomicBool::new(false));
+        let t = taken.clone();
+        let th = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            t.store(true, Ordering::SeqCst);
+            fence.store(false, Ordering::SeqCst);
+        });
+        h.remote_fence(0b10, 0).unwrap();
+        assert!(taken.load(Ordering::SeqCst), "returned before the hart took the fence");
+        th.join().unwrap();
     }
 }

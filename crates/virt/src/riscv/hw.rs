@@ -289,7 +289,10 @@ pub fn init_cpu() {
         | (1 << 15);
     csr_write!("0x602", hedeleg);
     csr_write!("0x603", HIDELEG);
-    csr_write!("0x606", 0x7u64); // hcounteren: cycle, time, instret; no host HPM counters
+    // hcounteren: only `time` (the guest's clock, offset by htimedelta).
+    // cycle and instret would show the guest the host's activity, so reading
+    // them in VS-mode raises a virtual-instruction exception.
+    csr_write!("0x606", 0x2u64);
     csr_write!("0x60a", 1u64 << 63); // henvcfg.STCE
     csr_write!("0x605", 0u64); // htimedelta
     csr_write!("0x645", 0u64); // hvip

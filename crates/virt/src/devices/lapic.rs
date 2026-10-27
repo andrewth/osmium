@@ -145,6 +145,18 @@ impl State {
         (v & 0xf0 > self.ppr() & 0xf0).then_some(v)
     }
 
+    /// Whether a logical-mode destination `dest` includes this APIC, by
+    /// LDR and DFR (flat or cluster model).
+    fn logical_match(&self, dest: u8) -> bool {
+        let ldr = (self.ldr >> 24) as u8;
+        if self.dfr >> 28 == 0xf {
+            dest & ldr != 0 // flat: one bit per APIC
+        } else {
+            // Cluster: high nibble is the cluster (0xf broadcasts to all), low nibble a bit mask.
+            (dest >> 4 == 0xf || dest >> 4 == ldr >> 4) && dest & ldr & 0xf != 0
+        }
+    }
+
     fn accept(&mut self, vector: u8) {
         if vector < 16 {
             self.esr |= 1 << 6; // received illegal vector
@@ -402,7 +414,10 @@ impl BusDevice for VirtualLapic {
             ICR_LOW => {
                 s.icr_low = v & !(1 << 12); // delivery status: always idle
                 let (vector, mode, shorthand) = (v as u8, (v >> 8) & 7, (v >> 18) & 3);
-                let to_self = shorthand == 1 || (shorthand == 0 && s.icr_high >> 24 == s.id as u32);
+                let dest = (s.icr_high >> 24) as u8;
+                let logical = v & (1 << 11) != 0;
+                let to_self =
+                    shorthand == 1 || (shorthand == 0 && if logical { s.logical_match(dest) } else { dest == s.id });
                 if mode == 0 && to_self {
                     s.accept(vector);
                 }
@@ -560,6 +575,19 @@ mod tests {
         r.w(ICR_HIGH, 1 << 24);
         r.w(ICR_LOW, 0x61);
         assert_eq!(*sent.lock(), [(1, 0x61)]);
+        // Logical destination mode (bit 11) goes by LDR and DFR, not the ID:
+        // the APIC ID here is 0, but logical 0x01 is not it until LDR says so.
+        sent.lock().clear();
+        r.w(DFR, 0xffff_ffff);
+        r.w(LDR, 0x04 << 24);
+        r.w(ICR_HIGH, 0x01 << 24);
+        r.w(ICR_LOW, 1 << 11 | 0x62);
+        assert_eq!(r.apic.acknowledge(), None, "logical 0x01 does not match LDR 0x04");
+        assert_eq!(*sent.lock(), [(1, 0x62)]);
+        r.w(ICR_HIGH, 0x04 << 24);
+        r.w(ICR_LOW, 1 << 11 | 0x63);
+        assert_eq!(r.apic.acknowledge(), Some(0x63), "logical 0x04 matches LDR 0x04");
+        r.w(EOI, 0);
         // INIT then STARTUP at page 8, as an OS starts an AP.
         assert_eq!(decode_icr(1 << 24, 0x4500), (IpiTarget::Apic(1), IpiKind::Init));
         assert_eq!(decode_icr(1 << 24, 0x0500), (IpiTarget::Apic(1), IpiKind::Other(5)), "INIT de-assert");

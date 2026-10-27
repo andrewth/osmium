@@ -24,6 +24,9 @@ pub const INVALID_PARAMETERS: i64 = -2;
 /// PSCI `ALREADY_ON`.
 pub const ALREADY_ON: i64 = -4;
 
+/// PSCI `ON_PENDING`.
+pub const ON_PENDING: i64 = -5;
+
 /// PSCI `NOT_SUPPORTED`.
 pub const NOT_SUPPORTED: i64 = -1;
 
@@ -39,6 +42,18 @@ pub enum Outcome {
     Stop,
 }
 
+/// The CPU index of a PSCI target MPIDR: Aff0 counts within a cluster of 16
+/// and Aff1 the clusters (see [`vcpu_affinity`](crate::devices::vcpu_affinity)).
+/// `None` for a value with bits outside the affinity fields or an Aff2/Aff3
+/// the guest does not have.
+fn target_cpu(mpidr: u64) -> Option<usize> {
+    let (aff0, aff1) = (mpidr & 0xff, mpidr >> 8 & 0xff);
+    if mpidr & !0xffff != 0 || aff0 >= 16 {
+        return None;
+    }
+    Some((aff1 * 16 + aff0) as usize)
+}
+
 /// Answers the PSCI (or other SMCCC) call in `exit`. Unknown functions
 /// return `NOT_SUPPORTED`. Returns `None` for other exits.
 pub fn handle(vcpu: &mut Aarch64Vcpu, exit: VmExit) -> Option<Outcome> {
@@ -51,17 +66,25 @@ pub fn handle(vcpu: &mut Aarch64Vcpu, exit: VmExit) -> Option<Outcome> {
 pub fn handle_smp(vcpu: &mut Aarch64Vcpu, exit: VmExit, cpus: Option<(&GuestCpus, usize)>) -> Option<Outcome> {
     let VmExit::Hypercall { nr, args } = exit else { return None };
     let ret = match nr & 0xffff_ffff {
-        CPU_ON if let Some((c, _)) = cpus => match c.request_start((args[0] & 0xff) as usize, args[1], args[2]) {
-            Ok(()) => 0,
-            Err(StartError::NoSuchCpu) => INVALID_PARAMETERS as u64,
-            Err(StartError::AlreadyOn) => ALREADY_ON as u64,
+        CPU_ON if let Some((c, _)) = cpus => match target_cpu(args[0]) {
+            None => INVALID_PARAMETERS as u64,
+            Some(t) => match c.request_start(t, args[1], args[2]) {
+                Ok(()) => 0,
+                Err(StartError::NoSuchCpu) => INVALID_PARAMETERS as u64,
+                Err(StartError::AlreadyOn) => ALREADY_ON as u64,
+                Err(StartError::Pending) => ON_PENDING as u64,
+            },
         },
         CPU_OFF if let Some((c, me)) = cpus => {
             c.stopped(me);
             return Some(Outcome::Stop);
         }
         AFFINITY_INFO if let Some((c, _)) = cpus => {
-            c.status((args[0] & 0xff) as usize).unwrap_or(INVALID_PARAMETERS as u64)
+            // Only affinity level 0 (the CPU itself) is supported.
+            match (target_cpu(args[0]), args[1]) {
+                (Some(t), 0) => c.status(t).unwrap_or(INVALID_PARAMETERS as u64),
+                _ => INVALID_PARAMETERS as u64,
+            }
         }
         VERSION => 0x1_0001, // 1.1
         SYSTEM_OFF | SYSTEM_RESET => return Some(Outcome::Shutdown),
@@ -103,7 +126,14 @@ mod tests {
         smp(&mut v, CPU_ON, [1, 0x4000_0100, 7, 0, 0, 0]);
         assert_eq!(v.state.x[0], 0);
         smp(&mut v, CPU_ON, [1, 0, 0, 0, 0, 0]);
-        assert_eq!(v.state.x[0] as i64, ALREADY_ON);
+        assert_eq!(v.state.x[0] as i64, ON_PENDING);
+        // Targets must be whole, existing MPIDR affinities (not just Aff0 & 0xff).
+        for bad in [2u64, 0x101, 1 << 40, 1 | 1 << 16, 0x10, 0x8000_0001] {
+            smp(&mut v, CPU_ON, [bad, 0, 0, 0, 0, 0]);
+            assert_eq!(v.state.x[0] as i64, INVALID_PARAMETERS, "{bad:#x}");
+        }
+        smp(&mut v, AFFINITY_INFO, [0x101, 0, 0, 0, 0, 0]);
+        assert_eq!(v.state.x[0] as i64, INVALID_PARAMETERS);
         smp(&mut v, AFFINITY_INFO, [1, 0, 0, 0, 0, 0]);
         assert_eq!(v.state.x[0], crate::smp::status::START_PENDING);
         assert_eq!(cpus.take_start(1), Some((0x4000_0100, 7)));

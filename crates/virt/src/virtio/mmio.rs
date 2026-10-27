@@ -226,6 +226,20 @@ impl<D: VirtioDevice> VirtioMmio<D> {
             (STATUS, _) if v == 0 => self.reset(s),
             (STATUS, _) => {
                 let mut v = v;
+                let bit = |b: u8| u32::from(b);
+                let step = bit(status::ACKNOWLEDGE) | bit(status::DRIVER);
+                // Status bits only accumulate; clearing one takes a reset (write 0).
+                if s.status & !v != 0 {
+                    return;
+                }
+                // FEATURES_OK only after ACKNOWLEDGE and DRIVER; DRIVER_OK only
+                // after FEATURES_OK was accepted by an earlier write.
+                if v & bit(status::FEATURES_OK) != 0 && v & step != step {
+                    v &= !bit(status::FEATURES_OK);
+                }
+                if v & bit(status::DRIVER_OK) != 0 && s.status & bit(status::FEATURES_OK) == 0 {
+                    v &= !bit(status::DRIVER_OK);
+                }
                 if v & u32::from(status::FEATURES_OK) != 0 && s.status & u32::from(status::FEATURES_OK) == 0 {
                     let offered = s.device.features() | VERSION_1;
                     let ok = s.driver_features & !offered == 0 && s.driver_features & VERSION_1 != 0;
@@ -334,6 +348,23 @@ pub(crate) mod tests {
             data.fill(offset as u8);
         }
         fn notify(&mut self, _queue: usize, _ctx: &mut DeviceCtx<'_>) {}
+    }
+
+    #[test]
+    fn status_transitions_are_enforced() {
+        let dev = VirtioMmio::new(Dummy, Arc::new(GuestMemory::new()), |_| {});
+        let st = |v: u8| dev.write(STATUS as u64, &u32::from(v).to_le_bytes());
+        let (a, d, f, k) = (status::ACKNOWLEDGE, status::DRIVER, status::FEATURES_OK, status::DRIVER_OK);
+        st(a | d | k);
+        assert_eq!(rd(&dev, STATUS), u32::from(a | d), "DRIVER_OK needs FEATURES_OK");
+        st(f);
+        assert_eq!(rd(&dev, STATUS), u32::from(a | d), "bits cannot be cleared; FEATURES_OK needs the earlier steps");
+        dev.write(DRIVER_FEATURES_SEL as u64, &1u32.to_le_bytes());
+        dev.write(DRIVER_FEATURES as u64, &1u32.to_le_bytes());
+        st(a | d | f | k);
+        assert_eq!(rd(&dev, STATUS), u32::from(a | d | f), "FEATURES_OK must be accepted by an earlier write");
+        st(a | d | f | k);
+        assert_eq!(rd(&dev, STATUS), u32::from(a | d | f | k));
     }
 
     #[test]

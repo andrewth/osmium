@@ -357,3 +357,51 @@ fn irq_raised_after_sampling_requests_a_window() {
     assert_ne!(v.intercepts() & INTERCEPT_VINTR, 0);
     assert_ne!(v.read64(vmcb::V_INTR) & 1 << 8, 0);
 }
+
+#[test]
+fn efer_rules_and_32_bit_paging_dr_access() {
+    let wrmsr = |v: &mut SvmVcpu, val: u64| {
+        v.regs.rcx = 0xc000_0080;
+        v.write64(vmcb::RAX, val & 0xffff_ffff);
+        v.regs.rdx = val >> 32;
+        v.write64(vmcb::EXITINFO1, 1);
+        v.emulate_msr();
+    };
+    // Paging on: LME cannot change; a write of LMA is ignored, not a fault.
+    let mut v = vcpu();
+    v.write64(vmcb::CR0, 1 << 31 | 1);
+    v.write64(vmcb::EFER, EFER_SVME | 1 << 8 | 1 << 10);
+    wrmsr(&mut v, 1 | 1 << 11); // clears LME
+    assert!(v.pending_exception.take().is_some(), "LME changed with paging on");
+    wrmsr(&mut v, 1 << 8 | 1 << 11); // LME kept, LMA not written
+    assert!(v.pending_exception.is_none());
+    assert_eq!(v.read64(vmcb::EFER) & (1 << 10), 1 << 10, "LMA follows the CPU");
+    // Paging off: LME may change.
+    let mut v = vcpu();
+    v.write64(vmcb::CR0, 1);
+    v.write64(vmcb::EFER, EFER_SVME);
+    wrmsr(&mut v, 1 << 8);
+    assert!(v.pending_exception.is_none());
+
+    // 32-bit paging, 32-bit code: 66 0F 23 C3 (mov dr0, ebx) at linear 0x40_0000.
+    let mut ram = alloc::vec![0u8; 0x4000];
+    let mut mem = GuestMemory::new();
+    // SAFETY: `ram` outlives the vCPU's use of `mem` in this test.
+    unsafe { mem.add_region(GuestPhysAddr(0), ram.as_mut_ptr(), 0x4000) };
+    mem.write_obj(GuestPhysAddr(0x1000 + 4), 0x2003u32).unwrap(); // PDE 1 -> table at 0x2000
+    mem.write_obj(GuestPhysAddr(0x2000), 0x3003u32).unwrap(); // PTE 0 -> page 0x3000
+    mem.write(GuestPhysAddr(0x3000), &[0x66, 0x0f, 0x21, 0xc3]).unwrap(); // mov ebx, dr0
+    let mut v = vcpu().with_memory(Arc::new(mem));
+    v.write64(vmcb::CR0, 1 << 31 | 1);
+    v.write64(vmcb::CR3, 0x1000);
+    v.write64(vmcb::CR4, 0);
+    v.write64(vmcb::EFER, EFER_SVME);
+    v.write64(vmcb::CS, 0); // clear selector/attrib
+    v.write64(vmcb::CS, 0xc9b << 16); // 32-bit code segment
+    v.write64(vmcb::CS + 8, 0);
+    v.write64(vmcb::RIP, 0x40_0000);
+    v.regs.rbx = 0x55;
+    assert_eq!(v.translate(0x40_0000), Some(0x3000));
+    assert!(v.reflect(exit::DR_READ));
+    assert_eq!((v.regs.rbx, v.rip()), (0, 0x40_0004));
+}

@@ -131,7 +131,7 @@ pub fn handle_smp(
         (eid::HSM, 0) if let Some((h, _)) = harts => match h.request_start(args[0] as usize, args[1], args[2]) {
             Ok(()) => (0, 0),
             Err(StartError::NoSuchCpu) => (ERR_INVALID_PARAM, 0),
-            Err(StartError::AlreadyOn) => (ERR_ALREADY_AVAILABLE, 0),
+            Err(StartError::AlreadyOn | StartError::Pending) => (ERR_ALREADY_AVAILABLE, 0),
         },
         (eid::HSM, 1) if let Some((h, me)) = harts => {
             h.stopped(me);
