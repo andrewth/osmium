@@ -192,8 +192,10 @@ impl<A: FrameAllocator, M: PhysMapper> DmaAllocator for LockedFrames<A, M> {
         // SAFETY: freshly allocated frames, at least `len` bytes, mapped at
         // `cpu`; devices see them at `pa` per this impl's stated conditions.
         let buf = unsafe { DmaBuffer::new(cpu, pa, len) };
-        // SAFETY: the frames are ours and at least `len` bytes long.
-        unsafe { core::ptr::write_bytes(cpu.as_ptr(), 0, len) };
+        // Zero the whole block, not just `len`: an IOMMU layer above may map
+        // all of its pages to a device.
+        // SAFETY: the frames are ours, `PAGE_SIZE << order` bytes long.
+        unsafe { core::ptr::write_bytes(cpu.as_ptr(), 0, osmium_mm::PAGE_SIZE << order) };
         Some(buf)
     }
 

@@ -34,9 +34,17 @@ impl<T> PerCpu<T> {
     ///
     /// Unless preemption is disabled, the task may migrate right after the
     /// call; the reference stays valid but may then name another CPU's slot.
+    ///
+    /// A CPU must call `osmium_arch::cpu::set_current_id` before using any
+    /// per-CPU data: until then its id reads as 0 (or, on x86-64, whatever
+    /// `IA32_TSC_AUX` holds), so it would alias CPU 0's slot. An id at or
+    /// above `MAX_CPUS` is a contract violation; it is caught by a debug
+    /// assertion and otherwise falls back to CPU 0's slot.
     #[inline]
     pub fn get(&self) -> &T {
-        pick(&self.slots, cpu::current_id())
+        let id = cpu::current_id();
+        debug_assert!(id < MAX_CPUS, "CPU id {id} out of range: set_current_id not called on this CPU?");
+        pick(&self.slots, id)
     }
 
     /// Returns the slot of `cpu`; an id beyond `MAX_CPUS` names CPU 0's slot.

@@ -194,11 +194,17 @@ impl SrIov {
     }
 
     /// Writes a 16-bit register, which shares its dword with the neighbor
-    /// (a write must carry that half unchanged).
+    /// (a write must carry that half unchanged). The neighbor of Control is
+    /// the SR-IOV Status register, whose bits may be write-one-to-clear: it
+    /// is written as zero, not read back and rewritten.
     fn write16<C: ConfigAccess + ?Sized>(&self, func: &Function<'_, C>, reg: u16, value: u16) {
         let at = self.offset + reg;
-        let (shift, keep) = ((at & 2) * 8, func.read32(at & !3));
-        func.write32(at & !3, keep & !(0xffff << shift) | (value as u32) << shift);
+        let shift = (at & 2) * 8;
+        let mut keep = func.read32(at & !3) & !(0xffff << shift);
+        if reg & !3 == CONTROL {
+            keep = 0;
+        }
+        func.write32(at & !3, keep | (value as u32) << shift);
     }
 
     /// The virtual function BAR `index` as the function describes it: its
@@ -527,6 +533,17 @@ mod tests {
         let s = f.sriov().unwrap();
         let bar = s.vf_bar(&f, 0).unwrap().unwrap();
         s.set_vf_bar(&f, &bar, 0x8008_0000);
+    }
+
+    #[test]
+    fn control_writes_do_not_touch_status() {
+        let (cfg, clock) = (function(), Ticks::default());
+        cfg.set(CAP + CONTROL, 0xffff << 16); // status bits set
+        let f = Function::new(&cfg, PF).unwrap();
+        let s = f.sriov().unwrap();
+        s.enable(&f, 2, &clock).unwrap();
+        let writes = cfg.writes.borrow();
+        assert!(writes.iter().filter(|&&(r, _)| r == CAP + CONTROL).all(|&(_, v)| v >> 16 == 0));
     }
 
     #[test]

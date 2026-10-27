@@ -1,7 +1,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use osmium_arch::irq;
@@ -14,13 +14,23 @@ struct Slot {
     ready: AtomicBool,
     /// True from the moment `spawn` claims the slot until its task has
     /// finished and been removed. `spawn` and `tasks` read this instead of
-    /// `task`'s lock, which `poll_once` holds while the task runs (so a task
-    /// can spawn, or count tasks, without locking its own slot).
+    /// `task`, which is empty while `poll_once` runs the task (so a task can
+    /// spawn, or count tasks, without touching its own slot).
     occupied: AtomicBool,
-    /// The owning executor's `pending` flag, recorded at spawn (a `const`
+    /// The owning executor's wake state, recorded at spawn (a `const`
     /// executor cannot point into itself at construction).
-    owner: AtomicPtr<AtomicBool>,
+    owner: AtomicPtr<Shared>,
+    /// Holds the task while it is idle. `poll_once` takes it out for the
+    /// duration of the poll, so the lock is not held while the future runs.
     task: IrqSpinLock<Option<TaskRef>>,
+}
+
+/// What a wake-up touches: the executor's non-generic part.
+struct Shared {
+    /// Set by every wake-up of one of the executor's tasks.
+    pending: AtomicBool,
+    /// 0, or a `fn()` that makes the executor's CPU leave its wait.
+    hook: AtomicUsize,
 }
 
 impl Slot {
@@ -29,7 +39,17 @@ impl Slot {
         let owner = self.owner.load(Ordering::Acquire);
         if !owner.is_null() {
             // SAFETY: `owner` points into the 'static executor holding this slot.
-            unsafe { &*owner }.store(true, Ordering::Release);
+            let shared = unsafe { &*owner };
+            // Only the first wake since the executor last looked needs to
+            // kick its CPU.
+            if !shared.pending.swap(true, Ordering::AcqRel) {
+                let hook = shared.hook.load(Ordering::Acquire);
+                if hook != 0 {
+                    // SAFETY: only `set_wake_hook` stores here, and it stores a `fn()`.
+                    let hook: fn() = unsafe { core::mem::transmute(hook) };
+                    hook();
+                }
+            }
         }
     }
 }
@@ -41,8 +61,7 @@ pub struct SpawnError;
 /// Runs up to `N` tasks on the calling CPU.
 pub struct Executor<const N: usize> {
     slots: [Slot; N],
-    /// Set by every wake-up of one of this executor's tasks.
-    pending: AtomicBool,
+    shared: Shared,
 }
 
 impl<const N: usize> Executor<N> {
@@ -57,8 +76,19 @@ impl<const N: usize> Executor<N> {
                     task: IrqSpinLock::new(None),
                 }
             }; N],
-            pending: AtomicBool::new(false),
+            shared: Shared { pending: AtomicBool::new(false), hook: AtomicUsize::new(0) },
         }
+    }
+
+    /// Registers `hook`, called after a task of this executor is woken while
+    /// the executor was not already flagged as having work. A wake from
+    /// another CPU cannot end this CPU's `hlt`/`wfi` by itself: the hook
+    /// should send that CPU an IPI (it may run on any CPU, in any context,
+    /// and may be called when the executor's own CPU is the caller, in which
+    /// case it should do nothing). Without one, such a wake-up is noticed
+    /// only at the executor CPU's next interrupt (a timer tick, say).
+    pub fn set_wake_hook(&self, hook: fn()) {
+        self.shared.hook.store(hook as usize, Ordering::Release);
     }
 
     /// Adds a task; it is polled on the next pass. May be called from any
@@ -74,7 +104,7 @@ impl<const N: usize> Executor<N> {
             // `poll_once` on another CPU that found it empty (IRQs are masked
             // while it is held, so never by code this call interrupted).
             *slot.task.lock() = Some(task);
-            slot.owner.store((&raw const self.pending).cast_mut(), Ordering::Release);
+            slot.owner.store((&raw const self.shared).cast_mut(), Ordering::Release);
             slot.wake();
             return Ok(());
         }
@@ -88,29 +118,29 @@ impl<const N: usize> Executor<N> {
 
     /// Polls every ready task once. Returns how many were polled.
     ///
-    /// Each task is polled with its slot locked, so with interrupts masked
-    /// on this CPU; a task must not block or spin waiting for an interrupt.
+    /// A task is polled with no lock held and interrupts as the caller left
+    /// them; its slot is empty meanwhile. An executor belongs to one CPU:
+    /// do not call this from two at once.
     pub fn poll_once(&'static self) -> usize {
-        self.pending.store(false, Ordering::Release);
+        self.shared.pending.store(false, Ordering::Release);
         let mut polled = 0;
         for slot in &self.slots {
             if !slot.ready.swap(false, Ordering::AcqRel) {
                 continue;
             }
-            let mut guard = slot.task.lock();
-            let Some(task) = guard.as_mut() else { continue };
+            // Take the task out so the lock is not held (nor IRQs masked)
+            // while the future runs. The slot stays `occupied`, so `spawn`
+            // cannot reuse it meanwhile.
+            let Some(mut task) = slot.task.lock().take() else { continue };
             // SAFETY: the slot is 'static and the vtable treats data as `*const Slot`.
             let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::from_ref(slot).cast(), &VTABLE)) };
             polled += 1;
-            // The slot stays locked (IRQs masked) while its task runs. Nothing
-            // the task can call re-enters the lock: wakers only touch atomics,
-            // and `spawn` and `tasks` skip occupied slots without locking.
             if task.as_mut().poll(&mut Context::from_waker(&waker)).is_ready() {
-                *guard = None;
-                drop(guard);
                 // Only now may `spawn` reuse the slot (and `tasks` stop
                 // counting it): the finished task is out of it.
                 slot.occupied.store(false, Ordering::Release);
+            } else {
+                *slot.task.lock() = Some(task);
             }
         }
         polled
@@ -188,7 +218,7 @@ impl<const N: usize> Executor<N> {
             // Check with interrupts masked, then wait atomically: a wake-up
             // from an interrupt after the check still ends the wait.
             irq::disable();
-            if self.pending.load(Ordering::Acquire) {
+            if self.shared.pending.load(Ordering::Acquire) {
                 irq::enable();
             } else {
                 irq::enable_and_wait();

@@ -394,7 +394,12 @@ impl<D: BlockDevice> BlockDevice for CachedDevice<D> {
                 for j in k..end {
                     let at = (j as usize) * bs;
                     let src = buf.get(at..at + bs).ok_or(BlockError::Io)?;
-                    self.fill(lba + j, src)?;
+                    // Best effort: the data is already in the caller's buffer, so a
+                    // failed write-back of a dirty victim must not fail this read.
+                    // (The victim stays dirty; the error resurfaces on `flush`.)
+                    if self.fill(lba + j, src).is_err() {
+                        break;
+                    }
                 }
             }
             k = end;
@@ -476,6 +481,7 @@ mod tests {
         reads: Vec<(u64, usize)>,
         writes: Vec<(u64, usize)>,
         flushes: usize,
+        fail_writes: bool,
     }
 
     struct Disk {
@@ -508,6 +514,9 @@ mod tests {
         }
         fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
             self.check_range(lba, buf.len())?;
+            if self.log.borrow().fail_writes {
+                return Err(BlockError::Io);
+            }
             self.log.borrow_mut().writes.push((lba, buf.len() / BS));
             self.bytes[lba as usize * BS..][..buf.len()].copy_from_slice(buf);
             Ok(())
@@ -522,6 +531,20 @@ mod tests {
         let mut v = vec![0; n * BS];
         c.read_blocks(lba, &mut v).unwrap();
         v
+    }
+
+    #[test]
+    fn a_failed_write_back_does_not_fail_a_read() {
+        let (d, log) = Disk::new(8);
+        let mut c = CachedDevice::new(d, 1, WritePolicy::WriteBack).unwrap();
+        c.write_blocks(0, &[7; BS]).unwrap(); // dirty, fills the only slot
+        log.borrow_mut().fail_writes = true;
+        // Caching block 3 would have to write block 0 back, which fails: the read still succeeds.
+        assert_eq!(read(&mut c, 3, 1), vec![3; BS]);
+        assert!(c.flush().is_err(), "the dirty block is still there to report");
+        log.borrow_mut().fail_writes = false;
+        c.flush().unwrap();
+        assert_eq!(read(&mut c, 0, 1), vec![7; BS]);
     }
 
     #[test]

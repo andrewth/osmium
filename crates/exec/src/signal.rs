@@ -158,6 +158,34 @@ mod tests {
     }
 
     #[test]
+    fn tasks_run_with_interrupts_enabled_and_wake_hook_fires() {
+        static EXEC: Executor<1> = Executor::new();
+        static SIG: Signal<u32> = Signal::new();
+        static A: StaticCell<Pin<std::boxed::Box<Fut>>> = StaticCell::new();
+        static HOOKS: AtomicU32 = AtomicU32::new(0);
+        static IRQ_ON: AtomicU32 = AtomicU32::new(0);
+        fn hook() {
+            HOOKS.fetch_add(1, Ordering::SeqCst);
+        }
+        osmium_arch::irq::enable();
+        EXEC.set_wake_hook(hook);
+        let a = A.init(std::boxed::Box::pin(async {
+            IRQ_ON.store(osmium_arch::irq::are_enabled() as u32, Ordering::SeqCst);
+            SIG.wait().await;
+        }));
+        EXEC.spawn(a.as_mut()).unwrap();
+        assert_eq!(HOOKS.load(Ordering::SeqCst), 1, "spawn wakes the executor");
+        EXEC.run_until_idle();
+        assert_eq!(IRQ_ON.load(Ordering::SeqCst), 1, "the slot lock is not held across the poll");
+        SIG.signal(1);
+        assert_eq!(HOOKS.load(Ordering::SeqCst), 2);
+        SIG.signal(1); // already flagged: no second kick
+        assert_eq!(HOOKS.load(Ordering::SeqCst), 2);
+        EXEC.run_until_idle();
+        assert_eq!(EXEC.tasks(), 0);
+    }
+
+    #[test]
     fn full_executor_rejects_spawn() {
         static EXEC: Executor<1> = Executor::new();
         static A: StaticCell<Pin<std::boxed::Box<Fut>>> = StaticCell::new();

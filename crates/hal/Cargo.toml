@@ -9,6 +9,11 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The `block_cache` module, which needs the `alloc` crate (and so a global
+# allocator in every binary that links it).
+alloc = []
+
 [dependencies]
 osmium-arch.workspace = true
 osmium-sync.workspace = true

@@ -56,10 +56,33 @@ mod imp {
         unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) }
     }
 
-    /// Invalidates all non-global TLB entries by reloading CR3.
+    /// CR4.PGE: global pages.
+    const CR4_PGE: u64 = 1 << 7;
+
+    /// Invalidates all TLB entries, global ones included.
+    ///
+    /// Reloading CR3 leaves global entries (kernel mappings) alone, so with
+    /// CR4.PGE on, PGE is cleared and restored, which flushes everything.
     pub fn flush_all() {
-        // SAFETY: rewriting CR3 with its own value keeps the same address space.
-        unsafe { crate::x86_64::write_cr3(crate::x86_64::read_cr3()) }
+        let cr4: u64;
+        // SAFETY: reading CR4 has no side effects.
+        unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+        if cr4 & CR4_PGE != 0 {
+            // SAFETY: clearing PGE and then restoring CR4 as it was only
+            // invalidates cached translations; nothing else changes.
+            unsafe {
+                asm!(
+                    "mov cr4, {off}",
+                    "mov cr4, {on}",
+                    off = in(reg) cr4 & !CR4_PGE,
+                    on = in(reg) cr4,
+                    options(nostack, preserves_flags),
+                )
+            };
+        } else {
+            // SAFETY: rewriting CR3 with its own value keeps the same address space.
+            unsafe { crate::x86_64::write_cr3(crate::x86_64::read_cr3()) }
+        }
     }
 }
 

@@ -14,7 +14,7 @@ workspace = true
 [features]
 default = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "netdev", "boot"]
 ## Everything, including the parts that need `alloc`.
-full = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "netdev", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net", "fs-ext4", "fs-iso9660", "iscsi", "acpi"]
+full = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "netdev", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net", "fs-ext4", "fs-iso9660", "iscsi", "acpi", "osmium-hal/alloc"]
 sync = ["dep:osmium-sync"]
 mm = ["sync", "dep:osmium-mm"]
 hal = ["sync", "mm", "dep:osmium-hal"]

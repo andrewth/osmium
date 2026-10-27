@@ -25,9 +25,11 @@ impl<T, const N: usize> SpscRing<T, N> {
     ///
     /// # Panics
     ///
-    /// If `N` is zero (at compile time in a `const` context).
+    /// If `N` is not a power of two (at compile time in a `const` context).
+    /// The indices are free-running counters reduced modulo `N`, which is
+    /// only consistent across their wrap-around for a power of two.
     pub const fn new() -> Self {
-        assert!(N > 0);
+        assert!(N.is_power_of_two(), "SpscRing capacity must be a power of two");
         Self {
             buf: [const { UnsafeCell::new(MaybeUninit::uninit()) }; N],
             head: AtomicUsize::new(0),
@@ -126,6 +128,24 @@ unsafe impl<T: Send, const N: usize> Send for Consumer<'_, T, N> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn non_power_of_two_capacity_is_rejected() {
+        let _ring: SpscRing<u8, 3> = SpscRing::new();
+    }
+
+    #[test]
+    fn counters_wrap_cleanly() {
+        let mut ring: SpscRing<u32, 4> = SpscRing::new();
+        *ring.head.get_mut() = usize::MAX - 2;
+        *ring.tail.get_mut() = usize::MAX - 2;
+        let (mut p, mut c) = ring.split().unwrap();
+        for i in 0..10 {
+            p.push(i).unwrap();
+            assert_eq!(c.pop(), Some(i));
+        }
+    }
 
     #[test]
     fn fifo_and_capacity() {

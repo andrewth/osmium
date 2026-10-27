@@ -38,14 +38,20 @@ impl Guardian for PreemptDisabled {
 
 /// Disables local interrupts while the lock is held, and restores the
 /// previous state afterwards. Required for data shared with IRQ handlers.
+///
+/// It also raises the preemption count, so a holder that tries to block or
+/// yield trips the scheduler's "scheduling while atomic" assertion.
 pub struct IrqDisabled;
 
 impl Guardian for IrqDisabled {
     type State = IrqState;
     fn enter() -> IrqState {
-        irq::save_and_disable()
+        let state = irq::save_and_disable();
+        preempt::disable();
+        state
     }
     fn exit(state: IrqState) {
+        preempt::enable();
         irq::restore(state);
     }
 }

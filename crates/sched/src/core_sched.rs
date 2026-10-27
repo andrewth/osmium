@@ -222,6 +222,8 @@ fn current_ptr() -> *const Task {
 /// The core of the scheduler: optionally requeue the current task, pick the
 /// next one and switch to it.
 fn schedule(requeue: Option<EnqueueReason>) {
+    // Spin locks (including IRQ-masking ones) raise the preempt count, so this
+    // also catches blocking while IRQs are masked by a lock.
     assert_eq!(preempt::count(), 0, "scheduling while holding a spin lock");
     let irq_state = irq::save_and_disable();
     let cpu = cpu::current_id();
@@ -292,7 +294,15 @@ fn schedule(requeue: Option<EnqueueReason>) {
         }
         if retries >= 3 || idle {
             // SAFETY: as above.
-            break initialized(unsafe { (*st).idle.clone() });
+            let fallback = initialized(unsafe { (*st).idle.clone() });
+            if ptr::eq(Arc::as_ptr(&fallback), cur) {
+                // Already on this CPU's idle task: nothing to switch to.
+                IDLE_CPUS.fetch_or(1 << cpu, Ordering::Relaxed);
+                cur.state.store(TaskState::Running as u8, Ordering::Release);
+                irq::restore(irq_state);
+                return;
+            }
+            break fallback;
         }
     };
     if next.is_idle {
@@ -462,6 +472,9 @@ fn finish_switch() {
 /// First code run by every new task.
 pub(crate) extern "C" fn task_entry() -> ! {
     finish_switch();
+    // A switch only happens with a zero preempt count, so a new task starts
+    // outside any lock and with IRQs on, whatever state its predecessor had.
+    debug_assert_eq!(preempt::count(), 0);
     irq::enable();
     // SAFETY: the entry is taken once, by the task itself, with IRQs off.
     let entry = irq::without(|| unsafe { (*(*current_ptr()).entry.get()).take() });

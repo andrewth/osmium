@@ -608,18 +608,21 @@ impl<I: Iommu, A: TableAlloc> Drop for IoDomain<'_, I, A> {
 }
 
 /// Maximum free extents an [`IovaAllocator`] remembers.
-const FREE_EXTENTS: usize = 32;
+const FREE_EXTENTS: usize = 64;
 
 /// A first-fit allocator of page-granular IOVA ranges.
 ///
-/// It remembers at most 32 free extents, coalescing neighbours as they are
-/// returned. If fragmentation exceeds that, the smallest piece is forgotten
-/// (its IOVAs are lost, which wastes address space but is always safe).
+/// It remembers at most 64 free extents, coalescing neighbours as they are
+/// returned, and needs no heap. When the table is full, an allocation that
+/// would split an extent in two fails (nothing is lost), and a
+/// [`free`](Self::free) that cannot be recorded reports it and counts it in
+/// [`leaked_pages`](Self::leaked_pages).
 #[derive(Debug)]
 pub struct IovaAllocator {
     /// Free `[start, end)` extents, sorted, non-adjacent; `len` are used.
     free: [(u64, u64); FREE_EXTENTS],
     len: usize,
+    leaked: u64,
 }
 
 impl IovaAllocator {
@@ -629,21 +632,42 @@ impl IovaAllocator {
         // Round inwards to whole pages (a no-op for aligned windows).
         let window = window.start.checked_next_multiple_of(page).unwrap_or(u64::MAX)..window.end / page * page;
         let mut free = [(0, 0); FREE_EXTENTS];
-        let len = usize::from(window.start < window.end);
-        free[0] = (window.start, window.end);
-        Self { free, len }
+        let mut len = 0;
+        if window.start < window.end
+            && let Some(first) = free.first_mut()
+        {
+            *first = (window.start, window.end);
+            len = 1;
+        }
+        Self { free, len, leaked: 0 }
     }
 
-    /// The used extents.
-    fn live(&self) -> &[(u64, u64)] {
-        self.free.get(..self.len).unwrap_or(&self.free)
+    /// Pages returned by [`free`](Self::free) that could not be recorded
+    /// (the table was full) and are lost.
+    pub fn leaked_pages(&self) -> u64 {
+        self.leaked
     }
 
-    /// Drops extent `i`, shifting the later ones down.
-    fn remove(&mut self, i: usize) {
+    fn extents(&self) -> &[(u64, u64)] {
+        self.free.get(..self.len).unwrap_or(&[])
+    }
+
+    /// Removes extent `i`, shifting the rest down.
+    fn remove_at(&mut self, i: usize) {
         if i < self.len {
             self.free.copy_within(i + 1..self.len, i);
             self.len -= 1;
+        }
+    }
+
+    /// Inserts `extent` at `i`; the caller has checked there is room.
+    fn insert_at(&mut self, i: usize, extent: (u64, u64)) {
+        if i <= self.len && self.len < FREE_EXTENTS {
+            self.free.copy_within(i..self.len, i + 1);
+            if let Some(slot) = self.free.get_mut(i) {
+                *slot = extent;
+            }
+            self.len += 1;
         }
     }
 
@@ -655,49 +679,50 @@ impl IovaAllocator {
     /// Like [`alloc`](Self::alloc), but the first IOVA is a multiple of
     /// `align` bytes (a power of two; less than a page means a page), so
     /// that a mapping can use 2 MiB or 1 GiB blocks. The skipped space stays
-    /// free. If the extent table is full when an allocation would split an
-    /// extent in two, the upper remainder is forgotten (safe, but wasteful).
+    /// free. If the allocation would split an extent in two and the table
+    /// is full, it fails (nothing is lost).
     pub fn alloc_aligned(&mut self, pages: usize, align: u64) -> Option<u64> {
         let bytes = (pages as u64).checked_mul(PAGE_SIZE as u64).filter(|&b| b != 0)?;
         let align = align.max(PAGE_SIZE as u64);
         if !align.is_power_of_two() {
             return None;
         }
-        let (i, start) = self.live().iter().enumerate().find_map(|(i, &(s, e))| {
+        let (i, start) = self.extents().iter().enumerate().find_map(|(i, &(s, e))| {
             let a = s.checked_next_multiple_of(align)?;
             (a.checked_add(bytes)? <= e).then_some((i, a))
         })?;
         let (s, e) = *self.free.get(i)?;
         let end = start + bytes;
         match (start > s, end < e) {
-            (false, false) => self.remove(i),
+            (false, false) => self.remove_at(i),
             (false, true) => self.free.get_mut(i)?.0 = end,
             (true, false) => self.free.get_mut(i)?.1 = start,
             (true, true) => {
-                self.free.get_mut(i)?.1 = start;
-                if self.len < FREE_EXTENTS {
-                    self.free.copy_within(i + 1..self.len, i + 2);
-                    *self.free.get_mut(i + 1)? = (end, e);
-                    self.len += 1;
+                if self.len == FREE_EXTENTS {
+                    return None;
                 }
+                self.free.get_mut(i)?.1 = start;
+                self.insert_at(i + 1, (end, e));
             }
         }
         Some(start)
     }
 
-    /// Returns `pages` pages at `iova`, from [`alloc`](Self::alloc).
-    pub fn free(&mut self, iova: u64, pages: usize) {
+    /// Returns `pages` pages at `iova`, from [`alloc`](Self::alloc). False
+    /// if the range could not be recorded because the table is full (it is
+    /// then counted in [`leaked_pages`](Self::leaked_pages)).
+    pub fn free(&mut self, iova: u64, pages: usize) -> bool {
         let end = (pages as u64).saturating_mul(PAGE_SIZE as u64).saturating_add(iova);
-        let i = self.live().partition_point(|&(s, _)| s < iova);
-        let prev = i.checked_sub(1).filter(|&p| self.free.get(p).is_some_and(|e| e.1 == iova));
-        let next = Some(i).filter(|&n| n < self.len && self.free.get(n).is_some_and(|e| e.0 == end));
+        let i = self.extents().partition_point(|&(s, _)| s < iova);
+        let prev = i.checked_sub(1).filter(|&p| self.extents().get(p).is_some_and(|e| e.1 == iova));
+        let next = Some(i).filter(|&n| self.extents().get(n).is_some_and(|e| e.0 == end));
         match (prev, next) {
             (Some(p), Some(n)) => {
                 let after = self.free.get(n).map_or(end, |e| e.1);
                 if let Some(e) = self.free.get_mut(p) {
                     e.1 = after;
                 }
-                self.remove(n);
+                self.remove_at(n);
             }
             (Some(p), None) => {
                 if let Some(e) = self.free.get_mut(p) {
@@ -711,31 +736,13 @@ impl IovaAllocator {
             }
             (None, None) => {
                 if self.len == FREE_EXTENTS {
-                    // Forget the smallest extent, or this one if it is.
-                    let Some((small, size)) = self
-                        .free
-                        .iter()
-                        .enumerate()
-                        .map(|(j, &(s, e))| (j, e.saturating_sub(s)))
-                        .min_by_key(|&(_, n)| n)
-                    else {
-                        return;
-                    };
-                    if size >= end.saturating_sub(iova) {
-                        return;
-                    }
-                    self.remove(small);
-                    return self.free(iova, pages);
+                    self.leaked = self.leaked.saturating_add(pages as u64);
+                    return false;
                 }
-                if i < self.len {
-                    self.free.copy_within(i..self.len, i + 1);
-                }
-                if let Some(e) = self.free.get_mut(i) {
-                    *e = (iova, end);
-                    self.len += 1;
-                }
+                self.insert_at(i, (iova, end));
             }
         }
+        true
     }
 }
 
@@ -783,8 +790,11 @@ impl<'iommu, I: Iommu, A: TableAlloc, B: DmaAllocator> IommuDma<'iommu, I, A, B>
 
 impl<I: Iommu, A: TableAlloc, B: DmaAllocator> DmaAllocator for IommuDma<'_, I, A, B> {
     fn alloc_coherent(&self, len: usize) -> Option<DmaBuffer> {
-        let buf = self.backing.alloc_coherent(len)?;
-        let bytes = len.max(1).next_multiple_of(PAGE_SIZE);
+        // The device gets whole pages, so take (and have zeroed) whole pages
+        // from `backing`: the mapping must not cover memory outside the
+        // allocation or leave stale bytes in its tail.
+        let bytes = len.max(1).checked_next_multiple_of(PAGE_SIZE)?;
+        let buf = self.backing.alloc_coherent(bytes)?;
         let pages = bytes / PAGE_SIZE;
         let mut st = self.state.lock();
         // Line the IOVA up with the buffer's physical address so that a big
@@ -833,7 +843,7 @@ impl<I: Iommu, A: TableAlloc, B: DmaAllocator> DmaAllocator for IommuDma<'_, I, 
             let cpu = buf.cpu_ptr();
             // SAFETY: the original buffer's memory, no longer reachable by
             // any device now the mapping is gone and the IOTLB flushed.
-            unsafe { self.backing.free_coherent(DmaBuffer::new(cpu, pa, buf.len())) };
+            unsafe { self.backing.free_coherent(DmaBuffer::new(cpu, pa, bytes)) };
         }
     }
 }
@@ -882,10 +892,13 @@ mod tests {
     #[derive(Default)]
     struct HostDma {
         live: Cell<usize>,
+        /// The largest `len` asked of this allocator.
+        max_len: Cell<usize>,
     }
 
     impl DmaAllocator for HostDma {
         fn alloc_coherent(&self, len: usize) -> Option<DmaBuffer> {
+            self.max_len.set(self.max_len.get().max(len));
             let layout = Layout::from_size_align(len.max(1).next_multiple_of(4096), 4096).ok()?;
             // SAFETY: non-zero size.
             let p = NonNull::new(unsafe { alloc_zeroed(layout) })?;
@@ -995,9 +1008,9 @@ mod tests {
         assert_eq!(a.alloc(1), None, "window exhausted");
         a.free(y, 4);
         a.free(x, 4);
-        assert_eq!(a.len, 1, "x and y coalesced");
+        assert_eq!(a.extents().len(), 1, "x and y coalesced");
         a.free(z, 8);
-        assert_eq!((a.len, a.free[0]), (1, (0x10000, 0x20000)));
+        assert_eq!(a.extents(), [(0x10000, 0x20000)]);
         assert_eq!(a.alloc(16), Some(0x10000));
     }
 
@@ -1005,17 +1018,30 @@ mod tests {
     fn iova_allocator_fragmentation_never_overlaps() {
         let mut a = IovaAllocator::new(0x1000..0x1000 + 200 * 4096);
         let all: Vec<u64> = (0..200).map(|_| a.alloc(1).unwrap()).collect();
-        // Free every other page: 100 extents, far above the 32 remembered.
-        for &p in all.iter().step_by(2) {
-            a.free(p, 1);
-        }
+        // Free every other page: 100 extents, more than the table holds.
+        let freed: Vec<bool> = all.iter().step_by(2).map(|&p| a.free(p, 1)).collect();
+        let kept = freed.iter().filter(|&&k| k).count();
+        assert_eq!(kept, FREE_EXTENTS, "the table fills, then frees are reported");
+        assert_eq!(a.leaked_pages(), (100 - kept) as u64, "every unrecorded free is counted");
         let mut got = Vec::new();
         while let Some(p) = a.alloc(1) {
             assert!(all.iter().step_by(2).any(|&f| f == p), "only freed pages come back");
             assert!(!got.contains(&p));
             got.push(p);
         }
-        assert!(!got.is_empty() && got.len() <= 100);
+        assert_eq!(got.len(), kept, "every recorded page comes back, no more");
+        // A split the full table cannot record fails and loses nothing.
+        let mut c = IovaAllocator::new(0x1000..0x1000 + 4096 * 1024);
+        let pages: Vec<u64> = (0..2 * FREE_EXTENTS).map(|_| c.alloc(1).unwrap()).collect();
+        // 63 freed pages plus the untouched tail make 64 extents: full.
+        for &p in pages.iter().step_by(2).take(FREE_EXTENTS - 1) {
+            assert!(c.free(p, 1));
+        }
+        assert_eq!(c.extents().len(), FREE_EXTENTS);
+        let before = c.extents().to_vec();
+        assert_eq!(c.alloc_aligned(1, 2 * 1024 * 1024), None, "needs a split the table cannot hold");
+        assert_eq!(c.extents(), before, "a failed allocation changes nothing");
+        assert_eq!(c.leaked_pages(), 0);
     }
 
     #[test]
@@ -1168,6 +1194,21 @@ mod tests {
         let mut b = IovaAllocator::new(0x1000..0x20_0000);
         assert_eq!(b.alloc_aligned(1, MIB2), None, "no aligned room");
         assert_eq!(b.alloc(1), Some(0x1000));
+    }
+
+    #[test]
+    fn dma_allocator_asks_backing_for_whole_pages() {
+        let (iommu, tables, backing) = (FakeIommu::default(), HostTables::default(), HostDma::default());
+        let dma = {
+            let domain = IoDomain::new(&iommu, DomainId(3), &tables).unwrap();
+            IommuDma::new(domain, &backing, 0x10_0000..0x4000_0000).unwrap()
+        };
+        let a = dma.alloc_coherent(100).unwrap();
+        assert_eq!(a.len(), 100);
+        assert_eq!(backing.max_len.get(), 4096, "the mapped page is all allocated (and zeroed) memory");
+        // SAFETY: from this allocator; no device is running.
+        unsafe { dma.free_coherent(a) };
+        assert_eq!(backing.live.get(), 0);
     }
 
     #[test]

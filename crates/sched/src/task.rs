@@ -83,7 +83,12 @@ enum Stack {
 }
 
 impl Stack {
+    /// Smallest stack ever allocated: room for the initial context frame and a
+    /// little more. Smaller requests are clamped up to this.
+    const MIN_SIZE: usize = 4096;
+
     fn try_new(size: usize) -> Result<Self, OutOfMemory> {
+        let size = size.max(Self::MIN_SIZE);
         match STACK_ALLOCATOR.get() {
             Some(a) => {
                 let (base, len) = a.alloc(size).ok_or(OutOfMemory)?;
@@ -448,7 +453,7 @@ impl TaskBuilder {
         }
     }
 
-    /// Sets the stack size in bytes.
+    /// Sets the stack size in bytes. Sizes below 4 KiB are raised to 4 KiB.
     pub fn stack_size(mut self, bytes: usize) -> Self {
         self.stack_size = bytes;
         self
@@ -606,5 +611,14 @@ mod tests {
         let t = TaskBuilder::new("t").affinity(1 << 2 | 1 << 3).build(|| {});
         t.set_cpu(3);
         assert_eq!(t.cpu(), 3);
+    }
+
+    #[test]
+    fn tiny_stack_is_clamped() {
+        let t = TaskBuilder::new("t").stack_size(0).build(|| {});
+        let top = t.kernel_stack_top().expect("has a stack");
+        let Some(Stack::Heap(h)) = &t._stack else { panic!("heap stack expected") };
+        assert!(h.len() * 16 >= Stack::MIN_SIZE);
+        assert_eq!(top, h.as_ptr() as usize + h.len() * 16);
     }
 }

@@ -186,6 +186,18 @@ mod tests {
     }
 
     #[test]
+    fn irq_lock_raises_preempt_count() {
+        // SAFETY: host simulation; only this thread uses id 9.
+        unsafe { osmium_arch::cpu::set_current_id(9) };
+        let lock = IrqSpinLock::new(());
+        let before = crate::preempt::count();
+        let g = lock.lock();
+        assert_eq!(crate::preempt::count(), before + 1);
+        drop(g);
+        assert_eq!(crate::preempt::count(), before);
+    }
+
+    #[test]
     fn default_lock_disables_preemption() {
         // A CPU id no other test uses, so the per-CPU counter is ours alone.
         // SAFETY: host simulation; only this thread uses id 7.

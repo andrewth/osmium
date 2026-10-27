@@ -114,8 +114,12 @@ impl TrapFrame {
     /// Called by the entry stub before the handler.
     pub(super) fn on_entry(&mut self) {
         match self.vector {
-            // int3 is a trap: rip already points past it.
-            3 => self.rip -= 1,
+            // int3 is a trap: rip already points past it. This assumes the
+            // one-byte 0xCC encoding (the two-byte `int 0x03` is not used);
+            // the instruction's own bytes are not read, since from user mode
+            // that could fault inside the handler. A corrupt rip of 0 wraps
+            // rather than panicking.
+            3 => self.rip = self.rip.wrapping_sub(1),
             14 => self.cr2 = read_cr2(),
             _ => {}
         }

@@ -62,7 +62,7 @@ impl Channel {
         }
         let shift = mask.trailing_zeros();
         let bits = (mask >> shift).trailing_ones();
-        if mask >> shift >> bits != 0 || bits > 8 {
+        if bits > 8 || mask >> shift >> bits != 0 {
             return None;
         }
         Some(Self::new(shift as u8, bits as u8))
@@ -474,6 +474,8 @@ mod tests {
         assert_eq!(PixelFormat::from_masks(16, 0xff_0000, 0xff00, 0xff), None, "red mask beyond 16 bits");
         assert_eq!(PixelFormat::from_masks(32, 0xf0f, 0xff00, 0xff), None, "gap in mask");
         assert_eq!(PixelFormat::from_masks(8, 0xe0, 0x1c, 3), None);
+        assert_eq!(Channel::from_mask(u32::MAX), None, "32 contiguous bits must not overflow a shift");
+        assert_eq!(Channel::from_mask(0xffff_ff00), None);
         for f in [PixelFormat::XRGB8888, PixelFormat::XBGR8888, PixelFormat::RGB888] {
             let c = Rgb::new(0x12, 0x34, 0x56);
             assert_eq!(f.decode(f.encode(c)), c);

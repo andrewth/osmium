@@ -425,9 +425,10 @@ impl SwapSpace {
         if !self.active() {
             return None;
         }
-        // (Cloned out so that the list's lock is not held while searching.)
-        let list = self.areas.lock().list.clone();
-        list.iter().find_map(|a| a.alloc().map(|index| Slot { area: a.id, index }))
+        // Nothing here allocates (this is the swap-out path, under memory
+        // pressure). The search is short and does no I/O; the nesting (list,
+        // then area) is the one `stats` uses.
+        self.areas.lock().list.iter().find_map(|a| a.alloc().map(|index| Slot { area: a.id, index }))
     }
 
     /// Another user of the page in `slot` (a fork copying a swapped-out
@@ -497,10 +498,10 @@ impl SwapSpace {
 
     /// A snapshot of the areas, highest priority first.
     pub fn infos(&self) -> Result<Vec<AreaInfo>, SwapError> {
-        let list = self.areas.lock().list.clone();
+        let areas = self.areas.lock();
         let mut out = Vec::new();
-        out.try_reserve_exact(list.len()).map_err(|_| SwapError::OutOfMemory)?;
-        out.extend(list.iter().map(|a| a.info()));
+        out.try_reserve_exact(areas.list.len()).map_err(|_| SwapError::OutOfMemory)?;
+        out.extend(areas.list.iter().map(|a| a.info()));
         Ok(out)
     }
 
