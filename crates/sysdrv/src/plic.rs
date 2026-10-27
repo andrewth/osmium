@@ -85,9 +85,12 @@ impl InterruptController for Plic {
             let _ = self.io.write(prio, 1u32);
         }
         let w = self.enable_word(irq);
-        if let Ok(v) = self.io.read::<u32>(w) {
-            let _ = self.io.write(w, v | 1 << (irq % 32));
-        }
+        // The word is this context's own (one per hart and mode); only a handler on this CPU can race.
+        osmium_arch::irq::without(|| {
+            if let Ok(v) = self.io.read::<u32>(w) {
+                let _ = self.io.write(w, v | 1 << (irq % 32));
+            }
+        });
     }
 
     /// Does nothing for a source the PLIC lacks, or if the window is too
@@ -97,9 +100,11 @@ impl InterruptController for Plic {
             return;
         }
         let w = self.enable_word(irq);
-        if let Ok(v) = self.io.read::<u32>(w) {
-            let _ = self.io.write(w, v & !(1 << (irq % 32)));
-        }
+        osmium_arch::irq::without(|| {
+            if let Ok(v) = self.io.read::<u32>(w) {
+                let _ = self.io.write(w, v & !(1 << (irq % 32)));
+            }
+        });
     }
 
     fn claim(&self) -> Option<u32> {

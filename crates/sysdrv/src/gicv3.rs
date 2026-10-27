@@ -178,9 +178,15 @@ mod sysregs {
 }
 
 /// The affinity fields (Aff3.Aff2.Aff1.Aff0) of an `MPIDR_EL1` value, packed
-/// the way `GICR_TYPER[63:32]` and `GICD_IROUTER` order them.
+/// the way `GICD_IROUTER` orders them (Aff3 at bits 39:32).
 pub const fn affinity(mpidr: u64) -> u64 {
     mpidr & 0xff_00ff_ffff
+}
+
+/// An [`affinity`] as it appears in `GICR_TYPER[63:32]`, where Aff3 is at bits
+/// 31:24 of the high word rather than 7:0 above Aff2.
+const fn typer_affinity(aff: u64) -> u64 {
+    (aff & 0x00ff_ffff) | ((aff >> 8) & 0xff00_0000)
 }
 
 /// Builds the `ICC_SGI1R_EL1` value that sends SGI `sgi` to the CPU whose
@@ -264,7 +270,7 @@ impl<C: CpuInterface> GicV3<C> {
         let mut off = 0usize;
         loop {
             let typer: u64 = self.gicr.read(off.checked_add(GICR_TYPER)?).ok()?;
-            if typer >> 32 == aff {
+            if typer >> 32 == typer_affinity(aff) {
                 return Some(off);
             }
             if typer & GICR_TYPER_LAST != 0 {
@@ -657,6 +663,17 @@ mod tests {
         assert_eq!(f.r[sgi + GICD_IPRIORITYR / 4 + 6] >> 24, 0x7f);
         assert_eq!(f.r[sgi + GICD_ICPENDR / 4], 1 << 3);
         assert_eq!(f.r[GICR_SGI_FRAME / 4 + GICD_ISENABLER / 4], 0, "CPU 0's redistributor untouched");
+    }
+
+    #[test]
+    fn redistributor_match_handles_aff3() {
+        let mut f = Fake::new();
+        // GICR_TYPER[63:32] holds Aff3 at bits 31:24.
+        f.r[(GICR_STRIDE + GICR_TYPER) / 4 + 1] = 0x0300_0201;
+        let cpu = FakeCpu::new(0);
+        let gic = f.gic(&cpu);
+        assert!(gic.register_cpu(1, 0x03_0000_0000 | 0x0201));
+        assert!(!gic.register_cpu(2, 0x0201));
     }
 
     #[test]

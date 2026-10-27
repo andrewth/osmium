@@ -196,12 +196,14 @@ impl Hpet {
 
     /// The main counter as a 64-bit tick count, extending a 32-bit counter across wraps.
     pub fn ticks(&self) -> u64 {
-        let raw = self.raw_counter();
         if self.counter64 {
-            return raw;
+            return self.raw_counter();
         }
         let mut prev = self.extended.load(Ordering::Relaxed);
         loop {
+            // Read the counter after loading `prev` (and again after a lost race), so a concurrent
+            // update can only make `prev` older than `raw`, never newer: a lower `raw` is a real wrap.
+            let raw = self.raw_counter();
             let mut next = (prev & !0xffff_ffff) | raw;
             if next < prev {
                 // The low half went backwards: the counter wrapped since the last call.

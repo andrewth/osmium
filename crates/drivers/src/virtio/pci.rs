@@ -25,7 +25,14 @@ pub struct PciTransport {
     notify_multiplier: u32,
     isr: IoMem,
     device: Option<IoMem>,
+    /// Each queue's doorbell offset in `notify`, read once by `new` so a kick
+    /// need not touch the shared `QUEUE_SELECT`.
+    notify_offsets: [u32; MAX_NOTIFY_QUEUES],
 }
+
+/// Queues whose doorbell offset is cached; later queues look theirs up on each
+/// kick. Kept small: the transport is moved around on small kernel stacks.
+const MAX_NOTIFY_QUEUES: usize = 16;
 
 /// The device type of a virtio PCI function, from its IDs, or `None` if it
 /// is not a virtio device.
@@ -92,11 +99,20 @@ impl PciTransport {
             return Err(VirtioError::NotPresent);
         }
         func.enable_memory_and_dma();
-        let t = Self { device_type, common, notify, notify_multiplier, isr, device };
+        let mut t = Self {
+            device_type,
+            common,
+            notify,
+            notify_multiplier,
+            isr,
+            device,
+            notify_offsets: [u32::MAX; MAX_NOTIFY_QUEUES],
+        };
         // Every queue's doorbell must lie in the notification window.
         for q in 0..t.num_queues() {
-            if t.notify_offset(q).is_none() {
-                return Err(VirtioError::BadQueue);
+            let Some(off) = t.notify_offset(q) else { return Err(VirtioError::BadQueue) };
+            if let Some(slot) = t.notify_offsets.get_mut(q as usize) {
+                *slot = u32::try_from(off).map_err(|_| VirtioError::BadQueue)?;
             }
         }
         Ok(t)
@@ -191,9 +207,15 @@ impl Transport for PciTransport {
     }
 
     fn notify(&self, index: u16) {
-        // `new` checked every queue's offset; a device that changes it
-        // later gets no doorbell, and its driver times out.
-        if let Some(off) = self.notify_offset(index) {
+        // `new` read and checked every queue's offset. A cached one avoids
+        // racing other CPUs on `QUEUE_SELECT`; a queue beyond the cache looks
+        // its offset up, and a device that changes it later gets no doorbell.
+        let off = match self.notify_offsets.get(index as usize) {
+            Some(&o) if o != u32::MAX => Some(o as usize),
+            Some(_) => None,
+            None => self.notify_offset(index),
+        };
+        if let Some(off) = off {
             let _ = self.notify.write(off, index);
         }
     }
@@ -283,6 +305,12 @@ mod tests {
         let mut bar = vec![0u32; BAR_SIZE as usize / 4];
         let base = bar.as_mut_ptr();
         let mut mapped = Vec::new();
+        // The doorbell offsets are read once, by `new`, so they must be in place before it.
+        // SAFETY: the window covers a local array.
+        unsafe {
+            base.add(NUM_QUEUES / 4).write_volatile(2 << 16);
+            base.add(QUEUE_NOTIFY_OFF / 4).write_volatile(3 << 16);
+        }
         let t = PciTransport::new(&func, |b| {
             mapped.push((b.index, b.address, b.size));
             // SAFETY: the window covers a local array.
@@ -296,9 +324,7 @@ mod tests {
         let regs = |i: usize| unsafe { base.add(i).read_volatile() };
         // SAFETY: as above.
         let set = |i: usize, v: u32| unsafe { base.add(i).write_volatile(v) };
-        set(NUM_QUEUES / 4, 2 << 16);
         set(QUEUE_SIZE / 4, 64);
-        set(QUEUE_NOTIFY_OFF / 4, 3 << 16);
         set(0x2000 / 4, 0x0000_0201);
         set(0x1000 / 4, 3);
         assert_eq!(t.max_queue_size(1), 64);

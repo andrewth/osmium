@@ -85,9 +85,10 @@ const OP_IOFENCE: u64 = 2;
 const OP_IODIR: u64 = 3;
 /// `IOTINVAL.VMA` (function 0) for one `PSCID`.
 const IOTINVAL_PSCV: u64 = 1 << 32;
-const IOFENCE_PR: u64 = 1 << 10;
-const IOFENCE_PW: u64 = 1 << 11;
-const IOFENCE_AV: u64 = 1 << 12;
+// AV at bit 10 is confirmed by QEMU's riscv-iommu-bits.h. WSI is bit 11; PR and PW follow it.
+const IOFENCE_AV: u64 = 1 << 10;
+const IOFENCE_PR: u64 = 1 << 12;
+const IOFENCE_PW: u64 = 1 << 13;
 const IODIR_DV: u64 = 1 << 33;
 
 // Device context: translation control and first-stage pointer.
@@ -390,7 +391,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
         barrier::mb();
         self.regs.w32(FQH, (head + 1) & mask);
         let requester = (q0 >> 40) as u16;
-        // Transaction types 3 and 6 are untranslated and translated writes.
+        // Transaction types 3 and 7 are untranslated and translated writes (6 is a translated read).
         let ttyp = (q0 >> 34) & 0x3f;
         Some(Fault {
             device: DeviceId::new(
@@ -398,7 +399,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for RiscvIommu<'_, D> {
                 Address::new((requester >> 8) as u8, (requester >> 3) as u8 & 31, requester as u8 & 7),
             ),
             iova: iotval,
-            write: matches!(ttyp, 3 | 6),
+            write: matches!(ttyp, 3 | 7),
             reason: (q0 & 0xfff) as u32,
         })
     }
@@ -738,7 +739,7 @@ mod tests {
         let unit = setup(&dma, &clock, &f);
         assert_eq!(unit.take_fault(), None);
         f.push_fault(dev(NIC).bdf(), 7, 3, 0x1234_5678);
-        f.push_fault(dev(FAR).bdf(), 5, 2, 0x9000);
+        f.push_fault(dev(FAR).bdf(), 5, 6, 0x9000);
         let a = unit.take_fault().unwrap();
         assert_eq!((a.device, a.iova, a.write, a.reason), (dev(NIC), 0x1234_5678, true, 7));
         let b = unit.take_fault().unwrap();

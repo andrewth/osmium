@@ -101,8 +101,12 @@ impl LocalApic {
     }
 
     fn send_icr(&self, dest: u8, low: u32) {
-        self.write(ICR_HIGH, (dest as u32) << 24);
-        self.write(ICR_LOW, low);
+        // ICR_HIGH latches the destination for the ICR_LOW write: an interrupt handler on this CPU
+        // that sent its own IPI in between would redirect ours.
+        osmium_arch::irq::without(|| {
+            self.write(ICR_HIGH, (dest as u32) << 24);
+            self.write(ICR_LOW, low);
+        });
         while self.read(ICR_LOW) & ICR_PENDING != 0 {
             core::hint::spin_loop();
         }

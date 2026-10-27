@@ -134,7 +134,10 @@ pub trait Transport {
 /// Returns the negotiated set. Finish initialization by setting up the
 /// queues and calling [`driver_ok`].
 pub fn negotiate<T: Transport + ?Sized>(t: &T, required: u64, optional: u64) -> Result<u64, VirtioError> {
-    t.set_status(0);
+    // The device must read back 0 before anything else is written (§2.1.2).
+    if !reset(t) {
+        return Err(VirtioError::NotPresent);
+    }
     t.set_status(status::ACKNOWLEDGE);
     t.set_status(status::ACKNOWLEDGE | status::DRIVER);
     let offered = t.device_features();

@@ -109,8 +109,14 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Vtd<'d, D> {
     pub(super) fn qi_submit(&self, desc: [u64; 2]) -> Result<(), IommuError> {
         let mut guard = self.qi.lock();
         let q = guard.as_mut().ok_or(IommuError::Unsupported)?;
-        q.seq = q.seq.wrapping_add(1).max(1);
         let (len, slots) = (q.desc_len(), q.slots());
+        // Two slots go in and the ring keeps one free (head == tail means empty). After a timed-out
+        // submission the unit may still be behind, and the tail must not lap the head.
+        let head = self.regs.r64(IQH) as usize / len % slots;
+        if (head + slots - q.tail - 1) % slots < 2 {
+            return Err(IommuError::Busy);
+        }
+        q.seq = q.seq.wrapping_add(1).max(1);
         let wait = [TYPE_WAIT | WAIT_SW | (q.seq as u64) << 32, q.mem.device_addr().as_u64() + STATUS as u64];
         q.mem.store::<u32>(STATUS, 0);
         let put = |q: &Queue<'d, D>, slot: usize, d: [u64; 2]| {
