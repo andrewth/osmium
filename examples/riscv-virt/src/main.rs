@@ -87,9 +87,13 @@ secondary_start:
     ld sp, 0(a1)
     call secondary_main
 
+    # The boot hart runs all of kmain on this stack (device probing and driver
+    # setup inline into big frames). It sits first in .bss, so running off the
+    # bottom silently overwrites the statics in .data below it (SCHED, FRAMES,
+    # lock words...). 64 KiB was outgrown; keep generous headroom.
     .section .bss.stack
     .align 12
-    .space 65536
+    .space 262144
 boot_stack_top:
 "#
 );

@@ -1023,8 +1023,14 @@ struct SigInfo {
 }
 
 fn catch_with(sig: u64, handler: extern "C" fn(i32, *const u8, *const u8), flags: u64) {
+    catch_masked(sig, handler, flags, 0);
+}
+
+/// [`catch_with`] that also blocks `mask` (`sa_mask`) while the handler runs.
+fn catch_masked(sig: u64, handler: extern "C" fn(i32, *const u8, *const u8), flags: u64, mask: u64) {
     let mut act = sys::sigaction(handler as usize as u64);
     act.flags = flags;
+    act.mask = mask;
     let r = sys::call(sys::RT_SIGACTION, [sig, &act as *const sys::SigAction as u64, 0, 8, 0]);
     assert!(r == 0);
 }
@@ -1055,8 +1061,12 @@ fn queued_signals_and_job_control() {
     let pid = sys::call(sys::GETPID, [0; 5]);
 
     // Real-time signals queue, with the value `rt_sigqueueinfo` passed, lowest number first.
-    catch_with(SIGRT1, on_queued, SA_SIGINFO);
-    catch_with(SIGRT2, on_queued, SA_SIGINFO);
+    // Each handler blocks the other signal (`sa_mask`): a timer interrupt can land before the first
+    // handler's first instruction, and an unblocked pending signal would then nest on top of it and
+    // run (and be recorded) first, as it may on any POSIX system.
+    let both = 1 << (SIGRT1 - 1) | 1 << (SIGRT2 - 1);
+    catch_masked(SIGRT1, on_queued, SA_SIGINFO, both);
+    catch_masked(SIGRT2, on_queued, SA_SIGINFO, both);
     sigprocmask(2, 1 << (SIGRT1 - 1) | 1 << (SIGRT2 - 1));
     for (sig, value) in [(SIGRT2, 1u64), (SIGRT1, 2), (SIGRT2, 3)] {
         let info =
