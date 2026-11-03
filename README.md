@@ -49,6 +49,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-iscsi` | iSCSI initiator over `osmium-net` TCP as a `BlockDevice`: login and negotiation, R2T and immediate-data writes, SendTargets discovery | yes |
 | `osmium-rand` | Entropy sources over the CPU's random number instructions (RDRAND/RDSEED, RNDR, Zkr), SHA-256, and a ChaCha20 generator with fast key erasure, shareable across CPUs and interrupt handlers | no |
 | `osmium-tls` | TLS 1.3 servers over rustls: a pure-Rust provider (ChaCha20-Poly1305, X25519, ECDSA P-256), a sans-I/O `ServerSession`, self-signed certificates and a boot-time self-test. Uses crates.io dependencies | yes |
+| `osmium-http` | Sans-I/O HTTP/1.1 server: strict request parsing (chunked bodies, limits, request-smuggling defences), keep-alive and pipelining, response building. No dependencies | yes |
 | `osmium-fs-ext4` | ext2/ext3/ext4 (read and write) for the `osmium-fs` VFS over any `BlockDevice` | yes |
 | `osmium-fs-iso9660` | read-only ISO 9660 for the `osmium-fs` VFS over any `BlockDevice`: Rock Ridge, Joliet, deep-directory relocation, multi-extent and interleaved files | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |

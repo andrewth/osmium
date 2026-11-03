@@ -340,7 +340,16 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Tested on the host against rustls's own client (handshake, IP-address names, wrong-name refusal, tampered records, 200 KB each way, garbage input) and against Python's `ssl` module (OpenSSL) over TCP, which checks the certificate independently
 - ✅ `x86_64-unknown-none` is soft-float, so `.cargo/config.toml` selects the portable backends of `chacha20`, `poly1305`, `sha2` and `curve25519-dalek`; binaries for that target that link `osmium-tls` need the same `--cfg` flags
 - ✅ The only crate with crates.io dependencies (rustls and the RustCrypto crates); nothing else in osmium depends on it
-- 🗺 HTTP server (`osmium-http`), client authentication, session resumption tests, AES-GCM for CPUs with AES instructions
+- 🗺 Client authentication, session resumption tests, AES-GCM for CPUs with AES instructions, SNI (rustls's unbuffered API doesn't expose it)
+
+### `osmium-http`: HTTP/1.1 server
+- ✅ `Connection`: one server connection with no I/O of its own (`receive`, `next_request`, `respond`, `outgoing`/`sent`, `should_close`); one request at a time, so pipelined requests are answered in order; keep-alive by HTTP/1.1 and 1.0 rules and `Connection`; `Expect: 100-continue` answered once; `HEAD` gets the length without the body; `receive` buffers at most one request's worth and reports what it took, for backpressure
+- ✅ Bodies by `Content-Length` or `chunked` (extensions and trailers ignored); chunks are located first and copied once, so a body arriving in pieces isn't re-copied each time
+- ✅ Strict parsing against request smuggling (RFC 9112): `Content-Length` with `Transfer-Encoding`, conflicting or non-decimal lengths, `Transfer-Encoding` in HTTP/1.0, codings other than `chunked` (501), obsolete folding, whitespace before a colon, control characters, bare CR or LF, missing `Host` in HTTP/1.1, versions other than 1.0 and 1.1 (505); `Limits` on head size and header count (431) and body size (413); every refusal is answered and closes the connection
+- ✅ `Response` builders (`text`, `json`, `redirect`, `error`), with `Content-Length` and `Connection` set by the connection and header fields that would break framing dropped; reason phrases; `content_type` by extension
+- ✅ `Request` helpers: case-insensitive headers, path, query parameters, decoded path `segments` that refuse encoded `/`, `.` and `..`; `url::percent_decode`, `url::query_pairs`
+- ✅ No dependencies; tested on the host, against Python's `http.client` over TCP (keep-alive, 100 KB body, chunked upload, `HEAD`, close) and against `urllib` over HTTPS through `osmium-tls`
+- 🗺 Request streaming for bodies larger than memory, `Range`, compression, HTTP/2
 
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name

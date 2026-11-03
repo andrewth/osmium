@@ -1,0 +1,15 @@
+[package]
+name = "osmium-http"
+description = "Osmium: a sans-I/O HTTP/1.1 server: request parsing, responses and connection handling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The HTTPS end-to-end test serves through osmium-tls.
+osmium-rand.workspace = true
+osmium-tls.workspace = true

@@ -354,6 +354,7 @@ dependencies = [
  "osmium-fs-fat",
  "osmium-fs-iso9660",
  "osmium-hal",
+ "osmium-http",
  "osmium-iscsi",
  "osmium-mm",
  "osmium-net",
@@ -457,6 +458,10 @@ dependencies = [
  "osmium-mm",
  "osmium-sync",
 ]
+
+[[package]]
+name = "osmium-http"
+version = "0.1.0"
 
 [[package]]
 name = "osmium-iscsi"

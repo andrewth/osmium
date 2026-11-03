@@ -29,6 +29,7 @@
 //! | `iscsi` | `osmium-iscsi` | iSCSI initiator: a remote SCSI disk over TCP as a block device |
 //! | `rand` | `osmium-rand` | entropy sources, SHA-256, ChaCha20 random number generator |
 //! | `tls` | `osmium-tls` | TLS 1.3 servers over rustls, self-signed certificates |
+//! | `http` | `osmium-http` | sans-I/O HTTP/1.1 server |
 //! | `acpi` | `osmium-acpi` | ACPI: FADT, AML interpreter, devices, resources, PCI routing, sleep states, SCI and GPE events |
 //!
 //! The library never defines an entry point, panic handler or global
@@ -62,6 +63,8 @@ pub use osmium_proc as proc;
 pub use osmium_rand as rand;
 #[cfg(feature = "tls")]
 pub use osmium_tls as tls;
+#[cfg(feature = "http")]
+pub use osmium_http as http;
 #[cfg(feature = "fs-fat")]
 pub use osmium_fs_fat as fs_fat;
 #[cfg(feature = "net")]
