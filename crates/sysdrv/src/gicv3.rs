@@ -8,16 +8,27 @@
 //! tested on the host against a simulation; `SysRegs` is the real thing on
 //! bare-metal AArch64.
 //!
-//! Not implemented: the interrupt translation service (ITS) and LPIs, group 0
-//! and secure-state configuration, and GICv4 virtual interrupts. The driver
+//! LPIs (message-based interrupts, IDs 8192 and up) are in [`lpi`]: their
+//! tables are handed to each redistributor by [`GicV3::enable_lpis`], and
+//! [`its`] drives the interrupt translation service that turns a device's
+//! MSI write into one. [`InterruptController::claim`] returns LPIs like any
+//! other interrupt.
+//!
+//! Not implemented: group 0 and secure-state configuration. The driver
 //! assumes it runs in the non-secure state at EL1 (or higher).
+
+pub mod its;
+pub mod lpi;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use osmium_arch::MAX_CPUS;
+use osmium_hal::dma::DmaAllocator;
 use osmium_hal::irq::InterruptController;
 use osmium_hal::mmio::IoMem;
 use osmium_sync::PerCpu;
+
+use lpi::{LpiError, LpiTables};
 
 const GICD_CTLR: usize = 0x0000;
 const GICD_TYPER: usize = 0x0004;
@@ -38,9 +49,18 @@ const GICD_CTLR_ARE_NS: u32 = 1 << 4;
 const GICD_CTLR_DS: u32 = 1 << 6;
 /// `GICD_CTLR.RWP`: a register write is still propagating.
 const GICD_CTLR_RWP: u32 = 1 << 31;
+/// `GICD_TYPER.LPIS`: the GIC supports LPIs.
+const GICD_TYPER_LPIS: u32 = 1 << 17;
 
+const GICR_CTLR: usize = 0x00;
 const GICR_TYPER: usize = 0x08;
 const GICR_WAKER: usize = 0x14;
+const GICR_PROPBASER: usize = 0x70;
+const GICR_PENDBASER: usize = 0x78;
+/// `GICR_CTLR.EnableLPIs`.
+const GICR_CTLR_ENABLE_LPIS: u32 = 1 << 0;
+/// `GICR_CTLR.RWP`: a write to `GICR_CTLR` is still propagating.
+const GICR_CTLR_RWP: u32 = 1 << 3;
 /// Offset of the SGI/PPI frame within a redistributor.
 const GICR_SGI_FRAME: usize = 0x1_0000;
 /// Size of a redistributor with the RD and SGI frames only.
@@ -50,6 +70,7 @@ const GICR_STRIDE_V4: usize = 0x4_0000;
 
 const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
 const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
+const GICR_TYPER_PLPIS: u64 = 1 << 0;
 const GICR_TYPER_VLPIS: u64 = 1 << 1;
 const GICR_TYPER_LAST: u64 = 1 << 4;
 
@@ -58,8 +79,18 @@ const ICC_CTLR_EOIMODE: u64 = 1 << 1;
 
 const FIRST_SPI: u32 = 32;
 /// Interrupt ids 1020–1023 are special, so no distributor implements more
-/// than 1020 lines (LPIs start at 8192 and are not handled here).
+/// than 1020 lines.
 const MAX_IRQS: u32 = 1020;
+/// The first LPI.
+pub const FIRST_LPI: u32 = 8192;
+/// One past the largest interrupt ID the CPU interface can report (24 bits).
+const INTID_LIMIT: u32 = 1 << 24;
+
+/// Whether `intid` is one that [`InterruptController::claim`] reports: a
+/// line below 1020, or an LPI.
+const fn is_claimable(intid: u32) -> bool {
+    intid < MAX_IRQS || (intid >= FIRST_LPI && intid < INTID_LIMIT)
+}
 
 /// Polls of a status bit before giving up on hardware that never answers.
 const SPIN_LIMIT: u32 = 1_000_000;
@@ -187,6 +218,21 @@ pub const fn affinity(mpidr: u64) -> u64 {
 /// 31:24 of the high word rather than 7:0 above Aff2.
 const fn typer_affinity(aff: u64) -> u64 {
     (aff & 0x00ff_ffff) | ((aff >> 8) & 0xff00_0000)
+}
+
+/// What [`GicV3::redistributor`] reports about a CPU's redistributor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redistributor {
+    /// Byte offset of its `RD_base` frame in the redistributor region.
+    pub offset: usize,
+    /// `GICR_TYPER.Processor_Number`, the target an ITS without physical
+    /// target addresses (`GITS_TYPER.PTA` = 0) names it by.
+    pub processor_number: u16,
+    /// It supports physical LPIs (`GICR_TYPER.PLPIS`).
+    pub plpis: bool,
+    /// It supports virtual LPIs (`GICR_TYPER.VLPIS`, GICv4), and so has the
+    /// two extra frames.
+    pub vlpis: bool,
 }
 
 /// Builds the `ICC_SGI1R_EL1` value that sends SGI `sgi` to the CPU whose
@@ -356,6 +402,88 @@ impl<C: CpuInterface> GicV3<C> {
         }
     }
 
+    /// The number of interrupt-ID bits the distributor supports
+    /// (`GICD_TYPER.IDbits` + 1), if it supports LPIs at all.
+    pub fn lpi_id_bits(&self) -> Option<u32> {
+        let typer: u32 = self.gicd.read(GICD_TYPER).unwrap_or(0);
+        (typer & GICD_TYPER_LPIS != 0).then_some((typer >> 19 & 0x1f) + 1)
+    }
+
+    /// The redistributor of logical CPU `cpu`, once registered (by
+    /// [`GicV3::register_cpu`] or [`GicV3::init_cpu`]).
+    pub fn redistributor(&self, cpu: usize) -> Option<Redistributor> {
+        if cpu >= MAX_CPUS {
+            return None;
+        }
+        let offset = self.redist.for_cpu(cpu).load(Ordering::Acquire);
+        if offset == NO_REDIST {
+            return None;
+        }
+        let typer: u64 = self.gicr.read(offset.checked_add(GICR_TYPER)?).ok()?;
+        Some(Redistributor {
+            offset,
+            processor_number: (typer >> 8 & 0xffff) as u16,
+            plpis: typer & GICR_TYPER_PLPIS != 0,
+            vlpis: typer & GICR_TYPER_VLPIS != 0,
+        })
+    }
+
+    /// Hands this CPU's redistributor the LPI property table and a pending
+    /// table of its own from `tables`, and enables LPIs on it. Call on each
+    /// CPU after [`GicV3::init_cpu`]; every CPU must get the same `tables`.
+    ///
+    /// Once enabled, LPIs cannot portably be disabled again (clearing
+    /// `GICR_CTLR.EnableLPIs` is optional for an implementation), so
+    /// `tables` must stay alive as long as the GIC runs: keep it in a
+    /// `static`.
+    pub fn enable_lpis<D: DmaAllocator + ?Sized>(&self, tables: &LpiTables<'_, D>) -> Result<(), LpiError> {
+        if self.lpi_id_bits().is_none_or(|bits| bits < tables.id_bits()) {
+            return Err(if self.lpi_id_bits().is_none() { LpiError::Unsupported } else { LpiError::BadIdBits });
+        }
+        let cpu = osmium_arch::cpu::current_id();
+        let rd = self.redistributor(cpu).ok_or(LpiError::NoRedistributor)?;
+        if !rd.plpis {
+            return Err(LpiError::Unsupported);
+        }
+        let reg = |r: usize| rd.offset.checked_add(r).ok_or(LpiError::NoRedistributor);
+        let ctlr: u32 = self.gicr.read(reg(GICR_CTLR)?).unwrap_or(0);
+        if ctlr & GICR_CTLR_ENABLE_LPIS != 0 {
+            // Already on (firmware, or an earlier call): the tables cannot change now.
+            let prop: u64 = self.gicr.read(reg(GICR_PROPBASER)?).unwrap_or(0);
+            return if prop & lpi::ADDR_MASK_4K == tables.property_table().as_u64() {
+                Ok(())
+            } else {
+                Err(LpiError::Unsupported)
+            };
+        }
+        let propbaser = tables.propbaser();
+        let pendbaser = tables.pendbaser(cpu)?;
+        let _ = self.gicr.write(reg(GICR_PROPBASER)?, propbaser);
+        let _ = self.gicr.write(reg(GICR_PENDBASER)?, pendbaser);
+        let readback: u64 = self.gicr.read(reg(GICR_PROPBASER)?).unwrap_or(0);
+        if readback & lpi::SHAREABILITY == 0 {
+            return Err(LpiError::NotCoherent);
+        }
+        // The tables must be in memory before the redistributor reads them.
+        osmium_arch::barrier::mb();
+        let _ = self.gicr.write(reg(GICR_CTLR)?, ctlr | GICR_CTLR_ENABLE_LPIS);
+        for _ in 0..SPIN_LIMIT {
+            if self.gicr.read::<u32>(reg(GICR_CTLR)?).is_ok_and(|v| v & GICR_CTLR_RWP != 0) {
+                core::hint::spin_loop();
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether LPIs are enabled on `cpu`'s redistributor.
+    pub fn lpis_enabled(&self, cpu: usize) -> bool {
+        self.redistributor(cpu)
+            .and_then(|rd| self.gicr.read::<u32>(rd.offset.checked_add(GICR_CTLR)?).ok())
+            .is_some_and(|v| v & GICR_CTLR_ENABLE_LPIS != 0)
+    }
+
     fn my_redist(&self) -> Option<usize> {
         let off = self.redist.get().load(Ordering::Acquire);
         (off != NO_REDIST).then_some(off)
@@ -475,17 +603,19 @@ impl<C: CpuInterface> InterruptController for GicV3<C> {
         self.set_bit(GICD_ICENABLER, irq);
     }
 
-    /// Acknowledges an interrupt. 1020–1023 (spurious, reserved) and LPI ids
-    /// give `None`.
+    /// Acknowledges an interrupt: a line below 1020 or an LPI (8192 and
+    /// up). 1020–1023 (spurious, reserved) give `None`.
     fn claim(&self) -> Option<u32> {
         let id = self.cpu_if.iar1() & 0xff_ffff;
-        (id < MAX_IRQS).then_some(id)
+        is_claimable(id).then_some(id)
     }
 
-    /// Drops the running priority (and deactivates, in [`EoiMode::Combined`]).
-    /// Ignores ids [`InterruptController::claim`] never returns.
+    /// Drops the running priority (and deactivates, in [`EoiMode::Combined`];
+    /// LPIs have no active state, so for them this is the whole end of the
+    /// interrupt in either mode). Ignores ids [`InterruptController::claim`]
+    /// never returns.
     fn complete(&self, irq: u32) {
-        if irq < MAX_IRQS {
+        if is_claimable(irq) {
             self.cpu_if.eoir1(irq);
         }
     }
@@ -518,7 +648,7 @@ mod tests {
     use std::vec::Vec;
 
     /// A simulated CPU interface.
-    struct FakeCpu {
+    pub(crate) struct FakeCpu {
         mpidr: u64,
         iar: AtomicU32,
         eoir: Mutex<Vec<u32>>,
@@ -530,7 +660,7 @@ mod tests {
     }
 
     impl FakeCpu {
-        fn new(mpidr: u64) -> Self {
+        pub(crate) fn new(mpidr: u64) -> Self {
             Self {
                 mpidr,
                 iar: AtomicU32::new(1023),
@@ -579,13 +709,13 @@ mod tests {
     }
 
     /// Two redistributors (affinities 0 and 1) and a 96-line distributor.
-    struct Fake {
-        d: Vec<u32>,
-        r: Vec<u32>,
+    pub(crate) struct Fake {
+        pub(crate) d: Vec<u32>,
+        pub(crate) r: Vec<u32>,
     }
 
     impl Fake {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let mut d = std::vec![0u32; 0x10000 / 4];
             d[GICD_TYPER / 4] = 2; // 96 lines
             let mut r = std::vec![0u32; 2 * GICR_STRIDE / 4];
@@ -598,7 +728,7 @@ mod tests {
             Self { d, r }
         }
 
-        fn gic<'a>(&mut self, cpu: &'a FakeCpu) -> GicV3<&'a FakeCpu> {
+        pub(crate) fn gic<'a>(&mut self, cpu: &'a FakeCpu) -> GicV3<&'a FakeCpu> {
             // SAFETY: the windows cover the vectors, which outlive the driver in each test.
             unsafe {
                 GicV3::new(
@@ -727,8 +857,15 @@ mod tests {
         let (mut f, cpu) = (Fake::new(), FakeCpu::new(0));
         let gic = f.gic(&cpu);
         assert_eq!(gic.claim(), None);
+        cpu.iar.store(1022, Ordering::Relaxed);
+        assert_eq!(gic.claim(), None, "reserved");
         cpu.iar.store(8192, Ordering::Relaxed);
-        assert_eq!(gic.claim(), None, "LPIs are not supported");
+        assert_eq!(gic.claim(), Some(8192), "LPIs are claimed");
+        gic.complete(8192);
+        gic.deactivate(8192);
+        cpu.iar.store(4000, Ordering::Relaxed);
+        assert_eq!(gic.claim(), None, "between the lines and the LPIs");
+        gic.complete(4000);
         gic.enable(96);
         gic.enable(1024 + 32);
         gic.disable(u32::MAX);
@@ -736,7 +873,8 @@ mod tests {
         gic.route(96, 1);
         gic.complete(1023);
         drop(gic);
-        assert!(cpu.eoir.lock().unwrap().is_empty());
+        assert_eq!(*cpu.eoir.lock().unwrap(), [8192]);
+        assert!(cpu.dirs.lock().unwrap().is_empty(), "LPIs have no active state to deactivate");
         assert!(f.d.iter().enumerate().all(|(i, &v)| i == GICD_TYPER / 4 || v == 0));
     }
 
@@ -752,5 +890,55 @@ mod tests {
         let gic = f.gic(&cpu);
         assert!(gic.register_cpu(1, 1));
         assert_eq!(gic.redist.for_cpu(1).load(Ordering::Relaxed), GICR_STRIDE_V4);
+    }
+
+    #[test]
+    fn lpis_need_distributor_and_redistributor_support() {
+        let dma = crate::iommu::testing::HostDma::default();
+        let tables = LpiTables::new(&dma, 14).unwrap();
+        let (mut f, cpu) = (Fake::new(), FakeCpu::new(0));
+        let gic = f.gic(&cpu);
+        assert!(gic.init_cpu());
+        assert_eq!(gic.lpi_id_bits(), None);
+        assert_eq!(gic.enable_lpis(&tables), Err(LpiError::Unsupported));
+        drop(gic);
+        f.d[GICD_TYPER / 4] |= GICD_TYPER_LPIS | 13 << 19; // 14 ID bits
+        let gic = f.gic(&cpu);
+        assert!(gic.init_cpu());
+        assert_eq!(gic.lpi_id_bits(), Some(14));
+        assert_eq!(gic.enable_lpis(&tables), Err(LpiError::Unsupported), "no GICR_TYPER.PLPIS");
+        let big = LpiTables::new(&dma, 15).unwrap();
+        assert_eq!(gic.enable_lpis(&big), Err(LpiError::BadIdBits));
+    }
+
+    #[test]
+    fn enable_lpis_programs_the_redistributor() {
+        let dma = crate::iommu::testing::HostDma::default();
+        let tables = LpiTables::new(&dma, 14).unwrap();
+        let (mut f, cpu) = (Fake::new(), FakeCpu::new(1));
+        f.d[GICD_TYPER / 4] |= GICD_TYPER_LPIS | 15 << 19;
+        // The second redistributor: Last, PLPIS, processor number 1.
+        f.r[(GICR_STRIDE + GICR_TYPER) / 4] |= GICR_TYPER_PLPIS as u32 | 1 << 8;
+        let gic = f.gic(&cpu);
+        assert!(gic.init_cpu());
+        let rd = gic.redistributor(0).unwrap();
+        assert_eq!(rd, Redistributor { offset: GICR_STRIDE, processor_number: 1, plpis: true, vlpis: false });
+        assert_eq!(gic.redistributor(1), None);
+        assert!(!gic.lpis_enabled(0));
+        gic.enable_lpis(&tables).unwrap();
+        assert!(gic.lpis_enabled(0));
+        gic.enable_lpis(&tables).unwrap();
+        let other = LpiTables::new(&dma, 14).unwrap();
+        assert_eq!(gic.enable_lpis(&other), Err(LpiError::Unsupported), "tables are fixed once enabled");
+        drop(gic);
+        let r64 = |off: usize| u64::from(f.r[off / 4]) | u64::from(f.r[off / 4 + 1]) << 32;
+        let prop = r64(GICR_STRIDE + GICR_PROPBASER);
+        assert_eq!(prop & lpi::ADDR_MASK_4K, tables.property_table().as_u64());
+        assert_eq!(prop & 0x1f, 13);
+        assert_eq!(prop & lpi::SHAREABILITY, 1 << 10, "inner shareable");
+        let pend = r64(GICR_STRIDE + GICR_PENDBASER);
+        assert_eq!(pend & lpi::ADDR_MASK_64K & 0xffff, 0);
+        assert_ne!(pend & lpi::ADDR_MASK_64K, 0);
+        assert_eq!(r64(GICR_PROPBASER), 0, "CPU 0's redistributor untouched");
     }
 }

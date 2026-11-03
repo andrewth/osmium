@@ -34,7 +34,7 @@ pub mod smmuv3;
 pub mod vtd;
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 use core::ptr::NonNull;
 

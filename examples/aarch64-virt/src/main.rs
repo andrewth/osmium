@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod iommu;
+mod its;
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -22,11 +23,8 @@ use osmium::arch::aarch64::{self, psci};
 use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
-use osmium::sysdrv::gicv2::GicV2;
-use osmium::sysdrv::gicv3::{GicV3, SysRegs};
-use osmium::sysdrv::pl011::Pl011;
 use osmium::hal::console::{SerialConsole, set_console};
-use osmium::hal::irq::{InterruptController, IrqTable};
+use osmium::hal::irq::{InterruptController, IrqTable, MAX_CLAIMS_PER_CALL};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
 use osmium::hal::timer::TickRate;
@@ -36,6 +34,9 @@ use osmium::mm::paging::PageSize;
 use osmium::mm::paging::formats::Aarch64;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
+use osmium::sysdrv::gicv2::GicV2;
+use osmium::sysdrv::gicv3::{FIRST_LPI, GicV3, SysRegs};
+use osmium::sysdrv::pl011::Pl011;
 
 use osmium::arch::trap::TrapCpu;
 use osmium::proc::{AddressSpace, ExitStatus, Process, UserMemory};
@@ -270,6 +271,21 @@ impl InterruptController for Gic {
     }
 }
 static IRQS: IrqTable<256> = IrqTable::new();
+/// LPI handlers, indexed by interrupt ID minus [`FIRST_LPI`].
+static LPIS: IrqTable<64> = IrqTable::new();
+
+/// Claims and dispatches pending interrupts: lines through [`IRQS`], LPIs
+/// through [`LPIS`].
+fn handle_irqs(gic: &Gic) {
+    for _ in 0..MAX_CLAIMS_PER_CALL {
+        let Some(irq) = gic.claim() else { break };
+        match irq.checked_sub(FIRST_LPI) {
+            Some(lpi) => LPIS.dispatch(lpi),
+            None => IRQS.dispatch(irq),
+        };
+        gic.complete(irq);
+    }
+}
 static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
 static TIMERS: TimerQueue = TimerQueue::new();
 static RATE: Once<TickRate> = Once::new();
@@ -562,6 +578,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     demos::user::boot_vfs();
     user_demo(ncpus);
     iommu::demo(&fdt);
+    its::demo(&fdt);
 
     println!(
         "[done]  {} timer ticks, {} IPIs, {} free frames; shutting down",
@@ -904,7 +921,9 @@ fn handle_trap(frame: &mut TrapFrame) {
             Trap::Syscall => return syscall(frame),
             Trap::Interrupt(_) => {}
             // A write to a page `fork` shares gets its own copy; retry.
-            Trap::PageFault { addr, access } if osmium::proc::handle_page_fault(addr as u64, access == Access::Write) => {
+            Trap::PageFault { addr, access }
+                if osmium::proc::handle_page_fault(addr as u64, access == Access::Write) =>
+            {
                 return;
             }
             cause => return user_fault(frame, cause),
@@ -929,7 +948,7 @@ fn handle_trap(frame: &mut TrapFrame) {
     }
     match frame.cause() {
         Trap::Interrupt(Interrupt::External) => {
-            IRQS.handle_pending(GIC.get().expect("GIC initialised"));
+            handle_irqs(GIC.get().expect("GIC initialised"));
             // Leaving an interrupt is a preemption point.
             osmium::sched::preempt_if_needed();
         }

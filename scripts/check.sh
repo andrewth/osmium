@@ -341,10 +341,19 @@ EXPECT=("${a64_expect[@]}" '\[gic\]   GICv2 distributor')
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
     -machine virt,gic-version=2 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
 # The same kernel on a GICv3 (distributor, redistributors, system-register
-# CPU interface, affinity-routed SGIs), probed from the device tree.
-EXPECT=("${a64_expect[@]}" '\[gic\]   GICv3 distributor' '\[smp\]   MPIDR 0x[0-9a-f]* online as CPU 3')
+# CPU interface, affinity-routed SGIs), probed from the device tree. An NVMe
+# controller (on a null block device) raises its MSI-X interrupts through
+# the ITS as LPIs: admin completions on one, an INT command on the same
+# one, and I/O completions on a second.
+EXPECT=("${a64_expect[@]}" '\[gic\]   GICv3 distributor' '\[smp\]   MPIDR 0x[0-9a-f]* online as CPU 3'
+    '\[its\]   ITS at 0x[0-9a-f]*; nvme [0-9a-f:.]* is device 0x[0-9a-f]*'
+    '\[its\]   nvme MSI-X entry 0 -> device 0x[0-9a-f]* event 0 -> LPI 8[0-9]* on CPU [0-9]*: [1-9][0-9]* interrupts from admin completions'
+    '\[its\]   INT command for device 0x[0-9a-f]* event 0 raised LPI 8[0-9]*'
+    '\[its\]   nvme completions by LPI 8[0-9]*: 256 KiB read, [1-9][0-9]* interrupts on MSI-X entry 1'
+    '\[its\]   device 0x[0-9a-f]* unmapped; LPIs 8[0-9]* and 8[0-9]* free again')
 boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
-    -machine virt,gic-version=3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi
+    -machine virt,gic-version=3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi \
+    -blockdev driver=null-co,node-name=nv0,read-zeroes=on -device nvme,serial=osmium0,drive=nv0
 # Arm SMMUv3 in front of the PCI bus (virt,iommu=smmuv3), with QEMU's
 # iommu-testdev: stage-2 translation of the test device's DMA, a blocked
 # unmapped address and a blocked detached device; then the same through
