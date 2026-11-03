@@ -1,6 +1,6 @@
 [package]
 name = "uefi"
-description = "A UEFI application that sets a GOP mode and draws on its framebuffer, built from Osmium components"
+description = "A UEFI application that sets a GOP mode and draws on its framebuffer, then reads a file, allocates pages and exits boot services as a loader does, built from Osmium components"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -9,6 +9,8 @@ license = "GPL-2.0-only"
 [dependencies]
 osmium-boot = { path = "../../crates/boot", default-features = false }
 osmium-hal = { path = "../../crates/hal" }
+osmium-mm = { path = "../../crates/mm" }
+osmium-sysdrv = { path = "../../crates/sysdrv" }
 
 [profile.dev]
 panic = "abort"

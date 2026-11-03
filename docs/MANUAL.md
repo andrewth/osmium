@@ -106,7 +106,7 @@ assembly. Copy them from whichever example is closest to your platform:
 | `riscv-virt` | `cargo run --release` | The most complete one. S-mode under OpenSBI, FDT discovery, W^X Sv39, 4 harts via SBI HSM, the shared scheduler demos, guard-page overflow detection, virtio-net with DHCP/ping/TCP, virtio-blk, AHCI, NVMe and iSCSI disks, colour bars on virtio-gpu (MMIO and PCI) and bochs-display, xHCI with USB keyboard, storage (FAT32) and CDC-ECM, EHCI and OHCI with USB storage, user processes with fork/exec/wait, and H-extension guests (`src/hyp.rs`). |
 | `aarch64-virt` | `cargo run --release` | The same kernel at EL1: PL011, GICv2, generic timer, PSCI CPU_ON, user processes with fork/exec. |
 | `x86_64-pc` | `cargo run --release` | PVH boot, ACPI MADT, COM1 over port I/O with IRQ 4 through the I/O APIC, local APIC timer calibrated by the PIT, INIT/SIPI AP bring-up, the shared demos, user processes with fork/exec, a VESA mode set through the BIOS followed by virtio-vga (run with `-vga none -device virtio-vga`), and UHCI and EHCI with USB storage, an EHCI handing full-speed devices to its UHCI companions (see the x86_64-pc command line in `scripts/check.sh`). |
-| `uefi` | see below | A UEFI application for OVMF (x86_64) and AAVMF (AArch64): sets a GOP mode and draws colour bars on the framebuffer, or with Blt where the GOP has no framebuffer. |
+| `uefi` | see below | A UEFI application for OVMF (x86_64) and AAVMF (AArch64): sets a GOP mode and draws colour bars on the framebuffer, or with Blt where the GOP has no framebuffer, then exercises the loader services (configuration tables, a file from the ESP, pages, the memory map, `ExitBootServices`). |
 | `riscv-firmware` | `cargo run --release` | M-mode firmware with no heap and no scheduler: two async tasks on `osmium-exec` await CLINT timer and UART interrupts. |
 | `aarch64-hyp` | `cargo run --release` (add `-smp 2` for the SMP guest), or see below | An EL2 hypervisor: emulated 16550 and GICv2, a virtual timer, PSCI, a 2-vCPU guest. Given the aarch64-virt image and 512 MiB, it boots that kernel as a two-vCPU guest instead. |
 | `x86_64-hyp` | `cargo run --release` | AMD SVM with nested paging (or Intel VMX with EPT, chosen at boot; VMX needs `-accel kvm -cpu host`): port-I/O and MMIO UARTs, an 8259 PIC pair with an 8254 PIT, a local APIC timer and COM1 through the I/O APIC for the 64-bit guest, and a 2-vCPU guest (add `-smp 2`). Given the x86_64-pc image and 512 MiB, it boots that kernel as a two-vCPU PVH guest instead. |
@@ -158,7 +158,8 @@ firmware's default boot file and let OVMF or AAVMF start it:
 
 ```sh
 (cd examples/uefi && cargo build --release)       # add --target aarch64-unknown-uefi for AArch64
-mkdir -p esp/EFI/BOOT && cp examples/uefi/target/x86_64-unknown-uefi/release/uefi.efi esp/EFI/BOOT/BOOTX64.EFI
+mkdir -p esp/EFI/BOOT esp/osmium && cp examples/uefi/target/x86_64-unknown-uefi/release/uefi.efi esp/EFI/BOOT/BOOTX64.EFI
+echo 'hello from the ESP' > esp/osmium/hello.txt     # the file it reads
 qemu-system-x86_64 -machine q35 -bios /usr/share/ovmf/OVMF.fd -m 256M \
   -drive if=none,id=esp,format=raw,file=fat:rw:esp -device virtio-blk-pci,drive=esp
 ```
@@ -168,6 +169,9 @@ On AArch64, name the file `BOOTAA64.EFI` and use `qemu-system-aarch64
 `-drive if=pflash` drives (copy the vars file first, since it is written)
 and `-device virtio-gpu-pci`. That GOP has no framebuffer, only Blt; use
 `-device ramfb` instead if you want a framebuffer.
+
+After `ExitBootServices` the firmware's console is gone, so the last two
+lines come straight from the UART (COM1, or QEMU virt's PL011).
 
 **Devices.** Each example probes for its devices and prints `no ... device`
 for any that are missing. The `cargo run` runner for riscv-virt has virtio-net,
@@ -208,7 +212,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `display` | osmium-display | no | virtio-gpu, Bochs DISPI, VESA BIOS Extensions |
 | `sysdrv` | osmium-sysdrv | no | UARTs, PIT, `fw_cfg`, interrupt controllers (PLIC, CLINT, GICv2, local APIC, I/O APIC) and IOMMUs (VT-d, AMD-Vi, SMMUv3, RISC-V) |
 | `storage` | osmium-storage | no | virtio-blk, AHCI, NVMe and RAM disk (enables `drivers`) |
-| `boot` | osmium-boot | `FdtWriter` only | FDT, Multiboot2, PVH, UEFI (system table, GOP), ACPI, ELF loading |
+| `boot` | osmium-boot | `FdtWriter` only | FDT, Multiboot2, PVH, UEFI (system table, GOP, loader boot services), ACPI, ELF loading |
 | `acpi` | osmium-acpi | yes | FADT, an AML interpreter, `_CRS`, `_PRT`, sleep states, power off, SCI and GPEs (enables `boot`) |
 | `exec` | osmium-exec | no | A heap-free async executor |
 | `sched` | osmium-sched | yes | Tasks, context switch, scheduler, `Mutex`, `WaitQueue`, timers |
@@ -309,7 +313,7 @@ Parse whatever the loader handed you into a `MemoryMap`:
 |---|---|
 | Device tree (OpenSBI, QEMU `virt`, U-Boot) | `osmium::boot::fdt::Fdt::from_ptr(dtb)` |
 | Multiboot2 (GRUB) | `osmium::boot::multiboot2::BootInfo::from_ptr(info)` |
-| UEFI application (OVMF, AAVMF, real firmware) | `osmium::boot::uefi::Uefi::new(system_table)`, then `gop()` for the screen. See `examples/uefi`. |
+| UEFI application (OVMF, AAVMF, real firmware) | `osmium::boot::uefi::Uefi::new(system_table)`, then `gop()` for the screen. A loader reads files with `boot_volume(image)` and `File`, takes pages with `allocate_pages`, finds the RSDP or devicetree with `configuration_table`, and ends with `exit_boot_services_with_map`, whose `MemoryMap` iterates the final map. See `examples/uefi`. |
 | PVH (QEMU/Xen/Firecracker `-kernel`) | `osmium::boot::pvh::StartInfo::from_ptr(start_info)`. Declare the entry with `pvh_start!(kmain, ap: ap_main)`. |
 
 ```rust

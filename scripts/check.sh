@@ -721,7 +721,9 @@ fi
 
 # UEFI application on OVMF (x86_64) and AAVMF (AArch64): GOP sets a mode and
 # the app draws on its framebuffer, or with Blt where virtio-gpu's GOP has
-# none; the screens are checked.
+# none; the screens are checked. Then the loader services: the RSDP from the
+# configuration tables, a file read from the ESP, page allocation, the memory
+# map and ExitBootServices, after which it reports on the serial port.
 uefi() {
     local arch=$1 qemu=$2 boot_efi=$3 width=$4 height=$5
     shift 5
@@ -731,14 +733,21 @@ uefi() {
     local esp log
     esp=$(mktemp -d)
     log=$(mktemp)
-    mkdir -p "$esp/EFI/BOOT"
+    mkdir -p "$esp/EFI/BOOT" "$esp/osmium"
     cp "examples/uefi/target/$arch-unknown-uefi/release/uefi.efi" "$esp/EFI/BOOT/$boot_efi"
+    printf 'hello from the ESP\n' > "$esp/osmium/hello.txt"
     screen "$qemu" "$width" "$height"
     run_qemu "uefi ($arch)" "$log" 120 "$qemu" "$@" -m 256M -nographic -display none -no-reboot \
         -drive if=none,id=esp,format=raw,file="fat:rw:$esp" -device virtio-blk-pci,drive=esp \
         -qmp "unix:$qmp,server=on,wait=off"
     screen_wait "uefi ($arch)"
-    expect "uefi ($arch)" "$log" '\[gop\] .*colour bars drawn' '\[done\]  shutting down'
+    expect "uefi ($arch)" "$log" '\[gop\] .*colour bars drawn' \
+        '\[tables\] [0-9]* configuration tables: ACPI 2.0 RSDP at 0x[0-9a-f]*, signature ok' \
+        '\[file\]  \\osmium\\hello.txt: 19 bytes at 0x[0-9a-f]*: "hello from the ESP"' \
+        '\[pages\] 4 pages below 4 GiB at 0x[0-9a-f]*; freed, claimed again at that address, a second claim refused: ok' \
+        '\[memmap\] [0-9]* descriptors of [0-9]* bytes: [1-9][0-9]* MiB free' \
+        '\[exit\]  boot services exited: final map has [1-9][0-9]* descriptors, [1-9][0-9]* MiB usable' \
+        '\[done\]  shutting down'
     rm -rf "$esp" "$log"
 }
 ovmf=

@@ -3,7 +3,11 @@
 //! [`Elf::new`] validates the header; [`Elf::segments`] yields the
 //! loadable segments with their file bytes, memory size and permissions.
 //! The caller maps memory and copies [`Segment::data`], zero-filling up to
-//! [`Segment::mem_size`].
+//! [`Segment::mem_size`]. A loader that runs before paging, or with the
+//! firmware's identity map, puts each segment at its physical address
+//! instead ([`Segment::paddr`], [`Elf::physical_span`],
+//! [`Elf::physical_entry`]), so a kernel can be linked at a high virtual
+//! address and still be loaded by one.
 //!
 //! Position-independent images (`ET_DYN`) are loaded at a bias the caller
 //! chooses ([`Elf::load_into_at`], [`Elf::segments_at`]); [`Elf::interp`]
@@ -63,6 +67,11 @@ pub struct SegmentFlags {
 pub struct Segment<'src> {
     /// Virtual address of the segment's first byte.
     pub vaddr: u64,
+    /// Physical address of the segment's first byte (`p_paddr`), where a
+    /// loader that places the image in physical memory puts it. Linkers
+    /// set it equal to `vaddr` unless told otherwise (an `AT()` in the
+    /// linker script); it is meaningless in most user programs.
+    pub paddr: u64,
     /// Bytes to copy from the file.
     pub data: &'src [u8],
     /// Size in memory; bytes past `data.len()` are zero (`.bss`).
@@ -170,7 +179,7 @@ impl<'src> Elf<'src> {
             }
             let seg = (|| {
                 let flags = le32(data, ph + 4)?;
-                let (offset, vaddr) = (le64(data, ph + 8)? as usize, le64(data, ph + 16)?);
+                let (offset, vaddr, paddr) = (le64(data, ph + 8)? as usize, le64(data, ph + 16)?, le64(data, ph + 24)?);
                 let (filesz, memsz, align) =
                     (le64(data, ph + 32)? as usize, le64(data, ph + 40)?, le64(data, ph + 48)?);
                 if (filesz as u64) > memsz {
@@ -178,6 +187,7 @@ impl<'src> Elf<'src> {
                 }
                 Some(Segment {
                     vaddr,
+                    paddr,
                     data: data.get(offset..offset.checked_add(filesz)?)?,
                     mem_size: memsz,
                     flags: SegmentFlags { read: flags & 4 != 0, write: flags & 2 != 0, execute: flags & 1 != 0 },
@@ -287,8 +297,9 @@ impl<'src> Elf<'src> {
     }
 
     /// The loadable segments as they appear when the image is loaded with
-    /// `bias` added to every address. A segment whose address would overflow
-    /// is left out; [`Elf::span_at`] reports that.
+    /// `bias` added to every virtual address. A segment whose address would
+    /// overflow is left out; [`Elf::span_at`] reports that. `paddr` is left
+    /// as the file gives it.
     pub fn segments_at(&self, bias: u64) -> impl Iterator<Item = Segment<'src>> + use<'src> {
         self.segments().filter_map(move |s| Some(Segment { vaddr: s.vaddr.checked_add(bias)?, ..s }))
     }
@@ -306,6 +317,31 @@ impl<'src> Elf<'src> {
             hi = hi.max(start.checked_add(s.mem_size)?.checked_next_multiple_of(page)?);
         }
         Some(if lo > hi { 0..0 } else { lo..hi })
+    }
+
+    /// The page-aligned physical addresses the non-empty segments cover
+    /// ([`Segment::paddr`]), like [`Elf::span_at`] with no bias. `None` if
+    /// any address overflows; `0..0` for an image with no memory.
+    pub fn physical_span(&self) -> Option<core::ops::Range<u64>> {
+        let page = PAGE_SIZE as u64;
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        for s in self.segments().filter(|s| s.mem_size != 0) {
+            lo = lo.min(s.paddr & !(page - 1));
+            hi = hi.max(s.paddr.checked_add(s.mem_size)?.checked_next_multiple_of(page)?);
+        }
+        Some(if lo > hi { 0..0 } else { lo..hi })
+    }
+
+    /// The physical address of the entry point: [`Elf::entry`] translated
+    /// through the segment whose virtual range holds it, for a loader that
+    /// jumps there before the image's own page tables are up. `None` if no
+    /// segment holds it.
+    pub fn physical_entry(&self) -> Option<u64> {
+        let entry = self.entry();
+        self.segments().find_map(|s| {
+            let off = entry.checked_sub(s.vaddr).filter(|&off| off < s.mem_size)?;
+            s.paddr.checked_add(off)
+        })
     }
 
     /// The lowest page-aligned virtual address any non-empty segment starts
@@ -449,6 +485,31 @@ mod tests {
         assert_eq!(segs[0].flags, SegmentFlags { read: true, write: false, execute: true });
         assert_eq!((segs[1].vaddr, segs[1].data.len(), segs[1].mem_size), (0x40_2000, 2, 0x102));
         assert!(segs[1].flags.write && !segs[1].flags.execute);
+        assert_eq!((segs[0].paddr, segs[1].paddr), (0, 0));
+    }
+
+    #[test]
+    fn physical_addresses() {
+        let mut f = sample();
+        // Linked at 0x40_1000.. but loaded at 0x10_0000.. (an `AT()`).
+        f[64 + 24..64 + 32].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        f[120 + 24..120 + 32].copy_from_slice(&0x10_1000u64.to_le_bytes());
+        let elf = Elf::new(&f).unwrap();
+        let segs: Vec<_> = elf.segments().collect();
+        assert_eq!((segs[0].vaddr, segs[0].paddr), (0x40_1000, 0x10_0000));
+        assert_eq!((segs[1].vaddr, segs[1].paddr), (0x40_2000, 0x10_1000));
+        assert_eq!(elf.physical_span(), Some(0x10_0000..0x10_2000));
+        assert_eq!(elf.span_at(0), Some(0x40_1000..0x40_3000));
+        assert_eq!(elf.physical_entry(), Some(0x10_0000));
+        // A bias moves the virtual addresses only.
+        let biased: Vec<_> = elf.segments_at(0x1000).collect();
+        assert_eq!((biased[0].vaddr, biased[0].paddr), (0x40_2000, 0x10_0000));
+        // An entry outside every segment has no physical address.
+        f[24..32].copy_from_slice(&0x50_0000u64.to_le_bytes());
+        assert_eq!(Elf::new(&f).unwrap().physical_entry(), None);
+        // A physical range that overflows is reported.
+        f[120 + 24..120 + 32].copy_from_slice(&(u64::MAX - 0x10).to_le_bytes());
+        assert_eq!(Elf::new(&f).unwrap().physical_span(), None);
     }
 
     #[test]

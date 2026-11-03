@@ -11,7 +11,9 @@
 //! - [`pe`]: PE32+ images: parse, map and relocate `.efi` files, and move
 //!   runtime drivers to their virtual addresses.
 //! - [`uefi`]: the UEFI system table, enough to print, set a Graphics Output
-//!   Protocol (GOP) mode and take its framebuffer, and shut down.
+//!   Protocol (GOP) mode and take its framebuffer, and shut down, and the
+//!   boot services a loader needs: pages, files on the boot volume, the
+//!   configuration tables, the memory map and `ExitBootServices`.
 //!
 //! Both can populate an [`osmium_mm::MemoryMap`], the starting point for
 //! the frame allocator.
