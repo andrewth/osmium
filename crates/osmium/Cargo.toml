@@ -14,7 +14,7 @@ workspace = true
 [features]
 default = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "netdev", "boot"]
 ## Everything, including the parts that need `alloc`.
-full = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "netdev", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net", "fs-ext4", "fs-iso9660", "iscsi", "acpi", "rand", "tls", "http", "osmium-hal/alloc"]
+full = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "netdev", "boot", "sched", "virt", "exec", "fs", "proc", "fs-fat", "net", "fs-ext4", "fs-iso9660", "fs-btrfs", "iscsi", "acpi", "rand", "tls", "http", "osmium-hal/alloc"]
 sync = ["dep:osmium-sync"]
 mm = ["sync", "dep:osmium-mm"]
 hal = ["sync", "mm", "dep:osmium-hal"]
@@ -48,6 +48,8 @@ net = ["hal", "dep:osmium-net"]
 fs-ext4 = ["fs", "hal", "sync", "dep:osmium-fs-ext4"]
 ## Read-only ISO 9660 with Rock Ridge and Joliet on any block device (needs `alloc`).
 fs-iso9660 = ["fs", "hal", "sync", "dep:osmium-fs-iso9660"]
+## Read-only btrfs with subvolumes, checksums and zlib, LZO and zstd compression on any block device (needs `alloc`).
+fs-btrfs = ["fs", "hal", "sync", "dep:osmium-fs-btrfs"]
 ## iSCSI initiator: a remote SCSI disk over TCP as a block device (needs `alloc`).
 iscsi = ["net", "dep:osmium-iscsi"]
 ## ACPI: FADT, an AML interpreter, devices, resources, PCI routing and power management (needs `alloc`).
@@ -92,4 +94,5 @@ osmium-http = { workspace = true, optional = true }
 osmium-net = { workspace = true, optional = true }
 osmium-fs-ext4 = { workspace = true, optional = true }
 osmium-fs-iso9660 = { workspace = true, optional = true }
+osmium-fs-btrfs = { workspace = true, optional = true }
 osmium-iscsi = { workspace = true, optional = true }

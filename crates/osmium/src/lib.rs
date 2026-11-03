@@ -24,6 +24,7 @@
 //! | `fs_fat` | `osmium-fs-fat` | FAT32 with long names on any block device |
 //! | `fs_ext4` | `osmium-fs-ext4` | ext2, ext3 and ext4, read and write, on any block device |
 //! | `fs_iso9660` | `osmium-fs-iso9660` | read-only ISO 9660 with Rock Ridge and Joliet on any block device |
+//! | `fs_btrfs` | `osmium-fs-btrfs` | read-only btrfs: subvolumes, checksums, zlib, LZO and zstd, on any block device |
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
 //! | `net` | `osmium-net` | IPv4 stack: ARP, ICMP echo, UDP, TCP, DHCP client |
 //! | `iscsi` | `osmium-iscsi` | iSCSI initiator: a remote SCSI disk over TCP as a block device |
@@ -73,6 +74,8 @@ pub use osmium_net as net;
 pub use osmium_fs_ext4 as fs_ext4;
 #[cfg(feature = "fs-iso9660")]
 pub use osmium_fs_iso9660 as fs_iso9660;
+#[cfg(feature = "fs-btrfs")]
+pub use osmium_fs_btrfs as fs_btrfs;
 #[cfg(feature = "iscsi")]
 pub use osmium_iscsi as iscsi;
 #[cfg(feature = "hal")]

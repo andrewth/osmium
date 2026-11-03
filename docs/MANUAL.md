@@ -220,6 +220,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `fs` | osmium-fs | yes | VFS, RamFs, `/dev`, cpio, ext2/ext3/ext4 |
 | `fs-fat` | osmium-fs-fat | yes | FAT12/16/32 (enables `fs`) |
 | `fs-iso9660` | osmium-fs-iso9660 | yes | Read-only ISO 9660 with Rock Ridge and Joliet (enables `fs`) |
+| `fs-btrfs` | osmium-fs-btrfs | yes | Read-only btrfs with subvolumes, checksums and compression (enables `fs`) |
 | `proc` | osmium-proc | yes | Processes and the system-call dispatcher (enables `sched`, `fs`, `mm`, `boot`) |
 | `net` | osmium-net | yes | IPv4, IPv6, ARP, ICMP, UDP, TCP, DHCP |
 | `iscsi` | osmium-iscsi | yes | iSCSI initiator: a remote disk over TCP as a `BlockDevice` (enables `net`) |
@@ -712,6 +713,10 @@ vfs.mount("/usb", fat.root())?;
 let iso = osmium::fs_iso9660::IsoFs::mount(cdrom, 5)?;
 println!("disc {:?}, names from {:?}", iso.volume_id(), iso.names());
 vfs.mount("/cdrom", iso.root())?;
+
+let btrfs = osmium::fs_btrfs::BtrfsFs::mount(ssd, 6)?;            // the default subvolume
+let home = osmium::fs_btrfs::BtrfsFs::mount_subvol(ssd2, 7, 257)?; // or one by id (5 is the top level)
+vfs.mount("/data", btrfs.root())?;
 ```
 
 | | ext2/3/4 (`osmium::fs::Ext2`) | FAT12/16/32 (`osmium::fs_fat::FatFs`) | ISO 9660 (`osmium::fs_iso9660::IsoFs`) |
@@ -731,6 +736,24 @@ in place, so call `sync()` before removing the device. A corrupt layout
 (including a bad superblock or group-descriptor checksum) fails the mount
 with `EINVAL`. Corrupt metadata found later (a bad checksum, a
 damaged inode or directory record) returns `EIO` for that access.
+
+The btrfs driver (`osmium::fs_btrfs::BtrfsFs`) is read-only. `label()`,
+`fsid()` and `subvol()` describe what was mounted. It checks every tree
+block and data sector against its checksum (CRC32C or xxHash64; SHA-256 and
+BLAKE2b volumes fail the mount with `EINVAL`), and reads a block or sector
+that fails from its other copy where the profile keeps one on the device
+(DUP, RAID1, RAID1C3 and RAID1C4). A sector that has no good copy, or is
+missing its checksum, returns `EIO`, so the driver never returns bad data.
+Files marked `nodatasum` are not checked. Extents compressed with zlib, LZO
+or zstd are decompressed by decoders in the crate. Other subvolumes and
+snapshots appear as directories. Their inode numbers are mixed with the
+subvolume id so that they do not collide with the mounted subvolume's
+numbers. Linux gives each subvolume its own `st_dev` instead. It reads only
+the device it is given, so striped chunks (RAID0, RAID10, RAID5, RAID6) of a
+multi-device volume return `EIO`. It does not replay the fsync log, so data
+fsynced after the last commit is not visible, as with Linux's `nologreplay`.
+Volumes with `extent-tree-v2` or the RAID stripe tree fail the mount.
+Owners are not reported because `Stat` has no field for them.
 
 To unpack an initramfs, use `osmium::fs::cpio::unpack(vfs, "/", archive)`,
 which reads the newc format.
