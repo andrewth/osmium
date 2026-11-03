@@ -15,6 +15,11 @@ workspace = true
 riscv64-hs = ["osmium-arch/riscv64-hs"]
 ## The AArch64 EL2 vCPU's world switch (aarch64 targets, host at EL2).
 aarch64-el2 = ["osmium-arch/aarch64-el2"]
+## The AArch64 vCPU's world switch for a VHE host (aarch64 targets, host at
+## EL2 with `HCR_EL2.E2H` set). Enables the matching guest-exit hook in
+## `osmium-arch`. Mutually exclusive with `aarch64-el2`, which takes
+## precedence if both are enabled.
+aarch64-vhe = ["osmium-arch/aarch64-vhe"]
 
 [dependencies]
 osmium-arch.workspace = true

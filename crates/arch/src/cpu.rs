@@ -67,30 +67,32 @@ mod imp {
     pub fn current_id() -> usize {
         let id: usize;
         // SAFETY: reads the software thread-id register.
-        #[cfg(not(feature = "aarch64-el2"))]
+        #[cfg(not(any(feature = "aarch64-el2", feature = "aarch64-vhe")))]
         unsafe {
             asm!("mrs {}, tpidr_el1", out(reg) id, options(nomem, nostack, preserves_flags))
         };
         // SAFETY: as above, at EL2.
-        #[cfg(feature = "aarch64-el2")]
+        #[cfg(any(feature = "aarch64-el2", feature = "aarch64-vhe"))]
         unsafe {
             asm!("mrs {}, tpidr_el2", out(reg) id, options(nomem, nostack, preserves_flags))
         };
         id
     }
 
-    /// Records `id` as this CPU's id in `TPIDR_EL1` (`TPIDR_EL2` with `aarch64-el2`).
+    /// Records `id` as this CPU's id in `TPIDR_EL1` (`TPIDR_EL2` with
+    /// `aarch64-el2` or `aarch64-vhe`: VHE does not redirect `TPIDR_EL1`, so a
+    /// guest's value there must not be where the host keeps its CPU id).
     ///
     /// # Safety
     /// Ids must be unique across CPUs and below [`crate::MAX_CPUS`].
     pub unsafe fn set_current_id(id: usize) {
         // SAFETY: the caller upholds the contract.
-        #[cfg(not(feature = "aarch64-el2"))]
+        #[cfg(not(any(feature = "aarch64-el2", feature = "aarch64-vhe")))]
         unsafe {
             asm!("msr tpidr_el1, {}", in(reg) id, options(nomem, nostack, preserves_flags))
         };
         // SAFETY: the caller upholds the contract.
-        #[cfg(feature = "aarch64-el2")]
+        #[cfg(any(feature = "aarch64-el2", feature = "aarch64-vhe"))]
         unsafe {
             asm!("msr tpidr_el2, {}", in(reg) id, options(nomem, nostack, preserves_flags))
         };

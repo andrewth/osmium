@@ -1,0 +1,16 @@
+[package]
+name = "aarch64-vhe"
+description = "A VHE hypervisor for QEMU's AArch64 virt machine at EL2 (E2H and TGE), assembled from Osmium components"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-2.0-only"
+
+[dependencies]
+osmium = { path = "../../crates/osmium", features = ["virt", "sysdrv", "aarch64-vhe"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

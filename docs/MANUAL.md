@@ -95,7 +95,7 @@ assembly. Copy them from whichever example is closest to your platform:
 | riscv-virt | `riscv64imac-unknown-none-elf` | `0x8020_0000` (OpenSBI payload) |
 | riscv-hyp | `riscv64imac-unknown-none-elf` | `0x8020_0000` (OpenSBI payload; guest image at `0x9800_0000`) |
 | riscv-firmware | `riscv64imac-unknown-none-elf` | `0x8000_0000` (`-bios none`) |
-| aarch64-virt, aarch64-hyp | `aarch64-unknown-none-softfloat` | `0x4020_0000` (aarch64-hyp's guest image at `0x5800_0000`) |
+| aarch64-virt, aarch64-hyp, aarch64-vhe | `aarch64-unknown-none-softfloat` | `0x4020_0000` (aarch64-hyp's guest image at `0x5800_0000`) |
 | uefi | `x86_64-unknown-uefi` (default) or `aarch64-unknown-uefi` | a PE image the firmware loads from `EFI/BOOT/` |
 | x86_64-pc, x86_64-hyp | `x86_64-unknown-none` with `-C relocation-model=static` | `0x20_0000` (PVH, keeps `.note.Xen`; x86_64-hyp's guest image at `0x1800_0000`) |
 
@@ -109,6 +109,7 @@ assembly. Copy them from whichever example is closest to your platform:
 | `uefi` | see below | A UEFI application for OVMF (x86_64) and AAVMF (AArch64): sets a GOP mode and draws colour bars on the framebuffer, or with Blt where the GOP has no framebuffer, then exercises the loader services (configuration tables, a file from the ESP, pages, the memory map, `ExitBootServices`). |
 | `riscv-firmware` | `cargo run --release` | M-mode firmware with no heap and no scheduler: two async tasks on `osmium-exec` await CLINT timer and UART interrupts. |
 | `aarch64-hyp` | `cargo run --release` (add `-smp 2` for the SMP guest), or see below | An EL2 hypervisor: emulated 16550 and GICv2, a virtual timer, PSCI, a 2-vCPU guest. Given the aarch64-virt image and 512 MiB, it boots that kernel as a two-vCPU guest instead. |
+| `aarch64-vhe` | `cargo run --release` | A VHE hypervisor (`-cpu max` or `neoverse-n1`; `cortex-a72` has no VHE): sets `HCR_EL2.E2H` and `TGE`, runs as an EL1 kernel at EL2, runs a guest that prints over an emulated 16550, halts and powers off with PSCI, then runs a user program at EL0. |
 | `x86_64-hyp` | `cargo run --release` | AMD SVM with nested paging (or Intel VMX with EPT, chosen at boot; VMX needs `-accel kvm -cpu host`): port-I/O and MMIO UARTs, an 8259 PIC pair with an 8254 PIT, a local APIC timer and COM1 through the I/O APIC for the 64-bit guest, and a 2-vCPU guest (add `-smp 2`). Given the x86_64-pc image and 512 MiB, it boots that kernel as a two-vCPU PVH guest instead. |
 | `riscv-hyp` | see below | A RISC-V hypervisor that boots the riscv-virt kernel itself as a guest: generated device tree, emulated 16550 and PLIC, SBI, virtio-blk and a virtio-net card bridged to the host NIC, one vCPU per host hart (up to 4). Guest lines start with `\| `. |
 
@@ -227,13 +228,14 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 `default` is `sync`, `mm`, `hal`, `drivers`, `sysdrv`, `storage`, `display`, `usb`, `netdev` and `boot`. `full` turns on all
 of the above.
 
-Three features choose the privilege level the arch code runs at:
+Four features choose the privilege level the arch code runs at:
 
 | Feature | Effect |
 |---|---|
 | `riscv-m-mode` | Use M-mode CSRs (`mstatus`, `mtvec`, …) for firmware. |
 | `riscv64-hs` | The RISC-V trap entry recognises guest exits and enables the H-extension vCPU. Only on CPUs with the H extension. |
-| `aarch64-el2` | Use EL2 registers and enable the EL2 vCPU. |
+| `aarch64-el2` | Use EL2 registers and enable the EL2 vCPU (non-VHE host). |
+| `aarch64-vhe` | VHE host at EL2 (`HCR_EL2.E2H` set): keep the EL1 registers and vectors, which VHE redirects, but put the CPU id in `TPIDR_EL2`, send guest exits from the lower-EL vectors to the vCPU, and enable the vCPU's VHE world switch. Not with `aarch64-el2`, which wins if both are on. |
 
 As an example, here is how riscv-firmware selects a heap-free subset:
 
@@ -933,7 +935,7 @@ let exit = run_vcpu(&mut vcpu, &mmio_bus, &pio_bus, |v, exit| match exit {
 | Backend | Feature | Host mode | Guest interrupt controller |
 |---|---|---|---|
 | `riscv::RiscvVcpu` | `riscv64-hs` | HS-mode | `VirtualPlic` |
-| `aarch64::Aarch64Vcpu` | `aarch64-el2` | EL2 (non-VHE) | `VirtualGicV2` |
+| `aarch64::Aarch64Vcpu` | `aarch64-el2` or `aarch64-vhe` | EL2, non-VHE or VHE | `VirtualGicV2` |
 | `x86::svm::SvmVcpu` | none | long mode + AMD SVM | `VirtualPic`, or a `VirtualLapic` per vCPU plus `VirtualIoApic` |
 
 Device models are an emulated 16550, an 8254 PIT, and virtio-mmio console,
@@ -1032,7 +1034,10 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
   AArch64.
 - Lazy switching assumes that nothing outside the scheduler loads FP/SIMD
   registers, so a hypervisor's guest FP switching (`osmium-virt`) is not safe
-  alongside lazily switched host tasks that use FP.
+  alongside lazily switched host tasks that use FP. The exception is the VHE
+  vCPU (`aarch64-vhe`), which saves and restores the host's FP/SIMD registers
+  around the guest when they are live (SVE state above the `q` registers is
+  not kept).
 - The heap can return large blocks to the frame allocator only if the
   mapper implements `virt_to_phys` (`OffsetMapper` does).
 - The Intel VMX backend has only run under nested KVM, and x86 MMIO emulation does not

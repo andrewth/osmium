@@ -2,8 +2,13 @@ use core::sync::atomic::Ordering;
 
 use super::{Access, Interrupt, Trap, TrapCpu};
 
-#[cfg(all(bare, not(feature = "aarch64-el2")))]
-core::arch::global_asm!(include_str!("aarch64_el1.S"));
+// The EL1 vectors, also used by a VHE host at EL2 (VHE redirects their
+// `_el1` register names to EL2). OSMIUM_VHE selects `TPIDR_EL2` for the CPU
+// id and the guest-exit hook in the lower-EL vectors.
+#[cfg(all(bare, not(feature = "aarch64-el2"), not(feature = "aarch64-vhe")))]
+core::arch::global_asm!(".set OSMIUM_VHE, 0", include_str!("aarch64_el1.S"));
+#[cfg(all(bare, not(feature = "aarch64-el2"), feature = "aarch64-vhe"))]
+core::arch::global_asm!(".set OSMIUM_VHE, 1", include_str!("aarch64_el1.S"));
 #[cfg(all(bare, feature = "aarch64-el2"))]
 core::arch::global_asm!(include_str!("aarch64_el2.S"));
 
@@ -76,7 +81,9 @@ impl TrapFrame {
     }
 
     /// Returns true if the exception came from user mode (EL0). For EL1
-    /// kernels; in `aarch64-el2` builds lower-EL exceptions are guest exits.
+    /// kernels and VHE hosts (`aarch64-vhe`, whose guest exits never reach
+    /// the trap handler); in `aarch64-el2` builds lower-EL exceptions are
+    /// guest exits.
     #[cfg(not(feature = "aarch64-el2"))]
     pub fn from_user(&self) -> bool {
         self.vector().from_lower_el()
@@ -154,7 +161,8 @@ impl TrapCpu {
 }
 
 /// Points this CPU's vector base (`VBAR_EL1`, or `VBAR_EL2` with
-/// `aarch64-el2`) at the Osmium vector table. Call on every CPU.
+/// `aarch64-el2` or `aarch64-vhe`) at the Osmium vector table. Call on every
+/// CPU.
 ///
 /// Call after `osmium_arch::cpu::set_current_id`: current-EL vectors find
 /// this CPU's [`TrapCpu`] through it, and use `TPIDRRO_EL0` and `SP_EL0` as
@@ -172,12 +180,12 @@ pub unsafe fn install() {
         }
         let base = osmium_trap_vectors as *const () as usize;
         // SAFETY: the table is 2 KiB aligned.
-        #[cfg(not(feature = "aarch64-el2"))]
+        #[cfg(not(any(feature = "aarch64-el2", feature = "aarch64-vhe")))]
         unsafe {
             core::arch::asm!("msr vbar_el1, {}", "isb", in(reg) base)
         };
         // SAFETY: as above.
-        #[cfg(feature = "aarch64-el2")]
+        #[cfg(any(feature = "aarch64-el2", feature = "aarch64-vhe"))]
         unsafe {
             core::arch::asm!("msr vbar_el2, {}", "isb", in(reg) base)
         };

@@ -1,4 +1,5 @@
-//! The world switch and EL2 controls (aarch64 with `aarch64-el2`).
+//! The world switch and EL2 controls (aarch64 with `aarch64-el2` or
+//! `aarch64-vhe`).
 //!
 //! `osmium_el2_run` saves the host's callee-saved registers and sp in
 //! [`GuestState`], points `TrapCpu::guest` at it, loads the guest's
@@ -9,6 +10,18 @@
 //! registers and syndrome, clears `TrapCpu::guest` and returns from
 //! `osmium_el2_run`. The EL1 system registers are switched in Rust around
 //! the call, with interrupts masked.
+//!
+//! # VHE hosts (`aarch64-vhe`)
+//!
+//! The assembly is the same for a host that runs at EL2 with
+//! `HCR_EL2.E2H` = 1: its hook is in the EL1 build's lower-EL vectors
+//! (`osmium-arch` with `aarch64-vhe`), which a VHE host shares with its own
+//! user-mode traps. What differs is around it. The guest's EL1 registers are
+//! reached through their `_EL12` and `_EL02` names, since the `_EL1` names
+//! are the host's own EL2 registers. `HCR_EL2` keeps `E2H` and drops `TGE`
+//! for the guest, and the host's `HCR_EL2`, `CPTR_EL2` and `MDCR_EL2`, and
+//! its FP/SIMD registers if they were in use, `TPIDR_EL0`, `PAR_EL1` and
+//! `CSSELR_EL1` (which VHE does not redirect), are put back on exit.
 
 use core::arch::{asm, global_asm};
 use core::mem::offset_of;
@@ -122,7 +135,7 @@ unsafe extern "C" {
 }
 
 macro_rules! mrs {
-    ($r:literal) => {{
+    ($r:expr) => {{
         let v: u64;
         // SAFETY: reading a system register at EL2 has no side effects.
         unsafe { asm!(concat!("mrs {}, ", $r), out(reg) v, options(nomem, nostack, preserves_flags)) };
@@ -131,9 +144,90 @@ macro_rules! mrs {
 }
 
 macro_rules! msr {
-    ($r:literal, $v:expr) => {
+    ($r:expr, $v:expr) => {
         // SAFETY: the hypervisor owns the EL1 context and the EL2 controls.
         unsafe { asm!(concat!("msr ", $r, ", {}"), in(reg) $v, options(nomem, nostack, preserves_flags)) }
+    };
+}
+
+/// The name of the guest's EL1 register `$r`: `<r>_el1` without VHE, where
+/// the host does not use EL1, and `<r>_el12` with it, where `<r>_el1` is the
+/// host's own (redirected to EL2). The `_el12` names are spelled by
+/// encoding (`op1` 5 in place of the EL1 register's 0), since the
+/// assembler accepts them only with the `vh` target feature.
+#[cfg(not(aarch64_vhe))]
+macro_rules! el1 {
+    ($r:literal) => {
+        concat!($r, "_el1")
+    };
+}
+#[cfg(aarch64_vhe)]
+macro_rules! el1 {
+    ("sctlr") => {
+        "S3_5_C1_C0_0"
+    };
+    ("cpacr") => {
+        "S3_5_C1_C0_2"
+    };
+    ("ttbr0") => {
+        "S3_5_C2_C0_0"
+    };
+    ("ttbr1") => {
+        "S3_5_C2_C0_1"
+    };
+    ("tcr") => {
+        "S3_5_C2_C0_2"
+    };
+    ("spsr") => {
+        "S3_5_C4_C0_0"
+    };
+    ("elr") => {
+        "S3_5_C4_C0_1"
+    };
+    ("afsr0") => {
+        "S3_5_C5_C1_0"
+    };
+    ("afsr1") => {
+        "S3_5_C5_C1_1"
+    };
+    ("esr") => {
+        "S3_5_C5_C2_0"
+    };
+    ("far") => {
+        "S3_5_C6_C0_0"
+    };
+    ("mair") => {
+        "S3_5_C10_C2_0"
+    };
+    ("amair") => {
+        "S3_5_C10_C3_0"
+    };
+    ("vbar") => {
+        "S3_5_C12_C0_0"
+    };
+    ("contextidr") => {
+        "S3_5_C13_C0_1"
+    };
+    ("cntkctl") => {
+        "S3_5_C14_C1_0"
+    };
+}
+
+/// The guest's virtual timer register `$r`: `<r>_el0`, or `<r>_el02` with
+/// VHE (by encoding, as for `el1!`).
+#[cfg(not(aarch64_vhe))]
+macro_rules! el0 {
+    ($r:literal) => {
+        concat!($r, "_el0")
+    };
+}
+#[cfg(aarch64_vhe)]
+macro_rules! el0 {
+    ("cntv_ctl") => {
+        "S3_5_C14_C3_1"
+    };
+    ("cntv_cval") => {
+        "S3_5_C14_C3_2"
     };
 }
 
@@ -243,6 +337,15 @@ pub const HCR_GUEST: u64 =
     1 << 0 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 9 | 1 << 13 | 1 << 19 | 1 << 20 | 1 << 21 | 1 << 31;
 /// `HCR_EL2.VI`: a virtual IRQ is pending for the guest.
 pub const HCR_VI: u64 = 1 << 7;
+/// `HCR_EL2.TGE`: a VHE host's own EL0 traps to EL2. Set while a VHE host
+/// runs, clear while its guest does.
+pub const HCR_TGE: u64 = 1 << 27;
+/// `HCR_EL2.E2H`: the host is VHE. Set throughout on a VHE host, while its
+/// guests run too.
+pub const HCR_E2H: u64 = 1 << 34;
+/// `HCR_EL2` while a guest of this build runs ([`HCR_GUEST`], plus
+/// [`HCR_E2H`] with `aarch64-vhe`).
+const HCR_RUN: u64 = HCR_GUEST | if cfg!(aarch64_vhe) { HCR_E2H } else { 0 };
 
 /// `VTCR_EL2` for [`Stage2Table`](crate::stage2::Stage2Table): 48-bit IPA
 /// (T0SZ 16) starting at level 0, 4 KiB granule, write-back cacheable,
@@ -253,6 +356,7 @@ pub const VTCR_48: u64 = 16 | 2 << 6 | 1 << 8 | 1 << 10 | 3 << 12 | 5 << 16 | 1 
 /// physical counter and timer, and a zero virtual-counter offset. Running a
 /// vCPU does this itself on a CPU that has not been prepared, so calling it
 /// is optional.
+#[cfg(not(aarch64_vhe))]
 pub fn init_cpu() {
     msr!("vtcr_el2", VTCR_48);
     // Guests read the host's MIDR_EL1 as their own.
@@ -274,32 +378,121 @@ pub fn init_cpu() {
     unsafe { asm!("isb", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Prepares this CPU to run guests: stage-2 geometry, the guest's
+/// `MIDR_EL1`, and a zero virtual-counter offset. Running a vCPU does this
+/// itself on a CPU that has not been prepared, so calling it is optional.
+/// The host's `HCR_EL2` must already have `E2H` set.
+///
+/// The controls a VHE host shares with its guests (`CPTR_EL2`, `MDCR_EL2`
+/// and the EL1 bits of `CNTHCTL_EL2`, which the host's `CPACR_EL1` and
+/// `CNTKCTL_EL1` writes reach) are set on every entry instead.
+#[cfg(aarch64_vhe)]
+pub fn init_cpu() {
+    msr!("vtcr_el2", VTCR_48);
+    let midr = mrs!("midr_el1");
+    msr!("vpidr_el2", midr);
+    msr!("cntvoff_el2", 0u64);
+    // SAFETY: only orders the writes above.
+    unsafe { asm!("isb", options(nomem, nostack, preserves_flags)) };
+}
+
+/// The host's EL2 controls that a VHE guest run changes, put back on exit.
+#[cfg(aarch64_vhe)]
+struct HostControls {
+    hcr: u64,
+    cptr: u64,
+    mdcr: u64,
+    tpidr_el0: u64,
+    par: u64,
+    csselr: u64,
+    /// The host's FP/SIMD registers, if `CPTR_EL2.FPEN` let it use them.
+    fp: Option<FpState>,
+}
+
+/// `CPTR_EL2` (E2H layout) `FPEN`, `ZEN` and `SMEN` fields.
+#[cfg(aarch64_vhe)]
+const CPTR_FPEN: u64 = 3 << 20;
+#[cfg(aarch64_vhe)]
+const CPTR_ZEN: u64 = 3 << 16;
+#[cfg(aarch64_vhe)]
+const CPTR_SMEN: u64 = 3 << 24;
+
+/// Saves the host's controls and sets the guest's: FP/SIMD untrapped so
+/// the guest can use it and the switch can move it (SVE and SME trap), the
+/// PMU and debug registers trapped as in [`init_cpu`] without VHE, and EL1
+/// access to the physical counter but not to the physical timer (the
+/// host's).
+#[cfg(aarch64_vhe)]
+fn enter_vhe() -> HostControls {
+    let cptr = mrs!("cptr_el2");
+    let mut host = HostControls {
+        hcr: mrs!("hcr_el2"),
+        cptr,
+        mdcr: mrs!("mdcr_el2"),
+        tpidr_el0: mrs!("tpidr_el0"),
+        par: mrs!("par_el1"),
+        csselr: mrs!("csselr_el1"),
+        fp: None,
+    };
+    msr!("cptr_el2", (cptr & !(CPTR_ZEN | CPTR_SMEN)) | CPTR_FPEN);
+    // SAFETY: FP/SIMD is on before the host's registers are read below.
+    unsafe { asm!("isb", options(nomem, nostack, preserves_flags)) };
+    if cptr & CPTR_FPEN == CPTR_FPEN {
+        let mut fp = FpState::default();
+        save_fp(&mut fp);
+        host.fp = Some(fp);
+    }
+    let counters = (mrs!("pmcr_el0") >> 11) & 0x1f;
+    msr!("mdcr_el2", counters | 1 << 5 | 1 << 6 | 1 << 9 | 1 << 10 | 1 << 11);
+    // CNTHCTL_EL2 with E2H: EL1PCTEN is bit 10, EL1PTEN bit 11. The EL0
+    // bits are the host's (its CNTKCTL_EL1).
+    let cnthctl = mrs!("cnthctl_el2");
+    msr!("cnthctl_el2", (cnthctl | 1 << 10) & !(1 << 11));
+    host
+}
+
+/// Puts back what [`enter_vhe`] saved, `HCR_EL2.TGE` included.
+#[cfg(aarch64_vhe)]
+fn exit_vhe(host: &HostControls) {
+    msr!("tpidr_el0", host.tpidr_el0);
+    msr!("par_el1", host.par);
+    msr!("csselr_el1", host.csselr);
+    if let Some(fp) = &host.fp {
+        load_fp(fp);
+    }
+    msr!("mdcr_el2", host.mdcr);
+    msr!("cptr_el2", host.cptr);
+    msr!("hcr_el2", host.hcr);
+    // SAFETY: the host's regime is back before its own code relies on it.
+    unsafe { asm!("isb", options(nomem, nostack, preserves_flags)) };
+}
+
 fn load_el1(r: &El1Regs) {
-    msr!("sctlr_el1", r.sctlr);
-    msr!("ttbr0_el1", r.ttbr0);
-    msr!("ttbr1_el1", r.ttbr1);
-    msr!("tcr_el1", r.tcr);
-    msr!("mair_el1", r.mair);
-    msr!("amair_el1", r.amair);
-    msr!("afsr0_el1", r.afsr0);
-    msr!("afsr1_el1", r.afsr1);
+    msr!(el1!("sctlr"), r.sctlr);
+    msr!(el1!("ttbr0"), r.ttbr0);
+    msr!(el1!("ttbr1"), r.ttbr1);
+    msr!(el1!("tcr"), r.tcr);
+    msr!(el1!("mair"), r.mair);
+    msr!(el1!("amair"), r.amair);
+    msr!(el1!("afsr0"), r.afsr0);
+    msr!(el1!("afsr1"), r.afsr1);
     msr!("csselr_el1", r.csselr);
-    msr!("vbar_el1", r.vbar);
-    msr!("contextidr_el1", r.contextidr);
-    msr!("esr_el1", r.esr);
-    msr!("far_el1", r.far);
+    msr!(el1!("vbar"), r.vbar);
+    msr!(el1!("contextidr"), r.contextidr);
+    msr!(el1!("esr"), r.esr);
+    msr!(el1!("far"), r.far);
     msr!("par_el1", r.par);
     msr!("sp_el1", r.sp_el1);
-    msr!("elr_el1", r.elr);
-    msr!("spsr_el1", r.spsr);
+    msr!(el1!("elr"), r.elr);
+    msr!(el1!("spsr"), r.spsr);
     msr!("sp_el0", r.sp_el0);
     msr!("tpidr_el0", r.tpidr_el0);
     msr!("tpidrro_el0", r.tpidrro_el0);
     msr!("tpidr_el1", r.tpidr_el1);
-    msr!("cpacr_el1", r.cpacr);
-    msr!("cntkctl_el1", r.cntkctl);
-    msr!("cntv_cval_el0", r.cntv_cval);
-    msr!("cntv_ctl_el0", r.cntv_ctl);
+    msr!(el1!("cpacr"), r.cpacr);
+    msr!(el1!("cntkctl"), r.cntkctl);
+    msr!(el0!("cntv_cval"), r.cntv_cval);
+    msr!(el0!("cntv_ctl"), r.cntv_ctl);
 }
 
 fn save_el1(r: &mut El1Regs) {
@@ -307,29 +500,29 @@ fn save_el1(r: &mut El1Regs) {
     // as scratch (interrupts are still masked here).
     r.sp_el0 = mrs!("sp_el0");
     r.tpidrro_el0 = mrs!("tpidrro_el0");
-    r.sctlr = mrs!("sctlr_el1");
-    r.ttbr0 = mrs!("ttbr0_el1");
-    r.ttbr1 = mrs!("ttbr1_el1");
-    r.tcr = mrs!("tcr_el1");
-    r.mair = mrs!("mair_el1");
-    r.amair = mrs!("amair_el1");
-    r.afsr0 = mrs!("afsr0_el1");
-    r.afsr1 = mrs!("afsr1_el1");
+    r.sctlr = mrs!(el1!("sctlr"));
+    r.ttbr0 = mrs!(el1!("ttbr0"));
+    r.ttbr1 = mrs!(el1!("ttbr1"));
+    r.tcr = mrs!(el1!("tcr"));
+    r.mair = mrs!(el1!("mair"));
+    r.amair = mrs!(el1!("amair"));
+    r.afsr0 = mrs!(el1!("afsr0"));
+    r.afsr1 = mrs!(el1!("afsr1"));
     r.csselr = mrs!("csselr_el1");
-    r.vbar = mrs!("vbar_el1");
-    r.contextidr = mrs!("contextidr_el1");
-    r.esr = mrs!("esr_el1");
-    r.far = mrs!("far_el1");
+    r.vbar = mrs!(el1!("vbar"));
+    r.contextidr = mrs!(el1!("contextidr"));
+    r.esr = mrs!(el1!("esr"));
+    r.far = mrs!(el1!("far"));
     r.par = mrs!("par_el1");
     r.sp_el1 = mrs!("sp_el1");
-    r.elr = mrs!("elr_el1");
-    r.spsr = mrs!("spsr_el1");
+    r.elr = mrs!(el1!("elr"));
+    r.spsr = mrs!(el1!("spsr"));
     r.tpidr_el0 = mrs!("tpidr_el0");
     r.tpidr_el1 = mrs!("tpidr_el1");
-    r.cpacr = mrs!("cpacr_el1");
-    r.cntkctl = mrs!("cntkctl_el1");
-    r.cntv_cval = mrs!("cntv_cval_el0");
-    r.cntv_ctl = mrs!("cntv_ctl_el0");
+    r.cpacr = mrs!(el1!("cpacr"));
+    r.cntkctl = mrs!(el1!("cntkctl"));
+    r.cntv_cval = mrs!(el0!("cntv_cval"));
+    r.cntv_ctl = mrs!(el0!("cntv_ctl"));
 }
 
 fn load_fp(fp: &FpState) {
@@ -389,10 +582,16 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     if mrs!("vtcr_el2") != VTCR_48 {
         init_cpu();
     }
+    #[cfg(aarch64_vhe)]
+    let host = enter_vhe();
     // A GICv3 guest's interrupts come from the list registers instead.
     let vi = v.vgic.is_none() && v.irq.load(core::sync::atomic::Ordering::Acquire);
-    let hcr = HCR_GUEST | if vi { HCR_VI } else { 0 };
+    let hcr = HCR_RUN | if vi { HCR_VI } else { 0 };
     msr!("hcr_el2", hcr);
+    // SAFETY: only orders the write above: the TLB maintenance below must
+    // see the guest's HCR_EL2 (on a VHE host, TGE clear: the `E1`
+    // operations then mean the EL1&0 regime rather than the host's EL2&0).
+    unsafe { asm!("isb", options(nomem, nostack, preserves_flags)) };
     // Always written: a vCPU without its own value must not see the one
     // the previous guest on this CPU left behind.
     let vmpidr = v.vmpidr.unwrap_or_else(|| mrs!("mpidr_el1"));
@@ -434,9 +633,13 @@ pub(super) fn run(v: &mut Aarch64Vcpu) {
     }
     // The guest's timer must not fire while the host runs; its level is
     // recomputed in software before the next entry.
-    msr!("cntv_ctl_el0", 0u64);
+    msr!(el0!("cntv_ctl"), 0u64);
     // Back to the host's stage-1 only: no stage 2, nothing routed.
+    #[cfg(not(aarch64_vhe))]
     msr!("hcr_el2", 1u64 << 31);
+    // Back to the VHE host's controls, with TGE set again.
+    #[cfg(aarch64_vhe)]
+    exit_vhe(&host);
     // SAFETY: restores the caller's interrupt mask.
     unsafe { asm!("msr daif, {}", in(reg) daif, options(nomem, nostack, preserves_flags)) };
 }

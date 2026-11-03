@@ -5,6 +5,7 @@ policy to you: how many VMs, where their memory comes from, which devices
 they see, what happens when they halt. The three `*-hyp` examples
 (`examples/riscv-virt/src/hyp.rs`, `examples/aarch64-hyp`,
 `examples/x86_64-hyp`) put the pieces together; this page explains them.
+`examples/aarch64-vhe` is a smaller one for an AArch64 VHE host.
 `examples/riscv-hyp`, and `examples/aarch64-hyp` and `examples/x86_64-hyp`
 when QEMU's loader provides an image, go further and boot a whole kernel
 from ELF with one vCPU per host CPU: Osmium's own `riscv-virt` (with a
@@ -41,8 +42,8 @@ claims returns all ones; a write to one is dropped, as on real hardware.
 
 | | RISC-V (`riscv::RiscvVcpu`) | AArch64 (`aarch64::Aarch64Vcpu`) | x86 (`x86::svm::SvmVcpu`) |
 |---|---|---|---|
-| Host runs in | HS-mode | EL2, non-VHE | long mode with SVM on |
-| Feature | `riscv64-hs` (osmium-arch and osmium-virt) | `aarch64-el2` | none (bare-metal x86_64) |
+| Host runs in | HS-mode | EL2, non-VHE or VHE | long mode with SVM on |
+| Feature | `riscv64-hs` (osmium-arch and osmium-virt) | `aarch64-el2` (non-VHE) or `aarch64-vhe` (VHE) | none (bare-metal x86_64) |
 | Guest entry/exit | `sret` / the trap entry's guest-exit hook | `eret` / lower-EL vectors 8-11 | `VMRUN` / `#VMEXIT` |
 | Second stage | G-stage, `hgatp_sv39x4` | stage 2, `vttbr`; `init_cpu` sets `VTCR_EL2` | NPT, `X86_64` tables with `USER` leaves |
 | MMIO exits from | guest-page faults, decoded from `htinst` or the instruction (`hlvx`) | data aborts with a valid syndrome | nested page faults, decoded by `x86::decode` |
@@ -55,6 +56,36 @@ Each backend saves the host's callee-saved registers, runs the guest, and
 returns to the caller of `Vcpu::run` with interrupts restored. A host
 interrupt that arrives while the guest runs exits with
 `ExternalInterrupt`; the host takes it as soon as `run` returns.
+
+### AArch64 VHE hosts
+
+A host that runs at EL2 with `HCR_EL2.E2H` set (VHE) builds with
+`aarch64-vhe` instead of `aarch64-el2`. The two are mutually exclusive
+(`aarch64-el2` wins if both are on). Such a host is an ordinary EL1 kernel as
+far as `osmium-arch` is concerned: VHE redirects the `_EL1` register names
+it uses to EL2, it can run user programs at EL0, and its lower-EL vectors take
+both their traps and guest exits (a hook sends an exception to the vCPU when
+one is running on that CPU, as with `riscv64-hs`). The host must:
+
+1. Set `HCR_EL2` to at least `E2H | TGE | RW` (`aarch64::HCR_E2H`,
+   `HCR_TGE`, bit 31) before `cpu::set_current_id` and `trap::install`. With
+   `aarch64-vhe` those use `TPIDR_EL2` and `VBAR_EL2`: VHE does not
+   redirect `TPIDR_EL1`, which the guest owns.
+2. Program its stage 1 through the EL1 names (`TCR_EL1` layout, `T1SZ` and
+   `EPD1` included), with the EL1 page-table format
+   (`osmium_mm::paging::formats::Aarch64`), since the EL2&0 regime has EL0
+   permissions.
+3. Optionally call `aarch64::init_cpu` (`VTCR_EL2`, `VPIDR_EL2`,
+   `CNTVOFF_EL2`); `run` does it on a CPU that has not been prepared.
+
+`Aarch64Vcpu::new(entry, x0, vttbr(root, vmid))` and the rest of the API are
+the same as without VHE. Each `run` masks interrupts, saves the host's
+`HCR_EL2` and sets `HCR_GUEST | E2H` (TGE clear), switches the guest's EL1
+registers through `SCTLR_EL12`, `TTBR0_EL12`, `VBAR_EL12` and the like, and on
+exit puts back the host's `HCR_EL2` (so `TGE` is set again), `CPTR_EL2`,
+`MDCR_EL2`, `TPIDR_EL0`, `PAR_EL1`, `CSSELR_EL1` and, if `CPTR_EL2.FPEN` let
+the host use them, its FP/SIMD registers. `CNTHCTL_EL2`'s EL1 bits (10 and 11
+with `E2H`) are set on each entry, leaving the host's EL0 bits alone.
 
 ## Interrupts: wiring a device to a guest
 
@@ -192,7 +223,9 @@ recipe is the same on each:
   KVM (`examples/x86_64-hyp` with `-accel kvm -cpu host`).
 - FP/SIMD state is switched per vCPU on the assumption that the host
   kernel itself never uses those registers (soft-float targets): always on
-  RISC-V and AArch64 (where SVE is not switched and traps), and on x86 for
+  RISC-V and AArch64 (where SVE is not switched and traps; a VHE host's own
+  `q` registers are kept if its FP was on, but not the upper bits of SVE
+  `z` registers), and on x86 for
   vCPUs built `with_fp_switching` (x87 and SSE through FXSAVE/FXRSTOR, not
   AVX). Without it an x86 guest uses the host CPU's registers as they are,
   which is enough for one vCPU per host CPU; the whole-kernel x86 guest runs

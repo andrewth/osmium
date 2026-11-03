@@ -11,7 +11,8 @@
 //! preempted task's stack until it resumes. User mode is not supported yet.
 //!
 //! Supported: RISC-V 64 (S-mode, or M-mode with `riscv-m-mode`), AArch64
-//! (EL1, or EL2 with `aarch64-el2`) and x86_64 (an IDT of interrupt gates,
+//! (EL1, EL2 with `aarch64-el2`, or EL2 under VHE with the EL1 vectors and
+//! `aarch64-vhe`) and x86_64 (an IDT of interrupt gates,
 //! no IST yet). On hosted targets a simulation lets
 //! tests drive handlers with [`simulate`].
 

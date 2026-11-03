@@ -651,6 +651,28 @@ if command -v qemu-system-aarch64 >/dev/null; then
     rm -f "$nestlog"
 fi
 
+# VHE hypervisor: sets HCR_EL2.E2H and TGE at boot and runs as an EL1
+# kernel would (osmium-arch's EL1 build with aarch64-vhe), then runs a guest
+# through the VHE world switch (TGE clear, _EL12 registers) and a user
+# program whose svc must still reach the host's own trap handler. Needs a CPU
+# with VHE: cortex-a72 has none.
+if command -v qemu-system-aarch64 >/dev/null; then
+    (cd examples/aarch64-vhe && cargo build -q --release)
+    for vhe_cpu in max neoverse-n1; do
+        echo "== boot examples/aarch64-vhe under QEMU (-cpu $vhe_cpu)"
+        vhelog=$(mktemp)
+        run_qemu "aarch64-vhe ($vhe_cpu)" "$vhelog" 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=3 -cpu "$vhe_cpu" -m 128M -nographic \
+            -kernel examples/aarch64-vhe/target/aarch64-unknown-none-softfloat/release/aarch64-vhe
+        expect "aarch64-vhe ($vhe_cpu)" "$vhelog" 'aarch64-vhe example (EL2)' 'E2H and TGE set' 'EL2&0 MMU on' \
+            '\[guest\] hello from EL1 under a VHE host' \
+            'guest exit Shutdown: 1 hypercall, 1 halt, LSR 0x60; HCR_EL2 back to the host.s on every exit: true' \
+            'host d0 kept across the guest: true' \
+            'guest svc taken at its own VBAR_EL1: true; guest TPIDR_EL1 0xdead, host CPU id still 0' \
+            '\[user\]  svc from EL0 (x8 = 172) reached the host.s trap handler at EL2' '\[done\]'
+        rm -f "$vhelog"
+    done
+fi
+
 # AMD SVM hypervisor (QEMU's TCG implements SVM with nested paging).
 if command -v qemu-system-x86_64 >/dev/null; then
     echo "== boot examples/x86_64-hyp under QEMU"

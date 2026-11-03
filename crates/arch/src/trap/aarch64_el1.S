@@ -1,4 +1,50 @@
 .section .text.osmium_trap, "ax"
+// OSMIUM_VHE (set by the including global_asm!) is 1 for a VHE host
+// (`aarch64-vhe`): the kernel runs at EL2 with HCR_EL2.E2H set, and the
+// `_el1` names below for ELR, SPSR, ESR, FAR and VBAR reach their EL2
+// registers. TPIDR_EL1 is not redirected, so the CPU id lives in TPIDR_EL2.
+.macro osmium_cpu_id reg
+.if OSMIUM_VHE
+    mrs \reg, tpidr_el2
+.else
+    mrs \reg, tpidr_el1
+.endif
+.endm
+
+// Lower-EL AArch64 vectors (8-11). On a VHE host they are also guest
+// exits while a vCPU runs on this CPU (TrapCpu.guest != 0): those branch to
+// osmium_el2_guest_exit (osmium-virt) with x0 = TrapCpu.guest, x1 = the
+// vector number and the guest's x0/x1 pushed on the stack, as in
+// aarch64_el2.S. Otherwise, and in EL1 kernels, they are user-mode traps.
+.macro osmium_lower_vector kind
+.if OSMIUM_VHE
+    stp x0, x1, [sp, #-16]!
+    mrs x0, tpidr_el2
+    adrp x1, OSMIUM_TRAP_CPUS
+    add x1, x1, :lo12:OSMIUM_TRAP_CPUS
+    add x0, x1, x0, lsl #6
+    ldr x0, [x0, #0x20]             // TrapCpu.guest
+    cbz x0, 1f
+    mov x1, #\kind
+    b osmium_el2_guest_exit
+1:  ldp x0, x1, [sp], #16
+.endif
+    sub sp, sp, #304
+    stp x0, x1, [sp, #0]
+    mov x0, #\kind
+    b osmium_trap_common_el0
+.endm
+
+.if OSMIUM_VHE
+// The weak default keeps VHE builds without osmium-virt linking; nothing
+// but osmium-virt's vCPU sets TrapCpu.guest, and its strong definition
+// replaces this one.
+.weak osmium_el2_guest_exit
+osmium_el2_guest_exit:
+    brk #0xe2
+    b osmium_el2_guest_exit
+.endif
+
 .macro osmium_kernel_vector kind
     // Current EL with SP_ELx: check sp before the first store, in case the
     // kernel stack has overflowed. Exactly 32 instructions (the slot size).
@@ -10,7 +56,7 @@
     // anything can take a current-EL exception.
     msr tpidrro_el0, x0
     msr sp_el0, x1
-    mrs x0, tpidr_el1
+    osmium_cpu_id x0
     adrp x1, OSMIUM_TRAP_CPUS
     add x1, x1, :lo12:OSMIUM_TRAP_CPUS
     add x0, x1, x0, lsl #6          // x0 = &TrapCpu
@@ -85,28 +131,16 @@ osmium_vec_7:
     osmium_kernel_vector 7
 .org osmium_trap_vectors + 0x400
 osmium_vec_8:
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #8
-    b osmium_trap_common_el0
+    osmium_lower_vector 8
 .org osmium_trap_vectors + 0x480
 osmium_vec_9:
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #9
-    b osmium_trap_common_el0
+    osmium_lower_vector 9
 .org osmium_trap_vectors + 0x500
 osmium_vec_10:
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #10
-    b osmium_trap_common_el0
+    osmium_lower_vector 10
 .org osmium_trap_vectors + 0x580
 osmium_vec_11:
-    sub sp, sp, #304
-    stp x0, x1, [sp, #0]
-    mov x0, #11
-    b osmium_trap_common_el0
+    osmium_lower_vector 11
 .org osmium_trap_vectors + 0x600
 osmium_vec_12:
     sub sp, sp, #304

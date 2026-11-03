@@ -62,6 +62,8 @@ http = ["dep:osmium-http"]
 riscv-m-mode = ["osmium-arch/riscv-m-mode"]
 ## AArch64 EL2 registers.
 aarch64-el2 = ["osmium-arch/aarch64-el2", "osmium-virt?/aarch64-el2"]
+## AArch64 VHE host (EL2 with `HCR_EL2.E2H`): guest-exit hook in the EL1 trap entry and the VHE world switch.
+aarch64-vhe = ["osmium-arch/aarch64-vhe", "osmium-virt?/aarch64-vhe"]
 ## RISC-V HS-mode hypervisor: guest-exit hook and the H-extension vCPU.
 riscv64-hs = ["osmium-arch/riscv64-hs", "osmium-virt?/riscv64-hs"]
 

@@ -1,5 +1,20 @@
-//! An AArch64 EL2 vCPU (non-VHE: the host kernel runs at EL2 with
-//! `HCR_EL2.E2H` = 0, the guest at EL1/EL0 under stage-2 translation).
+//! An AArch64 EL2 vCPU: the guest runs at EL1/EL0 under stage-2
+//! translation, the host kernel at EL2 in one of two ways, chosen at build
+//! time:
+//!
+//! - `aarch64-el2`: non-VHE (`HCR_EL2.E2H` = 0). The host uses the EL2
+//!   registers (`osmium-arch` with `aarch64-el2`) and has no user mode of its
+//!   own; every lower-EL exception is a guest exit.
+//! - `aarch64-vhe`: a VHE host (`HCR_EL2.E2H` = 1), which uses `osmium-arch`'s
+//!   EL1 build and may run its own user programs at EL0 (`HCR_EL2.TGE` = 1).
+//!   The guest's EL1 registers are switched through their `_EL12` names, and
+//!   `TGE` is clear only while the guest runs. The host must set `E2H` and
+//!   `TGE` before anything else (`osmium_arch::cpu::set_current_id` and
+//!   `osmium_arch::trap::install` then use `TPIDR_EL2` and `VBAR_EL2`);
+//!   [`Vcpu::run`] restores its `HCR_EL2` on every exit.
+//!
+//! Both share everything but the world switch's surroundings: the
+//! [`Aarch64Vcpu`] type, exit decoding, [`psci`] and the virtual GICv3 link.
 //!
 //! Exits are decoded from `ESR_EL2` into a [`VmExit`]:
 //!
@@ -33,10 +48,10 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
+#[cfg(aarch64_hw)]
 mod hw;
-#[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
-pub use hw::{HCR_GUEST, VTCR_48, counter, init_cpu};
+#[cfg(aarch64_hw)]
+pub use hw::{HCR_E2H, HCR_GUEST, HCR_TGE, VTCR_48, counter, init_cpu};
 
 use crate::devices::VirtualGicV3;
 use crate::memory::GuestPhysAddr;
@@ -46,12 +61,12 @@ use crate::vcpu::{Vcpu, VmExit};
 pub const MAX_LIST_REGISTERS: usize = 16;
 
 /// The list registers modeled by the host-side tests, which have no hardware.
-#[cfg(not(all(target_arch = "aarch64", feature = "aarch64-el2")))]
+#[cfg(not(aarch64_hw))]
 #[cfg_attr(not(test), allow(dead_code))]
 const SIMULATED_LIST_REGISTERS: usize = 4;
 
 /// A vCPU's virtual CPU interface state and its link to the GIC model.
-#[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+#[cfg_attr(not(aarch64_hw), allow(dead_code))]
 struct VgicLink {
     gic: Arc<VirtualGicV3>,
     cpu: usize,
@@ -220,17 +235,17 @@ pub struct Aarch64Vcpu {
     pending: Option<Load>,
     vgic: Option<VgicLink>,
     /// `VMPIDR_EL2`, if the vCPU sets one (what the guest reads as `MPIDR_EL1`).
-    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    #[cfg_attr(not(aarch64_hw), allow(dead_code))]
     vmpidr: Option<u64>,
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
     /// See [`new_vcpu_id`](crate::vcpu::new_vcpu_id).
-    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    #[cfg_attr(not(aarch64_hw), allow(dead_code))]
     pub(crate) id: u64,
     /// The stage-2 tables changed: invalidate the VMID before the next entry.
-    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    #[cfg_attr(not(aarch64_hw), allow(dead_code))]
     pub(crate) flush: bool,
     /// The CPU this vCPU last ran on ([`NO_CPU`](crate::vcpu::NO_CPU) before the first run).
-    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    #[cfg_attr(not(aarch64_hw), allow(dead_code))]
     pub(crate) last_cpu: usize,
 }
 
@@ -305,12 +320,12 @@ impl Aarch64Vcpu {
     }
 
     /// Loads the list registers for the next entry from the GIC model.
-    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    #[cfg_attr(not(aarch64_hw), allow(dead_code))]
     fn vgic_fill(&mut self) {
         let Some(l) = &mut self.vgic else { return };
-        #[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
+        #[cfg(aarch64_hw)]
         let n = hw::list_registers();
-        #[cfg(not(all(target_arch = "aarch64", feature = "aarch64-el2")))]
+        #[cfg(not(aarch64_hw))]
         let n = SIMULATED_LIST_REGISTERS;
         l.nlr = n.min(MAX_LIST_REGISTERS);
         if let Some(regs) = l.lr.get_mut(..l.nlr) {
@@ -319,7 +334,7 @@ impl Aarch64Vcpu {
     }
 
     /// Hands the list registers the guest left back to the GIC model.
-    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    #[cfg_attr(not(aarch64_hw), allow(dead_code))]
     fn vgic_sync(&mut self) {
         let Some(l) = &mut self.vgic else { return };
         if let Some(regs) = l.lr.get(..l.nlr) {
@@ -353,7 +368,7 @@ impl Aarch64Vcpu {
     }
 
     /// Feeds the timer line before an entry.
-    #[cfg_attr(not(all(target_arch = "aarch64", feature = "aarch64-el2")), allow(dead_code))]
+    #[cfg_attr(not(aarch64_hw), allow(dead_code))]
     fn sync_timer(&self, now: u64) {
         if let Some(line) = &self.timer {
             line(self.timer_level(now));
@@ -442,7 +457,7 @@ impl Aarch64Vcpu {
 }
 
 impl Vcpu for Aarch64Vcpu {
-    #[cfg(all(target_arch = "aarch64", feature = "aarch64-el2"))]
+    #[cfg(aarch64_hw)]
     fn run(&mut self) -> VmExit {
         if let Some(r) = &self.running {
             r.store(osmium_arch::cpu::current_id(), Ordering::Release);
@@ -462,9 +477,9 @@ impl Vcpu for Aarch64Vcpu {
         exit
     }
 
-    #[cfg(not(all(target_arch = "aarch64", feature = "aarch64-el2")))]
+    #[cfg(not(aarch64_hw))]
     fn run(&mut self) -> VmExit {
-        // AArch64 guests need an aarch64 build with the aarch64-el2 feature; report an exit nothing handles.
+        // AArch64 guests need an aarch64 build with the aarch64-el2 or aarch64-vhe feature; report an exit nothing handles.
         VmExit::Unhandled { reason: u64::MAX }
     }
 

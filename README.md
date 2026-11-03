@@ -40,7 +40,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG/DMAR/IVRS reader, ELF64 loader, PE32+ loader and relocator, UEFI system table, GOP and loader boot services (pages, memory map, `ExitBootServices`, files) | writer only |
 | `osmium-acpi` | ACPI: FADT, an AML interpreter (namespace, control methods, operation regions and fields), `_CRS` resource decoding, `_PRT` PCI interrupt routing, sleep states and power off, reset, SCI fixed events and GPEs | yes |
 | `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
-| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension, AArch64 EL2 and AMD SVM vCPUs with SBI and PSCI (multi-vCPU guests), emulated PLIC, GICv2, 8259 PIC, 8254 PIT and local APIC, virtio-net | yes |
+| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension, AArch64 EL2 (non-VHE or VHE host) and AMD SVM vCPUs with SBI and PSCI (multi-vCPU guests), emulated PLIC, GICv2, 8259 PIC, 8254 PIT and local APIC, virtio-net | yes |
 | `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
 | `osmium-fs` | `File` trait and `Vfs` namespace (mounts, `..` across mounts, symlinks), Linux `Errno`, RAM file system, `/dev` nodes, cpio initramfs unpacking | yes |
 | `osmium-proc` | `Process` (address space, fd table, cwd, exit status, `wait`), `AddressSpace` with page-table-checked user copies, and one portable system-call dispatcher using each architecture's Linux numbers and structure layouts, including sockets (loopback, `socketpair`, `sendmsg`/`recvmsg`) and `poll`/`select`/`epoll` | yes |
@@ -134,7 +134,8 @@ features.
   move only when `Task::set_cpu` asks.
 - The context switch saves FP registers only on targets that have them
   enabled (`neon`, `d`). Soft-float kernels are unaffected.
-- The hypervisor has RISC-V H, AArch64 EL2, AMD SVM and Intel VMX backends.
+- The hypervisor has RISC-V H, AArch64 EL2 (for a non-VHE host, or a VHE
+  host with `aarch64-vhe`), AMD SVM and Intel VMX backends.
   The VMX backend has only run under nested KVM (QEMU's TCG does not emulate
   VMX); `x86_64-hyp` uses SVM or VMX, whichever the CPU has. None of the
   backends has run on physical hardware.
