@@ -1,0 +1,23 @@
+[package]
+name = "osmium-tls"
+description = "Osmium: TLS 1.3 servers over rustls, with a small pure-Rust crypto provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+hmac = { version = "0.13.0", default-features = false }
+osmium-rand.workspace = true
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "alloc", "pem"] }
+rustls = { version = "0.23", default-features = false }
+sha2 = { version = "0.11.1", default-features = false }
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
+
+[dev-dependencies]
+# The client side of the tests uses rustls's buffered (std) API with this crate's provider.
+rustls = { version = "0.23", default-features = false, features = ["std"] }

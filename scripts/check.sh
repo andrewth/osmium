@@ -149,6 +149,8 @@ if PATH=$PATH:/usr/sbin command -v mkfs.fat >/dev/null && PATH=$PATH:/usr/sbin c
 fi
 screen qemu-system-riscv64 640 400 gpu
 EXPECT=(
+    # QEMU's default rv64 CPU has no Zkr; `-cpu max` does, and then the line reads "seeded from the CPU".
+    '\[rand\]  no CPU random number instructions'
     'ARP: 10.0.2.2 is at'
     'DHCP: 10.0.2.15/24 via 10.0.2.2'
     'ping 10.0.2.2: seq 1 in'
@@ -380,6 +382,8 @@ for s in "$stick_uhci" "$stick_ehci"; do
 done
 screen qemu-system-x86_64 640 400
 EXPECT=(
+    '\[rand\]  seeded from the CPU; draws differ'
+    '\[tls\]   self-test passed: TLS 1.3 handshake and echo'
     '\[aml\]   1 tables loaded (0 failed): [0-9]* objects, [0-9]* devices'
     '\[aml\]   _REG run [0-9]* times, _INI [0-9]* times, 0 methods failed'
     '\[aml\]   host bridge .*PCI0 (PNP0A08): [0-9]* resources, buses Some((0, 255))'
@@ -573,7 +577,8 @@ if command -v qemu-system-aarch64 >/dev/null; then
     (cd examples/aarch64-hyp && cargo build -q --release)
     run_qemu "aarch64-hyp" "$hyplog" 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=2 -cpu max -smp 2 -m 128M -nographic \
         -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp
-    expect "aarch64-hyp" "$hyplog" 'example (EL2)' 'EL2 MMU on' '\[guest\] hello from EL1 over MMIO' \
+    expect "aarch64-hyp" "$hyplog" 'example (EL2)' 'EL2 MMU on' '\[rand\]  seeded from the CPU; draws differ' \
+        '\[tls\]   self-test passed: TLS 1.3 handshake and echo' '\[guest\] hello from EL1 over MMIO' \
         'guest exit Shutdown: .*hypercall.*halt.*host interrupts, LSR 0x60' \
         '\[guest\] UART interrupt, received: ping' \
         'vGIC guest exit Shutdown: INTID 27 (timer) then INTID 33 (UART), [0-9]* halts, [0-9]* timer exits' \

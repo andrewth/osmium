@@ -1,0 +1,10 @@
+# x86_64-unknown-none is soft-float: SSE and AVX are off, so LLVM can't build
+# the RustCrypto crates' runtime-detected SIMD backends. Force their portable
+# ones. Anything that links osmium-tls for this target needs the same flags.
+[target.x86_64-unknown-none]
+rustflags = [
+    "--cfg", 'poly1305_backend="soft"',
+    "--cfg", 'sha2_backend="soft"',
+    "--cfg", 'curve25519_dalek_backend="serial"',
+    "--cfg", 'chacha20_backend="soft"',
+]

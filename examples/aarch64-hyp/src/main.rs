@@ -760,6 +760,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     enable_mmu(pt.root());
     TTBR0.store(pt.root().0, Ordering::Release);
     println!("[mmu]   EL2 MMU on, TTBR0_EL2 {:#x}; RAM {ram_start:#x}..{ram_end:#x}", pt.root().0);
+    rand_demo();
     core::mem::forget(pt);
 
     // The physical GIC only needs the virtual timer's PPI enabled: its
@@ -1368,4 +1369,28 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
         let _ = writeln!(osmium::hal::serial::SerialWriter(&mut uart), "\n[panic] {info}");
     }
     shutdown()
+}
+
+/// Seeds a generator from the CPU's random number instructions, draws from
+/// it, and runs the TLS self-test on it.
+fn rand_demo() {
+    static RNG: osmium::rand::SharedRng = osmium::rand::SharedRng::new();
+    if !osmium::rand::CpuEntropy::available() {
+        println!("[rand]  no CPU random number instructions");
+        return;
+    }
+    match RNG.seed(&osmium::rand::CpuEntropy) {
+        Ok(()) => match (RNG.next_u64(), RNG.next_u64()) {
+            (Ok(a), Ok(b)) if a != b => {
+                println!("[rand]  seeded from the CPU; draws differ");
+                // Any time will do: the self-test's certificate is valid around it.
+                match osmium::tls::self_test(&RNG, 1_800_000_000) {
+                    Ok(()) => println!("[tls]   self-test passed: TLS 1.3 handshake and echo"),
+                    Err(e) => println!("[tls]   self-test failed: {e}"),
+                }
+            }
+            r => println!("[rand]  seeded, but draws look wrong: {r:?}"),
+        },
+        Err(e) => println!("[rand]  {e}"),
+    }
 }

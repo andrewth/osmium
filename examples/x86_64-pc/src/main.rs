@@ -525,6 +525,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     }
     let t = pt.translate(va(kmain as *const () as u64)).expect("translate failed");
     println!("[mmu]   CR3 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
+    rand_demo();
     *PT.lock() = Some(pt);
     load_cpu_tables();
     // SAFETY: this CPU's TSS now has a double-fault stack; APs load theirs
@@ -1223,4 +1224,28 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let mut com1 = Uart16550::new(unsafe { Pio::new(COM1) });
     let _ = writeln!(osmium::hal::serial::SerialWriter(&mut com1), "\n[panic] {info}");
     shutdown()
+}
+
+/// Seeds a generator from the CPU's random number instructions, draws from
+/// it, and runs the TLS self-test on it.
+fn rand_demo() {
+    static RNG: osmium::rand::SharedRng = osmium::rand::SharedRng::new();
+    if !osmium::rand::CpuEntropy::available() {
+        println!("[rand]  no CPU random number instructions");
+        return;
+    }
+    match RNG.seed(&osmium::rand::CpuEntropy) {
+        Ok(()) => match (RNG.next_u64(), RNG.next_u64()) {
+            (Ok(a), Ok(b)) if a != b => {
+                println!("[rand]  seeded from the CPU; draws differ");
+                // Any time will do: the self-test's certificate is valid around it.
+                match osmium::tls::self_test(&RNG, 1_800_000_000) {
+                    Ok(()) => println!("[tls]   self-test passed: TLS 1.3 handshake and echo"),
+                    Err(e) => println!("[tls]   self-test failed: {e}"),
+                }
+            }
+            r => println!("[rand]  seeded, but draws look wrong: {r:?}"),
+        },
+        Err(e) => println!("[rand]  {e}"),
+    }
 }

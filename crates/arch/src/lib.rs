@@ -21,6 +21,7 @@ pub mod cpu;
 pub mod fp;
 pub mod irq;
 pub mod mmu;
+pub mod rng;
 pub mod trap;
 
 #[cfg(target_arch = "aarch64")]

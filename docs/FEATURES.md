@@ -98,6 +98,7 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ MMU control: activate a root table, flush one page, flush all
 - ✅ x86_64: port I/O, MSRs, CR3, CPUID; AArch64: system registers, `MAIR` constant; RISC-V: `satp`, CSRs
 - ✅ Host simulation backend
+- ✅ Hardware random numbers (`rng`): `random` and `seed` from RDRAND/RDSEED (x86_64, detected by CPUID and cached), RNDR/RNDRRS (AArch64 FEAT_RNG) and the Zkr `seed` CSR (RISC-V, enabled by `assume_seed_csr` since it can't be probed); `/dev/urandom` on the host. Checked under QEMU `-cpu max` on all three (x86_64-pc, aarch64-hyp at EL2, riscv-virt in S-mode under OpenSBI)
 - ✅ DMA memory barriers (`dma_wmb`, `dma_rmb`, `mb`)
 - ✅ Trap entry (RISC-V S/M-mode, AArch64 EL1/EL2): full `TrapFrame`, registered handler, portable `Trap` cause decoding
 - ✅ AArch64 PSCI (CPU on, system off/reset) and generic-timer registers; RISC-V SBI IPIs
@@ -322,6 +323,24 @@ Status: ✅ implemented in this release · 🗺 roadmap
 - ✅ Tested on the host against an in-process target and `scripts/iscsi-target.py` (a stdlib-only target), and under QEMU through a user-network `guestfwd` to that script
 - ✅ CHAP-MD5 authentication (one-way and mutual, credentials in `Options::chap`; local no_std MD5) and CRC32C header/data digests (`Offer::header_digest`/`data_digest`: off, prefer or require), tested against the in-process target and `scripts/iscsi-target.py` (`--chap`, `--mutual-chap`, `--digests`)
 - 🗺 Login redirection, error recovery levels above 0, multiple connections and LUNs per session
+
+### `osmium-rand`: random numbers
+- ✅ `EntropySource` trait, with `CpuEntropy` over `osmium_arch::rng::seed`
+- ✅ SHA-256 (incremental, FIPS 180-4 vectors), used to condition seed material
+- ✅ `ChaChaRng`: ChaCha20 (RFC 8439 block function) with fast key erasure: each refill of four blocks rekeys from its own first 32 bytes, and handed-out bytes are wiped from the buffer; seeded and reseeded by hashing 64 bytes of entropy (with the old key, on reseed); output checked against Python `cryptography`'s ChaCha20
+- ✅ `SharedRng`: a `ChaChaRng` behind an `IrqSpinLock` for a kernel's `static` generator; refuses output until seeded, reseeds from its source every MiB and keeps going on its current key if a reseed fails
+- 🗺 Fork-safety for generators copied into processes; health tests on raw entropy-source output (SP 800-90B repetition and adaptive proportion tests)
+
+### `osmium-tls`: TLS 1.3 servers
+- ✅ A rustls 0.23 crypto provider with one algorithm per role: `TLS13_CHACHA20_POLY1305_SHA256` (RustCrypto `chacha20poly1305`, `sha2`, `hmac`), X25519 (`x25519-dalek`, low-order points refused), ECDSA P-256 with SHA-256 signing (RFC 6979) and verification (`p256`), randomness from an `osmium-rand` `SharedRng`; P-256 keys load from PKCS#8 or SEC1
+- ✅ `server_config`: TLS 1.3 only, one certificate chain, no client authentication
+- ✅ `ServerSession`: one connection over rustls's unbuffered API with no I/O of its own (`receive`, `outgoing`/`sent`, `read`, `write`, `close`); holds application data written during the handshake, answers `close_notify`, and after a failure still hands out the fatal alert for the peer
+- ✅ `cert::self_signed`: a fresh P-256 key and an X.509 v3 certificate (DNS and IP subject alternative names, `CA:FALSE`, `digitalSignature`, `serverAuth`; UTCTime or GeneralizedTime as RFC 5280 requires), the key as PKCS#8; `cert::pem`
+- ✅ `self_test`: an in-memory handshake and echo between an unbuffered rustls client and a `ServerSession`, for checking the stack at boot; passes under QEMU on x86_64-pc, aarch64-hyp (EL2) and riscv-virt (`-cpu max`)
+- ✅ Tested on the host against rustls's own client (handshake, IP-address names, wrong-name refusal, tampered records, 200 KB each way, garbage input) and against Python's `ssl` module (OpenSSL) over TCP, which checks the certificate independently
+- ✅ `x86_64-unknown-none` is soft-float, so `.cargo/config.toml` selects the portable backends of `chacha20`, `poly1305`, `sha2` and `curve25519-dalek`; binaries for that target that link `osmium-tls` need the same `--cfg` flags
+- ✅ The only crate with crates.io dependencies (rustls and the RustCrypto crates); nothing else in osmium depends on it
+- 🗺 HTTP server (`osmium-http`), client authentication, session resumption tests, AES-GCM for CPUs with AES instructions
 
 ### `osmium`: the umbrella crate
 - ✅ Re-exports every component, each behind a Cargo feature of the same name

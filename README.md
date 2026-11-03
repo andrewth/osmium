@@ -27,7 +27,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 
 | Crate | What it provides | Needs `alloc` |
 |---|---|---|
-| `osmium-arch` | IRQ flag control, CPU id, trap entry with a portable `Trap` cause, per-task FP/SIMD state, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
+| `osmium-arch` | IRQ flag control, CPU id, hardware random numbers, trap entry with a portable `Trap` cause, per-task FP/SIMD state, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
 | `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
 | `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64 4/5-level, AArch64, Sv39/Sv48/Sv57, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2, IOMMU formats), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA, display), IOMMU domains and `IommuDma`, linear framebuffers with pixel formats, `IrqTable`, global console with `println!` | no |
@@ -47,6 +47,8 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-fs-fat` | FAT12, FAT16 and FAT32 for the `osmium-fs` VFS over any `BlockDevice`: long (VFAT) names, create, write, truncate, remove | yes |
 | `osmium-net` | Polled IPv4 and IPv6 stack over any `NetDevice`: ARP, neighbor discovery and SLAAC, ICMP echo, UDP, TCP (SACK, timestamps), DHCP client, DNS (UDP and TCP), IP fragmentation, IGMPv2 multicast | yes |
 | `osmium-iscsi` | iSCSI initiator over `osmium-net` TCP as a `BlockDevice`: login and negotiation, R2T and immediate-data writes, SendTargets discovery | yes |
+| `osmium-rand` | Entropy sources over the CPU's random number instructions (RDRAND/RDSEED, RNDR, Zkr), SHA-256, and a ChaCha20 generator with fast key erasure, shareable across CPUs and interrupt handlers | no |
+| `osmium-tls` | TLS 1.3 servers over rustls: a pure-Rust provider (ChaCha20-Poly1305, X25519, ECDSA P-256), a sans-I/O `ServerSession`, self-signed certificates and a boot-time self-test. Uses crates.io dependencies | yes |
 | `osmium-fs-ext4` | ext2/ext3/ext4 (read and write) for the `osmium-fs` VFS over any `BlockDevice` | yes |
 | `osmium-fs-iso9660` | read-only ISO 9660 for the `osmium-fs` VFS over any `BlockDevice`: Rock Ridge, Joliet, deep-directory relocation, multi-extent and interleaved files | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |

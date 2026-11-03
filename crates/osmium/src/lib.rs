@@ -27,6 +27,8 @@
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
 //! | `net` | `osmium-net` | IPv4 stack: ARP, ICMP echo, UDP, TCP, DHCP client |
 //! | `iscsi` | `osmium-iscsi` | iSCSI initiator: a remote SCSI disk over TCP as a block device |
+//! | `rand` | `osmium-rand` | entropy sources, SHA-256, ChaCha20 random number generator |
+//! | `tls` | `osmium-tls` | TLS 1.3 servers over rustls, self-signed certificates |
 //! | `acpi` | `osmium-acpi` | ACPI: FADT, AML interpreter, devices, resources, PCI routing, sleep states, SCI and GPE events |
 //!
 //! The library never defines an entry point, panic handler or global
@@ -56,6 +58,10 @@ pub use osmium_exec as exec;
 pub use osmium_fs as fs;
 #[cfg(feature = "proc")]
 pub use osmium_proc as proc;
+#[cfg(feature = "rand")]
+pub use osmium_rand as rand;
+#[cfg(feature = "tls")]
+pub use osmium_tls as tls;
 #[cfg(feature = "fs-fat")]
 pub use osmium_fs_fat as fs_fat;
 #[cfg(feature = "net")]

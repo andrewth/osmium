@@ -212,7 +212,9 @@ pub unsafe fn resume_user(frame: &crate::trap::TrapFrame) -> ! {
         asm!(
             "csrci sstatus, 0x2",
             "mv sp, {frame}",
-            "j osmium_trap_return",
+            // `tail` (auipc + jr, clobbering t1) rather than `j`, whose ±1 MiB
+            // reach large kernels outgrow. The return path reloads every register.
+            "tail osmium_trap_return",
             frame = in(reg) frame,
             options(noreturn),
         )

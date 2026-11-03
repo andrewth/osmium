@@ -291,6 +291,16 @@ fn isa_has(fdt: &osmium::boot::fdt::Fdt<'_>, letter: char) -> bool {
     isa.strip_prefix("rv64").unwrap_or("").split('_').next().unwrap_or("").contains(letter)
 }
 
+/// Returns true if the first hart's `riscv,isa` names multi-letter
+/// extension `ext` (such as `zkr`).
+fn isa_has_ext(fdt: &osmium::boot::fdt::Fdt<'_>, ext: &str) -> bool {
+    fdt.find_node("/cpus")
+        .and_then(|cpus| cpus.children().find(|c| c.property("riscv,isa").is_some()))
+        .and_then(|c| c.property("riscv,isa"))
+        .and_then(|p| p.as_str())
+        .is_some_and(|isa| isa.split('_').skip(1).any(|e| e == ext))
+}
+
 /// Gives this hart an emergency stack for traps from an overflowed stack.
 fn set_exception_stack() {
     let stack = alloc::vec![0u8; 16 * 1024].leak();
@@ -651,6 +661,12 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!("[mmu]   Sv39 on, root {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
     let t = pt.translate(va(ram_end - 1)).expect("translate failed");
     println!("[mmu]   top of RAM mapped {:?} via {:?} page", t.flags, t.size);
+    if isa_has_ext(&fdt, "zkr") {
+        // SAFETY: the devicetree lists Zkr, and OpenSBI sets `mseccfg.SSEED` for
+        // harts that have it, so S-mode may read `seed`.
+        unsafe { osmium::arch::rng::assume_seed_csr() };
+    }
+    rand_demo();
     *PT.lock() = Some(pt);
     set_exception_stack();
     osmium::sched::set_stack_allocator(&GuardedStacks);
@@ -1471,4 +1487,28 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     }
     let _ = writeln!(Sbi, "\n[panic] {info}");
     sbi::shutdown()
+}
+
+/// Seeds a generator from the CPU's random number instructions, draws from
+/// it, and runs the TLS self-test on it.
+fn rand_demo() {
+    static RNG: osmium::rand::SharedRng = osmium::rand::SharedRng::new();
+    if !osmium::rand::CpuEntropy::available() {
+        println!("[rand]  no CPU random number instructions");
+        return;
+    }
+    match RNG.seed(&osmium::rand::CpuEntropy) {
+        Ok(()) => match (RNG.next_u64(), RNG.next_u64()) {
+            (Ok(a), Ok(b)) if a != b => {
+                println!("[rand]  seeded from the CPU; draws differ");
+                // Any time will do: the self-test's certificate is valid around it.
+                match osmium::tls::self_test(&RNG, 1_800_000_000) {
+                    Ok(()) => println!("[tls]   self-test passed: TLS 1.3 handshake and echo"),
+                    Err(e) => println!("[tls]   self-test failed: {e}"),
+                }
+            }
+            r => println!("[rand]  seeded, but draws look wrong: {r:?}"),
+        },
+        Err(e) => println!("[rand]  {e}"),
+    }
 }
