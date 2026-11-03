@@ -48,7 +48,7 @@ net = ["hal", "dep:osmium-net"]
 fs-ext4 = ["fs", "hal", "sync", "dep:osmium-fs-ext4"]
 ## Read-only ISO 9660 with Rock Ridge and Joliet on any block device (needs `alloc`).
 fs-iso9660 = ["fs", "hal", "sync", "dep:osmium-fs-iso9660"]
-## Read-only btrfs with subvolumes, checksums and zlib, LZO and zstd compression on any block device (needs `alloc`).
+## btrfs, read and write, with subvolumes, checksums and zlib, LZO and zstd compression on any block device (needs `alloc`).
 fs-btrfs = ["fs", "hal", "sync", "dep:osmium-fs-btrfs"]
 ## iSCSI initiator: a remote SCSI disk over TCP as a block device (needs `alloc`).
 iscsi = ["net", "dep:osmium-iscsi"]

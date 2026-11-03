@@ -20,6 +20,22 @@ const SYS_CHUNK_ARRAY_MAX: usize = 2048;
 
 /// Tree ids (the `objectid` of a `ROOT_ITEM` in the root tree).
 pub mod tree {
+    /// The root tree.
+    pub const ROOT: u64 = 1;
+    /// The extent tree.
+    pub const EXTENT: u64 = 2;
+    /// The chunk tree.
+    pub const CHUNK: u64 = 3;
+    /// The device tree.
+    pub const DEV: u64 = 4;
+    /// The quota tree.
+    pub const QUOTA: u64 = 8;
+    /// The free space tree.
+    pub const FREE_SPACE: u64 = 10;
+    /// The block group tree.
+    pub const BLOCK_GROUP: u64 = 11;
+    /// Objectid of orphan items (`-5`).
+    pub const ORPHAN: u64 = -5i64 as u64;
     /// The chunk tree's items live under this objectid.
     pub const FIRST_CHUNK: u64 = 256;
     /// The data checksum tree.
@@ -40,6 +56,36 @@ pub mod tree {
 pub mod item {
     /// An inode.
     pub const INODE_ITEM: u8 = 1;
+    /// An inode's names, keyed by the parent directory.
+    pub const INODE_REF: u8 = 12;
+    /// More names, keyed by a hash of the parent and the name.
+    pub const INODE_EXTREF: u8 = 13;
+    /// An unlinked inode still to be deleted.
+    pub const ORPHAN_ITEM: u8 = 48;
+    /// A data extent and its references.
+    pub const EXTENT_ITEM: u8 = 168;
+    /// A tree block and its references (skinny metadata).
+    pub const METADATA_ITEM: u8 = 169;
+    /// Inline reference from a tree block to its tree.
+    pub const TREE_BLOCK_REF: u8 = 176;
+    /// A data extent's reference from a file.
+    pub const EXTENT_DATA_REF: u8 = 178;
+    /// A tree block's reference from a parent block.
+    pub const SHARED_BLOCK_REF: u8 = 182;
+    /// A data extent's reference from a leaf.
+    pub const SHARED_DATA_REF: u8 = 184;
+    /// A block group.
+    pub const BLOCK_GROUP_ITEM: u8 = 192;
+    /// A block group's free space summary.
+    pub const FREE_SPACE_INFO: u8 = 198;
+    /// A free range.
+    pub const FREE_SPACE_EXTENT: u8 = 199;
+    /// Free sectors as a bitmap.
+    pub const FREE_SPACE_BITMAP: u8 = 200;
+    /// A device range holding a chunk stripe.
+    pub const DEV_EXTENT: u8 = 204;
+    /// A device.
+    pub const DEV_ITEM: u8 = 216;
     /// An extended attribute, keyed by the hash of its name.
     pub const XATTR_ITEM: u8 = 24;
     /// A directory entry, keyed by the hash of its name.
@@ -108,6 +154,10 @@ pub mod incompat {
 pub mod profile {
     /// Striped across devices.
     pub const RAID0: u64 = 1 << 3;
+    /// Two copies on one device.
+    pub const DUP: u64 = 1 << 5;
+    /// Copies on other devices: RAID1, RAID1C3, RAID1C4.
+    pub const MIRRORED: u64 = 1 << 4 | 1 << 9 | 1 << 10;
     /// Striped mirrors.
     pub const RAID10: u64 = 1 << 6;
     /// Striped with parity.
@@ -136,6 +186,22 @@ pub fn le64(b: &[u8], off: usize) -> Result<u64, Errno> {
 /// The byte at `off`.
 pub fn byte(b: &[u8], off: usize) -> Result<u8, Errno> {
     b.get(off).copied().ok_or(Errno::EIO)
+}
+
+/// Writes `v` at `off` of `b`.
+pub fn put(b: &mut [u8], off: usize, v: &[u8]) -> Result<(), Errno> {
+    b.get_mut(off..off.checked_add(v.len()).ok_or(Errno::EIO)?).ok_or(Errno::EIO)?.copy_from_slice(v);
+    Ok(())
+}
+
+/// Writes `v` little-endian at `off` of `b`.
+pub fn put64(b: &mut [u8], off: usize, v: u64) -> Result<(), Errno> {
+    put(b, off, &v.to_le_bytes())
+}
+
+/// Writes `v` little-endian at `off` of `b`.
+pub fn put32(b: &mut [u8], off: usize, v: u32) -> Result<(), Errno> {
+    put(b, off, &v.to_le_bytes())
 }
 
 /// The `N` bytes at `off`.

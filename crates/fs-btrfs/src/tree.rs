@@ -39,8 +39,24 @@ impl ChunkMap {
         Ok(())
     }
 
+    /// A copy, failing instead of panicking if memory runs out.
+    pub fn try_clone(&self) -> Result<Self, Errno> {
+        let mut v = Vec::new();
+        v.try_reserve_exact(self.0.len()).map_err(|_| Errno::ENOMEM)?;
+        for c in &self.0 {
+            let stripes = osmium_sync::fallible::try_to_vec(&c.stripes)?;
+            try_push(&mut v, Chunk { logical: c.logical, length: c.length, ty: c.ty, stripes })?;
+        }
+        Ok(ChunkMap(v))
+    }
+
+    /// The chunks, by logical address.
+    pub fn iter(&self) -> impl Iterator<Item = &Chunk> {
+        self.0.iter()
+    }
+
     /// The chunk holding all of `logical..logical + len`.
-    fn find(&self, logical: u64, len: u64) -> Result<&Chunk, Errno> {
+    pub fn find(&self, logical: u64, len: u64) -> Result<&Chunk, Errno> {
         let at = self.0.partition_point(|c| c.logical <= logical).checked_sub(1).ok_or(Errno::EIO)?;
         let c = self.0.get(at).ok_or(Errno::EIO)?;
         let end = logical.checked_add(len).ok_or(Errno::EIO)?;
@@ -132,11 +148,12 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     /// striped profiles (RAID0, RAID10, RAID5, RAID6) are `EIO`.
     pub(crate) fn read_logical(
         &self,
+        chunks: &ChunkMap,
         logical: u64,
         buf: &mut [u8],
         good: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<(), Errno> {
-        let chunk = self.chunks.find(logical, buf.len() as u64)?;
+        let chunk = chunks.find(logical, buf.len() as u64)?;
         if chunk.ty & profile::STRIPED != 0 {
             return Err(Errno::EIO);
         }
@@ -150,15 +167,60 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         Err(Errno::EIO)
     }
 
+    /// Writes `buf`, whole device blocks, at byte offset `off` of the device.
+    pub(crate) fn write_phys(&self, mut off: u64, mut buf: &[u8]) -> Result<(), Errno> {
+        let bs = self.block_size as u64;
+        if !off.is_multiple_of(bs) || !(buf.len() as u64).is_multiple_of(bs) {
+            return Err(Errno::EIO);
+        }
+        let mut dev = self.dev.lock();
+        while !buf.is_empty() {
+            let n = buf.len().min(MAX_RUN / bs as usize * bs as usize);
+            dev.write_blocks(off / bs, buf.get(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
+            off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
+            buf = buf.get(n..).ok_or(Errno::EIO)?;
+        }
+        Ok(())
+    }
+
+    /// Writes `buf` at logical `logical`, to every copy.
+    pub(crate) fn write_logical(&self, chunks: &ChunkMap, logical: u64, buf: &[u8]) -> Result<(), Errno> {
+        let chunk = chunks.find(logical, buf.len() as u64)?;
+        if chunk.ty & profile::STRIPED != 0 || chunk.stripes.iter().any(|s| s.devid != self.devid) {
+            return Err(Errno::EIO);
+        }
+        let within = logical - chunk.logical;
+        for s in &chunk.stripes {
+            self.write_phys(s.offset.checked_add(within).ok_or(Errno::EIO)?, buf)?;
+        }
+        Ok(())
+    }
+
+    /// Makes previous writes durable.
+    pub(crate) fn flush(&self) -> Result<(), Errno> {
+        self.dev.lock().flush().map_err(|_| Errno::EIO)
+    }
+
+    /// Forgets cached copies of the blocks at `addrs`, which are about to be
+    /// rewritten.
+    pub(crate) fn forget(&self, addrs: impl Iterator<Item = u64> + Clone) {
+        let mut cache = self.cache.lock();
+        for slot in cache.0.iter_mut() {
+            if addrs.clone().any(|a| a == slot.0) {
+                slot.0 = u64::MAX;
+            }
+        }
+    }
+
     /// The tree block at `logical`, checked against its checksum, address and
     /// fsid.
-    pub(crate) fn block(&self, logical: u64) -> Result<Block, Errno> {
+    pub(crate) fn block(&self, chunks: &ChunkMap, logical: u64) -> Result<Block, Errno> {
         if let Some((_, b)) = self.cache.lock().0.iter().find(|(at, _)| *at == logical) {
             return Ok(b.clone());
         }
         let mut b = try_zeroed(self.nodesize)?;
         let (ty, uuid) = (self.csum_type, self.meta_uuid);
-        self.read_logical(logical, &mut b, &mut |b| {
+        self.read_logical(chunks, logical, &mut b, &mut |b| {
             let (stored, rest) = b.split_at_checked(crate::disk::CSUM_SPACE).unwrap_or((&[], &[]));
             csum::matches(ty, rest, stored)
                 && le64(b, header::BYTENR).ok() == Some(logical)
@@ -185,8 +247,8 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     }
 
     /// The tree block at `logical`, which must be at `want` level.
-    fn block_at(&self, logical: u64, want: u8) -> Result<Block, Errno> {
-        let b = self.block(logical)?;
+    fn block_at(&self, chunks: &ChunkMap, logical: u64, want: u8) -> Result<Block, Errno> {
+        let b = self.block(chunks, logical)?;
         if level(&b) != want || (want > 0 && nritems(&b) == 0) {
             return Err(Errno::EIO);
         }
@@ -196,11 +258,12 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     /// The data of the item with exactly `key` in the tree rooted at `root`.
     pub(crate) fn lookup<R>(
         &self,
+        chunks: &ChunkMap,
         root: (u64, u8),
         key: Key,
         f: impl FnOnce(&[u8]) -> Result<R, Errno>,
     ) -> Result<Option<R>, Errno> {
-        let mut c = Cursor::new(self, root);
+        let mut c = Cursor::new(self, chunks, root);
         match c.seek(key)? {
             Some((k, data)) if k == key => Ok(Some(f(data)?)),
             _ => Ok(None),
@@ -211,6 +274,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
 /// A position in a tree: the block and slot at each level, root first.
 pub struct Cursor<'s, D: BlockDevice + Send + 'static> {
     shared: &'s Shared<D>,
+    chunks: &'s ChunkMap,
     root: (u64, u8),
     path: Vec<(Block, usize)>,
     /// The key last returned, which the next must strictly follow so that a
@@ -220,8 +284,8 @@ pub struct Cursor<'s, D: BlockDevice + Send + 'static> {
 
 impl<'s, D: BlockDevice + Send + 'static> Cursor<'s, D> {
     /// A cursor over the tree whose root block is at `root.0`, level `root.1`.
-    pub fn new(shared: &'s Shared<D>, root: (u64, u8)) -> Self {
-        Cursor { shared, root, path: Vec::new(), last: None }
+    pub fn new(shared: &'s Shared<D>, chunks: &'s ChunkMap, root: (u64, u8)) -> Self {
+        Cursor { shared, chunks, root, path: Vec::new(), last: None }
     }
 
     /// The current item, if the leaf slot is in range.
@@ -254,7 +318,7 @@ impl<'s, D: BlockDevice + Send + 'static> Cursor<'s, D> {
         self.last = None;
         let (mut at, mut lvl) = self.root;
         loop {
-            let b = self.shared.block_at(at, lvl)?;
+            let b = self.shared.block_at(self.chunks, at, lvl)?;
             let n = nritems(&b);
             // The first slot whose key is after `key`; keys are sorted.
             let mut after = n;
@@ -327,7 +391,7 @@ impl<'s, D: BlockDevice + Send + 'static> Cursor<'s, D> {
         while self.path.len() <= self.root.1 as usize {
             let Some((b, slot)) = self.path.last() else { return Err(Errno::EIO) };
             let (at, lvl) = (child(b, *slot)?, level(b) - 1);
-            let c = self.shared.block_at(at, lvl)?;
+            let c = self.shared.block_at(self.chunks, at, lvl)?;
             let n = nritems(&c);
             if n == 0 {
                 // Only a root leaf may be empty.

@@ -1,6 +1,6 @@
 [package]
 name = "osmium-fs-btrfs"
-description = "Osmium: a read-only btrfs file system (subvolumes, checksums, zlib, LZO and zstd) on any block device, for the osmium-fs VFS"
+description = "Osmium: the btrfs file system, read and write (copy-on-write transactions, subvolumes, checksums, zlib, LZO and zstd), on any block device, for the osmium-fs VFS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

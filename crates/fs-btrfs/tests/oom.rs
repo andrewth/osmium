@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use osmium_fs::{Errno, Vfs};
+use osmium_fs::{Errno, OpenFlags, Vfs};
 use osmium_fs_btrfs::BtrfsFs;
 use osmium_hal::block::{BlockDevice, BlockError};
 
@@ -18,7 +18,21 @@ mod failing;
 #[global_allocator]
 static ALLOCATOR: failing::Failing = failing::Failing;
 
-use failing::every_failure;
+use failing::{every_failure, failing_at};
+
+/// [`every_failure`], but failing only every `stride`th allocation: an
+/// operation that commits makes thousands.
+fn some_failures<R>(stride: usize, mut op: impl FnMut() -> R, mut check: impl FnMut(R, bool)) -> usize {
+    let mut n = 0;
+    loop {
+        let (r, hit) = failing_at(n, &mut op);
+        check(r, hit);
+        if !hit {
+            return n;
+        }
+        n += stride;
+    }
+}
 
 /// An image file; reading it allocates nothing.
 #[derive(Clone)]
@@ -170,4 +184,110 @@ fn compressed_volumes_fail_cleanly() {
             fails_cleanly(disk);
         }
     }
+}
+
+/// A writable image file.
+#[derive(Clone)]
+struct RwDisk(Arc<std::fs::File>, u64);
+
+impl BlockDevice for RwDisk {
+    fn block_size(&self) -> usize {
+        4096
+    }
+    fn num_blocks(&self) -> u64 {
+        self.1 / 4096
+    }
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        self.check_range(lba, buf.len())?;
+        self.0.read_exact_at(buf, lba * 4096).map_err(|_| BlockError::Io)
+    }
+    fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+        self.check_range(lba, buf.len())?;
+        std::os::unix::fs::FileExt::write_all_at(&*self.0, buf, lba * 4096).map_err(|_| BlockError::Io)
+    }
+}
+
+#[test]
+fn writes_fail_cleanly() {
+    let Some(mkfs) = ["/usr/sbin", "/usr/bin"].iter().map(|d| Path::new(d).join("mkfs.btrfs")).find(|p| p.exists())
+    else {
+        eprintln!("mkfs.btrfs not found; skipping");
+        return;
+    };
+    let btrfs = Path::new("/usr/bin/btrfs");
+    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-oomw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("img");
+    std::fs::File::create(&img).unwrap().set_len(128 << 20).unwrap();
+    assert!(Command::new(&mkfs).args(["-q", "-n", "4096"]).arg(&img).status().unwrap().success());
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap();
+    let len = file.metadata().unwrap().len();
+    let disk = RwDisk(Arc::new(file), len);
+    // Names made beforehand: the closures may not allocate infallibly.
+    let names: Vec<String> = (0..20_000).map(|i| format!("/f{i}")).collect();
+    let moved: Vec<String> = (0..20_000).map(|i| format!("/g{i}")).collect();
+    let data = [7u8; 10_000];
+    {
+        let fs = BtrfsFs::mount(disk.clone(), 1).unwrap();
+        let vfs = Vfs::new(fs.root());
+        for name in &names[..40] {
+            vfs.open(name, OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, &data).unwrap();
+        }
+        let mut n = 39;
+        let mut runs = 0;
+        // Create and write.
+        runs += every_failure(
+            || {
+                n += 1;
+                let f = vfs.open(&names[n], OpenFlags::WRITE | OpenFlags::CREATE, 0o644)?;
+                f.write(0, &data)?;
+                f.write(5000, b"overwritten")
+            },
+            |r, injected| _ = ok_or_enomem(&r, injected),
+        );
+        // Rename and unlink, on files of their own.
+        let hs: Vec<String> = (0..1000).map(|i| format!("/h{i}")).collect();
+        for h in &hs {
+            vfs.open(h, OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, &data[..100]).unwrap();
+        }
+        let mut k = 0;
+        runs += some_failures(
+            7,
+            || {
+                k += 1;
+                vfs.rename(&hs[k], &moved[k])?;
+                vfs.unlink(&moved[k])
+            },
+            |r, injected| _ = ok_or_enomem(&r, injected),
+        );
+        // Truncate and extended attributes, again and again on one file.
+        let f = vfs.open(&hs[999], OpenFlags::WRITE, 0).unwrap();
+        let mut len = 0;
+        runs += some_failures(
+            7,
+            || {
+                len += 1;
+                f.truncate(len)?;
+                f.xattr_set(b"user.a", b"value", osmium_fs::XattrSet::Any)?;
+                f.xattr_remove(b"user.a")
+            },
+            |r, injected| _ = ok_or_enomem(&r, injected),
+        );
+        let dirs: Vec<String> = (0..20_000).map(|i| format!("/m{i}")).collect();
+        let mut d = 0;
+        runs += some_failures(
+            3,
+            || {
+                d += 1;
+                vfs.mkdir(&dirs[d], 0o755)
+            },
+            |r, injected| _ = ok_or_enomem(&r, injected),
+        );
+        assert!(runs > 200, "{runs} allocations");
+    }
+    let out = Command::new(btrfs).args(["check", "--readonly", "--check-data-csum"]).arg(&img).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && !text.contains("ERROR"), "btrfs check:\n{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

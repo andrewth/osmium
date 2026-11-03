@@ -220,7 +220,7 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 | `fs` | osmium-fs | yes | VFS, RamFs, `/dev`, cpio, ext2/ext3/ext4 |
 | `fs-fat` | osmium-fs-fat | yes | FAT12/16/32 (enables `fs`) |
 | `fs-iso9660` | osmium-fs-iso9660 | yes | Read-only ISO 9660 with Rock Ridge and Joliet (enables `fs`) |
-| `fs-btrfs` | osmium-fs-btrfs | yes | Read-only btrfs with subvolumes, checksums and compression (enables `fs`) |
+| `fs-btrfs` | osmium-fs-btrfs | yes | btrfs, read and write, with subvolumes, checksums and compression (enables `fs`) |
 | `proc` | osmium-proc | yes | Processes and the system-call dispatcher (enables `sched`, `fs`, `mm`, `boot`) |
 | `net` | osmium-net | yes | IPv4, IPv6, ARP, ICMP, UDP, TCP, DHCP |
 | `iscsi` | osmium-iscsi | yes | iSCSI initiator: a remote disk over TCP as a `BlockDevice` (enables `net`) |
@@ -714,8 +714,10 @@ let iso = osmium::fs_iso9660::IsoFs::mount(cdrom, 5)?;
 println!("disc {:?}, names from {:?}", iso.volume_id(), iso.names());
 vfs.mount("/cdrom", iso.root())?;
 
-let btrfs = osmium::fs_btrfs::BtrfsFs::mount(ssd, 6)?;            // the default subvolume
+let btrfs = osmium::fs_btrfs::BtrfsFs::mount(ssd, 6)?;            // the default subvolume, read-write if it can be
 let home = osmium::fs_btrfs::BtrfsFs::mount_subvol(ssd2, 7, 257)?; // or one by id (5 is the top level)
+let opts = osmium::fs_btrfs::MountOptions { subvol: None, read_only: true };
+let backup = osmium::fs_btrfs::BtrfsFs::mount_with(ssd3, 8, opts)?; // never written
 vfs.mount("/data", btrfs.root())?;
 ```
 
@@ -737,8 +739,44 @@ in place, so call `sync()` before removing the device. A corrupt layout
 with `EINVAL`. Corrupt metadata found later (a bad checksum, a
 damaged inode or directory record) returns `EIO` for that access.
 
-The btrfs driver (`osmium::fs_btrfs::BtrfsFs`) is read-only. `label()`,
-`fsid()` and `subvol()` describe what was mounted. It checks every tree
+The btrfs driver (`osmium::fs_btrfs::BtrfsFs`) reads and writes. `label()`,
+`fsid()`, `subvol()` and `generation()` describe what was mounted, and
+`is_read_only()` says whether it can be changed.
+
+Writing works in copy-on-write transactions, one for each call. A `write`,
+`truncate`, new or removed name, rename, hard link or extended attribute
+change copies the tree blocks it touches to new places. It brings the extent
+tree, data checksums, block group usage, the free space tree and the root
+items up to date, writes the new blocks, flushes, and then writes the
+superblock. The change is durable when the call returns, so `sync()` has
+nothing to do. A crash at any point leaves the volume as it was before the
+call or as it is after it. A call that fails, including for lack of memory,
+changes nothing. A write that does not fit fails with `ENOSPC` as a whole.
+File data goes to new extents, uncompressed, with checksums unless the file
+has `nodatasum`. Writing into a compressed or inline extent replaces that
+part. New data and metadata chunks (single or DUP, as the volume's existing
+ones are) are added when the block groups fill up. The last 64 metadata
+blocks are kept for calls that free space, so that a full volume can still
+be emptied. A file unlinked while a node of it is open stays readable through
+that node. It is deleted when the last node is dropped, or at the next mount
+if the system goes down first.
+
+Readers see the last commit and are not blocked while a writer works. Space a
+commit frees is not reused until no reader can still be reading it.
+Timestamps come from the global clock unless `set_clock_source` gives one.
+
+A volume mounts read-only when the driver cannot keep it consistent: more than
+one device, quotas, an fsync log to replay, mixed or zoned block groups, no
+skinny metadata, a free space tree that Linux marked invalid, or read-only
+compatible features it does not know. In a subvolume that shares blocks with
+a snapshot, writes fail with `EOPNOTSUPP`, because the driver does not count
+shared references. Read-only subvolumes return `EROFS`. Subvolumes cannot be
+created, renamed or removed. The crate's tests run `btrfs check` after each
+kind of change. They also boot Linux on the images under QEMU, which mounts,
+reads and writes them. Set `OSMIUM_LINUX_KERNEL` and `OSMIUM_LINUX_MODULES`
+to run that part.
+
+On reading, it checks every tree
 block and data sector against its checksum (CRC32C or xxHash64; SHA-256 and
 BLAKE2b volumes fail the mount with `EINVAL`), and reads a block or sector
 that fails from its other copy where the profile keeps one on the device

@@ -51,13 +51,22 @@ pub fn size(ty: u16) -> Option<usize> {
     }
 }
 
+/// The type-`ty` checksum of `data`, zero-padded to the 32 bytes of space
+/// it is stored in.
+pub fn compute(ty: u16, data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    match ty {
+        CRC32C => out.get_mut(..4).into_iter().for_each(|o| o.copy_from_slice(&(!crc32c(!0, data)).to_le_bytes())),
+        XXHASH => out.get_mut(..8).into_iter().for_each(|o| o.copy_from_slice(&xxh64(data, 0).to_le_bytes())),
+        _ => {}
+    }
+    out
+}
+
 /// Whether `stored` begins with the type-`ty` checksum of `data`.
 pub fn matches(ty: u16, data: &[u8], stored: &[u8]) -> bool {
-    match ty {
-        CRC32C => stored.get(..4) == Some(&(!crc32c(!0, data)).to_le_bytes()[..]),
-        XXHASH => stored.get(..8) == Some(&xxh64(data, 0).to_le_bytes()[..]),
-        _ => false,
-    }
+    let Some(n) = size(ty) else { return false };
+    stored.get(..n).is_some_and(|s| compute(ty, data).get(..n) == Some(s))
 }
 
 #[cfg(test)]

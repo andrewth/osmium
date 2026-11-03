@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use osmium_fs::{Errno, File, FileKind, OpenFlags, Vfs};
-use osmium_fs_btrfs::BtrfsFs;
+use osmium_fs_btrfs::{BtrfsFs, MountOptions};
 use osmium_hal::block::{BlockDevice, BlockError};
 
 /// An image file, read on demand in `block`-byte blocks (the images are
@@ -138,8 +138,17 @@ fn image(mkfs: &Path, dir: &Path, src: &Path, args: &[&str]) -> PathBuf {
     img
 }
 
+/// Mounted read-only: these tests check what was on the image.
 fn mount(img: &Path, block: usize) -> BtrfsFs<FileDisk> {
-    BtrfsFs::mount(FileDisk::open(img, block), 9).unwrap()
+    let fs = BtrfsFs::mount_with(FileDisk::open(img, block), 9, RO).unwrap();
+    assert!(fs.is_read_only());
+    fs
+}
+
+const RO: MountOptions = MountOptions { subvol: None, read_only: true };
+
+fn ro_subvol(id: u64) -> MountOptions {
+    MountOptions { subvol: Some(id), read_only: true }
 }
 
 fn read_all(f: &dyn File) -> Vec<u8> {
@@ -242,9 +251,9 @@ fn rejects_non_btrfs() {
     let dir = scratch("reject");
     let img = dir.join("zero");
     std::fs::File::create(&img).unwrap().set_len(1 << 20).unwrap();
-    assert_eq!(BtrfsFs::mount(FileDisk::open(&img, 512), 1).err(), Some(Errno::EINVAL));
+    assert_eq!(BtrfsFs::mount_with(FileDisk::open(&img, 512), 1, RO).err(), Some(Errno::EINVAL));
     std::fs::File::create(&img).unwrap().set_len(4096).unwrap();
-    assert_eq!(BtrfsFs::mount(FileDisk::open(&img, 512), 1).err(), Some(Errno::EINVAL));
+    assert_eq!(BtrfsFs::mount_with(FileDisk::open(&img, 512), 1, RO).err(), Some(Errno::EINVAL));
 }
 
 #[test]
@@ -292,7 +301,7 @@ fn checksums_and_sizes() {
     let dir = scratch("sha256");
     let src = tree(&dir);
     let img = image(&mkfs, &dir, &src, &["--csum", "sha256"]);
-    assert_eq!(BtrfsFs::mount(FileDisk::open(&img, 4096), 1).err(), Some(Errno::EINVAL));
+    assert_eq!(BtrfsFs::mount_with(FileDisk::open(&img, 4096), 1, RO).err(), Some(Errno::EINVAL));
 }
 
 #[test]
@@ -313,18 +322,18 @@ fn subvolumes() {
     assert_ne!(vol.ino, top.ino);
 
     // Mounted by id, the subvolume is the root.
-    let sub = BtrfsFs::mount_subvol(FileDisk::open(&img, 4096), 9, 256).unwrap();
+    let sub = BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, ro_subvol(256)).unwrap();
     let sv = Vfs::new(sub.root());
     assert_eq!(names(&*sv.lookup("/").unwrap()), ["in.txt", "inner"]);
     assert_eq!(sv.stat("/", true).unwrap().ino, 256);
-    assert_eq!(BtrfsFs::mount_subvol(FileDisk::open(&img, 4096), 9, 999).err(), Some(Errno::ENOENT));
+    assert_eq!(BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, ro_subvol(999)).err(), Some(Errno::ENOENT));
 
     // A default subvolume is what `mount` picks.
     let img = image(&mkfs, &dir, &src, &["-u", "default:vol"]);
     let fs = mount(&img, 4096);
     assert_eq!(fs.subvol(), 256);
     assert_eq!(names(&*fs.root()), ["in.txt", "inner"]);
-    let top = BtrfsFs::mount_subvol(FileDisk::open(&img, 4096), 9, 5).unwrap();
+    let top = BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, ro_subvol(5)).unwrap();
     check_tree(&Vfs::new(top.root()), true);
 }
 

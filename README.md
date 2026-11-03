@@ -52,7 +52,7 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | `osmium-http` | Sans-I/O HTTP/1.1 server: strict request parsing (chunked bodies, limits, request-smuggling defences), keep-alive and pipelining, response building. No dependencies | yes |
 | `osmium-fs-ext4` | ext2/ext3/ext4 (read and write) for the `osmium-fs` VFS over any `BlockDevice` | yes |
 | `osmium-fs-iso9660` | read-only ISO 9660 for the `osmium-fs` VFS over any `BlockDevice`: Rock Ridge, Joliet, deep-directory relocation, multi-extent and interleaved files | yes |
-| `osmium-fs-btrfs` | read-only btrfs for the `osmium-fs` VFS over any `BlockDevice`: subvolumes, CRC32C and xxHash64 checksums with fallback to a second copy, zlib, LZO and zstd extents, sparse files, xattrs | yes |
+| `osmium-fs-btrfs` | btrfs (read and write) for the `osmium-fs` VFS over any `BlockDevice`: copy-on-write transactions committed per call, subvolumes, CRC32C and xxHash64 checksums with fallback to a second copy, zlib, LZO and zstd extents read, new chunks as it fills, orphans for open unlinked files | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
 
 The library never defines an entry point, panic handler or global allocator;
