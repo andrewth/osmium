@@ -23,6 +23,7 @@
 extern crate alloc;
 
 mod kernel;
+mod vlpi;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -33,9 +34,6 @@ use osmium::arch::aarch64::{self, psci};
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::arch::{cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
-use osmium::sysdrv::gicv2::GicV2;
-use osmium::sysdrv::gicv3::{CpuInterface, GicV3, SysRegs};
-use osmium::sysdrv::pl011::Pl011;
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::irq::InterruptController;
 use osmium::hal::mmio::IoMem;
@@ -45,6 +43,9 @@ use osmium::mm::paging::formats::Aarch64El2;
 use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sync::{IrqSpinLock, Once};
+use osmium::sysdrv::gicv2::GicV2;
+use osmium::sysdrv::gicv3::{CpuInterface, GicV3, SysRegs};
+use osmium::sysdrv::pl011::Pl011;
 use osmium::virt::aarch64::{self as vm, Aarch64Vcpu};
 use osmium::virt::devices::{GIC_WINDOW, GICD_V3_WINDOW, Uart16550, VirtualGicV2, VirtualGicV3};
 use osmium::virt::smp::GuestCpus;
@@ -757,6 +758,10 @@ extern "C" fn kmain(x0: usize) -> ! {
         regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
     id(&mut pt, gicd, gicd + gicd_len, rw | MapFlags::DEVICE);
     id(&mut pt, gicc, gicc + gicc_len, rw | MapFlags::DEVICE);
+    let its_window = if gic_v3 { vlpi::its_window(&fdt) } else { None };
+    if let Some((base, len)) = its_window {
+        id(&mut pt, base, base + len, rw | MapFlags::DEVICE);
+    }
     enable_mmu(pt.root());
     TTBR0.store(pt.root().0, Ordering::Release);
     println!("[mmu]   EL2 MMU on, TTBR0_EL2 {:#x}; RAM {ram_start:#x}..{ram_end:#x}", pt.root().0);
@@ -823,6 +828,9 @@ extern "C" fn kmain(x0: usize) -> ! {
                 if matches!(gic, PhysGic::V3(_)) {
                     smp_guest_demo(true);
                 }
+            }
+            if matches!(gic, PhysGic::V3(_)) {
+                vlpi::demo(its_window, gicc);
             }
         }
     }

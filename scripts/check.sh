@@ -612,6 +612,28 @@ if command -v qemu-system-aarch64 >/dev/null; then
         '\[smp-guest\] cpu 0: got the SGI in guest code; cpu 1 is off' \
         'SMP GICv3 guest: 2 vCPUs on host CPUs 0 and 1; CPU_ON returned 0, cpu 1 got context 0x1234, IAR 0x1' '\[done\]'
     rm -f "$hyplog"
+    # On a GICv4 host the hypervisor also injects virtual LPIs through the
+    # ITS: an INT while the guest's vPE is not resident leaves the vLPI in its
+    # pending table and rings a physical doorbell LPI; once resident, the
+    # guest takes it, then another raised while it runs, through its CPU
+    # interface without exits. Older QEMUs lack GICv4 emulation under TCG.
+    probe_dir=$(mktemp -d)
+    if qemu-system-aarch64 -machine virt,virtualization=on,gic-version=4,dumpdtb="$probe_dir/v4.dtb" -cpu max -nographic >/dev/null 2>&1; then
+        echo "== boot examples/aarch64-hyp on a GICv4 host under QEMU"
+        hyplog=$(mktemp)
+        run_qemu "aarch64-hyp (GICv4)" "$hyplog" 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=4 -cpu max -smp 2 -m 128M -nographic \
+            -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp
+        expect "aarch64-hyp (GICv4)" "$hyplog" 'physical GICv3 (distributor/redistributors) at' \
+            'vGICv3 guest exit Shutdown: MPIDR 0x80000000' \
+            '\[vlpi\]  GICv4 ITS: vPE 0 on CPU 0.s redistributor; device 0xff00 events 0 and 1 -> vLPIs 8192 and 8193' \
+            '\[vlpi\]  vPE 0 not resident: INT for event 0 left vLPI 8192 in its pending table and rang the doorbell, physical LPI 8[0-9]*' \
+            '\[vlpi\]  guest exit Shutdown: took vLPI 8192 (pending while away) then vLPI 8193 (INT while resident) through ICC_IAR1_EL1' \
+            '\[done\]'
+        rm -f "$hyplog"
+    else
+        echo "== QEMU cannot emulate a GICv4 under TCG; skipping the aarch64-hyp GICv4 boot"
+    fi
+    rm -rf "$probe_dir"
     # The same hypervisor booting the aarch64-virt kernel built above as a
     # two-vCPU EL1 guest (QEMU's loader places the ELF raw in host RAM).
     echo "== boot examples/aarch64-virt as a guest of examples/aarch64-hyp under QEMU"

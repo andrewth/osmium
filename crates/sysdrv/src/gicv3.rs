@@ -12,13 +12,14 @@
 //! tables are handed to each redistributor by [`GicV3::enable_lpis`], and
 //! [`its`] drives the interrupt translation service that turns a device's
 //! MSI write into one. [`InterruptController::claim`] returns LPIs like any
-//! other interrupt.
+//! other interrupt. [`v4`] adds GICv4.0 virtual LPIs.
 //!
 //! Not implemented: group 0 and secure-state configuration. The driver
 //! assumes it runs in the non-secure state at EL1 (or higher).
 
 pub mod its;
 pub mod lpi;
+pub mod v4;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 

@@ -4,27 +4,27 @@ use crate::iommu::testing::{HostDma, HostRegs, Pump, StdClock, mem64};
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
-const ITS_PHYS: u64 = 0x808_0000;
+pub(crate) const ITS_PHYS: u64 = 0x808_0000;
 
 /// `GITS_TYPER` of the fake: physical LPIs, 8-byte ITT entries, 16 event
 /// and 16 device ID bits.
-const TYPER: u64 = TYPER_PHYSICAL | 7 << 4 | 15 << 8 | 15 << 13;
+pub(crate) const TYPER: u64 = TYPER_PHYSICAL | 7 << 4 | 15 << 8 | 15 << 13;
 
 /// A fake ITS: a thread consumes the command queue and records commands.
-struct FakeIts {
-    regs: HostRegs,
+pub(crate) struct FakeIts {
+    pub(crate) regs: HostRegs,
     cmds: Arc<Mutex<Vec<cmd::Command>>>,
     _pump: Pump,
 }
 
 #[derive(Clone, Copy, Default)]
-struct Quirks {
+pub(crate) struct Quirks {
     /// Stall at a command with this code.
-    stall_on: Option<u64>,
+    pub(crate) stall_on: Option<u64>,
 }
 
 impl FakeIts {
-    fn new(typer: u64, quirks: Quirks) -> Self {
+    pub(crate) fn new(typer: u64, quirks: Quirks) -> Self {
         let regs = HostRegs::new(ITS_REGS_LEN);
         regs.w64(GITS_TYPER, typer);
         regs.w32(GITS_CTLR, CTLR_QUIESCENT);
@@ -59,11 +59,16 @@ impl FakeIts {
         Self { regs, cmds, _pump: pump }
     }
 
-    fn its<'d>(&self, dma: &'d HostDma, clock: &'d StdClock, config: ItsConfig) -> Result<Its<'d, HostDma>, ItsError> {
+    pub(crate) fn its<'d>(
+        &self,
+        dma: &'d HostDma,
+        clock: &'d StdClock,
+        config: ItsConfig,
+    ) -> Result<Its<'d, HostDma>, ItsError> {
         Its::new(self.regs.io(), PhysAddr::new(ITS_PHYS), dma, clock, config)
     }
 
-    fn take(&self) -> Vec<cmd::Command> {
+    pub(crate) fn take(&self) -> Vec<cmd::Command> {
         core::mem::take(&mut *self.cmds.lock().unwrap())
     }
 }

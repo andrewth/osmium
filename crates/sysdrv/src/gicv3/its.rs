@@ -24,7 +24,8 @@
 //!   withdraw an event as if the device had written it.
 //!
 //! Every command batch ends with a `SYNC` (or `VSYNC`) and is waited for,
-//! so on return the ITS has acted on it.
+//! so on return the ITS has acted on it. GICv4 virtual LPIs (`VMAPP`,
+//! `VMAPTI`, `VMOVP`, ...) are in [`super::v4`].
 //!
 //! Not implemented: two-level (indirect) device tables, so the device table
 //! is flat and its size bounds the device IDs; recovery from a stalled
@@ -139,6 +140,8 @@ pub enum ItsError {
     BadEvent,
     /// The collection ID is out of range or not mapped.
     BadCollection,
+    /// The vPE ID is beyond the vPE table.
+    BadVpe,
     /// [`MAX_DEVICES`] devices are already added.
     TooManyDevices,
     /// An LPI table operation failed (none free, for one).
@@ -818,4 +821,4 @@ fn wait(clock: &dyn Clock, mut done: impl FnMut() -> bool) -> Result<(), ItsErro
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
