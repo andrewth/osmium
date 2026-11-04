@@ -366,9 +366,17 @@ fn fills_up_and_frees() {
             let data = pattern(4 << 20, i as u8);
             let f = vfs.open(&path, OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
             match f.write(0, &data) {
-                Ok(_) => {
+                Ok(n) if n == data.len() => {
                     model.insert(path, Want::File(data));
                     i += 1;
+                }
+                Ok(n) => {
+                    // A short write: what fit is there, and nothing more does.
+                    assert!(n % 4096 == 0 && n < data.len());
+                    assert_eq!(f.stat().size, n as u64);
+                    assert_eq!(f.write(n as u64, &data[n..]).err(), Some(Errno::ENOSPC));
+                    model.insert(path, Want::File(data[..n].to_vec()));
+                    break;
                 }
                 Err(Errno::ENOSPC) => {
                     model.insert(path, Want::File(Vec::new()));
@@ -624,4 +632,144 @@ fn removed_open_directory_takes_no_new_names() {
     check(&img);
     let fs = mount(&img);
     assert_eq!(names(&*fs.root()), ["f"]);
+}
+
+/// More hard links than the `INODE_REF` item of one directory can hold: the
+/// rest are `INODE_EXTREF`s, which unlink and rename must find again.
+#[test]
+fn many_hard_links() {
+    let dir = scratch("links");
+    let Some(img) = mkfs(&dir, 128 << 20, &["-n", "4096"]) else { return };
+    let mut model = Model::new();
+    let name = |i: usize| format!("{i:03}-{}", "n".repeat(200));
+    let data = pattern(10_000, 5);
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        for d in ["/d", "/e"] {
+            vfs.mkdir(d, 0o755).unwrap();
+            model.insert(d.into(), Want::Dir);
+        }
+        put(&vfs, "/d/first", &data);
+        model.insert("/d/first".into(), Want::File(data.clone()));
+        for i in 0..120 {
+            let p = format!("/d/{}", name(i));
+            vfs.link("/d/first", &p).unwrap();
+            model.insert(p, Want::File(data.clone()));
+        }
+        for i in 0..5 {
+            let p = format!("/e/{}", name(i));
+            vfs.link("/d/first", &p).unwrap();
+            model.insert(p, Want::File(data.clone()));
+        }
+        assert_eq!(vfs.stat("/d/first", true).unwrap().nlink, 126);
+    }
+    verify(&dir, &img, &model);
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        // Rename links stored both ways, within and across directories.
+        for (from, to) in [(3usize, "/d/renamed-a"), (100, "/e/renamed-b"), (119, "/d/renamed-c")] {
+            let old = format!("/d/{}", name(from));
+            vfs.rename(&old, to).unwrap();
+            let v = model.remove(&old).unwrap();
+            model.insert(to.into(), v);
+        }
+        for i in (0..120).step_by(3).chain([1, 2, 118]) {
+            let p = format!("/d/{}", name(i));
+            if model.remove(&p).is_some() {
+                vfs.unlink(&p).unwrap();
+            }
+        }
+        // Names freed from the `INODE_REF` item are reused.
+        for i in 200..210 {
+            let p = format!("/d/{}", name(i));
+            vfs.link("/e/renamed-b", &p).unwrap();
+            model.insert(p, Want::File(data.clone()));
+        }
+        // Renaming one link of a file to another does nothing, as POSIX says.
+        vfs.rename("/d/renamed-a", &format!("/d/{}", name(110))).unwrap();
+        let n = model.values().filter(|v| matches!(v, Want::File(_))).count();
+        assert_eq!(vfs.stat("/d/first", true).unwrap().nlink as usize, n);
+    }
+    verify(&dir, &img, &model);
+    {
+        // Remove every link; the last one frees the inode.
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        let files: Vec<_> = model.iter().filter(|(_, v)| matches!(v, Want::File(_))).map(|(k, _)| k.clone()).collect();
+        for k in files {
+            vfs.unlink(&k).unwrap();
+            model.remove(&k);
+        }
+    }
+    verify(&dir, &img, &model);
+}
+
+/// The file tree's data extent items, from `btrfs inspect-internal dump-tree`.
+fn extents(img: &Path) -> Vec<String> {
+    let out = Command::new(tool("btrfs").unwrap())
+        .args(["inspect-internal", "dump-tree", "-t", "5"])
+        .arg(img)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("EXTENT_DATA") || l.contains("disk byte"))
+        .map(|l| l.trim().split(" itemoff").next().unwrap().to_string())
+        .collect()
+}
+
+/// A nodatacow file is overwritten where it lies: its extents stay as they
+/// were. A file that is copy on write gets new ones.
+#[test]
+fn nodatacow_overwrites_in_place() {
+    let dir = scratch("nocow");
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("cow")).unwrap();
+    let Some(img) = mkfs(&dir, 64 << 20, &["--rootdir", src.to_str().unwrap(), "--inode-flags", "nodatacow:cow"])
+    else {
+        return;
+    };
+    let mut model = Model::new();
+    model.insert("/cow".into(), Want::Dir);
+    let mut a = pattern(300_000, 1);
+    let mut plain = pattern(300_000, 2);
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        put(&vfs, "/cow/a", &a);
+        put(&vfs, "/plain", &plain);
+    }
+    let before = extents(&img);
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        for (off, len) in [(0usize, 10), (5000, 20_000), (4095, 2), (299_990, 10)] {
+            let patch = pattern(len, off as u8 ^ 0x55);
+            a[off..off + len].copy_from_slice(&patch);
+            plain[off..off + len].copy_from_slice(&patch);
+            assert_eq!(vfs.open("/cow/a", OpenFlags::WRITE, 0).unwrap().write(off as u64, &patch).unwrap(), len);
+            assert_eq!(vfs.open("/plain", OpenFlags::WRITE, 0).unwrap().write(off as u64, &patch).unwrap(), len);
+        }
+        assert_eq!(cat(&vfs, "/cow/a"), a);
+    }
+    let after = extents(&img);
+    // The extent items of the first file (in /cow) and the second.
+    let split = |t: &[String]| -> (Vec<String>, Vec<String>) {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        let first = t.first().and_then(|l| l.split("key (").nth(1)?.split(' ').next()).unwrap().to_string();
+        for l in t {
+            if l.contains(&format!("key ({first} ")) { x.push(l.clone()) } else { y.push(l.clone()) }
+        }
+        (x, y)
+    };
+    let (b_cow, b_plain) = split(&before);
+    let (a_cow, a_plain) = split(&after);
+    assert!(!b_cow.is_empty() && !b_plain.is_empty());
+    assert_eq!(b_cow, a_cow, "nodatacow file's extents changed");
+    assert_ne!(b_plain, a_plain, "cow file's extents did not change");
+    model.insert("/cow/a".into(), Want::File(a));
+    model.insert("/plain".into(), Want::File(plain));
+    verify(&dir, &img, &model);
 }

@@ -234,6 +234,21 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             Some(d) => with(&d, &e)?,
             None => e,
         };
+        if ITEM + d.len() <= self.leaf_space() {
+            return self.put(t, key, &d);
+        }
+        // The `INODE_REF` item is full: the name goes in an `INODE_EXTREF`.
+        let mut x = Vec::new();
+        x.try_reserve_exact(18 + name.len()).map_err(|_| Errno::ENOMEM)?;
+        x.extend_from_slice(&parent.to_le_bytes());
+        x.extend_from_slice(&idx.to_le_bytes());
+        x.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        x.extend_from_slice(name);
+        let key = Key::new(ino, item::INODE_EXTREF, extref_hash(parent, name));
+        let d = match self.find(t, key)? {
+            Some(d) => with(&d, &x)?,
+            None => x,
+        };
         if ITEM + d.len() > self.leaf_space() {
             return Err(Errno::EMLINK);
         }
@@ -308,7 +323,12 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         if matches!(kind, FileKind::CharDevice | FileKind::BlockDevice) {
             put64(&mut d, ino::RDEV, kernel_rdev(rdev))?;
         }
-        put64(&mut d, ino::FLAGS, le64(&parent, ino::FLAGS)? & INHERITED)?;
+        let mut flags = le64(&parent, ino::FLAGS)? & INHERITED;
+        if flags & disk::INODE_NODATACOW != 0 && kind == FileKind::Regular {
+            // As Linux: a nodatacow file has no checksums either.
+            flags |= disk::INODE_NODATASUM;
+        }
+        put64(&mut d, ino::FLAGS, flags)?;
         for at in [ino::ATIME, ino::CTIME, ino::MTIME, ino::OTIME] {
             put_time(&mut d, at, now)?;
         }
@@ -558,11 +578,32 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     /// Writes `buf` (whole sectors) as new extents at file offset `at` of
     /// `ino`, replacing what was there; returns bytes added to `nbytes`
     /// less those dropped.
-    fn put_extents(&mut self, t: u64, ino: u64, mut at: u64, mut buf: &[u8], sums: bool) -> Result<i64, Errno> {
+    fn put_extents(&mut self, t: u64, ino: u64, at: u64, buf: &[u8], sums: bool) -> Result<i64, Errno> {
+        match self.put_extents_part(t, ino, at, buf, sums)? {
+            (delta, done) if done == buf.len() as u64 => Ok(delta),
+            _ => Err(Errno::ENOSPC),
+        }
+    }
+
+    /// As `put_extents`, but if data space runs out, stops there: returns the
+    /// `nbytes` change and the bytes of `buf` written.
+    fn put_extents_part(
+        &mut self,
+        t: u64,
+        ino: u64,
+        mut at: u64,
+        mut buf: &[u8],
+        sums: bool,
+    ) -> Result<(i64, u64), Errno> {
         let (ss, cs) = (self.sh.sectorsize, self.sh.csum_size);
         let mut delta = 0i64;
+        let total = buf.len() as u64;
         while !buf.is_empty() {
-            let (start, got) = self.alloc_data(buf.len() as u64)?;
+            let (start, got) = match self.alloc_data(buf.len() as u64) {
+                Ok(r) => r,
+                Err(Errno::ENOSPC) => break,
+                Err(e) => return Err(e),
+            };
             let (data, rest) = buf.split_at_checked(got as usize).ok_or(Errno::EIO)?;
             let chunks = self.new_chunks.as_ref().unwrap_or(&self.base.chunks);
             self.sh.write_logical(chunks, start, data)?;
@@ -588,7 +629,37 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             at += got;
             buf = rest;
         }
-        Ok(delta)
+        Ok((delta, total - buf.len() as u64))
+    }
+
+    /// Where on disk file range `a..e` of `ino` can be overwritten in place:
+    /// it lies in one plain regular extent that only this file refers to, and
+    /// that no snapshot can share.
+    fn nocow_target(&mut self, t: u64, ino: u64, a: u64, e: u64) -> Result<Option<u64>, Errno> {
+        let Some((k, d)) = self.prev_item(t, Key::new(ino, item::EXTENT_DATA, a))? else { return Ok(None) };
+        if k.objectid != ino || k.ty != item::EXTENT_DATA || d.len() < 53 {
+            return Ok(None);
+        }
+        // Regular, and not compressed, encrypted or otherwise encoded.
+        if byte(&d, 20)? != 1 || byte(&d, 16)? != 0 || byte(&d, 17)? != 0 || le16(&d, 18)? != 0 {
+            return Ok(None);
+        }
+        let (bytenr, disk_len, off, num) = (le64(&d, 21)?, le64(&d, 29)?, le64(&d, 37)?, le64(&d, 45)?);
+        let end = k.offset.checked_add(num).ok_or(Errno::EIO)?;
+        let snapshot = self.root(t)?.last_snapshot;
+        if bytenr == 0 || a < k.offset || e > end || (snapshot != 0 && le64(&d, 0)? <= snapshot) {
+            return Ok(None);
+        }
+        if self.data_refs.iter().any(|r| r.bytenr == bytenr) {
+            return Ok(None);
+        }
+        // Exactly one reference to the extent: ours.
+        let Some(x) = self.find(tree::EXTENT, Key::new(bytenr, item::EXTENT_ITEM, disk_len))? else { return Ok(None) };
+        if le64(&x, 0)? != 1 {
+            return Ok(None);
+        }
+        let at = off.checked_add(a - k.offset).ok_or(Errno::EIO)?;
+        Ok(bytenr.checked_add(at))
     }
 
     /// Reads committed bytes of the file into `buf` (zeroes past its end).
@@ -628,7 +699,9 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         }
         let end = off.checked_add(data.len() as u64).filter(|&e| e <= i64::MAX as u64).ok_or(Errno::EFBIG)?;
         let ss = self.sh.sectorsize;
-        let sums = le64(&d, ino::FLAGS)? & disk::INODE_NODATASUM == 0;
+        let flags = le64(&d, ino::FLAGS)?;
+        let sums = flags & disk::INODE_NODATASUM == 0;
+        let nocow = !sums && flags & disk::INODE_NODATACOW != 0;
         let mut nbytes = le64(&d, ino::NBYTES)? as i64 + self.uninline(t, ino, !sums)?;
         let mut pos = off;
         while pos < end {
@@ -647,14 +720,35 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             }
             let src = data.get((pos - off) as usize..(piece_end - off) as usize).ok_or(Errno::EIO)?;
             buf.get_mut((pos - a) as usize..(piece_end - a) as usize).ok_or(Errno::EIO)?.copy_from_slice(src);
-            nbytes += self.put_extents(t, ino, a, &buf, sums)?;
-            pos = piece_end;
+            let target = if nocow { self.nocow_target(t, ino, a, e)? } else { None };
+            let done = if let Some(addr) = target {
+                // Overwritten where it lies: no new extent, no new space.
+                let chunks = self.new_chunks.as_ref().unwrap_or(&self.base.chunks);
+                self.sh.write_logical(chunks, addr, &buf)?;
+                e - a
+            } else {
+                let (delta, done) = self.put_extents_part(t, ino, a, &buf, sums)?;
+                nbytes += delta;
+                done
+            };
+            let reached = a.saturating_add(done).min(piece_end);
+            if reached <= pos {
+                if pos == off {
+                    return Err(Errno::ENOSPC);
+                }
+                break;
+            }
+            pos = reached;
+            if done < e - a {
+                // Out of space: a short write.
+                break;
+            }
         }
-        put64(&mut d, ino::SIZE, size.max(end))?;
+        put64(&mut d, ino::SIZE, size.max(pos))?;
         put64(&mut d, ino::NBYTES, nbytes.max(0) as u64)?;
         self.stamp(&mut d, true)?;
         self.set_inode(t, ino, &d)?;
-        Ok(data.len())
+        Ok((pos - off) as usize)
     }
 
     /// A symbolic link's target: written once, whole, at offset 0, inline.
