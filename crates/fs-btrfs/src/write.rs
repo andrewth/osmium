@@ -138,6 +138,9 @@ pub struct Tx<'a, D: BlockDevice + Send + 'static> {
     /// Inodes this transaction made orphans, and orphans it deleted.
     pub(crate) orphans_added: Vec<(u64, u64)>,
     pub(crate) orphans_removed: Vec<(u64, u64)>,
+    /// Write the superblock even if no block changed (the replay of a log
+    /// that left the trees as they were).
+    pub(crate) force: bool,
 }
 
 /// The key just after `k`.
@@ -174,6 +177,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             frees: false,
             orphans_added: Vec::new(),
             orphans_removed: Vec::new(),
+            force: false,
         }
     }
 

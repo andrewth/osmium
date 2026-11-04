@@ -520,7 +520,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         if !settled {
             return Err(Errno::EIO);
         }
-        if self.dirty.is_empty() && self.allocs.is_empty() {
+        if self.dirty.is_empty() && self.allocs.is_empty() && !self.force {
             return Ok(());
         }
 

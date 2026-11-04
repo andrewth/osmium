@@ -21,7 +21,7 @@ const INHERITED: u64 = 1 << 0 | 1 << 1;
 const FT_XATTR: u8 = 8;
 
 /// Offsets in an inode item.
-mod ino {
+pub(crate) mod ino {
     pub const GENERATION: usize = 0;
     pub const TRANSID: usize = 8;
     pub const SIZE: usize = 16;
@@ -57,7 +57,7 @@ fn put_time(b: &mut [u8], at: usize, t: Timestamp) -> Result<(), Errno> {
 }
 
 /// A directory entry or extended attribute as stored.
-fn entry(location: Key, transid: u64, name: &[u8], data: &[u8], ft: u8) -> Result<Vec<u8>, Errno> {
+pub(crate) fn entry(location: Key, transid: u64, name: &[u8], data: &[u8], ft: u8) -> Result<Vec<u8>, Errno> {
     let mut e = Vec::new();
     e.try_reserve_exact(30 + name.len() + data.len()).map_err(|_| Errno::ENOMEM)?;
     e.extend_from_slice(&crate::node::key_bytes(&location));
@@ -72,9 +72,9 @@ fn entry(location: Key, transid: u64, name: &[u8], data: &[u8], ft: u8) -> Resul
 
 /// The packed entries of a dir or xattr item: each one's range and name.
 /// An entry's start and end in its item, and its name.
-type Entry<'d> = (usize, usize, &'d [u8]);
+pub(crate) type Entry<'d> = (usize, usize, &'d [u8]);
 
-fn entries(d: &[u8]) -> Result<Vec<Entry<'_>>, Errno> {
+pub(crate) fn entries(d: &[u8]) -> Result<Vec<Entry<'_>>, Errno> {
     let mut v = Vec::new();
     let mut p = 0;
     while p < d.len() {
@@ -88,7 +88,7 @@ fn entries(d: &[u8]) -> Result<Vec<Entry<'_>>, Errno> {
 }
 
 /// `d` without bytes `from..to`.
-fn without(d: &[u8], from: usize, to: usize) -> Result<Vec<u8>, Errno> {
+pub(crate) fn without(d: &[u8], from: usize, to: usize) -> Result<Vec<u8>, Errno> {
     let mut v = Vec::new();
     v.try_reserve_exact(d.len() - (to - from)).map_err(|_| Errno::ENOMEM)?;
     v.extend_from_slice(d.get(..from).ok_or(Errno::EIO)?);
@@ -97,7 +97,7 @@ fn without(d: &[u8], from: usize, to: usize) -> Result<Vec<u8>, Errno> {
 }
 
 /// `d` with `more` after it.
-fn with(d: &[u8], more: &[u8]) -> Result<Vec<u8>, Errno> {
+pub(crate) fn with(d: &[u8], more: &[u8]) -> Result<Vec<u8>, Errno> {
     let mut v = Vec::new();
     v.try_reserve_exact(d.len() + more.len()).map_err(|_| Errno::ENOMEM)?;
     v.extend_from_slice(d);
@@ -106,7 +106,7 @@ fn with(d: &[u8], more: &[u8]) -> Result<Vec<u8>, Errno> {
 }
 
 /// An inode's `INODE_EXTREF` key offset for `name` in `parent`.
-fn extref_hash(parent: u64, name: &[u8]) -> u64 {
+pub(crate) fn extref_hash(parent: u64, name: &[u8]) -> u64 {
     csum::crc32c(parent as u32, name) as u64
 }
 
@@ -126,7 +126,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         Ok(d)
     }
 
-    fn set_inode(&mut self, t: u64, ino: u64, d: &[u8]) -> Result<(), Errno> {
+    pub(crate) fn set_inode(&mut self, t: u64, ino: u64, d: &[u8]) -> Result<(), Errno> {
         self.update(t, Key::new(ino, item::INODE_ITEM, 0), d)
     }
 
@@ -223,7 +223,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     }
 
     /// Records that `ino` is called `name` in `parent`, at index `idx`.
-    fn inode_ref_add(&mut self, t: u64, ino: u64, parent: u64, idx: u64, name: &[u8]) -> Result<(), Errno> {
+    pub(crate) fn inode_ref_add(&mut self, t: u64, ino: u64, parent: u64, idx: u64, name: &[u8]) -> Result<(), Errno> {
         let mut e = Vec::new();
         e.try_reserve_exact(10 + name.len()).map_err(|_| Errno::ENOMEM)?;
         e.extend_from_slice(&idx.to_le_bytes());
@@ -241,7 +241,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     }
 
     /// Forgets that `ino` is called `name` in `parent`; returns its index.
-    fn inode_ref_del(&mut self, t: u64, ino: u64, parent: u64, name: &[u8]) -> Result<u64, Errno> {
+    pub(crate) fn inode_ref_del(&mut self, t: u64, ino: u64, parent: u64, name: &[u8]) -> Result<u64, Errno> {
         let key = Key::new(ino, item::INODE_REF, parent);
         if let Some(d) = self.find(t, key)? {
             let mut p = 0;
@@ -484,7 +484,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
 
     /// Takes the file range `p..q` out of inode `ino`'s extents, trimming or
     /// splitting those that cross its ends; returns the bytes it held.
-    fn drop_extents(&mut self, t: u64, ino: u64, p: u64, q: u64) -> Result<u64, Errno> {
+    pub(crate) fn drop_extents(&mut self, t: u64, ino: u64, p: u64, q: u64) -> Result<u64, Errno> {
         let mut removed = 0;
         let ours = |k: &Key| k.objectid == ino && k.ty == item::EXTENT_DATA;
         // One that starts before `p`.
@@ -542,7 +542,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn data_ref(
+    pub(crate) fn data_ref(
         &mut self,
         bytenr: u64,
         len: u64,

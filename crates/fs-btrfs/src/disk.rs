@@ -36,6 +36,8 @@ pub mod tree {
     pub const BLOCK_GROUP: u64 = 11;
     /// Objectid of orphan items (`-5`).
     pub const ORPHAN: u64 = -5i64 as u64;
+    /// The tree of fsync log roots, whose items point at each subvolume's log (`-6`).
+    pub const LOG: u64 = -6i64 as u64;
     /// The chunk tree's items live under this objectid.
     pub const FIRST_CHUNK: u64 = 256;
     /// The data checksum tree.
