@@ -242,6 +242,49 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         Ok(b)
     }
 
+    /// Reads every item of the tree rooted at `root` (in key order) into
+    /// `items`, and the address of each of its blocks into `blocks`.
+    pub(crate) fn read_tree(
+        &self,
+        chunks: &ChunkMap,
+        root: (u64, u8),
+        items: &mut Vec<(Key, Vec<u8>)>,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), Errno> {
+        if root.1 >= MAX_LEVEL {
+            return Err(Errno::EIO);
+        }
+        let start = items.len();
+        self.read_subtree(chunks, root.0, root.1, items, blocks)?;
+        // Keys must ascend, or the tree is not what it claims to be.
+        let read = items.get(start..).ok_or(Errno::EIO)?;
+        if read.windows(2).any(|w| w.first().map(|a| a.0) >= w.get(1).map(|b| b.0)) {
+            return Err(Errno::EIO);
+        }
+        Ok(())
+    }
+
+    fn read_subtree(
+        &self,
+        chunks: &ChunkMap,
+        addr: u64,
+        want: u8,
+        items: &mut Vec<(Key, Vec<u8>)>,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), Errno> {
+        let b = self.block_at(chunks, addr, want)?;
+        try_push(blocks, addr)?;
+        for slot in 0..nritems(&b) {
+            if want == 0 {
+                try_push(items, (slot_key(&b, slot)?, osmium_sync::fallible::try_to_vec(item_data(&b, slot)?)?))?;
+            } else {
+                let below = want.checked_sub(1).ok_or(Errno::EIO)?;
+                self.read_subtree(chunks, child(&b, slot)?, below, items, blocks)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The data of the item with exactly `key` in the tree rooted at `root`.
     pub(crate) fn lookup<R>(
         &self,

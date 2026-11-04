@@ -201,6 +201,9 @@ pub struct Tx<'a, D: BlockDevice + Send + 'static> {
     pend: Vec<(u64, i64, bool)>,
     /// Blocks to flag `FULL_BACKREF` in the extent tree: address and level.
     pub(crate) flag_ops: Vec<(u64, u8)>,
+    /// Write the superblock even if no block changed (the replay of a log
+    /// that left the trees as they were).
+    pub(crate) force: bool,
 }
 
 /// What the children of a block refer to it by.
@@ -250,6 +253,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             defer: false,
             pend: Vec::new(),
             flag_ops: Vec::new(),
+            force: false,
         }
     }
 

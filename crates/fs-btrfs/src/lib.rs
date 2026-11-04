@@ -36,8 +36,15 @@
 //! fill up. Unlinked files that are still open are kept as orphans and
 //! deleted when their last node goes, or at the next mount.
 //!
+//! A volume with an fsync log (what Linux leaves after a crash that follows
+//! an `fsync`) has the log replayed into the subvolume trees at mount, in a
+//! transaction that also clears the log, so that what was fsynced is there and
+//! the volume is writable; mounted with [`MountOptions::read_only`] the log is
+//! left alone and not visible. A log this cannot replay leaves the volume
+//! read-only with the log untouched.
+//!
 //! A volume is mounted read-only (see [`BtrfsFs::is_read_only`]) if it spans
-//! several devices, has quotas, an fsync log to replay, mixed or zoned block
+//! several devices, has quotas, mixed or zoned block
 //! groups, no skinny metadata, a free space tree Linux marked invalid, or
 //! read-only compatible features this driver does not know. Writing in a
 //! subvolume is `EROFS` if it is read-only.
@@ -75,7 +82,7 @@
 //! Not supported: file systems over several devices (only the copies on the
 //! device given are read, and striped chunks, RAID0, RAID10, RAID5 and RAID6,
 //! fail with `EIO`); SHA-256 and BLAKE2b checksums; `extent-tree-v2` and the
-//! RAID stripe tree; replaying the fsync log; send/receive; changing a
+//! RAID stripe tree; send/receive; changing a
 //! subvolume's read-only flag or the default subvolume; and encrypted or
 //! verity files.
 #![no_std]
@@ -96,6 +103,7 @@ mod node;
 mod ops;
 mod refs;
 mod snap;
+mod replay;
 mod space;
 mod tree;
 mod write;
@@ -384,7 +392,6 @@ fn read_only_reason(sb: &[u8], st: &State, quota: bool, block_size: usize, secto
         || fst_invalid
         || incompat & unwritable_incompat != 0
         || incompat & disk::incompat::SKINNY_METADATA == 0
-        || disk::le64(sb, 96)? != 0
         || disk::le64(sb, 136)? != 1
         || quota
         || odd_chunks
@@ -519,6 +526,7 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
         shared.top = top;
         shared.fs_root(&st, top)?.ok_or(Errno::ENOENT)?;
 
+        let (log_root, log_level) = (disk::le64(&b, 96)?, disk::byte(&b, 200)?);
         let quota = shared.tree_root(&st, disk::tree::QUOTA)?.is_some();
         if !opts.read_only && !read_only_reason(&b, &st, quota, block_size, shared.sectorsize)? {
             let compat_ro = disk::le64(&b, 180)?;
@@ -544,6 +552,17 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             }));
         }
         shared.state = SpinLock::new(try_arc(st)?);
+        // An fsync log is replayed into the trees; if that fails the volume
+        // is read-only and the log stays where it is.
+        if log_root != 0 {
+            let replayed = match &shared.writer {
+                Some(w) => shared.replay_log(&mut w.lock(), log_root, log_level).is_ok(),
+                None => true,
+            };
+            if !replayed {
+                shared.writer = None;
+            }
+        }
         let shared = try_arc(shared)?;
         shared.delete_orphans(top);
         shared.drop_dead_roots();
@@ -940,6 +959,59 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     /// transaction.
     fn drop_dead_root(&self, id: u64) -> Result<(), Errno> {
         while !self.transact(|tx| tx.drop_tree(id))? {}
+        Ok(())
+    }
+
+    /// Replays the fsync log whose root block is at `log_root` into the
+    /// subvolume trees, and commits with the log cleared.
+    fn replay_log(&self, w: &mut Writer, log_root: u64, level: u8) -> Result<(), Errno> {
+        let st = self.state();
+        let mut roots = Vec::new();
+        let mut blocks = Vec::new();
+        self.read_tree(&st.chunks, (log_root, level), &mut roots, &mut blocks)?;
+        let mut logs = Vec::new();
+        for (k, d) in &roots {
+            let id = k.offset;
+            let fs_tree = id == disk::tree::FS || (disk::tree::FIRST_FREE..=disk::tree::LAST_FREE).contains(&id);
+            if k.objectid != disk::tree::LOG || k.ty != item::ROOT_ITEM || !fs_tree {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let root = Root::parse(d, id)?;
+            if root.bytenr == 0 {
+                continue;
+            }
+            let mut items = Vec::new();
+            self.read_tree(&st.chunks, (root.bytenr, root.level), &mut items, &mut blocks)?;
+            try_push(&mut logs, replay::LogTree { id, items })?;
+        }
+        // The log's blocks were never in the extent tree, so they look free;
+        // they stay out of reach until the replay is committed.
+        let size = self.nodesize as u64;
+        let mut held = Vec::new();
+        for &b in &blocks {
+            let free = w.group_mut(b).is_some_and(|g| g.free.iter().any(|&(s, l)| s <= b && b + size <= s + l));
+            if free {
+                if let Some(g) = w.group_mut(b) {
+                    space::carve(&mut g.free, b, size)?;
+                }
+                try_push(&mut w.limbo, (b, size))?;
+                try_push(&mut held, b)?;
+            }
+        }
+        self.transact_locked(w, |tx| {
+            disk::put64(&mut tx.w.sb, 96, 0)?;
+            disk::put64(&mut tx.w.sb, 104, 0)?;
+            disk::put(&mut tx.w.sb, 200, &[0])?;
+            tx.replay_log(&logs)
+        })?;
+        for b in held {
+            if let Some(i) = w.limbo.iter().position(|&r| r == (b, size)) {
+                w.limbo.swap_remove(i);
+            }
+            if let Some(g) = w.group_mut(b) {
+                let _ = g.give(b, size);
+            }
+        }
         Ok(())
     }
 
