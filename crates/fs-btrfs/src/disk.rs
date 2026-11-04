@@ -389,6 +389,9 @@ impl Root {
 /// Inode flag: data has no checksums.
 pub const INODE_NODATASUM: u64 = 1 << 0;
 
+/// Inode flag: data is overwritten in place, not copied on write.
+pub const INODE_NODATACOW: u64 = 1 << 1;
+
 /// An inode item.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Inode {
