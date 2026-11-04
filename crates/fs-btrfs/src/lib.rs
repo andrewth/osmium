@@ -40,9 +40,21 @@
 //! several devices, has quotas, an fsync log to replay, mixed or zoned block
 //! groups, no skinny metadata, a free space tree Linux marked invalid, or
 //! read-only compatible features this driver does not know. Writing in a
-//! subvolume that shares blocks with a snapshot fails with `EOPNOTSUPP`, as
-//! does dropping a data extent another subvolume shares; read-only
-//! subvolumes are `EROFS`.
+//! subvolume is `EROFS` if it is read-only.
+//!
+//! Subvolumes and snapshots: [`BtrfsFs::create_subvolume`],
+//! [`BtrfsFs::create_snapshot`] (writable or read-only, of any subvolume,
+//! including into itself) and [`BtrfsFs::delete_subvolume`], with the root
+//! tree's `ROOT_REF`/`ROOT_BACKREF` items, the directory entries and the UUID
+//! tree kept. A snapshot shares every block with its source; the extent tree
+//! counts the references as Linux does, by tree (`TREE_BLOCK_REF`,
+//! `EXTENT_DATA_REF`) and, once one side has copied a shared block, by the
+//! block that holds them (`SHARED_BLOCK_REF`, `SHARED_DATA_REF`, with the
+//! block flagged `FULL_BACKREF`), so that either side can be written or
+//! deleted in any order. Deleting a subvolume unlinks it in one commit and
+//! drops its tree in further ones, a few hundred blocks each, remembering where
+//! it stopped in the root item (`drop_progress`) so that a crash, the next mount
+//! or Linux can finish.
 //!
 //! Readers see the last commit: each call takes the current state, and the
 //! space a commit frees is not reused until no reader can still be reading it.
@@ -63,8 +75,9 @@
 //! Not supported: file systems over several devices (only the copies on the
 //! device given are read, and striped chunks, RAID0, RAID10, RAID5 and RAID6,
 //! fail with `EIO`); SHA-256 and BLAKE2b checksums; `extent-tree-v2` and the
-//! RAID stripe tree; replaying the fsync log; creating subvolumes or
-//! snapshots; and encrypted or verity files.
+//! RAID stripe tree; replaying the fsync log; send/receive; changing a
+//! subvolume's read-only flag or the default subvolume; and encrypted or
+//! verity files.
 #![no_std]
 
 extern crate alloc;
@@ -81,6 +94,8 @@ mod lzo;
 mod lzo_comp;
 mod node;
 mod ops;
+mod refs;
+mod snap;
 mod space;
 mod tree;
 mod write;
@@ -531,6 +546,7 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
         shared.state = SpinLock::new(try_arc(st)?);
         let shared = try_arc(shared)?;
         shared.delete_orphans(top);
+        shared.drop_dead_roots();
         let root = shared.node(top, disk::tree::FIRST_FREE)?;
         if root.kind != FileKind::Directory {
             return Err(Errno::EIO);
@@ -631,6 +647,74 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
         Ok(r)
     }
 
+    /// The node `f`, if it is one of this mount's.
+    fn own_node<'f>(&self, f: &'f dyn File) -> Result<&'f Node<D>, Errno> {
+        let n = f.as_any().and_then(|a| a.downcast_ref::<Node<D>>()).ok_or(Errno::EXDEV)?;
+        if Arc::ptr_eq(&self.shared, &n.shared) { Ok(n) } else { Err(Errno::EXDEV) }
+    }
+
+    /// The id of the subvolume whose root directory `dir` is; `EINVAL` for
+    /// any other node.
+    pub fn subvolume_id(&self, dir: &dyn File) -> Result<u64, Errno> {
+        let n = self.own_node(dir)?;
+        if n.objectid == disk::tree::FIRST_FREE { Ok(n.tree) } else { Err(Errno::EINVAL) }
+    }
+
+    /// Creates an empty subvolume `name` in directory `parent`, as `btrfs
+    /// subvolume create` does; returns its id. It shows up in `parent` as a
+    /// directory.
+    pub fn create_subvolume(&self, parent: &dyn File, name: &str) -> Result<u64, Errno> {
+        let p = self.own_node(parent)?;
+        p.dir()?;
+        let (tree, dir) = (p.tree, p.objectid);
+        self.shared.transact(|tx| tx.create_subvolume(tree, dir, name.as_bytes()))
+    }
+
+    /// Snapshots the subvolume whose root directory is `source` as `name` in
+    /// directory `parent`, as `btrfs subvolume snapshot` does; returns the
+    /// snapshot's id. A `read_only` snapshot refuses changes (`EROFS`). The
+    /// two share all their blocks until one of them changes.
+    pub fn create_snapshot(
+        &self,
+        source: &dyn File,
+        parent: &dyn File,
+        name: &str,
+        read_only: bool,
+    ) -> Result<u64, Errno> {
+        let src = self.subvolume_id(source)?;
+        let p = self.own_node(parent)?;
+        p.dir()?;
+        let (tree, dir) = (p.tree, p.objectid);
+        self.shared.transact(|tx| tx.create_snapshot(src, tree, dir, name.as_bytes(), read_only))
+    }
+
+    /// Deletes the subvolume or snapshot `name` of directory `parent`, as
+    /// `btrfs subvolume delete` does. The name goes at once; the blocks are
+    /// freed (or, if a snapshot still shares them, kept) a little at a time,
+    /// all before this returns, or, if that fails (say `ENOMEM`), at the next
+    /// mount. `EBUSY` if the subvolume is mounted or has nodes in use,
+    /// `ENOTEMPTY` if it holds other subvolumes.
+    pub fn delete_subvolume(&self, parent: &dyn File, name: &str) -> Result<(), Errno> {
+        let p = self.own_node(parent)?;
+        p.dir()?;
+        let (tree, dir) = (p.tree, p.objectid);
+        let shared = &self.shared;
+        let w = shared.writer.as_ref().ok_or(Errno::EROFS)?;
+        let id = {
+            let mut w = w.lock();
+            shared.transact_locked(&mut w, |tx| {
+                let (loc, _) = tx.dir_lookup(tree, dir, name.as_bytes())?.ok_or(Errno::ENOENT)?;
+                if loc.ty == item::ROOT_ITEM
+                    && (loc.objectid == shared.top || shared.open.lock().iter().any(|e| e.0 == loc.objectid))
+                {
+                    return Err(Errno::EBUSY);
+                }
+                tx.unlink_subvolume(tree, dir, name.as_bytes())
+            })?
+        };
+        shared.drop_dead_root(id)
+    }
+
     /// Takes timestamps from `clock` instead of the global
     /// [`osmium_fs::clock`].
     pub fn set_clock_source(&self, clock: Arc<dyn Clock>) {
@@ -701,7 +785,8 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         if root.is_some_and(|r| r.dirid != disk::tree::FIRST_FREE) {
             return Err(Errno::EIO);
         }
-        Ok(root)
+        // A deleted subvolume is only waiting for its blocks to be dropped.
+        Ok(root.filter(|r| r.refs != 0))
     }
 
     /// The subvolume `btrfs subvolume set-default` chose, else the top level.
@@ -823,6 +908,39 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             w.orphans.extend(added);
         }
         Ok(r)
+    }
+
+    /// Drops the trees of subvolumes deleted before the last unmount, or
+    /// by Linux, that were not dropped yet.
+    fn drop_dead_roots(&self) {
+        if self.writer.is_none() {
+            return;
+        }
+        let st = self.state();
+        let mut dead = Vec::new();
+        let mut c = Cursor::new(self, &st.chunks, st.root_tree);
+        let mut at = c.seek(Key::new(disk::tree::ORPHAN, item::ORPHAN_ITEM, 0));
+        while let Ok(Some((k, _))) = at {
+            if k.objectid != disk::tree::ORPHAN || k.ty != item::ORPHAN_ITEM {
+                break;
+            }
+            if k.offset >= disk::tree::FIRST_FREE && try_push(&mut dead, k.offset).is_err() {
+                break;
+            }
+            at = c.next();
+        }
+        drop(st);
+        for id in dead {
+            // Best effort: what is left is dropped at the next mount.
+            let _ = self.drop_dead_root(id);
+        }
+    }
+
+    /// Drops the tree of the deleted subvolume `id`, a few blocks per
+    /// transaction.
+    fn drop_dead_root(&self, id: u64) -> Result<(), Errno> {
+        while !self.transact(|tx| tx.drop_tree(id))? {}
+        Ok(())
     }
 
     /// Deletes the orphans a previous mount left in subvolume `tree`.
