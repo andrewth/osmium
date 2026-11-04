@@ -115,37 +115,59 @@ fn child(b: &[u8], slot: usize) -> Result<u64, Errno> {
 }
 
 impl<D: BlockDevice + Send + 'static> Shared<D> {
-    /// Reads `buf.len()` bytes at byte offset `off` of the device.
-    pub(crate) fn read_phys(&self, mut off: u64, mut buf: &mut [u8]) -> Result<(), Errno> {
-        let bs = self.block_size;
-        let mut dev = self.dev.lock();
-        let mut bounce = Vec::new();
-        while !buf.is_empty() {
-            let lba = off / bs as u64;
-            let skip = (off % bs as u64) as usize;
-            let n = if skip == 0 && buf.len() >= bs {
-                let n = (buf.len() / bs * bs).min(MAX_RUN / bs * bs);
-                dev.read_blocks(lba, buf.get_mut(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
-                n
-            } else {
-                if bounce.is_empty() {
-                    bounce = try_zeroed(bs)?;
-                }
-                dev.read_blocks(lba, &mut bounce).map_err(|_| Errno::EIO)?;
-                let n = (bs - skip).min(buf.len());
-                let src = bounce.get(skip..skip + n).ok_or(Errno::EIO)?;
-                buf.get_mut(..n).ok_or(Errno::EIO)?.copy_from_slice(src);
-                n
-            };
-            off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
-            buf = buf.get_mut(n..).ok_or(Errno::EIO)?;
+    /// Runs `f` on the device with id `devid`: the one mounted, or one added
+    /// since. `EIO` if there is no such device.
+    pub(crate) fn with_dev<R>(&self, devid: u64, f: impl FnOnce(&mut D) -> Result<R, Errno>) -> Result<R, Errno> {
+        if devid == self.devid {
+            return f(&mut self.dev.lock());
         }
-        Ok(())
+        let mut others = self.others.lock();
+        let (_, dev) = others.iter_mut().find(|(id, _)| *id == devid).ok_or(Errno::EIO)?;
+        f(dev)
+    }
+
+    /// Whether device `devid` is part of the open volume.
+    pub(crate) fn has_dev(&self, devid: u64) -> bool {
+        devid == self.devid || self.others.lock().iter().any(|(id, _)| *id == devid)
+    }
+
+    /// Reads `buf.len()` bytes at byte offset `off` of the mounted device.
+    pub(crate) fn read_phys(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        self.read_phys_dev(self.devid, off, buf)
+    }
+
+    /// Reads `buf.len()` bytes at byte offset `off` of device `devid`.
+    pub(crate) fn read_phys_dev(&self, devid: u64, mut off: u64, mut buf: &mut [u8]) -> Result<(), Errno> {
+        let bs = self.block_size;
+        self.with_dev(devid, |dev| {
+            let mut bounce = Vec::new();
+            while !buf.is_empty() {
+                let lba = off / bs as u64;
+                let skip = (off % bs as u64) as usize;
+                let n = if skip == 0 && buf.len() >= bs {
+                    let n = (buf.len() / bs * bs).min(MAX_RUN / bs * bs);
+                    dev.read_blocks(lba, buf.get_mut(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
+                    n
+                } else {
+                    if bounce.is_empty() {
+                        bounce = try_zeroed(bs)?;
+                    }
+                    dev.read_blocks(lba, &mut bounce).map_err(|_| Errno::EIO)?;
+                    let n = (bs - skip).min(buf.len());
+                    let src = bounce.get(skip..skip + n).ok_or(Errno::EIO)?;
+                    buf.get_mut(..n).ok_or(Errno::EIO)?.copy_from_slice(src);
+                    n
+                };
+                off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
+                buf = core::mem::take(&mut buf).get_mut(n..).ok_or(Errno::EIO)?;
+            }
+            Ok(())
+        })
     }
 
     /// Reads logical `logical..logical + buf.len()` from the first copy that
-    /// reads and that `good` accepts. Only copies on this device are tried;
-    /// striped profiles (RAID0, RAID10, RAID5, RAID6) are `EIO`.
+    /// reads and that `good` accepts. Only copies on devices that are open are
+    /// tried; striped profiles (RAID0, RAID10, RAID5, RAID6) are `EIO`.
     pub(crate) fn read_logical(
         &self,
         chunks: &ChunkMap,
@@ -158,47 +180,59 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             return Err(Errno::EIO);
         }
         let within = logical - chunk.logical;
-        for s in chunk.stripes.iter().filter(|s| s.devid == self.devid) {
+        for s in chunk.stripes.iter() {
             let Some(at) = s.offset.checked_add(within) else { continue };
-            if self.read_phys(at, buf).is_ok() && good(buf) {
+            if self.read_phys_dev(s.devid, at, buf).is_ok() && good(buf) {
                 return Ok(());
             }
         }
         Err(Errno::EIO)
     }
 
-    /// Writes `buf`, whole device blocks, at byte offset `off` of the device.
-    pub(crate) fn write_phys(&self, mut off: u64, mut buf: &[u8]) -> Result<(), Errno> {
+    /// Writes `buf`, whole device blocks, at byte offset `off` of the mounted
+    /// device.
+    pub(crate) fn write_phys(&self, off: u64, buf: &[u8]) -> Result<(), Errno> {
+        self.write_phys_dev(self.devid, off, buf)
+    }
+
+    /// Writes `buf`, whole device blocks, at byte offset `off` of device `devid`.
+    pub(crate) fn write_phys_dev(&self, devid: u64, mut off: u64, mut buf: &[u8]) -> Result<(), Errno> {
         let bs = self.block_size as u64;
         if !off.is_multiple_of(bs) || !(buf.len() as u64).is_multiple_of(bs) {
             return Err(Errno::EIO);
         }
-        let mut dev = self.dev.lock();
-        while !buf.is_empty() {
-            let n = buf.len().min(MAX_RUN / bs as usize * bs as usize);
-            dev.write_blocks(off / bs, buf.get(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
-            off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
-            buf = buf.get(n..).ok_or(Errno::EIO)?;
-        }
-        Ok(())
+        self.with_dev(devid, |dev| {
+            while !buf.is_empty() {
+                let n = buf.len().min(MAX_RUN / bs as usize * bs as usize);
+                dev.write_blocks(off / bs, buf.get(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
+                off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
+                buf = buf.get(n..).ok_or(Errno::EIO)?;
+            }
+            Ok(())
+        })
     }
 
     /// Writes `buf` at logical `logical`, to every copy.
     pub(crate) fn write_logical(&self, chunks: &ChunkMap, logical: u64, buf: &[u8]) -> Result<(), Errno> {
         let chunk = chunks.find(logical, buf.len() as u64)?;
-        if chunk.ty & profile::STRIPED != 0 || chunk.stripes.iter().any(|s| s.devid != self.devid) {
+        if chunk.ty & profile::STRIPED != 0 || chunk.stripes.iter().any(|s| !self.has_dev(s.devid)) {
             return Err(Errno::EIO);
         }
         let within = logical - chunk.logical;
         for s in &chunk.stripes {
-            self.write_phys(s.offset.checked_add(within).ok_or(Errno::EIO)?, buf)?;
+            self.write_phys_dev(s.devid, s.offset.checked_add(within).ok_or(Errno::EIO)?, buf)?;
         }
         Ok(())
     }
 
-    /// Makes previous writes durable.
+    /// Makes previous writes durable, on every device.
     pub(crate) fn flush(&self) -> Result<(), Errno> {
-        self.dev.lock().flush().map_err(|_| Errno::EIO)
+        // No allocation: a commit flushes after it can no longer back out.
+        self.dev.lock().flush().map_err(|_| Errno::EIO)?;
+        for (_, dev) in self.others.lock().iter_mut() {
+            dev.flush().map_err(|_| Errno::EIO)?;
+        }
+        Ok(())
     }
 
     /// Forgets cached copies of the blocks at `addrs`, which are about to be

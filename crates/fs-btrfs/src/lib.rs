@@ -60,6 +60,7 @@ mod disk;
 mod lzo;
 mod node;
 mod ops;
+mod scrub;
 mod space;
 mod tree;
 mod write;
@@ -76,6 +77,8 @@ use osmium_fs::{Clock, ClockSlot, DirEntry, Errno, File, FileKind, PATH_MAX, Sta
 use osmium_hal::block::BlockDevice;
 use osmium_sync::SpinLock;
 use osmium_sync::fallible::{try_arc, try_push, try_to_vec, try_zeroed};
+
+pub use scrub::{ScrubError, ScrubErrorKind, ScrubReport};
 
 use disk::{DirItems, ExtentData, FileExtent, Inode, Key, Root, Super, compress, item};
 use tree::{Block, ChunkMap, Cursor};
@@ -111,6 +114,20 @@ impl From<DecodeError> for Errno {
             DecodeError::OutOfMemory => Errno::ENOMEM,
         }
     }
+}
+
+/// A chunk of the volume: a range of logical addresses and where it is kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkInfo {
+    /// First logical address.
+    pub logical: u64,
+    /// Bytes mapped.
+    pub length: u64,
+    /// Block group type (`1` data, `2` system, `4` metadata) and profile bits
+    /// (`BTRFS_BLOCK_GROUP_*`).
+    pub flags: u64,
+    /// Where each copy is: device id and byte offset on it.
+    pub stripes: Vec<(u64, u64)>,
 }
 
 /// How to mount.
@@ -169,6 +186,8 @@ impl Drop for State {
 
 struct Shared<D: BlockDevice + Send + 'static> {
     dev: SpinLock<D>,
+    /// Devices added since mount, by device id.
+    others: SpinLock<Vec<(u64, D)>>,
     block_size: usize,
     dev_id: u64,
     /// This device's id within the file system.
@@ -314,6 +333,7 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
         };
         let mut shared = Shared {
             dev: SpinLock::new(dev),
+            others: SpinLock::new(Vec::new()),
             block_size,
             dev_id,
             devid: 0,
@@ -442,6 +462,28 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
     /// The generation of the last commit.
     pub fn generation(&self) -> u64 {
         self.shared.state().generation
+    }
+
+    /// Checks every copy of every tree block and every checksummed data
+    /// sector against its checksum, as of the last commit, and reports the
+    /// copies that fail. With `repair`, each bad copy of a `DUP` or mirrored
+    /// chunk is rewritten from a good one (`EROFS` if the volume is
+    /// read-only); a block or sector with no good copy is counted as
+    /// uncorrectable and left alone. Transactions wait while it runs.
+    pub fn scrub(&self, repair: bool) -> Result<ScrubReport, Errno> {
+        self.shared.scrub(repair)
+    }
+
+    /// The chunks of the volume, by logical address.
+    pub fn chunks(&self) -> Result<Vec<ChunkInfo>, Errno> {
+        let st = self.shared.state();
+        let mut v = Vec::new();
+        v.try_reserve_exact(st.chunks.iter().count()).map_err(|_| Errno::ENOMEM)?;
+        for c in st.chunks.iter() {
+            let stripes = c.stripes.iter().map(|s| (s.devid, s.offset)).collect();
+            v.push(ChunkInfo { logical: c.logical, length: c.length, flags: c.ty, stripes });
+        }
+        Ok(v)
     }
 
     /// Takes timestamps from `clock` instead of the global
@@ -673,9 +715,19 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         let ss = self.sectorsize as usize;
         let sums = self.csums(st, at, buf.len() / ss)?;
         let (ty, cs) = (self.csum_type, self.csum_size);
-        self.read_logical(&st.chunks, at, buf, &mut |b| {
+        let whole = self.read_logical(&st.chunks, at, buf, &mut |b| {
             b.chunks(ss).zip(sums.chunks(cs)).all(|(sector, sum)| csum::matches(ty, sector, sum))
-        })
+        });
+        if whole.is_ok() || buf.len() <= ss {
+            return whole;
+        }
+        // No copy is good all through: each sector from the first copy that
+        // has it right, as the copies may be bad in different places.
+        for (i, (sector, sum)) in buf.chunks_mut(ss).zip(sums.chunks(cs)).enumerate() {
+            let sector_at = at.checked_add((i * ss) as u64).ok_or(Errno::EIO)?;
+            self.read_logical(&st.chunks, sector_at, sector, &mut |b| csum::matches(ty, b, sum))?;
+        }
+        Ok(())
     }
 
     /// Reads `out.len()` bytes of data at logical `at`, a whole sector at a
