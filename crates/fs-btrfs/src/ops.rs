@@ -6,10 +6,10 @@ use osmium_fs::{Errno, FileKind, Timestamp, XattrSet};
 use osmium_hal::block::BlockDevice;
 use osmium_sync::fallible::{try_push, try_to_vec, try_zeroed};
 
-use crate::csum;
-use crate::disk::{self, FileExtent, Key, byte, item, le16, le32, le64, put, put32, put64, tree};
+use crate::disk::{self, FileExtent, Key, byte, compress, item, le16, le32, le64, put, put32, put64, tree};
 use crate::node::ITEM;
 use crate::write::{DataRef, Tx};
+use crate::{MAX_COMPRESSED, csum, deflate, lzo_comp, zstd};
 
 /// Largest piece of a write handled at once (each gets its own extent).
 const MAX_PIECE: u64 = 1 << 20;
@@ -21,7 +21,7 @@ const MAX_INLINE: usize = 2048;
 const MAX_PREALLOC: u64 = 128 << 20;
 
 /// Inode flags a new inode takes from its directory.
-const INHERITED: u64 = 1 << 0 | 1 << 1;
+const INHERITED: u64 = disk::INODE_NODATASUM | disk::INODE_NODATACOW | disk::INODE_NOCOMPRESS | disk::INODE_COMPRESS;
 
 /// `BTRFS_FT_XATTR`.
 const FT_XATTR: u8 = 8;
@@ -582,10 +582,19 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     }
 
     /// Writes `buf` (whole sectors) as new extents at file offset `at` of
-    /// `ino`, replacing what was there; returns bytes added to `nbytes`
-    /// less those dropped.
-    fn put_extents(&mut self, t: u64, ino: u64, at: u64, buf: &[u8], sums: bool) -> Result<i64, Errno> {
-        match self.put_extents_part(t, ino, at, buf, sums)? {
+    /// `ino`, replacing what was there, compressed with `comp` where that
+    /// saves at least a sector; returns bytes added to `nbytes` less those
+    /// dropped.
+    fn put_extents(
+        &mut self,
+        t: u64,
+        ino: u64,
+        at: u64,
+        buf: &[u8],
+        sums: bool,
+        comp: u8,
+    ) -> Result<i64, Errno> {
+        match self.put_extents_part(t, ino, at, buf, sums, comp)? {
             (delta, done) if done == buf.len() as u64 => Ok(delta),
             _ => Err(Errno::ENOSPC),
         }
@@ -600,12 +609,25 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         mut at: u64,
         mut buf: &[u8],
         sums: bool,
+        comp: u8,
     ) -> Result<(i64, u64), Errno> {
         let (ss, cs) = (self.sh.sectorsize, self.sh.csum_size);
         let mut delta = 0i64;
         let total = buf.len() as u64;
         while !buf.is_empty() {
-            let (start, got) = match self.alloc_data(buf.len() as u64) {
+            if comp != compress::NONE {
+                let chunk = buf.get(..buf.len().min(MAX_COMPRESSED as usize)).ok_or(Errno::EIO)?;
+                if let Some(done) = self.put_compressed(t, ino, at, chunk, sums, comp)? {
+                    delta += done;
+                    at += chunk.len() as u64;
+                    buf = buf.get(chunk.len()..).ok_or(Errno::EIO)?;
+                    continue;
+                }
+            }
+            // Stored as is; with compression on, a chunk at a time so that
+            // the next one gets its try.
+            let want = if comp == compress::NONE { buf.len() } else { buf.len().min(MAX_COMPRESSED as usize) };
+            let (start, got) = match self.alloc_data(want as u64) {
                 Ok(r) => r,
                 Err(Errno::ENOSPC) => break,
                 Err(e) => return Err(e),
@@ -614,12 +636,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             let chunks = self.new_chunks.as_ref().unwrap_or(&self.base.chunks);
             self.sh.write_logical(chunks, start, data)?;
             if sums {
-                let mut s = Vec::new();
-                s.try_reserve_exact(data.len() / ss as usize * cs).map_err(|_| Errno::ENOMEM)?;
-                for sector in data.chunks(ss as usize) {
-                    s.extend_from_slice(csum::compute(self.sh.csum_type, sector).get(..cs).ok_or(Errno::EIO)?);
-                }
-                self.csum_insert(start, &s)?;
+                self.sum_extent(start, data, ss)?;
             }
             delta -= self.drop_extents(t, ino, at, at + got)? as i64;
             let mut fe = [0u8; 53];
@@ -668,6 +685,88 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         Ok(bytenr.checked_add(at))
     }
 
+    /// Checksums `data`, which starts at logical address `start`.
+    fn sum_extent(&mut self, start: u64, data: &[u8], ss: u64) -> Result<(), Errno> {
+        let cs = self.sh.csum_size;
+        let mut s = Vec::new();
+        s.try_reserve_exact(data.len() / ss as usize * cs).map_err(|_| Errno::ENOMEM)?;
+        for sector in data.chunks(ss as usize) {
+            s.extend_from_slice(csum::compute(self.sh.csum_type, sector).get(..cs).ok_or(Errno::EIO)?);
+        }
+        self.csum_insert(start, &s)
+    }
+
+    /// Tries to write `chunk` (whole sectors, at most [`MAX_COMPRESSED`]) at
+    /// `at` as one extent compressed with `comp`. `None`, and nothing
+    /// changed, if the result would not be a sector smaller or the space for
+    /// it is not in one piece.
+    fn put_compressed(
+        &mut self,
+        t: u64,
+        ino: u64,
+        at: u64,
+        chunk: &[u8],
+        sums: bool,
+        comp: u8,
+    ) -> Result<Option<i64>, Errno> {
+        let ss = self.sh.sectorsize;
+        let Some(limit) = chunk.len().checked_sub(ss as usize).filter(|&l| l > 0) else { return Ok(None) };
+        let packed = match comp {
+            compress::ZLIB => deflate::compress(chunk, limit)?,
+            compress::LZO => lzo_comp::compress(chunk, ss as usize, limit)?,
+            compress::ZSTD => zstd::compress(chunk, limit)?,
+            _ => None,
+        };
+        let Some(mut packed) = packed else { return Ok(None) };
+        // The extent takes whole sectors, zero-padded.
+        let disk_len = (packed.len() as u64).next_multiple_of(ss);
+        if disk_len > limit as u64 {
+            return Ok(None);
+        }
+        packed.try_reserve_exact((disk_len as usize).saturating_sub(packed.len())).map_err(|_| Errno::ENOMEM)?;
+        packed.resize(disk_len as usize, 0);
+        let (start, got) = self.alloc_data(disk_len)?;
+        if got < disk_len {
+            // Fragmented free space: give it back and store the chunk as is.
+            self.unalloc(start);
+            return Ok(None);
+        }
+        let chunks = self.new_chunks.as_ref().unwrap_or(&self.base.chunks);
+        self.sh.write_logical(chunks, start, &packed)?;
+        if sums {
+            self.sum_extent(start, &packed, ss)?;
+        }
+        let len = chunk.len() as u64;
+        let removed = self.drop_extents(t, ino, at, at + len)? as i64;
+        let mut fe = [0u8; 53];
+        put64(&mut fe, 0, self.transid)?;
+        put64(&mut fe, 8, len)?;
+        put(&mut fe, 16, &[comp])?;
+        put(&mut fe, 20, &[1])?;
+        put64(&mut fe, 21, start)?;
+        put64(&mut fe, 29, disk_len)?;
+        put64(&mut fe, 45, len)?;
+        self.insert(t, Key::new(ino, item::EXTENT_DATA, at), &fe)?;
+        self.data_ref(start, disk_len, t, ino, at, 1, true)?;
+        match comp {
+            compress::LZO => self.incompat |= disk::incompat::COMPRESS_LZO,
+            compress::ZSTD => self.incompat |= disk::incompat::COMPRESS_ZSTD,
+            _ => {}
+        }
+        Ok(Some(len as i64 - removed))
+    }
+
+    /// The algorithm for new data of an inode with `flags`.
+    fn algorithm(&self, flags: u64) -> u8 {
+        if flags & (disk::INODE_NODATACOW | disk::INODE_NOCOMPRESS) != 0 {
+            return compress::NONE;
+        }
+        match self.sh.compress {
+            compress::NONE if flags & disk::INODE_COMPRESS != 0 => compress::ZLIB,
+            c => c,
+        }
+    }
+
     /// Reads committed bytes of the file into `buf` (zeroes past its end).
     fn read_old(&mut self, t: u64, ino: u64, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         buf.fill(0);
@@ -687,7 +786,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         }
         let mut buf = try_zeroed(self.sh.sectorsize as usize)?;
         self.read_old(t, ino, 0, &mut buf)?;
-        self.put_extents(t, ino, 0, &buf, !nodatasum)
+        self.put_extents(t, ino, 0, &buf, !nodatasum, compress::NONE)
     }
 
     /// The most data an inline extent holds: like Linux, `max_inline` (2048),
@@ -780,6 +879,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         let flags = le64(&d, ino::FLAGS)?;
         let sums = flags & disk::INODE_NODATASUM == 0;
         let nocow = !sums && flags & disk::INODE_NODATACOW != 0;
+        let comp = self.algorithm(flags);
         if self.write_inline(t, ino, off, data, size, &mut d)? {
             self.set_inode(t, ino, &d)?;
             return Ok(data.len());
@@ -809,7 +909,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                 self.sh.write_logical(chunks, addr, &buf)?;
                 e - a
             } else {
-                let (delta, done) = self.put_extents_part(t, ino, a, &buf, sums)?;
+                let (delta, done) = self.put_extents_part(t, ino, a, &buf, sums, comp)?;
                 nbytes += delta;
                 done
             };
@@ -888,7 +988,8 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             return self.set_inode(t, ino, &d);
         }
         let ss = self.sh.sectorsize;
-        let sums = le64(&d, ino::FLAGS)? & disk::INODE_NODATASUM == 0;
+        let flags = le64(&d, ino::FLAGS)?;
+        let sums = flags & disk::INODE_NODATASUM == 0;
         let mut nbytes = le64(&d, ino::NBYTES)? as i64 + self.uninline(t, ino, !sums)?;
         if len < size {
             nbytes -= self.drop_extents(t, ino, len.next_multiple_of(ss), u64::MAX)? as i64;
@@ -898,7 +999,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                 let s0 = len & !(ss - 1);
                 let mut buf = try_zeroed(ss as usize)?;
                 self.read_old(t, ino, s0, buf.get_mut(..(len - s0) as usize).ok_or(Errno::EIO)?)?;
-                nbytes += self.put_extents(t, ino, s0, &buf, sums)?;
+                nbytes += self.put_extents(t, ino, s0, &buf, sums, compress::NONE)?;
             }
         }
         put64(&mut d, ino::SIZE, len)?;

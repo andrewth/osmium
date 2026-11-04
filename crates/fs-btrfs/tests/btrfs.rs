@@ -145,10 +145,10 @@ fn mount(img: &Path, block: usize) -> BtrfsFs<FileDisk> {
     fs
 }
 
-const RO: MountOptions = MountOptions { subvol: None, read_only: true };
+const RO: MountOptions = MountOptions { subvol: None, read_only: true, compress: osmium_fs_btrfs::Compression::None };
 
 fn ro_subvol(id: u64) -> MountOptions {
-    MountOptions { subvol: Some(id), read_only: true }
+    MountOptions { subvol: Some(id), read_only: true, ..MountOptions::default() }
 }
 
 fn read_all(f: &dyn File) -> Vec<u8> {

@@ -551,7 +551,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         let dev_used = le64(&sb, 201 + 16)? + self.dev_used;
         put64(&mut sb, 201 + 16, dev_used)?;
         // Holes are left implicit.
-        let flags = le64(&sb, 188)? | incompat::NO_HOLES;
+        let flags = le64(&sb, 188)? | incompat::NO_HOLES | self.incompat;
         put64(&mut sb, 188, flags)?;
         self.backup_roots(&mut sb, root_tree.addr, root_tree.level, chunk_root.addr, chunk_root.level)?;
         let chunks = match self.new_chunks.take() {

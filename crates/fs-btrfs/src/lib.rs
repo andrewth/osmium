@@ -21,11 +21,13 @@
 //! reference counts), data checksums, block group usage, the free space tree
 //! and root items are kept up to date, and the superblock is written last,
 //! after a flush, so that a crash leaves the volume as it was before the call
-//! or after it. File data goes to new extents (never compressed), with
-//! checksums unless the file has `nodatasum`; a file of up to 2048 bytes is
-//! one inline extent, as with Linux's default `max_inline`, and
-//! [`BtrfsFs::fallocate`] and [`BtrfsFs::punch_hole`] preallocate and
-//! deallocate ranges; new data and metadata chunks are added when the block groups
+//! or after it. File data goes to new extents (compressed with the
+//! algorithm of [`MountOptions::compress`] or the inode's `compress` flag,
+//! when that makes them smaller), with checksums unless the file has
+//! `nodatasum`; a file of up to 2048 bytes is one inline extent, as with
+//! Linux's default `max_inline`, and [`BtrfsFs::fallocate`] and
+//! [`BtrfsFs::punch_hole`] preallocate and deallocate ranges; new data and
+//! metadata chunks are added when the block groups
 //! fill up. Unlinked files that are still open are kept as orphans and
 //! deleted when their last node goes, or at the next mount.
 //!
@@ -58,8 +60,11 @@ extern crate std;
 
 mod commit;
 mod csum;
+mod deflate;
 mod disk;
+mod lz;
 mod lzo;
+mod lzo_comp;
 mod node;
 mod ops;
 mod space;
@@ -123,6 +128,25 @@ pub struct MountOptions {
     pub subvol: Option<u64>,
     /// Never write, even if the volume could be written.
     pub read_only: bool,
+    /// Compress the data of files written, like `-o compress=`. Files with
+    /// the `nodatacow` or `nocompress` inode flags are not compressed, and
+    /// files with the `compress` flag are even if this is
+    /// [`Compression::None`] (with zlib then).
+    pub compress: Compression,
+}
+
+/// A compression algorithm for new file data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Compression {
+    /// Store data as is.
+    #[default]
+    None,
+    /// zlib (deflate with fixed Huffman codes).
+    Zlib,
+    /// LZO.
+    Lzo,
+    /// Zstandard (raw literals, predefined tables).
+    Zstd,
 }
 
 /// A node's last decompressed extent: its address, the generation of the
@@ -180,6 +204,8 @@ struct Shared<D: BlockDevice + Send + 'static> {
     csum_type: u16,
     /// Bytes of each data checksum.
     csum_size: usize,
+    /// The [`compress`] algorithm new data gets by default.
+    compress: u8,
     /// The UUID every tree block carries.
     meta_uuid: [u8; 16],
     fsid: [u8; 16],
@@ -288,7 +314,7 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
     /// Mounts subvolume `subvol` (5 is the top level) of the btrfs volume on
     /// `dev`; `ENOENT` if there is no such subvolume.
     pub fn mount_subvol(dev: D, dev_id: u64, subvol: u64) -> Result<Self, Errno> {
-        Self::mount_with(dev, dev_id, MountOptions { subvol: Some(subvol), read_only: false })
+        Self::mount_with(dev, dev_id, MountOptions { subvol: Some(subvol), ..MountOptions::default() })
     }
 
     /// Mounts the btrfs volume on `dev` as `opts` say.
@@ -323,6 +349,12 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             sectorsize: 0,
             csum_type: 0,
             csum_size: 0,
+            compress: match opts.compress {
+                Compression::None => compress::NONE,
+                Compression::Zlib => compress::ZLIB,
+                Compression::Lzo => compress::LZO,
+                Compression::Zstd => compress::ZSTD,
+            },
             meta_uuid: [0; 16],
             fsid: [0; 16],
             label: String::new(),
