@@ -138,6 +138,8 @@ pub struct Tx<'a, D: BlockDevice + Send + 'static> {
     /// Inodes this transaction made orphans, and orphans it deleted.
     pub(crate) orphans_added: Vec<(u64, u64)>,
     pub(crate) orphans_removed: Vec<(u64, u64)>,
+    /// Incompatible feature flags this transaction's data needs set.
+    pub(crate) incompat: u64,
 }
 
 /// The key just after `k`.
@@ -174,6 +176,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             frees: false,
             orphans_added: Vec::new(),
             orphans_removed: Vec::new(),
+            incompat: 0,
         }
     }
 

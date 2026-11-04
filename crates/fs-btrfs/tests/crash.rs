@@ -93,7 +93,7 @@ fn snapshot(img: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
             }
         }
     }
-    let opts = MountOptions { subvol: None, read_only: true };
+    let opts = MountOptions { read_only: true, ..MountOptions::default() };
     let fs = BtrfsFs::mount_with(LogDisk::open(img, None), 1, opts).unwrap();
     let mut out = BTreeMap::new();
     walk(&*fs.root(), "", &mut out);

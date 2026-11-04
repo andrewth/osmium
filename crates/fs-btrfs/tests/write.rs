@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use osmium_fs::{Errno, File, FileKind, OpenFlags, Vfs};
-use osmium_fs_btrfs::{BtrfsFs, MountOptions};
+use osmium_fs_btrfs::{BtrfsFs, Compression, MountOptions};
 use osmium_hal::block::{BlockDevice, BlockError};
 
 /// An image file, read and written in `block`-byte blocks.
@@ -530,8 +530,12 @@ fn read_only_mounts_and_subvolumes() {
         return;
     };
     {
-        let fs =
-            BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, MountOptions { subvol: None, read_only: true }).unwrap();
+        let fs = BtrfsFs::mount_with(
+            FileDisk::open(&img, 4096),
+            9,
+            MountOptions { read_only: true, ..MountOptions::default() },
+        )
+        .unwrap();
         assert!(fs.is_read_only());
         let vfs = Vfs::new(fs.root());
         assert_eq!(vfs.mkdir("/x", 0o755).err(), Some(Errno::EROFS));
@@ -624,4 +628,109 @@ fn removed_open_directory_takes_no_new_names() {
     check(&img);
     let fs = mount(&img);
     assert_eq!(names(&*fs.root()), ["f"]);
+}
+
+/// Text that compresses well, and data that does not.
+fn words(len: usize, seed: usize) -> Vec<u8> {
+    let w = ["extent", "inode", "btrfs", "tree", "chunk", "csum", "root", "node", "leaf", "key"];
+    let mut out = Vec::with_capacity(len + 8);
+    let mut x = seed as u32 + 1;
+    while out.len() < len {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        out.extend_from_slice(w[(x >> 16) as usize % w.len()].as_bytes());
+        out.push(b' ');
+    }
+    out.truncate(len);
+    out
+}
+
+fn noise(len: usize) -> Vec<u8> {
+    let mut x = 0x1234_5678u32;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
+/// The file tree's extent lines from `btrfs inspect-internal dump-tree`.
+fn extent_lines(img: &Path) -> Vec<String> {
+    let out = Command::new(tool("btrfs").unwrap())
+        .args(["inspect-internal", "dump-tree", "-t", "5"])
+        .arg(img)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.lines().filter(|l| l.contains("extent compression")).map(|l| l.to_string()).collect()
+}
+
+/// Writes through the driver with compression on, then checks the result with `btrfs check
+/// --check-data-csum`, a fresh mount and `btrfs restore`.
+fn write_compressed(name: &str, algo: Compression, label: &str) {
+    let dir = scratch(name);
+    let Some(img) = mkfs(&dir, 128 << 20, &[]) else { return };
+    let mut model = Model::new();
+    {
+        let opts = MountOptions { compress: algo, ..MountOptions::default() };
+        let fs = BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, opts).unwrap();
+        assert!(!fs.is_read_only());
+        let vfs = Vfs::new(fs.root());
+        for (path, data) in [
+            ("/text", words(1_000_000, 1)),
+            ("/noise", noise(300_000)),
+            ("/zeros", vec![0u8; 500_000]),
+            ("/small", words(5000, 2)),
+            ("/mixed", [words(150_000, 3), noise(40_000), vec![7; 70_000], words(9_000, 4)].concat()),
+        ] {
+            put(&vfs, path, &data);
+            model.insert(path.into(), Want::File(data));
+        }
+        compare(&vfs, &model);
+        // Overwrites that cut compressed extents at both ends, and a truncation through one.
+        let edit = |model: &mut Model, path: &str, off: usize, data: &[u8]| {
+            let f = vfs.open(path, OpenFlags::WRITE, 0).unwrap();
+            f.write(off as u64, data).unwrap();
+            let Some(Want::File(v)) = model.get_mut(path) else { unreachable!() };
+            if v.len() < off + data.len() {
+                v.resize(off + data.len(), 0);
+            }
+            v[off..off + data.len()].copy_from_slice(data);
+        };
+        edit(&mut model, "/text", 70_001, &noise(3001));
+        edit(&mut model, "/text", 400_000, &words(200_000, 9));
+        edit(&mut model, "/mixed", 100_000, b"patched");
+        edit(&mut model, "/zeros", 1_000_000, b"far");
+        let t = vfs.open("/text", OpenFlags::WRITE, 0).unwrap();
+        t.truncate(655_555).unwrap();
+        let Some(Want::File(v)) = model.get_mut("/text") else { unreachable!() };
+        v.truncate(655_555);
+        vfs.unlink("/small").unwrap();
+        model.remove("/small");
+        compare(&vfs, &model);
+    }
+    verify(&dir, &img, &model);
+    let lines = extent_lines(&img);
+    let packed = lines.iter().filter(|l| l.contains(&format!("({label})"))).count();
+    let plain = lines.iter().filter(|l| l.contains("(none)")).count();
+    eprintln!("{name}: {packed} compressed extents, {plain} plain");
+    assert!(packed > 5, "expected compressed extents:\n{}", lines.join("\n"));
+    assert!(plain > 0, "noise should stay uncompressed");
+}
+
+#[test]
+fn writes_zlib() {
+    write_compressed("w-zlib", Compression::Zlib, "zlib");
+}
+
+#[test]
+fn writes_lzo() {
+    write_compressed("w-lzo", Compression::Lzo, "lzo");
+}
+
+#[test]
+fn writes_zstd() {
+    write_compressed("w-zstd", Compression::Zstd, "zstd");
 }
