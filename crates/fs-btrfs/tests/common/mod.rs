@@ -174,6 +174,8 @@ pub fn snapshot_fs(root: Arc<dyn File>) -> Snapshot {
             if e.kind == FileKind::Directory {
                 walk(&*node, &p, out);
                 out.insert(p, None);
+            } else if e.kind == FileKind::Symlink {
+                out.insert(p, Some(node.readlink().unwrap().into_bytes()));
             } else {
                 out.insert(p, Some(read_all(&*node)));
             }

@@ -262,7 +262,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     /// `align` units) if none is that long. Returns its start and length.
     fn take(&mut self, ty: u64, len: u64, align: u64, partial: bool) -> Result<Option<(u64, u64)>, Errno> {
         let mut best: Option<(u64, u64)> = None;
-        for g in self.w.groups.iter().filter(|g| g.flags & kind::MASK == ty) {
+        for g in self.w.groups.iter().filter(|g| g.flags & kind::MASK == ty && !self.avoid.contains(&g.start)) {
             for &(s, l) in &g.free {
                 let a = s.next_multiple_of(align);
                 let avail = (s + l).saturating_sub(a) / align * align;
@@ -298,7 +298,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                 .w
                 .groups
                 .iter()
-                .filter(|g| g.flags & kind::MASK == ty)
+                .filter(|g| g.flags & kind::MASK == ty && !self.avoid.contains(&g.start))
                 .flat_map(|g| g.free.iter())
                 .map(|r| r.1)
                 .sum();
@@ -327,6 +327,18 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         // A new chunk if there is room for one, else whatever is left.
         self.alloc_chunk(kind::DATA)?;
         self.take(kind::DATA, len, ss, true)?.ok_or(Errno::ENOSPC)
+    }
+
+    /// `len` bytes (a multiple of the sector size) in one piece for file
+    /// data, with a new chunk if no block group has room; `ENOSPC` if not even
+    /// that gives room.
+    pub(crate) fn alloc_data_exact(&mut self, len: u64) -> Result<u64, Errno> {
+        let ss = self.sh.sectorsize;
+        if let Some((a, _)) = self.take(kind::DATA, len, ss, false)? {
+            return Ok(a);
+        }
+        self.alloc_chunk(kind::DATA)?;
+        self.take(kind::DATA, len, ss, false)?.map(|(a, _)| a).ok_or(Errno::ENOSPC)
     }
 
     /// Frees a range this transaction allocated: it is free again once the
@@ -424,7 +436,6 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         for &o in &offsets {
             try_push(&mut stripes, Stripe { devid, offset: o })?;
         }
-        self.dev_used += size * copies;
         let mut pending = Vec::new();
         pending.try_reserve_exact(offsets.len()).map_err(|_| Errno::ENOMEM)?;
         pending.extend_from_slice(&offsets);

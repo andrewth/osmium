@@ -127,8 +127,12 @@ pub struct Tx<'a, D: BlockDevice + Send + 'static> {
     pub(crate) pinned: Vec<(u64, u64)>,
     /// Block groups this transaction created, by start.
     pub(crate) new_groups: Vec<u64>,
-    /// Device bytes taken by new chunks.
-    pub(crate) dev_used: u64,
+    /// Block groups (by start) new allocations stay out of: those a balance is
+    /// emptying.
+    pub(crate) avoid: Vec<u64>,
+    /// Block groups this transaction deletes, by start. They leave the
+    /// writer's list when it commits.
+    pub(crate) dropped_groups: Vec<u64>,
     /// Tree edits, to tell when a commit round changed nothing.
     pub(crate) edits: u64,
     /// Chunks added in memory, their items still to insert.
@@ -168,7 +172,8 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             allocs: Vec::new(),
             pinned: Vec::new(),
             new_groups: Vec::new(),
-            dev_used: 0,
+            avoid: Vec::new(),
+            dropped_groups: Vec::new(),
             edits: 0,
             pending_chunks: Vec::new(),
             frees: false,

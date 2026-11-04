@@ -548,8 +548,9 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             put64(&mut sb, 164, self.transid)?;
         }
         put64(&mut sb, 120, bytes_used)?;
-        let dev_used = le64(&sb, 201 + 16)? + self.dev_used;
-        put64(&mut sb, 201 + 16, dev_used)?;
+        // The superblock's copy of this device's item follows the chunk tree's.
+        let dev_item = self.find(tree::CHUNK, Key::new(1, item::DEV_ITEM, sh.devid))?.ok_or(Errno::EIO)?;
+        disk::put(&mut sb, 201, dev_item.get(..98).ok_or(Errno::EIO)?)?;
         // Holes are left implicit.
         let flags = le64(&sb, 188)? | incompat::NO_HOLES;
         put64(&mut sb, 188, flags)?;
@@ -603,6 +604,11 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             }
         }
         self.new_groups.clear();
+        for start in core::mem::take(&mut self.dropped_groups) {
+            if let Some(i) = self.w.groups.iter().position(|g| g.start == start) {
+                self.w.groups.remove(i);
+            }
+        }
         let pinned = core::mem::take(&mut self.pinned);
         self.w.limbo.extend_from_slice(&pinned);
         self.base.pinned.lock().extend(pinned);

@@ -54,6 +54,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod balance;
 mod commit;
 mod csum;
 mod disk;
@@ -78,6 +79,7 @@ use osmium_hal::block::BlockDevice;
 use osmium_sync::SpinLock;
 use osmium_sync::fallible::{try_arc, try_push, try_to_vec, try_zeroed};
 
+pub use balance::{BalanceFilter, BalanceReport};
 pub use scrub::{ScrubError, ScrubErrorKind, ScrubReport};
 
 use disk::{DirItems, ExtentData, FileExtent, Inode, Key, Root, Super, compress, item};
@@ -472,6 +474,19 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
     /// uncorrectable and left alone. Transactions wait while it runs.
     pub fn scrub(&self, repair: bool) -> Result<ScrubReport, Errno> {
         self.shared.scrub(repair)
+    }
+
+    /// Moves the contents of the block groups `filter` picks to other block
+    /// groups (new chunks if need be) and deletes the emptied chunks, which
+    /// compacts a fragmented volume and returns space to the device. Data
+    /// extents are copied with their checksums and every reference to them
+    /// updated; tree blocks are copied on write. Each step is a transaction,
+    /// so a crash leaves a volume that checks clean, and balancing again
+    /// carries on. A group that cannot be moved (see the module notes) is
+    /// left alone and listed in the report; `EROFS` if the volume is
+    /// read-only.
+    pub fn balance(&self, filter: &BalanceFilter) -> Result<BalanceReport, Errno> {
+        self.shared.balance(filter)
     }
 
     /// The chunks of the volume, by logical address.

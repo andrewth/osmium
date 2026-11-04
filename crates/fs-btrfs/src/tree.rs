@@ -39,6 +39,13 @@ impl ChunkMap {
         Ok(())
     }
 
+    /// Forgets the chunk at `logical`.
+    pub fn remove(&mut self, logical: u64) {
+        if let Ok(i) = self.0.binary_search_by_key(&logical, |c| c.logical) {
+            self.0.remove(i);
+        }
+    }
+
     /// A copy, failing instead of panicking if memory runs out.
     pub fn try_clone(&self) -> Result<Self, Errno> {
         let mut v = Vec::new();
