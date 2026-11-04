@@ -309,6 +309,8 @@ impl File for SynthNode {
             ino: self.ino,
             kind,
             mode: self.perm,
+            uid: 0,
+            gid: 0,
             nlink,
             size,
             rdev: 0,

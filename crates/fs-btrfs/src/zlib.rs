@@ -15,15 +15,16 @@ const MAX_LCODES: usize = 288;
 const MAX_DCODES: usize = 32;
 
 /// Base lengths and extra bits for length symbols 257..=285.
-const LEN_BASE: [u16; 29] =
+pub(crate) const LEN_BASE: [u16; 29] =
     [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
-const LEN_EXTRA: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+pub(crate) const LEN_EXTRA: [u8; 29] =
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
 /// Base distances and extra bits for distance symbols 0..=29.
-const DIST_BASE: [u16; 30] = [
+pub(crate) const DIST_BASE: [u16; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
     8193, 12289, 16385, 24577,
 ];
-const DIST_EXTRA: [u8; 30] =
+pub(crate) const DIST_EXTRA: [u8; 30] =
     [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 /// Order in which the code length code lengths are sent.
 const CL_ORDER: [u8; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
@@ -61,7 +62,7 @@ pub(crate) fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecodeErro
 }
 
 /// The Adler-32 checksum of `data`.
-fn adler32(data: &[u8]) -> u32 {
+pub(crate) fn adler32(data: &[u8]) -> u32 {
     const MOD: u32 = 65521;
     let (mut a, mut b) = (1u32, 0u32);
     // 5552 bytes is the most that cannot overflow `b` before the reduction.

@@ -96,7 +96,39 @@ struct Linux {
     kernel: PathBuf,
     initrd: PathBuf,
     qemu: PathBuf,
+    /// Whether `fx` (see [`FX`]) is in the initramfs.
+    has_fx: bool,
 }
+
+/// A static helper for the initramfs: `fx setxattr FILE NAME VALUE`, `fx getxattr FILE NAME`,
+/// `fx punch FILE OFFSET LENGTH`, `fx falloc FILE OFFSET LENGTH` (keeping the size).
+const FX: &str = r#"
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/xattr.h>
+#include <unistd.h>
+int main(int c, char **v) {
+    if (c < 3) return 2;
+    if (!strcmp(v[1], "setxattr") && c == 5) return setxattr(v[2], v[3], v[4], strlen(v[4]), 0) ? 1 : 0;
+    if (!strcmp(v[1], "getxattr") && c == 4) {
+        char b[256];
+        ssize_t n = getxattr(v[2], v[3], b, sizeof b);
+        if (n < 0) { puts("(none)"); return 0; }
+        fwrite(b, 1, n, stdout);
+        puts("");
+        return 0;
+    }
+    if ((!strcmp(v[1], "punch") || !strcmp(v[1], "falloc")) && c == 5) {
+        int f = open(v[2], O_RDWR);
+        int mode = FALLOC_FL_KEEP_SIZE | (v[1][0] == 'p' ? FALLOC_FL_PUNCH_HOLE : 0);
+        return f < 0 || fallocate(f, mode, atoll(v[3]), atoll(v[4])) ? 1 : 0;
+    }
+    return 2;
+}
+"#;
 
 impl Linux {
     fn new(dir: &Path) -> Option<Self> {
@@ -117,6 +149,30 @@ impl Linux {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         std::fs::copy(busybox, root.join("bin/busybox")).unwrap();
+        // A helper for what busybox cannot do (extended attributes, holes), if there is a C compiler.
+        let helper = dir.join("fx.c");
+        std::fs::write(&helper, FX).unwrap();
+        let built = ["cc", "gcc"].iter().find_map(|cc| {
+            let ok = Command::new(cc).args(["-static", "-O1", "-o"]).arg(root.join("bin/fx")).arg(&helper).status();
+            ok.ok().filter(|s| s.success())
+        });
+        // btrfs-progs too, with the libraries it needs, for the scripts that make subvolumes.
+        if let Some(btrfs) = tool("btrfs") {
+            std::fs::copy(&btrfs, root.join("bin/btrfs")).unwrap();
+            let ldd = Command::new("ldd").arg(&btrfs).output().unwrap();
+            for line in String::from_utf8_lossy(&ldd.stdout).lines() {
+                let Some(lib) = line.split_whitespace().find(|w| w.starts_with('/') && w.contains(".so")) else {
+                    continue;
+                };
+                let name = Path::new(lib).file_name().unwrap();
+                let dest = if lib.contains("ld-linux") { "lib64" } else { "lib/x86_64-linux-gnu" };
+                std::fs::create_dir_all(root.join(dest)).unwrap();
+                std::fs::copy(lib, root.join(dest).join(name)).unwrap();
+            }
+            // The program interpreter, which `ldd` lists without an arrow.
+            std::fs::create_dir_all(root.join("lib64")).unwrap();
+            let _ = std::fs::copy("/lib64/ld-linux-x86-64.so.2", root.join("lib64/ld-linux-x86-64.so.2"));
+        }
         let modules = PathBuf::from(modules);
         let mut insmods = String::new();
         for name in ["xor", "raid6_pq", "libblake2b", "btrfs"] {
@@ -148,12 +204,22 @@ impl Linux {
         let initrd = dir.join("initrd.cpio");
         let script = format!("cd {} && find . | cpio -o -H newc > {}", root.display(), initrd.display());
         assert!(Command::new("sh").args(["-c", &script]).status().unwrap().success());
-        Some(Linux { kernel: kernel.into(), initrd, qemu })
+        Some(Linux { kernel: kernel.into(), initrd, qemu, has_fx: built.is_some() })
     }
 
     /// Boots with `img` as `/dev/vda`, runs `script` in its root, and
     /// returns the console output.
     fn run(&self, dir: &Path, img: &Path, script: &str) -> String {
+        self.boot(dir, img, script, false)
+    }
+
+    /// Like [`Linux::run`], but `script` ends by powering off without
+    /// unmounting, so that what it `fsync`ed is only in the fsync log.
+    fn crash(&self, dir: &Path, img: &Path, script: &str) -> String {
+        self.boot(dir, img, &format!("{script}\necho POWER-OFF\npoweroff -n -f\n"), true)
+    }
+
+    fn boot(&self, dir: &Path, img: &Path, script: &str, crash: bool) -> String {
         let s = dir.join("script.sh");
         let mut body = script.as_bytes().to_vec();
         body.resize(body.len().next_multiple_of(512) + 512, b'\n');
@@ -177,6 +243,11 @@ impl Linux {
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         if std::env::var_os("OSMIUM_LINUX_SHOW").is_some() {
             eprintln!("{text}");
+        }
+        if crash {
+            assert!(text.contains("POWER-OFF"), "Linux did not finish:\n{text}");
+            assert!(text.contains("MOUNTED"), "Linux could not mount:\n{text}");
+            return text;
         }
         assert!(text.contains("LINUX-DONE"), "Linux did not finish:\n{text}");
         assert!(text.contains("MOUNTED") && text.contains("UNMOUNTED"), "Linux could not mount:\n{text}");
@@ -362,5 +433,355 @@ fn linux_reads_other_layouts() {
         let n = read_all(&*Vfs::new(fs.root()).lookup("/new").unwrap());
         assert_eq!(&n[12 << 20..], b"linux\n");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every file under the directory `dir` of `vfs`: path to contents.
+fn read_tree(vfs: &Vfs, dir: &str, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+    let d = vfs.lookup(dir).unwrap();
+    for e in (0..).map_while(|i| d.readdir(i).unwrap()) {
+        let path = format!("{dir}/{}", e.name);
+        let key = format!("{prefix}/{}", e.name);
+        if e.kind == osmium_fs::FileKind::Directory {
+            read_tree(vfs, &path, &key, out);
+        } else {
+            out.insert(key, read_all(&*vfs.lookup(&path).unwrap()));
+        }
+    }
+}
+
+/// What the driver sees under each of `subvols`, as paths from the volume's root.
+fn read_subvols(fs: &BtrfsFs<FileDisk>, subvols: &[&str]) -> BTreeMap<String, Vec<u8>> {
+    let vfs = Vfs::new(fs.root());
+    let mut out = BTreeMap::new();
+    for s in subvols {
+        read_tree(&vfs, &format!("/{s}"), s, &mut out);
+    }
+    out
+}
+
+/// Linux's checksums are the driver's.
+fn same_as_linux(text: &str, want: &BTreeMap<String, Vec<u8>>) {
+    let got = sums(text);
+    for (path, data) in want {
+        assert_eq!(got.get(path), Some(&md5(data)), "Linux read {path} differently");
+    }
+    assert_eq!(got.len(), want.len(), "Linux saw other files");
+}
+
+#[test]
+fn linux_snapshots() {
+    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-linux3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(linux) = Linux::new(&dir) else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let Some(mkfs) = tool("mkfs.btrfs") else { return };
+    let img = dir.join("img");
+    std::fs::File::create(&img).unwrap().set_len(256 << 20).unwrap();
+    assert!(Command::new(mkfs).args(["-q", "-n", "4096"]).arg(&img).status().unwrap().success());
+
+    // Linux makes a subvolume, snapshots of it and a snapshot of a snapshot, and
+    // changes each of them in turn.
+    let text = linux.run(
+        &dir,
+        &img,
+        "btrfs subvolume create sv >/dev/null\nmkdir sv/d\ni=0\nwhile [ $i -lt 1200 ]; do echo \"file number $i\" > sv/d/file-with-a-long-name-$i; i=$((i+1)); done\n\
+         yes 'big file' | head -c 3000000 > sv/big\nsync\n\
+         btrfs subvolume snapshot sv snap >/dev/null\nsync\n\
+         echo changed-in-src > sv/d/file-with-a-long-name-17\nrm sv/d/file-with-a-long-name-5*\nsync\n\
+         btrfs subvolume snapshot -r sv rosnap >/dev/null\nsync\n\
+         echo changed-in-snap > snap/d/file-with-a-long-name-18\nrm snap/d/file-with-a-long-name-6*\nsync\n\
+         btrfs subvolume snapshot snap snap2 >/dev/null\nsync\n\
+         echo changed-in-snap2 > snap2/d/file-with-a-long-name-19\nsync\n\
+         echo BEGIN-SUMS\nfind sv snap rosnap snap2 -type f | sort | xargs md5sum\necho END-SUMS\n",
+    );
+    check(&img);
+    let all = ["sv", "snap", "rosnap", "snap2"];
+
+    // The driver reads what Linux wrote, then changes it all sorts of ways.
+    let mut want;
+    {
+        let fs = mount(&img);
+        want = read_subvols(&fs, &all);
+        same_as_linux(&text, &want);
+        let vfs = Vfs::new(fs.root());
+        let root = vfs.lookup("/").unwrap();
+        let dir_of = |s: &str| fs.subvolume_id(&*vfs.lookup(s).unwrap()).unwrap();
+        assert!(dir_of("/snap2") > dir_of("/snap"));
+
+        // Writes in the source and the snapshots, over blocks and extents they share.
+        let new = pattern(5000, 1);
+        let f = vfs.open("/sv/d/file-with-a-long-name-100", OpenFlags::WRITE | OpenFlags::TRUNC, 0).unwrap();
+        f.write(0, &new).unwrap();
+        want.insert("sv/d/file-with-a-long-name-100".into(), new);
+        vfs.unlink("/snap/d/file-with-a-long-name-200").unwrap();
+        want.remove("snap/d/file-with-a-long-name-200");
+        let patch = pattern(100_000, 2);
+        vfs.open("/snap/big", OpenFlags::WRITE, 0).unwrap().write(1_000_000, &patch).unwrap();
+        want.get_mut("snap/big").unwrap()[1_000_000..1_100_000].copy_from_slice(&patch);
+        vfs.open("/sv/big", OpenFlags::WRITE, 0).unwrap().truncate(1_500_000).unwrap();
+        want.get_mut("sv/big").unwrap().truncate(1_500_000);
+        vfs.open("/snap2/made-by-osmium", OpenFlags::WRITE | OpenFlags::CREATE, 0o644)
+            .unwrap()
+            .write(0, &pattern(70_000, 3))
+            .unwrap();
+        want.insert("snap2/made-by-osmium".into(), pattern(70_000, 3));
+        assert_eq!(
+            vfs.open("/rosnap/big", OpenFlags::WRITE, 0).and_then(|f| f.write(0, b"no")).err(),
+            Some(osmium_fs::Errno::EROFS)
+        );
+
+        // Snapshots of those, written to as well.
+        fs.create_snapshot(&*vfs.lookup("/snap2").unwrap(), &*root, "drv", false).unwrap();
+        fs.create_snapshot(&*vfs.lookup("/sv").unwrap(), &*root, "drvro", true).unwrap();
+        for (k, v) in want.clone() {
+            if let Some(rest) = k.strip_prefix("snap2/") {
+                want.insert(format!("drv/{rest}"), v);
+            } else if let Some(rest) = k.strip_prefix("sv/") {
+                want.insert(format!("drvro/{rest}"), v);
+            }
+        }
+        let more = pattern(40_000, 4);
+        vfs.open("/drv/d/file-with-a-long-name-300", OpenFlags::WRITE | OpenFlags::TRUNC, 0)
+            .unwrap()
+            .write(0, &more)
+            .unwrap();
+        want.insert("drv/d/file-with-a-long-name-300".into(), more);
+        vfs.unlink("/sv/d/file-with-a-long-name-1").unwrap();
+        want.remove("sv/d/file-with-a-long-name-1");
+
+        // Deleting the middle of the chain leaves its neighbours whole.
+        fs.delete_subvolume(&*root, "snap").unwrap();
+        fs.delete_subvolume(&*root, "rosnap").unwrap();
+        want.retain(|k, _| !k.starts_with("snap/") && !k.starts_with("rosnap/"));
+        let after = pattern(9000, 5);
+        vfs.open("/snap2/d/file-with-a-long-name-400", OpenFlags::WRITE | OpenFlags::TRUNC, 0)
+            .unwrap()
+            .write(0, &after)
+            .unwrap();
+        want.insert("snap2/d/file-with-a-long-name-400".into(), after);
+        assert!(vfs.lookup("/snap").is_err());
+    }
+    check(&img);
+
+    // Linux reads all that, changes more, and deletes the source.
+    let text = linux.run(
+        &dir,
+        &img,
+        "echo BEGIN-SUMS\nfind sv snap2 drv drvro -type f | sort | xargs md5sum\necho END-SUMS\n\
+         echo linux-says > drv/d/file-with-a-long-name-500\n\
+         echo more >> snap2/big\n\
+         btrfs subvolume snapshot drv drv2 >/dev/null\nsync\n\
+         echo in-drv2 > drv2/d/file-with-a-long-name-600\nsync\n\
+         btrfs subvolume delete sv >/dev/null\nsync\n",
+    );
+    same_as_linux(&text, &want);
+    check(&img);
+
+    // And the driver reads what Linux did, carries on, and empties the volume.
+    {
+        let fs = mount(&img);
+        let got = read_subvols(&fs, &["snap2", "drv", "drv2", "drvro"]);
+        assert_eq!(got["drv/d/file-with-a-long-name-500"], b"linux-says\n");
+        assert_eq!(got["drv2/d/file-with-a-long-name-600"], b"in-drv2\n");
+        assert!(got["snap2/big"].ends_with(b"more\n"));
+        let vfs = Vfs::new(fs.root());
+        assert!(vfs.lookup("/sv").is_err());
+        vfs.open("/drv2/d/file-with-a-long-name-700", OpenFlags::WRITE | OpenFlags::TRUNC, 0)
+            .unwrap()
+            .write(0, b"osmium")
+            .unwrap();
+        let root = vfs.lookup("/").unwrap();
+        for s in ["snap2", "drv", "drvro"] {
+            fs.delete_subvolume(&*root, s).unwrap();
+        }
+    }
+    check(&img);
+    let fs = mount(&img);
+    let got = read_subvols(&fs, &["drv2"]);
+    assert_eq!(got["drv2/d/file-with-a-long-name-700"], b"osmium");
+    assert_eq!(got["drv2/d/file-with-a-long-name-600"], b"in-drv2\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// The listing a script prints to compare two views of one volume: type, size, links, mode and blocks of every
+/// path.
+const STATS: &str = "echo BEGIN-STAT\nfind . | sort | xargs stat -c '%n %F %s %h %a %b'\necho END-STAT\n";
+
+fn stats(text: &str) -> Vec<String> {
+    text.split("BEGIN-STAT").nth(1).unwrap().split("END-STAT").next().unwrap().lines().map(str::to_string).collect()
+}
+
+/// Whether the superblock of `img` has a log.
+fn has_log(img: &Path) -> bool {
+    let out = Command::new(tool("btrfs").unwrap()).args(["inspect-internal", "dump-super"]).arg(img).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = text.lines().find(|l| l.starts_with("log_root\t")).unwrap();
+    line.split_whitespace().nth(1) != Some("0")
+}
+
+/// Replays the log in `img` twice, once by the driver at mount (`mid` then looks at what it made) and once by
+/// Linux on a copy, and checks that `btrfs check` accepts both and that Linux sees the same files in each.
+fn compare_replays(linux: &Linux, dir: &Path, img: &Path, extra: &str, mid: impl FnOnce(&Vfs)) {
+    assert!(has_log(img), "Linux left no log");
+    let linux_img = dir.join("img-linux");
+    std::fs::copy(img, &linux_img).unwrap();
+    // To look at the log with `btrfs inspect-internal dump-tree`.
+    if let Some(keep) = std::env::var_os("OSMIUM_LINUX_KEEP") {
+        std::fs::copy(img, keep).unwrap();
+    }
+    {
+        let fs = mount(img);
+        let vfs = Vfs::new(fs.root());
+        mid(&vfs);
+        // The volume is writable.
+        vfs.open("/after", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, b"after").unwrap();
+        vfs.unlink("/after").unwrap();
+    }
+    assert!(!has_log(img), "the log is cleared");
+    check(img);
+    // Linux agrees with what the driver made of it, and with what it makes of it itself.
+    let ours = linux.run(dir, img, &format!("{SUMS}{STATS}{extra}sync\n"));
+    let theirs = linux.run(dir, &linux_img, &format!("{SUMS}{STATS}{extra}sync\n"));
+    assert_eq!(sums(&ours), sums(&theirs));
+    assert_eq!(stats(&ours), stats(&theirs));
+    check(&linux_img);
+    check(img);
+}
+
+#[test]
+fn linux_log_is_replayed() {
+    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-linux3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(linux) = Linux::new(&dir) else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let Some(mkfs) = tool("mkfs.btrfs") else { return };
+    if !linux.has_fx {
+        eprintln!("no C compiler for the helper; skipping");
+        return;
+    }
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("d")).unwrap();
+    std::fs::write(src.join("old"), pattern(100_000, 7)).unwrap();
+    std::fs::write(src.join("big"), pattern(2_000_000, 9)).unwrap();
+    std::fs::write(src.join("trunc"), pattern(200_000, 3)).unwrap();
+    std::fs::write(src.join("ren"), b"rename me").unwrap();
+    std::fs::write(src.join("d/gone"), b"gone soon").unwrap();
+    std::fs::write(src.join("d/stay"), b"stay").unwrap();
+    let img = dir.join("img");
+    std::fs::File::create(&img).unwrap().set_len(256 << 20).unwrap();
+    assert!(Command::new(mkfs).args(["-q", "--rootdir"]).arg(&src).arg(&img).status().unwrap().success());
+
+    // Linux changes things and loses power; what it fsynced is only in the log.
+    let text = linux.crash(
+        &dir,
+        &img,
+        "yes 'new data' | head -c 300000 > newbig\nsync newbig\n\
+         mkdir -p nd/sub\necho deep > nd/sub/f\nsync nd/sub/f\n\
+         echo appended >> old\nsync old\n\
+         dd if=/dev/zero of=big bs=4096 seek=10 count=3 conv=notrunc,fsync 2>/dev/null\n\
+         rm d/gone\nsync d\n\
+         ln d/stay hl2\nsync hl2\n\
+         mv ren renamed\nsync renamed\n\
+         truncate -s 50000 trunc\nsync trunc\n\
+         chmod 600 d/stay\nsync d/stay\n\
+         ln -s old sl\nsync .\n\
+         echo xv > fresh\nfx setxattr fresh user.k value1\nsync fresh\n\
+         fx punch big 500000 100000\nsync big\n",
+    );
+    assert!(!text.contains("BTRFS error"), "{text}");
+    compare_replays(&linux, &dir, &img, "fx getxattr fresh user.k\n", |vfs| {
+        let cycle = |s: &[u8]| s.iter().copied().cycle().take(300_000).collect::<Vec<u8>>();
+        assert_eq!(read_all(&*vfs.lookup("/newbig").unwrap()), cycle(b"new data\n"));
+        assert_eq!(read_all(&*vfs.lookup("/nd/sub/f").unwrap()), b"deep\n");
+        let mut old = pattern(100_000, 7);
+        old.extend_from_slice(b"appended\n");
+        assert_eq!(read_all(&*vfs.lookup("/old").unwrap()), old);
+        let mut big = pattern(2_000_000, 9);
+        big[40960..53248].fill(0);
+        big[500_000..600_000].fill(0);
+        assert_eq!(read_all(&*vfs.lookup("/big").unwrap()), big);
+        assert!(vfs.lookup("/d/gone").is_err());
+        assert_eq!(read_all(&*vfs.lookup("/hl2").unwrap()), b"stay");
+        assert_eq!(read_all(&*vfs.lookup("/d/stay").unwrap()), b"stay");
+        assert_eq!(vfs.lookup("/d/stay").unwrap().stat().nlink, 2);
+        assert!(vfs.lookup("/ren").is_err());
+        assert_eq!(read_all(&*vfs.lookup("/renamed").unwrap()), b"rename me");
+        assert_eq!(read_all(&*vfs.lookup("/trunc").unwrap()), pattern(200_000, 3)[..50_000]);
+        assert_eq!(vfs.readlink("/sl").unwrap(), "old");
+        assert_eq!(read_all(&*vfs.lookup("/fresh").unwrap()), b"xv\n");
+        assert_eq!(vfs.lookup("/fresh").unwrap().xattr_get(b"user.k").unwrap(), b"value1");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn linux_log_is_replayed_more() {
+    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-linux4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(linux) = Linux::new(&dir) else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let Some(mkfs) = tool("mkfs.btrfs") else { return };
+    if !linux.has_fx {
+        eprintln!("no C compiler for the helper; skipping");
+        return;
+    }
+    let src = dir.join("src");
+    for d in ["a", "b", "b/empty", "m"] {
+        std::fs::create_dir_all(src.join(d)).unwrap();
+    }
+    for i in 1..=5 {
+        std::fs::write(src.join(format!("a/f{i}")), format!("file {i}")).unwrap();
+    }
+    std::fs::write(src.join("mid"), pattern(1 << 20, 11)).unwrap();
+    std::fs::write(src.join("prealloc"), pattern(10_000, 12)).unwrap();
+    std::fs::write(src.join("inline"), b"short").unwrap();
+    let img = dir.join("img");
+    std::fs::File::create(&img).unwrap().set_len(256 << 20).unwrap();
+    assert!(Command::new(mkfs).args(["-q", "-n", "4096", "--rootdir"]).arg(&src).arg(&img).status().unwrap().success());
+
+    let text = linux.crash(
+        &dir,
+        &img,
+        "mv a/f1 b/f1\nsync b/f1\nsync a\n\
+         rm a/f2\nsync a\n\
+         rmdir b/empty\nsync b\n\
+         dd if=/dev/zero of=mid bs=1000 seek=300 count=5 conv=notrunc,fsync 2>/dev/null\n\
+         fx falloc prealloc 20000 100000\nsync prealloc\n\
+         echo 'a much longer text than before' > inline\nsync inline\n\
+         i=0; while [ $i -lt 400 ]; do echo $i > m/file-with-a-long-name-$i; i=$((i+1)); done\nsync m\n\
+         rm m/file-with-a-long-name-7 m/file-with-a-long-name-300\nsync m\n\
+         ln -s b/f1 m/link\nsync m\n\
+         fx setxattr a/f3 user.one 1\nfx setxattr a/f3 user.two 22\nsync a/f3\n",
+    );
+    assert!(!text.contains("BTRFS error"), "{text}");
+    compare_replays(&linux, &dir, &img, "fx getxattr a/f3 user.one\nfx getxattr a/f3 user.two\n", |vfs| {
+        assert_eq!(read_all(&*vfs.lookup("/b/f1").unwrap()), b"file 1");
+        assert!(vfs.lookup("/a/f1").is_err());
+        assert!(vfs.lookup("/a/f2").is_err());
+        assert_eq!(read_all(&*vfs.lookup("/a/f3").unwrap()), b"file 3");
+        assert!(vfs.lookup("/b/empty").is_err());
+        let mut mid = pattern(1 << 20, 11);
+        mid[300_000..305_000].fill(0);
+        assert_eq!(read_all(&*vfs.lookup("/mid").unwrap()), mid);
+        assert_eq!(vfs.lookup("/prealloc").unwrap().stat().size, 10_000);
+        assert_eq!(read_all(&*vfs.lookup("/prealloc").unwrap()), pattern(10_000, 12));
+        assert_eq!(read_all(&*vfs.lookup("/inline").unwrap()), b"a much longer text than before\n");
+        assert!(vfs.lookup("/m/file-with-a-long-name-7").is_err());
+        assert!(vfs.lookup("/m/file-with-a-long-name-300").is_err());
+        vfs.lookup("/m/file-with-a-long-name-399").unwrap();
+        assert_eq!(vfs.readlink("/m/link").unwrap(), "b/f1");
+        assert_eq!(vfs.lookup("/a/f3").unwrap().xattr_get(b"user.two").unwrap(), b"22");
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }

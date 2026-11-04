@@ -13,9 +13,6 @@ use crate::disk::{Chunk, Key, header, le64};
 use crate::raid::Place;
 use crate::{Dev, MAX_RUN, Shared, csum};
 
-/// Tree blocks kept in memory.
-const CACHE_BLOCKS: usize = 32;
-
 /// Deepest tree (`BTRFS_MAX_LEVEL`).
 const MAX_LEVEL: u8 = 8;
 
@@ -216,6 +213,8 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         if chunk.parity() != 0 {
             return Err(Errno::EIO);
         }
+        // Nothing cached for these addresses is current once they are written.
+        self.data_cache.lock().forget_range(logical, logical.saturating_add(buf.len() as u64));
         let mut done = 0usize;
         while done < buf.len() {
             let within = (logical - chunk.logical).checked_add(done as u64).ok_or(Errno::EIO)?;
@@ -243,18 +242,16 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     /// rewritten.
     pub(crate) fn forget(&self, addrs: impl Iterator<Item = u64> + Clone) {
         let mut cache = self.cache.lock();
-        for slot in cache.0.iter_mut() {
-            if addrs.clone().any(|a| a == slot.0) {
-                slot.0 = u64::MAX;
-            }
+        for a in addrs {
+            cache.forget_range(a, a.saturating_add(1));
         }
     }
 
     /// The tree block at `logical`, checked against its checksum, address and
     /// fsid.
     pub(crate) fn block(&self, chunks: &ChunkMap, logical: u64) -> Result<Block, Errno> {
-        if let Some((_, b)) = self.cache.lock().0.iter().find(|(at, _)| *at == logical) {
-            return Ok(b.clone());
+        if let Some(b) = self.cache.lock().get(logical) {
+            return Ok(b);
         }
         let mut b = try_zeroed(self.nodesize)?;
         let (ty, uuid) = (self.csum_type, self.meta_uuid);
@@ -274,17 +271,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             return Err(Errno::EIO);
         }
         let b = try_arc(b)?;
-        let mut cache = self.cache.lock();
-        let (slots, hand) = &mut *cache;
-        if slots.len() < CACHE_BLOCKS {
-            // A full cache never grows, so this push is the only allocation.
-            if try_push(slots, (logical, b.clone())).is_err() {
-                return Ok(b);
-            }
-        } else if let Some(slot) = slots.get_mut(*hand % CACHE_BLOCKS) {
-            *slot = (logical, b.clone());
-            *hand = hand.wrapping_add(1);
-        }
+        self.cache.lock().insert(logical, b.clone());
         Ok(b)
     }
 
@@ -295,6 +282,49 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             return Err(Errno::EIO);
         }
         Ok(b)
+    }
+
+    /// Reads every item of the tree rooted at `root` (in key order) into
+    /// `items`, and the address of each of its blocks into `blocks`.
+    pub(crate) fn read_tree(
+        &self,
+        chunks: &ChunkMap,
+        root: (u64, u8),
+        items: &mut Vec<(Key, Vec<u8>)>,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), Errno> {
+        if root.1 >= MAX_LEVEL {
+            return Err(Errno::EIO);
+        }
+        let start = items.len();
+        self.read_subtree(chunks, root.0, root.1, items, blocks)?;
+        // Keys must ascend, or the tree is not what it claims to be.
+        let read = items.get(start..).ok_or(Errno::EIO)?;
+        if read.windows(2).any(|w| w.first().map(|a| a.0) >= w.get(1).map(|b| b.0)) {
+            return Err(Errno::EIO);
+        }
+        Ok(())
+    }
+
+    fn read_subtree(
+        &self,
+        chunks: &ChunkMap,
+        addr: u64,
+        want: u8,
+        items: &mut Vec<(Key, Vec<u8>)>,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), Errno> {
+        let b = self.block_at(chunks, addr, want)?;
+        try_push(blocks, addr)?;
+        for slot in 0..nritems(&b) {
+            if want == 0 {
+                try_push(items, (slot_key(&b, slot)?, osmium_sync::fallible::try_to_vec(item_data(&b, slot)?)?))?;
+            } else {
+                let below = want.checked_sub(1).ok_or(Errno::EIO)?;
+                self.read_subtree(chunks, child(&b, slot)?, below, items, blocks)?;
+            }
+        }
+        Ok(())
     }
 
     /// The data of the item with exactly `key` in the tree rooted at `root`.

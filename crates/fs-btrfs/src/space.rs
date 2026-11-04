@@ -280,7 +280,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         }
     }
 
-    fn claim(&mut self, start: u64, len: u64) -> Result<(u64, u64), Errno> {
+    pub(crate) fn claim(&mut self, start: u64, len: u64) -> Result<(u64, u64), Errno> {
         self.allocs.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         self.w.group_mut(start).ok_or(Errno::EIO)?.take(start, len)?;
         self.allocs.push(Alloc { start, len, dead: false });

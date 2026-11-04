@@ -291,3 +291,86 @@ fn writes_fail_cleanly() {
     assert!(out.status.success() && !text.contains("ERROR"), "btrfs check:\n{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn snapshots_fail_cleanly() {
+    let Some(mkfs) = ["/usr/sbin", "/usr/bin"].iter().map(|d| Path::new(d).join("mkfs.btrfs")).find(|p| p.exists())
+    else {
+        eprintln!("mkfs.btrfs not found; skipping");
+        return;
+    };
+    let btrfs = Path::new("/usr/bin/btrfs");
+    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-oomsnap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("img");
+    std::fs::File::create(&img).unwrap().set_len(128 << 20).unwrap();
+    assert!(Command::new(&mkfs).args(["-q", "-n", "4096"]).arg(&img).status().unwrap().success());
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap();
+    let len = file.metadata().unwrap().len();
+    let disk = RwDisk(Arc::new(file), len);
+    let names: Vec<String> = (0..2000).map(|i| format!("snap{i}")).collect();
+    let files: Vec<String> = (0..400).map(|i| format!("/vol/file-with-a-long-name-{i}")).collect();
+    let data = [3u8; 3000];
+    let mut runs = 0;
+    {
+        let fs = BtrfsFs::mount(disk.clone(), 1).unwrap();
+        let vfs = Vfs::new(fs.root());
+        let root = vfs.lookup("/").unwrap();
+        fs.create_subvolume(&*root, "vol").unwrap();
+        for f in &files {
+            vfs.open(f, OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, &data).unwrap();
+        }
+        let vol = vfs.lookup("/vol").unwrap();
+        // Creating subvolumes and snapshots.
+        let mut n = 0;
+        runs += some_failures(
+            5,
+            || {
+                n += 1;
+                fs.create_snapshot(&*vol, &*root, &names[n], n % 2 == 0)
+            },
+            |r, injected| _ = ok_or_enomem(&r, injected),
+        );
+        let mut m = 1000;
+        runs += some_failures(
+            5,
+            || {
+                m += 1;
+                fs.create_subvolume(&*root, &names[m])
+            },
+            |r, injected| _ = ok_or_enomem(&r, injected),
+        );
+        // Writing blocks a snapshot shares.
+        let mut k = 0;
+        runs += some_failures(
+            11,
+            || {
+                k += 1;
+                vfs.open(&files[k], OpenFlags::WRITE, 0)?.write(100, &data[..500])
+            },
+            |r, injected| _ = ok_or_enomem(&r, injected),
+        );
+        // Deleting them, the trees dropped a few blocks at a time.
+        let mut d = 0;
+        runs += some_failures(
+            7,
+            || {
+                d += 1;
+                // A snapshot whose creation failed is not there to delete.
+                match fs.delete_subvolume(&*root, &names[d]) {
+                    Err(Errno::ENOENT) => Ok(()),
+                    r => r,
+                }
+            },
+            |r, injected| _ = ok_or_enomem(&r, injected),
+        );
+        assert!(runs > 100, "{runs} allocations");
+    }
+    // A mount finishes what a failed delete left, and the volume is whole.
+    drop(BtrfsFs::mount(disk, 1).unwrap());
+    let out = Command::new(btrfs).args(["check", "--readonly", "--check-data-csum"]).arg(&img).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && !text.contains("ERROR"), "btrfs check:\n{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

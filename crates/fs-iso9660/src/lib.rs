@@ -583,6 +583,8 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             ino: e.ino,
             kind: e.kind,
             mode: e.mode,
+            uid: 0,
+            gid: 0,
             nlink: e.nlink,
             size: e.size,
             rdev: e.rdev,

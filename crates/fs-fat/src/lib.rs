@@ -1047,6 +1047,8 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             ino,
             kind,
             mode,
+            uid: 0,
+            gid: 0,
             nlink: if kind == FileKind::Directory { 2 } else { 1 },
             size,
             rdev: 0,

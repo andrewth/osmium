@@ -15,32 +15,6 @@ use crate::node::ITEM;
 use crate::write::{MAX_ROUNDS, Tx, succ};
 use crate::{State, disk};
 
-/// Extent item flags.
-const EXTENT_DATA: u64 = 1;
-const EXTENT_TREE_BLOCK: u64 = 2;
-const EXTENT_FULL_BACKREF: u64 = 1 << 8;
-
-/// Bytes of an extent item before its inline references.
-const EXTENT_ITEM: usize = 24;
-
-/// The key offset of a keyed data reference (`hash_extent_data_ref`).
-fn data_ref_hash(root: u64, ino: u64, offset: u64) -> u64 {
-    let high = csum::crc32c(!0, &root.to_le_bytes());
-    let low = csum::crc32c(!0, &ino.to_le_bytes());
-    let low = csum::crc32c(low, &offset.to_le_bytes());
-    (high as u64) << 31 ^ low as u64
-}
-
-/// The fields of an `EXTENT_DATA_REF`.
-fn data_ref(root: u64, ino: u64, offset: u64, count: u32) -> [u8; 28] {
-    let mut b = [0u8; 28];
-    let _ = put64(&mut b, 0, root);
-    let _ = put64(&mut b, 8, ino);
-    let _ = put64(&mut b, 16, offset);
-    let _ = put32(&mut b, 24, count);
-    b
-}
-
 /// Merges sorted-or-not ranges into sorted, non-touching ones.
 fn normalize(v: &mut Vec<(u64, u64)>) {
     v.sort_unstable();
@@ -110,181 +84,6 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                     d.get(tail..).ok_or(Errno::EIO)?,
                 )?;
             }
-        }
-        Ok(())
-    }
-
-    /// Adds `delta` to data extent `bytenr`'s keyed reference by `(root, ino,
-    /// offset)`; returns `false` if there is none to take from. Colliding
-    /// references take the next free key offsets, so a reference is looked
-    /// for among all of the extent's keyed references from its hash on.
-    fn keyed_data_ref(&mut self, bytenr: u64, root: u64, ino: u64, offset: u64, delta: i64) -> Result<bool, Errno> {
-        let hash = data_ref_hash(root, ino, offset);
-        let mut at = Key::new(bytenr, item::EXTENT_DATA_REF, hash);
-        let mut free = None;
-        loop {
-            let found = self
-                .next_item(tree::EXTENT, at)?
-                .filter(|(k, _)| k.objectid == bytenr && k.ty == item::EXTENT_DATA_REF);
-            let Some((key, d)) = found else { break };
-            if free.is_none() && key.offset != at.offset {
-                free = Some(at);
-            }
-            if (le64(&d, 0)?, le64(&d, 8)?, le64(&d, 16)?) == (root, ino, offset) {
-                let count = le32(&d, 24)? as i64 + delta;
-                match count {
-                    ..0 => return Err(Errno::EIO),
-                    0 => self.delete(tree::EXTENT, key)?,
-                    _ => {
-                        let c = u32::try_from(count).map_err(|_| Errno::EIO)?;
-                        self.update(tree::EXTENT, key, &data_ref(root, ino, offset, c))?;
-                    }
-                }
-                return Ok(true);
-            }
-            at = succ(key).ok_or(Errno::EIO)?;
-        }
-        if delta < 0 {
-            return Ok(false);
-        }
-        let count = u32::try_from(delta).map_err(|_| Errno::EIO)?;
-        self.insert(tree::EXTENT, free.unwrap_or(at), &data_ref(root, ino, offset, count))?;
-        Ok(true)
-    }
-
-    /// Applies the pending data extent reference changes to the extent tree.
-    fn apply_data_refs(&mut self) -> Result<(), Errno> {
-        let mut refs = core::mem::take(&mut self.data_refs);
-        refs.sort_unstable_by_key(|r| (r.bytenr, r.root, r.ino, r.offset));
-        let mut i = 0;
-        while let Some(first) = refs.get(i).copied() {
-            let n = refs.get(i..).unwrap_or(&[]).iter().take_while(|r| r.bytenr == first.bytenr).count();
-            let group = refs.get(i..i + n).ok_or(Errno::EIO)?;
-            i += n;
-            // Net change per referrer.
-            let mut net: Vec<(u64, u64, u64, i64)> = Vec::new();
-            for r in group {
-                match net.last_mut() {
-                    Some(l) if (l.0, l.1, l.2) == (r.root, r.ino, r.offset) => l.3 += r.delta,
-                    _ => try_push(&mut net, (r.root, r.ino, r.offset, r.delta))?,
-                }
-            }
-            net.retain(|r| r.3 != 0);
-            let new = group.iter().any(|r| r.new);
-            let (bytenr, len) = (first.bytenr, first.len);
-            let key = Key::new(bytenr, item::EXTENT_ITEM, len);
-            if new {
-                if net.iter().any(|r| r.3 < 0) {
-                    return Err(Errno::EIO);
-                }
-                let total: i64 = net.iter().map(|r| r.3).sum();
-                let Some(&(root, ino, offset, count)) = net.first() else {
-                    // Written and dropped in this transaction.
-                    self.csum_delete(bytenr, len)?;
-                    self.unalloc(bytenr);
-                    continue;
-                };
-                let mut d = [0u8; EXTENT_ITEM + 29];
-                put64(&mut d, 0, total as u64)?;
-                put64(&mut d, 8, self.transid)?;
-                put64(&mut d, 16, EXTENT_DATA)?;
-                disk::put(&mut d, 24, &[item::EXTENT_DATA_REF])?;
-                disk::put(&mut d, 25, &data_ref(root, ino, offset, u32::try_from(count).map_err(|_| Errno::EIO)?))?;
-                self.insert(tree::EXTENT, key, &d)?;
-                for &(root, ino, offset, count) in net.get(1..).unwrap_or(&[]) {
-                    self.keyed_data_ref(bytenr, root, ino, offset, count)?;
-                }
-                continue;
-            }
-            let mut d = self.find(tree::EXTENT, key)?.ok_or(Errno::EIO)?;
-            if le64(&d, 16)? & EXTENT_DATA == 0 {
-                return Err(Errno::EIO);
-            }
-            let mut total = le64(&d, 0)? as i64;
-            for &(root, ino, offset, delta) in &net {
-                total += delta;
-                // An inline reference, else a keyed one.
-                let mut p = EXTENT_ITEM;
-                let mut found = false;
-                while p < d.len() {
-                    let size = match byte(&d, p)? {
-                        item::TREE_BLOCK_REF | item::SHARED_BLOCK_REF => 9,
-                        item::EXTENT_DATA_REF => 29,
-                        item::SHARED_DATA_REF => 13,
-                        _ => return Err(Errno::EIO),
-                    };
-                    if byte(&d, p)? == item::EXTENT_DATA_REF
-                        && (le64(&d, p + 1)?, le64(&d, p + 9)?, le64(&d, p + 17)?) == (root, ino, offset)
-                    {
-                        let count = le32(&d, p + 25)? as i64 + delta;
-                        if count < 0 {
-                            return Err(Errno::EIO);
-                        }
-                        if count == 0 {
-                            d.drain(p..p + 29);
-                        } else {
-                            put32(&mut d, p + 25, u32::try_from(count).map_err(|_| Errno::EIO)?)?;
-                        }
-                        found = true;
-                        break;
-                    }
-                    p += size;
-                }
-                if !found && !self.keyed_data_ref(bytenr, root, ino, offset, delta)? {
-                    // Referred to through a shared leaf (a snapshot or relocation).
-                    return Err(Errno::EOPNOTSUPP);
-                }
-            }
-            match total {
-                ..0 => return Err(Errno::EIO),
-                0 => {
-                    self.delete(tree::EXTENT, key)?;
-                    self.csum_delete(bytenr, len)?;
-                    try_push(&mut self.pinned, (bytenr, len))?;
-                }
-                _ => {
-                    put64(&mut d, 0, total as u64)?;
-                    self.update(tree::EXTENT, key, &d)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies the pending tree block reference changes to the extent tree.
-    fn apply_tree_refs(&mut self) -> Result<(), Errno> {
-        let refs = core::mem::take(&mut self.tree_refs);
-        for r in refs {
-            let key = Key::new(r.addr, item::METADATA_ITEM, r.level as u64);
-            if r.add {
-                let mut d = [0u8; EXTENT_ITEM + 9];
-                put64(&mut d, 0, 1)?;
-                put64(&mut d, 8, self.transid)?;
-                put64(&mut d, 16, EXTENT_TREE_BLOCK)?;
-                disk::put(&mut d, 24, &[item::TREE_BLOCK_REF])?;
-                put64(&mut d, 25, r.owner)?;
-                self.insert(tree::EXTENT, key, &d)?;
-                continue;
-            }
-            // Only a block its own tree alone refers to can go.
-            let (key, refs_at) = match self.find(tree::EXTENT, key)? {
-                Some(d) => (key, (d, EXTENT_ITEM)),
-                None => {
-                    let fat = Key::new(r.addr, item::EXTENT_ITEM, self.sh.nodesize as u64);
-                    (fat, (self.find(tree::EXTENT, fat)?.ok_or(Errno::EIO)?, EXTENT_ITEM + Key::SIZE + 1))
-                }
-            };
-            let (d, p) = refs_at;
-            let flags = le64(&d, 16)?;
-            if le64(&d, 0)? != 1
-                || flags & EXTENT_FULL_BACKREF != 0
-                || d.len() != p + 9
-                || byte(&d, p)? != item::TREE_BLOCK_REF
-                || le64(&d, p + 1)? != r.owner
-            {
-                return Err(Errno::EOPNOTSUPP);
-            }
-            self.delete(tree::EXTENT, key)?;
         }
         Ok(())
     }
@@ -520,7 +319,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         if !settled {
             return Err(Errno::EIO);
         }
-        if self.dirty.is_empty() && self.allocs.is_empty() {
+        if self.dirty.is_empty() && self.allocs.is_empty() && !self.force {
             return Ok(());
         }
 
@@ -553,7 +352,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         let dev_used = le64(&sb, 201 + 16)? + self.dev_used;
         put64(&mut sb, 201 + 16, dev_used)?;
         // Holes are left implicit.
-        let flags = le64(&sb, 188)? | incompat::NO_HOLES;
+        let flags = le64(&sb, 188)? | incompat::NO_HOLES | self.incompat;
         put64(&mut sb, 188, flags)?;
         self.backup_roots(&mut sb, root_tree.addr, root_tree.level, chunk_root.addr, chunk_root.level)?;
         let chunks = match self.new_chunks.take() {
@@ -571,7 +370,11 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             next: osmium_sync::SpinLock::new(None),
         })?;
         self.w.limbo.try_reserve(self.pinned.len()).map_err(|_| Errno::ENOMEM)?;
-        self.base.pinned.lock().try_reserve(self.pinned.len()).map_err(|_| Errno::ENOMEM)?;
+        self.base.pinned.lock().try_reserve(self.pinned.len() + self.w.held.len()).map_err(|_| Errno::ENOMEM)?;
+        // Room for the ranges a deferred commit sets aside or remembers; the
+        // free list `fresh` grows by one at most per allocation.
+        self.w.held.try_reserve(self.pinned.len()).map_err(|_| Errno::ENOMEM)?;
+        self.w.fresh.try_reserve(self.allocs.len()).map_err(|_| Errno::ENOMEM)?;
         let dead = self.allocs.iter().filter(|a| a.dead).count();
         for a in self.allocs.iter().filter(|a| a.dead) {
             if let Some(g) = self.w.group_mut(a.start) {
@@ -583,10 +386,16 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         for (addr, b) in &blocks {
             sh.write_logical(&chunks, *addr, b)?;
         }
-        sh.flush()?;
-        if let Err(e) = sh.write_super(&mut sb, &mut others) {
-            self.w.broken = true;
-            return Err(e);
+        // A deferred commit stops here: the blocks are written, and nothing
+        // points at them until `sync_locked` writes a superblock that does.
+        // The superblock of the last sync stays valid meanwhile, as the
+        // space it uses is held back (see `Writer::held`).
+        if !self.defer {
+            sh.flush()?;
+            if let Err(e) = sh.write_super(&mut sb, &mut others) {
+                self.w.broken = true;
+                return Err(e);
+            }
         }
 
         // Committed: nothing below may fail.
@@ -597,17 +406,38 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                 g.used = used;
             }
         }
-        for a in core::mem::take(&mut self.allocs) {
-            if a.dead
-                && let Some(g) = self.w.group_mut(a.start)
-            {
-                let _ = g.give(a.start, a.len);
+        let allocs = core::mem::take(&mut self.allocs);
+        // Freed ranges no superblock uses are reusable once readers let go;
+        // the others, only once a superblock without them is written.
+        let pinned = core::mem::take(&mut self.pinned);
+        self.w.limbo.extend_from_slice(&pinned);
+        let mut readers = self.base.pinned.lock();
+        if self.defer {
+            for (start, len) in pinned {
+                if self.w.is_fresh(start, len) {
+                    readers.push((start, len));
+                } else {
+                    self.w.held.push((start, len));
+                }
+            }
+            self.w.deferred = self.w.deferred.saturating_add(1);
+        } else {
+            readers.extend(pinned);
+            readers.append(&mut self.w.held);
+            self.w.fresh.clear();
+            self.w.deferred = 0;
+        }
+        drop(readers);
+        for a in allocs {
+            if a.dead {
+                if let Some(g) = self.w.group_mut(a.start) {
+                    let _ = g.give(a.start, a.len);
+                }
+            } else if self.defer {
+                self.w.add_fresh((a.start, a.len));
             }
         }
         self.new_groups.clear();
-        let pinned = core::mem::take(&mut self.pinned);
-        self.w.limbo.extend_from_slice(&pinned);
-        self.base.pinned.lock().extend(pinned);
         *self.base.next.lock() = Some(state.clone());
         *sh.state.lock() = state;
         Ok(())
@@ -630,6 +460,37 @@ impl<D: BlockDevice + Send + 'static> crate::Shared<D> {
             v.push(osmium_sync::fallible::try_zeroed(disk::SUPER_SIZE)?);
         }
         Ok(v)
+    }
+
+    /// Makes every deferred commit durable: flushes their blocks, then writes
+    /// the superblock that points at them.
+    pub(crate) fn sync_locked(&self, w: &mut crate::write::Writer) -> Result<(), Errno> {
+        if w.deferred == 0 {
+            return Ok(());
+        }
+        if w.broken {
+            return Err(Errno::EIO);
+        }
+        let mut others = self.super_buffers()?;
+        let mut sb = try_to_vec(&w.sb)?;
+        if let Err(e) = self.flush().and_then(|()| self.write_super(&mut sb, &mut others)) {
+            w.broken = true;
+            return Err(e);
+        }
+        w.sb = sb;
+        w.deferred = 0;
+        w.fresh.clear();
+        // What the deferred commits freed is free of the superblock now, and
+        // goes once the readers of every state so far have: the current
+        // state is the last of them to be dropped.
+        if !w.held.is_empty() {
+            let st = self.state();
+            let mut pinned = st.pinned.lock();
+            if pinned.try_reserve(w.held.len()).is_ok() {
+                pinned.append(&mut w.held);
+            }
+        }
+        Ok(())
     }
 
     /// Writes superblock `sb` (whose generation and roots are set) to every

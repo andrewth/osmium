@@ -125,7 +125,9 @@ fn mkfs(dir: &Path, n: usize, args: &[&str]) -> Option<Vec<PathBuf>> {
     Some(imgs)
 }
 
-const RO: MountOptions = MountOptions { subvol: None, read_only: true };
+fn ro() -> MountOptions<'static> {
+    MountOptions { read_only: true, ..MountOptions::default() }
+}
 
 fn mount(imgs: &[&Path], opts: MountOptions) -> Result<BtrfsFs<FileDisk>, Errno> {
     let mut md = MultiDevice::new();
@@ -417,7 +419,7 @@ fn empty_volumes_from_mkfs() {
         let dir = scratch(&format!("empty-{d}-{m}-{n}"));
         let Some(imgs) = mkfs(&dir, n, &["-d", d, "-m", m]) else { return };
         eprintln!("-d {d} -m {m} over {n} devices, empty");
-        let fs = mount(&paths(&imgs), RO).unwrap();
+        let fs = mount(&paths(&imgs), ro()).unwrap();
         touch(&fs);
         let rw = mount(&paths(&imgs), MountOptions::default()).unwrap();
         assert_eq!(rw.is_read_only(), is_parity(d, m));
@@ -449,12 +451,12 @@ fn read_every_profile() {
         let dir = scratch(&format!("read-{d}-{m}-{n}"));
         let Some(imgs) = populated(&dir, d, m, n) else { return };
         eprintln!("reading -d {d} -m {m} over {n} devices");
-        let fs = mount(&paths(&imgs), RO).unwrap();
+        let fs = mount(&paths(&imgs), ro()).unwrap();
         assert!(fs.is_read_only());
         verify(&fs);
         // Any order.
         let rev: Vec<&Path> = paths(&imgs).into_iter().rev().collect();
-        verify(&mount(&rev, RO).unwrap());
+        verify(&mount(&rev, ro()).unwrap());
         let rw = mount(&paths(&imgs), MountOptions::default()).unwrap();
         assert_eq!(rw.is_read_only(), is_parity(d, m));
         verify(&rw);
@@ -492,7 +494,7 @@ fn degraded() {
         // More than the profile covers: whatever reads must be right.
         if d == "raid5" || d == "raid6" {
             let have: Vec<&Path> = [0].into_iter().chain(lost + 1..n).map(|i| &*imgs[i]).collect();
-            let fs = mount(&have, RO).unwrap();
+            let fs = mount(&have, ro()).unwrap();
             let vfs = Vfs::new(fs.root());
             for (name, data) in files() {
                 if let Ok(f) = vfs.open(&format!("/{name}"), OpenFlags::READ, 0) {
@@ -531,7 +533,7 @@ fn damaged_device() {
             for i in 0..40u64 {
                 f.write_all_at(&junk, (1 << 20) + i * (1 << 20)).unwrap();
             }
-            verify(&mount(&paths(&imgs), RO).unwrap());
+            verify(&mount(&paths(&imgs), ro()).unwrap());
         }
     }
 }
@@ -541,21 +543,21 @@ fn bad_sets() {
     let dir = scratch("bad-sets");
     let Some(imgs) = mkfs(&dir, 2, &["-d", "raid1", "-m", "raid1"]) else { return };
     // The same device twice.
-    assert_eq!(mount(&[&imgs[0], &imgs[0]], RO).err(), Some(Errno::EINVAL));
+    assert_eq!(mount(&[&imgs[0], &imgs[0]], ro()).err(), Some(Errno::EINVAL));
     // A device of another volume.
     let dir2 = scratch("bad-sets-2");
     let Some(other) = mkfs(&dir2, 1, &["-d", "single", "-m", "single"]) else { return };
-    assert_eq!(mount(&[&imgs[0], &other[0]], RO).err(), Some(Errno::EINVAL));
+    assert_eq!(mount(&[&imgs[0], &other[0]], ro()).err(), Some(Errno::EINVAL));
     // A devid that is not what the superblock says.
     let mut md = MultiDevice::new();
     md.add_with_devid(2, FileDisk::open(&imgs[0])).unwrap();
-    assert_eq!(BtrfsFs::mount_multi(md, 9, RO).err(), Some(Errno::EINVAL));
+    assert_eq!(BtrfsFs::mount_multi(md, 9, ro()).err(), Some(Errno::EINVAL));
     let mut md = MultiDevice::new();
     md.add_with_devid(1, FileDisk::open(&imgs[0])).unwrap();
     md.add_with_devid(2, FileDisk::open(&imgs[1])).unwrap();
-    touch(&BtrfsFs::mount_multi(md, 9, RO).unwrap());
+    touch(&BtrfsFs::mount_multi(md, 9, ro()).unwrap());
     assert!(MultiDevice::<FileDisk>::new().is_empty());
-    assert_eq!(BtrfsFs::<FileDisk>::mount_multi(MultiDevice::new(), 9, RO).err(), Some(Errno::EINVAL));
+    assert_eq!(BtrfsFs::<FileDisk>::mount_multi(MultiDevice::new(), 9, ro()).err(), Some(Errno::EINVAL));
 }
 
 #[test]
@@ -575,7 +577,7 @@ fn checksum_types() {
             vfs.unlink("/hello.txt").unwrap();
         }
         check(&imgs[0], true);
-        let fs = mount(&[&imgs[0]], RO).unwrap();
+        let fs = mount(&[&imgs[0]], ro()).unwrap();
         let vfs = Vfs::new(fs.root());
         assert_eq!(cat(&vfs, "/dir/small"), b"small");
         assert!(vfs.lookup("/hello.txt").is_err());
@@ -632,7 +634,7 @@ fn write_multi() {
             assert!(cat(&vfs, "/odd") == pattern(65_536 * 3 + 123, 9));
             assert!(cat(&vfs, "/docs/more") == noise(300_000, 11));
         };
-        verify_after(&mount(&paths(&imgs), RO).unwrap());
+        verify_after(&mount(&paths(&imgs), ro()).unwrap());
         // Metadata is mirrored on each device, so btrfs check can go by one of
         // them (it reports the others missing); data is checked where it is
         // whole there.
@@ -654,7 +656,7 @@ fn write_multi() {
         }
         // A device lost from a mirrored volume after the writes.
         if d.starts_with("raid1") || d == "raid10" {
-            verify_after(&mount(&paths(&imgs)[1..], RO).unwrap());
+            verify_after(&mount(&paths(&imgs)[1..], ro()).unwrap());
         }
     }
 }
