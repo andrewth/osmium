@@ -44,6 +44,13 @@ pub const RESERVE_NODES: u64 = 64;
 /// Alignment of new chunks on the device and in logical addresses.
 const CHUNK_ALIGN: u64 = 64 * 1024;
 
+/// A device and its free ranges.
+struct DevRoom {
+    devid: u64,
+    total: u64,
+    gaps: Vec<(u64, u64)>,
+}
+
 /// A block group.
 pub struct Group {
     /// First logical address.
@@ -262,7 +269,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     /// `align` units) if none is that long. Returns its start and length.
     fn take(&mut self, ty: u64, len: u64, align: u64, partial: bool) -> Result<Option<(u64, u64)>, Errno> {
         let mut best: Option<(u64, u64)> = None;
-        for g in self.w.groups.iter().filter(|g| g.flags & kind::MASK == ty && !self.avoid.contains(&g.start)) {
+        for g in self.w.groups.iter().filter(|g| g.flags & kind::MASK == ty && self.may_allocate(g.start)) {
             for &(s, l) in &g.free {
                 let a = s.next_multiple_of(align);
                 let avail = (s + l).saturating_sub(a) / align * align;
@@ -278,6 +285,18 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             Some((a, l)) => self.claim(a, l).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Whether new allocations may go in the block group at `start`: it is
+    /// not being emptied, and none of its stripes is on a device being
+    /// removed.
+    fn may_allocate(&self, start: u64) -> bool {
+        !self.avoid.contains(&start)
+            && (self.w.no_alloc.is_empty()
+                || self
+                    .chunks()
+                    .find(start, 1)
+                    .is_ok_and(|c| c.stripes.iter().all(|s| !self.w.no_alloc.contains(&s.devid))))
     }
 
     fn claim(&mut self, start: u64, len: u64) -> Result<(u64, u64), Errno> {
@@ -298,7 +317,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                 .w
                 .groups
                 .iter()
-                .filter(|g| g.flags & kind::MASK == ty && !self.avoid.contains(&g.start))
+                .filter(|g| g.flags & kind::MASK == ty && self.may_allocate(g.start))
                 .flat_map(|g| g.free.iter())
                 .map(|r| r.1)
                 .sum();
@@ -376,59 +395,53 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         if flags & (profile::STRIPED | profile::MIRRORED) != 0 {
             return Ok(false);
         }
-        let devid = self.sh.devid;
-        let dev_item = self.find(tree::CHUNK, Key::new(1, item::DEV_ITEM, devid))?.ok_or(Errno::EIO)?;
-        let total = le64(&dev_item, 8)?;
+        let cap = if ty == kind::DATA { 1 << 30 } else { 256 << 20 };
 
-        // Free device ranges, between the dev extents.
-        let mut gaps: Vec<(u64, u64)> = Vec::new();
-        let mut pos = DEV_RESERVED;
-        let mut at = Key::new(devid, item::DEV_EXTENT, 0);
-        while let Some((k, data)) = self.next_item(tree::DEV, at)? {
-            if k.objectid != devid || k.ty != item::DEV_EXTENT {
+        // The devices that may take it, the one with most room first.
+        let mut cands: Vec<DevRoom> = Vec::new();
+        let mut at = Key::new(1, item::DEV_ITEM, 0);
+        while let Some((k, d)) = self.next_item(tree::CHUNK, at)? {
+            if k.objectid != 1 || k.ty != item::DEV_ITEM {
                 break;
             }
-            if k.offset > pos {
-                try_push(&mut gaps, (pos, k.offset - pos))?;
-            }
-            pos = pos.max(k.offset.saturating_add(le64(&data, 24)?));
             at = crate::write::succ(k).ok_or(Errno::EIO)?;
-        }
-        if total > pos {
-            try_push(&mut gaps, (pos, total - pos))?;
-        }
-        // Chunks this transaction added may not be in the device tree yet.
-        for &logical in &self.new_groups {
-            let c = self.chunks().find(logical, 1)?;
-            for s in &c.stripes {
-                carve(&mut gaps, s.offset, c.length)?;
+            if self.w.no_alloc.contains(&k.offset) || !self.sh.has_dev(k.offset) {
+                continue;
             }
+            let total = le64(&d, 8)?;
+            let gaps = self.dev_gaps(k.offset, total)?;
+            try_push(&mut cands, DevRoom { devid: k.offset, total, gaps })?;
         }
-        for g in gaps.iter_mut() {
-            let s = g.0.next_multiple_of(CHUNK_ALIGN);
-            *g = (s, (g.0 + g.1).saturating_sub(s) / CHUNK_ALIGN * CHUNK_ALIGN);
-        }
-        let cap = if ty == kind::DATA { 1 << 30 } else { 256 << 20 };
-        let tenth = (total / 10) / CHUNK_ALIGN * CHUNK_ALIGN;
-        let mut size = cap.min(tenth).max(8 << 20);
+        cands.sort_by_key(|c| core::cmp::Reverse(c.gaps.iter().map(|g| g.1).sum::<u64>()));
+
         // Shrink to what fits: one gap for both copies, else one per copy.
-        let fits = |size: u64| -> Option<Vec<u64>> {
-            if let Some(&(s, _)) = gaps.iter().find(|&&(_, l)| l >= size * copies) {
-                return Some((0..copies).map(|i| s + i * size).collect());
+        let mut found: Option<(u64, u64, Vec<u64>)> = None;
+        for DevRoom { devid, total, gaps } in &cands {
+            let tenth = (total / 10) / CHUNK_ALIGN * CHUNK_ALIGN;
+            let mut size = cap.min(tenth).max(8 << 20);
+            let fits = |size: u64| -> Option<Vec<u64>> {
+                if let Some(&(s, _)) = gaps.iter().find(|&&(_, l)| l >= size * copies) {
+                    return Some((0..copies).map(|i| s + i * size).collect());
+                }
+                let found: Vec<u64> =
+                    gaps.iter().filter(|&&(_, l)| l >= size).map(|&(s, _)| s).take(copies as usize).collect();
+                (found.len() as u64 == copies).then_some(found)
+            };
+            let offsets = loop {
+                if let Some(o) = fits(size) {
+                    break Some(o);
+                }
+                size = (size / 2) / CHUNK_ALIGN * CHUNK_ALIGN;
+                if size < (1 << 20) {
+                    break None;
+                }
+            };
+            if let Some(o) = offsets {
+                found = Some((*devid, size, o));
+                break;
             }
-            let found: Vec<u64> =
-                gaps.iter().filter(|&&(_, l)| l >= size).map(|&(s, _)| s).take(copies as usize).collect();
-            (found.len() as u64 == copies).then_some(found)
-        };
-        let offsets = loop {
-            if let Some(o) = fits(size) {
-                break o;
-            }
-            size = (size / 2) / CHUNK_ALIGN * CHUNK_ALIGN;
-            if size < (1 << 20) {
-                return Ok(false);
-            }
-        };
+        }
+        let Some((devid, size, offsets)) = found else { return Ok(false) };
 
         let logical =
             self.chunks().iter().map(|c| c.logical + c.length).max().unwrap_or(0).next_multiple_of(CHUNK_ALIGN);
@@ -462,16 +475,50 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         self.new_groups.push(logical);
         // Its items go in when the transaction commits: putting them in may
         // need the space it brings.
-        self.pending_chunks.push(PendingChunk { logical, size, flags, offsets: pending });
+        self.pending_chunks.push(PendingChunk { logical, size, flags, devid, offsets: pending });
         Ok(true)
+    }
+
+    /// The free ranges of device `devid`, which is `total` bytes: between its
+    /// device extents (and the chunks this transaction added), aligned for
+    /// chunks.
+    fn dev_gaps(&mut self, devid: u64, total: u64) -> Result<Vec<(u64, u64)>, Errno> {
+        let mut gaps: Vec<(u64, u64)> = Vec::new();
+        let mut pos = DEV_RESERVED;
+        let mut at = Key::new(devid, item::DEV_EXTENT, 0);
+        while let Some((k, data)) = self.next_item(tree::DEV, at)? {
+            if k.objectid != devid || k.ty != item::DEV_EXTENT {
+                break;
+            }
+            if k.offset > pos {
+                try_push(&mut gaps, (pos, k.offset - pos))?;
+            }
+            pos = pos.max(k.offset.saturating_add(le64(&data, 24)?));
+            at = crate::write::succ(k).ok_or(Errno::EIO)?;
+        }
+        if total > pos {
+            try_push(&mut gaps, (pos, total - pos))?;
+        }
+        // Chunks this transaction added may not be in the device tree yet.
+        for &logical in &self.new_groups {
+            let c = self.chunks().find(logical, 1)?;
+            for s in c.stripes.iter().filter(|s| s.devid == devid) {
+                carve(&mut gaps, s.offset, c.length)?;
+            }
+        }
+        for g in gaps.iter_mut() {
+            let s = g.0.next_multiple_of(CHUNK_ALIGN);
+            *g = (s, (g.0 + g.1).saturating_sub(s) / CHUNK_ALIGN * CHUNK_ALIGN);
+        }
+        Ok(gaps)
     }
 
     /// Puts the items of the chunks this transaction added into the chunk,
     /// device and block group trees.
     pub(crate) fn apply_pending_chunks(&mut self) -> Result<(), Errno> {
-        let devid = self.sh.devid;
-        let dev_key = Key::new(1, item::DEV_ITEM, devid);
         while let Some(c) = self.pending_chunks.pop() {
+            let devid = c.devid;
+            let dev_key = Key::new(1, item::DEV_ITEM, devid);
             let mut dev_item = self.find(tree::CHUNK, dev_key)?.ok_or(Errno::EIO)?;
             let dev_uuid: [u8; 16] = crate::disk::array(&dev_item, 66)?;
             // The chunk item, as Linux writes it.
@@ -519,6 +566,8 @@ pub struct PendingChunk {
     logical: u64,
     size: u64,
     flags: u64,
+    /// The device holding its stripes.
+    devid: u64,
     /// Device offsets of its stripes.
     offsets: Vec<u64>,
 }

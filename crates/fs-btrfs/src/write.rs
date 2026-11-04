@@ -101,6 +101,8 @@ pub struct Writer {
     pub fst: bool,
     /// Unlinked inodes still open: deleted when the last node goes.
     pub orphans: Vec<(u64, u64)>,
+    /// Devices that take no new allocations: one being removed.
+    pub no_alloc: Vec<u64>,
     /// Set if a commit failed after it began writing the superblock; no
     /// more writes are attempted.
     pub broken: bool,
@@ -130,6 +132,8 @@ pub struct Tx<'a, D: BlockDevice + Send + 'static> {
     /// Block groups (by start) new allocations stay out of: those a balance is
     /// emptying.
     pub(crate) avoid: Vec<u64>,
+    /// Write the superblocks even if no block changed.
+    pub(crate) force: bool,
     /// Block groups this transaction deletes, by start. They leave the
     /// writer's list when it commits.
     pub(crate) dropped_groups: Vec<u64>,
@@ -173,6 +177,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             pinned: Vec::new(),
             new_groups: Vec::new(),
             avoid: Vec::new(),
+            force: false,
             dropped_groups: Vec::new(),
             edits: 0,
             pending_chunks: Vec::new(),

@@ -221,3 +221,12 @@ pub fn root_addr(img: &Path) -> u64 {
 pub fn distinct(len: usize, seed: u32) -> Vec<u8> {
     (0..len / 4).flat_map(|i| (i as u32 ^ seed).wrapping_mul(2654435761).rotate_left(7).to_le_bytes()).collect()
 }
+
+/// `btrfs check` of the metadata only, which for a volume with a device
+/// missing (`btrfs check` cannot open the other image of two) is as much as it
+/// can look at; the warning that the device is missing is expected.
+pub fn try_check_metadata(img: &Path) -> Result<(), String> {
+    let out = Command::new(tool("btrfs").unwrap()).args(["check", "--readonly"]).arg(img).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.success() && !text.contains("ERROR") { Ok(()) } else { Err(text) }
+}

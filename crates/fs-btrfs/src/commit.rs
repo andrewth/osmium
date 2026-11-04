@@ -520,7 +520,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         if !settled {
             return Err(Errno::EIO);
         }
-        if self.dirty.is_empty() && self.allocs.is_empty() {
+        if self.dirty.is_empty() && self.allocs.is_empty() && !self.force {
             return Ok(());
         }
 
@@ -548,13 +548,32 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             put64(&mut sb, 164, self.transid)?;
         }
         put64(&mut sb, 120, bytes_used)?;
-        // The superblock's copy of this device's item follows the chunk tree's.
-        let dev_item = self.find(tree::CHUNK, Key::new(1, item::DEV_ITEM, sh.devid))?.ok_or(Errno::EIO)?;
-        disk::put(&mut sb, 201, dev_item.get(..98).ok_or(Errno::EIO)?)?;
+        // The size of the volume and its device count are the chunk tree's.
+        let (mut total, mut devices) = (0u64, 0u64);
+        let mut at = Key::new(1, item::DEV_ITEM, 0);
+        while let Some((k, d)) = self.next_item(tree::CHUNK, at)? {
+            if k.objectid != 1 || k.ty != item::DEV_ITEM {
+                break;
+            }
+            total = total.saturating_add(le64(&d, 8)?);
+            devices += 1;
+            at = succ(k).ok_or(Errno::EIO)?;
+        }
+        put64(&mut sb, 112, total)?;
+        put64(&mut sb, 136, devices)?;
         // Holes are left implicit.
         let flags = le64(&sb, 188)? | incompat::NO_HOLES;
         put64(&mut sb, 188, flags)?;
         self.backup_roots(&mut sb, root_tree.addr, root_tree.level, chunk_root.addr, chunk_root.level)?;
+        // One superblock per device, each with the chunk tree's item for its
+        // device. Devices added since the mount first, the mounted one last.
+        let mut sbs: Vec<(u64, Vec<u8>)> = Vec::new();
+        for id in sh.dev_ids()? {
+            let Some(di) = self.find(tree::CHUNK, Key::new(1, item::DEV_ITEM, id))? else { continue };
+            let mut one = try_to_vec(&sb)?;
+            disk::put(&mut one, 201, di.get(..98).ok_or(Errno::EIO)?)?;
+            try_push(&mut sbs, (id, one))?;
+        }
         let chunks = match self.new_chunks.take() {
             Some(m) => try_arc(m)?,
             None => self.base.chunks.clone(),
@@ -583,13 +602,15 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             sh.write_logical(&chunks, *addr, b)?;
         }
         sh.flush()?;
-        if let Err(e) = sh.write_super(&mut sb) {
+        if let Err(e) = sh.write_supers(&mut sbs) {
             self.w.broken = true;
             return Err(e);
         }
 
         // Committed: nothing below may fail.
-        self.w.sb = sb;
+        if let Some(i) = sbs.iter().position(|s| s.0 == sh.devid) {
+            self.w.sb = sbs.swap_remove(i).1;
+        }
         sh.forget(blocks.iter().map(|(a, _)| *a));
         for (start, used) in used_after {
             if let Some(g) = self.w.groups.iter_mut().find(|g| g.start == start) {
@@ -626,25 +647,31 @@ impl<D: BlockDevice + Send + 'static> Drop for Tx<'_, D> {
 }
 
 impl<D: BlockDevice + Send + 'static> crate::Shared<D> {
-    /// Writes superblock `sb` (whose generation and roots are set) to every
-    /// copy on the device, flushing before and after.
-    pub(crate) fn write_super(&self, sb: &mut [u8]) -> Result<(), Errno> {
-        let size = self.dev.lock().num_blocks().saturating_mul(self.block_size as u64);
+    /// Writes each superblock of `sbs` (whose generation and roots are set),
+    /// by device id, to every copy that fits on its device, in the order
+    /// given; flushes after the first copy of all and after the rest. On
+    /// return the buffers hold the primary copy, as on disk.
+    pub(crate) fn write_supers(&self, sbs: &mut [(u64, Vec<u8>)]) -> Result<(), Errno> {
         for (i, at) in [disk::SUPER_OFFSET, 64 << 20, 256 << 30].into_iter().enumerate() {
-            if at + disk::SUPER_SIZE as u64 > size {
-                continue;
+            for (devid, sb) in sbs.iter_mut() {
+                let size = self.with_dev(*devid, |d| Ok(d.num_blocks().saturating_mul(self.block_size as u64)))?;
+                if at + disk::SUPER_SIZE as u64 > size {
+                    continue;
+                }
+                put64(sb, 48, at)?;
+                let sum = csum::compute(self.csum_type, sb.get(disk::CSUM_SPACE..).ok_or(Errno::EIO)?);
+                disk::put(sb, 0, &sum)?;
+                self.write_phys_dev(*devid, at, sb)?;
             }
-            put64(sb, 48, at)?;
-            let sum = csum::compute(self.csum_type, sb.get(disk::CSUM_SPACE..).ok_or(Errno::EIO)?);
-            disk::put(sb, 0, &sum)?;
-            self.write_phys(at, sb)?;
             if i == 0 {
                 self.flush()?;
             }
         }
-        put64(sb, 48, disk::SUPER_OFFSET)?;
-        let sum = csum::compute(self.csum_type, sb.get(disk::CSUM_SPACE..).ok_or(Errno::EIO)?);
-        disk::put(sb, 0, &sum)?;
+        for (_, sb) in sbs.iter_mut() {
+            put64(sb, 48, disk::SUPER_OFFSET)?;
+            let sum = csum::compute(self.csum_type, sb.get(disk::CSUM_SPACE..).ok_or(Errno::EIO)?);
+            disk::put(sb, 0, &sum)?;
+        }
         self.flush()
     }
 }

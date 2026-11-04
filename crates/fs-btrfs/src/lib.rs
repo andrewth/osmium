@@ -35,6 +35,18 @@
 //! does dropping a data extent another subvolume shares; read-only
 //! subvolumes are `EROFS`.
 //!
+//! Maintenance, on a volume that can be written: [`BtrfsFs::scrub`] reads
+//! every copy of every tree block and checksummed data sector and repairs bad
+//! copies of `DUP` (and mirrored) chunks from good ones; [`BtrfsFs::balance`]
+//! moves the contents of data and metadata block groups elsewhere and deletes
+//! the emptied chunks (filtered by type, usage or device), one transaction at
+//! a time; [`BtrfsFs::add_device`], [`BtrfsFs::remove_device`] and
+//! [`BtrfsFs::replace_device`] change the set of devices under a mounted
+//! volume, which the chunk allocator then spreads new chunks over. Balance and
+//! device removal leave alone system chunks and anything shared through
+//! snapshots (`EOPNOTSUPP` in the report or result), and a volume mounted
+//! with more than one device is still read-only.
+//!
 //! Readers see the last commit: each call takes the current state, and the
 //! space a commit frees is not reused until no reader can still be reading it.
 //!
@@ -57,6 +69,7 @@ extern crate std;
 mod balance;
 mod commit;
 mod csum;
+mod devices;
 mod disk;
 mod lzo;
 mod node;
@@ -80,6 +93,7 @@ use osmium_sync::SpinLock;
 use osmium_sync::fallible::{try_arc, try_push, try_to_vec, try_zeroed};
 
 pub use balance::{BalanceFilter, BalanceReport};
+pub use devices::DeviceInfo;
 pub use scrub::{ScrubError, ScrubErrorKind, ScrubReport};
 
 use disk::{DirItems, ExtentData, FileExtent, Inode, Key, Root, Super, compress, item};
@@ -422,6 +436,7 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
                 bg_tree,
                 fst: compat_ro & 1 != 0,
                 orphans: Vec::new(),
+                no_alloc: Vec::new(),
                 broken: false,
             }));
         }
@@ -487,6 +502,38 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
     /// read-only.
     pub fn balance(&self, filter: &BalanceFilter) -> Result<BalanceReport, Errno> {
         self.shared.balance(filter)
+    }
+
+    /// The devices of the volume, from the chunk tree.
+    pub fn devices(&self) -> Result<Vec<DeviceInfo>, Errno> {
+        self.shared.device_items(&self.shared.state())
+    }
+
+    /// Adds `dev` to the volume and returns its device id. New chunks are
+    /// then placed on whichever device has the most room. The device's
+    /// previous contents are lost; it must have the block size of the first
+    /// and hold at least 16 MiB. A volume with more than one device mounts
+    /// read-only here, so the devices are used within this mount; `EROFS` if
+    /// the volume is read-only.
+    pub fn add_device(&self, dev: D) -> Result<u64, Errno> {
+        self.shared.add_device(dev)
+    }
+
+    /// Takes device `devid` out of the volume: every chunk with a stripe on
+    /// it is balanced onto the others (`ENOSPC` if they have no room), its
+    /// item is deleted and its superblocks are wiped; the device is handed
+    /// back. The mounted device cannot be removed (`EOPNOTSUPP`), nor one
+    /// holding a system chunk.
+    pub fn remove_device(&self, devid: u64) -> Result<D, Errno> {
+        self.shared.remove_device(devid)
+    }
+
+    /// Replaces device `devid` with `new`, which must be at least as large:
+    /// every device extent is copied across, then the volume switches to the
+    /// new device, which takes over the old one's id and UUID. The old device
+    /// is wiped and handed back. Works on the mounted device too.
+    pub fn replace_device(&self, devid: u64, new: D) -> Result<D, Errno> {
+        self.shared.replace_device(devid, new)
     }
 
     /// The chunks of the volume, by logical address.

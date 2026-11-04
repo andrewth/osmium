@@ -138,6 +138,17 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         devid == self.devid || self.others.lock().iter().any(|(id, _)| *id == devid)
     }
 
+    /// The ids of the open devices: those added since the mount, then the
+    /// mounted one.
+    pub(crate) fn dev_ids(&self) -> Result<Vec<u64>, Errno> {
+        let others = self.others.lock();
+        let mut v = Vec::new();
+        v.try_reserve_exact(others.len() + 1).map_err(|_| Errno::ENOMEM)?;
+        v.extend(others.iter().map(|(id, _)| *id));
+        v.push(self.devid);
+        Ok(v)
+    }
+
     /// Reads `buf.len()` bytes at byte offset `off` of the mounted device.
     pub(crate) fn read_phys(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         self.read_phys_dev(self.devid, off, buf)
@@ -194,12 +205,6 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             }
         }
         Err(Errno::EIO)
-    }
-
-    /// Writes `buf`, whole device blocks, at byte offset `off` of the mounted
-    /// device.
-    pub(crate) fn write_phys(&self, off: u64, buf: &[u8]) -> Result<(), Errno> {
-        self.write_phys_dev(self.devid, off, buf)
     }
 
     /// Writes `buf`, whole device blocks, at byte offset `off` of device `devid`.
