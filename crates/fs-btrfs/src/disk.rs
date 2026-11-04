@@ -30,6 +30,8 @@ pub mod tree {
     pub const DEV: u64 = 4;
     /// The quota tree.
     pub const QUOTA: u64 = 8;
+    /// The UUID tree.
+    pub const UUID: u64 = 9;
     /// The free space tree.
     pub const FREE_SPACE: u64 = 10;
     /// The block group tree.
@@ -98,6 +100,14 @@ pub mod item {
     pub const EXTENT_CSUM: u8 = 128;
     /// A tree's root.
     pub const ROOT_ITEM: u8 = 132;
+    /// A subvolume's name in its parent, keyed by the parent subvolume.
+    pub const ROOT_REF: u8 = 156;
+    /// A subvolume's parent, keyed by the subvolume.
+    pub const ROOT_BACKREF: u8 = 144;
+    /// A subvolume's UUID in the UUID tree.
+    pub const UUID_SUBVOL: u8 = 251;
+    /// A received subvolume's UUID in the UUID tree.
+    pub const UUID_RECEIVED: u8 = 252;
     /// A chunk: a range of logical addresses and where it is stored.
     pub const CHUNK_ITEM: u8 = 228;
 }
@@ -375,6 +385,8 @@ pub struct Root {
     pub level: u8,
     /// Objectid of its root directory (subvolumes).
     pub dirid: u64,
+    /// Names it has; none once it is deleted.
+    pub refs: u32,
 }
 
 impl Root {
@@ -382,7 +394,7 @@ impl Root {
     pub fn parse(b: &[u8], id: u64) -> Result<Self, Errno> {
         // An inode item, then generation, root_dirid, bytenr, byte_limit,
         // bytes_used, last_snapshot, flags, refs, drop_progress, drop_level, level.
-        Ok(Root { id, bytenr: le64(b, 176)?, level: byte(b, 238)?, dirid: le64(b, 168)? })
+        Ok(Root { id, bytenr: le64(b, 176)?, level: byte(b, 238)?, dirid: le64(b, 168)?, refs: le32(b, 216)? })
     }
 }
 

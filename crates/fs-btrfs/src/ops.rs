@@ -21,7 +21,7 @@ const INHERITED: u64 = 1 << 0 | 1 << 1;
 const FT_XATTR: u8 = 8;
 
 /// Offsets in an inode item.
-mod ino {
+pub(crate) mod ino {
     pub const GENERATION: usize = 0;
     pub const TRANSID: usize = 8;
     pub const SIZE: usize = 16;
@@ -51,7 +51,7 @@ pub fn ft_of(kind: FileKind) -> u8 {
     }
 }
 
-fn put_time(b: &mut [u8], at: usize, t: Timestamp) -> Result<(), Errno> {
+pub(crate) fn put_time(b: &mut [u8], at: usize, t: Timestamp) -> Result<(), Errno> {
     put64(b, at, t.sec as u64)?;
     put32(b, at + 8, t.nsec)
 }
@@ -74,7 +74,7 @@ fn entry(location: Key, transid: u64, name: &[u8], data: &[u8], ft: u8) -> Resul
 /// An entry's start and end in its item, and its name.
 type Entry<'d> = (usize, usize, &'d [u8]);
 
-fn entries(d: &[u8]) -> Result<Vec<Entry<'_>>, Errno> {
+pub(crate) fn entries(d: &[u8]) -> Result<Vec<Entry<'_>>, Errno> {
     let mut v = Vec::new();
     let mut p = 0;
     while p < d.len() {
@@ -126,13 +126,13 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         Ok(d)
     }
 
-    fn set_inode(&mut self, t: u64, ino: u64, d: &[u8]) -> Result<(), Errno> {
+    pub(crate) fn set_inode(&mut self, t: u64, ino: u64, d: &[u8]) -> Result<(), Errno> {
         self.update(t, Key::new(ino, item::INODE_ITEM, 0), d)
     }
 
     /// Marks inode data `d` changed now: its change time, and with `modify`
     /// its modification time.
-    fn stamp(&self, d: &mut [u8], modify: bool) -> Result<(), Errno> {
+    pub(crate) fn stamp(&self, d: &mut [u8], modify: bool) -> Result<(), Errno> {
         let now = self.sh.now();
         put_time(d, ino::CTIME, now)?;
         if modify {
@@ -142,7 +142,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         put64(d, ino::SEQUENCE, le64(d, ino::SEQUENCE)?.wrapping_add(1))
     }
 
-    fn kind(d: &[u8]) -> Result<FileKind, Errno> {
+    pub(crate) fn kind(d: &[u8]) -> Result<FileKind, Errno> {
         crate::kind_of(le32(d, ino::MODE)?).ok_or(Errno::EIO)
     }
 
@@ -167,7 +167,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     }
 
     /// The next free `DIR_INDEX` position in directory `dir`.
-    fn next_index(&mut self, t: u64, dir: u64) -> Result<u64, Errno> {
+    pub(crate) fn next_index(&mut self, t: u64, dir: u64) -> Result<u64, Errno> {
         match self.prev_item(t, Key::new(dir, item::DIR_INDEX, u64::MAX))? {
             Some((k, _)) if k.objectid == dir && k.ty == item::DIR_INDEX => {
                 k.offset.max(1).checked_add(1).ok_or(Errno::ENOSPC)
@@ -189,7 +189,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     }
 
     /// Adds `name` to directory `dir`, at index `idx`.
-    fn dir_add(&mut self, t: u64, dir: u64, name: &[u8], loc: Key, ft: u8, idx: u64) -> Result<(), Errno> {
+    pub(crate) fn dir_add(&mut self, t: u64, dir: u64, name: &[u8], loc: Key, ft: u8, idx: u64) -> Result<(), Errno> {
         let e = entry(loc, self.transid, name, &[], ft)?;
         let key = Key::new(dir, item::DIR_ITEM, csum::name_hash(name));
         match self.find(t, key)? {
@@ -205,7 +205,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     }
 
     /// Takes `name`, at index `idx`, out of directory `dir`.
-    fn dir_del(&mut self, t: u64, dir: u64, name: &[u8], idx: u64) -> Result<(), Errno> {
+    pub(crate) fn dir_del(&mut self, t: u64, dir: u64, name: &[u8], idx: u64) -> Result<(), Errno> {
         let key = Key::new(dir, item::DIR_ITEM, csum::name_hash(name));
         let d = self.find(t, key)?.ok_or(Errno::EIO)?;
         let (from, to, _) = entries(&d)?.into_iter().find(|e| e.2 == name).ok_or(Errno::EIO)?;
@@ -552,7 +552,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         delta: i64,
         new: bool,
     ) -> Result<(), Errno> {
-        Ok(try_push(&mut self.data_refs, DataRef { bytenr, len, root, ino, offset, delta, new })?)
+        Ok(try_push(&mut self.data_refs, DataRef { bytenr, len, root, ino, offset, delta, new, parent: 0 })?)
     }
 
     /// Writes `buf` (whole sectors) as new extents at file offset `at` of
@@ -777,15 +777,15 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
 }
 
 /// What `drop_extents` needs of a file extent item.
-struct ExtentInfo {
+pub(crate) struct ExtentInfo {
     /// Bytes of the file it covers.
-    len: u64,
+    pub(crate) len: u64,
     /// For a regular or preallocated extent: its address (0 for a hole),
     /// length on disk, and offset into it. `None` for inline data.
-    disk: Option<(u64, u64, u64)>,
+    pub(crate) disk: Option<(u64, u64, u64)>,
 }
 
-fn extent_info(d: &[u8]) -> Result<ExtentInfo, Errno> {
+pub(crate) fn extent_info(d: &[u8]) -> Result<ExtentInfo, Errno> {
     let fe = FileExtent::parse(d)?;
     let disk = match fe.data {
         disk::ExtentData::Inline(_) => None,

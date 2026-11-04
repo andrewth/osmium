@@ -47,8 +47,11 @@ pub struct TreeRef {
     pub owner: u64,
     /// Its level.
     pub level: u8,
-    /// `true` for a new block, `false` for one dropped.
+    /// `true` for a reference added, `false` for one dropped.
     pub add: bool,
+    /// Nonzero: the reference is a `SHARED_BLOCK_REF` from this parent block
+    /// instead of a `TREE_BLOCK_REF` from `owner`.
+    pub parent: u64,
 }
 
 /// A pending change to a data extent's reference by `(root, ino, offset)`.
@@ -68,6 +71,9 @@ pub struct DataRef {
     pub delta: i64,
     /// Whether this transaction allocated the extent.
     pub new: bool,
+    /// Nonzero: the reference is a `SHARED_DATA_REF` from this leaf instead
+    /// of an `EXTENT_DATA_REF` by `(root, ino, offset)`.
+    pub parent: u64,
 }
 
 /// A range allocated in this transaction.
@@ -138,6 +144,20 @@ pub struct Tx<'a, D: BlockDevice + Send + 'static> {
     /// Inodes this transaction made orphans, and orphans it deleted.
     pub(crate) orphans_added: Vec<(u64, u64)>,
     pub(crate) orphans_removed: Vec<(u64, u64)>,
+    /// Net pending change in the reference count of each tree block, by
+    /// address, and whether it was given `FULL_BACKREF` in this transaction.
+    pend: Vec<(u64, i64, bool)>,
+    /// Blocks to flag `FULL_BACKREF` in the extent tree: address and level.
+    pub(crate) flag_ops: Vec<(u64, u8)>,
+}
+
+/// What the children of a block refer to it by.
+#[derive(Clone, Copy)]
+pub(crate) enum RefMode {
+    /// By tree: `TREE_BLOCK_REF` and `EXTENT_DATA_REF`.
+    Owner(u64),
+    /// By the block holding them: `SHARED_BLOCK_REF` and `SHARED_DATA_REF`.
+    Shared(u64),
 }
 
 /// The key just after `k`.
@@ -174,6 +194,8 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             frees: false,
             orphans_added: Vec::new(),
             orphans_removed: Vec::new(),
+            pend: Vec::new(),
+            flag_ops: Vec::new(),
         }
     }
 
@@ -200,7 +222,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
         self.dirty.get_mut(i).ok_or(Errno::EIO)
     }
 
-    fn add_dirty(&mut self, n: TNode) -> Result<(), Errno> {
+    pub(crate) fn add_dirty(&mut self, n: TNode) -> Result<(), Errno> {
         let at = self.dirty.partition_point(|d| d.addr < n.addr);
         self.dirty.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         self.dirty.insert(at, n);
@@ -331,38 +353,152 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
     }
 
     /// A new, empty block of tree `owner` at `level`.
-    fn new_block(&mut self, owner: u64, level: u8, body: Body) -> Result<u64, Errno> {
+    pub(crate) fn new_block(&mut self, owner: u64, level: u8, body: Body) -> Result<u64, Errno> {
         let addr = self.alloc_meta(owner)?;
         let n = TNode { addr, owner, level, generation: self.transid, body };
         if let Err(e) = self.add_dirty(n) {
             self.unalloc(addr);
             return Err(e);
         }
-        try_push(&mut self.tree_refs, TreeRef { addr, owner, level, add: true })?;
+        self.push_tree_ref(TreeRef { addr, owner, level, add: true, parent: 0 })?;
         Ok(addr)
     }
 
-    /// Lets go of block `addr` of tree `owner`.
+    /// Records a pending reference change of a tree block.
+    pub(crate) fn push_tree_ref(&mut self, r: TreeRef) -> Result<(), Errno> {
+        self.pend_add(r.addr, if r.add { 1 } else { -1 })?;
+        Ok(try_push(&mut self.tree_refs, r)?)
+    }
+
+    fn pend_at(&self, addr: u64) -> Result<usize, usize> {
+        self.pend.binary_search_by_key(&addr, |p| p.0)
+    }
+
+    fn pend_add(&mut self, addr: u64, delta: i64) -> Result<(), Errno> {
+        match self.pend_at(addr) {
+            Ok(i) => {
+                if let Some(p) = self.pend.get_mut(i) {
+                    p.1 += delta;
+                }
+            }
+            Err(i) => {
+                self.pend.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+                self.pend.insert(i, (addr, delta, false));
+            }
+        }
+        Ok(())
+    }
+
+    /// Flags block `addr` `FULL_BACKREF`: its children are referred to by it.
+    pub(crate) fn set_full_backref(&mut self, addr: u64, level: u8) -> Result<(), Errno> {
+        self.pend_add(addr, 0)?;
+        let i = self.pend_at(addr).map_err(|_| Errno::EIO)?;
+        if let Some(p) = self.pend.get_mut(i) {
+            p.2 = true;
+        }
+        Ok(try_push(&mut self.flag_ops, (addr, level))?)
+    }
+
+    /// How many references the tree block `addr` of `level` has, counting
+    /// this transaction's pending changes, and whether its children are
+    /// referred to by `addr` (`FULL_BACKREF`).
+    pub(crate) fn block_refs(&mut self, addr: u64, level: u8) -> Result<(u64, bool), Errno> {
+        let skinny = Key::new(addr, item::METADATA_ITEM, level as u64);
+        let found = match self.find(tree::EXTENT, skinny)? {
+            Some(d) => Some(d),
+            None => self.find(tree::EXTENT, Key::new(addr, item::EXTENT_ITEM, self.sh.nodesize as u64))?,
+        };
+        let (mut refs, mut full) = match found {
+            Some(d) => (le64(&d, 0)? as i64, le64(&d, 16)? & crate::refs::EXTENT_FULL_BACKREF != 0),
+            None => (0, false),
+        };
+        if let Ok(i) = self.pend_at(addr)
+            && let Some(p) = self.pend.get(i)
+        {
+            refs += p.1;
+            full |= p.2;
+        }
+        Ok((refs.max(0) as u64, full))
+    }
+
+    /// Lets go of block `addr` of tree `owner`, which nothing else refers to.
     pub(crate) fn free_block(&mut self, addr: u64, owner: u64, level: u8) -> Result<(), Errno> {
+        self.release_block(addr, owner, level, 0, true)
+    }
+
+    /// Drops one reference to block `addr`: `owner`'s, or `parent`'s if
+    /// that is nonzero. With `last` the block is not referred to any more,
+    /// and its space is given back.
+    pub(crate) fn release_block(
+        &mut self,
+        addr: u64,
+        owner: u64,
+        level: u8,
+        parent: u64,
+        last: bool,
+    ) -> Result<(), Errno> {
         let fresh = self.allocs.iter().any(|a| a.start == addr && !a.dead);
-        if fresh {
+        if fresh && last {
             if let Some(i) = self.dirty_at(addr) {
                 self.dirty.remove(i);
             }
             match self.tree_refs.iter().position(|r| r.addr == addr && r.add) {
-                Some(i) => _ = self.tree_refs.remove(i),
-                None => try_push(&mut self.tree_refs, TreeRef { addr, owner, level, add: false })?,
+                Some(i) => {
+                    self.tree_refs.remove(i);
+                    self.pend_add(addr, -1)?;
+                }
+                None => self.push_tree_ref(TreeRef { addr, owner, level, add: false, parent })?,
             }
             self.unalloc(addr);
         } else {
-            try_push(&mut self.tree_refs, TreeRef { addr, owner, level, add: false })?;
-            try_push(&mut self.pinned, (addr, self.sh.nodesize as u64))?;
+            self.push_tree_ref(TreeRef { addr, owner, level, add: false, parent })?;
+            if last {
+                try_push(&mut self.pinned, (addr, self.sh.nodesize as u64))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds (`delta` 1) or drops (-1) the references of the children of `n`
+    /// that `mode` names.
+    pub(crate) fn ref_children(&mut self, n: &TNode, mode: RefMode, delta: i64) -> Result<(), Errno> {
+        let (root, parent) = match mode {
+            RefMode::Owner(r) => (r, 0),
+            RefMode::Shared(p) => (0, p),
+        };
+        match &n.body {
+            Body::Node(ptrs) => {
+                let level = n.level.checked_sub(1).ok_or(Errno::EIO)?;
+                for p in ptrs {
+                    let r = TreeRef { addr: p.addr, owner: root, level, add: delta > 0, parent };
+                    self.push_tree_ref(r)?;
+                }
+            }
+            Body::Leaf(items) => {
+                for it in items.iter().filter(|i| i.key.ty == item::EXTENT_DATA) {
+                    if let Some((bytenr, len, off)) = crate::ops::extent_info(&it.data)?.disk
+                        && bytenr != 0
+                    {
+                        let offset = it.key.offset.wrapping_sub(off);
+                        let (ino, new) = (it.key.objectid, false);
+                        try_push(&mut self.data_refs, DataRef { bytenr, len, root, ino, offset, delta, new, parent })?;
+                    }
+                }
+            }
         }
         Ok(())
     }
 
     /// Copies block `addr` of tree `id` for writing, unless this transaction
     /// already has; returns its address from now on.
+    ///
+    /// A block of a subvolume that was written before the last snapshot may
+    /// be shared with it. Whoever copies such a block gives the copy's
+    /// children their own references, as Linux does: if the block belongs to
+    /// the tree copying it, its children get references by the block's address
+    /// first (it keeps them for the other users, and is flagged
+    /// `FULL_BACKREF`); a flagged block last used by one tree has those
+    /// references turned into the copy's.
     fn cow(&mut self, id: u64, addr: u64, level: u8) -> Result<u64, Errno> {
         if self.dirty_at(addr).is_some() {
             return Ok(addr);
@@ -372,25 +508,90 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             Ok(i) => self.clean.remove(i),
             Err(_) => TNode::decode(&self.sh.block(self.chunks(), addr)?)?,
         };
-        if n.addr != addr {
+        if n.addr != addr || n.level != level {
             return Err(Errno::EIO);
         }
         let r = self.root(id)?;
-        // A block another tree may share (a snapshot's) needs reference
-        // counting this driver does not do.
-        if n.owner != id || n.level != level || (r.last_snapshot != 0 && n.generation <= r.last_snapshot) {
+        let shareable = id == tree::FS || id >= tree::FIRST_FREE;
+        let may_share = shareable && addr != r.addr && n.generation <= r.last_snapshot;
+        let (refs, full) = if may_share { self.block_refs(addr, level)? } else { (1, false) };
+        if refs == 0 {
+            return Err(Errno::EIO);
+        }
+        let own = n.owner == id;
+        if refs == 1 && !full && !own {
+            // Its children are held under another tree's name.
             return Err(Errno::EOPNOTSUPP);
         }
         let new = self.alloc_meta(id)?;
+        if let Err(e) = self.cow_refs(&n, id, refs, full, own) {
+            self.unalloc(new);
+            return Err(e);
+        }
         n.addr = new;
+        n.owner = id;
         n.generation = self.transid;
         if let Err(e) = self.add_dirty(n) {
             self.unalloc(new);
             return Err(e);
         }
-        try_push(&mut self.tree_refs, TreeRef { addr: new, owner: id, level, add: true })?;
-        self.free_block(addr, id, level)?;
+        self.push_tree_ref(TreeRef { addr: new, owner: id, level, add: true, parent: 0 })?;
+        self.release_block(addr, id, level, 0, refs == 1)?;
         Ok(new)
+    }
+
+    /// The reference changes for the children of block `n` being copied
+    /// by tree `id`, which holds it `own`s, `refs` times, `full`-backref'd
+    /// or not.
+    fn cow_refs(&mut self, n: &TNode, id: u64, refs: u64, full: bool, own: bool) -> Result<(), Errno> {
+        if refs > 1 {
+            if own && !full {
+                self.ref_children(n, RefMode::Shared(n.addr), 1)?;
+                self.set_full_backref(n.addr, n.level)?;
+            } else {
+                self.ref_children(n, RefMode::Owner(id), 1)?;
+            }
+        } else if full {
+            self.ref_children(n, RefMode::Owner(id), 1)?;
+            self.ref_children(n, RefMode::Shared(n.addr), -1)?;
+        }
+        Ok(())
+    }
+
+    /// Copies the root block `addr` (of `level`) of some tree as the root of
+    /// the new tree `id`, which then shares the blocks below it: each child
+    /// gets a reference for `id`. Returns the copy's address.
+    pub(crate) fn copy_root(&mut self, id: u64, addr: u64, level: u8) -> Result<u64, Errno> {
+        if self.dirty_at(addr).is_some() {
+            return Err(Errno::EIO);
+        }
+        let mut n = TNode::decode(&self.sh.block(self.chunks(), addr)?)?;
+        if n.addr != addr || n.level != level {
+            return Err(Errno::EIO);
+        }
+        let new = self.alloc_meta(id)?;
+        if let Err(e) = self.ref_children(&n, RefMode::Owner(id), 1) {
+            self.unalloc(new);
+            return Err(e);
+        }
+        n.addr = new;
+        n.owner = id;
+        n.generation = self.transid;
+        if let Err(e) = self.add_dirty(n) {
+            self.unalloc(new);
+            return Err(e);
+        }
+        self.push_tree_ref(TreeRef { addr: new, owner: id, level, add: true, parent: 0 })?;
+        Ok(new)
+    }
+
+    /// Notes that tree `id` has been snapshotted in this transaction, so that
+    /// its blocks written before now count as shared.
+    pub(crate) fn note_snapshot(&mut self, id: u64) {
+        let transid = self.transid;
+        if let Some(r) = self.roots.iter_mut().find(|r| r.id == id) {
+            r.last_snapshot = transid;
+        }
     }
 
     /// Copies tree `id`'s root for writing.
