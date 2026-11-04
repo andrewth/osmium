@@ -289,7 +289,14 @@ fn compressed() {
 #[test]
 fn checksums_and_sizes() {
     let Some(mkfs) = mkfs() else { return };
-    for args in [&["--csum", "xxhash"][..], &["-n", "4096"], &["-n", "65536"], &["-m", "single", "-d", "single"]] {
+    for args in [
+        &["--csum", "xxhash"][..],
+        &["--csum", "sha256"],
+        &["--csum", "blake2"],
+        &["-n", "4096"],
+        &["-n", "65536"],
+        &["-m", "single", "-d", "single"],
+    ] {
         let dir = scratch(&format!("variant-{}", args.join("").replace('-', "")));
         let src = tree(&dir);
         let img = image(&mkfs, &dir, &src, args);
@@ -297,11 +304,7 @@ fn checksums_and_sizes() {
         let fs = mount(&img, 4096);
         check_tree(&Vfs::new(fs.root()), true);
     }
-    // SHA-256 and BLAKE2b are not read.
-    let dir = scratch("sha256");
-    let src = tree(&dir);
-    let img = image(&mkfs, &dir, &src, &["--csum", "sha256"]);
-    assert_eq!(BtrfsFs::mount_with(FileDisk::open(&img, 4096), 1, RO).err(), Some(Errno::EINVAL));
+    // SHA-256 and BLAKE2b are covered in multi.rs, with writes.
 }
 
 #[test]

@@ -536,6 +536,8 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         let chunk_root = self.root(tree::CHUNK)?;
         let csum_root = self.root(tree::CSUM)?;
         let mut sb = try_to_vec(&self.w.sb)?;
+        // Before anything is written: writing the superblocks may not fail for want of memory.
+        let mut others = sh.super_buffers()?;
         let taken: u64 = self.allocs.iter().filter(|a| !a.dead).map(|a| a.len).sum();
         let given: u64 = self.pinned.iter().map(|p| p.1).sum();
         let bytes_used = (le64(&sb, 120)? + taken).saturating_sub(given);
@@ -582,7 +584,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             sh.write_logical(&chunks, *addr, b)?;
         }
         sh.flush()?;
-        if let Err(e) = sh.write_super(&mut sb) {
+        if let Err(e) = sh.write_super(&mut sb, &mut others) {
             self.w.broken = true;
             return Err(e);
         }
@@ -620,18 +622,43 @@ impl<D: BlockDevice + Send + 'static> Drop for Tx<'_, D> {
 }
 
 impl<D: BlockDevice + Send + 'static> crate::Shared<D> {
+    /// One buffer for each device but the first, for [`Self::write_super`].
+    pub(crate) fn super_buffers(&self) -> Result<Vec<Vec<u8>>, Errno> {
+        let mut v = Vec::new();
+        v.try_reserve_exact(self.devs.len()).map_err(|_| Errno::ENOMEM)?;
+        for _ in self.devs.iter().filter(|d| d.devid != self.devid) {
+            v.push(osmium_sync::fallible::try_zeroed(disk::SUPER_SIZE)?);
+        }
+        Ok(v)
+    }
+
     /// Writes superblock `sb` (whose generation and roots are set) to every
-    /// copy on the device, flushing before and after.
-    pub(crate) fn write_super(&self, sb: &mut [u8]) -> Result<(), Errno> {
-        let size = self.dev.lock().num_blocks().saturating_mul(self.block_size as u64);
+    /// copy on every device, flushing before and after. Each device's copies
+    /// carry its own `dev_item`; `sb` has the first device's. `others` come
+    /// from [`Self::super_buffers`].
+    pub(crate) fn write_super(&self, sb: &mut [u8], others: &mut [Vec<u8>]) -> Result<(), Errno> {
         for (i, at) in [disk::SUPER_OFFSET, 64 << 20, 256 << 30].into_iter().enumerate() {
-            if at + disk::SUPER_SIZE as u64 > size {
-                continue;
+            let mut next = others.iter_mut();
+            for d in &self.devs {
+                // `sb` itself for the device it was read from; for the others a
+                // copy with that device's own `dev_item`.
+                let img: &mut [u8] = if d.devid == self.devid {
+                    &mut *sb
+                } else {
+                    let img = next.next().ok_or(Errno::EIO)?;
+                    img.copy_from_slice(sb);
+                    disk::put(img, crate::DEV_ITEM_AT, &d.dev_item)?;
+                    img
+                };
+                let size = d.dev.lock().num_blocks().saturating_mul(d.block_size as u64);
+                if at + disk::SUPER_SIZE as u64 > size {
+                    continue;
+                }
+                put64(img, 48, at)?;
+                let sum = csum::compute(self.csum_type, img.get(disk::CSUM_SPACE..).ok_or(Errno::EIO)?);
+                disk::put(img, 0, &sum)?;
+                self.write_phys(d.devid, at, img)?;
             }
-            put64(sb, 48, at)?;
-            let sum = csum::compute(self.csum_type, sb.get(disk::CSUM_SPACE..).ok_or(Errno::EIO)?);
-            disk::put(sb, 0, &sum)?;
-            self.write_phys(at, sb)?;
             if i == 0 {
                 self.flush()?;
             }

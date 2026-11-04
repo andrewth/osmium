@@ -9,8 +9,9 @@ use osmium_fs::Errno;
 use osmium_hal::block::BlockDevice;
 use osmium_sync::fallible::{try_arc, try_push, try_zeroed};
 
-use crate::disk::{Chunk, Key, header, le64, profile};
-use crate::{MAX_RUN, Shared, csum};
+use crate::disk::{Chunk, Key, header, le64};
+use crate::raid::Place;
+use crate::{Dev, MAX_RUN, Shared, csum};
 
 /// Tree blocks kept in memory.
 const CACHE_BLOCKS: usize = 32;
@@ -45,7 +46,17 @@ impl ChunkMap {
         v.try_reserve_exact(self.0.len()).map_err(|_| Errno::ENOMEM)?;
         for c in &self.0 {
             let stripes = osmium_sync::fallible::try_to_vec(&c.stripes)?;
-            try_push(&mut v, Chunk { logical: c.logical, length: c.length, ty: c.ty, stripes })?;
+            try_push(
+                &mut v,
+                Chunk {
+                    logical: c.logical,
+                    length: c.length,
+                    ty: c.ty,
+                    stripe_len: c.stripe_len,
+                    sub_stripes: c.sub_stripes,
+                    stripes,
+                },
+            )?;
         }
         Ok(ChunkMap(v))
     }
@@ -114,9 +125,9 @@ fn child(b: &[u8], slot: usize) -> Result<u64, Errno> {
     le64(b, header::SIZE + slot * PTR + Key::SIZE)
 }
 
-impl<D: BlockDevice + Send + 'static> Shared<D> {
+impl<D: BlockDevice + Send + 'static> Dev<D> {
     /// Reads `buf.len()` bytes at byte offset `off` of the device.
-    pub(crate) fn read_phys(&self, mut off: u64, mut buf: &mut [u8]) -> Result<(), Errno> {
+    pub(crate) fn read(&self, mut off: u64, mut buf: &mut [u8]) -> Result<(), Errno> {
         let bs = self.block_size;
         let mut dev = self.dev.lock();
         let mut bounce = Vec::new();
@@ -142,38 +153,53 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         }
         Ok(())
     }
+}
 
-    /// Reads logical `logical..logical + buf.len()` from the first copy that
-    /// reads and that `good` accepts. Only copies on this device are tried;
-    /// striped profiles (RAID0, RAID10, RAID5, RAID6) are `EIO`.
+impl<D: BlockDevice + Send + 'static> Shared<D> {
+    /// The device with id `devid`, if it is present.
+    pub(crate) fn dev(&self, devid: u64) -> Option<&Dev<D>> {
+        self.devs.iter().find(|d| d.devid == devid)
+    }
+
+    /// Reads `buf.len()` bytes at byte offset `off` of device `devid`.
+    pub(crate) fn read_phys(&self, devid: u64, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        self.dev(devid).ok_or(Errno::EIO)?.read(off, buf)
+    }
+
+    /// Reads logical `logical..logical + buf.len()` a run at a time (a run
+    /// lies within one stripe element), each from the first copy that reads
+    /// and that `good` accepts; `good` is given a run and its byte offset in
+    /// `buf`. A RAID5 or RAID6 strip that does not read or check is rebuilt
+    /// from the rest of its row.
     pub(crate) fn read_logical(
         &self,
         chunks: &ChunkMap,
         logical: u64,
         buf: &mut [u8],
-        good: &mut dyn FnMut(&[u8]) -> bool,
+        good: &mut dyn FnMut(usize, &[u8]) -> bool,
     ) -> Result<(), Errno> {
         let chunk = chunks.find(logical, buf.len() as u64)?;
-        if chunk.ty & profile::STRIPED != 0 {
-            return Err(Errno::EIO);
+        let mut done = 0usize;
+        while done < buf.len() {
+            let within = (logical - chunk.logical).checked_add(done as u64).ok_or(Errno::EIO)?;
+            let piece = chunk.piece(within, (buf.len() - done) as u64)?;
+            let end = done.checked_add(piece.len as usize).ok_or(Errno::EIO)?;
+            let part = buf.get_mut(done..end).ok_or(Errno::EIO)?;
+            let at = done;
+            self.read_piece(chunk, &piece.place, part, &mut |p| good(at, p))?;
+            done = end;
         }
-        let within = logical - chunk.logical;
-        for s in chunk.stripes.iter().filter(|s| s.devid == self.devid) {
-            let Some(at) = s.offset.checked_add(within) else { continue };
-            if self.read_phys(at, buf).is_ok() && good(buf) {
-                return Ok(());
-            }
-        }
-        Err(Errno::EIO)
+        Ok(())
     }
 
-    /// Writes `buf`, whole device blocks, at byte offset `off` of the device.
-    pub(crate) fn write_phys(&self, mut off: u64, mut buf: &[u8]) -> Result<(), Errno> {
-        let bs = self.block_size as u64;
+    /// Writes `buf`, whole device blocks, at byte offset `off` of device `devid`.
+    pub(crate) fn write_phys(&self, devid: u64, mut off: u64, mut buf: &[u8]) -> Result<(), Errno> {
+        let d = self.dev(devid).ok_or(Errno::EIO)?;
+        let bs = d.block_size as u64;
         if !off.is_multiple_of(bs) || !(buf.len() as u64).is_multiple_of(bs) {
             return Err(Errno::EIO);
         }
-        let mut dev = self.dev.lock();
+        let mut dev = d.dev.lock();
         while !buf.is_empty() {
             let n = buf.len().min(MAX_RUN / bs as usize * bs as usize);
             dev.write_blocks(off / bs, buf.get(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
@@ -183,22 +209,34 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         Ok(())
     }
 
-    /// Writes `buf` at logical `logical`, to every copy.
+    /// Writes `buf` at logical `logical`, to every copy. Parity profiles are
+    /// not written.
     pub(crate) fn write_logical(&self, chunks: &ChunkMap, logical: u64, buf: &[u8]) -> Result<(), Errno> {
         let chunk = chunks.find(logical, buf.len() as u64)?;
-        if chunk.ty & profile::STRIPED != 0 || chunk.stripes.iter().any(|s| s.devid != self.devid) {
+        if chunk.parity() != 0 {
             return Err(Errno::EIO);
         }
-        let within = logical - chunk.logical;
-        for s in &chunk.stripes {
-            self.write_phys(s.offset.checked_add(within).ok_or(Errno::EIO)?, buf)?;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let within = (logical - chunk.logical).checked_add(done as u64).ok_or(Errno::EIO)?;
+            let piece = chunk.piece(within, (buf.len() - done) as u64)?;
+            let end = done.checked_add(piece.len as usize).ok_or(Errno::EIO)?;
+            let part = buf.get(done..end).ok_or(Errno::EIO)?;
+            let Place::Copies { first, count, off } = piece.place else { return Err(Errno::EIO) };
+            for s in chunk.stripes.iter().skip(first).take(count) {
+                self.write_phys(s.devid, s.offset.checked_add(off).ok_or(Errno::EIO)?, part)?;
+            }
+            done = end;
         }
         Ok(())
     }
 
-    /// Makes previous writes durable.
+    /// Makes previous writes durable, on every device.
     pub(crate) fn flush(&self) -> Result<(), Errno> {
-        self.dev.lock().flush().map_err(|_| Errno::EIO)
+        for d in &self.devs {
+            d.dev.lock().flush().map_err(|_| Errno::EIO)?;
+        }
+        Ok(())
     }
 
     /// Forgets cached copies of the blocks at `addrs`, which are about to be
@@ -220,7 +258,11 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         }
         let mut b = try_zeroed(self.nodesize)?;
         let (ty, uuid) = (self.csum_type, self.meta_uuid);
-        self.read_logical(chunks, logical, &mut b, &mut |b| {
+        let want = self.nodesize;
+        self.read_logical(chunks, logical, &mut b, &mut |_, b| {
+            if b.len() != want {
+                return false;
+            }
             let (stored, rest) = b.split_at_checked(crate::disk::CSUM_SPACE).unwrap_or((&[], &[]));
             csum::matches(ty, rest, stored)
                 && le64(b, header::BYTENR).ok() == Some(logical)

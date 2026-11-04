@@ -8,9 +8,14 @@
 //! snapshots show up as directories, as on Linux.
 //!
 //! Reading: every tree block and data sector is checked against its checksum
-//! (CRC32C or xxHash64) unless the file has `nodatasum`, and a block or
-//! sector that fails is read from its other copy if there is one (`DUP`,
-//! `RAID1`, `RAID1C3`, `RAID1C4`). Extents may be inline, regular,
+//! (CRC32C, xxHash64, SHA-256 or BLAKE2b) unless the file has `nodatasum`, and
+//! a block or sector that fails is read from its other copy if there is one
+//! (`DUP`, `RAID1`, `RAID1C3`, `RAID1C4`, and the mirror of a `RAID10`
+//! stripe), or rebuilt from the rest of its row (`RAID5`, `RAID6`). Volumes
+//! over several devices are mounted with [`BtrfsFs::mount_multi`], and read
+//! with the single, `DUP`, `RAID0`, `RAID1*`, `RAID10`, `RAID5` and `RAID6`
+//! profiles, with devices missing as far as the copies or parity go.
+//! Extents may be inline, regular,
 //! preallocated or holes (implicit with `no-holes`), and compressed with
 //! zlib, LZO or zstd. Extended attributes, symbolic links and device nodes
 //! are read too.
@@ -27,8 +32,15 @@
 //! fill up. Unlinked files that are still open are kept as orphans and
 //! deleted when their last node goes, or at the next mount.
 //!
-//! A volume is mounted read-only (see [`BtrfsFs::is_read_only`]) if it spans
-//! several devices, has quotas, an fsync log to replay, mixed or zoned block
+//! Several devices: writing works with the single, `DUP`, `RAID0`, `RAID1*`
+//! and `RAID10` profiles when every device is present and their superblocks
+//! agree, onto the block groups that exist; a new chunk is only allocated in
+//! a single or `DUP` profile, and on the first device, so a full `RAID`
+//! block group means `ENOSPC`. `RAID5` and `RAID6` are read-only, as is a
+//! degraded volume.
+//!
+//! A volume is mounted read-only (see [`BtrfsFs::is_read_only`]) if it has a
+//! `RAID5` or `RAID6` chunk, a device missing or stale, quotas, an fsync log to replay, mixed or zoned block
 //! groups, no skinny metadata, a free space tree Linux marked invalid, or
 //! read-only compatible features this driver does not know. Writing in a
 //! subvolume that shares blocks with a snapshot fails with `EOPNOTSUPP`, as
@@ -42,10 +54,7 @@
 //! subvolume's are mixed with its id so they do not collide with them (Linux
 //! gives each subvolume its own `st_dev` instead).
 //!
-//! Not supported: file systems over several devices (only the copies on the
-//! device given are read, and striped chunks, RAID0, RAID10, RAID5 and RAID6,
-//! fail with `EIO`); SHA-256 and BLAKE2b checksums; `extent-tree-v2` and the
-//! RAID stripe tree; replaying the fsync log; creating subvolumes or
+//! Not supported: `extent-tree-v2` and the RAID stripe tree; replaying the fsync log; creating subvolumes or
 //! snapshots; owners, which `Stat` has no room for; and encrypted or verity
 //! files.
 #![no_std]
@@ -60,6 +69,7 @@ mod disk;
 mod lzo;
 mod node;
 mod ops;
+mod raid;
 mod space;
 mod tree;
 mod write;
@@ -167,9 +177,24 @@ impl Drop for State {
     }
 }
 
-struct Shared<D: BlockDevice + Send + 'static> {
-    dev: SpinLock<D>,
+/// One device of the volume.
+pub(crate) struct Dev<D: BlockDevice + Send + 'static> {
+    /// Its id within the file system.
+    devid: u64,
     block_size: usize,
+    /// The `dev_item` its superblocks carry.
+    dev_item: [u8; DEV_ITEM_SIZE],
+    dev: SpinLock<D>,
+}
+
+/// Bytes of a `btrfs_dev_item`, which the superblock embeds.
+const DEV_ITEM_SIZE: usize = 98;
+/// Where the superblock embeds it.
+const DEV_ITEM_AT: usize = 201;
+
+struct Shared<D: BlockDevice + Send + 'static> {
+    /// The devices present.
+    devs: Vec<Dev<D>>,
     dev_id: u64,
     /// This device's id within the file system.
     devid: u64,
@@ -193,6 +218,49 @@ struct Shared<D: BlockDevice + Send + 'static> {
     clock: ClockSlot,
     /// Nodes in use, by tree and inode, with their counts.
     open: SpinLock<Vec<(u64, u64, usize)>>,
+}
+
+/// The devices of a volume, for [`BtrfsFs::mount_multi`].
+pub struct MultiDevice<D> {
+    devs: Vec<(Option<u64>, D)>,
+}
+
+impl<D> Default for MultiDevice<D> {
+    fn default() -> Self {
+        MultiDevice { devs: Vec::new() }
+    }
+}
+
+impl<D> MultiDevice<D> {
+    /// No devices yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a device; which one it is comes from its superblock.
+    pub fn add(&mut self, dev: D) -> Result<(), Errno> {
+        self.devs.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        self.devs.push((None, dev));
+        Ok(())
+    }
+
+    /// Adds the device that should be device `devid` of the volume; mounting
+    /// fails if its superblock says otherwise.
+    pub fn add_with_devid(&mut self, devid: u64, dev: D) -> Result<(), Errno> {
+        self.devs.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+        self.devs.push((Some(devid), dev));
+        Ok(())
+    }
+
+    /// Devices added so far.
+    pub fn len(&self) -> usize {
+        self.devs.len()
+    }
+
+    /// Whether none were.
+    pub fn is_empty(&self) -> bool {
+        self.devs.is_empty()
+    }
 }
 
 /// A mounted btrfs volume.
@@ -254,24 +322,34 @@ fn usable(name: &[u8]) -> Option<&str> {
 }
 
 /// Why a volume cannot be written, if it cannot.
-fn read_only_reason(sb: &[u8], st: &State, quota: bool, block_size: usize, sectorsize: u64) -> Result<bool, Errno> {
+fn read_only_reason(
+    sb: &[u8],
+    st: &State,
+    quota: bool,
+    blocks: &[usize],
+    sectorsize: u64,
+    devs: &[u64],
+    same_generation: bool,
+) -> Result<bool, Errno> {
     let flags = disk::le64(sb, 56)?;
     let compat_ro = disk::le64(sb, 180)?;
     let incompat = disk::le64(sb, 188)?;
     let fst_invalid = compat_ro & 1 != 0 && compat_ro & 2 == 0;
     let unwritable_incompat = disk::incompat::MIXED_GROUPS | disk::incompat::RAID56 | disk::incompat::ZONED;
-    let odd_chunks = st.chunks.iter().any(|c| c.ty & (disk::profile::STRIPED | disk::profile::MIRRORED) != 0);
+    // Parity profiles are read only, and so is a volume with a device missing
+    // (or stale: written before the others), whose mirrors would diverge.
+    let odd_chunks = st.chunks.iter().any(|c| c.parity() != 0 || c.stripes.iter().any(|s| !devs.contains(&s.devid)));
     Ok(flags & !SUPER_FLAGS_OK != 0
         || compat_ro & !COMPAT_RO_OK != 0
         || fst_invalid
         || incompat & unwritable_incompat != 0
         || incompat & disk::incompat::SKINNY_METADATA == 0
         || disk::le64(sb, 96)? != 0
-        || disk::le64(sb, 136)? != 1
+        || disk::le64(sb, 136)? != devs.len() as u64
+        || !same_generation
         || quota
         || odd_chunks
-        || block_size as u64 > sectorsize
-        || !sectorsize.is_multiple_of(block_size as u64))
+        || blocks.iter().any(|&bs| bs as u64 > sectorsize || !sectorsize.is_multiple_of(bs as u64)))
 }
 
 impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
@@ -291,14 +369,74 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
 
     /// Mounts the btrfs volume on `dev` as `opts` say.
     pub fn mount_with(dev: D, dev_id: u64, opts: MountOptions) -> Result<Self, Errno> {
-        let block_size = dev.block_size();
-        if block_size == 0 || block_size > MAX_RUN {
-            return Err(Errno::EINVAL);
-        }
+        let mut devices = MultiDevice::new();
+        devices.add(dev)?;
+        Self::mount_multi(devices, dev_id, opts)
+    }
+
+    /// Mounts the btrfs volume spread over `devices` as `opts` say. The
+    /// devices may come in any order, and some may be missing: a volume with
+    /// enough copies (RAID1, RAID1C3, RAID1C4, RAID10, or RAID5 and RAID6
+    /// with the parity to spare) still reads, rebuilding what the missing
+    /// devices held, but is then read-only. A volume over several devices is
+    /// also read-only if their superblocks are of different generations,
+    /// and it can only be written where its block groups already are: no
+    /// new chunk is allocated in a striped or mirrored profile, so writes
+    /// fail with `ENOSPC` once those fill up.
+    ///
+    /// `EINVAL` if a device is not part of one and the same volume, a device
+    /// is given twice, or none holds a volume this driver can read.
+    pub fn mount_multi(devices: MultiDevice<D>, dev_id: u64, opts: MountOptions) -> Result<Self, Errno> {
         let end = disk::SUPER_OFFSET + disk::SUPER_SIZE as u64;
-        if (dev.num_blocks() as u128) * (block_size as u128) < end as u128 {
+        let mut devs: Vec<Dev<D>> = Vec::new();
+        let mut supers: Vec<Vec<u8>> = Vec::new();
+        devs.try_reserve_exact(devices.devs.len()).map_err(|_| Errno::ENOMEM)?;
+        supers.try_reserve_exact(devices.devs.len()).map_err(|_| Errno::ENOMEM)?;
+        for (want, dev) in devices.devs {
+            let block_size = dev.block_size();
+            if block_size == 0 || block_size > MAX_RUN {
+                return Err(Errno::EINVAL);
+            }
+            if (dev.num_blocks() as u128) * (block_size as u128) < end as u128 {
+                return Err(Errno::EINVAL);
+            }
+            let mut d = Dev { devid: 0, block_size, dev_item: [0; DEV_ITEM_SIZE], dev: SpinLock::new(dev) };
+            let mut b = try_zeroed(disk::SUPER_SIZE)?;
+            d.read(disk::SUPER_OFFSET, &mut b).map_err(|_| Errno::EINVAL)?;
+            let sb = Super::parse(&b)?;
+            csum::size(sb.csum_type).ok_or(Errno::EINVAL)?;
+            let (stored, rest) = b.split_at_checked(disk::CSUM_SPACE).ok_or(Errno::EINVAL)?;
+            if !csum::matches(sb.csum_type, rest, stored) || sb.incompat & !disk::incompat::SUPPORTED != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if want.is_some_and(|w| w != sb.devid) || devs.iter().any(|o| o.devid == sb.devid) {
+                return Err(Errno::EINVAL);
+            }
+            d.devid = sb.devid;
+            d.dev_item = disk::array(&b, DEV_ITEM_AT)?;
+            devs.push(d);
+            supers.push(b);
+        }
+        // The superblock to go by is the newest one.
+        let best = (0..supers.len())
+            .max_by_key(|&i| (supers.get(i).and_then(|b| disk::le64(b, 72).ok()), core::cmp::Reverse(i)))
+            .ok_or(Errno::EINVAL)?;
+        let b = supers.swap_remove(best);
+        let sb = Super::parse(&b)?;
+        let same_generation = supers.iter().all(|o| disk::le64(o, 72).ok() == disk::le64(&b, 72).ok());
+        if supers.iter().any(|o| o.get(32..48) != b.get(32..48) || disk::le16(o, 196).ok() != Some(sb.csum_type)) {
             return Err(Errno::EINVAL);
         }
+        let csum_size = csum::size(sb.csum_type).ok_or(Errno::EINVAL)?;
+        let mut blocks: Vec<usize> = Vec::new();
+        let mut present: Vec<u64> = Vec::new();
+        blocks.try_reserve_exact(devs.len()).map_err(|_| Errno::ENOMEM)?;
+        present.try_reserve_exact(devs.len()).map_err(|_| Errno::ENOMEM)?;
+        for d in &devs {
+            blocks.push(d.block_size);
+            present.push(d.devid);
+        }
+
         let release = try_arc(SpinLock::new(Vec::new()))?;
         let empty_state = |chunks: ChunkMap| -> Result<Arc<State>, Errno> {
             Ok(try_arc(State {
@@ -313,17 +451,16 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             })?)
         };
         let mut shared = Shared {
-            dev: SpinLock::new(dev),
-            block_size,
+            devs,
             dev_id,
-            devid: 0,
-            nodesize: 0,
-            sectorsize: 0,
-            csum_type: 0,
-            csum_size: 0,
-            meta_uuid: [0; 16],
-            fsid: [0; 16],
-            label: String::new(),
+            devid: sb.devid,
+            nodesize: sb.nodesize as usize,
+            sectorsize: sb.sectorsize as u64,
+            csum_type: sb.csum_type,
+            csum_size,
+            meta_uuid: sb.meta_uuid,
+            fsid: sb.fsid,
+            label: String::from_utf8(sb.label).unwrap_or_default(),
             cache: SpinLock::new((Vec::new(), 0)),
             top: disk::tree::FS,
             state: SpinLock::new(empty_state(ChunkMap::default())?),
@@ -331,23 +468,6 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             clock: ClockSlot::new(),
             open: SpinLock::new(Vec::new()),
         };
-
-        let mut b = try_zeroed(disk::SUPER_SIZE)?;
-        shared.read_phys(disk::SUPER_OFFSET, &mut b).map_err(|_| Errno::EINVAL)?;
-        let sb = Super::parse(&b)?;
-        let csum_size = csum::size(sb.csum_type).ok_or(Errno::EINVAL)?;
-        let (stored, rest) = b.split_at_checked(disk::CSUM_SPACE).ok_or(Errno::EINVAL)?;
-        if !csum::matches(sb.csum_type, rest, stored) || sb.incompat & !disk::incompat::SUPPORTED != 0 {
-            return Err(Errno::EINVAL);
-        }
-        shared.devid = sb.devid;
-        shared.nodesize = sb.nodesize as usize;
-        shared.sectorsize = sb.sectorsize as u64;
-        shared.csum_type = sb.csum_type;
-        shared.csum_size = csum_size;
-        shared.meta_uuid = sb.meta_uuid;
-        shared.fsid = sb.fsid;
-        shared.label = String::from_utf8(sb.label).unwrap_or_default();
 
         // The chunk tree maps everything else.
         let mut chunks = ChunkMap::bootstrap(&sb.sys_chunks)?;
@@ -385,7 +505,8 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
         shared.fs_root(&st, top)?.ok_or(Errno::ENOENT)?;
 
         let quota = shared.tree_root(&st, disk::tree::QUOTA)?.is_some();
-        if !opts.read_only && !read_only_reason(&b, &st, quota, block_size, shared.sectorsize)? {
+        if !opts.read_only && !read_only_reason(&b, &st, quota, &blocks, shared.sectorsize, &present, same_generation)?
+        {
             let compat_ro = disk::le64(&b, 180)?;
             let bg_tree = if compat_ro & 1 << 3 != 0 { disk::tree::BLOCK_GROUP } else { disk::tree::EXTENT };
             let first = shared.block(&st.chunks, sb.root.0)?;
@@ -668,13 +789,16 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     /// against the checksum tree if `verify`.
     fn read_sectors(&self, st: &State, at: u64, buf: &mut [u8], verify: bool) -> Result<(), Errno> {
         if !verify {
-            return self.read_logical(&st.chunks, at, buf, &mut |_| true);
+            return self.read_logical(&st.chunks, at, buf, &mut |_, _| true);
         }
         let ss = self.sectorsize as usize;
         let sums = self.csums(st, at, buf.len() / ss)?;
         let (ty, cs) = (self.csum_type, self.csum_size);
-        self.read_logical(&st.chunks, at, buf, &mut |b| {
-            b.chunks(ss).zip(sums.chunks(cs)).all(|(sector, sum)| csum::matches(ty, sector, sum))
+        self.read_logical(&st.chunks, at, buf, &mut |off, b| {
+            let first = off / ss * cs;
+            let sums = sums.get(first..).unwrap_or(&[]);
+            b.len().div_ceil(ss) <= sums.len() / cs
+                && b.chunks(ss).zip(sums.chunks(cs)).all(|(sector, sum)| csum::matches(ty, sector, sum))
         })
     }
 

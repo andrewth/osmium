@@ -322,6 +322,10 @@ pub struct Chunk {
     pub length: u64,
     /// Block group type and [`profile`] bits.
     pub ty: u64,
+    /// Bytes of each stripe element, for the striped profiles.
+    pub stripe_len: u64,
+    /// Stripes per mirrored group (RAID10).
+    pub sub_stripes: u16,
     /// The stripes, one per copy for the mirrored profiles.
     pub stripes: Vec<Stripe>,
 }
@@ -337,7 +341,17 @@ impl Chunk {
     pub fn parse(b: &[u8], logical: u64) -> Result<(Self, usize), Errno> {
         let length = le64(b, 0)?;
         let n = le16(b, 44)? as usize;
+        let (ty, stripe_len, sub_stripes) = (le64(b, 24)?, le64(b, 16)?, le16(b, 46)?);
         if length == 0 || n == 0 || logical.checked_add(length).is_none() {
+            return Err(Errno::EIO);
+        }
+        // The striped profiles divide by these.
+        let sub = sub_stripes as usize;
+        if ty & profile::STRIPED != 0 && stripe_len == 0
+            || ty & profile::RAID10 != 0 && (sub == 0 || !n.is_multiple_of(sub))
+            || ty & profile::RAID5 != 0 && n < 2
+            || ty & profile::RAID6 != 0 && n < 3
+        {
             return Err(Errno::EIO);
         }
         let mut stripes = Vec::new();
@@ -346,7 +360,7 @@ impl Chunk {
             let at = Self::FIXED + i * Self::STRIPE;
             try_push(&mut stripes, Stripe { devid: le64(b, at)?, offset: le64(b, at + 8)? })?;
         }
-        Ok((Chunk { logical, length, ty: le64(b, 24)?, stripes }, Self::FIXED + n * Self::STRIPE))
+        Ok((Chunk { logical, length, ty, stripe_len, sub_stripes, stripes }, Self::FIXED + n * Self::STRIPE))
     }
 }
 
