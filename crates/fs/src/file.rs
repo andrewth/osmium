@@ -79,6 +79,10 @@ pub struct Stat {
     pub kind: FileKind,
     /// Permission bits only (`0o7777`).
     pub mode: u32,
+    /// Owner user id (`st_uid`); 0 for a file system that keeps no owners.
+    pub uid: u32,
+    /// Owner group id (`st_gid`); 0 for a file system that keeps no owners.
+    pub gid: u32,
     /// Hard link count.
     pub nlink: u32,
     /// Size in bytes (for a symlink, the target's length).
@@ -204,6 +208,45 @@ pub trait File: Send + Sync {
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
         let _ = (name, kind, mode);
         Err(Errno::ENOTDIR)
+    }
+
+    /// [`mknod`](File::mknod) for a node owned by `uid` and `gid` from the
+    /// start, so that no crash or reader sees it owned by anyone else. The
+    /// default makes the node and then calls [`chown`](File::chown), ignoring
+    /// `EPERM` from a file system that keeps no owners.
+    fn mknod_as(
+        &self,
+        name: &str,
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Arc<dyn File>, Errno> {
+        let node = self.mknod(name, kind, mode, rdev)?;
+        match node.chown(Some(uid), Some(gid)) {
+            Ok(()) | Err(Errno::EPERM) => Ok(node),
+            Err(e) => {
+                let _ = self.remove(name, kind == FileKind::Directory);
+                Err(e)
+            }
+        }
+    }
+
+    /// Sets the permission bits (`0o7777`; the type bits are ignored). The
+    /// default is `EPERM`: a file system that cannot change them. The caller
+    /// checks who may.
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        let _ = mode;
+        Err(Errno::EPERM)
+    }
+
+    /// Sets the owner and/or group (`None` leaves one as it is). The default
+    /// is `EPERM`: a file system that keeps no owners. The caller checks who
+    /// may.
+    fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        let _ = (uid, gid);
+        Err(Errno::EPERM)
     }
 
     /// [`create`](File::create) for a device node with the device number

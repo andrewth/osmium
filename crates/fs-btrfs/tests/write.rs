@@ -538,12 +538,8 @@ fn read_only_mounts_and_subvolumes() {
         return;
     };
     {
-        let fs = BtrfsFs::mount_with(
-            FileDisk::open(&img, 4096),
-            9,
-            MountOptions { read_only: true, ..MountOptions::default() },
-        )
-        .unwrap();
+        let fs =
+            BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, MountOptions { read_only: true, ..MountOptions::default() }).unwrap();
         assert!(fs.is_read_only());
         let vfs = Vfs::new(fs.root());
         assert_eq!(vfs.mkdir("/x", 0o755).err(), Some(Errno::EROFS));

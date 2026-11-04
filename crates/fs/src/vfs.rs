@@ -121,9 +121,22 @@ impl Vfs {
     /// [`OpenFlags::NOFOLLOW`] names a symbolic link. [`OpenFlags::TRUNC`]
     /// with [`OpenFlags::WRITE`] empties a regular file.
     pub fn open(&self, path: &str, flags: OpenFlags, mode: u32) -> Result<Arc<dyn File>, Errno> {
+        self.open_as(path, flags, mode, None)
+    }
+
+    /// [`open`](Vfs::open), where a file it creates is owned by `owner`
+    /// (user and group id) if there is one, as far as the file system keeps
+    /// owners (see [`File::mknod_as`]).
+    pub fn open_as(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        mode: u32,
+        owner: Option<(u32, u32)>,
+    ) -> Result<Arc<dyn File>, Errno> {
         let follow = !flags.contains(OpenFlags::NOFOLLOW);
         let node = if flags.contains(OpenFlags::CREATE) {
-            self.open_create(path, flags, mode, 0)?
+            self.open_create(path, flags, mode, owner, 0)?
         } else {
             self.resolve(path, follow)?.node
         };
@@ -147,7 +160,14 @@ impl Vfs {
     /// The node `open` with [`OpenFlags::CREATE`] ends up on: the existing
     /// one (through mounts, and through a final symbolic link unless
     /// `NOFOLLOW`), or a new regular file; a dangling link creates its target.
-    fn open_create(&self, path: &str, flags: OpenFlags, mode: u32, depth: usize) -> Result<Arc<dyn File>, Errno> {
+    fn open_create(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        mode: u32,
+        owner: Option<(u32, u32)>,
+        depth: usize,
+    ) -> Result<Arc<dyn File>, Errno> {
         let follow = !flags.contains(OpenFlags::NOFOLLOW);
         let parent = self.parent(path)?;
         let name = match parent.name {
@@ -158,7 +178,10 @@ impl Vfs {
         let mut node = match parent.dir.lookup(name) {
             Ok(node) => node,
             Err(Errno::ENOENT) if parent.trailing_slash => return Err(Errno::EISDIR),
-            Err(Errno::ENOENT) => match parent.dir.create(name, FileKind::Regular, mode & 0o7777) {
+            Err(Errno::ENOENT) => match match owner {
+                Some((uid, gid)) => parent.dir.mknod_as(name, FileKind::Regular, mode & 0o7777, 0, uid, gid),
+                None => parent.dir.create(name, FileKind::Regular, mode & 0o7777),
+            } {
                 Ok(node) => return Ok(node),
                 // Created by someone else since the lookup: open that one
                 // unless the caller insisted on a new file.
@@ -192,7 +215,7 @@ impl Vfs {
                         return Err(Errno::ENOENT);
                     }
                     let target = if target.starts_with('/') { target } else { join(&parent.path, &target)? };
-                    self.open_create(&target, flags, mode, depth + 1)
+                    self.open_create(&target, flags, mode, owner, depth + 1)
                 }
                 Err(e) => Err(e),
             };
@@ -226,13 +249,29 @@ impl Vfs {
     /// [`mknod`](Vfs::mknod) for a device node with device number `rdev`
     /// (see [`File::mknod`]).
     pub fn mknod_dev(&self, path: &str, kind: FileKind, mode: u32, rdev: u64) -> Result<Arc<dyn File>, Errno> {
+        self.mknod_dev_as(path, kind, mode, rdev, None)
+    }
+
+    /// [`mknod_dev`](Vfs::mknod_dev) for a node owned by `owner` (user and
+    /// group id) if there is one (see [`File::mknod_as`]).
+    pub fn mknod_dev_as(
+        &self,
+        path: &str,
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+        owner: Option<(u32, u32)>,
+    ) -> Result<Arc<dyn File>, Errno> {
         if kind == FileKind::Symlink {
             return Err(Errno::EINVAL);
         }
         let parent = self.parent(path)?;
         match parent.name {
             Some(name) if name != "." && name != ".." && (!parent.trailing_slash || kind == FileKind::Directory) => {
-                parent.dir.mknod(name, kind, mode & 0o7777, rdev)
+                match owner {
+                    Some((uid, gid)) => parent.dir.mknod_as(name, kind, mode & 0o7777, rdev, uid, gid),
+                    None => parent.dir.mknod(name, kind, mode & 0o7777, rdev),
+                }
             }
             _ => Err(Errno::EEXIST),
         }

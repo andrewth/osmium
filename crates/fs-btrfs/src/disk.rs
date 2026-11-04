@@ -405,6 +405,10 @@ pub struct Inode {
     pub nlink: u32,
     /// `st_mode`, type and permissions.
     pub mode: u32,
+    /// Owner.
+    pub uid: u32,
+    /// Group.
+    pub gid: u32,
     /// Device number, as Linux's kernel encodes it (`major << 20 | minor`).
     pub rdev: u64,
     /// `BTRFS_INODE_*` flags.
@@ -428,6 +432,8 @@ impl Inode {
             size: le64(b, 16)?,
             nlink: le32(b, 40)?,
             mode: le32(b, 52)?,
+            uid: le32(b, 44)?,
+            gid: le32(b, 48)?,
             rdev: le64(b, 56)?,
             flags: le64(b, 64)?,
             atime: time(112)?,

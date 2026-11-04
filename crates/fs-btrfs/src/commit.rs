@@ -569,7 +569,11 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             next: osmium_sync::SpinLock::new(None),
         })?;
         self.w.limbo.try_reserve(self.pinned.len()).map_err(|_| Errno::ENOMEM)?;
-        self.base.pinned.lock().try_reserve(self.pinned.len()).map_err(|_| Errno::ENOMEM)?;
+        self.base.pinned.lock().try_reserve(self.pinned.len() + self.w.held.len()).map_err(|_| Errno::ENOMEM)?;
+        // Room for the ranges a deferred commit sets aside or remembers; the
+        // free list `fresh` grows by one at most per allocation.
+        self.w.held.try_reserve(self.pinned.len()).map_err(|_| Errno::ENOMEM)?;
+        self.w.fresh.try_reserve(self.allocs.len()).map_err(|_| Errno::ENOMEM)?;
         let dead = self.allocs.iter().filter(|a| a.dead).count();
         for a in self.allocs.iter().filter(|a| a.dead) {
             if let Some(g) = self.w.group_mut(a.start) {
@@ -581,10 +585,16 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         for (addr, b) in &blocks {
             sh.write_logical(&chunks, *addr, b)?;
         }
-        sh.flush()?;
-        if let Err(e) = sh.write_super(&mut sb) {
-            self.w.broken = true;
-            return Err(e);
+        // A deferred commit stops here: the blocks are written, and nothing
+        // points at them until `sync_locked` writes a superblock that does.
+        // The superblock of the last sync stays valid meanwhile, as the
+        // space it uses is held back (see `Writer::held`).
+        if !self.defer {
+            sh.flush()?;
+            if let Err(e) = sh.write_super(&mut sb) {
+                self.w.broken = true;
+                return Err(e);
+            }
         }
 
         // Committed: nothing below may fail.
@@ -595,17 +605,38 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                 g.used = used;
             }
         }
-        for a in core::mem::take(&mut self.allocs) {
-            if a.dead
-                && let Some(g) = self.w.group_mut(a.start)
-            {
-                let _ = g.give(a.start, a.len);
+        let allocs = core::mem::take(&mut self.allocs);
+        // Freed ranges no superblock uses are reusable once readers let go;
+        // the others, only once a superblock without them is written.
+        let pinned = core::mem::take(&mut self.pinned);
+        self.w.limbo.extend_from_slice(&pinned);
+        let mut readers = self.base.pinned.lock();
+        if self.defer {
+            for (start, len) in pinned {
+                if self.w.is_fresh(start, len) {
+                    readers.push((start, len));
+                } else {
+                    self.w.held.push((start, len));
+                }
+            }
+            self.w.deferred = self.w.deferred.saturating_add(1);
+        } else {
+            readers.extend(pinned);
+            readers.append(&mut self.w.held);
+            self.w.fresh.clear();
+            self.w.deferred = 0;
+        }
+        drop(readers);
+        for a in allocs {
+            if a.dead {
+                if let Some(g) = self.w.group_mut(a.start) {
+                    let _ = g.give(a.start, a.len);
+                }
+            } else if self.defer {
+                self.w.add_fresh((a.start, a.len));
             }
         }
         self.new_groups.clear();
-        let pinned = core::mem::take(&mut self.pinned);
-        self.w.limbo.extend_from_slice(&pinned);
-        self.base.pinned.lock().extend(pinned);
         *self.base.next.lock() = Some(state.clone());
         *sh.state.lock() = state;
         Ok(())
@@ -620,6 +651,36 @@ impl<D: BlockDevice + Send + 'static> Drop for Tx<'_, D> {
 }
 
 impl<D: BlockDevice + Send + 'static> crate::Shared<D> {
+    /// Makes every deferred commit durable: flushes their blocks, then writes
+    /// the superblock that points at them.
+    pub(crate) fn sync_locked(&self, w: &mut crate::write::Writer) -> Result<(), Errno> {
+        if w.deferred == 0 {
+            return Ok(());
+        }
+        if w.broken {
+            return Err(Errno::EIO);
+        }
+        let mut sb = try_to_vec(&w.sb)?;
+        if let Err(e) = self.flush().and_then(|()| self.write_super(&mut sb)) {
+            w.broken = true;
+            return Err(e);
+        }
+        w.sb = sb;
+        w.deferred = 0;
+        w.fresh.clear();
+        // What the deferred commits freed is free of the superblock now, and
+        // goes once the readers of every state so far have: the current
+        // state is the last of them to be dropped.
+        if !w.held.is_empty() {
+            let st = self.state();
+            let mut pinned = st.pinned.lock();
+            if pinned.try_reserve(w.held.len()).is_ok() {
+                pinned.append(&mut w.held);
+            }
+        }
+        Ok(())
+    }
+
     /// Writes superblock `sb` (whose generation and roots are set) to every
     /// copy on the device, flushing before and after.
     pub(crate) fn write_super(&self, sb: &mut [u8]) -> Result<(), Errno> {

@@ -104,6 +104,54 @@ pub struct Writer {
     /// Set if a commit failed after it began writing the superblock; no
     /// more writes are attempted.
     pub broken: bool,
+    /// Commits since the superblock was last written: their blocks are on the
+    /// device but nothing points at them yet.
+    pub deferred: u32,
+    /// Ranges the deferred commits freed that the last superblock written
+    /// still uses: not reusable before the next superblock replaces it.
+    pub held: Vec<(u64, u64)>,
+    /// Ranges the deferred commits allocated, sorted and apart: no superblock
+    /// uses them, so freeing one needs no waiting for one.
+    pub fresh: Vec<(u64, u64)>,
+    /// Open [`BtrfsFs::batch`](crate::BtrfsFs::batch) calls.
+    pub batch_depth: u32,
+    /// Commits to defer at most (`MountOptions::commit_batch`).
+    pub commit_batch: u32,
+}
+
+impl Writer {
+    /// Whether all of `start..start + len` was allocated by a deferred commit.
+    pub fn is_fresh(&self, start: u64, len: u64) -> bool {
+        let i = self.fresh.partition_point(|r| r.0 <= start);
+        i.checked_sub(1)
+            .and_then(|i| self.fresh.get(i))
+            .is_some_and(|r| start.checked_add(len).is_some_and(|end| end <= r.0.saturating_add(r.1)))
+    }
+
+    /// Adds `r` to `fresh`, whose room is reserved already; merges what touches.
+    pub fn add_fresh(&mut self, r: (u64, u64)) {
+        if r.1 == 0 {
+            return;
+        }
+        let at = self.fresh.partition_point(|x| x.0 < r.0);
+        self.fresh.insert(at, r);
+        // Merge in place: `out` is how many are kept.
+        let mut out = 0usize;
+        for i in 0..self.fresh.len() {
+            let Some(&(s, l)) = self.fresh.get(i) else { break };
+            if let Some(last) = out.checked_sub(1).and_then(|o| self.fresh.get_mut(o))
+                && last.0.saturating_add(last.1) >= s
+            {
+                last.1 = last.1.max(s.saturating_add(l).saturating_sub(last.0));
+                continue;
+            }
+            if let Some(slot) = self.fresh.get_mut(out) {
+                *slot = (s, l);
+            }
+            out += 1;
+        }
+        self.fresh.truncate(out);
+    }
 }
 
 /// One transaction.
@@ -140,6 +188,8 @@ pub struct Tx<'a, D: BlockDevice + Send + 'static> {
     pub(crate) orphans_removed: Vec<(u64, u64)>,
     /// Incompatible feature flags this transaction's data needs set.
     pub(crate) incompat: u64,
+    /// Whether to leave the superblock for a later [`Shared::sync_locked`].
+    pub(crate) defer: bool,
 }
 
 /// The key just after `k`.
@@ -177,6 +227,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             orphans_added: Vec::new(),
             orphans_removed: Vec::new(),
             incompat: 0,
+            defer: false,
         }
     }
 

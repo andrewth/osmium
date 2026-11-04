@@ -12,9 +12,6 @@ use osmium_sync::fallible::{try_arc, try_push, try_zeroed};
 use crate::disk::{Chunk, Key, header, le64, profile};
 use crate::{MAX_RUN, Shared, csum};
 
-/// Tree blocks kept in memory.
-const CACHE_BLOCKS: usize = 32;
-
 /// Deepest tree (`BTRFS_MAX_LEVEL`).
 const MAX_LEVEL: u8 = 8;
 
@@ -190,6 +187,8 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             return Err(Errno::EIO);
         }
         let within = logical - chunk.logical;
+        // Nothing cached for these addresses is current once they are written.
+        self.data_cache.lock().forget_range(logical, logical.saturating_add(buf.len() as u64));
         for s in &chunk.stripes {
             self.write_phys(s.offset.checked_add(within).ok_or(Errno::EIO)?, buf)?;
         }
@@ -205,18 +204,16 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     /// rewritten.
     pub(crate) fn forget(&self, addrs: impl Iterator<Item = u64> + Clone) {
         let mut cache = self.cache.lock();
-        for slot in cache.0.iter_mut() {
-            if addrs.clone().any(|a| a == slot.0) {
-                slot.0 = u64::MAX;
-            }
+        for a in addrs {
+            cache.forget_range(a, a.saturating_add(1));
         }
     }
 
     /// The tree block at `logical`, checked against its checksum, address and
     /// fsid.
     pub(crate) fn block(&self, chunks: &ChunkMap, logical: u64) -> Result<Block, Errno> {
-        if let Some((_, b)) = self.cache.lock().0.iter().find(|(at, _)| *at == logical) {
-            return Ok(b.clone());
+        if let Some(b) = self.cache.lock().get(logical) {
+            return Ok(b);
         }
         let mut b = try_zeroed(self.nodesize)?;
         let (ty, uuid) = (self.csum_type, self.meta_uuid);
@@ -232,17 +229,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             return Err(Errno::EIO);
         }
         let b = try_arc(b)?;
-        let mut cache = self.cache.lock();
-        let (slots, hand) = &mut *cache;
-        if slots.len() < CACHE_BLOCKS {
-            // A full cache never grows, so this push is the only allocation.
-            if try_push(slots, (logical, b.clone())).is_err() {
-                return Ok(b);
-            }
-        } else if let Some(slot) = slots.get_mut(*hand % CACHE_BLOCKS) {
-            *slot = (logical, b.clone());
-            *hand = hand.wrapping_add(1);
-        }
+        self.cache.lock().insert(logical, b.clone());
         Ok(b)
     }
 
