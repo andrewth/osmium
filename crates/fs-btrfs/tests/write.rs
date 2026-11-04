@@ -625,3 +625,149 @@ fn removed_open_directory_takes_no_new_names() {
     let fs = mount(&img);
     assert_eq!(names(&*fs.root()), ["f"]);
 }
+
+/// The file extent types in the default tree, as `btrfs inspect-internal
+/// dump-tree` shows them: (inline, regular, prealloc).
+fn extent_types(img: &Path) -> (usize, usize, usize) {
+    let out = Command::new(tool("btrfs").unwrap())
+        .args(["inspect-internal", "dump-tree", "-t", "5"])
+        .arg(img)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let n = |ty: &str| text.matches(&format!("({ty})")).count();
+    (n("inline"), n("regular"), n("prealloc"))
+}
+
+fn set(model: &mut Model, path: &str, off: usize, data: &[u8]) {
+    let Want::File(v) = model.entry(path.into()).or_insert(Want::File(Vec::new())) else { unreachable!() };
+    if v.len() < off + data.len() {
+        v.resize(off + data.len(), 0);
+    }
+    v[off..off + data.len()].copy_from_slice(data);
+}
+
+fn resize(model: &mut Model, path: &str, len: usize) {
+    let Some(Want::File(v)) = model.get_mut(path) else { unreachable!() };
+    v.resize(len, 0);
+}
+
+#[test]
+fn inline_extents() {
+    let dir = scratch("inline");
+    let Some(img) = mkfs(&dir, 128 << 20, &[]) else { return };
+    let mut model = Model::new();
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        for (i, len) in [1usize, 100, 2047, 2048].into_iter().enumerate() {
+            let p = format!("/small{i}");
+            put(&vfs, &p, &pattern(len, i as u8));
+            set(&mut model, &p, 0, &pattern(len, i as u8));
+        }
+        put(&vfs, "/big", &pattern(2049, 9));
+        set(&mut model, "/big", 0, &pattern(2049, 9));
+        put(&vfs, "/empty", b"");
+        set(&mut model, "/empty", 0, b"");
+        // Appends and overwrites that stay inline.
+        let f = vfs.open("/small0", OpenFlags::WRITE, 0).unwrap();
+        f.write(1, b"appended").unwrap();
+        set(&mut model, "/small0", 1, b"appended");
+        f.write(3, b"XY").unwrap();
+        set(&mut model, "/small0", 3, b"XY");
+        // Truncating down stays inline; to zero removes the extent.
+        vfs.open("/small1", OpenFlags::WRITE, 0).unwrap().truncate(40).unwrap();
+        resize(&mut model, "/small1", 40);
+        let f = vfs.open("/small2", OpenFlags::WRITE, 0).unwrap();
+        f.truncate(0).unwrap();
+        resize(&mut model, "/small2", 0);
+        f.write(0, b"again").unwrap();
+        set(&mut model, "/small2", 0, b"again");
+    }
+    check(&img);
+    // small0..small3 are inline; `big` and `empty` are not.
+    assert_eq!(extent_types(&img).0, 4, "inline extents");
+    verify(&dir, &img, &model);
+    {
+        // Transitions to regular extents: past the limit, past a hole,
+        // truncating up, and a write inside a file that was inline.
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        vfs.open("/small3", OpenFlags::WRITE, 0).unwrap().write(2048, &pattern(3000, 4)).unwrap();
+        set(&mut model, "/small3", 2048, &pattern(3000, 4));
+        vfs.open("/small0", OpenFlags::WRITE, 0).unwrap().write(10_000, b"far").unwrap();
+        set(&mut model, "/small0", 10_000, b"far");
+        vfs.open("/small1", OpenFlags::WRITE, 0).unwrap().truncate(9000).unwrap();
+        resize(&mut model, "/small1", 9000);
+    }
+    verify(&dir, &img, &model);
+    assert_eq!(extent_types(&img).0, 1);
+}
+
+#[test]
+fn preallocation() {
+    let dir = scratch("prealloc");
+    let Some(img) = mkfs(&dir, 128 << 20, &[]) else { return };
+    let mut model = Model::new();
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        let create = |p: &str| vfs.open(p, OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
+        // Preallocate a new file, write into it and across its end.
+        let f = create("/pre");
+        fs.fallocate(&*f, 0, 1 << 20).unwrap();
+        set(&mut model, "/pre", 0, &vec![0; 1 << 20]);
+        assert_eq!(f.stat().size, 1 << 20);
+        f.write(5000, &pattern(10_000, 1)).unwrap();
+        set(&mut model, "/pre", 5000, &pattern(10_000, 1));
+        f.write(1 << 19, &pattern(4096, 2)).unwrap();
+        set(&mut model, "/pre", 1 << 19, &pattern(4096, 2));
+        f.write((1 << 20) - 10, &pattern(100, 3)).unwrap();
+        set(&mut model, "/pre", (1 << 20) - 10, &pattern(100, 3));
+        // A range partly with data: the data stays.
+        let g = create("/mixed");
+        g.write(0, &pattern(8192, 5)).unwrap();
+        set(&mut model, "/mixed", 0, &pattern(8192, 5));
+        g.write(40_000, &pattern(100, 6)).unwrap();
+        set(&mut model, "/mixed", 40_000, &pattern(100, 6));
+        fs.fallocate(&*g, 4096, 100_000).unwrap();
+        resize(&mut model, "/mixed", 104_096);
+        // An inline file, preallocated.
+        let h = create("/small");
+        h.write(0, b"tiny").unwrap();
+        set(&mut model, "/small", 0, b"tiny");
+        fs.fallocate(&*h, 0, 20_000).unwrap();
+        resize(&mut model, "/small", 20_000);
+        assert_eq!(fs.fallocate(&*vfs.lookup("/").unwrap(), 0, 10), Err(Errno::EISDIR));
+        // Punch holes: whole sectors, partial ends, inside one sector.
+        let p = create("/punch");
+        p.write(0, &pattern(200_000, 8)).unwrap();
+        set(&mut model, "/punch", 0, &pattern(200_000, 8));
+        fs.punch_hole(&*p, 10_000, 100_000).unwrap();
+        set(&mut model, "/punch", 10_000, &vec![0; 100_000]);
+        fs.punch_hole(&*p, 150_000, 50).unwrap();
+        set(&mut model, "/punch", 150_000, &[0; 50]);
+        fs.punch_hole(&*p, 190_000, 1_000_000).unwrap();
+        set(&mut model, "/punch", 190_000, &vec![0; 10_000]);
+        assert_eq!(p.stat().size, 200_000);
+        let s = create("/punch-small");
+        s.write(0, b"0123456789").unwrap();
+        fs.punch_hole(&*s, 2, 3).unwrap();
+        set(&mut model, "/punch-small", 0, b"01\0\0\x0056789");
+        compare(&vfs, &model);
+    }
+    verify(&dir, &img, &model);
+    assert!(extent_types(&img).2 > 0, "prealloc extents");
+    {
+        // Truncate through preallocated ranges, remove a file with them.
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        vfs.open("/pre", OpenFlags::WRITE, 0).unwrap().truncate(300_001).unwrap();
+        resize(&mut model, "/pre", 300_001);
+        vfs.open("/mixed", OpenFlags::WRITE, 0).unwrap().truncate(0).unwrap();
+        resize(&mut model, "/mixed", 0);
+        vfs.unlink("/small").unwrap();
+        model.remove("/small");
+    }
+    verify(&dir, &img, &model);
+}

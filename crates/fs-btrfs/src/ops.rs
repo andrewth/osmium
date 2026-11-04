@@ -14,6 +14,12 @@ use crate::write::{DataRef, Tx};
 /// Largest piece of a write handled at once (each gets its own extent).
 const MAX_PIECE: u64 = 1 << 20;
 
+/// Linux's default `max_inline`: the most file data kept in the tree.
+const MAX_INLINE: usize = 2048;
+
+/// Most bytes one preallocated extent covers.
+const MAX_PREALLOC: u64 = 128 << 20;
+
 /// Inode flags a new inode takes from its directory.
 const INHERITED: u64 = 1 << 0 | 1 << 1;
 
@@ -613,6 +619,78 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         self.put_extents(t, ino, 0, &buf, !nodatasum)
     }
 
+    /// The most data an inline extent holds: like Linux, `max_inline` (2048),
+    /// less than a sector and what fits in a leaf.
+    fn max_inline(&self) -> usize {
+        let room = self.leaf_space().saturating_sub(ITEM + 21);
+        MAX_INLINE.min(self.sh.sectorsize as usize - 1).min(room)
+    }
+
+    /// The uncompressed inline extent that is all of file `ino`, if so: its data.
+    fn inline_data(&mut self, t: u64, ino: u64, size: u64) -> Result<Option<Vec<u8>>, Errno> {
+        let Some(d) = self.find(t, Key::new(ino, item::EXTENT_DATA, 0))? else { return Ok(None) };
+        let fe = FileExtent::parse(&d)?;
+        match fe.data {
+            disk::ExtentData::Inline(data) if fe.compression == 0 && data.len() as u64 == size => {
+                Ok(Some(try_to_vec(data)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Stores `data` as the inline extent of file `ino`, whose inode is `d`.
+    fn set_inline(&mut self, t: u64, ino: u64, data: &[u8], d: &mut [u8]) -> Result<(), Errno> {
+        let mut fe = Vec::new();
+        fe.try_reserve_exact(21 + data.len()).map_err(|_| Errno::ENOMEM)?;
+        fe.extend_from_slice(&self.transid.to_le_bytes());
+        fe.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        fe.extend_from_slice(&[0; 5]);
+        fe.extend_from_slice(data);
+        self.put(t, Key::new(ino, item::EXTENT_DATA, 0), &fe)?;
+        put64(d, ino::SIZE, data.len() as u64)?;
+        put64(d, ino::NBYTES, data.len() as u64)?;
+        self.stamp(d, true)
+    }
+
+    /// Handles a write that leaves the whole file small enough to be one
+    /// inline extent: a write at 0 of an empty file, or one that touches or
+    /// extends an inline file. Updates inode `d` (not stored); `false` if
+    /// the write is not of that kind and nothing changed.
+    fn write_inline(
+        &mut self,
+        t: u64,
+        ino: u64,
+        off: u64,
+        data: &[u8],
+        size: u64,
+        d: &mut [u8],
+    ) -> Result<bool, Errno> {
+        let end = off.saturating_add(data.len() as u64);
+        if end > self.max_inline() as u64 || off > size {
+            return Ok(false);
+        }
+        let mut file = if size == 0 {
+            // Only if there is no extent at all (a preallocated one may be left).
+            match self.next_item(t, Key::new(ino, item::EXTENT_DATA, 0))? {
+                Some((k, _)) if k.objectid == ino && k.ty == item::EXTENT_DATA => return Ok(false),
+                _ => Vec::new(),
+            }
+        } else {
+            match self.inline_data(t, ino, size)? {
+                Some(old) => old,
+                None => return Ok(false),
+            }
+        };
+        let (o, e) = (off as usize, end as usize);
+        if file.len() < e {
+            file.try_reserve_exact(e - file.len()).map_err(|_| Errno::ENOMEM)?;
+            file.resize(e, 0);
+        }
+        file.get_mut(o..e).ok_or(Errno::EIO)?.copy_from_slice(data);
+        self.set_inline(t, ino, &file, d)?;
+        Ok(true)
+    }
+
     /// Writes `data` at `off` of file `ino`; returns the bytes written.
     pub(crate) fn write(&mut self, t: u64, ino: u64, off: u64, data: &[u8]) -> Result<usize, Errno> {
         let mut d = self.inode(t, ino)?;
@@ -629,6 +707,10 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         let end = off.checked_add(data.len() as u64).filter(|&e| e <= i64::MAX as u64).ok_or(Errno::EFBIG)?;
         let ss = self.sh.sectorsize;
         let sums = le64(&d, ino::FLAGS)? & disk::INODE_NODATASUM == 0;
+        if self.write_inline(t, ino, off, data, size, &mut d)? {
+            self.set_inode(t, ino, &d)?;
+            return Ok(data.len());
+        }
         let mut nbytes = le64(&d, ino::NBYTES)? as i64 + self.uninline(t, ino, !sums)?;
         let mut pos = off;
         while pos < end {
@@ -696,6 +778,21 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             return Ok(());
         }
         self.frees = len < size;
+        if len < size
+            && let Some(mut file) = self.inline_data(t, ino, size)?
+        {
+            // Stays inline, shorter.
+            if len == 0 {
+                self.delete(t, Key::new(ino, item::EXTENT_DATA, 0))?;
+                put64(&mut d, ino::SIZE, 0)?;
+                put64(&mut d, ino::NBYTES, 0)?;
+                self.stamp(&mut d, true)?;
+            } else {
+                file.truncate(len as usize);
+                self.set_inline(t, ino, &file, &mut d)?;
+            }
+            return self.set_inode(t, ino, &d);
+        }
         let ss = self.sh.sectorsize;
         let sums = le64(&d, ino::FLAGS)? & disk::INODE_NODATASUM == 0;
         let mut nbytes = le64(&d, ino::NBYTES)? as i64 + self.uninline(t, ino, !sums)?;
@@ -714,6 +811,134 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         put64(&mut d, ino::NBYTES, nbytes.max(0) as u64)?;
         self.stamp(&mut d, true)?;
         self.set_inode(t, ino, &d)
+    }
+
+    /// The parts of the sector-aligned file range `a..e` of `ino` that hold
+    /// no data (no extent, or a hole), as `(start, end)`.
+    fn gaps(&mut self, t: u64, ino: u64, a: u64, e: u64) -> Result<Vec<(u64, u64)>, Errno> {
+        let ours = |k: &Key| k.objectid == ino && k.ty == item::EXTENT_DATA;
+        let mut gaps = Vec::new();
+        let mut pos = a;
+        let mut from = a;
+        let mut pending = self.prev_item(t, Key::new(ino, item::EXTENT_DATA, a))?.filter(|(k, _)| ours(k));
+        loop {
+            let (k, d) = match pending.take() {
+                Some(x) => x,
+                None => match self.next_item(t, Key::new(ino, item::EXTENT_DATA, from))? {
+                    Some(x) if ours(&x.0) && x.0.offset < e => x,
+                    _ => break,
+                },
+            };
+            from = k.offset.saturating_add(1);
+            let info = extent_info(&d)?;
+            if !info.disk.is_some_and(|(bytenr, _, _)| bytenr != 0) {
+                // A hole: no data. (Inline data was turned into an extent.)
+                if info.disk.is_none() {
+                    return Err(Errno::EIO);
+                }
+                continue;
+            }
+            if k.offset > pos {
+                try_push(&mut gaps, (pos, k.offset.min(e)))?;
+            }
+            pos = pos.max(k.offset.saturating_add(info.len));
+        }
+        if pos < e {
+            try_push(&mut gaps, (pos, e))?;
+        }
+        Ok(gaps)
+    }
+
+    /// Preallocates the file range `off..off + len` of `ino`, as
+    /// `fallocate(2)` does: what has no data gets preallocated extents (read
+    /// as zeroes until written), what has is kept, and the file grows to
+    /// `off + len` if it is shorter.
+    pub(crate) fn fallocate(&mut self, t: u64, ino: u64, off: u64, len: u64) -> Result<(), Errno> {
+        let mut d = self.inode(t, ino)?;
+        match Self::kind(&d)? {
+            FileKind::Regular => {}
+            FileKind::Directory => return Err(Errno::EISDIR),
+            _ => return Err(Errno::EINVAL),
+        }
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = off.checked_add(len).filter(|&e| e <= i64::MAX as u64).ok_or(Errno::EFBIG)?;
+        let ss = self.sh.sectorsize;
+        let size = le64(&d, ino::SIZE)?;
+        let sums = le64(&d, ino::FLAGS)? & disk::INODE_NODATASUM == 0;
+        let (a, e) = (off & !(ss - 1), end.next_multiple_of(ss));
+        let mut nbytes = le64(&d, ino::NBYTES)? as i64;
+        if a == 0 {
+            nbytes += self.uninline(t, ino, !sums)?;
+        }
+        for (g0, g1) in self.gaps(t, ino, a, e)? {
+            let mut at = g0;
+            while at < g1 {
+                let (start, got) = self.alloc_data((g1 - at).min(MAX_PREALLOC))?;
+                // Whatever is in the range now is a hole; clear its item.
+                self.drop_extents(t, ino, at, at + got)?;
+                let mut fe = [0u8; 53];
+                put64(&mut fe, 0, self.transid)?;
+                put64(&mut fe, 8, got)?;
+                put(&mut fe, 20, &[2])?;
+                put64(&mut fe, 21, start)?;
+                put64(&mut fe, 29, got)?;
+                put64(&mut fe, 45, got)?;
+                self.insert(t, Key::new(ino, item::EXTENT_DATA, at), &fe)?;
+                self.data_ref(start, got, t, ino, at, 1, true)?;
+                nbytes += got as i64;
+                at += got;
+            }
+        }
+        put64(&mut d, ino::SIZE, size.max(end))?;
+        put64(&mut d, ino::NBYTES, nbytes.max(0) as u64)?;
+        self.stamp(&mut d, true)?;
+        self.set_inode(t, ino, &d)
+    }
+
+    /// Deallocates the file range `off..off + len` of `ino`, which then reads
+    /// as zeroes; the size stays. Whole sectors become holes, the partial
+    /// ones at the ends are zeroed.
+    pub(crate) fn punch_hole(&mut self, t: u64, ino: u64, off: u64, len: u64) -> Result<(), Errno> {
+        let d = self.inode(t, ino)?;
+        match Self::kind(&d)? {
+            FileKind::Regular => {}
+            FileKind::Directory => return Err(Errno::EISDIR),
+            _ => return Err(Errno::EINVAL),
+        }
+        let end = off.checked_add(len).filter(|&e| e <= i64::MAX as u64).ok_or(Errno::EFBIG)?;
+        let size = le64(&d, ino::SIZE)?;
+        let ss = self.sh.sectorsize;
+        // Data exists only below the size.
+        let (off, end) = (off.min(size), end.min(size));
+        if off >= end {
+            return Ok(());
+        }
+        self.frees = true;
+        let (ia, ib) = (off.next_multiple_of(ss), end & !(ss - 1));
+        let zero = |tx: &mut Self, from: u64, to: u64| -> Result<(), Errno> {
+            if from < to {
+                let z = try_zeroed((to - from) as usize)?;
+                tx.write(t, ino, from, &z)?;
+            }
+            Ok(())
+        };
+        if ia >= ib {
+            zero(self, off, end)?;
+        } else {
+            zero(self, off, ia)?;
+            zero(self, ib, end)?;
+        }
+        if ia < ib {
+            let removed = self.drop_extents(t, ino, ia, ib)?;
+            let mut d = self.inode(t, ino)?;
+            let nbytes = le64(&d, ino::NBYTES)?.saturating_sub(removed);
+            put64(&mut d, ino::NBYTES, nbytes)?;
+            self.stamp(&mut d, true)?;
+            self.set_inode(t, ino, &d)?;
+        }
+        Ok(())
     }
 
     /// Sets extended attribute `name` of `ino`.

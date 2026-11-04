@@ -21,9 +21,11 @@
 //! reference counts), data checksums, block group usage, the free space tree
 //! and root items are kept up to date, and the superblock is written last,
 //! after a flush, so that a crash leaves the volume as it was before the call
-//! or after it. File data goes to new extents (never compressed, never
-//! inline except for symbolic links), with checksums unless the file has
-//! `nodatasum`; new data and metadata chunks are added when the block groups
+//! or after it. File data goes to new extents (never compressed), with
+//! checksums unless the file has `nodatasum`; a file of up to 2048 bytes is
+//! one inline extent, as with Linux's default `max_inline`, and
+//! [`BtrfsFs::fallocate`] and [`BtrfsFs::punch_hole`] preallocate and
+//! deallocate ranges; new data and metadata chunks are added when the block groups
 //! fill up. Unlinked files that are still open are kept as orphans and
 //! deleted when their last node goes, or at the next mount.
 //!
@@ -411,6 +413,37 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             return Err(Errno::EIO);
         }
         Ok(BtrfsFs { shared, root: try_arc(root)? })
+    }
+
+    /// The node of `file` if it is a regular file of this mount.
+    fn regular<'f>(&self, file: &'f dyn File) -> Result<&'f Node<D>, Errno> {
+        let n = file.as_any().and_then(|a| a.downcast_ref::<Node<D>>()).ok_or(Errno::EBADF)?;
+        if !Arc::ptr_eq(&self.shared, &n.shared) {
+            return Err(Errno::EXDEV);
+        }
+        match n.kind {
+            FileKind::Regular => Ok(n),
+            FileKind::Directory => Err(Errno::EISDIR),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
+    /// Preallocates `off..off + len` of `file` (`fallocate(2)`): ranges
+    /// without data get extents that read as zeroes until written, and the
+    /// file grows to `off + len` if it is shorter. The `File` trait has no
+    /// such call, so this is on the file system.
+    pub fn fallocate(&self, file: &dyn File, off: u64, len: u64) -> Result<(), Errno> {
+        let n = self.regular(file)?;
+        let (tree, ino) = (n.tree, n.objectid);
+        self.shared.transact(|tx| tx.fallocate(tree, ino, off, len))
+    }
+
+    /// Deallocates `off..off + len` of `file` (`FALLOC_FL_PUNCH_HOLE`): it
+    /// reads as zeroes afterwards and its size does not change.
+    pub fn punch_hole(&self, file: &dyn File, off: u64, len: u64) -> Result<(), Errno> {
+        let n = self.regular(file)?;
+        let (tree, ino) = (n.tree, n.objectid);
+        self.shared.transact(|tx| tx.punch_hole(tree, ino, off, len))
     }
 
     /// The root directory, to mount in a `Vfs`.
