@@ -188,7 +188,7 @@ pub fn snapshot_fs(root: Arc<dyn File>) -> Snapshot {
 
 /// `snapshot_fs` of the image read-only.
 pub fn snapshot(img: &Path) -> Snapshot {
-    let opts = MountOptions { subvol: None, read_only: true };
+    let opts = MountOptions { subvol: None, read_only: true, ..Default::default() };
     let fs = BtrfsFs::mount_with(Disk::open(img), 1, opts).unwrap();
     snapshot_fs(fs.root())
 }

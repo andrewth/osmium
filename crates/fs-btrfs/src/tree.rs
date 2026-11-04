@@ -9,11 +9,9 @@ use osmium_fs::Errno;
 use osmium_hal::block::BlockDevice;
 use osmium_sync::fallible::{try_arc, try_push, try_zeroed};
 
-use crate::disk::{Chunk, Key, header, le64, profile};
-use crate::{MAX_RUN, Shared, csum};
-
-/// Tree blocks kept in memory.
-const CACHE_BLOCKS: usize = 32;
+use crate::disk::{Chunk, Key, header, le64};
+use crate::raid::Place;
+use crate::{Dev, MAX_RUN, Shared, csum};
 
 /// Deepest tree (`BTRFS_MAX_LEVEL`).
 const MAX_LEVEL: u8 = 8;
@@ -52,7 +50,17 @@ impl ChunkMap {
         v.try_reserve_exact(self.0.len()).map_err(|_| Errno::ENOMEM)?;
         for c in &self.0 {
             let stripes = osmium_sync::fallible::try_to_vec(&c.stripes)?;
-            try_push(&mut v, Chunk { logical: c.logical, length: c.length, ty: c.ty, stripes })?;
+            try_push(
+                &mut v,
+                Chunk {
+                    logical: c.logical,
+                    length: c.length,
+                    ty: c.ty,
+                    stripe_len: c.stripe_len,
+                    sub_stripes: c.sub_stripes,
+                    stripes,
+                },
+            )?;
         }
         Ok(ChunkMap(v))
     }
@@ -121,128 +129,133 @@ fn child(b: &[u8], slot: usize) -> Result<u64, Errno> {
     le64(b, header::SIZE + slot * PTR + Key::SIZE)
 }
 
-impl<D: BlockDevice + Send + 'static> Shared<D> {
-    /// Runs `f` on the device with id `devid`: the one mounted, or one added
-    /// since. `EIO` if there is no such device.
-    pub(crate) fn with_dev<R>(&self, devid: u64, f: impl FnOnce(&mut D) -> Result<R, Errno>) -> Result<R, Errno> {
-        if devid == self.devid {
-            return f(&mut self.dev.lock());
+impl<D: BlockDevice + Send + 'static> Dev<D> {
+    /// Reads `buf.len()` bytes at byte offset `off` of the device.
+    pub(crate) fn read(&self, mut off: u64, mut buf: &mut [u8]) -> Result<(), Errno> {
+        let bs = self.block_size;
+        let mut dev = self.dev.lock();
+        let mut bounce = Vec::new();
+        while !buf.is_empty() {
+            let lba = off / bs as u64;
+            let skip = (off % bs as u64) as usize;
+            let n = if skip == 0 && buf.len() >= bs {
+                let n = (buf.len() / bs * bs).min(MAX_RUN / bs * bs);
+                dev.read_blocks(lba, buf.get_mut(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
+                n
+            } else {
+                if bounce.is_empty() {
+                    bounce = try_zeroed(bs)?;
+                }
+                dev.read_blocks(lba, &mut bounce).map_err(|_| Errno::EIO)?;
+                let n = (bs - skip).min(buf.len());
+                let src = bounce.get(skip..skip + n).ok_or(Errno::EIO)?;
+                buf.get_mut(..n).ok_or(Errno::EIO)?.copy_from_slice(src);
+                n
+            };
+            off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
+            buf = buf.get_mut(n..).ok_or(Errno::EIO)?;
         }
-        let mut others = self.others.lock();
-        let (_, dev) = others.iter_mut().find(|(id, _)| *id == devid).ok_or(Errno::EIO)?;
-        f(dev)
+        Ok(())
+    }
+}
+
+impl<D: BlockDevice + Send + 'static> Shared<D> {
+    /// The device with id `devid`, if it is present.
+    pub(crate) fn dev(&self, devid: u64) -> Option<Arc<Dev<D>>> {
+        self.devs.lock().iter().find(|d| d.devid == devid).cloned()
     }
 
     /// Whether device `devid` is part of the open volume.
     pub(crate) fn has_dev(&self, devid: u64) -> bool {
-        devid == self.devid || self.others.lock().iter().any(|(id, _)| *id == devid)
+        self.devs.lock().iter().any(|d| d.devid == devid)
     }
 
-    /// The ids of the open devices: those added since the mount, then the
-    /// mounted one.
+    /// The ids of the open devices, the mounted one last.
     pub(crate) fn dev_ids(&self) -> Result<Vec<u64>, Errno> {
-        let others = self.others.lock();
+        let devs = self.devs.lock();
         let mut v = Vec::new();
-        v.try_reserve_exact(others.len() + 1).map_err(|_| Errno::ENOMEM)?;
-        v.extend(others.iter().map(|(id, _)| *id));
+        v.try_reserve_exact(devs.len()).map_err(|_| Errno::ENOMEM)?;
+        v.extend(devs.iter().filter(|d| d.devid != self.devid).map(|d| d.devid));
         v.push(self.devid);
         Ok(v)
     }
 
-    /// Reads `buf.len()` bytes at byte offset `off` of the mounted device.
-    pub(crate) fn read_phys(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
-        self.read_phys_dev(self.devid, off, buf)
-    }
-
     /// Reads `buf.len()` bytes at byte offset `off` of device `devid`.
-    pub(crate) fn read_phys_dev(&self, devid: u64, mut off: u64, mut buf: &mut [u8]) -> Result<(), Errno> {
-        let bs = self.block_size;
-        self.with_dev(devid, |dev| {
-            let mut bounce = Vec::new();
-            while !buf.is_empty() {
-                let lba = off / bs as u64;
-                let skip = (off % bs as u64) as usize;
-                let n = if skip == 0 && buf.len() >= bs {
-                    let n = (buf.len() / bs * bs).min(MAX_RUN / bs * bs);
-                    dev.read_blocks(lba, buf.get_mut(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
-                    n
-                } else {
-                    if bounce.is_empty() {
-                        bounce = try_zeroed(bs)?;
-                    }
-                    dev.read_blocks(lba, &mut bounce).map_err(|_| Errno::EIO)?;
-                    let n = (bs - skip).min(buf.len());
-                    let src = bounce.get(skip..skip + n).ok_or(Errno::EIO)?;
-                    buf.get_mut(..n).ok_or(Errno::EIO)?.copy_from_slice(src);
-                    n
-                };
-                off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
-                buf = core::mem::take(&mut buf).get_mut(n..).ok_or(Errno::EIO)?;
-            }
-            Ok(())
-        })
+    pub(crate) fn read_phys(&self, devid: u64, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        self.dev(devid).ok_or(Errno::EIO)?.read(off, buf)
     }
 
-    /// Reads logical `logical..logical + buf.len()` from the first copy that
-    /// reads and that `good` accepts. Only copies on devices that are open are
-    /// tried; striped profiles (RAID0, RAID10, RAID5, RAID6) are `EIO`.
+    /// Reads logical `logical..logical + buf.len()` a run at a time (a run
+    /// lies within one stripe element), each from the first copy that reads
+    /// and that `good` accepts; `good` is given a run and its byte offset in
+    /// `buf`. A RAID5 or RAID6 strip that does not read or check is rebuilt
+    /// from the rest of its row.
     pub(crate) fn read_logical(
         &self,
         chunks: &ChunkMap,
         logical: u64,
         buf: &mut [u8],
-        good: &mut dyn FnMut(&[u8]) -> bool,
+        good: &mut dyn FnMut(usize, &[u8]) -> bool,
     ) -> Result<(), Errno> {
         let chunk = chunks.find(logical, buf.len() as u64)?;
-        if chunk.ty & profile::STRIPED != 0 {
-            return Err(Errno::EIO);
+        let mut done = 0usize;
+        while done < buf.len() {
+            let within = (logical - chunk.logical).checked_add(done as u64).ok_or(Errno::EIO)?;
+            let piece = chunk.piece(within, (buf.len() - done) as u64)?;
+            let end = done.checked_add(piece.len as usize).ok_or(Errno::EIO)?;
+            let part = buf.get_mut(done..end).ok_or(Errno::EIO)?;
+            let at = done;
+            self.read_piece(chunk, &piece.place, part, &mut |p| good(at, p))?;
+            done = end;
         }
-        let within = logical - chunk.logical;
-        for s in chunk.stripes.iter() {
-            let Some(at) = s.offset.checked_add(within) else { continue };
-            if self.read_phys_dev(s.devid, at, buf).is_ok() && good(buf) {
-                return Ok(());
-            }
-        }
-        Err(Errno::EIO)
+        Ok(())
     }
 
     /// Writes `buf`, whole device blocks, at byte offset `off` of device `devid`.
-    pub(crate) fn write_phys_dev(&self, devid: u64, mut off: u64, mut buf: &[u8]) -> Result<(), Errno> {
-        let bs = self.block_size as u64;
+    pub(crate) fn write_phys(&self, devid: u64, mut off: u64, mut buf: &[u8]) -> Result<(), Errno> {
+        let d = self.dev(devid).ok_or(Errno::EIO)?;
+        let bs = d.block_size as u64;
         if !off.is_multiple_of(bs) || !(buf.len() as u64).is_multiple_of(bs) {
             return Err(Errno::EIO);
         }
-        self.with_dev(devid, |dev| {
-            while !buf.is_empty() {
-                let n = buf.len().min(MAX_RUN / bs as usize * bs as usize);
-                dev.write_blocks(off / bs, buf.get(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
-                off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
-                buf = buf.get(n..).ok_or(Errno::EIO)?;
-            }
-            Ok(())
-        })
+        let mut dev = d.dev.lock();
+        while !buf.is_empty() {
+            let n = buf.len().min(MAX_RUN / bs as usize * bs as usize);
+            dev.write_blocks(off / bs, buf.get(..n).ok_or(Errno::EIO)?).map_err(|_| Errno::EIO)?;
+            off = off.checked_add(n as u64).ok_or(Errno::EIO)?;
+            buf = buf.get(n..).ok_or(Errno::EIO)?;
+        }
+        Ok(())
     }
 
-    /// Writes `buf` at logical `logical`, to every copy.
+    /// Writes `buf` at logical `logical`, to every copy. Parity profiles are
+    /// not written.
     pub(crate) fn write_logical(&self, chunks: &ChunkMap, logical: u64, buf: &[u8]) -> Result<(), Errno> {
         let chunk = chunks.find(logical, buf.len() as u64)?;
-        if chunk.ty & profile::STRIPED != 0 || chunk.stripes.iter().any(|s| !self.has_dev(s.devid)) {
+        if chunk.parity() != 0 {
             return Err(Errno::EIO);
         }
-        let within = logical - chunk.logical;
-        for s in &chunk.stripes {
-            self.write_phys_dev(s.devid, s.offset.checked_add(within).ok_or(Errno::EIO)?, buf)?;
+        // Nothing cached for these addresses is current once they are written.
+        self.data_cache.lock().forget_range(logical, logical.saturating_add(buf.len() as u64));
+        let mut done = 0usize;
+        while done < buf.len() {
+            let within = (logical - chunk.logical).checked_add(done as u64).ok_or(Errno::EIO)?;
+            let piece = chunk.piece(within, (buf.len() - done) as u64)?;
+            let end = done.checked_add(piece.len as usize).ok_or(Errno::EIO)?;
+            let part = buf.get(done..end).ok_or(Errno::EIO)?;
+            let Place::Copies { first, count, off } = piece.place else { return Err(Errno::EIO) };
+            for s in chunk.stripes.iter().skip(first).take(count) {
+                self.write_phys(s.devid, s.offset.checked_add(off).ok_or(Errno::EIO)?, part)?;
+            }
+            done = end;
         }
         Ok(())
     }
 
     /// Makes previous writes durable, on every device.
     pub(crate) fn flush(&self) -> Result<(), Errno> {
-        // No allocation: a commit flushes after it can no longer back out.
-        self.dev.lock().flush().map_err(|_| Errno::EIO)?;
-        for (_, dev) in self.others.lock().iter_mut() {
-            dev.flush().map_err(|_| Errno::EIO)?;
+        for d in self.devs.lock().iter() {
+            d.dev.lock().flush().map_err(|_| Errno::EIO)?;
         }
         Ok(())
     }
@@ -251,22 +264,24 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
     /// rewritten.
     pub(crate) fn forget(&self, addrs: impl Iterator<Item = u64> + Clone) {
         let mut cache = self.cache.lock();
-        for slot in cache.0.iter_mut() {
-            if addrs.clone().any(|a| a == slot.0) {
-                slot.0 = u64::MAX;
-            }
+        for a in addrs {
+            cache.forget_range(a, a.saturating_add(1));
         }
     }
 
     /// The tree block at `logical`, checked against its checksum, address and
     /// fsid.
     pub(crate) fn block(&self, chunks: &ChunkMap, logical: u64) -> Result<Block, Errno> {
-        if let Some((_, b)) = self.cache.lock().0.iter().find(|(at, _)| *at == logical) {
-            return Ok(b.clone());
+        if let Some(b) = self.cache.lock().get(logical) {
+            return Ok(b);
         }
         let mut b = try_zeroed(self.nodesize)?;
         let (ty, uuid) = (self.csum_type, self.meta_uuid);
-        self.read_logical(chunks, logical, &mut b, &mut |b| {
+        let want = self.nodesize;
+        self.read_logical(chunks, logical, &mut b, &mut |_, b| {
+            if b.len() != want {
+                return false;
+            }
             let (stored, rest) = b.split_at_checked(crate::disk::CSUM_SPACE).unwrap_or((&[], &[]));
             csum::matches(ty, rest, stored)
                 && le64(b, header::BYTENR).ok() == Some(logical)
@@ -278,17 +293,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             return Err(Errno::EIO);
         }
         let b = try_arc(b)?;
-        let mut cache = self.cache.lock();
-        let (slots, hand) = &mut *cache;
-        if slots.len() < CACHE_BLOCKS {
-            // A full cache never grows, so this push is the only allocation.
-            if try_push(slots, (logical, b.clone())).is_err() {
-                return Ok(b);
-            }
-        } else if let Some(slot) = slots.get_mut(*hand % CACHE_BLOCKS) {
-            *slot = (logical, b.clone());
-            *hand = hand.wrapping_add(1);
-        }
+        self.cache.lock().insert(logical, b.clone());
         Ok(b)
     }
 
@@ -299,6 +304,49 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             return Err(Errno::EIO);
         }
         Ok(b)
+    }
+
+    /// Reads every item of the tree rooted at `root` (in key order) into
+    /// `items`, and the address of each of its blocks into `blocks`.
+    pub(crate) fn read_tree(
+        &self,
+        chunks: &ChunkMap,
+        root: (u64, u8),
+        items: &mut Vec<(Key, Vec<u8>)>,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), Errno> {
+        if root.1 >= MAX_LEVEL {
+            return Err(Errno::EIO);
+        }
+        let start = items.len();
+        self.read_subtree(chunks, root.0, root.1, items, blocks)?;
+        // Keys must ascend, or the tree is not what it claims to be.
+        let read = items.get(start..).ok_or(Errno::EIO)?;
+        if read.windows(2).any(|w| w.first().map(|a| a.0) >= w.get(1).map(|b| b.0)) {
+            return Err(Errno::EIO);
+        }
+        Ok(())
+    }
+
+    fn read_subtree(
+        &self,
+        chunks: &ChunkMap,
+        addr: u64,
+        want: u8,
+        items: &mut Vec<(Key, Vec<u8>)>,
+        blocks: &mut Vec<u64>,
+    ) -> Result<(), Errno> {
+        let b = self.block_at(chunks, addr, want)?;
+        try_push(blocks, addr)?;
+        for slot in 0..nritems(&b) {
+            if want == 0 {
+                try_push(items, (slot_key(&b, slot)?, osmium_sync::fallible::try_to_vec(item_data(&b, slot)?)?))?;
+            } else {
+                let below = want.checked_sub(1).ok_or(Errno::EIO)?;
+                self.read_subtree(chunks, child(&b, slot)?, below, items, blocks)?;
+            }
+        }
+        Ok(())
     }
 
     /// The data of the item with exactly `key` in the tree rooted at `root`.

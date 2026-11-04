@@ -104,7 +104,7 @@ fn reports_what_it_cannot_repair() {
     drop(vfs);
     drop(fs);
     // A read-only mount scrubs but does not repair.
-    let ro = BtrfsFs::mount_with(Disk::open(&img), 1, MountOptions { subvol: None, read_only: true }).unwrap();
+    let ro = BtrfsFs::mount_with(Disk::open(&img), 1, MountOptions { subvol: None, read_only: true, ..Default::default() }).unwrap();
     assert_eq!(ro.scrub(true).err(), Some(Errno::EROFS));
     assert_eq!(ro.scrub(false).unwrap().uncorrectable, 1);
 }

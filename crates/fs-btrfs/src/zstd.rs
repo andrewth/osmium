@@ -10,6 +10,9 @@ use alloc::vec::Vec;
 use crate::DecodeError;
 use crate::xxhash::xxh64;
 
+mod comp;
+pub(crate) use comp::compress;
+
 type Result<T> = core::result::Result<T, DecodeError>;
 
 const CORRUPT: DecodeError = DecodeError::Corrupt;

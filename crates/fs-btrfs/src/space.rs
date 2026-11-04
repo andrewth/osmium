@@ -119,11 +119,11 @@ impl Group {
 
 /// The logical ranges of `chunk` holding a superblock copy.
 pub fn super_ranges(chunk: &Chunk) -> impl Iterator<Item = (u64, u64)> + '_ {
-    chunk.stripes.iter().flat_map(move |s| {
-        SUPER_MIRRORS
-            .iter()
-            .filter(move |&&m| m >= s.offset && m < s.offset + chunk.length)
-            .map(move |&m| (chunk.logical + (m - s.offset), MIRROR_EXCLUDE.min(s.offset + chunk.length - m)))
+    chunk.stripes.iter().enumerate().flat_map(move |(i, s)| {
+        SUPER_MIRRORS.iter().filter_map(move |&m| {
+            let (logical, room) = chunk.rmap(i, m.checked_sub(s.offset)?)?;
+            Some((logical, MIRROR_EXCLUDE.min(room)))
+        })
     })
 }
 
@@ -299,7 +299,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                     .is_ok_and(|c| c.stripes.iter().all(|s| !self.w.no_alloc.contains(&s.devid))))
     }
 
-    fn claim(&mut self, start: u64, len: u64) -> Result<(u64, u64), Errno> {
+    pub(crate) fn claim(&mut self, start: u64, len: u64) -> Result<(u64, u64), Errno> {
         self.allocs.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         self.w.group_mut(start).ok_or(Errno::EIO)?.take(start, len)?;
         self.allocs.push(Alloc { start, len, dead: false });
@@ -455,7 +455,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         self.pending_chunks.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
 
         // In memory: the chunk, for reads and writes, and the group.
-        let chunk = Chunk { logical, length: size, ty: flags, stripes };
+        let chunk = Chunk { logical, length: size, ty: flags, stripe_len: 64 << 10, sub_stripes: 1, stripes };
         let mut free = Vec::new();
         try_push(&mut free, (logical, size))?;
         for (s, l) in super_ranges(&chunk) {

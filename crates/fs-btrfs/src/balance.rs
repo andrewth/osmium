@@ -129,13 +129,15 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             have.get(i).is_none_or(|&h| h == 0)
                 || sums.get(i * cs..(i + 1) * cs).is_some_and(|sum| csum::matches(ty, sector, sum))
         };
-        let whole = self.read_logical(&st.chunks, at, buf, &mut |b| b.chunks(ss).enumerate().all(|(i, s)| ok(i, s)));
+        let whole = self.read_logical(&st.chunks, at, buf, &mut |off, b| {
+            b.chunks(ss).enumerate().all(|(i, s)| ok(off / ss + i, s))
+        });
         if whole.is_ok() {
             return Ok(());
         }
         for (i, sector) in buf.chunks_mut(ss).enumerate() {
             let sector_at = at.checked_add((i * ss) as u64).ok_or(Errno::EIO)?;
-            self.read_logical(&st.chunks, sector_at, sector, &mut |b| ok(i, b))?;
+            self.read_logical(&st.chunks, sector_at, sector, &mut |_, b| ok(i, b))?;
         }
         Ok(())
     }
@@ -351,6 +353,13 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             return Err(Errno::EIO);
         }
         let refs = self.file_refs(bytenr, &d)?;
+        // A tree that has been snapshotted shares leaves with its snapshots,
+        // and the extents they hold: moving those needs every sharer changed.
+        for r in &refs {
+            if self.root(r.0)?.last_snapshot != 0 {
+                return Err(Errno::EOPNOTSUPP);
+            }
+        }
         let total: u64 = refs.iter().map(|r| r.3 as u64).sum();
         if total != le64(&d, 0)? || refs.is_empty() {
             return Err(Errno::EIO);
@@ -389,8 +398,14 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             self.retarget(r, bytenr, new)?;
             let (root, ino, offset, count) = r;
             let delta = count as i64;
-            try_push(&mut self.data_refs, DataRef { bytenr: new, len, root, ino, offset, delta, new: true })?;
-            try_push(&mut self.data_refs, DataRef { bytenr, len, root, ino, offset, delta: -delta, new: false })?;
+            try_push(
+                &mut self.data_refs,
+                DataRef { bytenr: new, len, root, ino, offset, parent: 0, delta, new: true },
+            )?;
+            try_push(
+                &mut self.data_refs,
+                DataRef { bytenr, len, root, ino, offset, parent: 0, delta: -delta, new: false },
+            )?;
         }
         Ok(len)
     }
@@ -401,10 +416,14 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         if self.pinned.iter().any(|p| p.0 == addr) {
             return Ok(false);
         }
-        let (owner, first) = {
+        let (owner, first, generation) = {
             let n = self.load(addr)?;
-            (n.owner, n.first_key())
+            (n.owner, n.first_key(), n.generation)
         };
+        // A block a snapshot may share cannot be moved for one tree alone.
+        if self.root(owner)?.last_snapshot >= generation && self.root(owner)?.last_snapshot != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
         self.path(owner, first.unwrap_or(Key::new(0, 0, 0)), 0)?;
         Ok(true)
     }

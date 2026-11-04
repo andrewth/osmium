@@ -1,4 +1,11 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable, clippy::string_slice)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::unreachable,
+    clippy::string_slice
+)]
 //! Devices: adding, removing and replacing them under a mounted volume.
 //! `btrfs check` reads a volume of image files only if it has one device, so
 //! the states with two are looked at through the superblocks
@@ -138,8 +145,12 @@ fn refuses_what_it_cannot_do() {
     assert_eq!(fs.replace_device(1, Disk::open(&tiny)).err(), Some(Errno::ENOSPC));
     assert_eq!(fs.replace_device(7, Disk::open(&tiny)).err(), Some(Errno::ENOENT));
     drop(fs);
-    let ro = BtrfsFs::mount_with(Disk::open(&img1), 1, osmium_fs_btrfs::MountOptions { subvol: None, read_only: true })
-        .unwrap();
+    let ro = BtrfsFs::mount_with(
+        Disk::open(&img1),
+        1,
+        osmium_fs_btrfs::MountOptions { subvol: None, read_only: true, ..Default::default() },
+    )
+    .unwrap();
     assert_eq!(ro.add_device(Disk::open(&blank(&dir, "d2", 128 << 20))).err(), Some(Errno::EROFS));
     assert_eq!(ro.remove_device(2).err(), Some(Errno::EROFS));
     // A volume with a second device mounts read-only here.
@@ -281,7 +292,7 @@ fn crash_while_adding() {
             let sb2 = assert_super_ok(&work[1]);
             assert_eq!(field(&sb2, "generation"), field(&sb, "generation"), "after {n}");
             assert_eq!(field(&sb2, "num_devices"), "2");
-            let ro = osmium_fs_btrfs::MountOptions { subvol: None, read_only: true };
+            let ro = osmium_fs_btrfs::MountOptions { subvol: None, read_only: true, ..Default::default() };
             let fs = BtrfsFs::mount_with(Disk::open(&work[0]), 1, ro).unwrap();
             assert_eq!(fs.devices().unwrap().len(), 2);
         }
@@ -328,7 +339,7 @@ fn crash_while_removing() {
             if let Err(t) = try_check_metadata(&work[0]) {
                 panic!("crash after {n} of {} writes fails btrfs check of the metadata:\n{t}", log.len());
             }
-            let ro = osmium_fs_btrfs::MountOptions { subvol: None, read_only: true };
+            let ro = osmium_fs_btrfs::MountOptions { subvol: None, read_only: true, ..Default::default() };
             let fs = BtrfsFs::mount_with(Disk::open(&work[0]), 1, ro).unwrap();
             assert_eq!(fs.devices().unwrap().len(), 2);
             assert_super_ok(&work[1]);
@@ -380,4 +391,36 @@ fn crash_while_replacing() {
         assert!(snapshot(img) == expect, "crash after {n} of {} writes changed the files", log.len());
     }
     assert!(olds > 0 && news > 0, "{olds} old, {news} new");
+}
+
+/// A volume with two devices mounts read-write when both are given, and the
+/// device operations carry on there.
+#[test]
+fn remount_with_both_devices() {
+    let dir = scratch("dev-remount");
+    let Some(img1) = mkfs_named(&dir, "d1", 128 << 20, &[]) else { return };
+    let img2 = blank(&dir, "d2", 128 << 20);
+    let want;
+    {
+        let fs = mount(&img1);
+        let vfs = Vfs::new(fs.root());
+        fs.add_device(Disk::open(&img2)).unwrap();
+        want = files(&vfs, 8, 1);
+        assert!(on_dev(&fs, 2) > 0);
+    }
+    let mut md = osmium_fs_btrfs::MultiDevice::new();
+    md.add(Disk::open(&img1)).unwrap();
+    md.add(Disk::open(&img2)).unwrap();
+    let fs = BtrfsFs::mount_multi(md, 9, Default::default()).unwrap();
+    assert!(!fs.is_read_only());
+    let vfs = Vfs::new(fs.root());
+    assert_files(&vfs, &want);
+    let more = files(&vfs, 2, 9);
+    assert!(fs.scrub(false).unwrap().is_clean());
+    fs.remove_device(2).unwrap();
+    assert_files(&vfs, &want);
+    assert_files(&vfs, &more);
+    drop(vfs);
+    drop(fs);
+    check(&img1);
 }

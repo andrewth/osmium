@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use osmium_fs::{Errno, File, FileKind, OpenFlags, Vfs};
-use osmium_fs_btrfs::{BtrfsFs, MountOptions};
+use osmium_fs_btrfs::{BtrfsFs, Compression, MountOptions};
 use osmium_hal::block::{BlockDevice, BlockError};
 
 /// An image file, read and written in `block`-byte blocks.
@@ -366,9 +366,17 @@ fn fills_up_and_frees() {
             let data = pattern(4 << 20, i as u8);
             let f = vfs.open(&path, OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
             match f.write(0, &data) {
-                Ok(_) => {
+                Ok(n) if n == data.len() => {
                     model.insert(path, Want::File(data));
                     i += 1;
+                }
+                Ok(n) => {
+                    // A short write: what fit is there, and nothing more does.
+                    assert!(n % 4096 == 0 && n < data.len());
+                    assert_eq!(f.stat().size, n as u64);
+                    assert_eq!(f.write(n as u64, &data[n..]).err(), Some(Errno::ENOSPC));
+                    model.insert(path, Want::File(data[..n].to_vec()));
+                    break;
                 }
                 Err(Errno::ENOSPC) => {
                     model.insert(path, Want::File(Vec::new()));
@@ -531,7 +539,7 @@ fn read_only_mounts_and_subvolumes() {
     };
     {
         let fs =
-            BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, MountOptions { subvol: None, read_only: true }).unwrap();
+            BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, MountOptions { read_only: true, ..MountOptions::default() }).unwrap();
         assert!(fs.is_read_only());
         let vfs = Vfs::new(fs.root());
         assert_eq!(vfs.mkdir("/x", 0o755).err(), Some(Errno::EROFS));
@@ -624,4 +632,397 @@ fn removed_open_directory_takes_no_new_names() {
     check(&img);
     let fs = mount(&img);
     assert_eq!(names(&*fs.root()), ["f"]);
+}
+
+/// Text that compresses well, and data that does not.
+fn words(len: usize, seed: usize) -> Vec<u8> {
+    let w = ["extent", "inode", "btrfs", "tree", "chunk", "csum", "root", "node", "leaf", "key"];
+    let mut out = Vec::with_capacity(len + 8);
+    let mut x = seed as u32 + 1;
+    while out.len() < len {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        out.extend_from_slice(w[(x >> 16) as usize % w.len()].as_bytes());
+        out.push(b' ');
+    }
+    out.truncate(len);
+    out
+}
+
+fn noise(len: usize) -> Vec<u8> {
+    let mut x = 0x1234_5678u32;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect()
+}
+
+/// The file tree's extent lines from `btrfs inspect-internal dump-tree`.
+fn extent_lines(img: &Path) -> Vec<String> {
+    let out = Command::new(tool("btrfs").unwrap())
+        .args(["inspect-internal", "dump-tree", "-t", "5"])
+        .arg(img)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.lines().filter(|l| l.contains("extent compression")).map(|l| l.to_string()).collect()
+}
+
+/// Writes through the driver with compression on, then checks the result with `btrfs check
+/// --check-data-csum`, a fresh mount and `btrfs restore`.
+fn write_compressed(name: &str, algo: Compression, label: &str) {
+    let dir = scratch(name);
+    let Some(img) = mkfs(&dir, 128 << 20, &[]) else { return };
+    let mut model = Model::new();
+    {
+        let opts = MountOptions { compress: algo, ..MountOptions::default() };
+        let fs = BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, opts).unwrap();
+        assert!(!fs.is_read_only());
+        let vfs = Vfs::new(fs.root());
+        for (path, data) in [
+            ("/text", words(1_000_000, 1)),
+            ("/noise", noise(300_000)),
+            ("/zeros", vec![0u8; 500_000]),
+            ("/small", words(5000, 2)),
+            ("/mixed", [words(150_000, 3), noise(40_000), vec![7; 70_000], words(9_000, 4)].concat()),
+        ] {
+            put(&vfs, path, &data);
+            model.insert(path.into(), Want::File(data));
+        }
+        compare(&vfs, &model);
+        // Overwrites that cut compressed extents at both ends, and a truncation through one.
+        let edit = |model: &mut Model, path: &str, off: usize, data: &[u8]| {
+            let f = vfs.open(path, OpenFlags::WRITE, 0).unwrap();
+            f.write(off as u64, data).unwrap();
+            let Some(Want::File(v)) = model.get_mut(path) else { unreachable!() };
+            if v.len() < off + data.len() {
+                v.resize(off + data.len(), 0);
+            }
+            v[off..off + data.len()].copy_from_slice(data);
+        };
+        edit(&mut model, "/text", 70_001, &noise(3001));
+        edit(&mut model, "/text", 400_000, &words(200_000, 9));
+        edit(&mut model, "/mixed", 100_000, b"patched");
+        edit(&mut model, "/zeros", 1_000_000, b"far");
+        let t = vfs.open("/text", OpenFlags::WRITE, 0).unwrap();
+        t.truncate(655_555).unwrap();
+        let Some(Want::File(v)) = model.get_mut("/text") else { unreachable!() };
+        v.truncate(655_555);
+        vfs.unlink("/small").unwrap();
+        model.remove("/small");
+        compare(&vfs, &model);
+    }
+    verify(&dir, &img, &model);
+    let lines = extent_lines(&img);
+    let packed = lines.iter().filter(|l| l.contains(&format!("({label})"))).count();
+    let plain = lines.iter().filter(|l| l.contains("(none)")).count();
+    eprintln!("{name}: {packed} compressed extents, {plain} plain");
+    assert!(packed > 5, "expected compressed extents:\n{}", lines.join("\n"));
+    assert!(plain > 0, "noise should stay uncompressed");
+}
+
+#[test]
+fn writes_zlib() {
+    write_compressed("w-zlib", Compression::Zlib, "zlib");
+}
+
+#[test]
+fn writes_lzo() {
+    write_compressed("w-lzo", Compression::Lzo, "lzo");
+}
+
+#[test]
+fn writes_zstd() {
+    write_compressed("w-zstd", Compression::Zstd, "zstd");
+}
+
+
+/// More hard links than the `INODE_REF` item of one directory can hold: the
+/// rest are `INODE_EXTREF`s, which unlink and rename must find again.
+#[test]
+fn many_hard_links() {
+    let dir = scratch("links");
+    let Some(img) = mkfs(&dir, 128 << 20, &["-n", "4096"]) else { return };
+    let mut model = Model::new();
+    let name = |i: usize| format!("{i:03}-{}", "n".repeat(200));
+    let data = pattern(10_000, 5);
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        for d in ["/d", "/e"] {
+            vfs.mkdir(d, 0o755).unwrap();
+            model.insert(d.into(), Want::Dir);
+        }
+        put(&vfs, "/d/first", &data);
+        model.insert("/d/first".into(), Want::File(data.clone()));
+        for i in 0..120 {
+            let p = format!("/d/{}", name(i));
+            vfs.link("/d/first", &p).unwrap();
+            model.insert(p, Want::File(data.clone()));
+        }
+        for i in 0..5 {
+            let p = format!("/e/{}", name(i));
+            vfs.link("/d/first", &p).unwrap();
+            model.insert(p, Want::File(data.clone()));
+        }
+        assert_eq!(vfs.stat("/d/first", true).unwrap().nlink, 126);
+    }
+    verify(&dir, &img, &model);
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        // Rename links stored both ways, within and across directories.
+        for (from, to) in [(3usize, "/d/renamed-a"), (100, "/e/renamed-b"), (119, "/d/renamed-c")] {
+            let old = format!("/d/{}", name(from));
+            vfs.rename(&old, to).unwrap();
+            let v = model.remove(&old).unwrap();
+            model.insert(to.into(), v);
+        }
+        for i in (0..120).step_by(3).chain([1, 2, 118]) {
+            let p = format!("/d/{}", name(i));
+            if model.remove(&p).is_some() {
+                vfs.unlink(&p).unwrap();
+            }
+        }
+        // Names freed from the `INODE_REF` item are reused.
+        for i in 200..210 {
+            let p = format!("/d/{}", name(i));
+            vfs.link("/e/renamed-b", &p).unwrap();
+            model.insert(p, Want::File(data.clone()));
+        }
+        // Renaming one link of a file to another does nothing, as POSIX says.
+        vfs.rename("/d/renamed-a", &format!("/d/{}", name(110))).unwrap();
+        let n = model.values().filter(|v| matches!(v, Want::File(_))).count();
+        assert_eq!(vfs.stat("/d/first", true).unwrap().nlink as usize, n);
+    }
+    verify(&dir, &img, &model);
+    {
+        // Remove every link; the last one frees the inode.
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        let files: Vec<_> = model.iter().filter(|(_, v)| matches!(v, Want::File(_))).map(|(k, _)| k.clone()).collect();
+        for k in files {
+            vfs.unlink(&k).unwrap();
+            model.remove(&k);
+        }
+    }
+    verify(&dir, &img, &model);
+}
+
+/// The file tree's data extent items, from `btrfs inspect-internal dump-tree`.
+fn extents(img: &Path) -> Vec<String> {
+    let out = Command::new(tool("btrfs").unwrap())
+        .args(["inspect-internal", "dump-tree", "-t", "5"])
+        .arg(img)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("EXTENT_DATA") || l.contains("disk byte"))
+        .map(|l| l.trim().split(" itemoff").next().unwrap().to_string())
+        .collect()
+}
+
+/// A nodatacow file is overwritten where it lies: its extents stay as they
+/// were. A file that is copy on write gets new ones.
+#[test]
+fn nodatacow_overwrites_in_place() {
+    let dir = scratch("nocow");
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("cow")).unwrap();
+    let Some(img) = mkfs(&dir, 64 << 20, &["--rootdir", src.to_str().unwrap(), "--inode-flags", "nodatacow:cow"])
+    else {
+        return;
+    };
+    let mut model = Model::new();
+    model.insert("/cow".into(), Want::Dir);
+    let mut a = pattern(300_000, 1);
+    let mut plain = pattern(300_000, 2);
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        put(&vfs, "/cow/a", &a);
+        put(&vfs, "/plain", &plain);
+    }
+    let before = extents(&img);
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        for (off, len) in [(0usize, 10), (5000, 20_000), (4095, 2), (299_990, 10)] {
+            let patch = pattern(len, off as u8 ^ 0x55);
+            a[off..off + len].copy_from_slice(&patch);
+            plain[off..off + len].copy_from_slice(&patch);
+            assert_eq!(vfs.open("/cow/a", OpenFlags::WRITE, 0).unwrap().write(off as u64, &patch).unwrap(), len);
+            assert_eq!(vfs.open("/plain", OpenFlags::WRITE, 0).unwrap().write(off as u64, &patch).unwrap(), len);
+        }
+        assert_eq!(cat(&vfs, "/cow/a"), a);
+    }
+    let after = extents(&img);
+    // The extent items of the first file (in /cow) and the second.
+    let split = |t: &[String]| -> (Vec<String>, Vec<String>) {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        let first = t.first().and_then(|l| l.split("key (").nth(1)?.split(' ').next()).unwrap().to_string();
+        for l in t {
+            if l.contains(&format!("key ({first} ")) { x.push(l.clone()) } else { y.push(l.clone()) }
+        }
+        (x, y)
+    };
+    let (b_cow, b_plain) = split(&before);
+    let (a_cow, a_plain) = split(&after);
+    assert!(!b_cow.is_empty() && !b_plain.is_empty());
+    assert_eq!(b_cow, a_cow, "nodatacow file's extents changed");
+    assert_ne!(b_plain, a_plain, "cow file's extents did not change");
+    model.insert("/cow/a".into(), Want::File(a));
+    model.insert("/plain".into(), Want::File(plain));
+    verify(&dir, &img, &model);
+}
+
+
+/// The file extent types in the default tree, as `btrfs inspect-internal
+/// dump-tree` shows them: (inline, regular, prealloc).
+fn extent_types(img: &Path) -> (usize, usize, usize) {
+    let out = Command::new(tool("btrfs").unwrap())
+        .args(["inspect-internal", "dump-tree", "-t", "5"])
+        .arg(img)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let n = |ty: &str| text.matches(&format!("({ty})")).count();
+    (n("inline"), n("regular"), n("prealloc"))
+}
+
+fn set(model: &mut Model, path: &str, off: usize, data: &[u8]) {
+    let Want::File(v) = model.entry(path.into()).or_insert(Want::File(Vec::new())) else { unreachable!() };
+    if v.len() < off + data.len() {
+        v.resize(off + data.len(), 0);
+    }
+    v[off..off + data.len()].copy_from_slice(data);
+}
+
+fn resize(model: &mut Model, path: &str, len: usize) {
+    let Some(Want::File(v)) = model.get_mut(path) else { unreachable!() };
+    v.resize(len, 0);
+}
+
+#[test]
+fn inline_extents() {
+    let dir = scratch("inline");
+    let Some(img) = mkfs(&dir, 128 << 20, &[]) else { return };
+    let mut model = Model::new();
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        for (i, len) in [1usize, 100, 2047, 2048].into_iter().enumerate() {
+            let p = format!("/small{i}");
+            put(&vfs, &p, &pattern(len, i as u8));
+            set(&mut model, &p, 0, &pattern(len, i as u8));
+        }
+        put(&vfs, "/big", &pattern(2049, 9));
+        set(&mut model, "/big", 0, &pattern(2049, 9));
+        put(&vfs, "/empty", b"");
+        set(&mut model, "/empty", 0, b"");
+        // Appends and overwrites that stay inline.
+        let f = vfs.open("/small0", OpenFlags::WRITE, 0).unwrap();
+        f.write(1, b"appended").unwrap();
+        set(&mut model, "/small0", 1, b"appended");
+        f.write(3, b"XY").unwrap();
+        set(&mut model, "/small0", 3, b"XY");
+        // Truncating down stays inline; to zero removes the extent.
+        vfs.open("/small1", OpenFlags::WRITE, 0).unwrap().truncate(40).unwrap();
+        resize(&mut model, "/small1", 40);
+        let f = vfs.open("/small2", OpenFlags::WRITE, 0).unwrap();
+        f.truncate(0).unwrap();
+        resize(&mut model, "/small2", 0);
+        f.write(0, b"again").unwrap();
+        set(&mut model, "/small2", 0, b"again");
+    }
+    check(&img);
+    // small0..small3 are inline; `big` and `empty` are not.
+    assert_eq!(extent_types(&img).0, 4, "inline extents");
+    verify(&dir, &img, &model);
+    {
+        // Transitions to regular extents: past the limit, past a hole,
+        // truncating up, and a write inside a file that was inline.
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        vfs.open("/small3", OpenFlags::WRITE, 0).unwrap().write(2048, &pattern(3000, 4)).unwrap();
+        set(&mut model, "/small3", 2048, &pattern(3000, 4));
+        vfs.open("/small0", OpenFlags::WRITE, 0).unwrap().write(10_000, b"far").unwrap();
+        set(&mut model, "/small0", 10_000, b"far");
+        vfs.open("/small1", OpenFlags::WRITE, 0).unwrap().truncate(9000).unwrap();
+        resize(&mut model, "/small1", 9000);
+    }
+    verify(&dir, &img, &model);
+    assert_eq!(extent_types(&img).0, 1);
+}
+
+#[test]
+fn preallocation() {
+    let dir = scratch("prealloc");
+    let Some(img) = mkfs(&dir, 128 << 20, &[]) else { return };
+    let mut model = Model::new();
+    {
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        let create = |p: &str| vfs.open(p, OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
+        // Preallocate a new file, write into it and across its end.
+        let f = create("/pre");
+        fs.fallocate(&*f, 0, 1 << 20).unwrap();
+        set(&mut model, "/pre", 0, &vec![0; 1 << 20]);
+        assert_eq!(f.stat().size, 1 << 20);
+        f.write(5000, &pattern(10_000, 1)).unwrap();
+        set(&mut model, "/pre", 5000, &pattern(10_000, 1));
+        f.write(1 << 19, &pattern(4096, 2)).unwrap();
+        set(&mut model, "/pre", 1 << 19, &pattern(4096, 2));
+        f.write((1 << 20) - 10, &pattern(100, 3)).unwrap();
+        set(&mut model, "/pre", (1 << 20) - 10, &pattern(100, 3));
+        // A range partly with data: the data stays.
+        let g = create("/mixed");
+        g.write(0, &pattern(8192, 5)).unwrap();
+        set(&mut model, "/mixed", 0, &pattern(8192, 5));
+        g.write(40_000, &pattern(100, 6)).unwrap();
+        set(&mut model, "/mixed", 40_000, &pattern(100, 6));
+        fs.fallocate(&*g, 4096, 100_000).unwrap();
+        resize(&mut model, "/mixed", 104_096);
+        // An inline file, preallocated.
+        let h = create("/small");
+        h.write(0, b"tiny").unwrap();
+        set(&mut model, "/small", 0, b"tiny");
+        fs.fallocate(&*h, 0, 20_000).unwrap();
+        resize(&mut model, "/small", 20_000);
+        assert_eq!(fs.fallocate(&*vfs.lookup("/").unwrap(), 0, 10), Err(Errno::EISDIR));
+        // Punch holes: whole sectors, partial ends, inside one sector.
+        let p = create("/punch");
+        p.write(0, &pattern(200_000, 8)).unwrap();
+        set(&mut model, "/punch", 0, &pattern(200_000, 8));
+        fs.punch_hole(&*p, 10_000, 100_000).unwrap();
+        set(&mut model, "/punch", 10_000, &vec![0; 100_000]);
+        fs.punch_hole(&*p, 150_000, 50).unwrap();
+        set(&mut model, "/punch", 150_000, &[0; 50]);
+        fs.punch_hole(&*p, 190_000, 1_000_000).unwrap();
+        set(&mut model, "/punch", 190_000, &vec![0; 10_000]);
+        assert_eq!(p.stat().size, 200_000);
+        let s = create("/punch-small");
+        s.write(0, b"0123456789").unwrap();
+        fs.punch_hole(&*s, 2, 3).unwrap();
+        set(&mut model, "/punch-small", 0, b"01\0\0\x0056789");
+        compare(&vfs, &model);
+    }
+    verify(&dir, &img, &model);
+    assert!(extent_types(&img).2 > 0, "prealloc extents");
+    {
+        // Truncate through preallocated ranges, remove a file with them.
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        vfs.open("/pre", OpenFlags::WRITE, 0).unwrap().truncate(300_001).unwrap();
+        resize(&mut model, "/pre", 300_001);
+        vfs.open("/mixed", OpenFlags::WRITE, 0).unwrap().truncate(0).unwrap();
+        resize(&mut model, "/mixed", 0);
+        vfs.unlink("/small").unwrap();
+        model.remove("/small");
+    }
+    verify(&dir, &img, &model);
 }

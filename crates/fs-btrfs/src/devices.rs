@@ -25,15 +25,17 @@
 
 use alloc::vec::Vec;
 
+use alloc::sync::Arc;
 use osmium_fs::Errno;
 use osmium_hal::block::BlockDevice;
-use osmium_sync::fallible::{try_push, try_zeroed};
+use osmium_sync::SpinLock;
+use osmium_sync::fallible::{try_arc, try_push, try_zeroed};
 
 use crate::balance::BalanceFilter;
 use crate::disk::{Key, item, le64, put, put64, tree};
 use crate::tree::Cursor;
 use crate::write::Tx;
-use crate::{MAX_RUN, Shared, csum, disk};
+use crate::{Dev, MAX_RUN, Shared, csum, disk};
 
 /// Smallest device that can be added.
 const MIN_DEVICE: u64 = 16 << 20;
@@ -101,24 +103,31 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
 
     /// Wipes the superblocks of `dev`, so that it no longer looks like part
     /// of a volume. Best effort: the device has left the volume already.
-    fn wipe_supers(&self, dev: &mut D) {
-        let bs = self.block_size as u64;
-        let Ok(zeros) = try_zeroed(disk::SUPER_SIZE.max(self.block_size)) else { return };
+    fn wipe_supers(dev: &mut D) {
+        let bs = dev.block_size();
+        let len = disk::SUPER_SIZE.max(bs);
+        let Ok(zeros) = try_zeroed(len) else { return };
         for at in [disk::SUPER_OFFSET, 64 << 20, 256 << 30] {
-            if at + disk::SUPER_SIZE as u64 <= dev.num_blocks().saturating_mul(bs) {
-                let _ = dev.write_blocks(at / bs, zeros.get(..disk::SUPER_SIZE.max(self.block_size)).unwrap_or(&[]));
+            if at + disk::SUPER_SIZE as u64 <= dev.num_blocks().saturating_mul(bs as u64) {
+                let _ = dev.write_blocks(at / bs as u64, &zeros);
             }
         }
         let _ = dev.flush();
     }
 
+    /// The block size of the mounted device.
+    fn mounted_block_size(&self) -> Result<usize, Errno> {
+        Ok(self.dev(self.devid).ok_or(Errno::EIO)?.block_size)
+    }
+
     /// Adds `dev` to the volume as a new device; returns its id.
     pub(crate) fn add_device(&self, dev: D) -> Result<u64, Errno> {
         let writer = self.writer.as_ref().ok_or(Errno::EROFS)?;
-        if dev.block_size() != self.block_size {
+        let block_size = self.mounted_block_size()?;
+        if dev.block_size() != block_size {
             return Err(Errno::EINVAL);
         }
-        let bytes = dev.num_blocks().checked_mul(self.block_size as u64).ok_or(Errno::EINVAL)?;
+        let bytes = dev.num_blocks().checked_mul(block_size as u64).ok_or(Errno::EINVAL)?;
         let size = bytes / self.sectorsize * self.sectorsize;
         if size < MIN_DEVICE {
             return Err(Errno::EINVAL);
@@ -132,14 +141,20 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             self.device_items(&st)?.iter().map(|d| d.devid).max().and_then(|m| m.checked_add(1)).ok_or(Errno::EIO)?
         };
         let uuid = self.device_uuid(devid, size);
+        let entry = try_arc(Dev {
+            devid,
+            block_size,
+            dev_item: SpinLock::new([0; crate::DEV_ITEM_SIZE]),
+            dev: SpinLock::new(dev),
+        })?;
         {
-            let mut others = self.others.lock();
-            others.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
-            others.push((devid, dev));
+            let mut devs = self.devs.lock();
+            devs.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+            devs.push(entry);
         }
         let r = self.transact_locked(&mut w, |tx| tx.add_dev_item(devid, size, uuid));
         if r.is_err() {
-            self.others.lock().retain(|(id, _)| *id != devid);
+            self.devs.lock().retain(|d| d.devid != devid);
         }
         r.map(|()| devid)
     }
@@ -168,11 +183,21 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         done?;
         // Nothing is on it: delete its item, and then it is not part of the volume.
         self.transact_locked(&mut w, |tx| tx.drop_dev_item(devid))?;
-        let mut others = self.others.lock();
-        let i = others.iter().position(|(id, _)| *id == devid).ok_or(Errno::EIO)?;
-        let (_, mut dev) = others.remove(i);
-        drop(others);
-        self.wipe_supers(&mut dev);
+        let mut devs = self.devs.lock();
+        let i = devs.iter().position(|d| d.devid == devid).ok_or(Errno::EIO)?;
+        let mut entry = devs.remove(i);
+        drop(devs);
+        // A reader may still be using it for a moment.
+        let mut dev = loop {
+            match Arc::try_unwrap(entry) {
+                Ok(d) => break d.dev.into_inner(),
+                Err(e) => {
+                    entry = e;
+                    core::hint::spin_loop();
+                }
+            }
+        };
+        Self::wipe_supers(&mut dev);
         Ok(dev)
     }
 
@@ -197,15 +222,13 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         if w.broken {
             return Err(Errno::EIO);
         }
-        if new.block_size() != self.block_size {
+        let entry = self.dev(devid).ok_or(Errno::ENOENT)?;
+        let bs = entry.block_size as u64;
+        if new.block_size() != entry.block_size {
             return Err(Errno::EINVAL);
         }
         let st = self.state();
         let info = self.device_items(&st)?.into_iter().find(|d| d.devid == devid).ok_or(Errno::ENOENT)?;
-        if !self.has_dev(devid) {
-            return Err(Errno::ENOENT);
-        }
-        let bs = self.block_size as u64;
         if new.num_blocks().saturating_mul(bs) < info.total_bytes {
             return Err(Errno::ENOSPC);
         }
@@ -230,9 +253,9 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             while off < len {
                 let n = (len - off).min(SLICE);
                 let part = buf.get_mut(..n as usize).ok_or(Errno::EIO)?;
-                self.read_phys_dev(devid, start + off, part)?;
+                self.read_phys(devid, start + off, part)?;
                 let mut at = start + off;
-                for run in part.chunks(MAX_RUN / self.block_size * self.block_size) {
+                for run in part.chunks(MAX_RUN / entry.block_size * entry.block_size) {
                     new.write_blocks(at / bs, run).map_err(|_| Errno::EIO)?;
                     at += run.len() as u64;
                 }
@@ -242,29 +265,19 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         new.flush().map_err(|_| Errno::EIO)?;
 
         // Switch, and commit so that the new device gets its superblocks.
-        let old = self.swap_dev(devid, new)?;
+        let old = core::mem::replace(&mut *entry.dev.lock(), new);
         match self.transact_locked(&mut w, |tx| tx.touch()) {
             Ok(()) => {
                 let mut old = old;
-                self.wipe_supers(&mut old);
+                Self::wipe_supers(&mut old);
                 Ok(old)
             }
             Err(e) => {
                 // Put the old one back.
-                let _ = self.swap_dev(devid, old);
+                *entry.dev.lock() = old;
                 Err(e)
             }
         }
-    }
-
-    /// Puts `new` in place of device `devid`; returns the one that was there.
-    fn swap_dev(&self, devid: u64, new: D) -> Result<D, Errno> {
-        if devid == self.devid {
-            return Ok(core::mem::replace(&mut *self.dev.lock(), new));
-        }
-        let mut others = self.others.lock();
-        let (_, slot) = others.iter_mut().find(|(id, _)| *id == devid).ok_or(Errno::ENOENT)?;
-        Ok(core::mem::replace(slot, new))
     }
 }
 

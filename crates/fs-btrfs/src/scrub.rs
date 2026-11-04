@@ -131,7 +131,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         for &c in &cs {
             let mut b = try_zeroed(self.nodesize)?;
             rep.copies_read += 1;
-            match self.read_phys_dev(c.devid, c.off, &mut b) {
+            match self.read_phys(c.devid, c.off, &mut b) {
                 Err(_) => try_push(&mut bad, (c, ScrubErrorKind::Io))?,
                 Ok(()) if self.block_ok(&b, logical) => {
                     if good.is_none() {
@@ -162,7 +162,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             rep.uncorrectable += 1;
         }
         for &(c, kind) in bad {
-            let fixed = repair && good.is_some_and(|g| self.write_phys_dev(c.devid, c.off, g).is_ok());
+            let fixed = repair && good.is_some_and(|g| self.write_phys(c.devid, c.off, g).is_ok());
             Self::note(rep, logical, c, kind, fixed);
         }
         if repair && good.is_some() {
@@ -195,7 +195,7 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         for (slot, &c) in bufs.iter_mut().zip(&copy_list) {
             let mut b = try_zeroed(n * ss)?;
             rep.copies_read += 1;
-            if self.read_phys_dev(c.devid, c.off, &mut b).is_ok() {
+            if self.read_phys(c.devid, c.off, &mut b).is_ok() {
                 *slot = Some(b);
             }
         }

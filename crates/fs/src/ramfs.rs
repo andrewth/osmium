@@ -85,6 +85,8 @@ struct Inner {
     /// Whether it counts against [`Limits::max_inodes`] (all but the root).
     counted: bool,
     mode: AtomicU32,
+    uid: AtomicU32,
+    gid: AtomicU32,
     /// The device number of a device node (`st_rdev`), else 0.
     rdev: u64,
     /// Names it has in directories; 0 once all are removed.
@@ -227,6 +229,8 @@ impl RamNode {
             fs: fs.clone(),
             counted,
             mode: AtomicU32::new(mode & 0o7777),
+            uid: AtomicU32::new(0),
+            gid: AtomicU32::new(0),
             rdev,
             linked: AtomicU32::new(1),
             body,
@@ -371,10 +375,29 @@ impl File for RamNode {
             ino: self.ino,
             kind: self.kind,
             mode: self.mode.load(Ordering::Relaxed),
+            uid: self.uid.load(Ordering::Relaxed),
+            gid: self.gid.load(Ordering::Relaxed),
             nlink,
             size,
             rdev: self.rdev,
         }
+    }
+
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        self.touch(false);
+        Ok(())
+    }
+
+    fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        if let Some(u) = uid {
+            self.uid.store(u, Ordering::Relaxed);
+        }
+        if let Some(g) = gid {
+            self.gid.store(g, Ordering::Relaxed);
+        }
+        self.touch(false);
+        Ok(())
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {
@@ -584,6 +607,28 @@ mod tests {
         // Opening again finds the same node.
         let g = vfs.open("/hello", OpenFlags::READ, 0).unwrap();
         assert_eq!(g.stat().ino, st.ino);
+    }
+
+    #[test]
+    fn owners_and_modes() {
+        let vfs = vfs();
+        // Without an owner, root's; with one, the caller's from the start.
+        let plain = vfs.open("/plain", RW | OpenFlags::CREATE, 0o644).unwrap();
+        assert_eq!((plain.stat().uid, plain.stat().gid), (0, 0));
+        let mine = vfs.open_as("/mine", RW | OpenFlags::CREATE, 0o600, Some((1000, 100))).unwrap();
+        assert_eq!((mine.stat().uid, mine.stat().gid, mine.stat().mode), (1000, 100, 0o600));
+        let dev = vfs.mknod_dev_as("/tty", FileKind::CharDevice, 0o620, 5, Some((3, 4))).unwrap();
+        assert_eq!((dev.stat().uid, dev.stat().gid, dev.stat().rdev), (3, 4, 5));
+        // Opening an existing file does not change its owner.
+        let again = vfs.open_as("/plain", RW | OpenFlags::CREATE, 0o644, Some((9, 9))).unwrap();
+        assert_eq!((again.stat().uid, again.stat().gid), (0, 0));
+        // chown changes what it is given; chmod only the permission bits.
+        plain.chown(Some(7), None).unwrap();
+        assert_eq!((plain.stat().uid, plain.stat().gid), (7, 0));
+        plain.chown(None, Some(8)).unwrap();
+        assert_eq!((plain.stat().uid, plain.stat().gid), (7, 8));
+        plain.chmod(0o104755).unwrap();
+        assert_eq!((plain.stat().mode, plain.stat().kind), (0o4755, FileKind::Regular));
     }
 
     #[test]

@@ -145,10 +145,19 @@ fn mount(img: &Path, block: usize) -> BtrfsFs<FileDisk> {
     fs
 }
 
-const RO: MountOptions = MountOptions { subvol: None, read_only: true };
+const RO: MountOptions<'static> = MountOptions {
+    subvol: None,
+    subvol_path: None,
+    read_only: true,
+    atime: osmium_fs_btrfs::Atime::NoAtime,
+    tree_cache_blocks: 0,
+    data_cache_bytes: 0,
+    commit_batch: 0,
+    compress: osmium_fs_btrfs::Compression::None,
+};
 
-fn ro_subvol(id: u64) -> MountOptions {
-    MountOptions { subvol: Some(id), read_only: true }
+fn ro_subvol(id: u64) -> MountOptions<'static> {
+    MountOptions { subvol: Some(id), read_only: true, ..MountOptions::default() }
 }
 
 fn read_all(f: &dyn File) -> Vec<u8> {
@@ -289,7 +298,14 @@ fn compressed() {
 #[test]
 fn checksums_and_sizes() {
     let Some(mkfs) = mkfs() else { return };
-    for args in [&["--csum", "xxhash"][..], &["-n", "4096"], &["-n", "65536"], &["-m", "single", "-d", "single"]] {
+    for args in [
+        &["--csum", "xxhash"][..],
+        &["--csum", "sha256"],
+        &["--csum", "blake2"],
+        &["-n", "4096"],
+        &["-n", "65536"],
+        &["-m", "single", "-d", "single"],
+    ] {
         let dir = scratch(&format!("variant-{}", args.join("").replace('-', "")));
         let src = tree(&dir);
         let img = image(&mkfs, &dir, &src, args);
@@ -297,11 +313,7 @@ fn checksums_and_sizes() {
         let fs = mount(&img, 4096);
         check_tree(&Vfs::new(fs.root()), true);
     }
-    // SHA-256 and BLAKE2b are not read.
-    let dir = scratch("sha256");
-    let src = tree(&dir);
-    let img = image(&mkfs, &dir, &src, &["--csum", "sha256"]);
-    assert_eq!(BtrfsFs::mount_with(FileDisk::open(&img, 4096), 1, RO).err(), Some(Errno::EINVAL));
+    // SHA-256 and BLAKE2b are covered in multi.rs, with writes.
 }
 
 #[test]
