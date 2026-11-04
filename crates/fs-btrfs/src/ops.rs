@@ -27,6 +27,8 @@ mod ino {
     pub const SIZE: usize = 16;
     pub const NBYTES: usize = 24;
     pub const NLINK: usize = 40;
+    pub const UID: usize = 44;
+    pub const GID: usize = 48;
     pub const MODE: usize = 52;
     pub const RDEV: usize = 56;
     pub const FLAGS: usize = 64;
@@ -36,6 +38,17 @@ mod ino {
     pub const MTIME: usize = 136;
     pub const OTIME: usize = 148;
     pub const LEN: usize = 160;
+}
+
+/// What a new inode is.
+pub(crate) struct NewInode {
+    pub kind: FileKind,
+    /// Permission bits.
+    pub mode: u32,
+    /// Device number of a device node.
+    pub rdev: u64,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// The `BTRFS_FT_*` of a kind.
@@ -279,15 +292,8 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     }
 
     /// Creates `name` in directory `dir`; returns the new inode number.
-    pub(crate) fn create(
-        &mut self,
-        t: u64,
-        dir: u64,
-        name: &[u8],
-        kind: FileKind,
-        mode: u32,
-        rdev: u64,
-    ) -> Result<u64, Errno> {
+    pub(crate) fn create(&mut self, t: u64, dir: u64, name: &[u8], new: NewInode) -> Result<u64, Errno> {
+        let NewInode { kind, mode, rdev, uid, gid } = new;
         let parent = self.inode(t, dir)?;
         if Self::kind(&parent)? != FileKind::Directory {
             return Err(Errno::ENOTDIR);
@@ -304,6 +310,8 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         put64(&mut d, ino::GENERATION, self.transid)?;
         put64(&mut d, ino::TRANSID, self.transid)?;
         put32(&mut d, ino::NLINK, 1)?;
+        put32(&mut d, ino::UID, uid)?;
+        put32(&mut d, ino::GID, gid)?;
         put32(&mut d, ino::MODE, kind.mode_bits() | mode & 0o7777)?;
         if matches!(kind, FileKind::CharDevice | FileKind::BlockDevice) {
             put64(&mut d, ino::RDEV, kernel_rdev(rdev))?;
@@ -317,6 +325,43 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         self.inode_ref_add(t, ino, dir, idx, name)?;
         self.dir_add(t, dir, name, Key::new(ino, item::INODE_ITEM, 0), ft_of(kind), idx)?;
         Ok(ino)
+    }
+
+    /// Sets the permission bits of inode `ino`.
+    pub(crate) fn chmod(&mut self, t: u64, ino: u64, mode: u32) -> Result<(), Errno> {
+        let mut d = self.inode(t, ino)?;
+        let kept = le32(&d, ino::MODE)? & !0o7777;
+        put32(&mut d, ino::MODE, kept | mode & 0o7777)?;
+        self.stamp(&mut d, false)?;
+        self.set_inode(t, ino, &d)
+    }
+
+    /// Sets the owner and/or group of inode `ino`.
+    pub(crate) fn chown(&mut self, t: u64, ino: u64, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        let mut d = self.inode(t, ino)?;
+        if let Some(u) = uid {
+            put32(&mut d, ino::UID, u)?;
+        }
+        if let Some(g) = gid {
+            put32(&mut d, ino::GID, g)?;
+        }
+        self.stamp(&mut d, false)?;
+        self.set_inode(t, ino, &d)
+    }
+
+    /// Sets the access time of inode `ino` to now if `policy` says it is due;
+    /// changes nothing (and so commits nothing) otherwise.
+    pub(crate) fn touch_atime(&mut self, t: u64, ino: u64, policy: crate::Atime) -> Result<(), Errno> {
+        let mut d = self.inode(t, ino)?;
+        let now = self.sh.now();
+        let time = |off| -> Result<Timestamp, Errno> {
+            Ok(Timestamp { sec: le64(&d, off)? as i64, nsec: le32(&d, off + 8)? })
+        };
+        if !policy.due(time(ino::ATIME)?, time(ino::MTIME)?, time(ino::CTIME)?, now) {
+            return Ok(());
+        }
+        put_time(&mut d, ino::ATIME, now)?;
+        self.set_inode(t, ino, &d)
     }
 
     /// Removes `name` from `dir`, which must (`want_dir`) or must not be a

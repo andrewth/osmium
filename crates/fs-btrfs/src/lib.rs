@@ -16,8 +16,13 @@
 //! are read too.
 //!
 //! Writing: each change (a write, a truncation, a new or removed name, an
-//! extended attribute) is a transaction of its own, committed before the
-//! call returns. Tree blocks are copied on write; the extent tree (with its
+//! extended attribute, an owner or mode) is a transaction of its own,
+//! committed before the call returns. [`MountOptions::commit_batch`] and
+//! [`BtrfsFs::batch`] defer the superblock write over several changes, so
+//! that they become durable together (all of them, or none after a crash);
+//! the space the last durable state uses is not reused until then.
+//!
+//! Tree blocks are copied on write; the extent tree (with its
 //! reference counts), data checksums, block group usage, the free space tree
 //! and root items are kept up to date, and the superblock is written last,
 //! after a flush, so that a crash leaves the volume as it was before the call
@@ -38,6 +43,15 @@
 //! Readers see the last commit: each call takes the current state, and the
 //! space a commit frees is not reused until no reader can still be reading it.
 //!
+//! Owners: `Stat` reports each node's user and group id, new nodes take the
+//! owner of [`File::mknod_as`] (or none: root's), and `chown` and `chmod`
+//! change them. Nothing is checked: the caller decides who may.
+//!
+//! Access times are not updated by reads unless [`MountOptions::atime`] says
+//! so (`relatime` or every read). A tree-block cache (by default
+//! [`DEFAULT_TREE_CACHE_BLOCKS`] blocks) and an optional data cache
+//! ([`MountOptions::data_cache_bytes`]) save repeat reads.
+//!
 //! Inode numbers: the mounted subvolume's are btrfs's own; another
 //! subvolume's are mixed with its id so they do not collide with them (Linux
 //! gives each subvolume its own `st_dev` instead).
@@ -46,14 +60,14 @@
 //! device given are read, and striped chunks, RAID0, RAID10, RAID5 and RAID6,
 //! fail with `EIO`); SHA-256 and BLAKE2b checksums; `extent-tree-v2` and the
 //! RAID stripe tree; replaying the fsync log; creating subvolumes or
-//! snapshots; owners, which `Stat` has no room for; and encrypted or verity
-//! files.
+//! snapshots; and encrypted or verity files.
 #![no_std]
 
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod cache;
 mod commit;
 mod csum;
 mod disk;
@@ -77,7 +91,9 @@ use osmium_hal::block::BlockDevice;
 use osmium_sync::SpinLock;
 use osmium_sync::fallible::{try_arc, try_push, try_to_vec, try_zeroed};
 
+use cache::Cache;
 use disk::{DirItems, ExtentData, FileExtent, Inode, Key, Root, Super, compress, item};
+use ops::NewInode;
 use tree::{Block, ChunkMap, Cursor};
 use write::{Tx, Writer};
 
@@ -113,14 +129,62 @@ impl From<DecodeError> for Errno {
     }
 }
 
+/// When reading updates a node's access time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Atime {
+    /// Never (`noatime`). Reading writes nothing. This is the default, unlike
+    /// Linux's, so that a volume mounted as before behaves as before.
+    #[default]
+    NoAtime,
+    /// As `relatime`: when the access time is not after the modification or
+    /// change time, or is a day or more old.
+    Relatime,
+    /// On every read (`strictatime`).
+    StrictAtime,
+}
+
+impl Atime {
+    /// Whether a node with these times is due an update at `now`.
+    pub(crate) fn due(self, atime: Timestamp, mtime: Timestamp, ctime: Timestamp, now: Timestamp) -> bool {
+        match self {
+            Atime::NoAtime => false,
+            Atime::StrictAtime => atime != now,
+            Atime::Relatime => atime <= mtime || atime <= ctime || now.sec.saturating_sub(atime.sec) >= 24 * 60 * 60,
+        }
+    }
+}
+
+/// Tree blocks cached unless [`MountOptions::tree_cache_blocks`] says otherwise.
+pub const DEFAULT_TREE_CACHE_BLOCKS: usize = 128;
+
 /// How to mount.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MountOptions {
+pub struct MountOptions<'path> {
     /// The subvolume to mount (5 is the top level); the default subvolume if
-    /// `None`.
+    /// `None`. Not with [`subvol_path`](MountOptions::subvol_path).
     pub subvol: Option<u64>,
+    /// The subvolume to mount by its path from the top level, such as
+    /// `"/data/home"` (`subvol=` on Linux); `ENOENT` if there is none, and
+    /// `EINVAL` if the path names an ordinary directory, or `subvol` is also
+    /// set.
+    pub subvol_path: Option<&'path str>,
     /// Never write, even if the volume could be written.
     pub read_only: bool,
+    /// When reads update access times; never by default. Ignored on a volume
+    /// that is read-only.
+    pub atime: Atime,
+    /// Tree blocks to keep in memory; [`DEFAULT_TREE_CACHE_BLOCKS`] if 0.
+    pub tree_cache_blocks: usize,
+    /// Bytes of file data to keep in memory, after checking, for reads; none
+    /// if 0 (the default). Rounded down to whole sectors.
+    pub data_cache_bytes: usize,
+    /// Changes to commit together: a change is written out at once, but the
+    /// superblock that makes it durable only on every `commit_batch`th, or at
+    /// [`BtrfsFs::sync`], [`File::sync`], [`BtrfsFs::batch`]'s end or when the
+    /// volume is dropped, whichever comes first. A crash in between loses
+    /// the changes since the last of those, all of them, never some. 0 and 1
+    /// make every change durable before its call returns (the default).
+    pub commit_batch: u32,
 }
 
 /// A node's last decompressed extent: its address, the generation of the
@@ -167,6 +231,13 @@ impl Drop for State {
     }
 }
 
+impl<D: BlockDevice + Send + 'static> Drop for Shared<D> {
+    fn drop(&mut self) {
+        // Commits still deferred go out with the volume.
+        let _ = self.sync();
+    }
+}
+
 struct Shared<D: BlockDevice + Send + 'static> {
     dev: SpinLock<D>,
     block_size: usize,
@@ -182,8 +253,12 @@ struct Shared<D: BlockDevice + Send + 'static> {
     meta_uuid: [u8; 16],
     fsid: [u8; 16],
     label: String,
-    /// Recently read tree blocks by address, and the next slot to replace.
-    cache: SpinLock<(Vec<(u64, Block)>, usize)>,
+    /// Recently read tree blocks by address.
+    cache: SpinLock<Cache<Block>>,
+    /// Checked data sectors by logical address, and whether each was checked
+    /// against a checksum.
+    data_cache: SpinLock<Cache<(bool, Arc<Vec<u8>>)>>,
+    atime: Atime,
     /// The mounted subvolume.
     top: u64,
     /// The last commit.
@@ -286,11 +361,11 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
     /// Mounts subvolume `subvol` (5 is the top level) of the btrfs volume on
     /// `dev`; `ENOENT` if there is no such subvolume.
     pub fn mount_subvol(dev: D, dev_id: u64, subvol: u64) -> Result<Self, Errno> {
-        Self::mount_with(dev, dev_id, MountOptions { subvol: Some(subvol), read_only: false })
+        Self::mount_with(dev, dev_id, MountOptions { subvol: Some(subvol), ..MountOptions::default() })
     }
 
     /// Mounts the btrfs volume on `dev` as `opts` say.
-    pub fn mount_with(dev: D, dev_id: u64, opts: MountOptions) -> Result<Self, Errno> {
+    pub fn mount_with(dev: D, dev_id: u64, opts: MountOptions<'_>) -> Result<Self, Errno> {
         let block_size = dev.block_size();
         if block_size == 0 || block_size > MAX_RUN {
             return Err(Errno::EINVAL);
@@ -324,7 +399,12 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             meta_uuid: [0; 16],
             fsid: [0; 16],
             label: String::new(),
-            cache: SpinLock::new((Vec::new(), 0)),
+            cache: SpinLock::new(Cache::new(match opts.tree_cache_blocks {
+                0 => DEFAULT_TREE_CACHE_BLOCKS,
+                n => n,
+            })?),
+            data_cache: SpinLock::new(Cache::new(0)?),
+            atime: opts.atime,
             top: disk::tree::FS,
             state: SpinLock::new(empty_state(ChunkMap::default())?),
             writer: None,
@@ -348,6 +428,10 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
         shared.meta_uuid = sb.meta_uuid;
         shared.fsid = sb.fsid;
         shared.label = String::from_utf8(sb.label).unwrap_or_default();
+        if opts.data_cache_bytes != 0 {
+            let sectors = opts.data_cache_bytes / shared.sectorsize.max(1) as usize;
+            shared.data_cache = SpinLock::new(Cache::new(sectors)?);
+        }
 
         // The chunk tree maps everything else.
         let mut chunks = ChunkMap::bootstrap(&sb.sys_chunks)?;
@@ -377,9 +461,11 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             next: SpinLock::new(None),
         };
         st.csum_tree = shared.tree_root(&st, disk::tree::CSUM)?.map(|r| (r.bytenr, r.level));
-        let top = match opts.subvol {
-            Some(id) => id,
-            None => shared.default_subvol(&st)?,
+        let top = match (opts.subvol, opts.subvol_path) {
+            (Some(_), Some(_)) => return Err(Errno::EINVAL),
+            (Some(id), None) => id,
+            (None, Some(path)) => shared.resolve_subvol(&st, path)?,
+            (None, None) => shared.default_subvol(&st)?,
         };
         shared.top = top;
         shared.fs_root(&st, top)?.ok_or(Errno::ENOENT)?;
@@ -401,6 +487,11 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
                 fst: compat_ro & 1 != 0,
                 orphans: Vec::new(),
                 broken: false,
+                deferred: 0,
+                held: Vec::new(),
+                fresh: Vec::new(),
+                batch_depth: 0,
+                commit_batch: opts.commit_batch,
             }));
         }
         shared.state = SpinLock::new(try_arc(st)?);
@@ -444,6 +535,37 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
         self.shared.state().generation
     }
 
+    /// Makes every change so far durable. Only has work to do with
+    /// [`MountOptions::commit_batch`] or inside [`batch`](BtrfsFs::batch);
+    /// otherwise each change was durable when its call returned.
+    pub fn sync(&self) -> Result<(), Errno> {
+        self.shared.sync()
+    }
+
+    /// Runs `f`, which makes changes to this volume's files and directories
+    /// (through any node of it), as one unit of durability: they are written
+    /// out as they happen, but the superblock that makes them durable is
+    /// written once, when the outermost `f` returns (and an earlier
+    /// [`sync`](BtrfsFs::sync) or `File::sync` from anywhere makes what is
+    /// done so far durable at that point). A crash before then leaves the
+    /// volume as it was before `f`; a crash after leaves all of `f`'s changes.
+    ///
+    /// A change `f` makes that fails is not rolled back, and the others
+    /// still take effect together. Space that changes free is not reused
+    /// until the batch ends, so a very large batch can run out of space.
+    /// Returns what `f` returns, or the error making the batch durable.
+    pub fn batch<R>(&self, f: impl FnOnce() -> R) -> Result<R, Errno> {
+        let Some(w) = &self.shared.writer else { return Ok(f()) };
+        w.lock().batch_depth += 1;
+        let r = f();
+        let mut w = w.lock();
+        w.batch_depth = w.batch_depth.saturating_sub(1);
+        if w.batch_depth == 0 {
+            self.shared.sync_locked(&mut w)?;
+        }
+        Ok(r)
+    }
+
     /// Takes timestamps from `clock` instead of the global
     /// [`osmium_fs::clock`].
     pub fn set_clock_source(&self, clock: Arc<dyn Clock>) {
@@ -459,6 +581,41 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
 
     pub(crate) fn now(&self) -> Timestamp {
         self.clock.now()
+    }
+
+    /// Makes deferred commits durable.
+    fn sync(&self) -> Result<(), Errno> {
+        let Some(w) = &self.writer else { return Ok(()) };
+        let mut w = w.lock();
+        self.sync_locked(&mut w)
+    }
+
+    /// The subvolume at `path` from the top level.
+    fn resolve_subvol(&self, st: &State, path: &str) -> Result<u64, Errno> {
+        let (mut tree, mut dir, mut is_subvol) = (disk::tree::FS, disk::tree::FIRST_FREE, true);
+        for name in path.split('/').filter(|c| !c.is_empty()) {
+            if name == "." || name == ".." {
+                return Err(Errno::EINVAL);
+            }
+            let root = self.fs_root(st, tree)?.ok_or(Errno::ENOENT)?;
+            let key = Key::new(dir, item::DIR_ITEM, csum::name_hash(name.as_bytes()));
+            let found = self.lookup(&st.chunks, (root.bytenr, root.level), key, |data| {
+                for e in DirItems::new(data) {
+                    let e = e?;
+                    if e.name == name.as_bytes() {
+                        return Ok(Some(e.location));
+                    }
+                }
+                Ok(None)
+            })?;
+            let location = found.flatten().ok_or(Errno::ENOENT)?;
+            match location.ty {
+                item::ROOT_ITEM => (tree, dir, is_subvol) = (location.objectid, disk::tree::FIRST_FREE, true),
+                item::INODE_ITEM => (dir, is_subvol) = (location.objectid, false),
+                _ => return Err(Errno::EIO),
+            }
+        }
+        if is_subvol { Ok(tree) } else { Err(Errno::EINVAL) }
     }
 
     /// The root of tree `id`, from the root tree.
@@ -582,8 +739,12 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             return Err(Errno::EIO);
         }
         w.reclaim();
+        // Defer the superblock inside a batch, and until `commit_batch`
+        // commits have gone by otherwise.
+        let defer = w.batch_depth > 0 || (w.commit_batch > 1 && w.deferred.saturating_add(1) < w.commit_batch);
         let (added, removed, r) = {
             let mut tx = Tx::new(self, w, self.state());
+            tx.defer = defer;
             let r = f(&mut tx)?;
             let added = core::mem::take(&mut tx.orphans_added);
             let removed = core::mem::take(&mut tx.orphans_removed);
@@ -678,6 +839,40 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         })
     }
 
+    /// Fills `buf` (whole sectors at logical `at`) from the data cache; false,
+    /// with `buf` unspecified, unless every sector is there.
+    fn read_cached(&self, at: u64, buf: &mut [u8], verify: bool) -> bool {
+        let ss = self.sectorsize;
+        let cache = self.data_cache.lock();
+        if cache.capacity() == 0 {
+            return false;
+        }
+        for (i, sector) in buf.chunks_mut(ss as usize).enumerate() {
+            let Some(addr) = at.checked_add(i as u64 * ss) else { return false };
+            match cache.get(addr) {
+                Some((checked, data)) if (checked || !verify) && data.len() == sector.len() => {
+                    sector.copy_from_slice(&data);
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Keeps the sectors just read at logical `at` in the data cache.
+    fn keep_cached(&self, at: u64, buf: &[u8], verified: bool) {
+        let ss = self.sectorsize;
+        if self.data_cache.lock().capacity() == 0 {
+            return;
+        }
+        for (i, sector) in buf.chunks(ss as usize).enumerate() {
+            let Some(addr) = at.checked_add(i as u64 * ss) else { return };
+            // Allocated before taking the lock.
+            let Some(copy) = try_to_vec(sector).ok().and_then(|v| try_arc(v).ok()) else { return };
+            self.data_cache.lock().insert(addr, (verified, copy));
+        }
+    }
+
     /// Reads `out.len()` bytes of data at logical `at`, a whole sector at a
     /// time.
     fn read_data(&self, st: &State, mut at: u64, mut out: &mut [u8], verify: bool) -> Result<(), Errno> {
@@ -688,7 +883,10 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             let span = (skip + out.len()).min(MAX_RUN);
             let n = span - skip;
             let mut tmp = try_zeroed(span.next_multiple_of(ss as usize))?;
-            self.read_sectors(st, start, &mut tmp, verify)?;
+            if !self.read_cached(start, &mut tmp, verify) {
+                self.read_sectors(st, start, &mut tmp, verify)?;
+                self.keep_cached(start, &tmp, verify);
+            }
             out.get_mut(..n).ok_or(Errno::EIO)?.copy_from_slice(tmp.get(skip..span).ok_or(Errno::EIO)?);
             at = at.checked_add(n as u64).ok_or(Errno::EIO)?;
             out = out.get_mut(n..).ok_or(Errno::EIO)?;
@@ -877,6 +1075,40 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
         Ok(found.flatten())
     }
 
+    /// Updates the access time as the mount's policy says, once a read is
+    /// done with `inode`. A failure leaves it as it was: the read stands.
+    fn touch_atime(&self, inode: &Inode) {
+        let sh = &self.shared;
+        if sh.atime == Atime::NoAtime
+            || sh.writer.is_none()
+            || !sh.atime.due(inode.atime, inode.mtime, inode.ctime, sh.now())
+        {
+            return;
+        }
+        let (tree, ino, policy) = (self.tree, self.objectid, sh.atime);
+        if sh.transact(|tx| tx.touch_atime(tree, ino, policy)).is_ok() {
+            self.inode.lock().atime = sh.now();
+        }
+    }
+
+    /// [`touch_atime`](Node::touch_atime) for a listing, which has not read
+    /// the inode: the copy kept says whether to look at it afresh.
+    fn touch_atime_cached(&self) {
+        let sh = &self.shared;
+        let cached = *self.inode.lock();
+        if sh.atime == Atime::NoAtime
+            || sh.writer.is_none()
+            || !sh.atime.due(cached.atime, cached.mtime, cached.ctime, sh.now())
+        {
+            return;
+        }
+        let st = sh.state();
+        if let Ok(fresh) = self.fresh_inode(&st) {
+            drop(st);
+            self.touch_atime(&fresh);
+        }
+    }
+
     fn dir(&self) -> Result<(), Errno> {
         if self.kind == FileKind::Directory { Ok(()) } else { Err(Errno::ENOTDIR) }
     }
@@ -924,7 +1156,10 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         }
         let st = self.shared.state();
         let inode = self.fresh_inode(&st)?;
-        self.shared.read_file(&st, self.root(&st)?, self.objectid, &inode, off, buf, Some(&self.extent))
+        let n = self.shared.read_file(&st, self.root(&st)?, self.objectid, &inode, off, buf, Some(&self.extent))?;
+        drop(st);
+        self.touch_atime(&inode);
+        Ok(n)
     }
 
     fn write(&self, off: u64, buf: &[u8]) -> Result<usize, Errno> {
@@ -951,8 +1186,19 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn sync(&self) -> Result<(), Errno> {
-        // Every change is committed before its call returns.
-        Ok(())
+        // Every change is committed before its call returns, unless the mount
+        // defers superblocks; then this writes the one that covers them.
+        self.shared.sync()
+    }
+
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        let (tree, ino) = (self.tree, self.objectid);
+        self.shared.transact(|tx| tx.chmod(tree, ino, mode))
+    }
+
+    fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        let (tree, ino) = (self.tree, self.objectid);
+        self.shared.transact(|tx| tx.chown(tree, ino, uid, gid))
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
@@ -961,6 +1207,7 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 
     fn readdir(&self, index: usize) -> Result<Option<DirEntry>, Errno> {
         self.dir()?;
+        self.touch_atime_cached();
         let st = self.shared.state();
         // Resume where the last call stopped if it is at or before `index`.
         let (mut i, from) = match *self.dir_hint.lock() {
@@ -1016,12 +1263,26 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn mknod(&self, name: &str, kind: FileKind, mode: u32, rdev: u64) -> Result<Arc<dyn File>, Errno> {
+        self.mknod_as(name, kind, mode, rdev, 0, 0)
+    }
+
+    fn mknod_as(
+        &self,
+        name: &str,
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Arc<dyn File>, Errno> {
         self.dir()?;
         if name.len() > 255 {
             return Err(Errno::ENAMETOOLONG);
         }
         let (tree, dir) = (self.tree, self.objectid);
-        let ino = self.shared.transact(|tx| tx.create(tree, dir, name.as_bytes(), kind, mode, rdev))?;
+        let ino = self
+            .shared
+            .transact(|tx| tx.create(tree, dir, name.as_bytes(), NewInode { kind, mode, rdev, uid, gid }))?;
         self.new_node(ino)
     }
 
@@ -1067,6 +1328,8 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         }
         let mut target = try_zeroed(inode.size as usize)?;
         self.shared.read_file(&st, self.root(&st)?, self.objectid, &inode, 0, &mut target, None)?;
+        drop(st);
+        self.touch_atime(&inode);
         String::from_utf8(target).map_err(|_| Errno::EIO)
     }
 
@@ -1113,6 +1376,8 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
             ino: self.shared.ino(self.tree, self.objectid),
             kind: self.kind,
             mode: i.mode & 0o7777,
+            uid: i.uid,
+            gid: i.gid,
             nlink: i.nlink,
             size: i.size,
             rdev,

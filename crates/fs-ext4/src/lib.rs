@@ -193,11 +193,13 @@ mod gd {
 /// Inode field offsets.
 mod ino {
     pub const MODE: usize = 0;
+    pub const UID: usize = 2;
     pub const SIZE: usize = 4;
     pub const ATIME: usize = 8;
     pub const CTIME: usize = 12;
     pub const MTIME: usize = 16;
     pub const DTIME: usize = 20;
+    pub const GID: usize = 24;
     pub const LINKS: usize = 26;
     pub const BLOCKS: usize = 28;
     pub const FLAGS: usize = 32;
@@ -207,6 +209,8 @@ mod ino {
     pub const SIZE_HIGH: usize = 108;
     pub const BLOCKS_HIGH: usize = 0x74;
     pub const FILE_ACL_HIGH: usize = 0x76;
+    pub const UID_HIGH: usize = 0x78;
+    pub const GID_HIGH: usize = 0x7a;
     pub const CHECKSUM_LO: usize = 0x7c;
     pub const EXTRA_ISIZE: usize = 128;
     pub const CHECKSUM_HI: usize = 0x82;
@@ -346,6 +350,14 @@ impl Inode {
 
     fn links(&self) -> u16 {
         get16(&self.raw, ino::LINKS)
+    }
+
+    fn uid(&self) -> u32 {
+        (get16(&self.raw, ino::UID_HIGH) as u32) << 16 | get16(&self.raw, ino::UID) as u32
+    }
+
+    fn gid(&self) -> u32 {
+        (get16(&self.raw, ino::GID_HIGH) as u32) << 16 | get16(&self.raw, ino::GID) as u32
     }
 
     fn set_links(&mut self, links: u16) {
@@ -2656,6 +2668,8 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             ino: ino as u64,
             kind,
             mode: (inode.mode() & 0o7777) as u32,
+            uid: inode.uid(),
+            gid: inode.gid(),
             nlink: inode.links() as u32,
             size: inode.size(),
             rdev,

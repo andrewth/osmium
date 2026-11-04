@@ -272,6 +272,14 @@ impl OvNode {
 }
 
 /// The tag in the top byte of an inode number from layer `layer`.
+/// Gives a copied-up node its source's owner, if the upper layer keeps owners.
+fn keep_owner(copy: &dyn File, stat: &Stat) -> Result<(), Errno> {
+    match copy.chown(Some(stat.uid), Some(stat.gid)) {
+        Ok(()) | Err(Errno::EPERM) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn tag(layer: usize, ino: u64) -> u64 {
     (ino & ((1 << LAYER_SHIFT) - 1)) | ((layer as u64) << LAYER_SHIFT)
 }
@@ -454,7 +462,9 @@ impl NodeData {
                 // Put together under another name, so that nobody sees half a file.
                 let tmp = self.shared.tmp_name();
                 let copy = dir.create(&tmp, self.kind, stat.mode)?;
-                let done = self.fill(&*copy, source).and_then(|()| dir.rename(&tmp, dir, &self.name));
+                let done = keep_owner(&*copy, stat)
+                    .and_then(|()| self.fill(&*copy, source))
+                    .and_then(|()| dir.rename(&tmp, dir, &self.name));
                 if let Err(e) = done {
                     let _ = dir.remove(&tmp, false);
                     return Err(e);
@@ -463,9 +473,15 @@ impl NodeData {
             }
             // Device nodes carry their number, or fail: a node made without it
             // would read as a different device (or as a whiteout).
-            kind @ (FileKind::CharDevice | FileKind::BlockDevice) => dir.mknod(&self.name, kind, stat.mode, stat.rdev),
+            kind @ (FileKind::CharDevice | FileKind::BlockDevice) => {
+                dir.mknod_as(&self.name, kind, stat.mode, stat.rdev, stat.uid, stat.gid)
+            }
             // Directories and nodes with nothing to copy but their kind.
-            kind => dir.create(&self.name, kind, stat.mode),
+            kind => {
+                let node = dir.create(&self.name, kind, stat.mode)?;
+                keep_owner(&*node, stat)?;
+                Ok(node)
+            }
         }
     }
 
@@ -545,6 +561,14 @@ impl File for OvNode {
             return Err(Errno::EISDIR);
         }
         self.0.ensure_upper()?.truncate(len)
+    }
+
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        self.0.ensure_upper()?.chmod(mode)
+    }
+
+    fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.0.ensure_upper()?.chown(uid, gid)
     }
 
     fn stat(&self) -> Stat {
@@ -882,6 +906,27 @@ mod tests {
 
     fn is_whiteout(vfs: &Vfs, path: &str) -> bool {
         vfs.stat(path, false).is_ok_and(|st| st.kind == FileKind::CharDevice && st.rdev == 0)
+    }
+
+    #[test]
+    fn owners_survive_copy_up_and_change() {
+        let f = fixture();
+        f.lower.lookup("/a").unwrap().chown(Some(11), Some(12)).unwrap();
+        assert_eq!(f.overlay.stat("/a", true).map(|s| (s.uid, s.gid)), Ok((11, 12)));
+        // Writing copies the file up with its owner and mode.
+        f.overlay.open("/a", OpenFlags::WRITE, 0).unwrap().write(0, b"changed").unwrap();
+        assert_eq!(f.upper.stat("/a", true).map(|s| (s.uid, s.gid)), Ok((11, 12)));
+        // chown and chmod copy up too, leaving the lower layer alone.
+        let node = f.overlay.lookup("/dir/x").unwrap();
+        node.chown(Some(5), None).unwrap();
+        node.chmod(0o600).unwrap();
+        let st = f.overlay.stat("/dir/x", true).unwrap();
+        assert_eq!((st.uid, st.gid, st.mode), (5, 0, 0o600));
+        assert_eq!(f.lower.stat("/dir/x", true).map(|s| (s.uid, s.mode)), Ok((0, 0o644)));
+        // A file made through the overlay takes its owner.
+        let made = f.overlay.open_as("/new", OpenFlags::WRITE | OpenFlags::CREATE, 0o640, Some((21, 22))).unwrap();
+        assert_eq!((made.stat().uid, made.stat().gid), (21, 22));
+        assert_eq!(f.upper.stat("/new", true).map(|s| (s.uid, s.gid)), Ok((21, 22)));
     }
 
     #[test]

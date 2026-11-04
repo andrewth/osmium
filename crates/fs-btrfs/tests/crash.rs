@@ -93,7 +93,7 @@ fn snapshot(img: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
             }
         }
     }
-    let opts = MountOptions { subvol: None, read_only: true };
+    let opts = MountOptions { read_only: true, ..MountOptions::default() };
     let fs = BtrfsFs::mount_with(LogDisk::open(img, None), 1, opts).unwrap();
     let mut out = BTreeMap::new();
     walk(&*fs.root(), "", &mut out);
@@ -104,9 +104,20 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed) ^ (i >> 11) as u8).collect()
 }
 
+type Step<'a> = &'a dyn Fn(&BtrfsFs<LogDisk>, &Vfs);
+
 /// Runs `setup`, then `change` with its writes logged, then checks every
 /// crash point of `change`.
 fn crash_points(name: &str, mkfs_args: &[&str], setup: impl Fn(&Vfs), change: impl Fn(&Vfs)) {
+    crash_steps(name, mkfs_args, MountOptions::default(), setup, &[&|_, vfs| change(vfs)]);
+}
+
+/// Runs `setup`, then each of `steps` with the writes logged, mounted with
+/// `opts`. A step but the last must leave its changes durable (by `sync`, by
+/// `batch` or by reaching `commit_batch`); the last is made so when the
+/// volume is dropped. Every crash point must leave the volume as it was
+/// before the first step or after one of them, never between.
+fn crash_steps(name: &str, mkfs_args: &[&str], opts: MountOptions<'_>, setup: impl Fn(&Vfs), steps: &[Step<'_>]) {
     let (Some(mkfs), Some(_)) = (tool("mkfs.btrfs"), tool("btrfs")) else { return };
     let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-crash-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -122,11 +133,19 @@ fn crash_points(name: &str, mkfs_args: &[&str], setup: impl Fn(&Vfs), change: im
     let base = dir.join("base");
     assert!(Command::new("cp").arg("--sparse=always").arg(&img).arg(&base).status().unwrap().success());
     let log = Arc::new(Mutex::new(Vec::new()));
+    let mut states = vec![before.clone()];
     {
-        let fs = BtrfsFs::mount(LogDisk::open(&img, Some(log.clone())), 1).unwrap();
-        change(&Vfs::new(fs.root()));
+        let fs = BtrfsFs::mount_with(LogDisk::open(&img, Some(log.clone())), 1, opts).unwrap();
+        let vfs = Vfs::new(fs.root());
+        for (i, step) in steps.iter().enumerate() {
+            step(&fs, &vfs);
+            if i + 1 < steps.len() {
+                states.push(snapshot(&img));
+            }
+        }
     }
-    let after = snapshot(&img);
+    states.push(snapshot(&img));
+    let after = states.last().unwrap().clone();
     assert_ne!(before, after, "the change changed nothing");
     let log = log.lock().unwrap();
     assert!(!log.is_empty());
@@ -143,12 +162,11 @@ fn crash_points(name: &str, mkfs_args: &[&str], setup: impl Fn(&Vfs), change: im
             panic!("{name}: crash after {n} of {} writes fails btrfs check:\n{text}", log.len());
         }
         let now = snapshot(&crashed);
-        if now == before {
-            olds += 1;
-        } else if now == after {
-            news += 1;
-        } else {
-            panic!("{name}: crash after {n} of {} writes is neither before nor after", log.len());
+        match states.iter().position(|s| *s == now) {
+            Some(0) => olds += 1,
+            Some(i) if i + 1 == states.len() => news += 1,
+            Some(_) => {}
+            None => panic!("{name}: crash after {n} of {} writes is neither before nor after", log.len()),
         }
     }
     // Before the superblock, the old state; from it on, the new.
@@ -222,5 +240,87 @@ fn new_chunk() {
         |vfs| {
             vfs.open("/b", OpenFlags::WRITE, 0).unwrap().write(0, &pattern(5 << 20, 5)).unwrap();
         },
+    );
+}
+
+fn put(vfs: &Vfs, path: &str, data: &[u8]) {
+    let f = vfs.open(path, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNC, 0o644).unwrap();
+    assert_eq!(f.write(0, data).unwrap(), data.len());
+}
+
+/// Several changes in one `batch` are one change to a crash: all or none.
+#[test]
+fn batch_is_all_or_nothing() {
+    crash_steps(
+        "batch",
+        &[],
+        MountOptions::default(),
+        |vfs| put(vfs, "/old", &pattern(100_000, 9)),
+        &[&|fs, vfs| {
+            fs.batch(|| {
+                vfs.mkdir("/d", 0o755).unwrap();
+                for i in 0..6 {
+                    put(vfs, &format!("/d/f{i}"), &pattern(30_000 + i * 7000, i as u8));
+                }
+                vfs.rename("/d/f1", "/d/g1").unwrap();
+                vfs.unlink("/old").unwrap();
+                put(vfs, "/d/f0", &pattern(500_000, 77));
+            })
+            .unwrap();
+        }],
+    );
+}
+
+/// `sync`, `File::sync` and the drop of the volume each end a unit; a crash
+/// at any write shows the volume at the end of one of them.
+#[test]
+fn deferred_commits_are_all_or_nothing() {
+    let opts = MountOptions { commit_batch: 1000, ..MountOptions::default() };
+    crash_steps(
+        "deferred",
+        &["-n", "4096"],
+        opts,
+        |vfs| {
+            vfs.mkdir("/d", 0o755).unwrap();
+            put(vfs, "/d/keep", &pattern(200_000, 5));
+        },
+        &[
+            &|fs, vfs| {
+                put(vfs, "/a", &pattern(10_000, 1));
+                put(vfs, "/d/keep", &pattern(300_000, 2));
+                vfs.unlink("/a").unwrap();
+                fs.sync().unwrap();
+            },
+            &|_, vfs| {
+                for i in 0..20 {
+                    put(vfs, &format!("/d/n{i}"), &pattern(5000 * (i + 1), i as u8));
+                }
+                vfs.open("/d/keep", OpenFlags::WRITE, 0).unwrap().sync().unwrap();
+            },
+            &|_, vfs| put(vfs, "/after", b"after the sync"),
+        ],
+    );
+}
+
+/// The superblock is written on every `commit_batch`th change.
+#[test]
+fn threshold_commits_are_whole_groups() {
+    // Creating and writing a file are two changes; two files are a group.
+    let opts = MountOptions { commit_batch: 4, ..MountOptions::default() };
+    crash_steps(
+        "threshold",
+        &[],
+        opts,
+        |_| {},
+        &[
+            &|_, vfs| {
+                put(vfs, "/a", &pattern(40_000, 1));
+                put(vfs, "/b", &pattern(40_000, 2));
+            },
+            &|_, vfs| {
+                put(vfs, "/c", &pattern(40_000, 3));
+                put(vfs, "/d", &pattern(40_000, 4));
+            },
+        ],
     );
 }
