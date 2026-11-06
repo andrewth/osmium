@@ -13,6 +13,11 @@ const READERS: usize = !(WRITER | WAITING);
 
 /// A reader/writer spin lock. A waiting writer blocks new readers, so
 /// writers cannot be starved.
+///
+/// Writer preference has a cost: a context that already holds a read guard
+/// and takes a second one with [`RwSpinLock::read`] deadlocks if a writer
+/// starts waiting in between. Do not nest read sections; use
+/// [`RwSpinLock::try_read`] where nesting cannot be ruled out.
 pub struct RwSpinLock<T: ?Sized, G: Guardian = PreemptDisabled> {
     state: AtomicUsize,
     _guard: PhantomData<fn() -> G>,
@@ -62,6 +67,39 @@ impl<T: ?Sized, G: Guardian> RwSpinLock<T, G> {
             }
             spin_hint();
         }
+    }
+
+    /// Acquires shared access without waiting, or returns `None` if a writer holds the lock or is waiting
+    /// for it (a waiting writer blocks new readers here as it does in [`RwSpinLock::read`]).
+    pub fn try_read(&self) -> Option<RwSpinLockReadGuard<'_, T, G>> {
+        let state = G::enter();
+        let mut s = self.state.load(Ordering::Relaxed);
+        // Retry only while other readers race us on the count; any writer means failure.
+        while s & (WRITER | WAITING) == 0 && s & READERS != READERS {
+            match self.state.compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return Some(RwSpinLockReadGuard { lock: self, state: Some(state), _not_send: PhantomData }),
+                Err(now) => s = now,
+            }
+        }
+        G::exit(state);
+        None
+    }
+
+    /// Acquires exclusive access without waiting, or returns `None` if any reader or writer holds the lock.
+    /// Unlike [`RwSpinLock::write`], a failed attempt does not announce itself, so it does not hold off new
+    /// readers.
+    pub fn try_write(&self) -> Option<RwSpinLockWriteGuard<'_, T, G>> {
+        let state = G::enter();
+        let mut s = self.state.load(Ordering::Relaxed);
+        // While the lock is free only WAITING (set by a spinning writer) can change under us.
+        while s & !WAITING == 0 {
+            match self.state.compare_exchange_weak(s, WRITER, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return Some(RwSpinLockWriteGuard { lock: self, state: Some(state), _not_send: PhantomData }),
+                Err(now) => s = now,
+            }
+        }
+        G::exit(state);
+        None
     }
 
     /// Returns the data without locking; the `&mut` proves exclusivity.
@@ -167,5 +205,40 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(*lock.read(), 10_000);
+    }
+
+    #[test]
+    fn try_read_and_try_write_fail_instead_of_waiting() {
+        let lock = RwSpinLock::<_, NoGuard>::new(1u32);
+        {
+            let r = lock.try_read().expect("free lock");
+            let r2 = lock.try_read().expect("readers share");
+            assert!(lock.try_write().is_none(), "readers exclude a writer");
+            assert_eq!(*r + *r2, 2);
+        }
+        {
+            let mut w = lock.try_write().expect("free lock");
+            *w = 5;
+            assert!(lock.try_read().is_none(), "a writer excludes readers");
+            assert!(lock.try_write().is_none(), "a writer excludes writers");
+        }
+        assert_eq!(*lock.try_read().expect("released"), 5);
+    }
+
+    #[test]
+    fn waiting_writer_blocks_new_readers() {
+        let lock = Arc::new(RwSpinLock::<_, NoGuard>::new(0u32));
+        let r = lock.read();
+        let l2 = lock.clone();
+        let writer = std::thread::spawn(move || *l2.write() = 7);
+        // The writer announces itself (WAITING) while the read guard is held; from then on new readers fail.
+        while lock.state.load(Ordering::Relaxed) & WAITING == 0 {
+            std::thread::yield_now();
+        }
+        assert!(lock.try_read().is_none(), "a waiting writer holds off new readers");
+        drop(r);
+        writer.join().unwrap();
+        assert_eq!(*lock.read(), 7);
+        assert_eq!(lock.state.load(Ordering::Relaxed), 0, "all released, WAITING cleared");
     }
 }
