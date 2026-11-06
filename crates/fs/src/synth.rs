@@ -64,7 +64,7 @@ enum Body {
 /// Names and link targets are [`Cow`]s: a `&'static str` is used as it is
 /// and a `String` is moved in, so they cost no allocation here (a directory
 /// function that makes names can make them with
-/// [`try_string`](osmium_sync::fallible::try_string) and return `ENOMEM`).
+/// [`try_string`] and return `ENOMEM`).
 /// The functions of a file or directory entry are put in an `Arc`, which,
 /// like the `Vec` a directory function returns, is allocated infallibly: a
 /// directory function runs on every lookup and listing, so running out of
