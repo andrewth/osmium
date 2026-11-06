@@ -4,7 +4,10 @@
 //! A file reports its readiness through [`osmium_fs::File::poll`]. A call that has to
 //! wait sleeps on one global queue, which every source of readiness wakes
 //! after it changes: the [`NetStack`](crate::net::NetStack) whenever it runs,
-//! and the in-memory socket pairs whenever they move data.
+//! and the in-memory socket pairs whenever they move data. (`File` has no
+//! way to name a queue of its own, so a change to one file wakes every
+//! poller.) A signal or the end of a process wakes only the threads it
+//! concerns, wherever they sleep (`signal::wait_on`).
 //!
 //! # Timeouts
 //!
@@ -86,7 +89,7 @@ pub(crate) fn wait<R>(timeout_ns: Option<u64>, mut scan: impl FnMut() -> Option<
         return Ok(None);
     }
     let deadline = timeout_ns.and_then(|t| now().map(|n| n.saturating_add(t)));
-    READY.wait_until(|| match scan() {
+    crate::signal::wait_on(&READY, || match scan() {
         Some(r) => Some(Ok(Some(r))),
         None if crate::signal::current_interrupted() => Some(Err(Errno::EINTR)),
         None if deadline.is_some_and(|d| now().is_some_and(|n| n >= d)) => Some(Ok(None)),

@@ -24,18 +24,13 @@ use crate::signal::{bit, sa};
 use crate::thread::Thread;
 
 /// Threads parked by a stop or by `sigsuspend` wait here; everything that
-/// changes what they wait for ([`crate::signal::wake_blocked`]) wakes them to
-/// look again.
+/// changes what they wait for wakes the threads it concerns
+/// ([`crate::signal::wake_threads`]) to look again.
 static PARKED: WaitQueue = WaitQueue::new();
-
-/// Wakes the parked threads of every process.
-pub(crate) fn wake() {
-    PARKED.wake_all();
-}
 
 /// Waits until `cond` holds. For the parked threads' wake-ups.
 pub(crate) fn park_until<R>(cond: impl FnMut() -> Option<R>) -> R {
-    PARKED.wait_until(cond)
+    crate::signal::wait_on(&PARKED, cond)
 }
 
 /// Whether `sig` stops a process by default.
@@ -128,7 +123,7 @@ pub(crate) fn prepare(p: &Process, sig: u8) {
         if p.signals.job.stopped.swap(false, Ordering::SeqCst) {
             p.signals.job.stop_report.store(false, Ordering::SeqCst);
             p.signals.job.cont_report.store(true, Ordering::SeqCst);
-            wake();
+            crate::signal::wake_threads(p);
             tell_parent(p, crate::signal::cld::CONTINUED, SIGCONT);
         }
     } else if is_stop(sig) {

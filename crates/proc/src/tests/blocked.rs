@@ -158,3 +158,27 @@ fn block_or_finish(
     let task = p.spawn(builder, move || r.store(body(&q), Ordering::SeqCst));
     (task, result)
 }
+
+#[test]
+fn a_signal_wakes_only_the_threads_it_concerns() {
+    become_cpu();
+    let (a, _) = process("wake-a");
+    let (b, _) = process("wake-b");
+    let (ra, _wa) = pipe_fds(&a);
+    // `b` waits in `sigsuspend`, which only a signal for it can end (a pipe
+    // read could be woken by any other test's pipe traffic).
+    put(&b, DATA + 0x200, &0u64.to_ne_bytes());
+    let (ta, result_a) = block_in(&a, move |p| call(p, Sys::Read, &[ra, DATA + 0x100, 8]));
+    let (tb, result_b) = block_in(&b, move |p| call(p, Sys::RtSigsuspend, &[DATA + 0x200, 8]));
+    // A signal for `a` wakes `a`'s reader at once (it is made ready by the
+    // sender), and leaves `b`'s asleep.
+    signal::send(&a, SIGTERM, a.pid()).unwrap();
+    assert_eq!(tb.state(), osmium_sched::TaskState::Blocked, "another process's sleeper is not woken");
+    assert_ne!(ta.state(), osmium_sched::TaskState::Blocked);
+    ta.join();
+    assert_eq!(result_a.load(Ordering::SeqCst), EINTR);
+    assert_eq!(result_b.load(Ordering::SeqCst), PENDING);
+    signal::send(&b, SIGKILL, b.pid()).unwrap();
+    tb.join();
+    assert_eq!(result_b.load(Ordering::SeqCst), EINTR);
+}

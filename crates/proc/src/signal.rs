@@ -246,23 +246,60 @@ impl Signals {
     }
 }
 
-/// Wakes everything a signal may have to interrupt: futex waiters, and a
-/// parent in `wait4`.
-fn poke(p: &Process) {
-    wake_blocked();
+/// Wakes what a signal to `p` (or to its thread `th` alone) may have to
+/// interrupt: the threads it concerns, wherever they wait, and the
+/// process's `wait4`.
+fn poke(p: &Process, th: Option<&Thread>) {
+    match th {
+        Some(th) => wake_thread(th),
+        None => wake_threads(p),
+    }
+    // Futex waits are not yet registered per thread (see `wait_on`).
+    crate::futex::interrupt();
     p.child_exited.wake_all();
 }
 
-/// Makes every thread blocked in a futex wait, `poll`, `select`, `epoll`,
-/// pipe, socket or `accept`/`connect`/`recv`/`send` look again, so that one
-/// that is interrupted or whose process is ending gives up.
-pub(crate) fn wake_blocked() {
-    crate::futex::interrupt();
-    crate::jobctl::wake();
-    crate::poll::notify();
-    if let Some(stack) = crate::net::stack() {
-        stack.wake_waiters();
+/// Makes every thread of `p` that is blocked in an interruptible wait
+/// (`poll`, `select`, `epoll`, pipe and socket I/O, `accept`, `connect`, a
+/// stop, `sigsuspend`, `execve`'s wait for the other threads) look again,
+/// so that one that is interrupted or whose process is ending gives up.
+/// Other processes' sleepers are left alone.
+pub(crate) fn wake_threads(p: &Process) {
+    p.group.each(wake_thread);
+}
+
+/// [`wake_threads`] for one thread.
+fn wake_thread(th: &Thread) {
+    let sleep = th.sleep.lock();
+    if *sleep == 0 {
+        return;
     }
+    if let Some(task) = th.ext.task() {
+        // SAFETY: `wait_on` stores the address of a queue it borrows for as
+        // long as the address is set, and clears it under this lock before
+        // the borrow ends, so the queue is alive while the lock is held.
+        let queue = unsafe { &*core::ptr::with_exposed_provenance::<osmium_sched::WaitQueue>(*sleep) };
+        queue.wake_task(&task);
+    }
+}
+
+/// Waits in `queue` until `cond` returns `Some`, as
+/// [`osmium_sched::WaitQueue::wait_until`] does, registered as the calling
+/// thread's interruptible wait so that a signal for it (or its process
+/// ending) wakes it alone. Every wait that gives up on
+/// [`current_interrupted`] must go through here.
+///
+/// Lock order: a thread's `sleep` lock is taken before the queue's, so
+/// `cond`, which runs under the queue's lock, must not take a thread
+/// group's lock.
+pub(crate) fn wait_on<R>(queue: &osmium_sched::WaitQueue, cond: impl FnMut() -> Option<R>) -> R {
+    let task = osmium_sched::current();
+    let Some(user) = task.data::<crate::process::UserTask>() else { return queue.wait_until(cond) };
+    let th = &user.thread;
+    *th.sleep.lock() = core::ptr::from_ref(queue).expose_provenance();
+    let r = queue.wait_until(cond);
+    *th.sleep.lock() = 0;
+    r
 }
 
 /// Sends `sig` to the process as a whole (`kill`): any thread that does not
@@ -321,7 +358,7 @@ pub(crate) fn post(
     }
     p.signals.set_sender(sig, from);
     pending.fetch_or(bit(sig), Ordering::SeqCst);
-    poke(p);
+    poke(p, th);
     Ok(())
 }
 
@@ -339,7 +376,7 @@ fn check(p: &Process, sig: u8) -> Result<(), Errno> {
 /// time it is in the kernel.
 pub(crate) fn kill_group(p: &Process, status: ExitStatus) {
     let _ = p.group.exiting.set(status);
-    poke(p);
+    poke(p, None);
 }
 
 /// Wakes a parent's blocking calls and queues `SIGCHLD` for it, with the

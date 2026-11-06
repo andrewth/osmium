@@ -116,7 +116,7 @@ impl NetStack {
     /// `EINTR` if the calling thread is interrupted by a signal or its
     /// process is ending (see [`crate::signal::current_interrupted`]).
     pub(crate) fn wait(&self, deadline: Option<u64>, mut ready: impl FnMut(&SocketSet) -> bool) -> Result<bool, Errno> {
-        self.events.wait_until(|| {
+        crate::signal::wait_on(&self.events, || {
             if ready(&self.inner.lock().sockets) {
                 Some(Ok(true))
             } else if crate::signal::current_interrupted() {
@@ -127,12 +127,6 @@ impl NetStack {
                 None
             }
         })
-    }
-
-    /// Makes every thread blocked in [`wait`](Self::wait) look again: for
-    /// signals and process exit.
-    pub(crate) fn wake_waiters(&self) {
-        self.events.wake_all();
     }
 
     /// The stack's clock, in nanoseconds.

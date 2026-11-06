@@ -86,6 +86,10 @@ pub struct Thread {
     stale_count: AtomicU32,
     /// Restart block and priority-inheritance state.
     pub(crate) ext: crate::thread_ext::ThreadExt,
+    /// The address of the wait queue the thread sleeps in while it is in an
+    /// interruptible wait ([`crate::signal::wait_on`]), or 0: how a signal
+    /// wakes this thread alone.
+    pub(crate) sleep: IrqSpinLock<usize>,
     /// Links the thread into its group's list.
     group_link: Shared<Link>,
     /// Links a non-leader thread into [`TIDS`], keyed by `key`.
@@ -147,6 +151,7 @@ impl Thread {
             stale_page: AtomicU64::new(0),
             stale_count: AtomicU32::new(0),
             ext: crate::thread_ext::ThreadExt::new(),
+            sleep: IrqSpinLock::new(0),
             group_link: Shared::new(Link::new()),
             tid_link: Shared::new(TreeLink::new()),
             key: tid,
@@ -535,7 +540,7 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
         drop(files);
         p.set_exited(status);
     } else if group_wide.is_some() {
-        crate::signal::wake_blocked();
+        crate::signal::wake_threads(p);
     }
 }
 
@@ -553,9 +558,11 @@ pub(crate) fn exec_begin(p: &Process, th: &Thread) -> Result<(), Errno> {
     if !doom_others(p, th) {
         return Err(Errno::EINTR);
     }
-    crate::signal::wake_blocked();
+    crate::signal::wake_threads(p);
     p.child_exited.wake_all();
-    p.group.ended.wait_until(|| {
+    // Interruptible, so that an `exit_group` or a competing `execve` that
+    // dooms this thread meanwhile is noticed.
+    crate::signal::wait_on(&p.group.ended, || {
         if th.doomed.load(Ordering::SeqCst) || p.group.exiting.get().is_some() {
             Some(Err(Errno::EINTR))
         } else if p.group.live() == 1 {
