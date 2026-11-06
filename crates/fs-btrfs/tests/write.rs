@@ -527,6 +527,39 @@ fn open_files_outlive_unlink() {
     assert!(names(&*fs.root()).is_empty());
 }
 
+/// Orphan items in a tree: `(inode)` of each.
+fn orphan_items(img: &Path, tree: u64) -> Vec<String> {
+    let btrfs = tool("btrfs").unwrap();
+    let out =
+        Command::new(btrfs).args(["inspect-internal", "dump-tree", "-t", &tree.to_string()]).arg(img).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains("ORPHAN_ITEM")).map(str::to_string).collect()
+}
+
+#[test]
+fn orphans_of_other_subvolumes_go_at_mount() {
+    let dir = scratch("orphan-sub");
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    let Some(img) = mkfs(&dir, 128 << 20, &["--rootdir", src.to_str().unwrap(), "-u", "rw:sub"]) else { return };
+    {
+        // Left open by a "crash", in a subvolume that is not the one mounted.
+        let fs = mount(&img);
+        let vfs = Vfs::new(fs.root());
+        put(&vfs, "/sub/lost", &pattern(300_000, 3));
+        let f = vfs.lookup("/sub/lost").unwrap();
+        vfs.unlink("/sub/lost").unwrap();
+        std::mem::forget(f);
+    }
+    assert_eq!(orphan_items(&img, 256).len(), 1);
+    check(&img);
+    drop(mount(&img));
+    assert!(orphan_items(&img, 256).is_empty(), "{:?}", orphan_items(&img, 256));
+    check(&img);
+    // Its extent is gone too: nothing in the subvolume refers to data.
+    let fs = mount(&img);
+    assert!(names(&*Vfs::new(fs.root()).lookup("/sub").unwrap()).is_empty());
+}
+
 #[test]
 fn read_only_mounts_and_subvolumes() {
     let dir = scratch("ro");
@@ -538,8 +571,12 @@ fn read_only_mounts_and_subvolumes() {
         return;
     };
     {
-        let fs =
-            BtrfsFs::mount_with(FileDisk::open(&img, 4096), 9, MountOptions { read_only: true, ..MountOptions::default() }).unwrap();
+        let fs = BtrfsFs::mount_with(
+            FileDisk::open(&img, 4096),
+            9,
+            MountOptions { read_only: true, ..MountOptions::default() },
+        )
+        .unwrap();
         assert!(fs.is_read_only());
         let vfs = Vfs::new(fs.root());
         assert_eq!(vfs.mkdir("/x", 0o755).err(), Some(Errno::EROFS));
@@ -739,7 +776,6 @@ fn writes_zstd() {
     write_compressed("w-zstd", Compression::Zstd, "zstd");
 }
 
-
 /// More hard links than the `INODE_REF` item of one directory can hold: the
 /// rest are `INODE_EXTREF`s, which unlink and rename must find again.
 #[test]
@@ -879,7 +915,6 @@ fn nodatacow_overwrites_in_place() {
     model.insert("/plain".into(), Want::File(plain));
     verify(&dir, &img, &model);
 }
-
 
 /// The file extent types in the default tree, as `btrfs inspect-internal
 /// dump-tree` shows them: (inline, regular, prealloc).

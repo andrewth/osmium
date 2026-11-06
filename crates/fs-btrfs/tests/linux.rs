@@ -5,11 +5,13 @@
 //! image read-write, lists and checksums every file, makes changes of its own
 //! and unmounts; the console must show no btrfs error or warning. In between,
 //! `btrfs check` runs on the image and the driver reads Linux's changes and
-//! makes more.
+//! makes more. A volume over several devices is checked by `btrfs check` in
+//! the guest, which sees them all (on the host it takes one image only).
 //!
 //! Opt-in: set `OSMIUM_LINUX_KERNEL` to a bootable x86-64 kernel image and
 //! `OSMIUM_LINUX_MODULES` to its `/lib/modules/<version>` directory (with
-//! `btrfs` as a module or built in). Needs `qemu-system-x86_64`, a static
+//! `btrfs` as a module or built in; so may be `virtio_blk` and the checksum
+//! algorithms, as in distribution kernels). Needs `qemu-system-x86_64`, a static
 //! `busybox`, `zstd`, `cpio`, `md5sum` and btrfs-progs; skipped, with a
 //! note, without them.
 
@@ -175,8 +177,24 @@ impl Linux {
         }
         let modules = PathBuf::from(modules);
         let mut insmods = String::new();
-        for name in ["xor", "raid6_pq", "libblake2b", "btrfs"] {
-            let found = ["crypto", "lib/raid6", "lib/crypto", "fs/btrfs", "lib"]
+        // The virtio block driver and the checksum algorithms too, for kernels that build them as modules.
+        let names = [
+            "virtio_ring",
+            "virtio",
+            "virtio_pci_legacy_dev",
+            "virtio_pci_modern_dev",
+            "virtio_pci",
+            "virtio_blk",
+            "xor",
+            "raid6_pq",
+            "libblake2b",
+            "crc32c-cryptoapi",
+            "xxhash_generic",
+            "blake2b_generic",
+            "btrfs",
+        ];
+        for name in names {
+            let found = ["drivers/virtio", "drivers/block", "crypto", "lib/raid6", "lib/crypto", "fs/btrfs", "lib"]
                 .iter()
                 .flat_map(|d| [format!("kernel/{d}/{name}.ko.zst"), format!("kernel/{d}/{name}.ko")])
                 .map(|p| modules.join(p))
@@ -193,6 +211,8 @@ impl Linux {
         }
         let init = format!(
             "#!/bin/busybox sh\n/bin/busybox --install -s /bin\nmount -t proc proc /proc\nmount -t sysfs sys /sys\nmount -t devtmpfs dev /dev\n{insmods}\
+             btrfs device scan --all-devices >/dev/null 2>&1\n\
+             if head -n 1 /dev/vdb | grep -q '^#check'; then\n  btrfs check --readonly --check-data-csum /dev/vda 2>&1\n  echo \"CHECK-EXIT $?\"\nfi\n\
              if mount -t btrfs /dev/vda /mnt; then\n  echo MOUNTED\n  cd /mnt && sh /dev/vdb\n  cd /\n  umount /mnt && echo UNMOUNTED\nfi\ndmesg | grep -i btrfs\necho LINUX-DONE\npoweroff -f\n"
         );
         std::fs::write(root.join("init"), init).unwrap();
@@ -220,6 +240,14 @@ impl Linux {
     }
 
     fn boot(&self, dir: &Path, img: &Path, script: &str, crash: bool) -> String {
+        self.boot_devices(dir, &[img], script, crash)
+    }
+
+    /// Boots with the devices `imgs` of one volume as `/dev/vda` and, after
+    /// the script's `/dev/vdb`, `/dev/vdc` on. A script whose first line is
+    /// `#check` has `btrfs check` look at the volume, with all its devices,
+    /// before it is mounted; it prints `CHECK-EXIT` and the exit status.
+    fn boot_devices(&self, dir: &Path, imgs: &[&Path], script: &str, crash: bool) -> String {
         let s = dir.join("script.sh");
         let mut body = script.as_bytes().to_vec();
         body.resize(body.len().next_multiple_of(512) + 512, b'\n');
@@ -233,9 +261,12 @@ impl Linux {
             .arg(&self.initrd)
             .args(["-append", "console=ttyS0 panic=-1 quiet loglevel=4"])
             .arg("-drive")
-            .arg(format!("file={},format=raw,if=virtio,cache=unsafe", img.display()))
+            .arg(format!("file={},format=raw,if=virtio,cache=unsafe", imgs[0].display()))
             .arg("-drive")
             .arg(format!("file={},format=raw,if=virtio,readonly=on", s.display()));
+        for img in &imgs[1..] {
+            cmd.arg("-drive").arg(format!("file={},format=raw,if=virtio,cache=unsafe", img.display()));
+        }
         if kvm {
             cmd.args(["-enable-kvm", "-cpu", "host"]);
         }
@@ -607,6 +638,142 @@ fn linux_snapshots() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Linux's balance moves every tree block, leaving blocks of the subvolumes flagged `RELOC` and owned by the
+/// relocation tree, some of them `FULL_BACKREF`; the driver can still change every file across them.
+#[test]
+fn linux_balance_then_write() {
+    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-linux6-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(linux) = Linux::new(&dir) else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let Some(mkfs) = tool("mkfs.btrfs") else { return };
+    let img = dir.join("img");
+    std::fs::File::create(&img).unwrap().set_len(128 << 20).unwrap();
+    assert!(Command::new(mkfs).args(["-q", "-n", "4096"]).arg(&img).status().unwrap().success());
+
+    // Files in the top subvolume, a subvolume, and snapshots of that, then a balance of it all.
+    let text = linux.run(
+        &dir,
+        &img,
+        "mkdir top\ni=0\nwhile [ $i -lt 300 ]; do echo \"top file $i\" > top/file-with-a-long-name-$i; i=$((i+1)); done\n\
+         btrfs subvolume create sv >/dev/null\nmkdir sv/d\n\
+         i=0\nwhile [ $i -lt 800 ]; do echo \"file number $i\" > sv/d/file-with-a-long-name-$i; i=$((i+1)); done\n\
+         yes 'big file' | head -c 1000000 > sv/big\nsync\n\
+         btrfs subvolume snapshot sv snap >/dev/null\nsync\n\
+         echo changed > sv/d/file-with-a-long-name-17\nsync\n\
+         btrfs subvolume snapshot -r sv rosnap >/dev/null\nsync\n\
+         btrfs balance start --full-balance . 2>&1 | tail -1\nsync\n\
+         btrfs balance start --full-balance . 2>&1 | tail -1\nsync\n\
+         echo BEGIN-SUMS\nfind top sv snap rosnap -type f | sort | xargs md5sum\necho END-SUMS\n",
+    );
+    assert!(text.contains("Done, had to relocate"), "Linux did not balance:\n{text}");
+    check(&img);
+    if let Some(keep) = std::env::var_os("OSMIUM_LINUX_KEEP") {
+        std::fs::copy(&img, keep).unwrap();
+    }
+
+    // The driver rewrites every file of each writable subvolume, so every leaf is copied.
+    let mut want;
+    {
+        let fs = mount(&img);
+        want = read_subvols(&fs, &["top", "sv", "snap", "rosnap"]);
+        same_as_linux(&text, &want);
+        let vfs = Vfs::new(fs.root());
+        for (path, data) in want.iter_mut() {
+            if path.starts_with("rosnap/") {
+                continue;
+            }
+            let f = vfs.open(&format!("/{path}"), OpenFlags::WRITE, 0).unwrap();
+            f.write(0, b"OSMIUM").unwrap_or_else(|e| panic!("writing {path}: {e:?}"));
+            let n = data.len().min(6);
+            data[..n].copy_from_slice(&b"OSMIUM"[..n]);
+            data.extend_from_slice(&b"OSMIUM"[n..]);
+        }
+        for i in (0..800).step_by(7) {
+            vfs.unlink(&format!("/snap/d/file-with-a-long-name-{i}")).unwrap();
+            want.remove(&format!("snap/d/file-with-a-long-name-{i}"));
+        }
+        let root = vfs.lookup("/").unwrap();
+        fs.delete_subvolume(&*root, "rosnap").unwrap();
+        want.retain(|k, _| !k.starts_with("rosnap/"));
+    }
+    check(&img);
+    let text =
+        linux.run(&dir, &img, "echo BEGIN-SUMS\nfind top sv snap -type f | sort | xargs md5sum\necho END-SUMS\n");
+    same_as_linux(&text, &want);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What the driver writes over several devices `btrfs check` accepts with all of them (which it cannot be given
+/// as image files on the host), and Linux reads it; then the driver reads what Linux wrote there.
+#[test]
+fn linux_checks_multi_device() {
+    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-linux7-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let Some(linux) = Linux::new(&dir) else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let Some(mkfs) = tool("mkfs.btrfs") else { return };
+    let mount_all = |imgs: &[PathBuf]| {
+        let mut md = osmium_fs_btrfs::MultiDevice::new();
+        for img in imgs {
+            let file = std::fs::OpenOptions::new().read(true).write(true).open(img).unwrap();
+            let len = file.metadata().unwrap().len();
+            md.add(FileDisk { file: Arc::new(file), len }).unwrap();
+        }
+        BtrfsFs::mount_multi(md, 9, osmium_fs_btrfs::MountOptions::default()).unwrap()
+    };
+    for (d, m, n) in [("raid1", "raid1", 2), ("raid10", "raid10", 4), ("raid1c3", "raid1c3", 3), ("raid0", "raid1", 2)]
+    {
+        eprintln!("-d {d} -m {m} over {n}");
+        let imgs: Vec<PathBuf> = (0..n).map(|i| dir.join(format!("dev{i}"))).collect();
+        for img in &imgs {
+            std::fs::File::create(img).unwrap().set_len(256 << 20).unwrap();
+        }
+        let out = Command::new(&mkfs).args(["-q", "-f", "-n", "4096", "-d", d, "-m", m]).args(&imgs).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut want: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        {
+            let fs = mount_all(&imgs);
+            assert!(!fs.is_read_only());
+            let vfs = Vfs::new(fs.root());
+            vfs.mkdir("/d", 0o755).unwrap();
+            for i in 0..300 {
+                let (path, data) = (format!("d/f{i}"), pattern(100 + i * 37, i as u8));
+                vfs.open(&format!("/{path}"), OpenFlags::WRITE | OpenFlags::CREATE, 0o644)
+                    .unwrap()
+                    .write(0, &data)
+                    .unwrap();
+                want.insert(path, data);
+            }
+            let big = pattern(6 << 20, 7);
+            vfs.open("/big", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap().write(0, &big).unwrap();
+            want.insert("big".into(), big);
+            let patch = pattern(200_000, 8);
+            vfs.open("/big", OpenFlags::WRITE, 0).unwrap().write(1_000_000, &patch).unwrap();
+            want.get_mut("big").unwrap()[1_000_000..1_200_000].copy_from_slice(&patch);
+            for i in (0..300).step_by(5) {
+                vfs.unlink(&format!("/d/f{i}")).unwrap();
+                want.remove(&format!("d/f{i}"));
+            }
+        }
+        let paths: Vec<&Path> = imgs.iter().map(PathBuf::as_path).collect();
+        let text = linux.boot_devices(&dir, &paths, &format!("#check\n{SUMS}echo from-linux > linux\nsync\n"), false);
+        assert!(text.contains("CHECK-EXIT 0") && !text.contains("ERROR"), "btrfs check, -d {d} -m {m}:\n{text}");
+        same_as_linux(&text, &want);
+        let fs = mount_all(&imgs);
+        assert_eq!(read_all(&*Vfs::new(fs.root()).lookup("/linux").unwrap()), b"from-linux\n");
+        drop(fs);
+        let text = linux.boot_devices(&dir, &paths, "#check\n", false);
+        assert!(text.contains("CHECK-EXIT 0") && !text.contains("ERROR"), "btrfs check after Linux, -d {d}:\n{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 /// The listing a script prints to compare two views of one volume: type, size, links, mode and blocks of every
 /// path.
@@ -655,7 +822,7 @@ fn compare_replays(linux: &Linux, dir: &Path, img: &Path, extra: &str, mid: impl
 
 #[test]
 fn linux_log_is_replayed() {
-    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-linux3-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("osmium-fs-btrfs-linux5-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let Some(linux) = Linux::new(&dir) else {

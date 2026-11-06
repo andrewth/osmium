@@ -67,26 +67,27 @@ pub struct Group {
 
 impl Group {
     fn end(&self) -> u64 {
-        self.start + self.len
+        self.start.saturating_add(self.len)
     }
 
     /// Takes `start..start + len`, which must be free.
     fn take(&mut self, start: u64, len: u64) -> Result<(), Errno> {
         let i = self.free.partition_point(|&(s, _)| s <= start).checked_sub(1).ok_or(Errno::EIO)?;
         let &(s, l) = self.free.get(i).ok_or(Errno::EIO)?;
-        if start + len > s + l {
+        let (end, free_end) = (start.checked_add(len).ok_or(Errno::EIO)?, s.saturating_add(l));
+        if end > free_end {
             return Err(Errno::EIO);
         }
         self.free.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
-        let (head, tail) = (start - s, s + l - (start + len));
+        let (head, tail) = (start - s, free_end - end);
         let slot = self.free.get_mut(i).ok_or(Errno::EIO)?;
         match (head, tail) {
             (0, 0) => _ = self.free.remove(i),
-            (0, _) => *slot = (start + len, tail),
+            (0, _) => *slot = (end, tail),
             (_, 0) => *slot = (s, head),
             _ => {
                 *slot = (s, head);
-                self.free.insert(i + 1, (start + len, tail));
+                self.free.insert(i + 1, (end, tail));
             }
         }
         Ok(())
@@ -96,17 +97,22 @@ impl Group {
     /// memory that is not there (never when undoing in order).
     pub fn give(&mut self, start: u64, len: u64) -> Result<(), Errno> {
         let i = self.free.partition_point(|&(s, _)| s < start);
-        let prev = i.checked_sub(1).filter(|&p| self.free.get(p).is_some_and(|&(s, l)| s + l == start));
-        let next = Some(i).filter(|&n| self.free.get(n).is_some_and(|&(s, _)| start + len == s));
+        let end = start.checked_add(len).ok_or(Errno::EIO)?;
+        let prev = i.checked_sub(1).filter(|&p| self.free.get(p).is_some_and(|&(s, l)| s.saturating_add(l) == start));
+        let next = Some(i).filter(|&n| self.free.get(n).is_some_and(|&(s, _)| end == s));
         match (prev, next) {
             (Some(p), Some(n)) => {
                 let (_, nl) = self.free.remove(n);
-                self.free.get_mut(p).ok_or(Errno::EIO)?.1 += len + nl;
+                let r = self.free.get_mut(p).ok_or(Errno::EIO)?;
+                r.1 = r.1.saturating_add(len).saturating_add(nl);
             }
-            (Some(p), None) => self.free.get_mut(p).ok_or(Errno::EIO)?.1 += len,
+            (Some(p), None) => {
+                let r = self.free.get_mut(p).ok_or(Errno::EIO)?;
+                r.1 = r.1.saturating_add(len);
+            }
             (None, Some(n)) => {
                 let r = self.free.get_mut(n).ok_or(Errno::EIO)?;
-                *r = (start, r.1 + len);
+                *r = (start, r.1.saturating_add(len));
             }
             (None, None) => {
                 self.free.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
@@ -205,11 +211,11 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
 
 /// Removes `start..start + len` from the ranges `free`, wherever it overlaps.
 pub fn carve(free: &mut Vec<(u64, u64)>, start: u64, len: u64) -> Result<(), Errno> {
-    let end = start + len;
+    let end = start.saturating_add(len);
     let mut out = Vec::new();
     out.try_reserve_exact(free.len() + 1).map_err(|_| Errno::ENOMEM)?;
     for &(s, l) in free.iter() {
-        let e = s + l;
+        let e = s.saturating_add(l);
         if e <= start || s >= end {
             out.push((s, l));
             continue;
@@ -443,8 +449,8 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         }
         let Some((devid, size, offsets)) = found else { return Ok(false) };
 
-        let logical =
-            self.chunks().iter().map(|c| c.logical + c.length).max().unwrap_or(0).next_multiple_of(CHUNK_ALIGN);
+        let end = self.chunks().iter().try_fold(0u64, |m, c| c.logical.checked_add(c.length).map(|e| m.max(e)));
+        let logical = end.and_then(|e| e.checked_next_multiple_of(CHUNK_ALIGN)).ok_or(Errno::EIO)?;
         let mut stripes = Vec::new();
         for &o in &offsets {
             try_push(&mut stripes, Stripe { devid, offset: o })?;
@@ -548,7 +554,9 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
                 put(&mut de, 32, &self.w.chunk_uuid)?;
                 self.insert(tree::DEV, Key::new(devid, item::DEV_EXTENT, o), &de)?;
             }
-            let used = le64(&dev_item, 16)? + c.size * c.offsets.len() as u64;
+            let used =
+                c.size.checked_mul(c.offsets.len() as u64).and_then(|n| n.checked_add(le64(&dev_item, 16).ok()?));
+            let used = used.ok_or(Errno::EIO)?;
             put(&mut dev_item, 16, &used.to_le_bytes())?;
             self.update(tree::CHUNK, dev_key, &dev_item)?;
             let mut bg = [0u8; 24];

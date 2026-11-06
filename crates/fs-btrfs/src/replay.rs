@@ -502,7 +502,14 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         if bytenr % ss != 0 || disk_len == 0 || disk_len % ss != 0 || bytenr.checked_add(disk_len).is_none() {
             return Err(Errno::EIO);
         }
-        // Allocated by the transaction that never committed, or not.
+        // Allocated by the transaction that never committed, or not. An
+        // extent that overlaps one met already without being the same (start
+        // and length) is not something Linux logs: not replayed.
+        let end = bytenr + disk_len;
+        let overlap = |s: u64, l: u64| s < end && bytenr < s.saturating_add(l) && (s, l) != (bytenr, disk_len);
+        if self.data_refs.iter().any(|r| overlap(r.bytenr, r.len)) {
+            return Err(Errno::EOPNOTSUPP);
+        }
         let seen = self.data_refs.iter().any(|r| r.bytenr == bytenr);
         let new = if seen {
             self.data_refs.iter().any(|r| r.bytenr == bytenr && r.new)
@@ -510,7 +517,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             false
         } else {
             let g = self.w.group_mut(bytenr).ok_or(Errno::EIO)?;
-            if g.flags & kind::MASK != kind::DATA || bytenr + disk_len > g.start + g.len {
+            if g.flags & kind::MASK != kind::DATA || end > g.start.saturating_add(g.len) {
                 return Err(Errno::EIO);
             }
             self.claim(bytenr, disk_len)?;
@@ -525,16 +532,16 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         let (from, to) = if fe.compression == disk::compress::NONE {
             (bytenr.checked_add(eoff).ok_or(Errno::EIO)?, bytenr.saturating_add(eoff).saturating_add(le64(d, 45)?))
         } else {
-            (bytenr, bytenr + disk_len)
+            (bytenr, end)
         };
-        let (from, to) = (from & !(ss - 1), to.next_multiple_of(ss));
+        let (from, to) = (from & !(ss - 1), to.checked_next_multiple_of(ss).ok_or(Errno::EIO)?);
         let mut i = csums.partition_point(|c| c.0.offset <= from).saturating_sub(1);
         while let Some((ck, cd)) = csums.get(i) {
             i += 1;
             if ck.offset >= to {
                 break;
             }
-            let cend = ck.offset + (cd.len() / cs) as u64 * ss;
+            let cend = ck.offset.saturating_add((cd.len() / cs) as u64 * ss);
             let (lo, hi) = (ck.offset.max(from), cend.min(to));
             if lo >= hi {
                 continue;
@@ -631,5 +638,91 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             self.update(t, key, &cur)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::BtrfsFs;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use osmium_hal::block::BlockError;
+    use std::os::unix::fs::FileExt;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[derive(Clone)]
+    struct FileDisk(Arc<std::fs::File>, u64);
+
+    impl BlockDevice for FileDisk {
+        fn block_size(&self) -> usize {
+            4096
+        }
+        fn num_blocks(&self) -> u64 {
+            self.1 / 4096
+        }
+        fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+            self.check_range(lba, buf.len())?;
+            self.0.read_exact_at(buf, lba * 4096).map_err(|_| BlockError::Io)
+        }
+        fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+            self.check_range(lba, buf.len())?;
+            self.0.write_all_at(buf, lba * 4096).map_err(|_| BlockError::Io)
+        }
+    }
+
+    /// A regular file extent item: `len` bytes of the extent at `bytenr` of `disk_len`.
+    fn extent(bytenr: u64, disk_len: u64, len: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 53];
+        d[8..16].copy_from_slice(&disk_len.to_le_bytes());
+        d[20] = 1;
+        d[21..29].copy_from_slice(&bytenr.to_le_bytes());
+        d[29..37].copy_from_slice(&disk_len.to_le_bytes());
+        d[45..53].copy_from_slice(&len.to_le_bytes());
+        d
+    }
+
+    /// Log extents that overlap without being the same extent are not
+    /// replayed: `EOPNOTSUPP` (a log this does not understand), not `EIO`.
+    #[test]
+    fn overlapping_log_extents() {
+        let Some(mkfs) = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+            .iter()
+            .map(|d| Path::new(d).join("mkfs.btrfs"))
+            .find(|p| p.exists())
+        else {
+            std::eprintln!("mkfs.btrfs not found; skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(std::format!("osmium-fs-btrfs-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/f"), b"a file").unwrap();
+        let img = dir.join("img");
+        std::fs::File::create(&img).unwrap().set_len(128 << 20).unwrap();
+        let ok = Command::new(mkfs).args(["-q", "--rootdir"]).arg(dir.join("src")).arg(&img).status().unwrap();
+        assert!(ok.success());
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&img).unwrap();
+        let len = file.metadata().unwrap().len();
+        let fs = BtrfsFs::mount(FileDisk(Arc::new(file), len), 1).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Two extents of 8 KiB in free data space 4 KiB apart, or two at the
+        // same start of different lengths.
+        for second in [4096, 0] {
+            let r = fs.shared.transact(|tx| {
+                let g = tx.w.groups.iter().find(|g| g.flags & kind::MASK == kind::DATA).ok_or(Errno::ENOSPC)?;
+                let &(at, _) = g.free.iter().find(|r| r.1 >= 1 << 20).ok_or(Errno::ENOSPC)?;
+                let ino = tree::FIRST_FREE + 1;
+                assert!(tx.find(tree::FS, Key::new(ino, item::INODE_ITEM, 0))?.is_some());
+                let items = vec![
+                    (Key::new(ino, item::EXTENT_DATA, 0), extent(at, 8192, 8192)),
+                    (Key::new(ino, item::EXTENT_DATA, 8192), extent(at + second, 4096 << (second / 4096), 4096)),
+                ];
+                tx.replay_log(&[LogTree { id: tree::FS, items }])
+            });
+            assert_eq!(r.err(), Some(Errno::EOPNOTSUPP), "second extent at +{second}");
+        }
     }
 }
