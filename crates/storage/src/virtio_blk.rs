@@ -10,8 +10,8 @@ use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_hal::dma::{DmaAllocator, OwnedDma};
 use osmium_hal::virtio::blk;
 
-use osmium_drivers::virtio::queue::{Segment, VirtQueue};
 use core::mem::ManuallyDrop;
+use osmium_drivers::virtio::queue::{Segment, VirtQueue};
 
 use osmium_drivers::virtio::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
 
@@ -49,7 +49,9 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioBlk<'d, T, D> {
             n if n >= 4 => 1 << n.ilog2(),
             _ => return Err(VirtioError::BadQueue),
         };
-        let sectors = u64::from_le_bytes(core::array::from_fn(|i| transport.config_read8(blk::CONFIG_CAPACITY + i)));
+        // Two 32-bit accesses, under the configuration generation so that a
+        // resize between them cannot tear the value.
+        let sectors = transport.config_read64(blk::CONFIG_CAPACITY)?;
         // Plain values until all succeed, so a failure frees the others.
         let queue = VirtQueue::new(dma, blk::REQUEST_QUEUE, size)?;
         let req = OwnedDma::new(dma, 64).ok_or(VirtioError::NoMemory)?;
@@ -182,10 +184,10 @@ impl<T: Transport, D: DmaAllocator + ?Sized> Drop for VirtioBlk<'_, T, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicBool, Ordering};
     use osmium_drivers::virtio::queue::tests::DeviceSide;
     use osmium_drivers::virtio::testing::{FakeTransport, HostDma};
     use osmium_drivers::virtio::{feature, status};
-    use core::sync::atomic::{AtomicBool, Ordering};
     use osmium_hal::virtio::queue::DESC_F_WRITE;
     use std::vec;
     use std::vec::Vec;
@@ -296,6 +298,14 @@ mod tests {
         assert_eq!(VirtioBlk::new(tiny, &dma).err(), Some(VirtioError::BadQueue));
         let net = FakeTransport::new(DeviceType::Net, 0, &[]);
         assert_eq!(VirtioBlk::new(net, &dma).err(), Some(VirtioError::WrongDevice));
+        // A capacity changing while it is read is read again, and one that
+        // never settles is refused rather than torn.
+        let resizing = device(feature::VERSION_1, 0x1_0000_0001);
+        resizing.churn.set(5);
+        assert_eq!(VirtioBlk::new(resizing, &dma).map(|b| b.num_blocks()).ok(), Some(0x1_0000_0001));
+        let unstable = device(feature::VERSION_1, 8);
+        unstable.churn.set(u32::MAX);
+        assert_eq!(VirtioBlk::new(unstable, &dma).err(), Some(VirtioError::ConfigUnstable));
         assert_eq!(dma.live.get(), 0, "failed probes leak nothing");
     }
 

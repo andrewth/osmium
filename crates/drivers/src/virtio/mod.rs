@@ -68,7 +68,14 @@ pub enum VirtioError {
     NoMemory,
     /// The queue has no free descriptors.
     QueueFull,
+    /// The device kept changing its configuration while it was read (the
+    /// configuration generation never stayed the same across a read).
+    ConfigUnstable,
 }
+
+/// Attempts at a consistent configuration read before
+/// [`VirtioError::ConfigUnstable`].
+pub const CONFIG_RETRIES: u32 = 64;
 
 /// Device addresses of a split virtqueue's three parts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,10 +128,81 @@ pub trait Transport {
     /// device provides.
     fn config_read8(&self, offset: usize) -> u8;
 
-    /// Reads a little-endian word of device-specific configuration.
+    /// Reads the little-endian 16-bit field at `offset` (2-aligned) of
+    /// device-specific configuration. The specification asks for one access
+    /// of the field's width, which the MMIO and PCI transports make; the
+    /// default reads two bytes.
     fn config_read16(&self, offset: usize) -> u16 {
         u16::from_le_bytes([self.config_read8(offset), self.config_read8(offset + 1)])
     }
+
+    /// Reads the little-endian 32-bit field at `offset` (4-aligned), as
+    /// [`config_read16`](Self::config_read16) does.
+    fn config_read32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes(core::array::from_fn(|i| self.config_read8(offset + i)))
+    }
+
+    /// Writes a byte of device-specific configuration; dropped beyond what
+    /// the device provides.
+    fn config_write8(&self, offset: usize, value: u8);
+
+    /// Writes the little-endian 16-bit field at `offset` (2-aligned), with
+    /// one access where the transport can (the default writes two bytes).
+    fn config_write16(&self, offset: usize, value: u16) {
+        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+            self.config_write8(offset + i, b);
+        }
+    }
+
+    /// Writes the little-endian 32-bit field at `offset` (4-aligned), as
+    /// [`config_write16`](Self::config_write16) does.
+    fn config_write32(&self, offset: usize, value: u32) {
+        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+            self.config_write8(offset + i, b);
+        }
+    }
+
+    /// The configuration generation (virtio 1.x §2.5.1): it changes whenever
+    /// the device changes its configuration, so a read that spans several
+    /// accesses is consistent if the generation is the same before and
+    /// after. Transports without one (legacy interfaces, which promise no
+    /// consistency) report 0, the default.
+    fn config_generation(&self) -> u32 {
+        0
+    }
+
+    /// Reads `buf.len()` bytes of configuration at `offset` a byte at a time
+    /// (for byte-array fields such as a MAC address), consistently: see
+    /// [`config_consistent`].
+    fn config_read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<(), VirtioError> {
+        config_consistent(self, |t| {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = t.config_read8(offset + i);
+            }
+        })
+    }
+
+    /// Reads the little-endian 64-bit field at `offset` (4-aligned) as two
+    /// 32-bit accesses, low word first, consistently: see
+    /// [`config_consistent`].
+    fn config_read64(&self, offset: usize) -> Result<u64, VirtioError> {
+        config_consistent(self, |t| u64::from(t.config_read32(offset)) | u64::from(t.config_read32(offset + 4)) << 32)
+    }
+}
+
+/// Runs `read`, a read of several configuration fields or of one field in
+/// several accesses, until the configuration generation is the same before
+/// and after it, so that the values belong together. Fails with
+/// [`VirtioError::ConfigUnstable`] after [`CONFIG_RETRIES`] attempts.
+pub fn config_consistent<T: Transport + ?Sized, R>(t: &T, mut read: impl FnMut(&T) -> R) -> Result<R, VirtioError> {
+    for _ in 0..CONFIG_RETRIES {
+        let before = t.config_generation();
+        let value = read(t);
+        if t.config_generation() == before {
+            return Ok(value);
+        }
+    }
+    Err(VirtioError::ConfigUnstable)
 }
 
 /// Resets the device and negotiates features (spec 3.1.1 steps 1–6).
@@ -236,7 +314,11 @@ pub mod testing {
         pub max_queue: u16,
         pub queues: RefCell<Vec<(u16, u16, QueueAddrs)>>,
         pub notified: RefCell<Vec<u16>>,
-        pub config: Vec<u8>,
+        pub config: RefCell<Vec<u8>>,
+        pub generation: Cell<u32>,
+        /// Configuration reads during which the device changes its
+        /// configuration (bumping the generation), as if mid-update.
+        pub churn: Cell<u32>,
     }
 
     impl FakeTransport {
@@ -251,7 +333,9 @@ pub mod testing {
                 max_queue: 256,
                 queues: RefCell::new(Vec::new()),
                 notified: RefCell::new(Vec::new()),
-                config: config.to_vec(),
+                config: RefCell::new(config.to_vec()),
+                generation: Cell::new(0),
+                churn: Cell::new(0),
             }
         }
 
@@ -295,8 +379,41 @@ pub mod testing {
             1
         }
         fn config_read8(&self, offset: usize) -> u8 {
-            self.config.get(offset).copied().unwrap_or(0)
+            if self.churn.get() > 0 {
+                self.churn.set(self.churn.get() - 1);
+                self.generation.set(self.generation.get().wrapping_add(1));
+            }
+            self.config.borrow().get(offset).copied().unwrap_or(0)
         }
+        fn config_write8(&self, offset: usize, value: u8) {
+            if let Some(b) = self.config.borrow_mut().get_mut(offset) {
+                *b = value;
+            }
+        }
+        fn config_generation(&self) -> u32 {
+            self.generation.get()
+        }
+    }
+
+    #[test]
+    fn consistent_config_reads() {
+        let t = FakeTransport::new(DeviceType::Net, feature::VERSION_1, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut mac = [0u8; 6];
+        t.churn.set(3);
+        assert_eq!(t.config_read_bytes(0, &mut mac), Ok(()));
+        assert_eq!(mac, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(t.churn.get(), 0, "retried until a read saw no change");
+        assert_eq!(t.config_read64(0), Ok(0x0807_0605_0403_0201));
+        t.churn.set(u32::MAX);
+        assert_eq!(t.config_read_bytes(0, &mut mac), Err(VirtioError::ConfigUnstable));
+        assert_eq!(t.config_read64(0), Err(VirtioError::ConfigUnstable));
+        t.churn.set(0);
+        t.config_write16(2, 0xbeef);
+        t.config_write32(4, 0x1234_5678);
+        assert_eq!(t.config_read16(2), 0xbeef);
+        assert_eq!(t.config_read32(4), 0x1234_5678);
+        t.config_write8(100, 1);
+        assert_eq!(t.config_read8(100), 0, "beyond the configuration");
     }
 
     #[test]

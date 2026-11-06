@@ -226,7 +226,46 @@ impl Transport for PciTransport {
     }
 
     fn config_read8(&self, offset: usize) -> u8 {
-        self.device.as_ref().and_then(|d| d.read(offset).ok()).unwrap_or(0)
+        self.cfg_read(offset)
+    }
+
+    fn config_read16(&self, offset: usize) -> u16 {
+        self.cfg_read(offset)
+    }
+
+    fn config_read32(&self, offset: usize) -> u32 {
+        self.cfg_read(offset)
+    }
+
+    fn config_write8(&self, offset: usize, value: u8) {
+        self.cfg_write(offset, value);
+    }
+
+    fn config_write16(&self, offset: usize, value: u16) {
+        self.cfg_write(offset, value);
+    }
+
+    fn config_write32(&self, offset: usize, value: u32) {
+        self.cfg_write(offset, value);
+    }
+
+    fn config_generation(&self) -> u32 {
+        self.common.rd::<u8>(CONFIG_GENERATION) as u32
+    }
+}
+
+impl PciTransport {
+    /// One access of `T`'s width to the device configuration at `offset`;
+    /// 0 if there is none there or the offset is misaligned.
+    fn cfg_read<T: osmium_hal::mmio::RegValue>(&self, offset: usize) -> T {
+        self.device.as_ref().and_then(|d| d.read(offset).ok()).unwrap_or_default()
+    }
+
+    /// As [`cfg_read`](Self::cfg_read), for writes, which are dropped.
+    fn cfg_write<T: osmium_hal::mmio::RegValue>(&self, offset: usize, value: T) {
+        if let Some(d) = self.device.as_ref() {
+            let _ = d.write(offset, value);
+        }
     }
 }
 
@@ -344,6 +383,13 @@ mod tests {
         assert_eq!(regs(QUEUE_ENABLE / 4) & 0xffff, 1);
         assert_eq!(regs((0x3000 + 3 * 4) / 4) & 0xffff, 1, "notify at queue_notify_off * multiplier");
         assert_eq!(t.config_read16(0), 0x201);
+        assert_eq!(t.config_read32(0), 0x201);
+        t.config_write32(4, 0xdead_beef);
+        t.config_write16(8, 0x1234);
+        assert_eq!((regs(0x2004 / 4), regs(0x2008 / 4)), (0xdead_beef, 0x1234));
+        assert_eq!(t.config_read64(0), Ok(0xdead_beef_0000_0201));
+        set(CONFIG_GENERATION / 4, 9 << ((CONFIG_GENERATION % 4) * 8));
+        assert_eq!(t.config_generation(), 9);
         assert_eq!(t.ack_interrupt(), 3);
 
         t.set_driver_features(1 << 32 | 3);
