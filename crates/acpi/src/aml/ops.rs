@@ -3,6 +3,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::error::AmlError;
+use super::value::try_zeroed;
+
 /// Parses leading hex digits, as an implicit string-to-integer conversion does: no `0x`, stops at the
 /// first other character, at most 16 digits.
 pub(crate) fn parse_hex(s: &str) -> u64 {
@@ -121,23 +124,62 @@ pub(crate) fn copy_bits(src: &[u8], src_bit: usize, dst: &mut [u8], dst_bit: usi
     Some(())
 }
 
-/// `len` bits of `src` starting at `bit`, as a zero-padded little-endian byte vector.
-pub(crate) fn get_bits(src: &[u8], bit: usize, len: usize) -> Option<Vec<u8>> {
-    let mut out = alloc::vec![0u8; len.div_ceil(8)];
-    copy_bits(src, bit, &mut out, 0, len)?;
-    Some(out)
+/// `len` bits of `src` starting at `bit`, as a zero-padded little-endian byte vector. Fails with
+/// `OutOfBounds` if the range is outside `src`, or `OutOfMemory`.
+pub(crate) fn get_bits(src: &[u8], bit: usize, len: usize) -> Result<Vec<u8>, AmlError> {
+    let mut out = try_zeroed(len.div_ceil(8))?;
+    copy_bits(src, bit, &mut out, 0, len).ok_or(AmlError::OutOfBounds)?;
+    Ok(out)
 }
 
 /// Replaces `len` bits of `dst` starting at `bit` with the low bits of `value`, zero-extended if `value`
-/// is shorter.
+/// is shorter. Fails if the range is outside `dst`, which is then unchanged.
 pub(crate) fn put_bits(dst: &mut [u8], bit: usize, len: usize, value: &[u8]) -> Option<()> {
+    if bit.checked_add(len)? > dst.len().checked_mul(8)? {
+        return None;
+    }
     let have = value.len().checked_mul(8)?.min(len);
     copy_bits(value, 0, dst, bit, have)?;
-    if have < len {
-        let zeros = alloc::vec![0u8; (len - have).div_ceil(8)];
-        copy_bits(&zeros, 0, dst, bit + have, len - have)?;
+    for i in bit + have..bit + len {
+        *dst.get_mut(i / 8)? &= !(1u8 << (i % 8));
     }
     Some(())
+}
+
+/// A buffer as text, its bytes separated by commas: in hex (`0A,FF`) as `ToHexString` and the implicit
+/// conversion make it, or in decimal (`10,255`) as `ToDecimalString` does. Fails with `TooLarge` if the
+/// text would be longer than `max`, before allocating it.
+pub(crate) fn bytes_to_text(b: &[u8], hex: bool, max: usize) -> Result<String, AmlError> {
+    let digits = |x: u8| {
+        if hex {
+            2
+        } else if x >= 100 {
+            3
+        } else if x >= 10 {
+            2
+        } else {
+            1
+        }
+    };
+    let len = b.iter().map(|&x| digits(x) + 1).sum::<usize>().saturating_sub(1);
+    if len > max {
+        return Err(AmlError::TooLarge);
+    }
+    let mut s = String::new();
+    s.try_reserve_exact(len).map_err(|_| AmlError::OutOfMemory)?;
+    for (i, &x) in b.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        if hex {
+            for nib in [x >> 4, x & 0xf] {
+                s.push(char::from_digit(u32::from(nib), 16).map_or('0', |c| c.to_ascii_uppercase()));
+            }
+        } else {
+            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{x}"));
+        }
+    }
+    Ok(s)
 }
 
 /// Up to eight little-endian bytes as an integer.
