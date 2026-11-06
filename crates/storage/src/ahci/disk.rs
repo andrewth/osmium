@@ -488,6 +488,44 @@ mod tests {
         );
     }
 
+    /// An HBA that has reported a queued byte count is one that reports
+    /// them, so a later zero count is a short transfer.
+    #[test]
+    fn a_zero_count_fails_once_counts_have_been_reported() {
+        let data = pattern(8 * 512, 4);
+        with_disk(
+            FakeDev::disk(8, 512).with_data(data.clone()).with_ncq(4),
+            |_| {},
+            |d| {
+                let mut buf = [0u8; 1024];
+                d.read_blocks(2, &mut buf).unwrap();
+                assert_eq!(buf[..], data[2 * 512..4 * 512]);
+                fake::with(|f| f.ports[0].ncq_no_prdbc = true);
+                assert_eq!(d.read_blocks(2, &mut buf), Err(BlockError::Io), "zero after a reported count");
+            },
+        );
+    }
+
+    /// A round in which some slots report a count and others do not has
+    /// lost data in the silent ones, even on an HBA never seen to report.
+    #[test]
+    fn a_round_with_some_counts_missing_fails() {
+        const SECTORS: u64 = 3 * (NCQ_CHUNK as u64 / 512);
+        let data = pattern(SECTORS as usize * 512, 6);
+        with_disk(
+            FakeDev::disk(SECTORS, 512).with_data(data.clone()).with_ncq(4),
+            |hba| hba.ports[0].ncq_drop_prdbc = 0b10,
+            |d| {
+                let mut buf = vec![0u8; 3 * NCQ_CHUNK];
+                assert_eq!(d.read_blocks(0, &mut buf), Err(BlockError::Io));
+                // The same HBA reporting every count is fine.
+                fake::with(|f| f.ports[0].ncq_drop_prdbc = 0);
+                d.read_blocks(0, &mut buf).unwrap();
+                assert_eq!(buf, data);
+            },
+        );
+    }
+
     #[test]
     fn short_reads_fail() {
         let data = pattern(8 * 512, 3);

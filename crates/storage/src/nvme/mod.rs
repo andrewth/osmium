@@ -292,6 +292,18 @@ impl Default for IrqSignal {
 }
 
 /// How an interrupt-driven [`Nvme`] is signalled and waits.
+///
+/// The idle hook must be `Sync`, so a hook with unsynchronised state is
+/// rejected:
+///
+/// ```compile_fail
+/// use core::cell::Cell;
+/// use osmium_storage::nvme::{Interrupts, IrqSignal};
+/// let signal = IrqSignal::new();
+/// let calls = Cell::new(0);
+/// let idle = || calls.set(calls.get() + 1);
+/// let _ = Interrupts { vector: 0, signal: &signal, idle: &idle };
+/// ```
 #[derive(Clone, Copy)]
 pub struct Interrupts<'d> {
     /// The MSI-X table entry the I/O completion queue raises. The caller
@@ -303,7 +315,14 @@ pub struct Interrupts<'d> {
     /// `sti; hlt`). It may return early or spuriously, and must return
     /// eventually (a timer tick suffices), since the driver enforces its
     /// command timeouts between calls.
-    pub idle: &'d dyn Fn(),
+    ///
+    /// The hook is `Sync` because a shared [`Nvme`] calls it from every CPU
+    /// that runs I/O, possibly at the same time. For I/O commands it runs
+    /// with the queue's [`SpinLock`] held (reads, writes and flushes alike),
+    /// so preemption is disabled: it must not block or yield to the
+    /// scheduler. Halting until the next interrupt is fine, since interrupts
+    /// stay enabled. Admin commands are polled and never call it.
+    pub idle: &'d (dyn Fn() + Sync),
 }
 
 /// Sleeps in `irq`'s idle hook if no interrupt has arrived since `seen`
@@ -407,7 +426,8 @@ pub struct Nvme<'d, D: DmaAllocator + ?Sized> {
 
 // SAFETY: through `&self` the driver touches only the registers (volatile
 // accesses valid from any CPU), the atomic `broken`, the clock (which is
-// `Sync`), the interrupt hook (documented as callable from any CPU) and the
+// `Sync`), the interrupt hook (`dyn Fn() + Sync`, so callable from any CPU
+// at once) and the
 // I/O queues, each behind its own spin lock. Everything else, including the
 // admin queue and `admin_data`, is reached only through `&mut self`. The DMA
 // buffers inside the locks are exclusively owned and need `D: Sync` to be
