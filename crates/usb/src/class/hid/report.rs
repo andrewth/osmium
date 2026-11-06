@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Extracting values from, and packing values into, HID reports using a
 //! parsed [`ReportDescriptor`].
 //!

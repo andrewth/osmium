@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Allocation that reports failure instead of panicking.
 //!
 //! The kernel heap returns null when it runs out of memory, and the

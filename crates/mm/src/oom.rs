@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Out-of-memory victim selection.
 //!
 //! When an allocation fails and nothing can be reclaimed, something has to

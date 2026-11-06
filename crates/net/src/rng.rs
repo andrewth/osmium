@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Random numbers for TCP initial sequence numbers, DHCP transaction ids,
 //! DNS query ids and ephemeral ports.
 

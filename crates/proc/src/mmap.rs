@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The address range `mmap` hands out, and which parts of it are free.
 
 use alloc::sync::Arc;

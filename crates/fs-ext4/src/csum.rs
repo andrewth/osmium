@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The checksums ext4 uses: CRC32C (Castagnoli) for `metadata_csum` and
 //! CRC16 (ANSI) for group descriptors under `uninit_bg`. Both are Linux's
 //! raw forms, with no inversion on the way in or out; callers pass the seed.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Packet formats: Ethernet II, ARP, IPv4, ICMP echo, UDP and TCP headers
 //! (the last two over IPv4 or IPv6; see [`ipv6`](crate::ipv6) for the rest of IPv6),
 //! parsed from and written into byte slices, and the Internet checksum.

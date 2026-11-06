@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Recompiles the test tables. The .aml files are checked in so the tests need no ACPI compiler; run this
 # (it needs `iasl`) after changing an .asl file. -oa keeps the compiler from folding constant expressions
 # the tests exist to run.

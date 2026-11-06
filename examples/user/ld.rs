@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A minimal program interpreter (RISC-V only), the `PT_INTERP` of
 //! `/bin/dyn`. The kernel loads it beside the program, with `AT_BASE` set to
 //! its own load address, and starts it instead of the program. It relocates

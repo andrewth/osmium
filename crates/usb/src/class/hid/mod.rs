@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB HID: report descriptors and the devices driven through them, plus
 //! boot-protocol keyboards (class 03/01/01).
 //!

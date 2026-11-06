@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A software ConnectX for host tests: PCI configuration space, BAR 0 with
 //! the command register, the UAR pages, and enough firmware to check what
 //! the driver asks of it.

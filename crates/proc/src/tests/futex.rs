@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Futexes against the memory system: operations racing `fork` and
 //! `munmap` on other CPUs never fault, do file I/O or shoot down other CPUs

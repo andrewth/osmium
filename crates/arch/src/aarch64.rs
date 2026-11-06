@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! AArch64 system registers and memory-attribute conventions.
 //!
 //! Reads and writes of EL1/EL2 registers trap when executed at EL0.

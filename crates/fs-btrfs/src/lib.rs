@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A btrfs file system on any [`BlockDevice`], read and write, for the
 //! `osmium-fs` VFS.
 //!

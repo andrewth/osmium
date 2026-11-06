@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use super::Trap;
 
 /// A simulated trap frame for hosted builds of architectures without a

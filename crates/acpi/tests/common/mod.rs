@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A host that is a few maps, and helpers for loading compiled test tables.
 #![allow(dead_code, clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

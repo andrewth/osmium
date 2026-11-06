@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Restartable system calls.
 //!
 //! A blocked call that a signal interrupts fails with `EINTR` inside the

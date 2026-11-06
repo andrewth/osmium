@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Fragmentation and reassembly for IPv6 on an [`Interface`]: datagrams
 //! larger than the MTU are sent in pieces (except TCP, which sizes its
 //! segments to fit), and pieces that arrive are put back together within

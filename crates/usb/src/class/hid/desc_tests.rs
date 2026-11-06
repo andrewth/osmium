@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Tests of report descriptor parsing, report decoding and the descriptor-driven devices.
 
 // Tests drop drivers explicitly to end their borrow of the fake device.

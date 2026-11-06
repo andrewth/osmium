@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The System Use Sharing Protocol and the Rock Ridge entries carried in it
 //! (IEEE P1281 and P1282).
 

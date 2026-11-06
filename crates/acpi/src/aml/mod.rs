@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An AML interpreter: the ACPI namespace and the control methods in it.
 //!
 //! ```ignore

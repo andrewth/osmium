@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Boot-protocol parsing.
 //!
 //! - [`fdt`]: Flattened Device Tree (DTB) parsing, zero-copy and heap-free,

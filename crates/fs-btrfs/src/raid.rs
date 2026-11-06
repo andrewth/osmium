@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Striped and mirrored chunks: mapping a logical range onto the stripes of
 //! its chunk, and rebuilding a RAID5 or RAID6 strip from the others.
 

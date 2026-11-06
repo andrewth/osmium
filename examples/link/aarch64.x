@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Shared by the AArch64 examples (aarch64-virt, aarch64-hyp, aarch64-vhe).
    QEMU virt: RAM starts at 0x40000000 and, for ELF kernels, the device tree
    is placed at its base, so the kernel is linked above it. */

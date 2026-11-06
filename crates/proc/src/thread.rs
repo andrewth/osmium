@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Threads: tasks that share one process's address space, files and signal
 //! dispositions.
 //!

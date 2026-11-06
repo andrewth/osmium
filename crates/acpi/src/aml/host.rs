@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! What the interpreter needs from the machine it runs on.
 
 use alloc::string::String;

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 .section .text.osmium_trap, "ax", @progbits
 .balign 4
 .globl osmium_trap_entry

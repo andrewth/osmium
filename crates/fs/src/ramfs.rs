@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A file system kept entirely in memory (tmpfs).
 
 use alloc::string::String;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use std::string::{String, ToString};
 use std::vec::Vec;
 use std::{format, vec};

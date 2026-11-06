@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! NS16550A-compatible UART.
 
 use osmium_hal::ioext::IoMemExt;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! x86_64 registers and instructions: port I/O, MSRs, control registers, CPUID.
 //!
 //! Everything here is privileged; on a hosted target the functions compile

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! SVM enablement and the VMRUN world switch (bare-metal x86_64).
 //!
 //! `osmium_svm_run` saves the host's callee-saved registers on its stack,

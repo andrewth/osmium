@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! PSCI for guests: version, features and power off, and with
 //! [`GuestCpus`] the SMP calls (`CPU_ON`, `CPU_OFF`, `AFFINITY_INFO`).
 

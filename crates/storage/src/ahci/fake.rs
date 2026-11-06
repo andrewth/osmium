@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A software AHCI HBA for host tests, with RAM disks on its ports.
 //!
 //! The register file is ordinary memory that the driver reaches through an

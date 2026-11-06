@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Display demos: find a PCI display adapter, set a mode and draw colour
 //! bars that `scripts/screen.py` can check in a QEMU screendump.
 

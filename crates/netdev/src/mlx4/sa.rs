@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Subnet administration: the one request IPoIB needs, joining a multicast
 //! group (a SubnAdmSet of a MCMemberRecord), and its answer.
 //!

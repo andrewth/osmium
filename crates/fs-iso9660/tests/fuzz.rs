@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! A hostile ISO 9660 image must not panic or hang the driver. Valid images
 //! (plain, Rock Ridge with a continuation, Joliet) are built here, random

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! LZO decompression as btrfs stores it (`fs/btrfs/lzo.c` in Linux): a
 //! sequence of length-prefixed LZO1X segments, each the compression of at most
 //! one sector.

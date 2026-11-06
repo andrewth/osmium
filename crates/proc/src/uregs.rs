@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The user-visible registers of a trap frame, as signals and threads need
 //! them, behind one portable trait, and each architecture's Linux signal
 //! frame (`struct rt_sigframe`).

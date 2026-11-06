@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The JBD2 journal: replay at mount, and write-ahead logging of metadata.
 //!
 //! Every operation collects the metadata blocks it changes in memory (`Fs::tx`).

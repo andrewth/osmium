@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `pipe` and `pipe2`: ends, readiness, capacity, hang-up and `SIGPIPE`.
 
 use std::sync::Mutex;

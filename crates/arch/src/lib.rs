@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! CPU primitives for x86_64, AArch64 and RISC-V 64.
 //!
 //! This is the lowest Osmium layer. It wraps the handful of instructions that

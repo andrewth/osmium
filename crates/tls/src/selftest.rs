@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A power-on check of the whole TLS stack, with no network.
 
 use alloc::sync::Arc;

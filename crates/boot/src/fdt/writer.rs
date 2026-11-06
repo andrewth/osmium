@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use alloc::vec::Vec;
 
 use super::{BEGIN_NODE, END, END_NODE, MAGIC, PROP};

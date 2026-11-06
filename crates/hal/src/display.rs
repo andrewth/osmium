@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Linear framebuffers.
 //!
 //! Every display driver ends in the same place: a block of memory the CPU

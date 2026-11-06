@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB Ethernet, CDC Network Control Model (communications class 02/0d/00).
 //!
 //! An NCM function is laid out like an [ECM](super::ecm) one: a

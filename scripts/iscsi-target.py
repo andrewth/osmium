@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """A minimal iSCSI target (RFC 7143) serving one raw image as LUN 0.
 
 Standard library only. One connection at a time, error recovery level 0;

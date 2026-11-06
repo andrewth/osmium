@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The second extended file system and its successors ext3 and ext4, read
 //! and write, over any [`BlockDevice`].
 //!

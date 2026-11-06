@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An Ethernet port: one completion queue and one raw Ethernet queue pair
 //! (see [`queue`](super::queue) for the rings they share with InfiniBand
 //! ports).

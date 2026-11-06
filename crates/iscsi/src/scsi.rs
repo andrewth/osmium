@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The SCSI commands a block initiator needs (SPC-4, SBC-3), and parsing of
 //! what they return.
 //!

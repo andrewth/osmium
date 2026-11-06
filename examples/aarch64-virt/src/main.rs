@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A small kernel for QEMU's AArch64 `virt` machine (GICv2 or GICv3), built entirely
 //! from Osmium components. QEMU starts ELF kernels at EL1 with the MMU off
 //! and the device tree at the base of RAM.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! HID devices driven by their report descriptors: a generic [`HidDevice`]
 //! that fetches and parses the descriptor and reads input reports, and on
 //! top of it [`HidKeyboard`] and [`HidMouse`], which turn reports into key

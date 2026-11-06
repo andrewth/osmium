@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! UHCI USB 1.1 host controller (Intel Universal Host Controller Interface
 //! 1.1, PCI class 0c/03/00).
 //!

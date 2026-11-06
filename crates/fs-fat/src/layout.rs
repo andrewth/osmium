@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The on-disk layout: the BIOS Parameter Block in sector 0 and the FSInfo
 //! sector (Microsoft FAT specification §3, §5).
 

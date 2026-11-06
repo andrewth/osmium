@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! VMX enablement and the VMLAUNCH/VMRESUME world switch (bare-metal x86_64).
 //!
 //! `osmium_vmx_run` saves the host's callee-saved registers on its stack,

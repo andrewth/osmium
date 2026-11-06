@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A submission/completion queue pair.
 //!
 //! The driver writes 64-byte commands at the submission queue's tail; the

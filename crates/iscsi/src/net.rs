@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! How a session reaches the network stack.
 
 use osmium_hal::net::NetDevice;

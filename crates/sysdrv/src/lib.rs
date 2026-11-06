@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! System device drivers built on `osmium-hal`: UARTs, interrupt controllers, timers, firmware interfaces and IOMMUs.
 //!
 //! | Driver | Device | Implements |

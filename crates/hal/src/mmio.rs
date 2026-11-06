@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Memory-mapped I/O.
 //!
 //! Describe a device's register block as a `#[repr(C)]` struct of

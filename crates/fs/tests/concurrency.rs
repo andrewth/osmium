@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! The VFS and RamFs under real threads: path walks, creation races, renames
 //! and removals at once, through a mount point too.

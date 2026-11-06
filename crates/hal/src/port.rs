@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Typed x86 I/O ports.
 
 use core::marker::PhantomData;

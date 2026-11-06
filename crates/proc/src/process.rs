@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Processes: an address space, open files and an exit status, attached to
 //! the task that runs them.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! What a DHCPv6 client ([`Dhcp6Client`](crate::dhcp6::Dhcp6Client)) does to
 //! an [`Interface`]: adds the addresses it leased, with their lifetimes, and
 //! sets the DNS servers it learned.

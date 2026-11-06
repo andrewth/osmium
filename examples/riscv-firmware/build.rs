@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Links with the M-mode script: QEMU virt starts M-mode code at the base of
 //! RAM.
 

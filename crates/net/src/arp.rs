@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The neighbor cache: IPv4 to MAC mappings learned over ARP.
 
 use alloc::vec::Vec;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The HCA command register (HCR) and the big-endian contexts commands carry.
 //!
 //! Every structure the device reads or writes is a sequence of big-endian

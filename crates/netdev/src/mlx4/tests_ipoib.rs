@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IP over InfiniBand against the simulated HCA and a pretend subnet
 //! administrator.
 

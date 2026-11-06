@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Readiness notification: the queue of wakers a file tells when what its
 //! [`File::poll`](crate::File::poll) reports may have changed.
 //!

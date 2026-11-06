@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Task queues whose links live in the [`Task`] itself, so queueing a task
 //! never allocates: a wake-up, a preemption or a block cannot run out of
 //! memory.

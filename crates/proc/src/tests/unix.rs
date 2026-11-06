@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! `AF_UNIX` sockets: names in the file system and abstract names, streams
 //! and datagrams, and file descriptors and credentials in ancillary data.

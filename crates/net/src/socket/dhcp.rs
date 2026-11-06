@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A DHCPv4 client (RFC 2131) that configures its interface.
 
 use alloc::vec::Vec;

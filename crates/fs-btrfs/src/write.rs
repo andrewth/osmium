@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Transactions: copy-on-write edits of the trees.
 //!
 //! A [`Tx`] copies each tree block it changes to a newly allocated address

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Async counterparts of the device-class traits.
 //!
 //! [`AsyncBlockDevice`], [`AsyncSerialPort`] and [`AsyncNetDevice`] mirror

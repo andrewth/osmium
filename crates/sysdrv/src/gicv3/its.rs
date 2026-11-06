@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The GICv3 interrupt translation service (ITS).
 //!
 //! An ITS turns a device's message-signalled interrupt into an LPI. The

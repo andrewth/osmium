@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! PCIe extended capabilities and Single Root I/O Virtualization.
 //!
 //! A physical function with the SR-IOV capability can present up to

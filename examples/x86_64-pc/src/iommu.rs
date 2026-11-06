@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IOMMU demo: Intel VT-d or AMD-Vi, whichever the firmware describes in its
 //! DMAR or IVRS table, put in front of QEMU's `iommu-testdev`.
 //!

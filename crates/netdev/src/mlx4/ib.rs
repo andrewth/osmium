@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An InfiniBand port: queue pair 0 and 1 for management, and an
 //! unreliable datagram (UD) queue pair for data, each with its own
 //! completion queue.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Random numbers for kernels: entropy sources and a ChaCha20 generator.
 //!
 //! - [`EntropySource`]: something that produces unpredictable bytes, slowly.

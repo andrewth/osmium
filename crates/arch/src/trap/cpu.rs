@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Per-CPU trap-entry state shared by the RISC-V and AArch64 stubs.
 
 use core::sync::atomic::{AtomicU64, Ordering};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The ChaCha20 block function (RFC 8439).
 
 /// The ChaCha20 block for `key`, block `counter` and `nonce`, as 64 bytes.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A kernel heap usable as `#[global_allocator]`.
 //!
 //! Requests of up to 2 KiB are served from eight power-of-two size classes,

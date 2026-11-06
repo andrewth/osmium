@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Sockets and the set an interface serves.
 
 use alloc::vec::Vec;

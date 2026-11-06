@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Selects the bare-metal backend for freestanding targets, and the
 //! host-simulation backend everywhere else.
 fn main() {

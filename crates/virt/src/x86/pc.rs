@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Booting PC guests the PVH way: the `hvm_start_info` a PVH kernel finds
 //! in `ebx`, its memory map, and the ACPI tables (RSDP, XSDT and a MADT
 //! listing the local APICs and the I/O APIC) it reads its CPUs and

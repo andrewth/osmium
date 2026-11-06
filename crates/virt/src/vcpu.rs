@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Virtual CPUs and exit handling.
 
 use alloc::sync::Arc;

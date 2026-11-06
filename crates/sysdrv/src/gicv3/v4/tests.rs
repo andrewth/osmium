@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Tests drop drivers explicitly to end their use of the fake register memory
 // before inspecting it.
 #![allow(clippy::drop_non_drop)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Queued signals (`rt_sigqueueinfo`, and real-time signals from `kill`),
 //! the alternate signal stack (`sigaltstack`) and `rt_sigsuspend`.
 //!

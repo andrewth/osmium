@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Builds the user programs in `examples/user` for the kernel's target, for
 //! `demos::user` to embed: static ELFs linked at `demos::user::USER_BASE`
 //! and, on RISC-V, the position-independent programs too.

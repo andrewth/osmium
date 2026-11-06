@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A position-independent executable (RISC-V only). It keeps pointers in
 //! static data, which only work once something has applied its relative
 //! relocations: the kernel, for a static PIE, or the interpreter named in

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Running out of memory in the middle of an ext2/3/4 call is `ENOMEM`, and
 //! leaves a file system `e2fsck` finds clean: no leaked block or inode.

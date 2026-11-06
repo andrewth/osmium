@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! x86 High Precision Event Timer (HPET).
 //!
 //! One free-running main counter (at least 10 MHz, 32 or 64 bits wide) and a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A Zstandard decoder (RFC 8878), for compressed extents.
 //!
 //! The whole output lives in the caller's buffer, which doubles as the match window, so the decoder needs no

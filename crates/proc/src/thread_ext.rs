@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Per-thread state for restartable system calls and priority inheritance,
 //! kept apart from [`crate::thread::Thread`] proper.
 

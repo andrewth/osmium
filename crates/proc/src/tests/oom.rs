@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Running out of memory in the middle of a system call is an error, and
 //! leaves nothing behind. Each test fails every allocation of an operation in

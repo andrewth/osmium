@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Osmium: a separable toolkit for building operating systems, firmware and
 //! hypervisors.
 //!

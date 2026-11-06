@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Decoding the x86 instruction behind a nested page fault, so the access
 //! can be emulated as MMIO. Covers the moves drivers use for device
 //! registers: `MOV r/m, r` (88, 89), `MOV r, r/m` (8A, 8B), `MOV r/m, imm`

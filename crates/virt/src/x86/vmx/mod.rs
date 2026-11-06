@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An Intel VMX vCPU.
 //!
 //! [`VmxVcpu`] owns a VMCS and runs a guest with EPT, VPID and unrestricted

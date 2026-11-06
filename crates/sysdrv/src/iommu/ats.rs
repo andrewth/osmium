@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Wire formats for invalidating a device's ATS translation cache.
 //!
 //! When a mapping changes, an IOMMU whose device has ATS on must also tell

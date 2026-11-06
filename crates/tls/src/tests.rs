@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use std::io::{Read, Write};
 use std::string::{String, ToString};
 use std::sync::Arc;

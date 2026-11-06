@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! File system operations, each run inside a transaction.
 
 use alloc::vec::Vec;

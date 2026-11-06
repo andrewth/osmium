@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The file system layer: a virtual file system that resolves paths across
 //! mounted file systems.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IPv4 multicast group membership: IGMPv2 (RFC 2236) with the multicast
 //! MAC mapping of RFC 1112.
 //!

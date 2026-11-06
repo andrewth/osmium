@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Balance: moving the contents of block groups to other ones and deleting
 //! the emptied chunks.
 //!

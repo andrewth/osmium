@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering, fence};

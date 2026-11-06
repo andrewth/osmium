@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The hypervisor's choice between AMD SVM and Intel VMX. The first CPU
 //! picks whichever extension the processor has; everything else (page
 //! tables, vCPU pages and the vCPU itself) follows through the types here,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! x86 I/O APIC: routes external interrupt lines (global system interrupts)
 //! to local-APIC vectors.
 

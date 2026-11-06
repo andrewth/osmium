@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! POSIX signals: dispositions, masks, pending sets, and delivery to a user
 //! handler on a signal frame.
 //!

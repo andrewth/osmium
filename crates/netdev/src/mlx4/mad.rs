@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Management datagrams: the wire headers the special queue pairs build by
 //! hand, and the directed-route rules a channel adapter follows (IBA
 //! volume 1, section 14.2.2).

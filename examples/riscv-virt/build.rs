@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Links with the RISC-V S-mode script shared by the examples. The user
 //! programs are built by the `demos` crate.
 

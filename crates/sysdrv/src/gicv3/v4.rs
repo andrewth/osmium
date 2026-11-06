@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! GICv4.0 virtual LPIs: direct injection of a device's MSIs into a guest.
 //!
 //! A hypervisor gives each virtual CPU a *vPE*: an ID the ITS knows it by

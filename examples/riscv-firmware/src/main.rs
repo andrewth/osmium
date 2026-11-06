@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Machine-mode RISC-V firmware for QEMU `virt`, built from Osmium parts,
 //! with no heap, no scheduler and no OpenSBI (`-bios none`).
 //!

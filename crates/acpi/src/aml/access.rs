@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Reading and writing objects and references, and the implicit conversions between data types.
 
 use alloc::string::String;

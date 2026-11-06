@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `futex`: wait, wake, requeue, `WAKE_OP`, bitsets, timeouts and robust
 //! lists. Enough for `pthread_join`, mutexes and condition variables.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! ext2 and ext4 under real threads: creation races, renames over targets,
 //! files unlinked while others hold them open (the orphan list), and nodes

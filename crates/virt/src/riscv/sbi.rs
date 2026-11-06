@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A minimal SBI implementation for guests: enough for a console, a timer
 //! and shutdown.
 

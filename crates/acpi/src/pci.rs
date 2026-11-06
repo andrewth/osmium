@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! PCI interrupt routing: the `_PRT` tables of host bridges and PCI-to-PCI bridges.
 
 use alloc::vec::Vec;

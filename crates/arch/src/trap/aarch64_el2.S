@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 .section .text.osmium_trap, "ax"
 // Lower-EL vectors 8-11 are guest exits while a vCPU runs on this CPU
 // (TrapCpu.guest != 0): they branch to osmium_el2_guest_exit (osmium-virt)

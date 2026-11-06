@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ICMP echo (ping) sockets. The interface answers echo requests itself;
 //! these sockets send requests and collect the replies.
 

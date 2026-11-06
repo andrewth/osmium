@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Time as the caller reports it.
 
 use core::ops::{Add, Sub};

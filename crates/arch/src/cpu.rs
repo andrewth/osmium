@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! CPU identity, idling and the monotonic counter.
 
 pub use imp::{current_id, set_current_id, ticks, wait_for_interrupt};

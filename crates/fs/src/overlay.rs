@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A union of directory trees: a writable upper tree over read-only lower
 //! ones.
 //!

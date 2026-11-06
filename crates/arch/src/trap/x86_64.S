@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 .section .text.osmium_trap, "ax"
 osmium_trap_stub_0:
     push 0

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! On-disk structures: the superblock, keys, tree block headers and the items
 //! this driver reads. Every field is little-endian; every parser checks its
 //! lengths and fails with `EIO` on a short or inconsistent structure.

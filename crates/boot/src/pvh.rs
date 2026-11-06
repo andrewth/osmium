@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The PVH boot protocol (Xen `hvm_start_info`), used by QEMU, Firecracker
 //! and Cloud Hypervisor to start x86 kernels directly in 32-bit protected
 //! mode.

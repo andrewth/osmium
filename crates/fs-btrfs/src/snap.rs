@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Subvolumes and snapshots: creating them, and deleting them, which unlinks
 //! the subvolume at once and then drops its tree a few blocks per transaction.
 //!

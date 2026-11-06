@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Synthetic trees whose contents are generated when they are read: the
 //! machinery under a `/proc`- or `/sys`-like file system, with none of the
 //! layout of either.

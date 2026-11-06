@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `pipe` and `pipe2`: a byte stream in memory with a read end and a write
 //! end, each its own open file description.
 

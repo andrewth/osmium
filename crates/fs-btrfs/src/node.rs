@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Tree blocks as a transaction edits them: decoded into items or pointers,
 //! and encoded back with a fresh checksum when the transaction commits.
 

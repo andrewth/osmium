@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Position-independent and dynamically linked executables: load bias,
 //! relocation by the kernel, interpreters and the auxiliary vector, and
 //! hostile variants of each.

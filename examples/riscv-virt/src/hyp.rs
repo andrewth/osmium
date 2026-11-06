@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Runs a tiny guest in VS-mode with the H extension: it prints through an
 //! emulated 16550 (MMIO exits), reads the UART's status register, prints
 //! through the SBI debug console (hypercalls), spins long enough for host

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IPv6 on an [`Interface`]: link-local and autoconfigured addresses,
 //! duplicate address detection, neighbor discovery in place of ARP, router
 //! discovery for SLAAC, ICMPv6 echo, and UDP and TCP delivery.

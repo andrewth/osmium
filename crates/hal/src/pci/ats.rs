@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! PCIe Address Translation Services and Process Address Space IDs.
 //!
 //! A function with the ATS capability can ask its IOMMU for translations and

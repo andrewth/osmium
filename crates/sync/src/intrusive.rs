@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Intrusive linked lists and search trees: the links live inside the
 //! elements, so inserting and removing never allocates.
 //!

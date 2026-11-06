@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Where file systems get the time from.
 //!
 //! No file system reads hardware itself. Time comes from a [`Clock`], which

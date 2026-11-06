@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 //! Helpers shared by the maintenance tests (scrub, balance, devices): image
 //! files as block devices, `mkfs.btrfs` and `btrfs check`.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Each architecture's Linux signal frame, built from and restored into a
 //! stand-in with that architecture's trap-frame fields: the same register

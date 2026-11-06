@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Priority-inheritance futexes: `FUTEX_LOCK_PI`, `FUTEX_LOCK_PI2`,
 //! `FUTEX_UNLOCK_PI` and `FUTEX_TRYLOCK_PI`.
 //!

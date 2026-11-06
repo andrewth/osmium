@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Swap: pages written out to a backing store so that their frames can be
 //! used for something else, and read back when touched.
 //!

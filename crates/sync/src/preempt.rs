@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The per-CPU preemption counter.
 //!
 //! A scheduler may only switch tasks involuntarily on a CPU whose count is

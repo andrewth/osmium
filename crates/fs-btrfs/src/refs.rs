@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The extent tree's references: a transaction's pending changes to the
 //! reference counts of tree blocks and data extents, applied to the extent
 //! items and the keyed references beside them.

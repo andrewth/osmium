@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! NVM Express (NVMe) storage controllers.
 //!
 //! [`Nvme`] brings a controller up from its registers (PCI BAR 0, class

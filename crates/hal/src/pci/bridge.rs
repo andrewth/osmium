@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! PCI-to-PCI bridge walking.
 //!
 //! [`for_each_function`](super::for_each_function) scans bus numbers

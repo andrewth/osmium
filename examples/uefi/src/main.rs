@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A UEFI application: finds the Graphics Output Protocol, switches to an
 //! 800x600 mode (or keeps the current one) and draws colour bars on the linear framebuffer. Then it
 //! does what a loader does: finds the ACPI RSDP among the configuration tables, reads

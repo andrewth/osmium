@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Generic multi-level page tables.
 //!
 //! [`PageTable`] implements the walk, map, unmap, translate and protect logic

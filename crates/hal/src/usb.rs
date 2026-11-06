@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB: wire formats and the host-controller interface.
 //!
 //! The types here are the USB 2.0/3.x chapter 9 formats (setup packets and

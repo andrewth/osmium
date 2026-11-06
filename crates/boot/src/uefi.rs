@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! UEFI: enough of the system table for a UEFI application or loader to
 //! print, find the Graphics Output Protocol (GOP), set a mode and take its
 //! linear framebuffer, read files from the volume it was loaded from,

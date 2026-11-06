@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A polled IPv4 and IPv6 network stack over any [`NetDevice`].
 //!
 //! - [`Interface`]: one Ethernet interface with an IPv4 address and, once

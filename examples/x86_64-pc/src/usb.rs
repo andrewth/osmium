@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB 1.1 and 2.0 host controllers under QEMU: the EHCI controller
 //! first, so that it hands the low- and full-speed devices on its ports to
 //! its companion UHCI controllers, then every UHCI controller on bus 0

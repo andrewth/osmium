@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! End-to-end tests against images made by `xorriso` and `genisoimage`.
 //! Each test fails if its tool is missing, unless `OSMIUM_SKIP_TOOL_TESTS=1`

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use super::*;
 use crate::gicv3::tests::{Fake, FakeCpu};
 use crate::iommu::testing::{HostDma, HostRegs, Pump, StdClock, mem64};

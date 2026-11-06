@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The Fixed ACPI Description Table (`FACP`): where the power-management registers are.
 
 use osmium_boot::acpi::Table;

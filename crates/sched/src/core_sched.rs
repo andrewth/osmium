@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use alloc::sync::Arc;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};

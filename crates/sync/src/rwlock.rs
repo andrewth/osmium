@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};

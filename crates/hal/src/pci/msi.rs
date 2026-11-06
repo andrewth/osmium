@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Message-signalled interrupts: MSI and MSI-X.
 //!
 //! A function raises a message-signalled interrupt by writing

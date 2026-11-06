@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Transfer Request Blocks (xHCI 1.2 §6.4): the 16-byte entries of every
 //! command, transfer and event ring.
 

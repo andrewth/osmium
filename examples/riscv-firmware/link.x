@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* With -bios none, QEMU virt starts M-mode at the base of RAM. */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)

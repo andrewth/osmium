@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use core::future::poll_fn;
 use core::task::{Poll, Waker};
 

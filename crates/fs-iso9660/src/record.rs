@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Directory records (ECMA-119 section 9.1).
 
 use osmium_fs::{Errno, Timestamp};

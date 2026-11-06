@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Boot-time physical memory accounting.
 
 use crate::addr::{PAGE_SIZE, PhysAddr};

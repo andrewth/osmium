@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! How an [`Interface`] forms its SLAAC addresses: from the MAC address
 //! (the default), as opaque stable identifiers (RFC 7217), and with
 //! temporary addresses beside them (RFC 4941). See [`privacy`].

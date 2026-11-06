@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! zlib compression (RFC 1950 around RFC 1951): greedy LZ77 matching coded
 //! with the fixed Huffman code in a single block. It does not reach what
 //! zlib's dynamic codes do, but every stream it writes is valid and any zlib

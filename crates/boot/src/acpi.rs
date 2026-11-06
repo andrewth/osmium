@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A minimal ACPI table reader: enough to find CPUs, I/O APICs and PCI
 //! ECAM windows without an AML interpreter.
 //!

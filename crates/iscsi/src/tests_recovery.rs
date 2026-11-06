@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Error recovery levels 1 and 2 against the fake target, which loses
 //! PDUs, fails digests, and drops connections on request.
 

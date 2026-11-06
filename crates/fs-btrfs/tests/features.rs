@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Owners, access times, mount options, caches and batching, on images from
 //! `mkfs.btrfs`, checked by `btrfs check`. Skipped, with a note, if the tools

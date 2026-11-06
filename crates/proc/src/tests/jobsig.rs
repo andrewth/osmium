@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Queued signals, the alternate signal stack, `sigsuspend`, and stopping and
 //! continuing. The first group needs no scheduler; the rest run tasks on the

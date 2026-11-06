@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Every system call, thrown hostile argument values. Nothing may panic or
 //! hang; the result itself is whatever the call makes of the nonsense.

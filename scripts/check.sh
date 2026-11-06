@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # The full gate: host tests, clippy and rustdoc on the workspace, the library
 # built for every bare-metal target and type-checked for the two musl
 # targets that save FP registers in the context switch, the self-test of

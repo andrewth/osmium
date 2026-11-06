@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A SATA disk on one AHCI port.
 
 use osmium_hal::block::{BlockDevice, BlockError};

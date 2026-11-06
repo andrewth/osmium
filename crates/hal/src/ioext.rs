@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Panic-free register access for drivers: an access outside the window
 //! reads as all ones and a write is dropped, as on a bus with no device.
 

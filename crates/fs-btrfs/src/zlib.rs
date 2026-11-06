@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! zlib decompression (RFC 1950 framing around RFC 1951 deflate), as btrfs
 //! stores it: one zlib stream per extent.
 //!

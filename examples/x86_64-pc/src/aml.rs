@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The firmware's AML: the DSDT's devices, resources and interrupt routing, and power off through `_S5_`.
 
 use osmium::acpi::aml::{Config, Host, HostError, Interpreter, PciAddress, ROOT};

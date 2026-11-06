@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Permission checks on plain types.
 //!
 //! The VFS does no permission checks and [`Stat`](crate::Stat) carries no

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! File names: validation, 8.3 short names and VFAT long names (Microsoft
 //! FAT specification §6, §7).
 

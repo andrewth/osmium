@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Writing: changes made through the driver to images from `mkfs.btrfs`,
 //! checked by `btrfs check` and read back, by this driver and by

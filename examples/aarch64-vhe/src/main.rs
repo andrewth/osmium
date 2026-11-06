@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A VHE hypervisor for QEMU's AArch64 `virt` machine, built from Osmium
 //! components. QEMU starts ELF kernels at EL2 with `-machine
 //! virt,virtualization=on`; this one sets `HCR_EL2.E2H` and `TGE` before

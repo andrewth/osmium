@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Device nodes: a directory of kernel-provided files, `/dev/null` and
 //! `/dev/zero`.
 

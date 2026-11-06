@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! A volume Linux has balanced: its relocation leaves blocks of a snapshotted
 //! subvolume flagged `RELOC`, written after the last snapshot yet shared, owned

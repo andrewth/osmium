@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The global console behind [`print!`](crate::print) and
 //! [`println!`](crate::println).
 //!

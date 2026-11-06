@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use osmium_arch::irq::{self, IrqState};
 
 use crate::preempt;

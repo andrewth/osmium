@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Tests of interrupt-driven completion, native command queuing and ATAPI
 //! drives, against the fake HBA.
 

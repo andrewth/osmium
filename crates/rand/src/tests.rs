@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use super::*;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

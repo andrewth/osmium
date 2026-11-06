@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `execve`: replacing a process's program with an ELF file from the VFS,
 //! and the kernel hooks that `fork` and `execve` need.
 

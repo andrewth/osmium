@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The interpreter: state, loading definition blocks, and the entry points that run control methods.
 
 use alloc::collections::{BTreeMap, BTreeSet};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `newc` cpio archives, the format of a Linux initramfs.
 
 use alloc::string::String;

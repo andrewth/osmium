@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Job control: stopping a process with `SIGSTOP`, `SIGTSTP`, `SIGTTIN` or
 //! `SIGTTOU`, continuing it with `SIGCONT`, and reporting both to a parent in
 //! `wait4` (`WUNTRACED`, `WCONTINUED`).

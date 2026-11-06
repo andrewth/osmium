@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Directory entries (Microsoft FAT specification §6, §7).
 
 use alloc::string::String;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! One HTTP/1.1 connection, with no I/O of its own.
 
 use alloc::vec::Vec;

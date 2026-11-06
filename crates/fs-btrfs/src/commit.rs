@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Committing a transaction: the extent tree, data checksums, block groups,
 //! the free space tree and root items brought up to date, then the new
 //! blocks written, then the superblock.

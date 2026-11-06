@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Split virtqueues (virtio 1.x §2.7, legacy §2.4).
 //!
 //! The queue lives in one page-aligned DMA buffer in the legacy layout

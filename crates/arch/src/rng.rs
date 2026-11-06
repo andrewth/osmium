@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Hardware random numbers.
 //!
 //! | Architecture | [`random`] | [`seed`] | Detected by |

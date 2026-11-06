@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Arm SMMUv3.
 //!
 //! [`Smmuv3`] drives one System MMU. Its [`Iommu`] implementation is stage 2

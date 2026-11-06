@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ECDSA P-256 with SHA-256: signing for the server, and verification.
 
 use alloc::boxed::Box;

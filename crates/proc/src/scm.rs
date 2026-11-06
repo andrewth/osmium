@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The user-memory side of `AF_UNIX` sockets: `struct sockaddr_un` and the
 //! ancillary data (`struct cmsghdr`) of `sendmsg` and `recvmsg`.
 

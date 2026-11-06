@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The Bochs VBE ("DISPI") display interface.
 //!
 //! This is the hardware behind QEMU's VESA BIOS: Bochs and QEMU's standard

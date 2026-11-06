@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Fault demos shared by the example kernels: recovering from a breakpoint
 //! and a page fault, and a task that overflows its guarded stack.
 //!

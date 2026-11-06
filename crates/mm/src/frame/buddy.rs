@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::{FrameAllocator, FrameKind, PhysMapper};

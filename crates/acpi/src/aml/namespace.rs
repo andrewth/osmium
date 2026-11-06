@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The ACPI namespace: a tree of named objects.
 
 use alloc::collections::BTreeMap;

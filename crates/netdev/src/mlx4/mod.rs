@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Mellanox ConnectX, ConnectX-2 and ConnectX-3 (mlx4): Ethernet,
 //! InfiniBand and IPoIB.
 //!

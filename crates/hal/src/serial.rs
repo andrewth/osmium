@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Byte-oriented serial ports.
 
 use core::fmt;

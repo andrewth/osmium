@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Split virtqueues (virtio 1.x §2.7), read from and written to guest memory.
 
 use alloc::vec::Vec;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Page-table entry encodings.
 //!
 //! | Format | Use | Levels | Input bits |

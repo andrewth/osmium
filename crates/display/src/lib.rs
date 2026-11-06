@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Display drivers built on `osmium-hal`.
 //!
 //! Each driver ends in an [`osmium_hal::display::Display`]: a linear

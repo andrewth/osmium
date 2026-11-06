@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 .section .text.osmium_trap, "ax"
 // OSMIUM_VHE (set by the including global_asm!) is 1 for a VHE host
 // (`aarch64-vhe`): the kernel runs at EL2 with HCR_EL2.E2H set, and the

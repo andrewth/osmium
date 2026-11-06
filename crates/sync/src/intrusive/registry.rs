@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A non-owning ordered index over elements that embed a [`TreeLink`].
 
 use core::ptr::NonNull;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Extended attributes: those in the inode's spare space after its fixed
 //! fields, and those in its external block.
 //!

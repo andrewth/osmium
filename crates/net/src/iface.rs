@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An Ethernet interface: ARP, IPv4 routing to the next hop, ICMP echo, and
 //! the glue between a device and the sockets.
 

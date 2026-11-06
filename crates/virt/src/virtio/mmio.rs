@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The virtio-mmio transport, version 2 (virtio 1.x §4.2), as a [`BusDevice`].
 //!
 //! # Locking

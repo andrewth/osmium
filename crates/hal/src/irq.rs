@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Interrupt controllers and handler dispatch.
 
 use osmium_sync::{IrqDisabled, RwSpinLock};

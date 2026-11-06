@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Network device drivers built on `osmium-hal`, each a [`NetDevice`](osmium_hal::net::NetDevice).
 //!
 //! | Driver | Device | Implements |

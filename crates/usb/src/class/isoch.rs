@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Streaming helpers for isochronous endpoints, generic over any
 //! [`IsochHost`].
 //!

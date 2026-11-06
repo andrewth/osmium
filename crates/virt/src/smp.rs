@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The CPUs of a multi-vCPU guest: start/stop state, IPI and remote-fence
 //! lines, and kicks of vCPUs running on other host CPUs.
 //!

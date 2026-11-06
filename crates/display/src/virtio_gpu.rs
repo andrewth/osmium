@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio-gpu, 2D: a framebuffer in guest RAM that the device scans out.
 //!
 //! The driver keeps one host resource per mode. [`VirtioGpu::set_mode`]

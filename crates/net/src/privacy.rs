@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Interface identifiers that do not give a host away: semantically opaque
 //! stable ones (RFC 7217) and temporary ones (RFC 4941).
 //!

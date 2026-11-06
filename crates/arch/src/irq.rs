@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Local interrupt-flag control.
 //!
 //! These functions affect only the calling CPU. They are safe: enabling

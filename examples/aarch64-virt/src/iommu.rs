@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IOMMU demo: the Arm SMMUv3 that QEMU's `virt,iommu=smmuv3` puts in front
 //! of its PCI bus, with QEMU's `iommu-testdev` behind it.
 //!

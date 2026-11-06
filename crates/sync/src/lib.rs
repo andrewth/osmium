@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Synchronization primitives for kernels, firmware and hypervisors.
 //!
 //! - [`SpinLock`]: a fair ticket lock, generic over a [`Guardian`] that runs

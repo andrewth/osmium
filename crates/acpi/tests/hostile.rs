@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! AML is firmware's, and firmware is not trusted: hostile and broken tables must fail cleanly. Nothing
 //! here may panic (debug builds also trap arithmetic overflow), hang, recurse off the stack or allocate
 //! without bound.

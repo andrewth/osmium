@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! InfiniBand ports against the simulated HCA: bring-up, the subnet
 //! manager's management datagrams on queue pair 0, general services on
 //! queue pair 1, datagrams and multicast.

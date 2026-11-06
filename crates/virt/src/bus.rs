@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Routing guest MMIO and port I/O to emulated devices.
 
 use alloc::collections::BTreeMap;

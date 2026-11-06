@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! One HBA port: its registers, its DMA memory (command list, received-FIS
 //! area, a command table per slot), and running commands through its slots:
 //! one at a time through slot 0, or several queued (NCQ) at once.

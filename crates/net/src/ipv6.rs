@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IPv6 packet formats: the IPv6 header with its extension headers, ICMPv6
 //! (echo and neighbor discovery, RFC 4443 and RFC 4861), and the address
 //! arithmetic that stateless autoconfiguration needs.

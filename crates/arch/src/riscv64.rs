@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! RISC-V 64 CSRs, `satp` encoding and the Supervisor Binary Interface.
 
 use core::arch::asm;

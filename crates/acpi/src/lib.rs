@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ACPI: reading the firmware's description of the machine and driving its power management.
 //!
 //! - [`aml`]: an AML interpreter. It loads the DSDT and SSDTs into a namespace, runs control methods

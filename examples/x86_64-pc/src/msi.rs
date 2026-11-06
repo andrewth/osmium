@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! MSI-X under QEMU: an NVMe controller's admin completions arrive as
 //! message-signalled interrupts at [`VECTOR`] on this CPU's local APIC.
 //!

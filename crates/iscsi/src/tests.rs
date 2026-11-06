@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! End-to-end tests: the initiator on one osmium-net interface against the
 //! fake target in [`crate::testing`] on another.
 

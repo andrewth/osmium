@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! What the example hypervisors share: a console for guests' UARTs, guest
 //! images placed by QEMU's loader or linked into the host, and the
 //! bookkeeping of a guest whose vCPUs run on several host CPUs.

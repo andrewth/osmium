@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB Ethernet, CDC Ethernet Control Model (communications class 02/06/00).
 //!
 //! An ECM function is two interfaces: a communications interface carrying

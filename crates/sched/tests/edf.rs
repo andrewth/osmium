@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Earliest-deadline-first scheduling with real context switches on the
 //! host: each test thread acts as one CPU. A test binary of its own, since a

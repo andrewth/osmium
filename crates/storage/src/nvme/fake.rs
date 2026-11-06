@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A software NVMe controller for host tests.
 //!
 //! [`Fake::serve`] runs on its own thread and plays the controller over

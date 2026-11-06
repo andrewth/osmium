@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A Zstandard compressor (RFC 8878): greedy LZ77 matching, literals stored
 //! raw, sequences coded with the predefined FSE tables, all in one
 //! single-segment frame with one block. The output is an ordinary frame that

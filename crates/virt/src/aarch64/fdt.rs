@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Device trees for AArch64 guests.
 
 use alloc::format;

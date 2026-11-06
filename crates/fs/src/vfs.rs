@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The namespace: absolute path lookup across mounted file systems.
 
 use alloc::string::String;

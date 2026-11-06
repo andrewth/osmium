@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IP over InfiniBand (RFC 4391, 4392) as a [`NetDevice`].
 //!
 //! The stack above speaks Ethernet, so this device translates. A neighbor

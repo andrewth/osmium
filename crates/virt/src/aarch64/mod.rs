@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An AArch64 EL2 vCPU: the guest runs at EL1/EL0 under stage-2
 //! translation, the host kernel at EL2 in one of two ways, chosen at build
 //! time:

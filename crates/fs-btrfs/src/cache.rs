@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A fixed-capacity cache of values by address, for tree blocks and data
 //! sectors: lookups by binary search, replacement in the order of insertion.
 

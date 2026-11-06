@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio-blk.
 //!
 //! Every request is three descriptors: a 16-byte header (type, sector) the

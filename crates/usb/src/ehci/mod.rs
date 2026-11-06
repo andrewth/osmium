@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! EHCI USB 2.0 host controller (Enhanced Host Controller Interface 1.0,
 //! PCI class 0c/03/20).
 //!

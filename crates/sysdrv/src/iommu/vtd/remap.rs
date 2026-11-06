@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Interrupt remapping: the interrupt remapping table (IRT) of 128-bit
 //! entries (IRTEs), the remappable-format MSI message and I/O APIC entry that
 //! select an entry, and the unit's controls for them.

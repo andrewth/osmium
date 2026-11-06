@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An intrusive red-black tree.
 
 use super::bst::{Bst, Detached, KeyAdapter, Ptr, TreeLink, aux, child, dir_of, parent, rd, rotate, set_aux};

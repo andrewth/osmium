@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Waiting for readiness: `poll`, `ppoll`, `select` and `pselect6`, and the
 //! wait queue that `epoll` shares with them.
 //!

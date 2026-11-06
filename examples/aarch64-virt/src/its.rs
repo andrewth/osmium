@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! MSI-X through the GICv3 ITS: an NVMe controller's interrupts arrive as
 //! LPIs.
 //!

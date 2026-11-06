@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Processes, user address spaces and a portable system-call layer.
 //!
 //! A [`Process`] is a user address space ([`UserMemory`], usually an

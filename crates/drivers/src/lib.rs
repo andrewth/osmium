@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The virtio core shared by the device drivers: the [`virtio::Transport`] trait, its MMIO and PCI
 //! implementations ([`virtio::mmio`], [`virtio::pci`]) and the split virtqueue ([`virtio::queue`]).
 //!

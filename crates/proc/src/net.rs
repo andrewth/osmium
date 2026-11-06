@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The network stack that sockets use.
 //!
 //! A kernel hands the socket calls an interface, its device and a socket set

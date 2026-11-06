@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio devices.
 //!
 //! A virtio driver is split the way the specification is: a [`Transport`]

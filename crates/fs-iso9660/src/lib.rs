@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A read-only ISO 9660 file system on any [`BlockDevice`], for the
 //! `osmium-fs` VFS.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `AF_UNIX` sockets, stream or datagram, backed by memory.
 //!
 //! A socket is made by `socket` or `socketpair`. It may be given a name by

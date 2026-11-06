@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! A crash at any point of a change leaves the volume as it was before the
 //! change or as it is after it. Each test records the device writes of one

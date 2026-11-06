@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Host-test support shared by the IOMMU drivers: heap-backed DMA and table
 //! memory whose "physical" addresses are host addresses, register windows
 //! over plain memory, and a thread that plays the hardware.

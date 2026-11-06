@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Snapshots and subvolumes: created, written, and deleted through the
 //! driver, checked by `btrfs check` and read back. Skipped, with a note, if

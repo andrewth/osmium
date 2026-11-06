@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! File identifiers: plain ISO 9660 and Joliet (UCS-2) names.
 
 use alloc::string::String;

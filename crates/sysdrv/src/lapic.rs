@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! x86 local APIC in xAPIC (MMIO) mode.
 
 use osmium_hal::ioext::IoMemExt;

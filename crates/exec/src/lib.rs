@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A heap-free async executor for firmware and small kernels.
 //!
 //! Tasks are `'static` futures placed in a fixed number of slots (`N`), so

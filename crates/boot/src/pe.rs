@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! PE32+ (COFF) image parsing, mapping and base relocation: what a UEFI
 //! firmware or a boot loader needs to load an `.efi` application or a Windows
 //! style kernel.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! TCP connections (RFC 9293), with RFC 6298 retransmission timing.
 //!
 //! A listening socket takes a single connection: on a SYN it turns into

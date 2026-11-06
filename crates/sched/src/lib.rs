@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Tasks, context switching and pluggable scheduling.
 //!
 //! The crate provides the *mechanism*: [`Task`]s with their own stacks, the

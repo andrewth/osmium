@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Reading the volume: physical reads, the chunk map from logical to
 //! physical addresses, checked tree blocks with a small cache, and cursors
 //! that walk a tree in key order.

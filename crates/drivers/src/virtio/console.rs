@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio-console (spec §5.3): a byte stream per port.
 //!
 //! Without `VIRTIO_CONSOLE_F_MULTIPORT` the device has one port (queues 0 and

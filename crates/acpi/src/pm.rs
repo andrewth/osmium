@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Power management: entering ACPI mode, sleep states and power off, reset, and the System Control
 //! Interrupt (SCI) with the fixed events and general-purpose events (GPEs) behind it.
 //!

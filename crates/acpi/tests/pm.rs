@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The FADT, ACPI mode, sleep states, reset, and the SCI with fixed events and GPEs.
 #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

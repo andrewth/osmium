@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! XXH64, the 64-bit xxHash (used by zstd content checksums and btrfs `xxhash64` checksums).
 
 const P1: u64 = 0x9E37_79B1_85EB_CA87;

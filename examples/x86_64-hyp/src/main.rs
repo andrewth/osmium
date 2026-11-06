@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A small hypervisor for QEMU's x86_64 PC (q35) on AMD SVM, built from
 //! Osmium components. QEMU loads the ELF through PVH; the kernel enables
 //! SVM and runs a 32-bit protected-mode guest under nested paging.

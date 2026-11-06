@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The FP/SIMD registers in a signal frame, as Linux lays them out for each
 //! architecture, and the checks a frame from user memory must pass before
 //! `rt_sigreturn` loads them.

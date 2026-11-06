@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Executing AML terms.
 //!
 //! There is no syntax tree. A term is evaluated as it is read, which is why every operand is parsed and

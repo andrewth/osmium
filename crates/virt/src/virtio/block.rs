@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio-blk (device ID 2) over any [`BlockDevice`].
 
 use alloc::vec;

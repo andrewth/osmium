@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Relocating a position-independent executable that has no interpreter
 //! (a "static PIE"): the kernel applies its `RELA` relocations once the
 //! image is loaded at its bias. An image with an interpreter relocates

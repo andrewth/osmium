@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Booting a whole guest kernel the PVH way: an ELF image QEMU's loader
 //! places in host RAM (`-device loader,file=...,addr=0x18000000,force-raw=on`)
 //! entered at its `XEN_ELFNOTE_PHYS32_ENTRY` with `ebx` = an

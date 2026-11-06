@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Path MTU discovery (RFC 1191 for IPv4, RFC 8201 for IPv6): the cache of
 //! what routers have said the path to a destination carries.
 //!

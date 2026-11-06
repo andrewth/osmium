@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A bounds-checked reader over AML bytes.
 
 use super::error::AmlError;

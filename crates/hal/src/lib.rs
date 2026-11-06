@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Hardware abstraction: register access, device-class traits, interrupt
 //! dispatch and the console.
 //!

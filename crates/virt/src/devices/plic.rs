@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;

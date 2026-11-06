@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! AHCI: SATA disks behind an Advanced Host Controller Interface HBA (PCI
 //! class 01/06/01), such as Intel's ICH and QEMU's `ahci` device.
 //!

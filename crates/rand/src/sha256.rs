@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! SHA-256 (FIPS 180-4).
 
 const K: [u32; 64] = [

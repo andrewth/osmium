@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The [`File`] trait: one node (file, directory or device) of a file system.
 
 use alloc::string::String;

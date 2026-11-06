@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Links with the linker script shared by the examples for this architecture.
 
 fn main() {

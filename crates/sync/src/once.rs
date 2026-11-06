@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
 use core::ops::Deref;

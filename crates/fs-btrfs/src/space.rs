@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Space: block groups, their free ranges, and new chunks when they run out.
 //!
 //! Free ranges live in memory, built at mount from the block group items and

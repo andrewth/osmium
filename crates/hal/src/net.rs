@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Network interfaces.
 //!
 //! [`NetDevice`] moves whole Ethernet frames (destination MAC through

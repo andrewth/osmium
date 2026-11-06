@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! GICv4 direct injection: a virtual LPI reaches a guest through the ITS
 //! with no list register and no exit.
 //!

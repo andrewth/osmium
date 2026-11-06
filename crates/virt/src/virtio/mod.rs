@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio device models: the split virtqueue, the virtio-mmio transport,
 //! and devices that plug into it.
 //!

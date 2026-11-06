@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! TLS 1.3 servers for kernels and firmware, built on rustls.
 //!
 //! - [`provider`]: a rustls crypto provider with one cipher suite

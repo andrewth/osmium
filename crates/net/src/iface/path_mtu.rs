@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Path MTU discovery: learning from ICMP "fragmentation needed" and ICMPv6
 //! "packet too big", and telling the connections it affects.
 //!

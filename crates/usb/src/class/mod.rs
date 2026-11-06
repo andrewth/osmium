@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB class drivers, generic over any [`UsbHost`](osmium_hal::usb::UsbHost).
 //!
 //! Each takes a device already [enumerated](osmium_hal::usb::enumerate) and

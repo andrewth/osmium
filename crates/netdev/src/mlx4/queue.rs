@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! What the ports are built on: a completion queue and one queue pair, with
 //! their rings and buffers. A port owns one such set per queue pair it uses.
 //!

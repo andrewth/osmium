@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Reliable connections against the simulated HCA: two queue pairs of one
 //! adapter, on its two ports, connected to each other.
 

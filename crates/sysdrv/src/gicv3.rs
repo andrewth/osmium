@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Arm Generic Interrupt Controller, version 3, with affinity routing.
 //!
 //! A GICv3 has a memory-mapped distributor (shared peripheral interrupts,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IPv4 header options (RFC 791).
 //!
 //! A receiver walks the options once, checking every length so that a

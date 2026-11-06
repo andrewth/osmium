@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Conversions and bit manipulation that need no interpreter state.
 
 use alloc::string::String;

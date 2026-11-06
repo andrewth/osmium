@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Hypervisor building blocks.
 //!
 //! - [`memory`]: [`GuestMemory`], the map from guest-physical addresses to

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Arm PrimeCell PL011 UART.
 
 use osmium_hal::mmio::{IoMem, IoMemError, ReadOnly, ReadWrite, RegisterBlock, WriteOnly};

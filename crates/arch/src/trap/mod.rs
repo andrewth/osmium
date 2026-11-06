@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Trap (exception and interrupt) entry.
 //!
 //! [`install`] points the CPU's trap vector at an entry stub that saves the

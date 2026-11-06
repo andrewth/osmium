@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `poll`, `select`, `epoll`, `sendmsg`/`recvmsg`, `socketpair` and
 //! `MSG_PEEK`, on in-memory socket pairs (so no network stack is needed).
 

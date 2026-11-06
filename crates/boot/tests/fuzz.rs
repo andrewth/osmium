@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Garbage in, no panic out: every firmware and image parser fed random, truncated and mutated input from a
 //! fixed seed. Valid seeds are mutated so the fuzzing reaches past the first header check.
 #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Scrub: finds and repairs bad copies of `DUP` chunks, and says so when it
 //! cannot. Skipped, with a note, without btrfs-progs.

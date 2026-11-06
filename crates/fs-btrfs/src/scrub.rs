@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Scrub: reading every copy of every tree block and every checksummed data
 //! sector, reporting the copies that do not match their checksums, and
 //! rewriting each bad copy from a good one.

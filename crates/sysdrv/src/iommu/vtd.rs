@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Intel VT-d DMA and interrupt remapping.
 //!
 //! [`Vtd`] drives one remapping unit (a DRHD in the ACPI DMAR table) in one

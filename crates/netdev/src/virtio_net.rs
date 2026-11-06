@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio-net.
 //!
 //! Each queue entry owns one fixed slot of [`SLOT_LEN`] bytes in a DMA

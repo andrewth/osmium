@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An HTTP/1.1 server with no I/O of its own.
 //!
 //! [`Connection`] turns bytes from a client into [`Request`]s and

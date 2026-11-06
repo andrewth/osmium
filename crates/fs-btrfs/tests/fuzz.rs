@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! A hostile btrfs image must not panic or hang the driver. A valid image is
 //! made with `mkfs.btrfs`, random bytes of its tree blocks are changed (fixed

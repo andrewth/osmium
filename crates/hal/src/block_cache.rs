@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A block cache that sits between a file system and a [`BlockDevice`].
 //!
 //! [`CachedDevice`] wraps any device and is itself a [`BlockDevice`], so every

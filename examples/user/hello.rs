@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A user program: an ordinary `no_std` Rust binary, compiled to an ELF by
 //! each example kernel's build script and loaded with `osmium_boot::elf`.
 //! System calls follow Linux numbering and conventions for each

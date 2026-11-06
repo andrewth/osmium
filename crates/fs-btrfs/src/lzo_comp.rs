@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! LZO compression in btrfs's framing (see [`crate::lzo`] for the layout):
 //! each sector becomes one LZO1X segment, written with greedy matching and the
 //! M2 and M3 match forms (so no match reaches back more than 16 KiB). The

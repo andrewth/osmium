@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! MD5 (RFC 1321), for CHAP (RFC 1994). Not for anything that needs a
 //! collision-resistant hash.
 

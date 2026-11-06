@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Intrusive collections of `Arc`s: the list or tree owns one strong
 //! reference to each element it links, and linking never allocates.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! I/O memory management units.
 //!
 //! An IOMMU translates and filters the addresses that devices put on the bus,

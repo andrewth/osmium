@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Links with the x86_64 PVH script shared by the examples. The user
 //! programs are built by the `demos` crate.
 

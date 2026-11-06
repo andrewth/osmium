@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An iSCSI initiator (RFC 7143) over [`osmium_net`] TCP.
 //!
 //! [`IscsiDisk`] logs in to a target and presents one of its logical units

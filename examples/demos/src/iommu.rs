@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IOMMU demo shared by the example kernels, driven by QEMU's
 //! `iommu-testdev` (`-device iommu-testdev`): a PCI function that, when its
 //! trigger register is read, writes a known pattern to an I/O virtual address

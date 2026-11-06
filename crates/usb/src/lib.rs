@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB host controllers and class drivers built on `osmium-hal`.
 //!
 //! | Driver | Device | Implements |

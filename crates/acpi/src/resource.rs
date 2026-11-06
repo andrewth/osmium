@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Resource descriptors: the buffers `_CRS`, `_PRS` and `_SRS` pass around.
 
 use alloc::vec::Vec;

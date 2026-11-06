@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A small kernel for QEMU's x86_64 PC (q35), built entirely from Osmium
 //! components. QEMU loads the ELF directly through the PVH boot protocol and
 //! enters `pvh_start` in 32-bit protected mode with `ebx` pointing at the

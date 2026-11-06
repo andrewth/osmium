@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Mounting an image with corrupted metadata, then walking and reading the
 //! whole tree and trying writes, fails with an error at worst: no panic and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Bounds-checked access to the fixed-layout byte buffers that system calls
 //! copy in from and out to user memory. A buffer that is too short is an
 //! `EINVAL` error, never an out-of-range index.

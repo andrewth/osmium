@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A small kernel for QEMU's RISC-V `virt` machine, built entirely from
 //! Osmium components. OpenSBI (QEMU's `-bios default`) starts it in S-mode
 //! with the hart id in `a0` and the device tree in `a1`.

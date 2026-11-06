@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! File-backed memory: `mmap` of a file, private or shared, and the
 //! reservations `PROT_NONE` makes.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Binary search tree plumbing shared by the red-black and AVL trees.
 
 use super::{Adapter, link_of, value_of};

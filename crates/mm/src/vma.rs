@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Virtual memory areas: the address ranges of a space that are reserved for
 //! something, and with which permissions.
 //!

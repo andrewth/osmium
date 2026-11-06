@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Text keys (RFC 7143 §6): `key=value` pairs, each ended by a NUL, in the
 //! data segment of Login and Text PDUs.
 

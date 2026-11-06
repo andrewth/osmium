@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IOMMU drivers: [`vtd`] (Intel VT-d), [`amdvi`] (AMD-Vi), [`smmuv3`] (Arm
 //! SMMUv3) and [`riscv`] (RISC-V IOMMU).
 //!

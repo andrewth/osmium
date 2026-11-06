@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A text console on a linear framebuffer.
 //!
 //! [`FbConsole`] draws characters from a built-in 8x8 bitmap font onto a

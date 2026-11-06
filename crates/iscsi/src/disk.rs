@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Logical units of an iSCSI target as [`BlockDevice`]s.
 
 use alloc::rc::Rc;

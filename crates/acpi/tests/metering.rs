@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The interpreter's budgets cover the work and the memory inside a term, not only the number of terms:
 //! hostile AML that makes each term allocate megabytes or touch a register a hundred thousand times must
 //! still stop within the configured limits. These tests count the bytes the heap hands out (with a counting

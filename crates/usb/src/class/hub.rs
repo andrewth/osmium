@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB hubs (class 09, USB 2.0 chapter 11 and USB 3.x chapter 10).
 //!
 //! [`Hub`] drives one hub that is already enumerated and configured: it

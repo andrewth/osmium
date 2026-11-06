@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A user program that uses sockets: it round-trips a message through a TCP
 //! echo server, and reads a file from a TFTP server over UDP (QEMU's user
 //! network serves both). System calls follow Linux numbering and conventions

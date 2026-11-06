@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Volume descriptors (ECMA-119 section 8).
 
 use alloc::string::String;

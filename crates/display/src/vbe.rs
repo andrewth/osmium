@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! VESA BIOS Extensions (VBE 2.0/3.0): linear framebuffer modes through the
 //! video BIOS's `int 10h` functions 4F00h–4F02h.
 //!

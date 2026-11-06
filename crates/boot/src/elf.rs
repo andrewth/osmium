@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ELF64 executables: enough to load a kernel, a guest or a user program.
 //!
 //! [`Elf::new`] validates the header; [`Elf::segments`] yields the

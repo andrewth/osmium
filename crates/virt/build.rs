@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Names the AArch64 world switch this build has, if any: `aarch64_hw` for
 //! an aarch64 target with `aarch64-el2` or `aarch64-vhe`, and `aarch64_vhe`
 //! when it is the VHE one (`aarch64-el2` takes precedence over it).

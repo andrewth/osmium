@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Socket system calls against a simulated peer on a simulated link.
 
 use alloc::boxed::Box;

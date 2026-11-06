@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A rustls crypto provider with exactly one choice of each algorithm.
 //!
 //! | Role | Algorithm | Implementation |

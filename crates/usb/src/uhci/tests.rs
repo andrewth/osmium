@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use core::cell::{Cell, RefCell};
 use std::boxed::Box;
 use std::rc::Rc;

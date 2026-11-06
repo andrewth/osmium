@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Match finding shared by the compressors: a hash of four bytes with chains
 //! through earlier positions, searched a few steps deep.
 

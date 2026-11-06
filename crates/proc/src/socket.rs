@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Sockets: `AF_INET` streams (TCP) and datagrams (UDP) over the
 //! [`NetStack`], as files in the descriptor table.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A TLS server connection that does no I/O of its own.
 //!
 //! [`ServerSession`] sits between a byte transport (a TCP socket from

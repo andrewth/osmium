@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! IPv6 fragmentation and reassembly (RFC 8200 section 4.5).
 //!
 //! [`fragment`] cuts a payload into the pieces that carry it over a link of

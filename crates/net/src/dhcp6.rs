@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A DHCPv6 client (RFC 8415): stateful, leasing addresses (an IA_NA) and
 //! DNS servers, or stateless, asking only for configuration such as DNS
 //! servers with an Information-request (RFC 8415 section 18.2.6).

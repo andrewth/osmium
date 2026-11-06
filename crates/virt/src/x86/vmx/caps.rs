@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! What the CPU's VMX capability MSRs allow, and the controls a [`VmxVcpu`](super::VmxVcpu) asks for.
 
 /// VMX capability MSRs (Intel SDM vol. 3D, appendix A).

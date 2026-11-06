@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Locality-specific peripheral interrupts (LPIs): the tables a GICv3 keeps
 //! them in.
 //!

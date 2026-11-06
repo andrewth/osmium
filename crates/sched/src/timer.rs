@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Deadline-ordered timer callbacks.
 
 use alloc::boxed::Box;

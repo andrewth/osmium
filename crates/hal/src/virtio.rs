@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio wire formats shared by drivers and device models.
 //!
 //! Constants and layout arithmetic from the virtio 1.2 specification (and

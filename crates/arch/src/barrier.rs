@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Memory barriers for sharing memory with devices.
 //!
 //! Drivers that build descriptor rings in RAM need two orderings the

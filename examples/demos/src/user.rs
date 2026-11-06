@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Pieces the example kernels share for running user programs: the boot
 //! file system, the user address-space layout, spawning flat and ELF
 //! programs, the demos that run them, and the user-mode half of a trap

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB mass storage: SCSI over Bulk-Only Transport (class 08/06/50), as
 //! used by USB sticks, card readers and external drives.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Login key negotiation (RFC 7143 §6, §13).
 //!
 //! The initiator offers values in its Login Requests and the target answers

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Second-stage (guest-physical to host-physical) translation.
 
 use osmium_mm::paging::formats::{Aarch64Stage2, Ept, Sv39x4, Sv48x4};

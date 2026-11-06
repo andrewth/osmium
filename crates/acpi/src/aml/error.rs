@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Errors from loading and running AML.
 
 use core::fmt;

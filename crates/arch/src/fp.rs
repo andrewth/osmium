@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Per-task floating-point and SIMD registers.
 //!
 //! Osmium's kernel targets are soft-float, so the kernel never touches the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An ATAPI packet device (an optical drive) on one AHCI port, as a
 //! read-only block device.
 

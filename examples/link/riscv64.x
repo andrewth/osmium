@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Shared by the RISC-V S-mode examples (riscv-virt, riscv-hyp): loaded by
    OpenSBI at the start of S-mode payload space on QEMU virt. */
 OUTPUT_ARCH(riscv)

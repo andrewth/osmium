@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Garbage in, no panic out: every parser fed random, truncated and mutated bytes from a fixed seed.
 
 use std::string::String;

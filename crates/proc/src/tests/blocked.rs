@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Blocking calls give up when the thread is interrupted or the process is
 //! killed. These run on the real scheduler: each test thread is one CPU, and

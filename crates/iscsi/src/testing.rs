@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Test fixtures: two osmium-net interfaces joined by a simulated Ethernet
 //! link (as in osmium-net's own tests), and a fake iSCSI target serving a
 //! RAM disk from a TCP socket on the second one.

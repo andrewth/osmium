@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Running out of memory in the middle of a FAT call is `ENOMEM`, and leaves
 //! the volume as it was: no entry, no node, no cluster leaked. Each test

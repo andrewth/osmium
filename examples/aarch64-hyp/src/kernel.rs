@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Booting a whole guest kernel: an ELF image QEMU's loader places in host
 //! RAM (`-device loader,file=...,addr=0x58000000,force-raw=on`), run with
 //! one vCPU per host CPU under a generated device tree, an emulated GICv2

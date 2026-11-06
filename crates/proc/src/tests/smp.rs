@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! The threads of one process on several CPUs: page-table changes shoot down
 //! the other CPUs, after the address space's lock and before frames are

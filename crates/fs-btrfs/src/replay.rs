@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Replaying the fsync log.
 //!
 //! `fsync` on Linux does not commit a transaction: it writes the inodes it

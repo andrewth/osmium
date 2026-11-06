@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use super::formats::*;
 use super::*;
 use crate::frame::testmem::SimRam;

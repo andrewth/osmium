@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! QEMU `fw_cfg`: named blobs the hypervisor hands to the guest firmware
 //! (ACPI tables, `-kernel`/`-initrd`/`-append`, the `ramfb` configuration,
 //! SMBIOS, boot order, ...).

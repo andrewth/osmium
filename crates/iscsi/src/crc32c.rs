@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! CRC32C (Castagnoli), the iSCSI header and data digest (RFC 7143 §12.1).
 
 const fn table() -> [u32; 256] {

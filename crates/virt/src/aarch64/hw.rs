@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The world switch and EL2 controls (aarch64 with `aarch64-el2` or
 //! `aarch64-vhe`).
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A FAT12, FAT16 or FAT32 file system on any [`BlockDevice`], for the `osmium-fs` VFS.
 //!
 //! [`FatFs::mount`] reads the volume and [`FatFs::root`] hands out its root

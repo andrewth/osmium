@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! x86 hardware virtualization: AMD SVM ([`svm::SvmVcpu`]) and Intel VMX
 //! ([`vmx::VmxVcpu`]), the instruction decoder both use for MMIO
 //! ([`decode`]), and the PC machine model ([`pc`]).

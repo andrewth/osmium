@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The virtio-mmio transport (device tree `virtio,mmio`), versions 1
 //! (legacy) and 2.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use core::sync::atomic::Ordering;
 
 use super::{Access, Interrupt, Trap, TrapCpu};

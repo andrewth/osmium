@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Blocking synchronization built on the scheduler.
 
 use core::cell::{Cell, UnsafeCell};

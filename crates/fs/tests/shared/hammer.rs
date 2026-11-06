@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A multi-threaded workout for any file system behind a [`Vfs`], shared by
 //! the concurrency tests of `osmium-fs` and the disk file systems (each
 //! includes it with `#[path]`). Real threads create, write, read back,

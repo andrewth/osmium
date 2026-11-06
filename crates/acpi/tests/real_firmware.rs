@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Real firmware: loads a machine's own tables and runs everything in them.
 //!
 //! Skipped unless `ACPI_TABLES_DIR` names a directory holding a `DSDT` and any number of `SSDT*` files, as

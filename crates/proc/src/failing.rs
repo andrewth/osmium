@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A host-test allocator that can fail one allocation of the calling thread,
 //! for tests that walk an operation through every point where memory could
 //! run out. An allocation that goes through an infallible constructor

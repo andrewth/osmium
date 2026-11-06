@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Checksums: CRC32C (the default), xxHash64, SHA-256 and BLAKE2b-256.
 
 // `as_chunks` would need the nightly-only const generics at each call site for

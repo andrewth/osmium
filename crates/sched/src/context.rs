@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Saved CPU state and the context switch.
 //!
 //! Only callee-saved registers are saved: a switch is an ordinary function

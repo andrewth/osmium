@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Read-copy-update.
 //!
 //! [`Rcu`] is a *domain*: readers enter it with [`Rcu::read_lock`] and may

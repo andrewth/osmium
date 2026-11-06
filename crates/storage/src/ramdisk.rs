@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A memory-backed block device.
 
 use osmium_hal::block::{BlockDevice, BlockError};

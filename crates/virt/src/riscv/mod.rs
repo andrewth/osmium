@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A RISC-V hypervisor-extension (H) vCPU.
 //!
 //! [`RiscvVcpu`] runs a guest in VS-mode under an HS-mode host kernel. Its

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An intrusive interval tree.
 
 use super::avltree::{insert_retrace, remove_retrace};

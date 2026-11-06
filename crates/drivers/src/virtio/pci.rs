@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The virtio-pci transport, modern interface (virtio 1.x §4.1).
 //!
 //! A modern virtio PCI function describes its register structures with

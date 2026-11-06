@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Decoding the load or store that caused a guest page fault, so it can be
 //! emulated as MMIO.
 

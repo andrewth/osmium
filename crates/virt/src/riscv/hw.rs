@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The world switch and hypervisor CSRs (riscv64 with `riscv64-hs`).
 //!
 //! `osmium_hs_run` saves the host's callee-saved registers in

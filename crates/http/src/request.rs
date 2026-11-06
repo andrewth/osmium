@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Requests, and the parser that reads them from a byte buffer.
 
 use alloc::string::String;

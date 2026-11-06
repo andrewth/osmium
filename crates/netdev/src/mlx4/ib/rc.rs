@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Reliable connections: queue pairs that carry sends, RDMA writes and
 //! RDMA reads to one peer, with the adapter doing the acknowledgments and
 //! retransmissions.

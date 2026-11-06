@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `epoll`: an interest list of open files that reports which are ready.
 //!
 //! The list holds files weakly, so closing every descriptor of a file drops

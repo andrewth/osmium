@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An AMD SVM vCPU.
 //!
 //! [`SvmVcpu`] owns a VMCB and runs a guest with nested paging (NPT). Every

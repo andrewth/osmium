@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Clocks and timers.
 
 /// A monotonic clock.

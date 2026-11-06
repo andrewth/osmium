@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Command, transfer and event rings (xHCI 1.2 §4.9).
 //!
 //! Each ring is one page-sized segment of [`RING_TRBS`] TRBs. Producer rings

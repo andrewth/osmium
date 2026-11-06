@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The system-call layer: Linux numbers and structure layouts for each
 //! architecture, decoded once and handled by portable code.
 

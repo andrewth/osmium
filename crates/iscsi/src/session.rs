@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An iSCSI session: login (following redirections), commands in the full
 //! feature phase over one or more TCP connections, error recovery, and
 //! logout.

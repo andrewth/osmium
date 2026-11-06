@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio-console (device ID 3) with a single port and no control queue.
 
 use alloc::boxed::Box;

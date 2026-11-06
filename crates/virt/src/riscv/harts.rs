@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The harts of a multi-vCPU RISC-V guest: [`GuestHarts`] is
 //! [`GuestCpus`](crate::smp::GuestCpus) under its RISC-V name.
 

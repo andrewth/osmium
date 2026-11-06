@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Operation regions and the fields laid over them.
 
 use alloc::vec::Vec;

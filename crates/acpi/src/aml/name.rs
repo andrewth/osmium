@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Namespace names: four-character segments and the paths built from them.
 
 use core::fmt;

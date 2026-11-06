@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Storage drivers built on `osmium-hal`, each a [`BlockDevice`](osmium_hal::block::BlockDevice).
 //!
 //! | Driver | Device | Implements |

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! RISC-V Platform-Level Interrupt Controller.
 
 use osmium_hal::ioext::IoMemExt;

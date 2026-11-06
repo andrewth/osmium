@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A DNS stub resolver (RFC 1035) for IPv4 and IPv6 addresses.
 //!
 //! [`DnsClient`] puts a [`UdpSocket`] in the [`SocketSet`] for each query it

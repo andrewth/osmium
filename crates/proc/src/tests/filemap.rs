@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! File-backed `mmap`: demand paging, private copies, shared write-back
 //! through `msync` and `munmap`, `mprotect`, and hostile arguments.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! HID report descriptor parsing (HID 1.11 section 6.2.2).
 //!
 //! A report descriptor is a stream of short items. *Global* items set state

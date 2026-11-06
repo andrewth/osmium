@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Checks what a QEMU guest put on its screen.
 
 Connects to QEMU's QMP socket and takes screendumps until the picture is

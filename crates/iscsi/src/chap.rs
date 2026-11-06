@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! CHAP authentication (RFC 7143 §12.1, RFC 1994) with MD5.
 //!
 //! The initiator proves it knows a shared secret: the target sends an

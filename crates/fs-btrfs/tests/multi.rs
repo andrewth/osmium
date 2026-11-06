@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Volumes over several devices (RAID0, RAID1, RAID1C3, RAID1C4, RAID10,
 //! RAID5, RAID6, degraded and with damaged devices), and the SHA-256 and

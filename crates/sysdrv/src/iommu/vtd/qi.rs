@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Queued invalidation: a ring of descriptors the unit executes in order,
 //! each submission followed by an invalidation-wait descriptor that writes a
 //! status word so the driver knows the earlier ones are done.

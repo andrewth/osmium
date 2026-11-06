@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Percent-decoding and query strings.
 
 use alloc::string::String;

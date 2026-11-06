@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use core::future::Future;
 use core::pin::Pin;
 use core::ptr;

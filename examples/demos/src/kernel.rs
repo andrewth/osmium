@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Kernel plumbing the example kernels share: the frame allocator, guarded
 //! stacks, the clock, CPU bring-up bookkeeping and the random number demo.
 //! What is left in each kernel is what differs between platforms.

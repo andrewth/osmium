@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Arm Generic Interrupt Controller, version 2.
 
 use core::sync::atomic::{AtomicU32, Ordering};

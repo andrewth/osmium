@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Running out of memory in the middle of a file system call is `ENOMEM`,
 //! and leaves the file system as it was. Each test fails every allocation of

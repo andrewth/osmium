@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! EDID (VESA Enhanced EDID 1.4) base-block parser.
 //!
 //! An EDID comes from the monitor, or from a virtual one such as

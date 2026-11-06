@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! virtio-net (device ID 1): frames to and from a pluggable backend.
 
 use alloc::boxed::Box;

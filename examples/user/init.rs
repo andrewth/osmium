@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A user program that exercises `fork`, `execve` and `wait4`: it forks a
 //! child that changes memory and exits, then forks one that execs this same
 //! program again with arguments and an environment, and reaps both. Where

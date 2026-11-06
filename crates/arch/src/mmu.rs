@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! TLB maintenance for the current CPU's active translation regime.
 //!
 //! Installing a root table is architecture specific; see `x86_64::write_cr3`,

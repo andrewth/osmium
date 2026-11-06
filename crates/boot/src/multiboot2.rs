@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Multiboot2 boot information.
 
 use osmium_hal::display::{FramebufferInfo, PixelFormat};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Calling the PC BIOS from long mode.
 //!
 //! A thunk copied to [`THUNK`] drops the boot CPU from long mode to real

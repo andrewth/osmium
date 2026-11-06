@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! A hostile disk image must not panic or hang the driver. Valid FAT12, FAT16
 //! and FAT32 volumes are made through the driver, then random bytes of their

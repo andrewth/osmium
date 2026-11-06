@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A hypervisor for QEMU's RISC-V virt machine (H extension), built from
 //! Osmium components, that boots a whole guest kernel: an ELF image QEMU
 //! places in host RAM with

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! What the UHCI, OHCI and EHCI drivers share: the table of addressed
 //! devices, the enumeration steps that need only control transfers, data
 //! toggle bookkeeping and bounded waits.

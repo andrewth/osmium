@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Operation regions and fields: layout, access widths, update rules, index and bank fields, PCI
 //! addressing, and `_REG`.
 #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Delivery to 127.0.0.0/8 inside the interface, with no device.
 
 use alloc::vec;

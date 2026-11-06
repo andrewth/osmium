@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Shared by the x86_64 examples (x86_64-pc, x86_64-hyp): loaded by QEMU's
    PVH loader at its physical link address. */
 ENTRY(pvh_start)

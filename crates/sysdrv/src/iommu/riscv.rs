@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The RISC-V IOMMU.
 //!
 //! [`RiscvIommu`] drives one unit (the `riscv-iommu` PCI function QEMU

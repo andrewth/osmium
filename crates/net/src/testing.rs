@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Two interfaces joined by a simulated Ethernet link.
 
 use std::cell::RefCell;

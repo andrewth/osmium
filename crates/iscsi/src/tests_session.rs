@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Login redirection, several connections in a session, and several logical
 //! units, against the fake target.
 

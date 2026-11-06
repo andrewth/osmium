@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Intel 8254 programmable interval timer (PC PIT).
 //!
 //! Used here as a fixed-frequency reference: channel 2 (the speaker channel,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Which user address space each CPU may have loaded, so that none is freed
 //! while a CPU's MMU can still walk its tables.
 //!

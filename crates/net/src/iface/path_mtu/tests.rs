@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::vec;

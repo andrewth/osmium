@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! Balance: block groups emptied into others and their chunks deleted, checked
 //! by `btrfs check --check-data-csum`, by reading everything back and, for a

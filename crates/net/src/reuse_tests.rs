@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `SO_REUSEADDR` and `SO_REUSEPORT`: bind conflicts and delivery.
 
 use alloc::vec::Vec;

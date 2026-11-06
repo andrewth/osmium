@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! PCI and PCI Express configuration space.
 //!
 //! [`ConfigAccess`] reads and writes configuration dwords; [`Ecam`]

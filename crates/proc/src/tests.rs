@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

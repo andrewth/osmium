@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! AMD-Vi (the AMD IOMMU).
 //!
 //! [`AmdVi`] drives one unit (an IVHD block in the ACPI IVRS table). A device

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Devices: adding one to a mounted volume, removing one, and replacing one
 //! with another.
 //!

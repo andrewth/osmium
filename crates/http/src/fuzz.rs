@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Deterministic fuzzing of the request parser and the chunked decoder.
 //!
 //! A fixed-seed generator mutates well-formed requests and builds random

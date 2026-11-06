@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! ext4 extent trees: lookup, insertion with node splits, conversion of
 //! uninitialized extents on write, and truncation.
 //!

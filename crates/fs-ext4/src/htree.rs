@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Hashed (htree) directories.
 //!
 //! An indexed directory's first block holds `.`, `..` and the root of a tree

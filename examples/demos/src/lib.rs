@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! What the example kernels and hypervisors share: the scheduler, network,
 //! storage and USB demos (each prints lines that `scripts/check.sh` looks
 //! for), and the plumbing that is the same on every platform: [`kernel`]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Self-signed ECDSA P-256 server certificates, and PEM encoding.
 //!
 //! A device that serves HTTPS needs a certificate before anyone has had a

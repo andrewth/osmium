@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! iSCSI PDUs (RFC 7143 §11), independent of any transport.
 //!
 //! Every PDU is a 48-byte Basic Header Segment (BHS), optional Additional

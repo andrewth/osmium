@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Run-time values of the AML data types.
 
 use alloc::boxed::Box;

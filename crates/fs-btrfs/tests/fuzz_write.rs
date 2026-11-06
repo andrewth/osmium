@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! A hostile btrfs image must not panic the driver's write path either. A
 //! valid image is made with `mkfs.btrfs`; random bytes of blocks of its extent,

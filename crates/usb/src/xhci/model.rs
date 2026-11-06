@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! A scripted xHCI controller for the tests, playing the part that
 //! `usbhc::fakedev` plays for UHCI, OHCI and EHCI.
 //!

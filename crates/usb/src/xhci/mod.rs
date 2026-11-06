@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! xHCI USB host controller (eXtensible Host Controller Interface 1.2).
 //!
 //! [`Xhci`] brings the controller up from its MMIO registers (normally PCI
