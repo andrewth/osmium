@@ -3,7 +3,7 @@
 //! | Driver | Device | Implements |
 //! |---|---|---|
 //! | [`virtio_net::VirtioNet`] | virtio network card (MMIO or PCI, legacy and 1.x) | `NetDevice` |
-//! | [`mlx4::Mlx4`] | Mellanox ConnectX-2/-3 Ethernet, InfiniBand and IPoIB (PCI, polled or MSI-X) | `NetDevice` per Ethernet port or IPoIB interface; UD datagrams and reliable connections per InfiniBand port |
+//! | [`mlx4::Mlx4`] | Mellanox ConnectX, ConnectX-2 and ConnectX-3 Ethernet, InfiniBand and IPoIB (PCI, polled or MSI-X; simulator-tested only) | `NetDevice` per Ethernet port or IPoIB interface; UD datagrams and reliable connections per InfiniBand port |
 //! | [`usb::ecm::UsbEthernet`] | USB Ethernet (CDC-ECM) on any `UsbHost` | `NetDevice` |
 //! | [`usb::ncm::UsbNcm`] | USB Ethernet (CDC-NCM; simulator-tested only) on any `UsbHost` | `NetDevice` |
 //!

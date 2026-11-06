@@ -214,7 +214,9 @@ pub struct BadNtb;
 
 /// Walks the datagrams of a received 16-bit NTB, following its NDP chain.
 /// It holds offsets rather than a borrow, so the NTB's buffer can be read
-/// between calls.
+/// between calls. NCM puts every NDP at a multiple of four bytes, but like
+/// Linux's `cdc_ncm` the reader takes an NDP or datagram at any offset
+/// inside the block (it reads the NTB a byte at a time).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NtbReader {
     /// `wBlockLength`: the bytes that belong to the NTB.
@@ -702,6 +704,29 @@ mod tests {
         let mut padded = b.clone();
         padded.resize(b.len() + 50, 0xee);
         assert_eq!(datagrams(&padded).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn unaligned_offsets_are_read_byte_wise() {
+        // Move the NDP one byte up, off its 4-byte alignment, and point a
+        // datagram at an odd offset.
+        let mut b = ntb(&[&[1; 60], &[2; 60]]);
+        let ndp = u16::from_le_bytes([b[10], b[11]]) as usize;
+        b.insert(ndp, 0xee);
+        let ndp = ndp + 1;
+        b[10..12].copy_from_slice(&(ndp as u16).to_le_bytes());
+        let len = b.len() as u16;
+        b[8..10].copy_from_slice(&len.to_le_bytes());
+        let second = u16::from_le_bytes([b[ndp + 12], b[ndp + 13]]);
+        b[ndp + 12..ndp + 14].copy_from_slice(&(second + 1).to_le_bytes());
+        b[ndp + 14..ndp + 16].copy_from_slice(&58u16.to_le_bytes());
+        assert_eq!(datagrams(&b).unwrap(), [std::vec![1; 60], std::vec![2; 58]]);
+        // Even an NDP straddling the end of the block by one byte is refused, not read past.
+        let mut short = b.clone();
+        short.truncate(b.len() - 1);
+        let len = short.len() as u16;
+        short[8..10].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(datagrams(&short), Err(BadNtb));
     }
 
     #[test]

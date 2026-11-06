@@ -1,4 +1,11 @@
-//! Mellanox ConnectX-2 and ConnectX-3 (mlx4) Ethernet.
+//! Mellanox ConnectX, ConnectX-2 and ConnectX-3 (mlx4): Ethernet,
+//! InfiniBand and IPoIB.
+//!
+//! None of this driver has run on a physical adapter: every path, from
+//! bring-up and plain Ethernet to the offloads, MSI-X and InfiniBand, has
+//! only run against the simulated HCA of its unit tests. The register and
+//! context layouts follow Linux 6.12's `mlx4_core`, `mlx4_en` and `mlx4_ib`
+//! and iPXE's `hermon`.
 //!
 //! [`Mlx4`] brings the adapter up from PCI BAR 0 (configuration and the
 //! command register) and BAR 2 (the UAR doorbell pages): reset, firmware
@@ -35,7 +42,7 @@
 //! [`NetDevice`](osmium_hal::net::NetDevice) trait has no way to express
 //! offloads, so these are inherent methods; [`EthPort::offloads`] reports
 //! what the port can do. The offload and MSI-X paths follow the PRM and
-//! Linux's `mlx4_en` but have only run against the simulated HCA.
+//! Linux's `mlx4_en`.
 //!
 //! [`Mlx4::open_ib`] turns a port whose cable carries InfiniBand into an
 //! [`IbPort`]: queue pair 0 (subnet management) and 1 (general services),
@@ -53,7 +60,9 @@
 //! [`open_eth`](Mlx4::open_eth) or [`open_ib`](Mlx4::open_ib), by what the
 //! cable senses (if nothing is sensed, by which one the caller asks for).
 //! The InfiniBand path follows Linux's `mlx4_ib` and the PRM as it uses
-//! them, and has only run against the simulated HCA.
+//! them. Responder resources for inbound RDMA reads come from an RDMARC
+//! table of 16 entries per queue pair (fewer if the adapter allows fewer),
+//! which bounds [`RcParams::max_dest_rd_atomic`].
 //!
 //! Not supported: receive-side scaling, one completion vector per CPU,
 //! MAC/VLAN steering, VLAN tag offload, tunnel offloads; for InfiniBand,
@@ -175,11 +184,17 @@ const MAX_MTTS: u32 = EQ_MTTS + PORT_MTTS * MAX_SETS;
 const RC_WINDOWS: u32 = queue::RC_QPS as u32 * MAX_PORTS as u32;
 const EQ_MTTS: u32 = 2;
 
-const NUM_EQES: u32 = 8;
+/// Entries per event queue: one page. Each completion queue has at most
+/// one event outstanding (it is disarmed by its event and re-armed only once
+/// the event has been consumed), so the completion event queue cannot
+/// overrun; the rest is headroom, as Linux leaves `MLX4_NUM_SPARE_EQE`.
+const NUM_EQES: u32 = 128;
 const EQE_LEN: usize = 32;
 const EVENT_PORT_CHANGE: u32 = 0x09;
 const PORT_CHANGE_ACTIVE: u32 = 0x04;
 const EVENT_COMPLETION: u32 = 0x00;
+/// An event queue overran: events may have been lost.
+const EVENT_EQ_OVERFLOW: u32 = 0x0f;
 /// Event queue consumer index doorbell bit asking for the next event to
 /// raise an interrupt.
 const EQ_ARM: u32 = 1 << 31;
@@ -274,6 +289,7 @@ struct Caps {
     reserved_mtts: u32,
     reserved_mrws: u32,
     reserved_uars: u32,
+    rdmarc_entry: u64,
     qpc_entry: u64,
     altc_entry: u64,
     auxc_entry: u64,
@@ -300,14 +316,12 @@ impl Caps {
             reserved_qps: 1 << c.get(4, 8, 4),
             reserved_srqs: 1 << c.get(5, 28, 4),
             reserved_cqs: 1 << c.get(6, 8, 4),
-            // Older firmware reports only the log2.
-            reserved_eqs: match c.get(6, 24, 8) {
-                0 => 1 << c.get(7, 8, 4),
-                n => n,
-            },
+            // Byte 0x1e, a log2 (Linux's QUERY_DEV_CAP_RSVD_EQ_OFFSET).
+            reserved_eqs: 1 << c.get(7, 8, 4),
             reserved_mtts: 1 << c.get(8, 28, 4),
             reserved_mrws: 1 << c.get(8, 8, 4),
             reserved_uars: c.get(18, 28, 4),
+            rdmarc_entry: c.get(32, 16, 16) as u64,
             qpc_entry: c.get(32, 0, 16) as u64,
             altc_entry: c.get(33, 0, 16) as u64,
             auxc_entry: c.get(33, 16, 16) as u64,
@@ -319,12 +333,17 @@ impl Caps {
             mtt_entry: c.get(36, 16, 16) as u64,
             num_ports: (c.get(13, 0, 4) as u8).min(MAX_PORTS),
             dpdp: c.get(17, 12, 1) != 0,
-            max_gso: if c.get(11, 21, 1) != 0 { 1 << c.get(11, 16, 5) } else { 0 },
+            // Byte 0x2d: the low five bits are the log2, zero for none (as Linux reads it).
+            max_gso: match c.get(11, 16, 5) {
+                0 => 0,
+                log => 1 << log,
+            },
             log_max_msg_sz: c.get(14, 24, 5),
             log_max_req_rd: c.get(10, 16, 6),
             log_max_res_rd: c.get(10, 0, 6),
         };
         let sizes = [
+            caps.rdmarc_entry,
             caps.qpc_entry,
             caps.altc_entry,
             caps.auxc_entry,
@@ -348,7 +367,19 @@ impl Caps {
     fn comp_eqn(&self) -> u32 {
         self.eqn() + 1
     }
+
+    /// log2 of the RDMA reads (and atomics) a queue pair can have
+    /// outstanding as responder: the RDMARC entries each queue pair gets.
+    /// Linux's profile gives every queue pair 16; never more than the device
+    /// handles, or than INIT_HCA's 3-bit field holds.
+    fn log_rd_per_qp(&self) -> u32 {
+        self.log_max_res_rd.min(LOG_RDMARC_PER_QP)
+    }
 }
+
+/// log2 of the RDMARC entries per queue pair the driver asks for (Linux's
+/// `rdmarc_per_qp`).
+const LOG_RDMARC_PER_QP: u32 = 4;
 
 /// `ceil(log2(n))` for `n >= 1`.
 fn log2_ceil(n: u32) -> u32 {
@@ -401,6 +432,10 @@ fn plan_icm(caps: &Caps) -> IcmPlan {
     c.set_addr(12, table(caps.qpc_entry, log_qps)).set(13, 0, 5, log_qps);
     c.set_addr(24, table(caps.altc_entry, log_qps));
     c.set_addr(28, table(caps.auxc_entry, log_qps));
+    // The responder's RDMA read contexts: `2^log_rd` entries per queue pair
+    // (INIT_HCA 0x90, with the log2 in byte 0x97).
+    let log_rd = caps.log_rd_per_qp();
+    c.set_addr(36, table(caps.rdmarc_entry << log_rd, log_qps)).set(37, 0, 3, log_rd);
     c.set_addr(18, table(caps.srqc_entry, log_srqs)).set(19, 0, 5, log_srqs);
     c.set_addr(20, table(caps.cqc_entry, log_cqs)).set(21, 0, 5, log_cqs);
     c.set_addr(32, table(caps.eqc_entry, log_eqs)).set(33, 0, 5, log_eqs);
@@ -494,6 +529,9 @@ pub struct Mlx4<'d, D: DmaAllocator + ?Sized> {
     /// Bit `n` set: port `n + 1` is open / its link is up.
     open: Cell<u8>,
     link: Cell<u8>,
+    /// Ports to signal at the next interrupt because an event queue
+    /// overran and their completion events may be lost.
+    lost: Cell<u8>,
 }
 
 impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
@@ -542,6 +580,7 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
             window_variant: Default::default(),
             open: Cell::new(0),
             link: Cell::new(0),
+            lost: Cell::new(0),
         };
         hca.start_firmware()?;
         hca.caps = hca.query_caps()?;
@@ -726,15 +765,25 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
     /// Initializes `ring` and hands it to the device as event queue `eqn`,
     /// its MTT entry at `mtt`. If `armed` the queue raises MSI-X vector
     /// `intr` on its next event; otherwise it is "fired" and never
-    /// interrupts, and is only polled.
-    fn sw2hw_eq(&self, eqn: u32, ring: &OwnedDma<'d, D>, mtt: u32, intr: u16, armed: bool) -> Result<(), Mlx4Error> {
+    /// interrupts, and is only polled. With `overrun_ignore` the device
+    /// keeps writing when the queue is full instead of reporting an overrun.
+    fn sw2hw_eq(
+        &self,
+        eqn: u32,
+        ring: &OwnedDma<'d, D>,
+        mtt: u32,
+        intr: u16,
+        armed: bool,
+        overrun_ignore: bool,
+    ) -> Result<(), Mlx4Error> {
         for i in 0..NUM_EQES as usize {
             put32(ring, i * EQE_LEN + 28, 0x80); // owned by hardware
         }
         self.write_mtt(mtt, ring)?;
         let mut eqc = Ctx::new();
-        // Overruns are ignored.
-        eqc.set(0, 8, 4, if armed { EQ_STATE_ARMED } else { EQ_STATE_FIRED }).set(0, 17, 1, 1);
+        let state = if armed { EQ_STATE_ARMED } else { EQ_STATE_FIRED };
+        // Bit 17: overrun ignore (Linux's `MLX4_EQ_FLAG_OI`).
+        eqc.set(0, 8, 4, state).set(0, 17, 1, u32::from(overrun_ignore));
         eqc.set(3, 24, 5, log2_ceil(NUM_EQES));
         eqc.set(5, 0, 8, intr as u32);
         eqc.set_addr(6, self.mtt_addr(mtt));
@@ -743,7 +792,10 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
 
     fn create_eq(&mut self) -> Result<(), Mlx4Error> {
         let ring = OwnedDma::new(self.dma, NUM_EQES as usize * EQE_LEN).ok_or(Mlx4Error::NoMemory)?;
-        let created = self.sw2hw_eq(self.caps.eqn(), &ring, 0, VECTOR_ASYNC, false);
+        // Port events are not bounded the way completion events are: a
+        // polled adapter whose link flaps unobserved may fill the queue, and
+        // only the latest link state matters, so overruns are ignored here.
+        let created = self.sw2hw_eq(self.caps.eqn(), &ring, 0, VECTOR_ASYNC, false, true);
         self.mem.eq = Some(ring);
         created?;
         self.stage.eq_hw = true;
@@ -789,7 +841,7 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
 
         let eqn = self.caps.comp_eqn();
         let ring = OwnedDma::new(self.dma, NUM_EQES as usize * EQE_LEN).ok_or(Mlx4Error::NoMemory)?;
-        let created = self.sw2hw_eq(eqn, &ring, 1, VECTOR_COMPLETION, true);
+        let created = self.sw2hw_eq(eqn, &ring, 1, VECTOR_COMPLETION, true, false);
         self.mem.comp_eq = Some(ring);
         created?;
         self.stage.comp_eq_hw = true;
@@ -818,17 +870,32 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
     /// completion queue signalled: the caller wakes whatever waits on those
     /// ports. Completions themselves are reaped by the port's own
     /// `receive` and `transmit` calls, which also re-arm the port's
-    /// completion queue (until then it raises no further events). The async vector returns 0
-    /// (it updates [`link_up`](Self::link_up)).
+    /// completion queue (until then it raises no further events). The async
+    /// vector updates [`link_up`](Self::link_up) and normally returns 0; if
+    /// the adapter reported an event queue overrun, either vector returns
+    /// every open port, whose completion queues are then re-armed by their
+    /// next reap (completion events may have been lost).
     pub fn handle_interrupt(&self, vector: u16) -> u8 {
-        match vector {
+        let signalled = match vector {
             VECTOR_ASYNC => {
                 self.poll_events();
                 0
             }
             VECTOR_COMPLETION => self.poll_completion_events(),
             _ => 0,
+        };
+        signalled | self.lost.take()
+    }
+
+    /// An event queue overran, so completion events may have been lost and
+    /// with them the re-arming of their completion queues. Every queue is
+    /// treated as having fired (re-arming one that had not costs at most a
+    /// spurious event), and every open port is signalled.
+    fn events_lost(&self) {
+        for sn in &self.arm_sn {
+            sn.set(sn.get().wrapping_add(1));
         }
+        self.lost.set(self.lost.get() | self.open.get());
     }
 
     /// Consumes the events in `ring` from consumer index `ci`, calling
@@ -866,6 +933,8 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
                 if (1..=MAX_PORTS).contains(&port) {
                     self.set_link(port, head & PORT_CHANGE_ACTIVE != 0);
                 }
+            } else if kind == EVENT_EQ_OVERFLOW {
+                self.events_lost();
             }
         });
     }
@@ -882,6 +951,8 @@ impl<'d, D: DmaAllocator + ?Sized> Mlx4<'d, D> {
                     // A port's sets are interleaved with the other port's.
                     signalled |= 1 << (index % MAX_PORTS as u32);
                 }
+            } else if kind == EVENT_EQ_OVERFLOW {
+                self.events_lost();
             }
         });
         signalled
@@ -1189,6 +1260,7 @@ mod tests {
             reserved_mtts: 16,
             reserved_mrws: 16,
             reserved_uars: 8,
+            rdmarc_entry: 32,
             qpc_entry: 256,
             altc_entry: 64,
             auxc_entry: 128,
@@ -1219,7 +1291,9 @@ mod tests {
             (base(64, !0), 1 << log2_ceil(16 + MAX_MTTS), 8),
             (base(60, !0), 1 << c.get(62, 0, 6), 64),
             (base(48, !0), 128, 64),
+            (base(36, !0x1f), 1 << c.get(13, 0, 5), 32 << c.get(37, 0, 3)),
         ];
+        assert_eq!(c.get(37, 0, 3), LOG_RDMARC_PER_QP, "16 responder resources per queue pair");
         assert!(1 << c.get(13, 0, 5) >= 64 + 15 + MAX_QPS as u64);
         assert!(1 << c.get(33, 0, 5) > caps.comp_eqn() as u64);
         let other = plan.regions[4];
@@ -1239,6 +1313,70 @@ mod tests {
         assert_eq!(plan.size, other.va + other.len as u64);
     }
 
+    fn put8(c: &mut Ctx, at: usize, v: u8) {
+        c.set(at / 4, 8 * (3 - (at % 4) as u32), 8, v as u32);
+    }
+
+    fn put16(c: &mut Ctx, at: usize, v: u16) {
+        put8(c, at, (v >> 8) as u8);
+        put8(c, at + 1, v as u8);
+    }
+
+    /// QUERY_DEV_CAP's output laid out byte by byte as Linux 6.12's
+    /// `mlx4_QUERY_DEV_CAP` reads it, with junk in the bits it ignores.
+    #[test]
+    fn caps_are_read_where_linux_reads_them() {
+        let mut c = Ctx::new();
+        for (at, v) in [
+            (0x12, 0x06), // log2 reserved queue pairs
+            (0x14, 0x60), // reserved SRQs, high nibble
+            (0x18, 0x55), // nothing Linux reads
+            (0x1a, 0x07), // reserved completion queues
+            (0x1e, 0xa4), // log2 reserved event queues, low nibble
+            (0x20, 0x40), // reserved MTT entries, high nibble
+            (0x22, 0x04), // reserved memory regions
+            (0x29, 0x06), // requester reads
+            (0x2b, 0x05), // responder reads
+            (0x2d, 0xd0), // log2 largest LSO frame, low five bits
+            (0x37, 0x02), // ports
+            (0x38, 0x1f), // log2 largest message
+            (0x48, 0x80), // reserved UARs, high nibble
+        ] {
+            put8(&mut c, at, v);
+        }
+        for (at, v) in [
+            (0x80, 32),
+            (0x82, 256),
+            (0x84, 128),
+            (0x86, 64),
+            (0x88, 64),
+            (0x8a, 64),
+            (0x8c, 64),
+            (0x8e, 64),
+            (0x90, 8),
+            (0x92, 64),
+        ] {
+            put16(&mut c, at, v);
+        }
+        let caps = Caps::parse(&c).unwrap();
+        assert_eq!((caps.reserved_qps, caps.reserved_srqs, caps.reserved_cqs), (64, 64, 128));
+        assert_eq!(caps.reserved_eqs, 16, "byte 0x1e's low nibble, not byte 0x18");
+        assert_eq!((caps.reserved_mtts, caps.reserved_mrws, caps.reserved_uars), (16, 16, 8));
+        assert_eq!(caps.max_gso, 1 << 16, "the low five bits of byte 0x2d, with no flag bit required");
+        assert_eq!((caps.log_max_req_rd, caps.log_max_res_rd, caps.log_max_msg_sz), (6, 5, 31));
+        assert_eq!((caps.rdmarc_entry, caps.qpc_entry, caps.auxc_entry, caps.altc_entry), (32, 256, 128, 64));
+        assert_eq!((caps.eqc_entry, caps.cqc_entry, caps.srqc_entry, caps.cmpt_entry), (64, 64, 64, 64));
+        assert_eq!((caps.mtt_entry, caps.dmpt_entry, caps.num_ports), (8, 64, 2));
+        assert_eq!(caps.log_rd_per_qp(), 4, "16 responder resources, within the 32 the device takes");
+
+        put8(&mut c, 0x2d, 0xe0);
+        assert_eq!(Caps::parse(&c).unwrap().max_gso, 0, "no segmentation");
+        put8(&mut c, 0x2b, 0x02);
+        assert_eq!(Caps::parse(&c).unwrap().log_rd_per_qp(), 2, "no more than the device's responder limit");
+        put16(&mut c, 0x80, 0);
+        assert_eq!(Caps::parse(&c), None, "an adapter without RDMARC entries is nonsense");
+    }
+
     #[test]
     fn bring_up_and_tear_down() {
         let hca = FakeHca::new(ETH);
@@ -1253,6 +1391,8 @@ mod tests {
             assert_eq!(s.fw.aux_pages, fake::AUX_PAGES);
             assert_eq!(s.fw.special_qp, Some(64), "special QPs after the 64 reserved");
             assert_eq!(s.fw.lkey, Some(mlx.lkey));
+            let (rdmarc, log_rd) = s.fw.rdmarc;
+            assert!(rdmarc != 0 && log_rd == 4, "an RDMARC table, 16 entries per queue pair");
             let first = |o| s.log.iter().position(|&x| x == o).unwrap();
             let order = [op::QUERY_FW, op::MAP_FA, op::RUN_FW, op::QUERY_DEV_CAP, op::SET_ICM_SIZE, op::INIT_HCA];
             assert!(order.windows(2).all(|w| first(w[0]) < first(w[1])), "{:x?}", s.log);
@@ -1365,6 +1505,78 @@ mod tests {
         assert_eq!(dma.live.get(), 0);
     }
 
+    /// More receive completions than receive entries posted (the device's
+    /// mistake) are dropped, not written past the software queue.
+    #[test]
+    fn receive_completions_beyond_the_posted_entries_are_dropped() {
+        let hca = FakeHca::new(ETH);
+        let dma = HostDma::default();
+        let mlx = bring_up(&hca, &dma).unwrap();
+        let mut eth = mlx.open_eth(1).unwrap();
+        let qpn = 64 + 8;
+        for n in 0..queue::RX_SLOTS {
+            assert!(hca.deliver(1, &[n as u8; 64]));
+        }
+        hca.rogue_receive_completion(qpn, 64);
+        hca.rogue_receive_completion(qpn, 64);
+        let mut buf = [0u8; 2048];
+        for n in 0..queue::RX_SLOTS {
+            assert_eq!(eth.receive(&mut buf), Ok(64));
+            assert_eq!(buf[0], n as u8, "in order, the excess dropped");
+        }
+        assert_eq!(eth.receive(&mut buf), Err(NetError::WouldBlock));
+        // The ring carries on.
+        assert!(hca.deliver(1, &[0xaa; 64]));
+        assert_eq!(eth.receive(&mut buf), Ok(64));
+        assert_eq!(buf[0], 0xaa);
+    }
+
+    #[test]
+    fn a_failed_send_fails_the_transmits_after_it() {
+        let hca = FakeHca::new(ETH);
+        let dma = HostDma::default();
+        let mlx = bring_up(&hca, &dma).unwrap();
+        let mut eth = mlx.open_eth(1).unwrap();
+        let qpn = 64 + 8;
+        eth.transmit(&[1; 60]).unwrap();
+        assert_eq!(hca.sent(qpn).len(), 1);
+
+        // A local protection error puts the queue pair in the error state.
+        hca.fail_next_send(qpn, 0x04);
+        eth.transmit(&[2; 60]).unwrap();
+        eth.transmit(&[3; 60]).unwrap();
+        assert!(hca.sent(qpn).is_empty(), "neither went out");
+        assert_eq!(hca.qp_state(qpn), 6);
+        assert_eq!(eth.transmit(&[4; 60]), Err(NetError::Io), "reported, not swallowed");
+        let tso = TxOffload { checksum: true, tso: None };
+        assert_eq!(eth.transmit_offload(&[4; 60], tso), Err(TxError::Net(NetError::Io)));
+        assert!(hca.sent(qpn).is_empty(), "nothing more posted");
+    }
+
+    /// The device prefetches up to 2 KiB past the last entry posted; the
+    /// fake checks those entries' 64-byte chunks are stamped each time its
+    /// send engine stops, so laps of every queue type's ring exercise it.
+    #[test]
+    fn send_entries_are_restamped_after_completing() {
+        let hca = FakeHca::new(ETH);
+        hca.state.borrow_mut().max_gso = 65536;
+        let dma = HostDma::default();
+        let mlx = bring_up(&hca, &dma).unwrap();
+        let mut eth = mlx.open_eth(1).unwrap();
+        let qpn = 64 + 8;
+        let frame: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        for n in 0..3 * queue::SQ_ENTRIES {
+            // Segmentation entries carry an inline header across the second chunk.
+            if n % 2 == 0 {
+                eth.transmit(&frame[..60]).unwrap();
+            } else {
+                let tso = TxOffload { checksum: false, tso: Some(Tso { mss: 1000, header_len: 90 }) };
+                eth.transmit_offload(&frame, tso).unwrap();
+            }
+            assert_eq!(hca.sent(qpn).len(), 1, "entry {n}");
+        }
+    }
+
     #[test]
     fn link_events() {
         let hca = FakeHca::new(ETH);
@@ -1374,7 +1586,7 @@ mod tests {
         let p2 = mlx.open_eth(2).unwrap();
         assert!(p1.link_up() && !p2.link_up());
         for i in 0..20 {
-            // More events than the queue holds, consumed as they come.
+            // A stream of events, consumed as they come.
             hca.port_event(1, i % 2 == 1);
             hca.port_event(2, i % 2 == 0);
             assert_eq!((p1.link_up(), p2.link_up()), (i % 2 == 1, i % 2 == 0));

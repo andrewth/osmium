@@ -4,9 +4,10 @@
 use std::vec::Vec;
 
 use osmium_hal::net::NetError;
+use osmium_hal::pci::MsiMessage;
 
-use super::fake::FakeHca;
-use super::tests_ib::{IB, QKEY, bring_up};
+use super::fake::{self, FakeHca};
+use super::tests_ib::{IB, QKEY, bring_up, peer};
 use super::*;
 use osmium_drivers::virtio::testing::HostDma;
 
@@ -102,6 +103,8 @@ fn connections_are_made_with_the_right_parameters() {
         RcParams { send_psn: 1 << 24, ..again },
         RcParams { max_rd_atomic: 65, ..again },
         RcParams { max_dest_rd_atomic: 65, ..again },
+        // More than the 16 RDMARC entries each queue pair has.
+        RcParams { max_dest_rd_atomic: 17, ..again },
         RcParams {
             route: Some(Route { dgid: Gid::default(), sgid_index: 8, hop_limit: 1, traffic_class: 0, flow_label: 0 }),
             ..again
@@ -123,8 +126,10 @@ fn connections_are_made_with_the_right_parameters() {
         traffic_class: 0x44,
         flow_label: 0xa_bcde,
     };
-    p.a.rc_connect(c3, &RcParams { route: Some(route), sl: 5, path_bits: 1, ..again }).unwrap();
+    // With every responder resource its RDMARC entries allow.
+    p.a.rc_connect(c3, &RcParams { route: Some(route), sl: 5, path_bits: 1, max_dest_rd_atomic: 16, ..again }).unwrap();
     let c = hca.rc_ctx(76);
+    assert_eq!(c.max_dest_rd_log, 4);
     assert_eq!((c.grh, c.path_bits, c.sgid_index, c.hop_limit, c.dgid), (true, 1, 3, 9, route.dgid.0));
     assert_eq!((c.tclass_flow, c.sched_queue), (0x44 << 20 | 0xa_bcde, 0x83 | 5 << 2));
 
@@ -405,4 +410,105 @@ fn window_keys_are_not_reissued_after_the_counter_is_used_up() {
     }
     assert!(refused, "the slot is retired once its keys are used up");
     assert_eq!(keys.len(), 255);
+}
+
+/// Every completion queue of both ports (data, queue pairs 0 and 1, four
+/// connections each) completes before the interrupt is handled: the
+/// completion event queue holds every event, and each queue goes on
+/// interrupting afterwards.
+#[test]
+fn all_completion_queues_firing_at_once_lose_no_event() {
+    let hca = FakeHca::new(IB);
+    let dma = HostDma::default();
+    let func = Function::new(&hca, fake::ADDR).unwrap();
+    let mut mlx = Mlx4::new(&func, hca.config_io(), hca.uar_io(), &dma, &hca).unwrap();
+    let messages = [MsiMessage { address: 0xfee0_0000, data: 0x40 }, MsiMessage { address: 0xfee0_1000, data: 0x41 }];
+    mlx.enable_msix(&func, &hca.msix_io(), messages).unwrap();
+    let comp_eqn = mlx.caps.comp_eqn();
+    let (mut a, mut b) = (mlx.open_ib(1, QKEY).unwrap(), mlx.open_ib(2, QKEY).unwrap());
+    hca.sm_configure(1, 7);
+    hca.sm_configure(2, 8);
+    hca.take_interrupts();
+    mlx.handle_interrupt(VECTOR_ASYNC);
+    let mut conns = Vec::new();
+    for _ in 0..queue::RC_QPS {
+        let ((ca, ia), (cb, ib)) = (a.rc_create().unwrap(), b.rc_create().unwrap());
+        a.rc_connect(ca, &params(8, ib.qpn, A_PSN, B_PSN)).unwrap();
+        b.rc_connect(cb, &params(7, ia.qpn, B_PSN, A_PSN)).unwrap();
+        conns.push((ca, ia.qpn, cb));
+    }
+    // A trap from a neighbor (dropped by queue pair 0's service), and an
+    // administration reply (kept by queue pair 1's for its client).
+    let (mut trap, mut reply) = ([0u8; 256], [0u8; 256]);
+    trap[..4].copy_from_slice(&[1, 0x01, 1, 0x05]);
+    reply[..4].copy_from_slice(&[1, 0x03, 2, 0x81]);
+    let mut buf = [0u8; 256];
+    for round in 0..4 {
+        let before = hca.eq_events(comp_eqn);
+        for &(ca, qa, _) in &conns {
+            a.rc_send(ca, b"x").unwrap();
+            assert_eq!(hca.rc_run(qa), 1); // a send completion here, a receive completion on port 2
+        }
+        for (port, ud) in [(1, a.qpn()), (2, b.qpn())] {
+            assert!(hca.deliver_ud(port, ud, QKEY, peer(3, 9), None, &[round; 8]));
+            assert!(hca.deliver_mad(port, false, peer(0, 0), None, &trap, 0));
+            assert!(hca.deliver_mad(port, true, peer(1, 1), None, &reply, 0));
+        }
+        assert_eq!(
+            hca.eq_events(comp_eqn) - before,
+            2 * queue::SETS_PER_PORT as u32,
+            "round {round}: every queue fired"
+        );
+        assert_eq!(hca.eq_lost(comp_eqn), 0, "round {round}: nothing overran");
+        assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION], "round {round}");
+        assert_eq!(mlx.handle_interrupt(VECTOR_COMPLETION), 0b11);
+
+        // Reaping everything re-arms every queue.
+        for &(ca, _, cb) in &conns {
+            assert_eq!(a.rc_poll(ca, &mut buf), Some(RcEvent::Sent));
+            assert_eq!(b.rc_poll(cb, &mut buf), Some(RcEvent::Received { len: 1 }));
+        }
+        for ib in [&mut a, &mut b] {
+            assert_eq!(ib.receive(&mut buf).map(|d| d.len), Ok(8));
+            ib.service();
+            assert!(ib.take_general().is_some());
+        }
+    }
+}
+
+#[test]
+fn an_event_queue_overrun_rearms_every_queue() {
+    let hca = FakeHca::new(IB);
+    let dma = HostDma::default();
+    let func = Function::new(&hca, fake::ADDR).unwrap();
+    let mut mlx = Mlx4::new(&func, hca.config_io(), hca.uar_io(), &dma, &hca).unwrap();
+    let messages = [MsiMessage { address: 0xfee0_0000, data: 0x40 }, MsiMessage { address: 0xfee0_1000, data: 0x41 }];
+    mlx.enable_msix(&func, &hca.msix_io(), messages).unwrap();
+    let mut a = mlx.open_ib(1, QKEY).unwrap();
+    hca.sm_configure(1, 7);
+    hca.take_interrupts();
+    assert_eq!(mlx.handle_interrupt(VECTOR_ASYNC), 0);
+    let mut buf = [0u8; 64];
+
+    // A datagram whose completion event the adapter then lost: its queue stays disarmed.
+    assert!(hca.deliver_ud(1, a.qpn(), QKEY, peer(3, 9), None, &[1; 8]));
+    assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION]);
+    let comp_eqn = mlx.caps.comp_eqn();
+    // (Consume the event behind the driver's back, as an overrun would have lost it.)
+    let ci = hca.eq_events(comp_eqn);
+    let doorbell = 0x800 + 4096 * (comp_eqn as usize / 4) + 8 * (comp_eqn as usize % 4);
+    mlx.uar.write(doorbell, (ci | 1 << 31).to_be()).unwrap();
+    mlx.comp_eq_ci.set(ci);
+    assert_eq!(a.receive(&mut buf).map(|d| d.len), Ok(8));
+    assert!(hca.deliver_ud(1, a.qpn(), QKEY, peer(3, 9), None, &[2; 8]));
+    assert!(hca.take_interrupts().is_empty(), "disarmed: the event that would re-arm it never came");
+
+    // The overrun report signals the port, whose next reap re-arms its queues.
+    hca.async_event(0x0f, comp_eqn);
+    assert_eq!(hca.take_interrupts(), [VECTOR_ASYNC]);
+    assert_eq!(mlx.handle_interrupt(VECTOR_ASYNC), 0b1, "every open port");
+    assert_eq!(mlx.handle_interrupt(VECTOR_ASYNC), 0, "once");
+    assert_eq!(a.receive(&mut buf).map(|d| d.len), Ok(8));
+    assert!(hca.deliver_ud(1, a.qpn(), QKEY, peer(3, 9), None, &[3; 8]));
+    assert_eq!(hca.take_interrupts(), [VECTOR_COMPLETION], "armed again");
 }

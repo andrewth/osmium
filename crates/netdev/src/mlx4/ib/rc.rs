@@ -22,8 +22,10 @@ use osmium_hal::net::NetError;
 
 use super::{IbPort, Route};
 use crate::mlx4::cmd::Ctx;
-use crate::mlx4::queue::{CTRL_COMPLETE, Geometry, QpSetup, Queues, SEG_LEN, SET_RC, SQ_ENTRIES, TX_SLOTS, optpar};
-use crate::mlx4::{MAX_PORTS, Mlx4Error, put32};
+use crate::mlx4::queue::{
+    CTRL_COMPLETE, Geometry, QpSetup, Queues, SEG_LEN, SET_RC, SQ_ENTRIES, SendEntry, TX_SLOTS, optpar,
+};
+use crate::mlx4::{MAX_PORTS, Mlx4Error};
 
 /// Bytes of the window a peer can read and write.
 pub const WINDOW_LEN: usize = 16 * 1024;
@@ -90,7 +92,8 @@ pub struct RcParams {
     pub min_rnr_timer: u8,
     /// RDMA reads this end may have outstanding.
     pub max_rd_atomic: u8,
-    /// RDMA reads the peer may have outstanding.
+    /// RDMA reads the peer may have outstanding: at most 16, the responder
+    /// resources (RDMARC entries) each queue pair has.
     pub max_dest_rd_atomic: u8,
 }
 
@@ -366,7 +369,8 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
             || p.receive_psn > 0xff_ffff
             || !route_ok
             || !fits(p.max_rd_atomic, hca.caps.log_max_req_rd)
-            || !fits(p.max_dest_rd_atomic, hca.caps.log_max_res_rd)
+            // Responder resources live in the RDMARC table, sized at INIT_HCA.
+            || !fits(p.max_dest_rd_atomic, hca.caps.log_rd_per_qp())
         {
             return Err(Mlx4Error::BadParameter);
         }
@@ -410,31 +414,31 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
                 return Err(NetError::WouldBlock);
             }
         }
-        let (wqe, slot) = rc.q.begin_send();
+        let slot = rc.q.tx_slot();
         if let Some(d) = data {
             rc.q.mem.tx.write(slot, d);
         }
         let buf = rc.q.mem.tx.device_addr().as_u64() + slot as u64;
         let lkey = rc.q.hca.lkey;
-        let wq = rc.q.wq();
-        put32(wq, wqe + 8, CTRL_COMPLETE);
-        let mut at = wqe + SEG_LEN;
+        let mut e = SendEntry::new();
+        e.put32(8, CTRL_COMPLETE);
+        let mut at = SEG_LEN;
         let opcode = match op {
             Op::Send => OPCODE_SEND,
             Op::Write => OPCODE_RDMA_WRITE,
             Op::Read { .. } => OPCODE_RDMA_READ,
         };
         if let Some((raddr, rkey)) = remote {
-            wq.store(at, raddr.to_be());
-            put32(wq, at + 8, rkey);
+            e.put64(at, raddr);
+            e.put32(at + 8, rkey);
             at += SEG_LEN;
         }
-        put32(wq, at, len as u32);
-        put32(wq, at + 4, lkey);
-        wq.store(at + 8, buf.to_be());
-        let size = ((at + SEG_LEN - wqe) / SEG_LEN) as u32;
-        put32(wq, wqe + 4, size);
-        rc.q.finish_send(wqe, opcode);
+        e.put32(at, len as u32);
+        e.put32(at + 4, lkey);
+        e.put64(at + 8, buf);
+        let size = ((at + SEG_LEN) / SEG_LEN) as u32;
+        e.put32(4, size);
+        rc.q.finish_send(&e, opcode);
         if let Some(entry) = rc.ops.get_mut(rc.posted as usize % TX_SLOTS as usize) {
             *entry = op;
         }
