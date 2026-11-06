@@ -523,7 +523,7 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
     let addr = th.clear_tid.swap(0, Ordering::SeqCst);
     if addr != 0 {
         let _ = p.memory().write(addr, &0u32.to_ne_bytes());
-        crate::futex::wake(p.pid(), addr, 1);
+        crate::futex::wake(p, addr, 1);
     }
     let live = {
         let mut threads = p.group.threads.lock();

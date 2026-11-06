@@ -1,38 +1,73 @@
 //! `futex`: wait, wake, requeue, `WAKE_OP`, bitsets, timeouts and robust
 //! lists. Enough for `pthread_join`, mutexes and condition variables.
 //!
-//! Futexes are keyed by (process, address): memory is never shared between
-//! processes, so `FUTEX_PRIVATE_FLAG` makes no difference. A waiting thread
-//! is woken by a wake, or interrupted (`EINTR`) by a signal it would act on,
-//! or when its process is ending.
+//! # Keys
+//!
+//! A futex is known by a key, as in Linux. With `FUTEX_PRIVATE_FLAG` the key
+//! is the address space and the user address, so threads of one process
+//! meet whatever the memory is. Without it, a word in a `MAP_SHARED` mapping
+//! is keyed by its physical address, so processes that share the frame (a
+//! parent and the children it forked with the mapping) meet there even
+//! though each has its own space; any other word (private memory, which a
+//! `fork` copies on write) is keyed as a private one. A shared key names a
+//! frame, not a file: there is no page cache across unrelated spaces (see
+//! `memory::filemap`), so they share no frames and no futexes either. A
+//! frame freed and reused while a thread waits on it can only cause a
+//! spurious wake-up, which callers of `FUTEX_WAIT` must expect anyway.
+//!
+//! # Locking and user memory
+//!
+//! Waiters are hashed by key into 64 buckets, each with its own
+//! spin lock and its own wait queue, so a wake locks and wakes one bucket.
+//! The futex word is read and written under that lock (or the
+//! priority-inheritance lock, see `crate::futex_pi`) only through
+//! [`UserMemory::with_word`]: an atomic access through the physical mapping
+//! under the space's lock, which never faults, allocates, does file I/O or
+//! shoots down other CPUs. When the page is not ready (not loaded, or
+//! copy-on-write for a store) every lock is dropped, the page is faulted in
+//! with [`UserMemory::prefault`], and the whole operation starts again,
+//! including the key, since a `fork`, `munmap` or `mprotect` may have
+//! changed the mapping in between. The lock order is: futex bucket(s), in
+//! index order, or the priority-inheritance lock; then the address space.
+//!
+//! `WAKE_OP` changes the word with one atomic instruction, so it is atomic
+//! against the program's own atomics too.
+//!
+//! # Sleeping
+//!
+//! A waiting thread is woken by a wake, interrupted (`EINTR`) by a signal it
+//! would act on, or by its process ending. Signals and process exit wake
+//! every bucket, since any thread may be the one they are for.
 //!
 //! Timeouts need a clock: a kernel supplies one with [`set_clock`] and calls
 //! [`tick`] from its timer interrupt so deadlines are noticed. Without a
 //! clock a timed wait fails with `ENOSYS`. `CLOCK_REALTIME` and
-//! `CLOCK_MONOTONIC` both read that clock.
+//! `CLOCK_MONOTONIC` both read that clock. A timed sleeper registers its
+//! deadline, and [`tick`] wakes only the buckets of the sleepers whose
+//! deadline has passed; with none due it reads one atomic.
 //!
 //! Priority-inheritance futexes (`LOCK_PI` and friends) are in
 //! `crate::futex_pi`. A timed or untimed `FUTEX_WAIT` that a signal handler
 //! interrupts fails with `EINTR`; if no handler runs it continues through
-//! `restart_syscall` (see `crate::restart`). `WAKE_OP` and the requeue operations compare and
-//! modify user memory under the futex lock, which orders them against other
-//! futex calls but not against the program's own atomic instructions.
+//! `restart_syscall` (see `crate::restart`).
 //!
 //! Robust lists (`set_robust_list`): when a thread exits, each futex it
 //! still owns is marked `FUTEX_OWNER_DIED` and one waiter is woken.
 
+use alloc::sync::Arc;
 use core::marker::PhantomPinned;
 use core::mem::offset_of;
 use core::pin::Pin;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use osmium_fs::Errno;
 use osmium_sched::WaitQueue;
 use osmium_sync::intrusive::{Adapter, Link, List};
-use osmium_sync::{IrqSpinLock, Once};
+use osmium_sync::{IrqDisabled, IrqSpinLock, Once, SpinLockGuard};
 
-use crate::process::{Pid, Process};
+use crate::memory::{UserMemory, WordAt};
+use crate::process::Process;
 use crate::thread::Thread;
 
 const WAIT: u64 = 0;
@@ -62,13 +97,111 @@ const ROBUST_HEAD_LEN: u64 = 24;
 /// Most entries walked, so a corrupt (circular) list ends.
 const ROBUST_LIMIT: usize = 2048;
 
-/// A thread waiting on a futex. It is linked into [`WAITERS`] through its own
-/// `link`, so waiting never allocates: the waiting thread keeps the `Waiter`
-/// on its stack, pinned, and it unlinks itself when dropped.
+/// How many times an operation starts again because the word's page was not
+/// ready, before it gives up with `EFAULT`. Each retry first faults the page
+/// in, so only a page that cannot be made ready (or a mapping that keeps
+/// changing) gets that far.
+const RETRIES: usize = 64;
+
+/// What a futex is known by: an address space and a user address for a
+/// private futex, or (`space` 0) the physical address of a word in shared
+/// memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Key {
+    space: u64,
+    addr: u64,
+}
+
+/// How a futex call reaches user memory: the caller's space, and whether
+/// the call was `FUTEX_PRIVATE_FLAG`.
+pub(crate) struct Ctx {
+    mem: Arc<dyn UserMemory>,
+    /// Identifies the space while it lives (its address; never 0).
+    space: u64,
+    private: bool,
+}
+
+/// The result of one attempt at an operation on a futex word.
+pub(crate) enum Step<R> {
+    /// It is done.
+    Done(R),
+    /// Fault in the word at this address (for a store if `true`), then try again.
+    Fault(u64, bool),
+    /// Something moved under it (the word changed between two looks): try again.
+    Again,
+}
+
+impl Ctx {
+    pub(crate) fn new(p: &Process, private: bool) -> Self {
+        let mem = p.memory();
+        let space = Arc::as_ptr(&mem).cast::<u8>() as u64;
+        Self { mem, space, private }
+    }
+
+    fn key_at(&self, addr: u64, at: WordAt) -> Key {
+        if !self.private && at.shared { Key { space: 0, addr: at.pa.0 } } else { Key { space: self.space, addr } }
+    }
+
+    /// The key of the futex at `addr`, or `None` if its page has to be
+    /// faulted in first. Locks nothing but the space, briefly.
+    pub(crate) fn key(&self, addr: u64) -> Result<Option<Key>, Errno> {
+        if self.private {
+            return Ok(Some(Key { space: self.space, addr }));
+        }
+        let mut key = None;
+        let ready = self.mem.with_word(addr, false, &mut |_, at| key = Some(self.key_at(addr, at)))?;
+        Ok(key.filter(|_| ready))
+    }
+
+    /// Runs `f` on the word at `addr` if its page is ready for the access
+    /// (a store if `write`) and the word still has `key`; `None` if not, and
+    /// the operation must fault the page in and start again. Never faults or
+    /// blocks: see [`UserMemory::with_word`].
+    pub(crate) fn word<R>(
+        &self,
+        addr: u64,
+        write: bool,
+        key: Key,
+        f: impl FnOnce(&AtomicU32) -> R,
+    ) -> Result<Option<R>, Errno> {
+        let mut f = Some(f);
+        let mut out = None;
+        self.mem.with_word(addr, write, &mut |w, at| {
+            if self.key_at(addr, at) == key
+                && let Some(f) = f.take()
+            {
+                out = Some(f(w));
+            }
+        })?;
+        Ok(out)
+    }
+
+    /// Runs `attempt` until it is done, faulting pages in (with no lock
+    /// held) between attempts as it asks.
+    pub(crate) fn retry<R>(&self, mut attempt: impl FnMut() -> Result<Step<R>, Errno>) -> Result<R, Errno> {
+        for _ in 0..RETRIES {
+            match attempt()? {
+                Step::Done(r) => return Ok(r),
+                Step::Fault(addr, write) => self.mem.prefault(addr, 4, write)?,
+                Step::Again => {}
+            }
+        }
+        Err(Errno::EFAULT)
+    }
+}
+
+/// A thread waiting on a futex. It is linked into its bucket's list through
+/// its own `link`, so waiting never allocates: the waiting thread keeps the
+/// `Waiter` on its stack, pinned, and it unlinks itself when dropped.
 pub(crate) struct Waiter {
     link: Link,
-    pid: Pid,
+    /// The key, set before the waiter is queued and changed only by a
+    /// requeue that holds the locks of the old and the new bucket. Read
+    /// under the lock of the bucket the waiter is in.
+    space: AtomicU64,
     addr: AtomicU64,
+    /// The bucket of the key: the waiter is in that bucket's list, if in any.
+    bucket: AtomicUsize,
     bitset: u32,
     pub(crate) woken: AtomicBool,
     _pinned: PhantomPinned,
@@ -82,45 +215,133 @@ unsafe impl Adapter<Link> for ByLink {
     const OFFSET: usize = offset_of!(Waiter, link);
 }
 
-/// The waiters in the order they arrived. Linked waiters are alive: `Waiter`
-/// unlinks itself before it goes away, under the same lock.
+/// The waiters of one bucket in the order they arrived. Linked waiters are
+/// alive: `Waiter` unlinks itself before it goes away, under the same lock.
 struct WaiterList(List<ByLink>);
 
 // SAFETY: the list is only used under the lock around it, and the waiters it
 // links are `Sync` (atomics and an intrusive link used only under that lock).
 unsafe impl Send for WaiterList {}
 
+/// How many buckets futexes hash into: a power of two no larger than 64, so
+/// a set of them fits a `u64`.
+const BUCKETS: usize = 64;
+
+/// A bucket's waiters, and the queue its sleeping threads wait in.
+struct Bucket {
+    waiters: IrqSpinLock<WaiterList>,
+    sleepers: WaitQueue,
+}
+
+static TABLE: [Bucket; BUCKETS] =
+    [const { Bucket { waiters: IrqSpinLock::new(WaiterList(List::new())), sleepers: WaitQueue::new() } }; BUCKETS];
+
+type Guard = SpinLockGuard<'static, WaiterList, IrqDisabled>;
+
+fn bucket(i: usize) -> &'static Bucket {
+    let [first, ..] = &TABLE;
+    TABLE.get(i).unwrap_or(first)
+}
+
+/// The bucket `key` hashes into.
+pub(crate) fn bucket_of(key: Key) -> usize {
+    let h = (key.space ^ key.addr.rotate_left(29) ^ (key.addr >> 2)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (h >> (64 - BUCKETS.trailing_zeros())) as usize
+}
+
+/// Wakes the threads sleeping in bucket `i`, which look at their waiters again.
+pub(crate) fn wake_bucket(i: usize) {
+    bucket(i).sleepers.wake_all();
+}
+
+/// The locks of the buckets of two keys, taken in index order (once if
+/// they are the same).
+struct Pair {
+    // Declared first so it is released first: the guards restore the
+    // interrupt state in the reverse order they were taken.
+    second: Option<Guard>,
+    first: Guard,
+    lo: usize,
+}
+
+impl Pair {
+    fn lock(a: usize, b: usize) -> Self {
+        let (lo, hi) = (a.min(b), a.max(b));
+        let first = bucket(lo).waiters.lock();
+        let second = (hi != lo).then(|| bucket(hi).waiters.lock());
+        Self { second, first, lo }
+    }
+
+    /// The list of bucket `a`, and that of `b` if it is another one.
+    fn lists(&mut self, a: usize) -> (&mut WaiterList, Option<&mut WaiterList>) {
+        match &mut self.second {
+            None => (&mut self.first, None),
+            Some(second) if a == self.lo => (&mut self.first, Some(second)),
+            Some(second) => (second, Some(&mut self.first)),
+        }
+    }
+}
+
 impl Waiter {
-    pub(crate) fn new(pid: Pid, addr: u64, bitset: u32) -> Self {
+    pub(crate) fn new(bitset: u32) -> Self {
         Self {
             link: Link::new(),
-            pid,
-            addr: AtomicU64::new(addr),
+            space: AtomicU64::new(0),
+            addr: AtomicU64::new(0),
+            bucket: AtomicUsize::new(0),
             bitset,
             woken: AtomicBool::new(false),
             _pinned: PhantomPinned,
         }
     }
 
-    /// Queues the waiter at its address if the word there still holds `val`:
-    /// the check and the queueing cannot be separated by a wake.
-    pub(crate) fn enqueue(self: Pin<&Self>, p: &Process, val: u32) -> Result<(), Errno> {
-        prefault(p, self.addr.load(Ordering::SeqCst), false);
-        let mut waiters = WAITERS.lock();
-        if read_u32(p, self.addr.load(Ordering::SeqCst))? != val {
-            return Err(Errno::EAGAIN);
-        }
-        // SAFETY: the waiter is pinned, and its `Drop` unlinks it (under this
-        // lock) before its memory can be reused.
-        unsafe { waiters.0.push_back(NonNull::from(self.get_ref())) };
-        Ok(())
+    fn key(&self) -> Key {
+        Key { space: self.space.load(Ordering::SeqCst), addr: self.addr.load(Ordering::SeqCst) }
     }
 
-    /// Takes the waiter out of the queue, if a wake has not already.
+    /// Gives the waiter `key`, whose bucket is `b`. Only with the locks of
+    /// the bucket it is in (if any) and of `b` held.
+    fn set_key(&self, key: Key, b: usize) {
+        self.space.store(key.space, Ordering::SeqCst);
+        self.addr.store(key.addr, Ordering::SeqCst);
+        self.bucket.store(b, Ordering::SeqCst);
+    }
+
+    /// Queues the waiter at the futex at `uaddr` if the word there still
+    /// holds `val`: the check and the queueing cannot be separated by a wake.
+    pub(crate) fn enqueue(self: Pin<&Self>, ctx: &Ctx, uaddr: u64, val: u32) -> Result<(), Errno> {
+        ctx.retry(|| {
+            let Some(key) = ctx.key(uaddr)? else { return Ok(Step::Fault(uaddr, false)) };
+            let b = bucket_of(key);
+            let mut list = bucket(b).waiters.lock();
+            let Some(cur) = ctx.word(uaddr, false, key, |w| w.load(Ordering::SeqCst))? else {
+                return Ok(Step::Fault(uaddr, false));
+            };
+            if cur != val {
+                return Err(Errno::EAGAIN);
+            }
+            // Not queued anywhere yet, and `b`'s lock is held.
+            self.set_key(key, b);
+            // SAFETY: the waiter is pinned, and its `Drop` unlinks it (under
+            // this lock, which `bucket` names) before its memory can be reused.
+            unsafe { list.0.push_back(NonNull::from(self.get_ref())) };
+            Ok(Step::Done(()))
+        })
+    }
+
+    /// Takes the waiter out of its bucket, if a wake has not already.
     fn dequeue(&self) {
-        let mut waiters = WAITERS.lock();
-        // SAFETY: if the waiter is linked, it is in `WAITERS`.
-        unsafe { waiters.0.remove(NonNull::from(self)) };
+        loop {
+            let b = self.bucket.load(Ordering::SeqCst);
+            let mut list = bucket(b).waiters.lock();
+            // A requeue moves the waiter with both locks held: if it is still
+            // in `b`, it stays there while we hold `b`'s lock.
+            if self.bucket.load(Ordering::SeqCst) == b {
+                // SAFETY: if the waiter is linked, it is in bucket `b`'s list.
+                unsafe { list.0.remove(NonNull::from(self)) };
+                return;
+            }
+        }
     }
 }
 
@@ -130,10 +351,6 @@ impl Drop for Waiter {
     }
 }
 
-static WAITERS: IrqSpinLock<WaiterList> = IrqSpinLock::new(WaiterList(List::new()));
-/// Every sleeping thread waits here and checks its own waiter; wakes are
-/// rare enough that waking the lot is simpler than a queue per address.
-pub(crate) static SLEEPERS: WaitQueue = WaitQueue::new();
 static CLOCK: Once<fn() -> u64> = Once::new();
 
 /// Sets the monotonic clock, in nanoseconds, that futex timeouts read. Only
@@ -142,24 +359,119 @@ pub fn set_clock(now_ns: fn() -> u64) {
     let _ = CLOCK.set(now_ns);
 }
 
-/// Makes timed waits look at the clock again: call it from the timer
+/// The deadline of a timed sleeper, linked into [`TIMERS`] while it sleeps.
+pub(crate) struct Timer {
+    link: Link,
+    deadline: u64,
+    /// The bucket whose queue the sleeper is in, for [`tick`] to wake.
+    bucket: AtomicUsize,
+    /// Set by [`tick`] once the deadline has passed.
+    fired: AtomicBool,
+    armed: bool,
+    _pinned: PhantomPinned,
+}
+
+struct ByTimerLink;
+
+// SAFETY: `offset_of!` of the `Link` field of `Timer`.
+unsafe impl Adapter<Link> for ByTimerLink {
+    type Value = Timer;
+    const OFFSET: usize = offset_of!(Timer, link);
+}
+
+struct TimerList(List<ByTimerLink>);
+
+// SAFETY: as for `WaiterList`: used only under its lock, and linked timers
+// unlink themselves under it before they go away.
+unsafe impl Send for TimerList {}
+
+static TIMERS: IrqSpinLock<TimerList> = IrqSpinLock::new(TimerList(List::new()));
+/// No timer in [`TIMERS`] is due before this: [`tick`] looks no further
+/// while the clock is behind it.
+static EARLIEST: AtomicU64 = AtomicU64::new(u64::MAX);
+
+impl Timer {
+    fn new(deadline: Option<u64>) -> Self {
+        Self {
+            link: Link::new(),
+            deadline: deadline.unwrap_or(u64::MAX),
+            bucket: AtomicUsize::new(0),
+            fired: AtomicBool::new(false),
+            armed: deadline.is_some(),
+            _pinned: PhantomPinned,
+        }
+    }
+
+    fn arm(self: Pin<&Self>) {
+        if !self.armed {
+            return;
+        }
+        let mut timers = TIMERS.lock();
+        // SAFETY: the timer is pinned, and its `Drop` unlinks it under this
+        // lock before its memory can be reused.
+        unsafe { timers.0.push_back(NonNull::from(self.get_ref())) };
+        EARLIEST.fetch_min(self.deadline, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: if the timer is linked, it is in `TIMERS`.
+            unsafe { TIMERS.lock().0.remove(NonNull::from(&*self)) };
+        }
+    }
+}
+
+/// Fires the timers due at `now`, and returns the set of buckets whose
+/// sleepers must look again.
+fn expire(now: u64) -> u64 {
+    if now < EARLIEST.load(Ordering::SeqCst) {
+        return 0;
+    }
+    let mut timers = TIMERS.lock();
+    let (mut due, mut next) = (0u64, u64::MAX);
+    timers.0.retain(|t| {
+        if t.deadline <= now {
+            t.fired.store(true, Ordering::SeqCst);
+            due |= 1u64.wrapping_shl(t.bucket.load(Ordering::SeqCst) as u32);
+            false
+        } else {
+            next = next.min(t.deadline);
+            true
+        }
+    });
+    EARLIEST.store(next, Ordering::SeqCst);
+    due
+}
+
+/// Notices the futex deadlines that have passed: call it from the timer
 /// interrupt (or any periodic task), or a timeout only fires when something
-/// else wakes the waiter.
+/// else wakes the waiter. Only the buckets of sleepers whose deadline has
+/// passed are woken.
 pub fn tick() {
-    SLEEPERS.wake_all();
+    let Some(now) = CLOCK.get() else { return };
+    let mut due = expire(now());
+    while due != 0 {
+        wake_bucket(due.trailing_zeros() as usize);
+        due &= due - 1;
+    }
 }
 
 /// Makes every sleeping thread look again: for signals and process exit.
 pub(crate) fn interrupt() {
-    SLEEPERS.wake_all();
+    for b in &TABLE {
+        b.sleepers.wake_all();
+    }
 }
 
-/// Wakes up to `n` threads of `pid` waiting at `addr` whose bitset meets
-/// `mask`, oldest first, with the waiter list already locked.
-fn wake_locked(waiters: &mut WaiterList, pid: Pid, addr: u64, n: u32, mask: u32) -> u32 {
+/// Wakes up to `n` threads waiting on `key` whose bitset meets `mask`,
+/// oldest first, with their bucket's list locked. The caller then wakes the
+/// bucket's sleepers.
+fn wake_locked(waiters: &mut WaiterList, key: Key, n: u32, mask: u32) -> u32 {
     let mut woken = 0;
     waiters.0.retain(|w| {
-        if woken < n && w.pid == pid && w.addr.load(Ordering::SeqCst) == addr && w.bitset & mask != 0 {
+        if woken < n && w.key() == key && w.bitset & mask != 0 {
             w.woken.store(true, Ordering::SeqCst);
             woken += 1;
             false
@@ -170,31 +482,20 @@ fn wake_locked(waiters: &mut WaiterList, pid: Pid, addr: u64, n: u32, mask: u32)
     woken
 }
 
-/// Wakes up to `n` threads of `pid` waiting at `addr`, oldest first, and
-/// returns how many.
-pub(crate) fn wake(pid: Pid, addr: u64, n: u32) -> u32 {
-    wake_bits(pid, addr, n, BITSET_ANY)
+/// Wakes up to `n` threads waiting at `addr` in `p`, oldest first, as a
+/// process-shared futex (for `CLONE_CHILD_CLEARTID`), and returns how many.
+pub(crate) fn wake(p: &Process, addr: u64, n: u32) -> u32 {
+    wake_bits(&Ctx::new(p, false), addr, n, BITSET_ANY).unwrap_or(0)
 }
 
-fn wake_bits(pid: Pid, addr: u64, n: u32, mask: u32) -> u32 {
-    let woken = wake_locked(&mut WAITERS.lock(), pid, addr, n, mask);
+fn wake_bits(ctx: &Ctx, addr: u64, n: u32, mask: u32) -> Result<u32, Errno> {
+    let key = ctx.retry(|| Ok(ctx.key(addr)?.map_or(Step::Fault(addr, false), Step::Done)))?;
+    let b = bucket_of(key);
+    let woken = wake_locked(&mut bucket(b).waiters.lock(), key, n, mask);
     if woken != 0 {
-        SLEEPERS.wake_all();
+        wake_bucket(b);
     }
-    woken
-}
-
-/// Makes the word at `addr` resident (and writable if `write`) before a
-/// spin lock is taken for a read or write of it: see [`UserMemory::prefault`].
-/// A bad address is left for the access under the lock to report.
-pub(crate) fn prefault(p: &Process, addr: u64, write: bool) {
-    let _ = p.memory().prefault(addr, 4, write);
-}
-
-pub(crate) fn read_u32(p: &Process, addr: u64) -> Result<u32, Errno> {
-    let mut cur = [0; 4];
-    p.memory().read(addr, &mut cur)?;
-    Ok(u32::from_ne_bytes(cur))
+    Ok(woken)
 }
 
 /// A waiter at `addr`, queued if it still holds `val`, for a test to wake.
@@ -211,32 +512,54 @@ pub(crate) fn enqueue_bits(
     val: u32,
     bitset: u32,
 ) -> Result<Pin<alloc::boxed::Box<Waiter>>, Errno> {
-    let w = alloc::boxed::Box::pin(Waiter::new(p.pid(), addr, bitset));
-    w.as_ref().enqueue(p, val)?;
+    let w = alloc::boxed::Box::pin(Waiter::new(bitset));
+    w.as_ref().enqueue(&Ctx::new(p, false), addr, val)?;
     Ok(w)
 }
 
 /// Blocks until `ready` holds, the thread is interrupted (`EINTR`), or the
-/// clock reaches `deadline` (`ETIMEDOUT`). `ready` is checked first.
-pub(crate) fn sleep_on(p: &Process, th: &Thread, deadline: Option<u64>, ready: impl Fn() -> bool) -> Result<(), Errno> {
+/// clock reaches `deadline` (`ETIMEDOUT`). `ready` is checked first. The
+/// thread sleeps in the queue of bucket `home()`, and moves when that
+/// changes (a requeue wakes the old bucket after changing it).
+pub(crate) fn sleep_on(
+    p: &Process,
+    th: &Thread,
+    deadline: Option<u64>,
+    home: &dyn Fn() -> usize,
+    ready: &dyn Fn() -> bool,
+) -> Result<(), Errno> {
     let now = CLOCK.get().copied();
-    SLEEPERS.wait_until(|| {
-        if ready() {
-            Some(Ok(()))
-        } else if crate::signal::interrupted(p, th) {
-            Some(Err(Errno::EINTR))
-        } else if deadline.is_some_and(|d| now.is_some_and(|now| now() >= d)) {
-            Some(Err(Errno::ETIMEDOUT))
-        } else {
-            None
+    let timer = core::pin::pin!(Timer::new(deadline.filter(|_| now.is_some())));
+    timer.as_ref().arm();
+    loop {
+        let b = home();
+        // Before the deadline is checked below: `expire` sets `fired` before
+        // it reads this, so it either wakes `b` or we see `fired`.
+        timer.bucket.store(b, Ordering::SeqCst);
+        let r = bucket(b).sleepers.wait_until(|| {
+            if ready() {
+                Some(Some(Ok(())))
+            } else if crate::signal::interrupted(p, th) {
+                Some(Some(Err(Errno::EINTR)))
+            } else if timer.fired.load(Ordering::SeqCst) || deadline.is_some_and(|d| now.is_some_and(|now| now() >= d))
+            {
+                Some(Some(Err(Errno::ETIMEDOUT)))
+            } else if home() != b {
+                Some(None)
+            } else {
+                None
+            }
+        });
+        if let Some(r) = r {
+            return r;
         }
-    })
+    }
 }
 
 /// Blocks until `w` is woken, the thread is interrupted, or the clock
 /// reaches `deadline` (`ETIMEDOUT`).
 fn sleep_until(p: &Process, th: &Thread, w: &Waiter, deadline: Option<u64>) -> Result<(), Errno> {
-    let r = sleep_on(p, th, deadline, || w.woken.load(Ordering::SeqCst));
+    let r = sleep_on(p, th, deadline, &|| w.bucket.load(Ordering::SeqCst), &|| w.woken.load(Ordering::SeqCst));
     if r.is_err() {
         w.dequeue();
         // A wake that raced with the interruption still counts.
@@ -257,9 +580,9 @@ pub(crate) fn is_wait(op: u64) -> bool {
     matches!(op & !(PRIVATE | CLOCK_REALTIME), WAIT | WAIT_BITSET)
 }
 
-/// Waits at `uaddr` while it holds `val`, until woken or `deadline`. If a
-/// signal interrupts it, the thread's restart block lets `restart_syscall`
-/// continue it with the same deadline.
+/// Waits at `uaddr` while it holds `val`, until woken or `deadline`; a
+/// private futex if `private`. If a signal interrupts it, the thread's
+/// restart block lets `restart_syscall` continue it with the same deadline.
 pub(crate) fn wait(
     p: &Process,
     th: &Thread,
@@ -267,13 +590,14 @@ pub(crate) fn wait(
     val: u32,
     bitset: u32,
     deadline: Option<u64>,
+    private: bool,
 ) -> Result<u64, Errno> {
     *th.ext.restart.lock() = None;
-    let w = core::pin::pin!(Waiter::new(p.pid(), uaddr, bitset));
-    w.as_ref().enqueue(p, val)?;
+    let w = core::pin::pin!(Waiter::new(bitset));
+    w.as_ref().enqueue(&Ctx::new(p, private), uaddr, val)?;
     let r = sleep_until(p, th, &w, deadline);
     if r == Err(Errno::EINTR) {
-        *th.ext.restart.lock() = Some(crate::restart::Block::FutexWait { uaddr, val, bitset, deadline });
+        *th.ext.restart.lock() = Some(crate::restart::Block::FutexWait { uaddr, val, bitset, deadline, private });
     }
     r.map(|()| 0)
 }
@@ -301,11 +625,19 @@ fn deadline(p: &Process, timeout: u64, absolute: bool) -> Result<Option<u64>, Er
     Ok(Some(if absolute { t } else { now().saturating_add(t) }))
 }
 
+/// The keys of `uaddr` and `uaddr2`, or (`Err`) the address whose page must
+/// be faulted in first.
+fn keys(ctx: &Ctx, uaddr: u64, uaddr2: u64) -> Result<Result<(Key, Key), u64>, Errno> {
+    let Some(k1) = ctx.key(uaddr)? else { return Ok(Err(uaddr)) };
+    let Some(k2) = ctx.key(uaddr2)? else { return Ok(Err(uaddr2)) };
+    Ok(Ok((k1, k2)))
+}
+
 /// `FUTEX_REQUEUE` / `FUTEX_CMP_REQUEUE`: wakes up to `nr_wake` waiters at
 /// `uaddr` and moves up to `nr_requeue` more to `uaddr2`. With `expect`, the
 /// word at `uaddr` must hold it (`EAGAIN`). Returns woken plus requeued.
 fn requeue(
-    p: &Process,
+    ctx: &Ctx,
     [uaddr, uaddr2]: [u64; 2],
     [nr_wake, nr_requeue]: [u32; 2],
     expect: Option<u32>,
@@ -313,38 +645,58 @@ fn requeue(
     if !uaddr2.is_multiple_of(4) {
         return Err(Errno::EINVAL);
     }
-    let pid = p.pid();
-    if expect.is_some() {
-        prefault(p, uaddr, false);
-    }
-    let mut waiters = WAITERS.lock();
-    if let Some(v) = expect
-        && read_u32(p, uaddr)? != v
-    {
-        return Err(Errno::EAGAIN);
-    }
-    let woken = wake_locked(&mut waiters, pid, uaddr, nr_wake, BITSET_ANY);
-    let mut moved = 0;
-    for w in waiters.0.iter() {
-        if moved == nr_requeue {
-            break;
+    let (woken, moved, b1, b2) = ctx.retry(|| {
+        let (k1, k2) = match keys(ctx, uaddr, uaddr2)? {
+            Ok(k) => k,
+            Err(addr) => return Ok(Step::Fault(addr, false)),
+        };
+        let (b1, b2) = (bucket_of(k1), bucket_of(k2));
+        let mut pair = Pair::lock(b1, b2);
+        if let Some(v) = expect {
+            let Some(cur) = ctx.word(uaddr, false, k1, |w| w.load(Ordering::SeqCst))? else {
+                return Ok(Step::Fault(uaddr, false));
+            };
+            if cur != v {
+                return Err(Errno::EAGAIN);
+            }
         }
-        if w.pid == pid && w.addr.load(Ordering::SeqCst) == uaddr {
-            w.addr.store(uaddr2, Ordering::SeqCst);
+        let (from, mut to) = pair.lists(b1);
+        let woken = wake_locked(from, k1, nr_wake, BITSET_ANY);
+        if k1 == k2 {
+            // Requeued onto itself: the waiters stay, and count as moved.
+            let moved = nr_requeue.min(from.0.iter().filter(|w| w.key() == k1).count() as u32);
+            return Ok(Step::Done((woken, moved, b1, b2)));
+        }
+        let mut moved = 0;
+        while moved < nr_requeue {
+            let Some(w) = from.0.find_ptr(|w| w.key() == k1) else { break };
             moved += 1;
+            match to.as_deref_mut() {
+                // SAFETY: `w` is linked in `from`, and both buckets are locked,
+                // so the waiter cannot unlink itself meanwhile.
+                Some(to) => unsafe {
+                    from.0.remove(w);
+                    w.as_ref().set_key(k2, b2);
+                    to.0.push_back(w);
+                },
+                // SAFETY: as above; it stays in the same bucket.
+                None => unsafe { w.as_ref() }.set_key(k2, b2),
+            }
         }
-    }
-    drop(waiters);
-    if woken != 0 {
-        SLEEPERS.wake_all();
+        Ok(Step::Done((woken, moved, b1, b2)))
+    })?;
+    if woken != 0 || (moved != 0 && b1 != b2) {
+        // The moved waiters sleep in `b1`'s queue until they look again.
+        wake_bucket(b1);
     }
     Ok(woken as u64 + moved as u64)
 }
 
 /// `FUTEX_WAKE_OP`: applies the operation encoded in `val3` to the word at
-/// `uaddr2`, wakes up to `nr_wake` waiters at `uaddr`, and, if the old value
-/// of the word passes the encoded comparison, up to `nr_wake2` at `uaddr2`.
-fn wake_op(p: &Process, [uaddr, uaddr2]: [u64; 2], [nr_wake, nr_wake2]: [u32; 2], val3: u32) -> Result<u64, Errno> {
+/// `uaddr2` (atomically), wakes up to `nr_wake` waiters at `uaddr`, and, if
+/// the old value of the word passes the encoded comparison, up to
+/// `nr_wake2` at `uaddr2`.
+fn wake_op(ctx: &Ctx, [uaddr, uaddr2]: [u64; 2], [nr_wake, nr_wake2]: [u32; 2], val3: u32) -> Result<u64, Errno> {
     if !uaddr2.is_multiple_of(4) {
         return Err(Errno::EINVAL);
     }
@@ -356,37 +708,48 @@ fn wake_op(p: &Process, [uaddr, uaddr2]: [u64; 2], [nr_wake, nr_wake2]: [u32; 2]
         // OPARG_SHIFT: the argument is a bit number.
         oparg = u32::try_from(oparg).ok().and_then(|n| 1i32.checked_shl(n)).ok_or(Errno::EINVAL)?;
     }
-    let pid = p.pid();
-    prefault(p, uaddr2, true);
-    let mut waiters = WAITERS.lock();
-    let old = read_u32(p, uaddr2)? as i32;
-    let new = match op {
-        0 => oparg,
-        1 => old.wrapping_add(oparg),
-        2 => old | oparg,
-        3 => old & !oparg,
-        4 => old ^ oparg,
-        _ => return Err(Errno::ENOSYS),
-    };
-    let hit = match cmp {
-        0 => old == cmparg,
-        1 => old != cmparg,
-        2 => old < cmparg,
-        3 => old <= cmparg,
-        4 => old > cmparg,
-        5 => old >= cmparg,
-        _ => return Err(Errno::ENOSYS),
-    };
-    p.memory().write(uaddr2, &new.to_ne_bytes())?;
-    let mut woken = wake_locked(&mut waiters, pid, uaddr, nr_wake, BITSET_ANY);
-    if hit {
-        woken += wake_locked(&mut waiters, pid, uaddr2, nr_wake2, BITSET_ANY);
+    if op > 4 || cmp > 5 {
+        return Err(Errno::ENOSYS);
     }
-    drop(waiters);
-    if woken != 0 {
-        SLEEPERS.wake_all();
+    let arg = oparg as u32;
+    let (woken, b1, b2) = ctx.retry(|| {
+        let (k1, k2) = match keys(ctx, uaddr, uaddr2)? {
+            Ok(k) => k,
+            Err(addr) => return Ok(Step::Fault(addr, false)),
+        };
+        let (b1, b2) = (bucket_of(k1), bucket_of(k2));
+        let mut pair = Pair::lock(b1, b2);
+        let apply = |w: &AtomicU32| match op {
+            0 => w.swap(arg, Ordering::SeqCst),
+            1 => w.fetch_add(arg, Ordering::SeqCst),
+            2 => w.fetch_or(arg, Ordering::SeqCst),
+            3 => w.fetch_and(!arg, Ordering::SeqCst),
+            _ => w.fetch_xor(arg, Ordering::SeqCst),
+        };
+        let Some(old) = ctx.word(uaddr2, true, k2, apply)? else { return Ok(Step::Fault(uaddr2, true)) };
+        let old = old as i32;
+        let hit = match cmp {
+            0 => old == cmparg,
+            1 => old != cmparg,
+            2 => old < cmparg,
+            3 => old <= cmparg,
+            4 => old > cmparg,
+            _ => old >= cmparg,
+        };
+        let (l1, l2) = pair.lists(b1);
+        let mut woken = [wake_locked(l1, k1, nr_wake, BITSET_ANY), 0];
+        if hit {
+            woken[1] = wake_locked(l2.unwrap_or(l1), k2, nr_wake2, BITSET_ANY);
+        }
+        Ok(Step::Done((woken, b1, b2)))
+    })?;
+    if woken[0] != 0 {
+        wake_bucket(b1);
     }
-    Ok(woken as u64)
+    if woken[1] != 0 && b2 != b1 {
+        wake_bucket(b2);
+    }
+    Ok(woken[0] as u64 + woken[1] as u64)
 }
 
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)`; `a` holds the six
@@ -398,6 +761,7 @@ pub(crate) fn futex(p: &Process, th: &Thread, a: [u64; 6]) -> Result<u64, Errno>
     }
     let count = |v: u64| (v as i32).max(0) as u32;
     let cmd = op & !(PRIVATE | CLOCK_REALTIME);
+    let private = op & PRIVATE != 0;
     if op & CLOCK_REALTIME != 0 && cmd != WAIT_BITSET && cmd != LOCK_PI2 {
         return Err(Errno::ENOSYS);
     }
@@ -408,23 +772,23 @@ pub(crate) fn futex(p: &Process, th: &Thread, a: [u64; 6]) -> Result<u64, Errno>
                 return Err(Errno::EINVAL);
             }
             let deadline = deadline(p, timeout, cmd == WAIT_BITSET)?;
-            wait(p, th, uaddr, val as u32, bitset, deadline)
+            wait(p, th, uaddr, val as u32, bitset, deadline, private)
         }
         // The timeout is absolute.
-        LOCK_PI | LOCK_PI2 => crate::futex_pi::lock(p, th, uaddr, deadline(p, timeout, true)?),
-        UNLOCK_PI => crate::futex_pi::unlock(p, th, uaddr),
-        TRYLOCK_PI => crate::futex_pi::trylock(p, th, uaddr),
+        LOCK_PI | LOCK_PI2 => crate::futex_pi::lock(p, th, uaddr, deadline(p, timeout, true)?, private),
+        UNLOCK_PI => crate::futex_pi::unlock(p, th, uaddr, private),
+        TRYLOCK_PI => crate::futex_pi::trylock(p, th, uaddr, private),
         WAKE | WAKE_BITSET => {
             let mask = if cmd == WAKE_BITSET { val3 as u32 } else { BITSET_ANY };
             if mask == 0 {
                 return Err(Errno::EINVAL);
             }
-            Ok(wake_bits(p.pid(), uaddr, count(val), mask) as u64)
+            Ok(wake_bits(&Ctx::new(p, private), uaddr, count(val), mask)? as u64)
         }
         // The fourth argument is the requeue count here, not a timeout.
-        REQUEUE => requeue(p, [uaddr, uaddr2], [count(val), count(timeout)], None),
-        CMP_REQUEUE => requeue(p, [uaddr, uaddr2], [count(val), count(timeout)], Some(val3 as u32)),
-        WAKE_OP => wake_op(p, [uaddr, uaddr2], [count(val), count(timeout)], val3 as u32),
+        REQUEUE => requeue(&Ctx::new(p, private), [uaddr, uaddr2], [count(val), count(timeout)], None),
+        CMP_REQUEUE => requeue(&Ctx::new(p, private), [uaddr, uaddr2], [count(val), count(timeout)], Some(val3 as u32)),
+        WAKE_OP => wake_op(&Ctx::new(p, private), [uaddr, uaddr2], [count(val), count(timeout)], val3 as u32),
         // The requeue-PI operations (11, 12) and the rest.
         _ => Err(Errno::ENOSYS),
     }
@@ -494,21 +858,66 @@ pub(crate) fn exit_robust_list(p: &Process, th: &Thread) {
     }
 }
 
+/// Thread `tid` died owning the robust futex at `addr`: marks it
+/// `OWNER_DIED` and wakes one waiter, as a process-shared futex (as Linux does).
 fn owner_died(p: &Process, tid: u32, addr: u64) {
-    prefault(p, addr, true);
     if crate::futex_pi::owner_died(p, tid, addr) {
         return;
     }
-    prefault(p, addr, true);
-    let mut waiters = WAITERS.lock();
-    let Ok(v) = read_u32(p, addr) else { return };
-    if v & TID_MASK != tid {
-        return;
+    let ctx = Ctx::new(p, false);
+    let woke = ctx.retry(|| {
+        let Some(key) = ctx.key(addr)? else { return Ok(Step::Fault(addr, true)) };
+        let b = bucket_of(key);
+        let mut list = bucket(b).waiters.lock();
+        let mark = |w: &AtomicU32| {
+            let v = w.load(Ordering::SeqCst);
+            if v & TID_MASK != tid {
+                return Some(0);
+            }
+            let new = (v & WAITERS_BIT) | OWNER_DIED;
+            w.compare_exchange(v, new, Ordering::SeqCst, Ordering::SeqCst).ok()
+        };
+        match ctx.word(addr, true, key, mark)? {
+            None => Ok(Step::Fault(addr, true)),
+            // The word changed under us: look again.
+            Some(None) => Ok(Step::Again),
+            Some(Some(v)) if v & WAITERS_BIT != 0 => {
+                Ok(Step::Done((wake_locked(&mut list, key, 1, BITSET_ANY) != 0).then_some(b)))
+            }
+            // Not its futex (`v` reads as 0 then), or nobody waits.
+            Some(Some(_)) => Ok(Step::Done(None)),
+        }
+    });
+    if let Ok(Some(b)) = woke {
+        wake_bucket(b);
     }
-    let _ = p.memory().write(addr, &((v & WAITERS_BIT) | OWNER_DIED).to_ne_bytes());
-    if v & WAITERS_BIT != 0 {
-        wake_locked(&mut waiters, p.pid(), addr, 1, BITSET_ANY);
-        drop(waiters);
-        SLEEPERS.wake_all();
+}
+
+/// The set of buckets that timers due at `now` would wake, firing them.
+#[cfg(test)]
+pub(crate) fn expire_for_test(now: u64) -> u64 {
+    expire(now)
+}
+
+/// A timer for bucket `b` with `deadline`, armed, for a test.
+#[cfg(test)]
+pub(crate) fn timer_for_test(deadline: u64, b: usize) -> Pin<alloc::boxed::Box<Timer>> {
+    let t = alloc::boxed::Box::pin(Timer::new(Some(deadline)));
+    t.bucket.store(b, Ordering::SeqCst);
+    t.as_ref().arm();
+    t
+}
+
+#[cfg(test)]
+impl Timer {
+    pub(crate) fn has_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
     }
+}
+
+/// The key a call by `p` would use for `addr`, for tests.
+#[cfg(test)]
+pub(crate) fn key_for_test(p: &Process, addr: u64, private: bool) -> Key {
+    let ctx = Ctx::new(p, private);
+    ctx.retry(|| Ok(ctx.key(addr)?.map_or(Step::Fault(addr, false), Step::Done))).expect("a valid address")
 }
