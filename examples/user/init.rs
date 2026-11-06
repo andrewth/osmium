@@ -855,6 +855,8 @@ fn signals_and_threads() {
 static RESTART_HANDLED: AtomicU32 = AtomicU32::new(0);
 static PIPE_FDS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static MAIN_TID: AtomicU32 = AtomicU32::new(0);
+/// Set by the main thread just before its `read` in the restart demonstration.
+static READING: AtomicU32 = AtomicU32::new(0);
 static mut RESTART_STACK: Stack = Stack([0; 16384]);
 static mut RESTART_CTID: u32 = 0;
 static mut PI_STACK: Stack = Stack([0; 16384]);
@@ -869,13 +871,25 @@ extern "C" fn on_restart_signal(_sig: i32, _info: *const u8, _ctx: *const u8) {
 
 /// Sends the main thread a signal while it is blocked in `read`, then the
 /// byte it waits for.
+///
+/// The byte goes only after the handler has run, that is after the signal
+/// has interrupted the `read`: a byte written while the main thread is still
+/// on its way to sleep would be there when it looks, and data in the pipe
+/// wins over a pending signal (as on Linux), so the read would return it.
 extern "C" fn interrupter(_: u64) -> ! {
+    while READING.load(Ordering::SeqCst) == 0 {
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+    }
     for _ in 0..20 {
         sys::call(sys::SCHED_YIELD, [0; 5]);
     }
     sys::call(sys::TKILL, [MAIN_TID.load(Ordering::SeqCst) as u64, 12, 0, 0, 0]);
-    for _ in 0..20 {
+    // Bounded, so that a signal that is never delivered fails the check
+    // rather than leaving the main thread blocked for good.
+    let mut spins = 0;
+    while RESTART_HANDLED.load(Ordering::SeqCst) == 0 && spins < 100_000 {
         sys::call(sys::SCHED_YIELD, [0; 5]);
+        spins += 1;
     }
     let b = b"x";
     sys::call(sys::WRITE, [PIPE_FDS[1].load(Ordering::SeqCst) as u64, b.as_ptr() as u64, 1, 0, 0]);
@@ -905,6 +919,7 @@ fn read_through_signal(flags: u64) -> i64 {
     act.flags |= flags;
     sys::call(sys::RT_SIGACTION, [12, &act as *const sys::SigAction as u64, 0, 8, 0]);
     RESTART_HANDLED.store(0, Ordering::SeqCst);
+    READING.store(0, Ordering::SeqCst);
     // SAFETY: statics only this program uses; the stack is the thread's own.
     unsafe {
         let top = (&raw mut RESTART_STACK) as u64 + 16384;
@@ -919,6 +934,7 @@ fn read_through_signal(flags: u64) -> i64 {
         )
     };
     let mut byte = [0u8; 1];
+    READING.store(1, Ordering::SeqCst);
     let r = sys::call(sys::READ, [PIPE_FDS[0].load(Ordering::SeqCst) as u64, byte.as_mut_ptr() as u64, 1, 0, 0]);
     // SAFETY: the kernel clears the word when the thread ends.
     while unsafe { core::ptr::read_volatile(&raw const RESTART_CTID) } != 0 {

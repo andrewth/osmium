@@ -120,6 +120,28 @@ fn a_signal_interrupts_a_blocked_read_but_data_wins() {
     assert_eq!(call(&p, Sys::Read, &[r, DATA + 0x100, 8]), 3);
 }
 
+/// The sequence `examples/user/init.rs`'s restart check once raced on: a
+/// signal for a reader asleep in `read`, then data, both before the reader
+/// runs again. It wakes to find data and returns it, as Linux does
+/// (`wait_event_interruptible` checks the condition before signals), and the
+/// signal stays pending for the way out. So a writer that wants the read
+/// interrupted must wait until it has been, as the demo now does.
+#[test]
+fn data_that_lands_before_an_interrupted_reader_runs_wins_over_the_signal() {
+    become_cpu();
+    let (p, _) = process("eintr-race");
+    let (r, w) = pipe_fds(&p);
+    let (task, result) = block_in(&p, move |p| call(p, Sys::Read, &[r, DATA + 0x100, 8]));
+    // Both on this CPU, so the reader cannot run in between.
+    signal::send(&p, SIGUSR1, p.pid()).unwrap();
+    put(&p, DATA + 0x300, b"x");
+    assert_eq!(call(&p, Sys::Write, &[w, DATA + 0x300, 1]), 1);
+    task.join();
+    assert_eq!(result.load(Ordering::SeqCst), 1, "the data, not EINTR");
+    assert_eq!(get(&p, DATA + 0x100, 1), b"x");
+    assert_ne!(p.signals.pending_for_test() & signal::bit(SIGUSR1), 0, "still pending");
+}
+
 #[test]
 fn ppoll_installs_its_mask_for_the_wait_only() {
     become_cpu();
