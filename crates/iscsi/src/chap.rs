@@ -19,7 +19,10 @@ const ALGORITHM_MD5: &str = "5";
 const MAX_CHALLENGE: usize = 1024;
 
 /// Credentials for CHAP login.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Its `Debug` output leaves the secrets out, so logging the login
+/// [`Options`](crate::Options) does not reveal them.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Chap {
     /// The name we authenticate as (`CHAP_N`).
     pub name: String,
@@ -30,8 +33,8 @@ pub struct Chap {
     pub mutual: Option<Mutual>,
 }
 
-/// What mutual CHAP needs to check the target.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What mutual CHAP needs to check the target. `Debug` leaves the secret out.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Mutual {
     /// The name the target must authenticate as.
     pub name: String,
@@ -41,6 +44,27 @@ pub struct Mutual {
     /// Our challenge to the target; its first byte is the identifier. The
     /// caller must supply unpredictable bytes, new for every login.
     pub challenge: [u8; 16],
+}
+
+impl core::fmt::Debug for Chap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Chap")
+            .field("name", &self.name)
+            .field("secret", &"<redacted>")
+            .field("mutual", &self.mutual)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for Mutual {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The challenge goes over the wire in the clear, so it is no secret.
+        f.debug_struct("Mutual")
+            .field("name", &self.name)
+            .field("secret", &"<redacted>")
+            .field("challenge", &self.challenge)
+            .finish()
+    }
 }
 
 impl Chap {
