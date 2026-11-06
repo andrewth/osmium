@@ -4,7 +4,12 @@
 //! The queue pair's send queue holds [`SQ_ENTRIES`] 128-byte entries, of
 //! which at most [`TX_SLOTS`] are in flight: the device prefetches up to
 //! 2 KiB past the last posted entry, so the rest stay unused headroom
-//! (iPXE's arrangement). Each receive entry permanently points at its own
+//! (iPXE's arrangement). Because the device may prefetch an entry before it
+//! is written, the first dword of every 64-byte chunk of an entry not yet
+//! posted holds 0xffffffff ("stamped", as Linux's `mlx4_ib` does it): an
+//! entry is restamped as its completion is reaped, and a new entry writes
+//! those dwords only after the rest of their chunk, and its ownership bit
+//! last. Each receive entry permanently points at its own
 //! buffer slot, so reposting is just advancing the doorbell record. Both
 //! directions complete into the set's own completion queue, sized so it
 //! cannot overflow; receive completions found while reaping transmit ones
@@ -27,7 +32,7 @@
 use core::cell::Cell;
 use core::mem::ManuallyDrop;
 
-use osmium_hal::dma::{DmaAllocator, DmaBuffer, OwnedDma};
+use osmium_hal::dma::{DmaAllocator, OwnedDma};
 
 use super::cmd::{Ctx, Input, op};
 use super::{EQ_MTTS, MAX_PORTS, Mlx4, Mlx4Error, PAGE, PD, PORT_MTTS, UAR_PAGE, get32, log2_ceil, put32};
@@ -80,12 +85,20 @@ const CQE_OPCODE_ERROR: u32 = 0x1e;
 const INVALID_LKEY: u32 = 0x100;
 /// Send doorbell, in [`UAR_PAGE`].
 const SEND_DOORBELL: usize = 0x14;
+/// Send entries are stamped in chunks of this many bytes.
+const STAMP_STRIDE: usize = 64;
+/// What the first dword of a chunk the device must not use holds.
+const STAMP: u32 = 0xffff_ffff;
+/// The completion syndrome of an entry flushed because its queue pair is
+/// in the error state.
+pub(super) const SYNDROME_FLUSHED: u8 = 0x05;
 
 // Compile-time checks of the ring arithmetic.
 const _: () = assert!(SQ_ENTRIES.is_power_of_two() && RX_SLOTS.is_power_of_two() && CQ_ENTRIES.is_power_of_two());
 const _: () = assert!(TX_SLOTS < SQ_ENTRIES - (2048 / SQ_STRIDE) as u32);
 const _: () = assert!(TX_SLOTS + RX_SLOTS <= CQ_ENTRIES);
 const _: () = assert!(CQ_ENTRIES as usize * CQE_LEN <= PAGE);
+const _: () = assert!(SQ_STRIDE.is_multiple_of(STAMP_STRIDE));
 const _: () =
     assert!((SQ_ENTRIES as usize * SQ_STRIDE + RX_SLOTS as usize * RQ_STRIDE).div_ceil(PAGE) < PORT_MTTS as usize);
 
@@ -116,6 +129,39 @@ pub(super) struct Memory<'d, D: DmaAllocator + ?Sized> {
     pub tx: OwnedDma<'d, D>,
     /// Staging for segmentation frames; present if the port asked for it.
     pub lso: Option<OwnedDma<'d, D>>,
+}
+
+/// A send entry being built, in the byte order the device reads. Offsets
+/// are from the start of the entry; [`Queues::finish_send`] copies it into
+/// the ring.
+pub(super) struct SendEntry([u8; SQ_STRIDE]);
+
+impl SendEntry {
+    pub fn new() -> Self {
+        Self([0; SQ_STRIDE])
+    }
+
+    /// Copies `bytes` to `at`; whatever falls outside the entry is dropped.
+    pub fn write(&mut self, at: usize, bytes: &[u8]) {
+        if let Some(dst) = at.checked_add(bytes.len()).and_then(|end| self.0.get_mut(at..end)) {
+            dst.copy_from_slice(bytes);
+        }
+    }
+
+    /// Stores a big-endian dword at `at`.
+    pub fn put32(&mut self, at: usize, value: u32) {
+        self.write(at, &value.to_be_bytes());
+    }
+
+    /// Stores a big-endian quadword at `at`.
+    pub fn put64(&mut self, at: usize, value: u64) {
+        self.write(at, &value.to_be_bytes());
+    }
+
+    /// The dword at `at`, as it goes to memory.
+    fn raw32(&self, at: usize) -> u32 {
+        self.0.get(at..at + 4).and_then(|b| b.try_into().ok()).map_or(0, u32::from_ne_bytes)
+    }
 }
 
 /// A received packet reaped from the completion queue but not yet taken.
@@ -196,6 +242,9 @@ pub(super) struct Queues<'h, 'd, D: DmaAllocator + ?Sized> {
     pub tx_done: u32,
     /// How each completed send ended (0: well), by completion number.
     pub tx_syndrome: [u8; SQ_ENTRIES as usize],
+    /// The syndrome of the first send that failed. A failed send puts the
+    /// queue pair in the error state, so nothing posted after it goes out.
+    pub tx_error: Option<u8>,
     /// Receive entries handed to the device.
     rx_posted: u32,
     /// Packets reaped from the completion queue but not yet taken,
@@ -243,6 +292,7 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
             tx_head: 0,
             tx_done: 0,
             tx_syndrome: [0; SQ_ENTRIES as usize],
+            tx_error: None,
             rx_posted: 0,
             rx_ready: [Received::default(); RX_SLOTS as usize],
             rx_ready_head: 0,
@@ -333,7 +383,8 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
         let mtt = self.cq_mtt() + 1;
         let (wq, rx) = (&self.mem.wq, &self.mem.rx);
         let sq_len = SQ_ENTRIES as usize * SQ_STRIDE;
-        // Send entries start invalid for the first pass (owner bit set).
+        // Send entries start invalid for the first pass (owner bit set) and
+        // stamped.
         for off in (0..sq_len).step_by(4) {
             wq.store(off, !0u32);
         }
@@ -426,6 +477,11 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
                     if let Some(s) = self.tx_syndrome.get_mut(self.tx_done as usize % SQ_ENTRIES as usize) {
                         *s = syndrome;
                     }
+                    if error && self.tx_error.is_none() {
+                        self.tx_error = Some(syndrome);
+                    }
+                    // Sends complete in order, so this is the entry the device is done with.
+                    self.stamp((self.tx_done % SQ_ENTRIES) as usize * SQ_STRIDE);
                     self.tx_done = self.tx_done.wrapping_add(1);
                 }
             } else {
@@ -506,31 +562,36 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Queues<'h, 'd, D> {
         self.rx_ready_count > 0 || self.completion_waiting(false)
     }
 
-    /// Starts the next send entry: returns the byte offsets of the entry in
-    /// the work queue memory and of its buffer slot in the transmit buffer,
-    /// with all of the entry but its first dword cleared. The caller fills
-    /// the entry in and hands it over with [`finish_send`](Self::finish_send).
-    pub fn begin_send(&mut self) -> (usize, usize) {
-        let slot = (self.tx_head % TX_SLOTS) as usize * self.tx_slot;
-        let wqe = (self.tx_head % SQ_ENTRIES) as usize * SQ_STRIDE;
-        for off in (4..SQ_STRIDE).step_by(4) {
-            self.mem.wq.store(wqe + off, 0u32);
+    /// Marks every chunk of the send entry at byte `wqe` but the first as
+    /// not to be used, should the device prefetch it.
+    fn stamp(&self, wqe: usize) {
+        for off in (STAMP_STRIDE..SQ_STRIDE).step_by(STAMP_STRIDE) {
+            put32(&self.mem.wq, wqe + off, STAMP);
         }
-        (wqe, slot)
     }
 
-    /// The send queue memory, to fill in an entry started by
-    /// [`begin_send`](Self::begin_send).
-    pub fn wq(&self) -> &DmaBuffer {
-        &self.mem.wq
+    /// The byte offset in the transmit buffer of the slot of the next send.
+    pub fn tx_slot(&self) -> usize {
+        (self.tx_head % TX_SLOTS) as usize * self.tx_slot
     }
 
-    /// Hands the entry at `wqe` to the device and rings the doorbell.
-    pub fn finish_send(&mut self, wqe: usize, opcode: u32) {
+    /// Copies `entry` into the next send queue entry, hands it to the
+    /// device and rings the doorbell.
+    pub fn finish_send(&mut self, entry: &SendEntry, opcode: u32) {
+        let (wq, wqe) = (&self.mem.wq, (self.tx_head % SQ_ENTRIES) as usize * SQ_STRIDE);
+        // The chunks' first dwords still hold the stamp: write the rest
+        // first, so a chunk the device prefetches meanwhile reads as unused.
+        for off in (4..SQ_STRIDE).step_by(4).filter(|off| !off.is_multiple_of(STAMP_STRIDE)) {
+            wq.store(wqe + off, entry.raw32(off));
+        }
+        osmium_arch::barrier::dma_wmb();
+        for off in (STAMP_STRIDE..SQ_STRIDE).step_by(STAMP_STRIDE) {
+            wq.store(wqe + off, entry.raw32(off));
+        }
         // The entry must be complete before its owner bit hands it over.
         osmium_arch::barrier::dma_wmb();
         let owner = (self.tx_head / SQ_ENTRIES) & 1;
-        put32(&self.mem.wq, wqe, owner << 31 | opcode);
+        put32(wq, wqe, owner << 31 | opcode);
         osmium_arch::barrier::mb();
         let _ = self.hca.uar.write(UAR_PAGE as usize * PAGE + SEND_DOORBELL, (self.qpn << 8).to_be());
         self.tx_head = self.tx_head.wrapping_add(1);

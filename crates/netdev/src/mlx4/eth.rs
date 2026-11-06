@@ -12,8 +12,8 @@ use osmium_hal::dma::DmaAllocator;
 use osmium_hal::net::{MacAddress, NetDevice, NetError};
 
 use super::cmd::{Ctx, Input, op};
-use super::queue::{CTRL_COMPLETE, Geometry, OPCODE_SEND, QpSetup, Queues, SEG_LEN, SET_DATA, SQ_STRIDE};
-use super::{Mlx4, Mlx4Error, put32};
+use super::queue::{CTRL_COMPLETE, Geometry, OPCODE_SEND, QpSetup, Queues, SEG_LEN, SET_DATA, SQ_STRIDE, SendEntry};
+use super::{Mlx4, Mlx4Error};
 
 /// Bytes per buffer slot.
 pub const SLOT_LEN: usize = 2048;
@@ -212,6 +212,10 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
     /// frame may be up to [`Offloads::tso_max_frame`] bytes and is cut into
     /// segments by the adapter; only one such frame is in flight at a time
     /// (the next returns [`NetError::WouldBlock`] until it completes).
+    ///
+    /// Once the adapter has reported a failed send (seen when completions
+    /// are reaped), every further transmit fails with [`NetError::Io`]: the
+    /// queue pair is in the error state and the port must be reopened.
     pub fn transmit_offload(&mut self, frame: &[u8], offload: TxOffload) -> Result<(), TxError> {
         let tso = offload.tso;
         let limit = if tso.is_some() { LSO_BUF_LEN } else { MAX_FRAME };
@@ -232,14 +236,18 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
             }
         }
         let lso = tso.is_some();
-        if self.q.tx_full() || lso && self.lso_busy() {
+        // Reaping frees slots and tells of sends that failed.
+        if self.q.tx_head != self.q.tx_done {
             self.q.poll_cq();
-            if self.q.tx_full() || lso && self.lso_busy() {
-                return Err(NetError::WouldBlock.into());
-            }
         }
-        let (wqe, slot) = self.q.begin_send();
-        let wq = self.q.wq();
+        if let Some(e) = self.tx_failed() {
+            return Err(e);
+        }
+        if self.q.tx_full() || lso && self.lso_busy() {
+            return Err(NetError::WouldBlock.into());
+        }
+        let slot = self.q.tx_slot();
+        let mut e = SendEntry::new();
         let mut flags = CTRL_COMPLETE;
         if offload.checksum || tso.is_some() {
             flags |= CTRL_IP_CSUM | CTRL_L4_CSUM;
@@ -249,25 +257,31 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> EthPort<'h, 'd, D> {
                 let h = t.header_len as usize;
                 lso.write(0, frame);
                 let hdr = (LSO_FIXED + h).next_multiple_of(SEG_LEN);
-                put32(wq, wqe + SEG_LEN, (t.mss as u32) << 16 | h as u32);
-                wq.write(wqe + SEG_LEN + LSO_FIXED, frame.get(..h).unwrap_or_default());
-                (OPCODE_LSO, 2 + hdr / SEG_LEN, wqe + SEG_LEN + hdr, lso, h, frame.len().saturating_sub(h))
+                e.put32(SEG_LEN, (t.mss as u32) << 16 | h as u32);
+                e.write(SEG_LEN + LSO_FIXED, frame.get(..h).unwrap_or_default());
+                (OPCODE_LSO, 2 + hdr / SEG_LEN, SEG_LEN + hdr, lso, h, frame.len().saturating_sub(h))
             }
             _ => {
                 self.q.mem.tx.write(slot, frame);
-                (OPCODE_SEND, 2, wqe + SEG_LEN, &self.q.mem.tx, slot, frame.len())
+                (OPCODE_SEND, 2, SEG_LEN, &self.q.mem.tx, slot, frame.len())
             }
         };
-        put32(wq, wqe + 4, segments as u32); // control, optional LSO header, data
-        put32(wq, wqe + 8, flags);
-        put32(wq, data_at, data_len as u32);
-        put32(wq, data_at + 4, self.q.hca.lkey);
-        wq.store(data_at + 8, (buf.device_addr().as_u64() + data_off as u64).to_be());
-        self.q.finish_send(wqe, opcode);
+        e.put32(4, segments as u32); // control, optional LSO header, data
+        e.put32(8, flags);
+        e.put32(data_at, data_len as u32);
+        e.put32(data_at + 4, self.q.hca.lkey);
+        e.put64(data_at + 8, buf.device_addr().as_u64() + data_off as u64);
+        self.q.finish_send(&e, opcode);
         if tso.is_some() {
             self.lso_until = Some(self.q.tx_head);
         }
         Ok(())
+    }
+
+    /// [`NetError::Io`] once a send has failed: the adapter put the queue
+    /// pair in the error state, and it flushes whatever is posted after.
+    fn tx_failed(&self) -> Option<TxError> {
+        self.q.tx_error.map(|_| TxError::Net(NetError::Io))
     }
 
     /// True while a segmentation frame still owns the staging buffer.

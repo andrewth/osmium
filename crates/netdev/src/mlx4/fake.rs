@@ -30,11 +30,18 @@ pub const AUX_PAGES: u64 = 2;
 // Reserved resources reported by QUERY_DEV_CAP.
 pub const RSVD_QPS_LOG: u32 = 6;
 pub const RSVD_CQS_LOG: u32 = 7;
-pub const RSVD_EQS: u32 = 32;
+/// log2 of the reserved event queues (32).
+pub const RSVD_EQS_LOG: u32 = 5;
 pub const RSVD_UARS: u32 = 8;
 pub const RSVD_MTTS_LOG: u32 = 4;
 pub const RSVD_MRWS_LOG: u32 = 4;
 pub const MTT_ENTRY: u64 = 8;
+/// Bytes of one RDMA read responder context (RDMARC entry).
+pub const RDMARC_ENTRY: u64 = 32;
+/// The cMPT windows: four of 2^24 64-byte entries from ICM address 0.
+const CMPT_END: u64 = 4 * (64 << 24);
+/// How far past the last posted send entry the device prefetches.
+const PREFETCH_BYTES: usize = 2048;
 
 /// Header values the reset must preserve.
 pub const BAR0: u32 = 0xe000_000c;
@@ -80,6 +87,12 @@ pub struct Eq {
     armed: bool,
     /// The doorbell value already used up by an interrupt.
     spent_arm: Option<u32>,
+    /// Overruns ignored: the device writes on when the queue is full (here
+    /// the event is lost). Otherwise an overrun is reported on the
+    /// asynchronous event queue.
+    overrun_ignore: bool,
+    /// Events lost to a full queue.
+    pub lost: u32,
 }
 
 /// A frame the send engine took from a queue.
@@ -337,6 +350,9 @@ struct Qp {
     sched_queue: u32,
     sq_next: u32,
     rq_next: u32,
+    /// The next send fails with this syndrome and the queue pair goes to
+    /// the error state.
+    fail_send: Option<u8>,
 }
 
 /// What the firmware loses on reset.
@@ -350,6 +366,8 @@ pub struct Firmware {
     pub aux_pages: u64,
     pub hca_up: bool,
     pub init_hca: Vec<u32>,
+    /// (base, log2 entries per queue pair) of the RDMARC table INIT_HCA set up.
+    pub rdmarc: (u64, u32),
     mtt: BTreeMap<u64, u64>,
     pub lkey: Option<u32>,
     pub eqs: BTreeMap<u32, Eq>,
@@ -525,6 +543,12 @@ impl FakeHca {
         u32::from_be(unsafe { self.uar.add(offset / 4).read_volatile() })
     }
 
+    /// True if every page of ICM `[va, va + len)` is mapped.
+    fn icm_mapped(icm: &[(u64, u64, u64)], va: u64, len: u64) -> bool {
+        (va / 4096..(va + len).div_ceil(4096))
+            .all(|page| icm.iter().any(|&(at, _, n)| (at..at + n).contains(&(page * 4096))))
+    }
+
     /// The bus address of byte `off` of the buffer whose MTT entries start
     /// at byte address `mtt`, as the device translates it.
     fn translate(fw: &Firmware, mtt: u64, off: usize) -> u64 {
@@ -664,15 +688,18 @@ impl FakeHca {
                 let mut c = [0u32; 64];
                 c[4] = RSVD_QPS_LOG << 8;
                 c[5] = 6 << 28;
-                c[6] = RSVD_EQS << 24 | RSVD_CQS_LOG << 8;
+                // Byte offsets and field widths as Linux's mlx4_QUERY_DEV_CAP reads them.
+                c[6] = RSVD_CQS_LOG << 8; // 0x1a
+                c[7] = RSVD_EQS_LOG << 8; // 0x1e
                 c[8] = RSVD_MTTS_LOG << 28 | RSVD_MRWS_LOG << 8;
-                c[11] = if s.max_gso > 0 { 0x20 | s.max_gso.trailing_zeros() } else { 0 } << 16;
+                // 0x2d: log2 of the largest LSO frame in the low 5 bits, 0 for none.
+                c[11] = if s.max_gso > 0 { s.max_gso.trailing_zeros() } else { 0 } << 16;
                 c[10] = 6 << 16 | 6;
                 c[13] = 2;
                 c[14] = 31 << 24;
                 c[17] = (s.dpdp as u32) << 12;
                 c[18] = RSVD_UARS << 28;
-                c[32] = 256;
+                c[32] = (RDMARC_ENTRY as u32) << 16 | 256; // 0x80 RDMARC, 0x82 QPC
                 c[33] = 128 << 16 | 64;
                 c[34] = 64 << 16 | 64;
                 c[35] = 64 << 16 | 64;
@@ -717,6 +744,17 @@ impl FakeHca {
                         "table at dword {dw} unmapped"
                     );
                 }
+                // The responder resources: 2^log_rd entries for every queue
+                // pair, at 0x90 with the log2 in 0x97 (zero: none set up).
+                let log_rd = c[37] & 7;
+                let rdmarc = (c[36] as u64) << 32 | (c[37] & !0x1f) as u64;
+                let qps = 1u64 << (c[13] & 0x1f);
+                if rdmarc != 0 {
+                    let len = (RDMARC_ENTRY << log_rd) * qps;
+                    assert!(rdmarc.is_multiple_of(len), "RDMARC table aligned to its size");
+                    assert!(Self::icm_mapped(&fw.icm, rdmarc, len), "RDMARC table in mapped ICM");
+                }
+                fw.rdmarc = (rdmarc, log_rd);
                 fw.init_hca = c;
                 fw.hca_up = true;
             }
@@ -760,7 +798,10 @@ impl FakeHca {
                     intr: c[5] & 0xff,
                     armed: c[0] >> 8 & 0xf == 0x9,
                     spent_arm: None,
+                    overrun_ignore: c[0] >> 17 & 1 != 0,
+                    lost: 0,
                 };
+                assert!(eq.log_size + 5 <= 12, "the event queue fits the one page its MTT entry maps");
                 fw.eqs.insert(in_mod, eq);
             }
             op::MAP_EQ => {
@@ -878,6 +919,7 @@ impl FakeHca {
             }
             op::INIT2RTR_QP | op::RTR2RTS_QP => {
                 let c = self.mailbox(128);
+                let (rdmarc, icm) = (fw.rdmarc, fw.icm.clone());
                 let qp = fw.qps.get_mut(&in_mod).ok_or(BAD_STATE)?;
                 let (from, to) = if opcode == op::INIT2RTR_QP { (1, 2) } else { (2, 3) };
                 if qp.state != from {
@@ -911,6 +953,19 @@ impl FakeHca {
                             }
                             r.sched_queue = c[16] >> 24;
                             r.max_dest_rd_log = c[38] >> 21 & 7;
+                            // Inbound reads keep their state in the queue pair's RDMARC
+                            // entries: there must be as many as the context asks for, in
+                            // the table INIT_HCA set up.
+                            let (base, log_rd) = rdmarc;
+                            if r.max_dest_rd_log > log_rd {
+                                return Err(BAD_PARAM);
+                            }
+                            let per_qp = RDMARC_ENTRY << log_rd;
+                            let at = base + in_mod as u64 * per_qp;
+                            assert!(
+                                base >= CMPT_END && Self::icm_mapped(&icm, at, per_qp),
+                                "responder context of queue pair {in_mod} at ICM {at:#x}: outside the RDMARC table"
+                            );
                             r.access = c[38] >> 13 & 7;
                             (r.rq_psn, r.min_rnr_timer) = (c[39] & 0xff_ffff, c[39] >> 24 & 0x1f);
                             r.recv_psn = r.rq_psn;
@@ -1119,7 +1174,18 @@ impl FakeHca {
         let db = self.uar_reg(doorbell);
         let eq = s.fw.eqs.get_mut(&eqn).unwrap();
         let n = 1u32 << eq.log_size;
-        assert!(eq.pi.wrapping_sub(db & 0xff_ffff) & 0xff_ffff < n, "event queue overflow");
+        if eq.pi.wrapping_sub(db & 0xff_ffff) & 0xff_ffff >= n {
+            // Full: the event is lost. Unless overruns are ignored, the
+            // overrun is reported on the asynchronous queue (type 0x0f,
+            // naming the queue that overran).
+            eq.lost += 1;
+            if !eq.overrun_ignore
+                && let Some(async_eqn) = s.fw.async_eqn.filter(|&a| a != eqn)
+            {
+                self.post_event(s, async_eqn, 0x0f, 0, 4, eqn);
+            }
+            return;
+        }
         let (mtt, pi, intr) = (eq.mtt, eq.pi, eq.intr as u16);
         eq.pi += 1;
         // Armed at creation, or by a doorbell write not yet spent.
@@ -1159,10 +1225,23 @@ impl FakeHca {
             let wqe = Self::translate(fw, qp.mtt, (qp.sq_next % n) as usize * stride);
             let ctrl = rd(wqe);
             if ctrl >> 31 != (qp.sq_next / n) & 1 {
+                Self::check_stamps(fw, qpn);
                 break;
             }
             // One doorbell register serves every queue pair, so it names the last to ring it.
             assert!(fw.qps.contains_key(&(self.uar_reg(UAR_PAGE as usize * 4096 + 0x14) >> 8)), "send doorbell");
+            // A queue pair in the error state flushes what is posted; the
+            // send that put it there fails with its own syndrome.
+            if qp.state == 6 || qp.fail_send.is_some() {
+                let q = fw.qps.get_mut(&qpn).unwrap();
+                let syndrome = q.fail_send.take().unwrap_or(5);
+                let counter = q.sq_next & 0xffff;
+                (q.sq_next, q.state) = (q.sq_next + 1, 6);
+                let mut fw = core::mem::take(&mut s.fw);
+                self.complete_ud(&mut fw, qpn, true, counter, 0, (0, 0), (0, 0, 0), Cqe::Err(syndrome));
+                s.fw = fw;
+                continue;
+            }
             let flags = rd(wqe + 8);
             assert_eq!(flags & 0xc, 0xc, "completion");
             assert!(qp.special || flags & 2 != 0, "solicited");
@@ -1268,6 +1347,74 @@ impl FakeHca {
         frames
     }
 
+    /// Checks what the device may prefetch past the last entry `qpn` posted:
+    /// every 64-byte chunk of those entries but the first must start with
+    /// the stamp 0xffffffff, or the device could take stale contents for
+    /// part of an entry written later.
+    fn check_stamps(fw: &Firmware, qpn: u32) {
+        let qp = &fw.qps[&qpn];
+        let (n, stride) = (1u32 << qp.log_sq, 1usize << qp.log_sq_stride);
+        for i in 0..(PREFETCH_BYTES / stride) as u32 {
+            let index = qp.sq_next + i;
+            for chunk in (64..stride).step_by(64) {
+                let at = Self::translate(fw, qp.mtt, (index % n) as usize * stride + chunk);
+                assert_eq!(rd(at), !0, "send entry {index} of queue pair {qpn}: chunk at {chunk} not stamped");
+            }
+        }
+    }
+
+    /// Makes the next send of queue pair `qpn` fail with `syndrome`, which
+    /// puts it in the error state (later sends are flushed).
+    pub fn fail_next_send(&self, qpn: u32, syndrome: u8) {
+        self.state.borrow_mut().fw.qps.get_mut(&qpn).unwrap().fail_send = Some(syndrome);
+    }
+
+    /// Completes the next receive entry posted to `qpn` with an error
+    /// (`syndrome`) instead of a packet; false if none is posted.
+    pub fn fail_receive(&self, qpn: u32, syndrome: u8) -> bool {
+        let mut s = self.state.borrow_mut();
+        let mut fw = core::mem::take(&mut s.fw);
+        let qp = &fw.qps[&qpn];
+        let posted = rd(qp.db) & 0xffff != qp.rq_next & 0xffff;
+        if posted {
+            let counter = qp.rq_next & 0xffff;
+            fw.qps.get_mut(&qpn).unwrap().rq_next += 1;
+            self.complete_ud(&mut fw, qpn, false, counter, 0, (0, 0), (0, 0, 0), Cqe::Err(syndrome));
+        }
+        s.fw = fw;
+        self.flush_events(&mut s);
+        posted
+    }
+
+    /// Writes a receive completion to `qpn`'s completion queue for no
+    /// receive entry at all, as a broken device might.
+    pub fn rogue_receive_completion(&self, qpn: u32, len: u32) {
+        let mut s = self.state.borrow_mut();
+        let mut fw = core::mem::take(&mut s.fw);
+        let counter = fw.qps[&qpn].rq_next & 0xffff;
+        self.complete(&mut fw, qpn, false, counter, len, (0, 0));
+        s.fw = fw;
+        self.flush_events(&mut s);
+    }
+
+    /// Events written to event queue `eqn` so far.
+    pub fn eq_events(&self, eqn: u32) -> u32 {
+        self.state.borrow().fw.eqs[&eqn].pi
+    }
+
+    /// Events event queue `eqn` lost because it was full.
+    pub fn eq_lost(&self, eqn: u32) -> u32 {
+        self.state.borrow().fw.eqs[&eqn].lost
+    }
+
+    /// Posts an event of type `kind` with `word` in its second dword to the
+    /// asynchronous event queue.
+    pub fn async_event(&self, kind: u32, word: u32) {
+        let mut s = self.state.borrow_mut();
+        let eqn = s.fw.async_eqn.expect("event queue mapped");
+        self.post_event(&mut s, eqn, kind, 0, 4, word);
+    }
+
     /// The state of queue pair `qpn`: 1 INIT, 2 RTR, 3 RTS, 6 error.
     pub fn qp_state(&self, qpn: u32) -> u8 {
         self.state.borrow().fw.qps[&qpn].state
@@ -1307,6 +1454,7 @@ impl FakeHca {
         let wqe = Self::translate(fw, qp.mtt, (qp.sq_next % n) as usize * stride);
         let ctrl = rd(wqe);
         if ctrl >> 31 != (qp.sq_next / n) & 1 {
+            Self::check_stamps(fw, qpn);
             return false;
         }
         let counter = qp.sq_next & 0xffff;
