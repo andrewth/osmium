@@ -20,7 +20,9 @@ Examples are not workspace members and each has its own `Cargo.lock`. Run them f
 cd examples/riscv-virt && cargo run --release    # Ctrl-A X quits QEMU
 ```
 
-`check.sh` skips any step whose QEMU or optional tool is missing and prints a message. It does not fail.
+`check.sh` skips any step whose Rust target, QEMU binary or device, firmware or optional tool (dosfstools, bzip2, python3, nested-VMX KVM) is missing, prints a message, and lists every skip again at the end; a skip does not fail the gate. UEFI boots use the system's OVMF/AAVMF, or the bundled images in `fw/` when those are absent (`OSMIUM_FW=bundled` forces `fw/`). Before any boot it lints (`clippy -D warnings`) and builds every example, so an example that does not compile fails the gate even without QEMU. `.github/workflows/check.yml` runs `check.sh` on push and pull request.
+
+Host tests that check against real tools (`mkfs.ext*`/`e2fsck`/`debugfs`, `mkfs.fat`/`fsck.fat`, `xorriso`/`genisoimage`, GNU `cpio`) fail when the tool is missing; set `OSMIUM_SKIP_TOOL_TESTS=1` to skip them instead. The btrfs tests skip with a note without `mkfs.btrfs`; their Linux suite is opt-in (`OSMIUM_LINUX_KERNEL`, `OSMIUM_LINUX_MODULES`).
 
 ## Formatting
 
@@ -38,13 +40,13 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
 
 **Host simulation.** `osmium-arch` swaps privileged instructions for simulations when the target is not `none` or `uefi`: IRQ flags and CPU id are per-thread, TLB flushes are no-ops, and the context switch runs for real on host threads. This is what lets most of the code be unit-tested with plain `cargo test`. Code that depends on the simulation's behaviour (for example, trap handling via `osmium::arch::trap::simulate`) should be tested through it.
 
-**Shared demos.** `examples/demos` holds the scheduler, mutex, IPI and fault demos that every scheduler-capable example runs. `examples/user` holds the user programs (ELF) that the `proc` examples load.
+**Shared demos.** `examples/demos` holds the demos every scheduler-capable example runs and the plumbing the kernels share: `demos::kernel` (frames, `GuardedStacks`, clock, CPU bring-up), `demos::fault`, `demos::user` (user address-space layout, spawning, the user half of a trap handler) and `demos::guest` (for the hypervisors). Its `build.rs` compiles the programs in `examples/user` (behind the default `user` feature) and `demos::user` embeds them as `HELLO_ELF`, `INIT_ELF` and so on. The linker scripts are in `examples/link/<arch>.x`.
 
 **Hypervisor nesting.** `examples/*-hyp` are hypervisors built on `osmium-virt`. Their `check.sh` boots load the `*-virt` or `x86_64-pc` kernel as a guest (QEMU's `-device loader` places the ELF in host RAM), so a change to a guest kernel is also exercised under its hypervisor.
 
 ## The QEMU boot checks
 
-Each example's serial output is grepped against a list of expected lines in `scripts/check.sh`. When you add a feature to an example, add its log line to that boot's `EXPECT` list. Match on what happened, not on counts or timing, since multi-threaded TCG makes those flaky. Serial lines end in `\r\n`, so don't anchor patterns with `$`.
+Each example's serial output is grepped against a list of expected lines in `scripts/check.sh`. When you add a feature to an example, add its log line to that boot's `EXPECT` list. Match on what happened, not on counts or timing, since multi-threaded TCG makes those flaky. `run_qemu` strips CRs and escape sequences from the log before grepping.
 
 ## Things that will bite
 
