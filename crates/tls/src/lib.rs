@@ -61,7 +61,7 @@ use alloc::vec::Vec;
 pub use provider::{SIGNATURE_ALGORITHMS, TLS13_CHACHA20_POLY1305_SHA256, provider, shared_provider};
 pub use rustls;
 pub use selftest::{FixedTime, self_test};
-pub use session::{MAX_INCOMING, ServerSession};
+pub use session::{MAX_INCOMING, MAX_PLAINTEXT, ServerSession};
 pub use sign::{ECDSA_P256_SHA256, EcdsaSigningKey};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};

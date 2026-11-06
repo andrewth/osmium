@@ -15,6 +15,17 @@
 //! which the caller reports how much was sent with
 //! [`sent`](ServerSession::sent). The session never blocks, so it works the
 //! same from a polling loop, an interrupt-driven driver or an async task.
+//!
+//! Receive-side memory is bounded: at most [`MAX_INCOMING`] bytes of
+//! ciphertext are buffered, and once [`MAX_PLAINTEXT`] bytes of decrypted
+//! data are waiting for [`read`](ServerSession::read) the session stops
+//! decrypting, so [`receive`](ServerSession::receive) takes fewer bytes and
+//! the transport's own flow control (a TCP receive window, say) pushes back
+//! on the peer. Writing still works while reads are held back.
+//!
+//! TLS 1.3 early data (0-RTT) is refused: an attacker can replay it, and the
+//! session has no way to tell the application which bytes were early.
+//! [`ServerSession::new`] rejects a configuration that would accept it.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -28,6 +39,11 @@ use rustls::{Error, ServerConfig};
 /// Bytes of received TLS records buffered before [`ServerSession::receive`]
 /// refuses more: one maximum-size record and its header, with slack.
 pub const MAX_INCOMING: usize = 16 * 1024 + 2048;
+
+/// Bytes of decrypted application data waiting for [`ServerSession::read`]
+/// at which the session stops decrypting more. The record that crosses the
+/// limit is kept whole, so up to 16 KiB more than this can be waiting.
+pub const MAX_PLAINTEXT: usize = 64 * 1024;
 
 /// One TLS server connection.
 pub struct ServerSession {
@@ -50,7 +66,13 @@ pub struct ServerSession {
 
 impl ServerSession {
     /// A new connection waiting for a client hello.
+    ///
+    /// Fails if `config` accepts early data (its `max_early_data_size` is not
+    /// zero), since the session never delivers replayable 0-RTT bytes.
     pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
+        if config.max_early_data_size != 0 {
+            return Err(Error::General("TLS early data is not supported".into()));
+        }
         Ok(Self {
             conn: UnbufferedServerConnection::new(config)?,
             incoming: Vec::new(),
@@ -69,8 +91,9 @@ impl ServerSession {
     /// Takes bytes received from the peer and processes as much as it can.
     ///
     /// Returns how many bytes were taken: fewer than `data.len()` only when
-    /// [`MAX_INCOMING`] bytes are already waiting, which means the caller
-    /// should first [`read`](Self::read) what has been decrypted.
+    /// [`MAX_INCOMING`] bytes are already waiting, which happens when
+    /// [`MAX_PLAINTEXT`] decrypted bytes are waiting for [`read`](Self::read).
+    /// The caller should keep the rest and offer it again after reading.
     pub fn receive(&mut self, data: &[u8]) -> Result<usize, Error> {
         let take = data.len().min(MAX_INCOMING.saturating_sub(self.incoming.len()));
         self.incoming.extend_from_slice(data.get(..take).unwrap_or(&[]));
@@ -89,12 +112,21 @@ impl ServerSession {
     }
 
     /// Copies decrypted application data into `buf`, returning how much.
+    ///
+    /// Reading below [`MAX_PLAINTEXT`] resumes decrypting received records
+    /// that were held back. An error found while doing so closes the session
+    /// (see [`is_closed`](Self::is_closed)) and is returned by the next
+    /// [`receive`](Self::receive) or [`write`](Self::write).
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.plain_in.len());
         if let (Some(dst), Some(src)) = (buf.get_mut(..n), self.plain_in.get(..n)) {
             dst.copy_from_slice(src);
         }
         self.plain_in.drain(..n);
+        if n > 0 && !self.incoming.is_empty() && self.plain_in.len() < MAX_PLAINTEXT {
+            // An error is kept in `self.error` for the next call that can return it.
+            let _ = self.process();
+        }
         n
     }
 
@@ -156,7 +188,19 @@ impl ServerSession {
     /// Runs rustls until it needs more input or has nothing more to do.
     fn step(&mut self) -> Result<(), Error> {
         loop {
-            let UnbufferedStatus { mut discard, state } = self.conn.process_tls_records(&mut self.incoming);
+            // With MAX_PLAINTEXT bytes waiting, hold the received records back
+            // and show rustls no input, so it still reaches WriteTraffic for
+            // whatever the application writes. rustls's handshake deframer
+            // keeps offsets into the input only while a handshake message is
+            // incomplete, and application data never arrives in that state
+            // (RFC 8446 section 5.1, which rustls enforces), so when the limit
+            // is reached nothing in rustls refers into `incoming`.
+            let hold = self.plain_in.len() >= MAX_PLAINTEXT;
+            let input: &mut [u8] = if hold { &mut [] } else { &mut self.incoming };
+            let UnbufferedStatus { mut discard, state } = self.conn.process_tls_records(input);
+            if hold {
+                discard = 0;
+            }
             let state = match state {
                 Ok(state) => state,
                 Err(e) => {
@@ -174,13 +218,10 @@ impl ServerSession {
                         self.plain_in.extend_from_slice(payload);
                     }
                 }
-                ConnectionState::ReadEarlyData(mut r) => {
-                    // Early data is off unless the config enables it; take it as ordinary data.
-                    while let Some(record) = r.next_record() {
-                        let AppDataRecord { discard: d, payload } = record?;
-                        discard += d;
-                        self.plain_in.extend_from_slice(payload);
-                    }
+                ConnectionState::ReadEarlyData(_) => {
+                    // `new` refuses configs that accept early data, so this is
+                    // not reached; never hand replayable bytes over as ordinary data.
+                    return Err(Error::General("TLS early data is not supported".into()));
                 }
                 ConnectionState::EncodeTlsData(mut e) => {
                     append(&mut self.outgoing, |buf| e.encode(buf).map_err(Grow::from))?;

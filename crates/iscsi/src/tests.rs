@@ -560,6 +560,54 @@ fn chap_failures() {
     assert!(IscsiDisk::connect(&mut net, PORTAL, &options()).is_err());
 }
 
+#[test]
+fn chap_after_a_login_redirection() {
+    use crate::testing::{B_IP, Redirect};
+    let redirected = |mutual: bool| TargetConfig {
+        redirect: Some(Redirect { address: "192.168.1.2:3261,1".into(), permanent: false }),
+        extra_ports: vec![3261],
+        ..chap_target(mutual)
+    };
+    // The redirected login authenticates afresh, one-way and mutual.
+    for mutual in [false, true] {
+        let mut net = TestNet::new(redirected(mutual), BLOCKS);
+        let mut chap = Chap::new("alice", SECRET);
+        if mutual {
+            chap = chap.mutual("tgt", TARGET_SECRET, *b"my-own-challenge");
+        }
+        let mut disk = IscsiDisk::connect(&mut net, PORTAL, &chap_options(chap)).unwrap();
+        assert_eq!(disk.portal(), Some(SocketAddrV4::new(B_IP, 3261)));
+        round_trip(&mut disk);
+        assert_eq!(disk.net_mut().target.stats.redirects, 1);
+    }
+    // Credentials that are wrong fail at the new portal too.
+    let mut net = TestNet::new(redirected(false), BLOCKS);
+    let e = IscsiDisk::connect(&mut net, PORTAL, &chap_options(Chap::new("alice", b"wrong secret....."))).err();
+    assert_eq!(e, Some(IscsiError::Login { class: 2, detail: 1 }));
+    assert_eq!(sockets(&net), 0);
+    // And a redirection does not let a login skip the CHAP its target requires.
+    let mut net = TestNet::new(redirected(false), BLOCKS);
+    assert!(IscsiDisk::connect(&mut net, PORTAL, &options()).is_err());
+    assert_eq!(sockets(&net), 0);
+}
+
+#[test]
+fn debug_output_leaves_chap_secrets_out() {
+    let chap = Chap::new("alice", b"initiator-secret").mutual("tgt", b"the-target-secret", *b"my-own-challenge");
+    let opts = chap_options(chap.clone());
+    use std::format;
+    for text in [format!("{chap:?}"), format!("{opts:?}"), format!("{:?}", chap.mutual)] {
+        assert!(text.contains("alice") || text.contains("tgt"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        for secret in [&b"initiator-secret"[..], b"the-target-secret"] {
+            assert!(!text.contains(core::str::from_utf8(secret).unwrap()), "{text}");
+            // Nor as the byte list a derived Debug would print.
+            let bytes = format!("{:?}", &secret[..4]);
+            assert!(!text.contains(bytes.trim_end_matches(']')), "{text}");
+        }
+    }
+}
+
 fn digests(header: DigestPolicy, data: DigestPolicy) -> Options {
     Options { offer: crate::Offer { header_digest: header, data_digest: data, ..crate::Offer::default() }, ..options() }
 }

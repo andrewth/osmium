@@ -460,3 +460,100 @@ fn chunked_body_trickling_in() {
     conn.receive(b"0\r\n\r\n");
     assert_eq!(conn.next_request().expect("request").expect("ok").body, expect);
 }
+
+/// Offers `input` the way a transport would, answering each request, and
+/// returns the statuses sent. Panics if the connection stops taking bytes
+/// while having nothing to answer: the client would wait forever.
+fn statuses_without_stalling(limits: Limits, input: &[u8]) -> Vec<u16> {
+    let mut conn = Connection::new(limits);
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < input.len() {
+        let took = conn.receive(&input[offset..]);
+        offset += took;
+        let mut answered = false;
+        while let Some(r) = conn.next_request() {
+            if r.is_ok() {
+                conn.respond(Response::new(204));
+            }
+            answered = true;
+        }
+        out.extend_from_slice(conn.outgoing());
+        let n = conn.outgoing().len();
+        conn.sent(n);
+        assert!(took > 0 || answered || conn.should_close(), "stalled after {offset} of {} bytes", input.len());
+    }
+    let text = String::from_utf8(out).expect("ASCII");
+    text.split("HTTP/1.1 ").filter_map(|r| r.get(..3)).map(|s| s.parse().expect("status")).collect()
+}
+
+#[test]
+fn chunk_framing_that_fills_the_buffer_is_refused_not_stalled() {
+    let limits = Limits { max_head: 512, max_headers: 8, max_body: 64 };
+    let mut input = Vec::from(&b"POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"[..]);
+    // One-byte chunks, each with a long extension: the body stays tiny while
+    // the framing grows past anything the connection buffers.
+    let ext = "x".repeat(1000);
+    for _ in 0..60 {
+        input.extend_from_slice(format!("1;{ext}\r\nA\r\n").as_bytes());
+    }
+    input.extend_from_slice(b"0\r\n\r\n");
+    assert_eq!(statuses_without_stalling(limits, &input), [400]);
+}
+
+#[test]
+fn empty_lines_before_a_request_count_towards_the_head_limit() {
+    let limits = Limits { max_head: 512, max_headers: 8, max_body: 64 };
+    let input = "\r\n".repeat(2000);
+    assert_eq!(statuses_without_stalling(limits, input.as_bytes()), [431]);
+    // A few are still fine.
+    assert_eq!(statuses_without_stalling(limits, b"\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n"), [204]);
+}
+
+#[test]
+fn trailers_count_partial_lines_towards_the_limit() {
+    let limits = Limits { max_head: 512, max_headers: 8, max_body: 64 };
+    let mut input = Vec::from(&b"POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"[..]);
+    input.extend_from_slice(format!("A: {}\r\n", "a".repeat(400)).as_bytes());
+    input.extend_from_slice("b".repeat(5000).as_bytes());
+    assert_eq!(statuses_without_stalling(limits, &input), [431]);
+}
+
+#[test]
+fn the_largest_request_within_the_limits_fits_the_buffer() {
+    let limits = Limits { max_head: 512, max_headers: 8, max_body: 64 };
+    let mut input = Vec::from(&b"POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n"[..]);
+    let pad = 512 - input.len() - "X: \r\n\r\n".len();
+    input.extend_from_slice(format!("X: {}\r\n\r\n", "p".repeat(pad)).as_bytes());
+    assert_eq!(input.len(), 512);
+    // 64 one-byte chunks with extensions: 64 * 16 + 3 = 1027 framing bytes, within max_body + 1 KiB.
+    for _ in 0..64 {
+        input.extend_from_slice(b"1;e=12345678\r\nZ\r\n");
+    }
+    input.extend_from_slice(b"0\r\n");
+    input.extend_from_slice(format!("T: {}\r\n\r\n", "t".repeat(500)).as_bytes());
+    let mut conn = Connection::new(limits);
+    assert_eq!(conn.receive(&input), input.len(), "a request within the limits must fit");
+    let req = conn.next_request().expect("request").expect("within the limits");
+    assert_eq!(req.body, [b'Z'; 64]);
+}
+
+#[test]
+fn absolute_form_targets_route_like_origin_form() {
+    let (reqs, _) = serve(b"GET http://example.com:8080/a/b%20c?x=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n");
+    let req = reqs[0].as_ref().expect("request");
+    assert_eq!(req.path(), "/a/b%20c");
+    assert_eq!(req.query(), Some("x=1"));
+    assert_eq!(req.authority(), Some("example.com:8080"));
+    assert_eq!(req.segments(), Some(vec!["a".to_string(), "b c".to_string()]));
+
+    let (reqs, _) = serve(b"GET https://h?q=2 HTTP/1.1\r\nHost: h\r\n\r\nGET http://h HTTP/1.1\r\nHost: h\r\n\r\n");
+    let a = reqs[0].as_ref().expect("request");
+    assert_eq!((a.path(), a.query(), a.authority()), ("/", Some("q=2"), Some("h")));
+    let b = reqs[1].as_ref().expect("request");
+    assert_eq!((b.path(), b.query(), b.authority()), ("/", None, Some("h")));
+
+    let (reqs, _) = serve(b"GET /plain?y HTTP/1.1\r\nHost: h\r\n\r\n");
+    let c = reqs[0].as_ref().expect("request");
+    assert_eq!((c.path(), c.query(), c.authority()), ("/plain", Some("y"), None));
+}

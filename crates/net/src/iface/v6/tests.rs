@@ -623,3 +623,22 @@ fn advertised_infinite_lifetimes_are_capped() {
     assert!(a.iface.v6.addrs.iter().filter(|x| !is_link_local(x.addr)).all(|x| x.expires.is_some()));
     assert!(a.iface.v6.addrs.iter().any(|x| !is_link_local(x.addr)));
 }
+
+#[test]
+fn a_neighbor_flood_does_not_evict_the_routers() {
+    let mut st = State::new(MacAddress([2, 0, 0, 0, 0, 1]));
+    let t0 = Instant::ZERO;
+    let gateway = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x98);
+    st.routers.push(Router { addr: ROUTER, expires: t0 + Duration::from_secs(600) });
+    st.gateway = Some(gateway);
+    st.insert(ROUTER, ROUTER_MAC, t0);
+    st.insert(gateway, MacAddress([2, 0, 0, 0, 0, 0x98]), t0);
+    for i in 1..=200u16 {
+        let at = t0 + Duration::from_millis(u64::from(i));
+        st.insert(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 1, i), MacAddress([2, 0, 0, 1, 0, i as u8]), at);
+    }
+    let later = t0 + Duration::from_secs(1);
+    assert_eq!(st.lookup(ROUTER, later), Some(ROUTER_MAC));
+    assert_eq!(st.lookup(gateway, later), Some(MacAddress([2, 0, 0, 0, 0, 0x98])));
+    assert_eq!(st.neighbors.len(), NEIGHBORS);
+}

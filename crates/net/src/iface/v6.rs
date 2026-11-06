@@ -44,7 +44,8 @@ const NS_RETRY: Duration = Duration::from_secs(1);
 const NS_GIVE_UP: Duration = Duration::from_secs(3);
 /// How long a learned link-layer address stays valid.
 const NEIGHBOR_LIFETIME: Duration = Duration::from_secs(60);
-/// Neighbors kept; the oldest is replaced when the cache is full.
+/// Neighbors kept; when the cache is full the one closest to expiry is
+/// replaced, but never a router's.
 const NEIGHBORS: usize = 32;
 const MAX_ADDRESSES: usize = 8;
 const MAX_PREFIXES: usize = 8;
@@ -253,8 +254,14 @@ impl State {
             n.expires = expires;
         } else if self.neighbors.len() < NEIGHBORS {
             self.neighbors.push(Neighbor { ip, mac, expires });
-        } else if let Some(n) = self.neighbors.iter_mut().min_by_key(|n| n.expires) {
-            *n = Neighbor { ip, mac, expires };
+        } else {
+            // Neighbor solicitations from made-up addresses must not push the
+            // routers out and cut off everything beyond the link.
+            let (routers, gateway) = (&self.routers, self.gateway);
+            let router = |a: Ipv6Addr| gateway == Some(a) || routers.iter().any(|r| r.addr == a);
+            if let Some(n) = self.neighbors.iter_mut().filter(|n| !router(n.ip)).min_by_key(|n| n.expires) {
+                *n = Neighbor { ip, mac, expires };
+            }
         }
     }
 }

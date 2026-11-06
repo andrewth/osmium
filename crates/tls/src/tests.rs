@@ -340,3 +340,70 @@ fn utc_and_generalized_time() {
 fn self_test_passes_on_the_host() {
     self_test(rng(), NOW).expect("self-test");
 }
+
+/// A client that keeps sending while the application never reads must not
+/// make the session buffer without bound: it stops taking bytes, writes
+/// still go out, and everything arrives intact once the application reads.
+#[test]
+fn slow_consumer_gets_backpressure_not_unbounded_buffering() {
+    let srv = server(NOW);
+    let mut s = ServerSession::new(srv.config.clone()).expect("session");
+    let mut c = client(&srv.cert, "hyperon.test");
+    pump(&mut c, &mut s).expect("handshake");
+
+    let up: Vec<u8> = (0..1_000_000u32).map(|i| (i * 7 % 253) as u8).collect();
+    let mut wire = Vec::new();
+    for chunk in up.chunks(8_000) {
+        c.writer().write_all(chunk).expect("client write");
+        while c.wants_write() {
+            c.write_tls(&mut wire).expect("client write_tls");
+        }
+    }
+    // Offer everything without reading: the session takes only a bounded amount.
+    let mut offset = 0;
+    loop {
+        let n = s.receive(&wire[offset..]).expect("receive");
+        offset += n;
+        if n == 0 || offset == wire.len() {
+            break;
+        }
+    }
+    assert!(offset < wire.len(), "the session took the whole megabyte without being read");
+    assert!(s.readable() <= MAX_PLAINTEXT + 16 * 1024, "{} bytes buffered", s.readable());
+    assert!(offset <= MAX_PLAINTEXT + 16 * 1024 + MAX_INCOMING + 4096, "{offset} bytes taken");
+
+    // Writing still works while reads are held back.
+    s.write(b"pong").expect("server write");
+    let out = s.outgoing().to_vec();
+    s.sent(out.len());
+    let mut rest = &out[..];
+    while !rest.is_empty() {
+        c.read_tls(&mut rest).expect("client read_tls");
+    }
+    c.process_new_packets().expect("client process");
+    assert_eq!(client_read(&mut c), b"pong");
+
+    // Now read, offering the rest as the session makes room.
+    let mut got = Vec::new();
+    for _ in 0..100_000 {
+        got.extend(drain_server(&mut s));
+        if offset == wire.len() && s.readable() == 0 {
+            break;
+        }
+        offset += s.receive(&wire[offset..]).expect("receive");
+    }
+    got.extend(drain_server(&mut s));
+    assert_eq!(got.len(), up.len());
+    assert!(got == up, "data corrupted under backpressure");
+}
+
+/// 0-RTT data can be replayed, so a config that would accept it is refused
+/// rather than having early bytes delivered as if they were ordinary data.
+#[test]
+fn config_accepting_early_data_is_refused() {
+    let srv = server(NOW);
+    let mut config = (*srv.config).clone();
+    config.max_early_data_size = 16 * 1024;
+    let err = ServerSession::new(Arc::new(config)).err().expect("must refuse early data");
+    assert!(std::format!("{err}").contains("early data"), "{err}");
+}

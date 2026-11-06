@@ -9,7 +9,9 @@
 //!
 //! Data that arrives past a gap is held, within the receive window, until
 //! the gap is filled; each out-of-order segment is acknowledged at once so
-//! that the sender sees duplicate ACKs. Window scaling (RFC 7323) and
+//! that the sender sees duplicate ACKs. The window is what the receive
+//! buffer has free, and held data lies inside it, so in-order and held bytes
+//! together never exceed the receive buffer's size. Window scaling (RFC 7323) and
 //! selective acknowledgments (RFC 2018) are negotiated in the handshake.
 //!
 //! The sender is congestion controlled (RFC 5681): slow start from a ten
@@ -374,6 +376,12 @@ impl TcpSocket {
     /// ephemeral port if it is 0. The SYN goes out on the next poll;
     /// [`state`](Self::state) reaches [`State::Established`] when the peer
     /// accepts, and [`error`](Self::error) says why if it does not.
+    ///
+    /// A socket cannot see the others, so an explicit `local_port` is
+    /// checked against them on the next poll: if another socket of the set
+    /// already holds the same port and `remote`, the connection fails with
+    /// [`Error::AddressInUse`]. [`SocketSet::connect_tcp`](super::SocketSet::connect_tcp)
+    /// checks at once instead.
     pub fn connect(&mut self, remote: impl Into<SocketAddr>, local_port: u16) -> Result<(), Error> {
         let remote = remote.into();
         let unusable = match remote.ip() {
@@ -606,6 +614,25 @@ impl TcpSocket {
         self.fresh && self.local.port() == 0
     }
 
+    /// The port and peer of a connection waiting to send its SYN from a
+    /// port its owner chose.
+    pub(crate) fn pending_explicit_connect(&self) -> Option<(u16, SocketAddr)> {
+        (self.fresh && self.local.port() != 0).then_some((self.local.port(), self.remote))
+    }
+
+    /// Returns true if the socket holds the connection `local_port` ->
+    /// `remote` (in any state but closed or listening, TIME-WAIT included,
+    /// and including one still waiting to send its SYN).
+    pub(crate) fn holds_tuple(&self, local_port: u16, remote: SocketAddr) -> bool {
+        !matches!(self.state, State::Closed | State::Listen) && self.local.port() == local_port && self.remote == remote
+    }
+
+    /// Gives up a connection that has not sent its SYN yet, with `error`.
+    pub(crate) fn refuse_connect(&mut self, error: Error) {
+        self.fresh = false;
+        self.fail(error);
+    }
+
     pub(crate) fn set_ephemeral_port(&mut self, port: u16) {
         self.local.set_port(port);
     }
@@ -788,14 +815,19 @@ impl TcpSocket {
         let seg_len = payload.len() as u32 + u32::from(seg.has(TCP_SYN)) + u32::from(seg.has(TCP_FIN));
         let wnd = self.rx_window();
         // PAWS (RFC 7323 5): a segment older than the newest timestamp seen
-        // is a wrapped-around duplicate, and one without a timestamp on a
-        // connection that agreed on them is not from the peer.
-        if self.ts_ok && !seg.has(TCP_RST) {
-            let (val, _) = seg.timestamps?;
-            if before(val, self.ts_recent) && now - self.ts_recent_at < TS_RECENT_LIFE {
-                self.ack_pending = true;
-                return None;
-            }
+        // is a wrapped-around duplicate. RFC 7323 3.2 says a segment without
+        // a timestamp on a connection that agreed on them SHOULD be dropped;
+        // like Linux, take it instead (some middleboxes strip the option),
+        // without letting it move TS.Recent or sample the round trip. It
+        // still has to pass the window and RFC 5961 checks below.
+        if self.ts_ok
+            && !seg.has(TCP_RST)
+            && let Some((val, _)) = seg.timestamps
+            && before(val, self.ts_recent)
+            && now - self.ts_recent_at < TS_RECENT_LIFE
+        {
+            self.ack_pending = true;
+            return None;
         }
         let in_window = |s: u32| s.wrapping_sub(self.rcv_nxt) < wnd;
         let acceptable = seg.seq == self.rcv_nxt
@@ -2663,12 +2695,16 @@ mod tests {
             sock.recv_queue()
         };
         assert_eq!(segment(sock, now, Some((recent.wrapping_sub(1), 0)), b"old"), 0, "older than TS.Recent");
-        assert_eq!(segment(sock, now, None, b"bare"), 0, "no timestamp on a timestamped connection");
-        assert_eq!(segment(sock, now, Some((recent.wrapping_add(1), 0)), b"new"), 3);
-        assert_eq!(sock.ts_recent, recent.wrapping_add(1));
+        // Like Linux, a segment without the option is taken (RFC 7323 3.2
+        // only says SHOULD drop), but it does not move TS.Recent.
+        assert_eq!(segment(sock, now, None, b"bare"), 4, "no timestamp on a timestamped connection");
+        assert_eq!(sock.ts_recent, recent);
+        // PAWS still applies to the segments that do carry one.
+        assert_eq!(segment(sock, now, Some((recent.wrapping_sub(1), 0)), b"old"), 4, "older than TS.Recent");
+        assert_eq!(segment(sock, now, Some((recent.wrapping_add(1), 0)), b"new"), 7);
         // After 24 days of silence TS.Recent is not trusted.
         let later = now + TS_RECENT_LIFE;
-        assert_eq!(segment(sock, later, Some((recent.wrapping_sub(5), 0)), b"!"), 4);
+        assert_eq!(segment(sock, later, Some((recent.wrapping_sub(5), 0)), b"!"), 8);
     }
 
     #[test]
@@ -2699,5 +2735,164 @@ mod tests {
         }));
         assert_eq!(got, data);
         assert!(tcp(&mut a, ca).srtt.is_some());
+    }
+
+    /// A fresh connection from port 5000 to `PEER`, and the SYN it sent.
+    fn syn_sent(rng: &mut crate::rng::Rng) -> (TcpSocket, TcpHeader) {
+        let mut s = TcpSocket::new(1024, 1024);
+        s.connect(PEER, 5000).unwrap();
+        let mut out = Vec::new();
+        s.dispatch(&mut test_cx(rng, Instant::ZERO), &mut out);
+        assert_eq!(s.state(), State::SynSent);
+        let (syn, _) = TcpHeader::parse(&out[0].payload, B_IP, PEER.ip()).expect("a SYN");
+        assert_eq!(syn.flags, TCP_SYN);
+        (s, syn)
+    }
+
+    #[test]
+    fn syn_sent_takes_only_a_reset_that_acknowledges_its_syn() {
+        let mut rng = crate::rng::Rng::new(1);
+        let (mut s, syn) = syn_sent(&mut rng);
+        let local = sa(B_IP, 5000);
+        let rst = |ack: u32, flags: u8| TcpHeader {
+            src_port: 4000,
+            dst_port: 5000,
+            seq: 0,
+            ack,
+            flags,
+            ..Default::default()
+        };
+        // RFC 9293 3.10.7.3: a reset whose ACK is not for our SYN, or that
+        // has no ACK, is dropped without an answer.
+        for seg in [rst(syn.seq.wrapping_add(2), TCP_RST | TCP_ACK), rst(syn.seq, TCP_RST | TCP_ACK), rst(0, TCP_RST)] {
+            assert!(s.process(&mut test_cx(&mut rng, Instant::ZERO), local, PEER, &seg, &[]).is_none());
+            assert_eq!((s.state(), s.error()), (State::SynSent, None));
+        }
+        // A bare ACK for something else gets a reset of its own.
+        let stray = TcpHeader { ack: syn.seq.wrapping_add(7), flags: TCP_ACK, ..rst(0, 0) };
+        let answer = s.process(&mut test_cx(&mut rng, Instant::ZERO), local, PEER, &stray, &[]).expect("a reset");
+        assert_eq!((answer.flags, answer.seq), (TCP_RST, syn.seq.wrapping_add(7)));
+        assert_eq!(s.state(), State::SynSent);
+        // The right one refuses the connection.
+        let seg = rst(syn.seq.wrapping_add(1), TCP_RST | TCP_ACK);
+        assert!(s.process(&mut test_cx(&mut rng, Instant::ZERO), local, PEER, &seg, &[]).is_none());
+        assert_eq!((s.state(), s.error()), (State::Closed, Some(Error::ConnectionRefused)));
+    }
+
+    #[test]
+    fn data_on_the_handshakes_last_ack_is_delivered() {
+        let mut rng = crate::rng::Rng::new(1);
+        let mut s = half_open(&mut rng, &syn(None));
+        let mut out = Vec::new();
+        s.dispatch(&mut test_cx(&mut rng, Instant::ZERO), &mut out);
+        let (synack, _) = TcpHeader::parse(&out[0].payload, B_IP, PEER.ip()).expect("a SYN-ACK");
+        assert_eq!(synack.flags, TCP_SYN | TCP_ACK);
+        let ack = TcpHeader {
+            src_port: 4000,
+            dst_port: 80,
+            seq: 1001,
+            ack: synack.seq.wrapping_add(1),
+            flags: TCP_ACK | TCP_PSH,
+            window: 1000,
+            ..Default::default()
+        };
+        let at = Instant::from_millis(5);
+        assert!(s.process(&mut test_cx(&mut rng, at), sa(B_IP, 80), PEER, &ack, b"GET /").is_none());
+        assert_eq!(s.state(), State::Established);
+        let mut buf = [0u8; 16];
+        assert_eq!(s.recv(&mut buf), Ok(5));
+        assert_eq!(&buf[..5], b"GET /");
+    }
+
+    #[test]
+    fn a_lost_fin_alone_is_sent_again() {
+        let (mut a, mut b, ca, cb, mut now) = connected(1024, 1024);
+        // Drop A's first FIN; nothing else is in flight.
+        let mut dropped = false;
+        a.set_filter(move |_, f| {
+            let fin = f.len() >= 14 + 20 + 20 && f[14 + 9] == 6 && f[14 + 20 + 13] & TCP_FIN != 0;
+            if fin && !dropped {
+                dropped = true;
+                return false;
+            }
+            true
+        });
+        tcp(&mut a, ca).close();
+        let start = now;
+        assert!(run(&mut a, &mut b, &mut now, 5000, |a, b| {
+            tcp(b, cb).state() == State::CloseWait && tcp(a, ca).state() == State::FinWait2
+        }));
+        assert!(now - start >= MIN_RTO, "the FIN went again after a retransmission timeout");
+        let mut buf = [0u8; 4];
+        assert_eq!(tcp(&mut b, cb).recv(&mut buf), Ok(0), "end of stream");
+    }
+
+    #[test]
+    fn a_connection_from_a_port_in_use_to_the_same_peer_is_refused() {
+        let (mut a, mut b) = pair();
+        let listener = b.sockets.add(TcpSocket::new(1024, 1024));
+        tcp(&mut b, listener).listen(80).unwrap();
+        let first = a.sockets.add(TcpSocket::new(1024, 1024));
+        a.sockets.connect_tcp(first, sa(B_IP, 80), 5000).unwrap();
+        let mut now = Instant::ZERO;
+        assert!(run(&mut a, &mut b, &mut now, 1000, |a, _| tcp(a, first).state() == State::Established));
+        // Checked at once through the set...
+        let second = a.sockets.add(TcpSocket::new(1024, 1024));
+        assert_eq!(a.sockets.connect_tcp(second, sa(B_IP, 80), 5000), Err(Error::AddressInUse));
+        assert_eq!(tcp(&mut a, second).state(), State::Closed);
+        // ...and on the next poll when connected directly.
+        tcp(&mut a, second).connect(sa(B_IP, 80), 5000).unwrap();
+        a.poll(now);
+        let x = tcp(&mut a, second);
+        assert_eq!((x.state(), x.error()), (State::Closed, Some(Error::AddressInUse)));
+        assert_eq!(tcp(&mut a, first).state(), State::Established, "the first connection is untouched");
+        // The same port to another peer port is a different connection.
+        let other = b.sockets.add(TcpSocket::new(1024, 1024));
+        tcp(&mut b, other).listen(81).unwrap();
+        a.sockets.connect_tcp(second, sa(B_IP, 81), 5000).unwrap();
+        assert!(run(&mut a, &mut b, &mut now, 1000, |a, _| tcp(a, second).state() == State::Established));
+        // Two new connections with the same addresses: the first one made goes ahead.
+        let (x, y) = (a.sockets.add(TcpSocket::new(64, 64)), a.sockets.add(TcpSocket::new(64, 64)));
+        tcp(&mut a, x).connect(sa(B_IP, 82), 6000).unwrap();
+        tcp(&mut a, y).connect(sa(B_IP, 82), 6000).unwrap();
+        a.poll(now);
+        assert_eq!(tcp(&mut a, x).state(), State::SynSent);
+        assert_eq!(tcp(&mut a, y).error(), Some(Error::AddressInUse));
+    }
+
+    /// Out-of-order data is held only inside the advertised window, so what
+    /// is held and what waits to be read never exceed the receive buffer.
+    #[test]
+    fn held_and_buffered_bytes_stay_within_the_receive_buffer() {
+        let (_a, mut b, _ca, cb, _) = connected(4096, 1024);
+        let mut rng = crate::rng::Rng::new(7);
+        let sock = tcp(&mut b, cb);
+        let (local, remote) = (sock.local, sock.remote);
+        let base = sock.rcv_nxt;
+        let mut seed = 0x1234_5678u32;
+        let mut buf = [0u8; 700];
+        for round in 0..2000u32 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let offset = (seed >> 8) % 12_000;
+            let len = 1 + (seed >> 20) as usize % 1400;
+            let ts = sock.ts_ok.then(|| (sock.ts_recent.wrapping_add(round), 0));
+            let seg = TcpHeader {
+                src_port: remote.port(),
+                dst_port: local.port(),
+                seq: base.wrapping_add(offset),
+                ack: sock.snd_nxt,
+                flags: TCP_ACK,
+                window: 1000,
+                timestamps: ts,
+                ..Default::default()
+            };
+            let payload = std::vec![1u8; len];
+            sock.process(&mut test_cx(&mut rng, Instant::from_millis(10_000)), local, remote, &seg, &payload);
+            let held: usize = sock.ooo.iter().map(|(_, d)| d.len()).sum();
+            assert!(sock.rx.len() + held <= sock.rx_cap, "{} buffered + {held} held > {}", sock.rx.len(), sock.rx_cap);
+            if round % 3 == 0 {
+                let _ = sock.recv(&mut buf);
+            }
+        }
     }
 }

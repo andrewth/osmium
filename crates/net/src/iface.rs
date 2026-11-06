@@ -187,6 +187,13 @@ pub struct Interface {
     looped: bool,
     /// Limits the port-unreachable errors sent.
     error_limit: ErrorLimit,
+    /// The socket slot the next poll lets send first. A poll stops asking
+    /// sockets once the transmit queue is half full, and the next one starts
+    /// with the socket that was not asked, so high handles are not starved.
+    dispatch_from: usize,
+    /// The headers of the UDP datagrams sent most recently, which an ICMP
+    /// error must quote to be believed (see [`path_mtu`]).
+    sent_udp: VecDeque<path_mtu::SentUdp>,
 }
 
 /// A token bucket for the ICMP errors the interface originates, so that a
@@ -255,6 +262,8 @@ impl Interface {
             looping: false,
             looped: false,
             error_limit: ErrorLimit::new(),
+            dispatch_from: 0,
+            sent_udp: VecDeque::new(),
         }
     }
 
@@ -410,8 +419,13 @@ impl Interface {
 
         sockets.assign_ephemeral_ports(&mut self.rng);
         let mut out = Vec::new();
-        for (_, s) in sockets.iter_mut() {
+        let slots = sockets.slot_count();
+        // Without a stop, the next poll starts one slot on, so no socket is
+        // always first either.
+        let mut next = self.dispatch_from.wrapping_add(1);
+        for (handle, s) in sockets.iter_mut_from(self.dispatch_from) {
             if self.tx.len() >= TX_QUEUE / 2 {
+                next = handle.index();
                 break;
             }
             let mut cx = Cx {
@@ -427,9 +441,11 @@ impl Interface {
             };
             s.dispatch(&mut cx, &mut out);
             for p in out.drain(..) {
+                self.note_sent(&p);
                 self.send_ip(now, p);
             }
         }
+        self.dispatch_from = next.checked_rem(slots).unwrap_or(0);
 
         let looped = self.loopback.len();
         for _ in 0..looped {
@@ -670,7 +686,10 @@ impl Interface {
     }
 
     fn learned(&mut self, now: Instant, ip: Ipv4Addr, mac: MacAddress) {
-        self.arp.insert(ip, mac, now);
+        // The gateway's entry is never what makes room: a flood of ARP
+        // requests from made-up neighbors must not cut off everything
+        // beyond the subnet.
+        self.arp.insert(ip, mac, now, self.config.and_then(|c| c.gateway));
         self.requests.retain(|r| r.ip != ip);
         let mut i = 0;
         while i < self.pending.len() {
@@ -1163,6 +1182,83 @@ mod tests {
             assert!(!b.iface.arp.contains(ip), "{ip}");
         }
         assert!(sent.borrow().is_empty(), "no replies");
+    }
+
+    #[test]
+    fn an_arp_flood_does_not_evict_the_gateway() {
+        let (a, mut b) = pair();
+        let gateway = Ipv4Addr::new(192, 168, 1, 254);
+        b.iface.set_config(Some(Config { gateway: Some(gateway), ..crate::testing::config(B_IP) }));
+        let arp_from = |ip: Ipv4Addr, mac: MacAddress| {
+            let arp = ArpPacket {
+                op: ARP_REQUEST,
+                sender_mac: mac,
+                sender_ip: ip,
+                target_mac: MacAddress::default(),
+                target_ip: B_IP,
+            };
+            let mut f = vec![0; ETH_HEADER_LEN + ARP_LEN];
+            EthernetHeader { dst: MacAddress::BROADCAST, src: mac, ethertype: ETHERTYPE_ARP }.emit(&mut f);
+            arp.emit(&mut f[ETH_HEADER_LEN..]);
+            f
+        };
+        let gw_mac = MacAddress([2, 0, 0, 0, 0, 0xfe]);
+        a.dev.tx.borrow_mut().push_back(arp_from(gateway, gw_mac));
+        b.poll(Instant::ZERO);
+        assert_eq!(b.iface.arp.lookup(gateway, Instant::ZERO), Some(gw_mac));
+        // Requests from 200 made-up neighbors, each learned since it targets B.
+        for i in 1..=200u8 {
+            let at = Instant::from_millis(u64::from(i));
+            a.dev
+                .tx
+                .borrow_mut()
+                .push_back(arp_from(Ipv4Addr::new(192, 168, 1, i.max(3)), MacAddress([2, 0, 0, 1, 0, i])));
+            b.poll(at);
+        }
+        assert_eq!(b.iface.arp.lookup(gateway, Instant::from_millis(300)), Some(gw_mac), "the gateway is still known");
+    }
+
+    /// Sockets with more to send than one poll takes all get their turn,
+    /// whatever their handles: the transmit queue fills, and the next poll
+    /// starts with the sockets the last one did not reach.
+    #[test]
+    fn transmission_is_shared_between_sockets() {
+        use crate::TcpSocket;
+        let (mut a, mut b) = pair();
+        let mut now = Instant::ZERO;
+        const N: usize = 20;
+        let mut pairs = Vec::new();
+        for i in 0..N {
+            let ca = a.sockets.add(TcpSocket::new(65535, 65535));
+            let cb = b.sockets.add(TcpSocket::new(65535, 65535));
+            let port = 1000 + i as u16;
+            b.sockets.get_mut::<TcpSocket>(cb).listen(port).unwrap();
+            a.sockets.get_mut::<TcpSocket>(ca).connect(sa(B_IP, port), 0).unwrap();
+            pairs.push((ca, cb));
+        }
+        assert!(run(&mut a, &mut b, &mut now, 2000, |a, _| pairs.iter().all(|&(ca, _)| a
+            .sockets
+            .get::<TcpSocket>(ca)
+            .state()
+            == crate::TcpState::Established)));
+        // Every socket always has data waiting, and B reads all it gets.
+        let data = vec![0x5a; 65535];
+        let mut got = vec![0usize; N];
+        let mut buf = vec![0; 65535];
+        run(&mut a, &mut b, &mut now, 300, |a, b| {
+            for (i, &(ca, cb)) in pairs.iter().enumerate() {
+                let t = a.sockets.get_mut::<TcpSocket>(ca);
+                let room = 65535 - t.send_queue();
+                let _ = t.send(&data[..room]);
+                while let Ok(n @ 1..) = b.sockets.get_mut::<TcpSocket>(cb).recv(&mut buf) {
+                    got[i] += n;
+                }
+            }
+            false
+        });
+        assert!(got.iter().all(|&n| n > 0), "every connection moved data: {got:?}");
+        let (least, most) = (got.iter().min().copied().unwrap_or(0), got.iter().max().copied().unwrap_or(0));
+        assert!(least * 2 >= most, "the slowest got under half of what the fastest did: {got:?}");
     }
 
     fn udp_pair(
