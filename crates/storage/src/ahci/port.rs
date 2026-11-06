@@ -177,6 +177,10 @@ pub(super) struct Port<'d, D: DmaAllocator + ?Sized> {
     broken: bool,
     /// Command slots in use (1 unless the disk does NCQ).
     slots: usize,
+    /// The HBA has reported a byte count for a queued command on this
+    /// port, so it is one that reports them (QEMU never does): from then on
+    /// a queued command's zero count is a short transfer, not "unreported".
+    queued_counts: bool,
     /// What a waiter does between polls, with the port's interrupts armed;
     /// `None` polls.
     idle: Option<fn()>,
@@ -249,6 +253,7 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
             kind: DeviceKind::Other(0),
             broken: false,
             slots: 1,
+            queued_counts: false,
             idle: None,
             mem: ManuallyDrop::new(mem),
             data: ManuallyDrop::new(None),
@@ -457,19 +462,26 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
         }
     }
 
+    /// The byte count (PRDBC) the HBA left in `slot`'s command header. It is
+    /// cleared when the command is built.
+    fn transferred(&self, slot: usize) -> u32 {
+        self.mem.load::<u32>(header(slot) + 4)
+    }
+
     /// Whether data in to `slot` all arrived, or the buffer is partly stale.
     ///
-    /// The byte count the device leaves in the command header is cleared
-    /// when the command is built. A queued command's count is optional
-    /// (AHCI 1.3.1 §5.3.2 only requires it for the others, and QEMU leaves
-    /// it at zero), so for those a zero means "not reported" and only a
-    /// different, non-zero count is a short transfer.
-    fn check_transferred(&self, slot: usize, cmd: &Command, queued: bool) -> Result<(), AhciError> {
+    /// `unreported_ok` accepts a zero count as "not reported" rather than
+    /// short. Only a queued read on an HBA that has never reported a queued
+    /// byte count gets it: the count is optional there (AHCI 1.3.1 §5.3.2
+    /// requires it only for the other commands, and QEMU leaves it at zero),
+    /// and the bounce buffer cannot tell such a read from one that moved
+    /// nothing. Every other read with a count other than its length fails.
+    fn check_transferred(&self, slot: usize, cmd: &Command, unreported_ok: bool) -> Result<(), AhciError> {
         if cmd.write {
             return Ok(());
         }
-        let done = self.mem.load::<u32>(header(slot) + 4);
-        if done == cmd.len as u32 || (queued && done == 0) { Ok(()) } else { Err(AhciError::ShortTransfer) }
+        let done = self.transferred(slot);
+        if done == cmd.len as u32 || (unreported_ok && done == 0) { Ok(()) } else { Err(AhciError::ShortTransfer) }
     }
 
     /// Runs `cmd` in slot 0 and waits for it, with no recovery.
@@ -525,9 +537,19 @@ impl<'d, D: DmaAllocator + ?Sized> Port<'d, D> {
         let (done, failed) = self.wait_slots(mask, true);
         self.finish(failed);
         barrier::dma_rmb();
-        let result = self
-            .outcome(done, failed)
-            .and_then(|()| cmds.iter().enumerate().try_for_each(|(slot, cmd)| self.check_transferred(slot, cmd, true)));
+        // A zero count is believed only from an HBA that has never reported
+        // a queued count, this round included: one that reports some but
+        // not all of them has dropped data.
+        let reported = (0..cmds.len()).any(|slot| self.transferred(slot) != 0);
+        let finished = done.is_ok() && !failed;
+        let unreported_ok = !self.queued_counts && !reported;
+        let result = self.outcome(done, failed).and_then(|()| {
+            cmds.iter().enumerate().try_for_each(|(slot, cmd)| self.check_transferred(slot, cmd, unreported_ok))
+        });
+        // Only a round that finished can have meaningful counts.
+        if finished {
+            self.queued_counts |= reported;
+        }
         if let Err(e) = result
             && self.recover(matches!(e, AhciError::Device { .. })).is_err()
         {

@@ -1,6 +1,6 @@
 [package]
 name = "osmium-usb"
-description = "Osmium: USB host controllers (xHCI, EHCI, OHCI, UHCI) and class drivers (mass storage, HID, CDC-ECM/NCM, hubs, isochronous)"
+description = "Osmium: USB host controllers (xHCI, EHCI, OHCI, UHCI) and class drivers (mass storage, HID, hubs, isochronous streams)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -44,6 +44,12 @@ mod feature {
     pub const C_PORT_SUSPEND: u16 = 18;
     pub const C_PORT_OVER_CURRENT: u16 = 19;
     pub const C_PORT_RESET: u16 = 20;
+    /// USB 3 only.
+    pub const C_PORT_LINK_STATE: u16 = 25;
+    /// USB 3 only.
+    pub const C_PORT_CONFIG_ERROR: u16 = 26;
+    /// USB 3 only.
+    pub const C_BH_PORT_RESET: u16 = 29;
 }
 
 /// `wPortStatus` / `wPortChange` bits common to both speeds.
@@ -57,6 +63,27 @@ const LOW_SPEED: u16 = 1 << 9;
 const HIGH_SPEED: u16 = 1 << 10;
 /// USB 3 only.
 const POWER_3: u16 = 1 << 9;
+
+/// `wPortChange` bits of a USB 2 hub and the features that clear them
+/// (USB 2.0 table 11-22).
+const CHANGES_2: [(u16, u16); 5] = [
+    (CONNECTION, feature::C_PORT_CONNECTION),
+    (ENABLE, feature::C_PORT_ENABLE),
+    (1 << 2, feature::C_PORT_SUSPEND),
+    (OVER_CURRENT, feature::C_PORT_OVER_CURRENT),
+    (RESET, feature::C_PORT_RESET),
+];
+
+/// `wPortChange` bits of a USB 3 hub and the features that clear them
+/// (USB 3.2 table 10-14). Bits 1 and 2 are reserved there.
+const CHANGES_3: [(u16, u16); 6] = [
+    (CONNECTION, feature::C_PORT_CONNECTION),
+    (OVER_CURRENT, feature::C_PORT_OVER_CURRENT),
+    (RESET, feature::C_PORT_RESET),
+    (1 << 5, feature::C_BH_PORT_RESET),
+    (1 << 6, feature::C_PORT_LINK_STATE),
+    (1 << 7, feature::C_PORT_CONFIG_ERROR),
+];
 
 /// How many times a port's status is read while waiting for its reset.
 const RESET_POLLS: u32 = 2000;
@@ -313,16 +340,11 @@ impl<H: UsbHost> Hub<H> {
         Ok(PortState { status: le16(&b, 0), change: le16(&b, 2), super_speed: self.super_speed })
     }
 
-    /// Acknowledges every change `state` reports on `port`.
+    /// Acknowledges every change `state` reports on `port`. A change left
+    /// set would keep the hub reporting the port forever.
     fn clear_changes(&mut self, port: u8, state: PortState) -> Result<(), UsbError> {
-        const CHANGES: [(u16, u16); 5] = [
-            (CONNECTION, feature::C_PORT_CONNECTION),
-            (ENABLE, feature::C_PORT_ENABLE),
-            (1 << 2, feature::C_PORT_SUSPEND),
-            (OVER_CURRENT, feature::C_PORT_OVER_CURRENT),
-            (RESET, feature::C_PORT_RESET),
-        ];
-        for (bit, selector) in CHANGES {
+        let changes: &[(u16, u16)] = if state.super_speed { &CHANGES_3 } else { &CHANGES_2 };
+        for &(bit, selector) in changes {
             if state.change & bit != 0 {
                 self.port_request(req::CLEAR_FEATURE, selector, port)?;
             }
@@ -451,7 +473,11 @@ mod tests {
         attached: Vec<(u8, Speed)>,
         detached: Vec<DeviceId>,
         armed: bool,
+        /// Status-change reports delivered.
+        reports: u32,
         super_speed: bool,
+        /// A SuperSpeed hub answers with a full-length SuperSpeed hub descriptor.
+        ss_descriptor: bool,
         /// Resets complete only after this many status reads.
         reset_delay: u32,
         resetting: Option<(usize, u32)>,
@@ -485,6 +511,11 @@ mod tests {
                     let ty = (s.value >> 8) as u8;
                     assert_eq!(ty, if self.super_speed { 0x2a } else { 0x29 });
                     // Think time 2 (24 FS bit times), power-good 50 ms.
+                    if self.ss_descriptor {
+                        let d = [12, ty, 3, 0, 0, 25, 100, 0, 0, 0, 0, 0];
+                        buf[..12].copy_from_slice(&d);
+                        return Ok(12);
+                    }
                     let d = [9, ty, 3, 2 << 5, 0, 25, 100, 0, 0xff];
                     buf[..9].copy_from_slice(&d);
                     Ok(9)
@@ -521,6 +552,9 @@ mod tests {
                         feature::C_PORT_CONNECTION => CONNECTION,
                         feature::C_PORT_ENABLE => ENABLE,
                         feature::C_PORT_RESET => RESET,
+                        feature::C_BH_PORT_RESET => 1 << 5,
+                        feature::C_PORT_LINK_STATE => 1 << 6,
+                        feature::C_PORT_CONFIG_ERROR => 1 << 7,
                         _ => 0,
                     };
                     self.ports[s.index as usize - 1].1 &= !bit;
@@ -548,6 +582,8 @@ mod tests {
                 return None;
             }
             self.armed = false;
+            self.reports += 1;
+            assert!(self.reports < 1000, "a change that is never cleared is reported forever");
             buf[0] = bitmap;
             Some(Ok(1))
         }
@@ -598,6 +634,22 @@ mod tests {
         // The fake's descriptor is the 9-byte USB 2 shape, too short for a SuperSpeed hub.
         assert_eq!(Hub::new(&mut fake, DeviceId(1), &CONFIG, Some(1)).err(), Some(UsbError::BadDescriptor));
         assert_eq!(fake.requests[0], (req::SET_HUB_DEPTH, 1, 0));
+    }
+
+    /// A USB 3 hub's own change bits (warm reset, link state, config
+    /// error) are acknowledged, so the port stops being reported.
+    #[test]
+    fn superspeed_changes_are_cleared() {
+        let mut fake = FakeHub { super_speed: true, ss_descriptor: true, ..Default::default() };
+        let mut h = Hub::new(&mut fake, DeviceId(1), &CONFIG, Some(0)).unwrap();
+        h.host().ports[1] = (POWER_3, 1 << 5 | 1 << 6 | 1 << 7);
+        assert_eq!(h.poll_events(), Ok(None));
+        assert_eq!(h.host().ports[1].1, 0, "every change acknowledged");
+        let cleared: Vec<_> = fake.requests.iter().filter(|r| r.0 == req::CLEAR_FEATURE).map(|r| (r.1, r.2)).collect();
+        assert_eq!(
+            cleared,
+            [(feature::C_BH_PORT_RESET, 2), (feature::C_PORT_LINK_STATE, 2), (feature::C_PORT_CONFIG_ERROR, 2)]
+        );
     }
 
     #[test]
