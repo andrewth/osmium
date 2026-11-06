@@ -2,7 +2,7 @@
 //! Running out of memory in the middle of an ext2/3/4 call is `ENOMEM`, and
 //! leaves a file system `e2fsck` finds clean: no leaked block or inode.
 //! Each test fails every allocation of a call in turn on an image made by
-//! `mkfs.ext*` (skipped, with a note, if e2fsprogs is missing).
+//! `mkfs.ext*` (failing if e2fsprogs is missing, unless `OSMIUM_SKIP_TOOL_TESTS=1`).
 
 use std::path::PathBuf;
 use std::process::Command;

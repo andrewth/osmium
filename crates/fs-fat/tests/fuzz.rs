@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
-//! A hostile disk image must not panic or hang the driver. Valid FAT12 and
-//! FAT16 volumes are made through the driver, then random bytes of their
+//! A hostile disk image must not panic or hang the driver. Valid FAT12, FAT16
+//! and FAT32 volumes are made through the driver, then random bytes of their
 //! metadata are flipped (fixed seed), and each damaged image is mounted,
 //! walked, read and written.
 
@@ -142,26 +142,61 @@ fn exercise(disk: MemDisk) -> bool {
     true
 }
 
-fn fuzz(clusters: usize, fat16: bool, rounds: usize, seed: u64) {
-    let (blank, meta) = blank(clusters, fat16);
-    let disk = MemDisk(Arc::new(Mutex::new(blank)));
-    populate(&disk);
-    let pristine = disk.0.lock().unwrap().clone();
+/// An empty FAT32 volume of `clusters` one-sector clusters (at least 65525,
+/// or it would count as FAT16), with FSInfo and a backup boot sector, its
+/// root directory in cluster 2; returns it and where the regions worth
+/// damaging start: the boot sector, FSInfo, the first FAT and the data area
+/// (the root and the first files).
+fn blank32(clusters: usize) -> (Vec<u8>, [usize; 4]) {
+    const RESERVED: usize = 32;
+    let fat = ((clusters + 2) * 4).div_ceil(512);
+    let total = RESERVED + 2 * fat + clusters;
+    let mut disk = vec![0u8; total * 512];
+    let boot = &mut disk[..512];
+    boot[0..3].copy_from_slice(&[0xeb, 0x58, 0x90]);
+    boot[3..11].copy_from_slice(b"OSMIUM  ");
+    boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+    boot[13] = 1;
+    boot[14..16].copy_from_slice(&(RESERVED as u16).to_le_bytes());
+    boot[16] = 2;
+    boot[21] = 0xf8;
+    boot[32..36].copy_from_slice(&(total as u32).to_le_bytes());
+    boot[36..40].copy_from_slice(&(fat as u32).to_le_bytes());
+    boot[44..48].copy_from_slice(&2u32.to_le_bytes());
+    boot[48..50].copy_from_slice(&1u16.to_le_bytes());
+    boot[50..52].copy_from_slice(&6u16.to_le_bytes());
+    boot[66] = 0x29;
+    boot[82..90].copy_from_slice(b"FAT32   ");
+    boot[510..512].copy_from_slice(&[0x55, 0xaa]);
+    let copy: Vec<u8> = disk[..512].to_vec();
+    disk[6 * 512..7 * 512].copy_from_slice(&copy);
+    let info = &mut disk[512..1024];
+    info[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());
+    info[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes());
+    info[488..492].copy_from_slice(&((clusters - 1) as u32).to_le_bytes());
+    info[492..496].copy_from_slice(&3u32.to_le_bytes());
+    info[508..512].copy_from_slice(&0xaa55_0000u32.to_le_bytes());
+    for copy in 0..2 {
+        let at = (RESERVED + copy * fat) * 512;
+        for (i, v) in [0x0fff_fff8u32, 0x0fff_ffff, 0x0fff_ffff].into_iter().enumerate() {
+            disk[at + 4 * i..at + 4 * i + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    (disk, [0, 512, RESERVED * 512, (RESERVED + 2 * fat) * 512])
+}
+
+/// Damages random bytes of `pristine` in `regions` (start, length) and
+/// exercises each result.
+fn damage(pristine: &[u8], regions: &[(usize, usize)], rounds: usize, seed: u64) {
     // The undamaged image mounts and walks.
-    assert!(exercise(MemDisk(Arc::new(Mutex::new(pristine.clone())))));
+    assert!(exercise(MemDisk(Arc::new(Mutex::new(pristine.to_vec())))));
     let mut mounted = 0;
     let mut rng = Rng(seed);
-    for round in 0..rounds {
-        let mut img = pristine.clone();
+    for _ in 0..rounds {
+        let mut img = pristine.to_vec();
         for _ in 0..1 + rng.below(6) {
-            // Mostly the boot sector, the start of the FAT, the root
-            // directory and the first data clusters, where the files are.
-            let at = match rng.below(4) {
-                0 => rng.below(64),
-                1 => 512 + rng.below(1024),
-                2 => meta - ROOT_SECTORS * 512 + rng.below(512),
-                _ => meta + rng.below(24 * 512),
-            };
+            let (start, len) = regions[rng.below(regions.len())];
+            let at = start + rng.below(len);
             if at < img.len() {
                 img[at] = match rng.below(3) {
                     0 => 0,
@@ -171,9 +206,33 @@ fn fuzz(clusters: usize, fat16: bool, rounds: usize, seed: u64) {
             }
         }
         mounted += exercise(MemDisk(Arc::new(Mutex::new(img)))) as usize;
-        let _ = round;
     }
     assert!(mounted > rounds / 4, "{mounted} of {rounds} damaged images mounted");
+}
+
+#[test]
+fn damaged_fat32_images() {
+    let (blank, [boot, info, fat, data]) = blank32(65600);
+    let disk = MemDisk(Arc::new(Mutex::new(blank)));
+    let fs = FatFs::mount(disk.clone(), 1).unwrap();
+    assert!(fs.free_bytes().is_some());
+    drop(fs);
+    populate(&disk);
+    let pristine = disk.0.lock().unwrap().clone();
+    // The boot sector's BPB, FSInfo's counts, the start of the FAT (the
+    // root's chain and the files'), and the root and the first files.
+    damage(&pristine, &[(boot, 96), (info + 480, 32), (fat, 1024), (data, 24 * 512)], 250, 0x3141_5926_5358_9793);
+}
+
+fn fuzz(clusters: usize, fat16: bool, rounds: usize, seed: u64) {
+    let (blank, meta) = blank(clusters, fat16);
+    let disk = MemDisk(Arc::new(Mutex::new(blank)));
+    populate(&disk);
+    let pristine = disk.0.lock().unwrap().clone();
+    // Mostly the boot sector, the start of the FAT, the root directory and
+    // the first data clusters, where the files are.
+    let regions = [(0, 64), (512, 1024), (meta - ROOT_SECTORS * 512, 512), (meta, 24 * 512)];
+    damage(&pristine, &regions, rounds, seed);
 }
 
 #[test]

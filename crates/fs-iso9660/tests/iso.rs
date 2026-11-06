@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! End-to-end tests against images made by `xorriso` and `genisoimage`.
-//! Each test is skipped, with a note, if its tool is missing.
+//! Each test fails if its tool is missing, unless `OSMIUM_SKIP_TOOL_TESTS=1`
+//! is set to skip it.
 
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};

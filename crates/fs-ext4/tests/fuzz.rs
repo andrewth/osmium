@@ -2,7 +2,7 @@
 //! Mounting an image with corrupted metadata, then walking and reading the
 //! whole tree and trying writes, fails with an error at worst: no panic and
 //! no endless loop. Images come from `mkfs.ext*` and are filled by the driver
-//! itself (skipped, with a note, if e2fsprogs is missing); the corruption is
+//! itself (failing if e2fsprogs is missing, unless `OSMIUM_SKIP_TOOL_TESTS=1`); the corruption is
 //! pseudo-random from a fixed seed, so a failure repeats.
 
 use std::path::PathBuf;

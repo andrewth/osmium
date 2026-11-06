@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! End-to-end tests against FAT12, FAT16 and FAT32 volumes made by
 //! `mkfs.fat` and checked with `fsck.fat` (dosfstools), and against
-//! hand-made ones. The dosfstools tests are skipped, with a note, if the
-//! tools are missing.
+//! hand-made ones. The dosfstools tests fail if the tools are missing,
+//! unless `OSMIUM_SKIP_TOOL_TESTS=1` is set to skip them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -661,7 +661,7 @@ fn a_stray_high_word_in_dotdot_does_not_hide_an_ancestor() {
         // not part of the cluster (FAT12 and FAT16 use it for other things).
         let mut found = 0;
         for sector in disk.sectors.lock().unwrap().values_mut() {
-            for e in sector.chunks_exact_mut(32) {
+            for e in sector.as_chunks_mut::<32>().0 {
                 if &e[..11] == b"..         " && e[11] & 0x10 != 0 && e[26..28] != [0, 0] {
                     e[20..22].copy_from_slice(&1u16.to_le_bytes());
                     found += 1;
@@ -883,6 +883,24 @@ fn names_are_found_by_short_alias_and_unicode_case() {
     let mut left = names(&*root);
     left.sort();
     assert_eq!(left, ["sub", "Ärger.txt"]);
+}
+
+#[path = "../../fs/tests/shared/hammer.rs"]
+mod hammer;
+
+#[test]
+fn many_threads_at_once_leave_a_clean_volume() {
+    for (image, fat, kib) in [("conc32.img", "32", "40000"), ("conc16.img", "16", "16000")] {
+        let Some((path, disk)) = mkfs(image, fat, kib) else { return };
+        let fs = FatFs::mount(disk.clone(), 1).unwrap();
+        let vfs = Arc::new(Vfs::new(fs.root()));
+        vfs.mkdir("/work", 0o755).unwrap();
+        hammer::hammer(vfs.clone(), "/work", 6, 120);
+        fs.root().sync().unwrap();
+        drop(vfs);
+        fsck(&path, &disk);
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[test]

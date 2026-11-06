@@ -32,13 +32,19 @@ impl DevDir {
         DevDir { dev, ino: 1, entries: RwSpinLock::new(Vec::new()) }
     }
 
-    /// Adds `file` as `name`, replacing any entry of that name.
-    ///
-    /// # Panics
-    ///
-    /// If memory runs out; see [`try_insert`](DevDir::try_insert).
+    /// Adds `file` as `name`, replacing any entry of that name. Allocates
+    /// as `Vec::push` does, aborting if memory runs out: for setting up
+    /// `/dev` at boot. [`try_insert`](DevDir::try_insert) fails instead.
     pub fn insert(&self, name: &str, file: Arc<dyn File>) {
-        self.try_insert(name, file).expect("out of memory adding a device node");
+        let mut entries = self.entries.write();
+        match position(&entries, name) {
+            Ok(i) => {
+                if let Some(slot) = entries.get_mut(i) {
+                    slot.1 = file;
+                }
+            }
+            Err(i) => entries.insert(i, (String::from(name), file)),
+        }
     }
 
     /// [`insert`](DevDir::insert), failing with `ENOMEM` (and changing
