@@ -254,14 +254,12 @@ fn poke(p: &Process, th: Option<&Thread>) {
         Some(th) => wake_thread(th),
         None => wake_threads(p),
     }
-    // Futex waits are not yet registered per thread (see `wait_on`).
-    crate::futex::interrupt();
     p.child_exited.wake_all();
 }
 
 /// Makes every thread of `p` that is blocked in an interruptible wait
-/// (`poll`, `select`, `epoll`, pipe and socket I/O, `accept`, `connect`, a
-/// stop, `sigsuspend`, `execve`'s wait for the other threads) look again,
+/// (`futex`, `poll`, `select`, `epoll`, pipe and socket I/O, `accept`,
+/// `connect`, a stop, `sigsuspend`, `execve`'s wait for the other threads) look again,
 /// so that one that is interrupted or whose process is ending gives up.
 /// Other processes' sleepers are left alone.
 pub(crate) fn wake_threads(p: &Process) {
@@ -271,16 +269,12 @@ pub(crate) fn wake_threads(p: &Process) {
 /// [`wake_threads`] for one thread.
 fn wake_thread(th: &Thread) {
     let sleep = th.sleep.lock();
-    if *sleep == 0 {
-        return;
-    }
-    if let Some(task) = th.ext.task() {
-        // SAFETY: `wait_on` stores the address of a queue it borrows for as
-        // long as the address is set, and clears it under this lock before
-        // the borrow ends, so the queue is alive while the lock is held.
-        let queue = unsafe { &*core::ptr::with_exposed_provenance::<osmium_sched::WaitQueue>(*sleep) };
-        queue.wake_task(&task);
-    }
+    let Some((addr, task)) = &*sleep else { return };
+    // SAFETY: `wait_on_for` stores the address of a queue it borrows for as
+    // long as the address is set, and clears it under this lock before the
+    // borrow ends, so the queue is alive while the lock is held.
+    let queue = unsafe { &*core::ptr::with_exposed_provenance::<osmium_sched::WaitQueue>(*addr) };
+    queue.wake_task(task);
 }
 
 /// Waits in `queue` until `cond` returns `Some`, as
@@ -292,13 +286,28 @@ fn wake_thread(th: &Thread) {
 /// Lock order: a thread's `sleep` lock is taken before the queue's, so
 /// `cond`, which runs under the queue's lock, must not take a thread
 /// group's lock.
-pub(crate) fn wait_on<R>(queue: &osmium_sched::WaitQueue, cond: impl FnMut() -> Option<R>) -> R {
+pub(crate) fn wait_on<R>(queue: &osmium_sched::WaitQueue, mut cond: impl FnMut() -> Option<R>) -> R {
+    if let Some(r) = cond() {
+        return r;
+    }
     let task = osmium_sched::current();
-    let Some(user) = task.data::<crate::process::UserTask>() else { return queue.wait_until(cond) };
-    let th = &user.thread;
-    *th.sleep.lock() = core::ptr::from_ref(queue).expose_provenance();
+    match task.data::<crate::process::UserTask>() {
+        Some(user) => wait_on_for(&user.thread, queue, cond),
+        None => queue.wait_until(cond),
+    }
+}
+
+/// [`wait_on`] on behalf of thread `th`: a signal for `th` (or its process
+/// ending) wakes the calling task. The same lock order applies.
+pub(crate) fn wait_on_for<R>(th: &Thread, queue: &osmium_sched::WaitQueue, mut cond: impl FnMut() -> Option<R>) -> R {
+    if let Some(r) = cond() {
+        return r;
+    }
+    let me = osmium_sched::current();
+    // The task is dropped (released) after the lock, not under it.
+    let _was = th.sleep.lock().replace((core::ptr::from_ref(queue).expose_provenance(), me));
     let r = queue.wait_until(cond);
-    *th.sleep.lock() = 0;
+    let _me = th.sleep.lock().take();
     r
 }
 

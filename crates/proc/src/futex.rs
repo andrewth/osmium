@@ -36,8 +36,10 @@
 //! # Sleeping
 //!
 //! A waiting thread is woken by a wake, interrupted (`EINTR`) by a signal it
-//! would act on, or by its process ending. Signals and process exit wake
-//! every bucket, since any thread may be the one they are for.
+//! would act on, or by its process ending. A sleep is registered as the
+//! thread's interruptible wait (`crate::signal::wait_on`), so a signal or the
+//! process ending wakes only the threads it concerns, not every sleeper in
+//! their buckets.
 //!
 //! Timeouts need a clock: a kernel supplies one with [`set_clock`] and calls
 //! [`tick`] from its timer interrupt so deadlines are noticed. Without a
@@ -458,13 +460,6 @@ pub fn tick() {
     }
 }
 
-/// Makes every sleeping thread look again: for signals and process exit.
-pub(crate) fn interrupt() {
-    for b in &TABLE {
-        b.sleepers.wake_all();
-    }
-}
-
 /// Wakes up to `n` threads waiting on `key` whose bitset meets `mask`,
 /// oldest first, with their bucket's list locked. The caller then wakes the
 /// bucket's sleepers.
@@ -536,7 +531,9 @@ pub(crate) fn sleep_on(
         // Before the deadline is checked below: `expire` sets `fired` before
         // it reads this, so it either wakes `b` or we see `fired`.
         timer.bucket.store(b, Ordering::SeqCst);
-        let r = bucket(b).sleepers.wait_until(|| {
+        // Registered as the thread's interruptible wait, so a signal for it
+        // (or its process ending) wakes it alone, not the whole bucket.
+        let r = crate::signal::wait_on_for(th, &bucket(b).sleepers, || {
             if ready() {
                 Some(Some(Ok(())))
             } else if crate::signal::interrupted(p, th) {

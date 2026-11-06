@@ -298,3 +298,52 @@ fn timers_wake_only_the_buckets_of_expired_sleepers() {
     drop(t2);
     assert_eq!(futex::expire_for_test(4) & (1 << 9), 0, "a dropped timer is gone");
 }
+
+/// A futex sleep in bucket `b` that counts each look at its condition, and
+/// returns 0 once `go` is set, or the negated errno.
+fn counted_sleep(
+    p: &Arc<Process>,
+    b: usize,
+    looks: &Arc<AtomicUsize>,
+    go: &Arc<AtomicBool>,
+) -> (Arc<osmium_sched::Task>, Arc<core::sync::atomic::AtomicI64>) {
+    let (looks, go) = (looks.clone(), go.clone());
+    super::blocked::block_in(p, move |p| {
+        let th = crate::thread::current_thread(p);
+        let ready = || {
+            looks.fetch_add(1, Ordering::SeqCst);
+            go.load(Ordering::SeqCst)
+        };
+        match futex::sleep_on(p, &th, None, &|| b, &ready) {
+            Ok(()) => 0,
+            Err(e) => -(e.0 as i64),
+        }
+    })
+}
+
+#[test]
+fn a_signal_wakes_only_the_futex_sleeper_it_is_for() {
+    use crate::signal::sig::{SIGKILL, SIGUSR1};
+    become_cpu();
+    let b = 17;
+    let (quiet, _) = process("futex-quiet");
+    let (target, _) = process("futex-target");
+    let (looks, go) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+    let (quiet_task, quiet_result) = counted_sleep(&quiet, b, &looks, &go);
+    let (target_task, target_result) =
+        counted_sleep(&target, b, &Arc::new(AtomicUsize::new(0)), &Arc::new(AtomicBool::new(false)));
+    let before = looks.load(Ordering::SeqCst);
+    // Both sleep in bucket `b`. A signal for one, and its process ending, leave the other asleep.
+    crate::signal::send(&target, SIGUSR1, target.pid()).unwrap();
+    target_task.join();
+    assert_eq!(target_result.load(Ordering::SeqCst), -(Errno::EINTR.0 as i64));
+    crate::signal::kill_group(&target, ExitStatus::Signal(SIGKILL));
+    osmium_sched::yield_now();
+    assert_eq!(looks.load(Ordering::SeqCst), before, "the other sleeper was not woken");
+    assert_eq!(quiet_result.load(Ordering::SeqCst), i64::MIN, "and still sleeps");
+    // A wake of its bucket still reaches it.
+    go.store(true, Ordering::SeqCst);
+    futex::wake_bucket(b);
+    quiet_task.join();
+    assert_eq!(quiet_result.load(Ordering::SeqCst), 0);
+}
