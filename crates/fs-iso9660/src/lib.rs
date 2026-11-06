@@ -7,7 +7,10 @@
 //! (POSIX names, modes, link counts, symbolic links, device nodes and deep
 //! directory relocation) if the primary tree carries it, else the Joliet
 //! tree's Unicode names, else plain ISO 9660 names shown in lower case
-//! without their `;1` version (and looked up ignoring case).
+//! without their `;1` version (and looked up ignoring case). A volume
+//! descriptor that cannot be used (one past the first without a signature,
+//! or a primary or Joliet one with nonsense fields) is skipped, as Linux
+//! skips it, so a damaged Joliet descriptor leaves the primary tree.
 //!
 //! Files of several extents (ISO level 3, larger than 4 GiB) and
 //! interleaved files (a file unit size and an interleave gap size in the
@@ -265,11 +268,15 @@ impl<D: BlockDevice + Send + 'static> IsoFs<D> {
         let mut d = try_zeroed(desc::SIZE)?;
         for i in 0..MAX_DESCRIPTORS {
             shared.read_at(desc::FIRST + i * desc::SIZE as u64, &mut d).map_err(|_| Errno::EINVAL)?;
-            match Descriptor::parse(&d)? {
-                Descriptor::Terminator => break,
-                Descriptor::Primary(v) => _ = primary.get_or_insert(v),
-                Descriptor::Joliet(v) => _ = joliet.get_or_insert(v),
-                Descriptor::Other => {}
+            match Descriptor::parse(&d) {
+                Ok(Descriptor::Terminator) => break,
+                Ok(Descriptor::Primary(v)) => _ = primary.get_or_insert(v),
+                Ok(Descriptor::Joliet(v)) => _ = joliet.get_or_insert(v),
+                Ok(Descriptor::Other) => {}
+                // No signature where the first should be: not ISO 9660.
+                Err(e) if i == 0 || e == Errno::ENOMEM => return Err(e),
+                // A damaged one further on is skipped, as Linux does.
+                Err(_) => {}
             }
         }
         let primary = primary.ok_or(Errno::EINVAL)?;
@@ -526,6 +533,8 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
                         // SAFETY: the block takes itself out when dropped, and
                         // its key never changes.
                         let fresh = unsafe { dirs.insert(&block) };
+                        // An invariant, not a condition of the disc: the
+                        // lock is held, and `take` just emptied the key.
                         assert!(fresh, "the key was just freed");
                         block
                     }

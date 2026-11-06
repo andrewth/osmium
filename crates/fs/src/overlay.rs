@@ -488,8 +488,9 @@ impl NodeData {
     fn fill(&self, copy: &dyn File, source: &dyn File) -> Result<(), Errno> {
         if self.kind == FileKind::Symlink {
             let target = source.readlink()?;
-            if !target.is_empty() {
-                copy.write(0, target.as_bytes())?;
+            // A target cut short would be another target.
+            if !target.is_empty() && copy.write(0, target.as_bytes())? != target.len() {
+                return Err(Errno::ENOSPC);
             }
             return Ok(());
         }
@@ -500,7 +501,11 @@ impl NodeData {
             let Some(chunk) = buf.get(..n).filter(|c| !c.is_empty()) else { return Ok(()) };
             let mut done = 0;
             while let Some(rest) = chunk.get(done..).filter(|r| !r.is_empty()) {
-                done += copy.write(off + done as u64, rest)?;
+                match copy.write(off + done as u64, rest)? {
+                    // An upper layer that takes nothing would loop forever.
+                    0 => return Err(Errno::ENOSPC),
+                    wrote => done += wrote,
+                }
             }
             off += n as u64;
         }
@@ -902,6 +907,70 @@ mod tests {
         )
         .unwrap();
         Fixture { lower, lower2, upper, overlay: Vfs::new(fs.root()) }
+    }
+
+    /// An upper layer whose files take no bytes: every write returns 0.
+    struct Full;
+
+    impl File for Full {
+        fn read(&self, _: u64, _: &mut [u8]) -> Result<usize, Errno> {
+            Ok(0)
+        }
+
+        fn write(&self, _: u64, _: &[u8]) -> Result<usize, Errno> {
+            Ok(0)
+        }
+
+        fn stat(&self) -> Stat {
+            Stat { ino: 2, kind: FileKind::Regular, mode: 0o644, nlink: 1, ..Stat::default() }
+        }
+    }
+
+    struct FullDir;
+
+    impl File for FullDir {
+        fn read(&self, _: u64, _: &mut [u8]) -> Result<usize, Errno> {
+            Err(Errno::EISDIR)
+        }
+
+        fn stat(&self) -> Stat {
+            Stat { ino: 1, kind: FileKind::Directory, mode: 0o755, nlink: 2, ..Stat::default() }
+        }
+
+        fn lookup(&self, _: &str) -> Result<Arc<dyn File>, Errno> {
+            Err(Errno::ENOENT)
+        }
+
+        fn readdir(&self, _: usize) -> Result<Option<DirEntry>, Errno> {
+            Ok(None)
+        }
+
+        fn create(&self, _: &str, _: FileKind, _: u32) -> Result<Arc<dyn File>, Errno> {
+            Ok(Arc::new(Full))
+        }
+
+        fn remove(&self, _: &str, _: bool) -> Result<(), Errno> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn copy_up_into_a_layer_that_takes_nothing_fails() {
+        let lower = Vfs::new(RamFs::new(1).root());
+        put(&lower, "/a", b"lower a");
+        lower.symlink("a", "/link").unwrap();
+        let fs = OverlayFs::new(4, Some(Arc::new(FullDir)), vec![lower.lookup("/").unwrap()]).unwrap();
+        let overlay = Vfs::new(fs.root());
+        // In a thread, so that the old endless loop fails the test.
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let write = overlay.lookup("/a").unwrap().write(0, b"x");
+            let link = overlay.lookup("/link").and_then(|l| l.chmod(0o700));
+            done.send((write, link)).unwrap();
+        });
+        let (write, link) = wait.recv_timeout(std::time::Duration::from_secs(20)).expect("copy-up looped");
+        assert_eq!(write.err(), Some(Errno::ENOSPC));
+        assert_eq!(link.err(), Some(Errno::ENOSPC));
     }
 
     fn is_whiteout(vfs: &Vfs, path: &str) -> bool {

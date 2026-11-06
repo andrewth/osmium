@@ -176,3 +176,24 @@ fn removing_listing_and_mounting_fail_cleanly() {
     );
     assert!(n >= 1, "unlink: {n}");
 }
+
+#[test]
+fn adding_device_nodes_fails_cleanly() {
+    use osmium_fs::dev::{DevDir, Null};
+    let dev = DevDir::new(2);
+    let null: Arc<dyn File> = Arc::new(Null::new());
+    dev.insert("a", null.clone());
+    let n = every_failure(
+        || dev.try_insert("b", null.clone()),
+        |r, injected| {
+            if ok_or_enomem(&r, injected) {
+                assert!(dev.lookup("b").is_ok());
+                dev.take("b").unwrap();
+            } else {
+                assert_eq!(dev.lookup("b").err(), Some(Errno::ENOENT), "a failed insert adds nothing");
+            }
+            assert!(dev.lookup("a").is_ok());
+        },
+    );
+    assert!(n >= 1, "try_insert: {n}");
+}

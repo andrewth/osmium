@@ -1,12 +1,13 @@
 //! Device nodes: a directory of kernel-provided files, `/dev/null` and
 //! `/dev/zero`.
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use osmium_sync::RwSpinLock;
+use osmium_sync::fallible::try_string;
 
 use crate::{DirEntry, Errno, File, FileKind, Stat};
 
@@ -16,23 +17,54 @@ use crate::{DirEntry, Errno, File, FileKind, Stat};
 pub struct DevDir {
     dev: u64,
     ino: u64,
-    entries: RwSpinLock<BTreeMap<String, Arc<dyn File>>>,
+    /// Sorted by name.
+    entries: RwSpinLock<Vec<(String, Arc<dyn File>)>>,
+}
+
+/// Where `name` is in `entries`, or where it would go.
+fn position(entries: &[(String, Arc<dyn File>)], name: &str) -> Result<usize, usize> {
+    entries.binary_search_by(|(n, _)| n.as_str().cmp(name))
 }
 
 impl DevDir {
     /// An empty directory reporting `dev` and inode 1.
     pub fn new(dev: u64) -> Self {
-        DevDir { dev, ino: 1, entries: RwSpinLock::new(BTreeMap::new()) }
+        DevDir { dev, ino: 1, entries: RwSpinLock::new(Vec::new()) }
     }
 
     /// Adds `file` as `name`, replacing any entry of that name.
+    ///
+    /// # Panics
+    ///
+    /// If memory runs out; see [`try_insert`](DevDir::try_insert).
     pub fn insert(&self, name: &str, file: Arc<dyn File>) {
-        self.entries.write().insert(String::from(name), file);
+        self.try_insert(name, file).expect("out of memory adding a device node");
+    }
+
+    /// [`insert`](DevDir::insert), failing with `ENOMEM` (and changing
+    /// nothing) if memory runs out.
+    pub fn try_insert(&self, name: &str, file: Arc<dyn File>) -> Result<(), Errno> {
+        let mut entries = self.entries.write();
+        match position(&entries, name) {
+            Ok(i) => {
+                if let Some(slot) = entries.get_mut(i) {
+                    slot.1 = file;
+                }
+            }
+            Err(i) => {
+                let name = try_string(name)?;
+                entries.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+                entries.insert(i, (name, file));
+            }
+        }
+        Ok(())
     }
 
     /// Removes the entry `name`, returning it.
     pub fn take(&self, name: &str) -> Option<Arc<dyn File>> {
-        self.entries.write().remove(name)
+        let mut entries = self.entries.write();
+        let i = position(&entries, name).ok()?;
+        Some(entries.remove(i).1)
     }
 }
 
@@ -47,13 +79,15 @@ impl File for DevDir {
 
     fn readdir(&self, index: usize) -> Result<Option<DirEntry>, Errno> {
         let entries = self.entries.read();
-        let Some((name, file)) = entries.iter().nth(index) else { return Ok(None) };
+        let Some((name, file)) = entries.get(index) else { return Ok(None) };
         let st = file.try_stat()?;
-        Ok(Some(DirEntry { ino: st.ino, kind: st.kind, name: osmium_sync::fallible::try_string(name)? }))
+        Ok(Some(DirEntry { ino: st.ino, kind: st.kind, name: try_string(name)? }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
-        self.entries.read().get(name).cloned().ok_or(Errno::ENOENT)
+        let entries = self.entries.read();
+        let i = position(&entries, name).map_err(|_| Errno::ENOENT)?;
+        entries.get(i).map(|(_, f)| f.clone()).ok_or(Errno::ENOENT)
     }
 
     fn create(&self, _: &str, _: FileKind, _: u32) -> Result<Arc<dyn File>, Errno> {
@@ -61,7 +95,7 @@ impl File for DevDir {
     }
 
     fn remove(&self, name: &str, _: bool) -> Result<(), Errno> {
-        if self.entries.read().contains_key(name) { Err(Errno::EPERM) } else { Err(Errno::ENOENT) }
+        if position(&self.entries.read(), name).is_ok() { Err(Errno::EPERM) } else { Err(Errno::ENOENT) }
     }
 }
 
