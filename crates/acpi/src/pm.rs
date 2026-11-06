@@ -248,15 +248,24 @@ impl Pm {
             write_gas(host, ctl, 8, u64::from(typ_a) << 2 | 1 << 5)?;
         } else {
             self.write_pm1_status(host, fixed::WAKE)?;
-            for (reg, typ) in [(&self.fadt.pm1a_cnt, typ_a), (&self.fadt.pm1b_cnt, typ_b)] {
+            // The type into both control registers first, then the enable bit into both, as the
+            // specification has it: setting SLP_EN in PM1a before PM1b has its type could start the
+            // transition with PM1b's type still stale.
+            let regs = [(&self.fadt.pm1a_cnt, typ_a), (&self.fadt.pm1b_cnt, typ_b)];
+            let mut typed = [None; 2];
+            for ((reg, typ), slot) in regs.iter().zip(&mut typed) {
                 if reg.is_empty() {
                     continue;
                 }
-                // The type first, then the enable bit, as the specification has it.
                 let cur = read_gas(host, reg, 16)? & !(SLP_TYP_MASK | SLP_EN);
-                let with_type = cur | u64::from(typ) << SLP_TYP_SHIFT;
+                let with_type = cur | u64::from(*typ) << SLP_TYP_SHIFT;
                 write_gas(host, reg, 16, with_type)?;
-                write_gas(host, reg, 16, with_type | SLP_EN)?;
+                *slot = Some(with_type);
+            }
+            for ((reg, _), with_type) in regs.iter().zip(typed) {
+                if let Some(v) = with_type {
+                    write_gas(host, reg, 16, v | SLP_EN)?;
+                }
             }
         }
         if (1..=3).contains(&state) && !self.fadt.hw_reduced() {
