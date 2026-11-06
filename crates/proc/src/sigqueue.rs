@@ -91,8 +91,9 @@ impl SigQueue {
 /// `sigaltstack` flags.
 const SS_ONSTACK: i32 = 1;
 const SS_DISABLE: i32 = 2;
-/// The smallest alternate stack `sigaltstack` accepts.
-pub(crate) const MINSIGSTKSZ: u64 = 2048;
+/// The smallest alternate stack `sigaltstack` accepts: Linux's, which on
+/// AArch64 is larger because its signal frame is.
+pub(crate) const MINSIGSTKSZ: u64 = if cfg!(target_arch = "aarch64") { 5120 } else { 2048 };
 
 /// A thread's alternate signal stack.
 #[derive(Clone, Copy, Default)]
@@ -156,6 +157,36 @@ impl ThreadSig {
         let alt = *self.alt.lock();
         (act_flags & crate::signal::sa::ONSTACK != 0 && alt.enabled() && !alt.contains(sp))
             .then(|| (alt.sp.saturating_add(alt.size), alt.sp))
+    }
+
+    /// The alternate stack as a signal frame's `uc_stack` records it for a
+    /// thread whose stack pointer is `sp`: base, `ss_flags` and size.
+    pub(crate) fn alt_state(&self, sp: u64) -> (u64, i32, u64) {
+        let alt = *self.alt.lock();
+        let flags = if !alt.enabled() {
+            SS_DISABLE
+        } else if alt.contains(sp) {
+            SS_ONSTACK
+        } else {
+            0
+        };
+        (alt.sp, flags, alt.size)
+    }
+
+    /// `rt_sigreturn`: makes the frame's `uc_stack` the alternate stack, as
+    /// `sigaltstack` would for a thread whose stack pointer is `sp` (the one
+    /// just restored), ignoring a setting `sigaltstack` would refuse, as
+    /// Linux does.
+    pub(crate) fn restore_alt(&self, (base, flags, size): (u64, i32, u64), sp: u64) {
+        let mut alt = self.alt.lock();
+        if alt.contains(sp) {
+            return;
+        }
+        if flags & SS_DISABLE != 0 {
+            *alt = AltStack::default();
+        } else if flags & !SS_ONSTACK == 0 && size >= MINSIGSTKSZ && base.checked_add(size).is_some() {
+            *alt = AltStack { sp: base, size };
+        }
     }
 
     pub(crate) fn take_saved_mask(&self) -> Option<u64> {

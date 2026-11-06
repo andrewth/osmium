@@ -108,11 +108,12 @@ impl JobCtl {
 }
 
 /// Queues `SIGCHLD` for the parent of `p`, unless it asked not to hear of
-/// stops (`SA_NOCLDSTOP`), and wakes its `wait4`.
-fn tell_parent(p: &Process) {
+/// stops (`SA_NOCLDSTOP`), and wakes its `wait4`. `code` and `status` are
+/// the `si_code` and `si_status` of the `SIGCHLD`.
+fn tell_parent(p: &Process, code: i32, status: u8) {
     let Some(parent) = p.parent().and_then(Process::find) else { return };
     if parent.signals.action(SIGCHLD).flags & sa::NOCLDSTOP == 0 {
-        crate::signal::child_exited(&parent, p.pid());
+        crate::signal::child_exited(&parent, p.pid(), code, i32::from(status));
     }
     parent.child_exited.wake_all();
 }
@@ -128,7 +129,7 @@ pub(crate) fn prepare(p: &Process, sig: u8) {
             p.signals.job.stop_report.store(false, Ordering::SeqCst);
             p.signals.job.cont_report.store(true, Ordering::SeqCst);
             wake();
-            tell_parent(p);
+            tell_parent(p, crate::signal::cld::CONTINUED, SIGCONT);
         }
     } else if is_stop(sig) {
         p.signals.discard_pending(bit(SIGCONT));
@@ -147,7 +148,7 @@ pub(crate) fn stop_group(p: &Process, sig: u8) {
     job.stop_sig.store(sig, Ordering::SeqCst);
     job.cont_report.store(false, Ordering::SeqCst);
     job.stop_report.store(true, Ordering::SeqCst);
-    tell_parent(p);
+    tell_parent(p, crate::signal::cld::STOPPED, sig);
 }
 
 /// Parks `th` while its process is stopped. Returns at once if it is not,

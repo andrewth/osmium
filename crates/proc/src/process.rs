@@ -496,7 +496,11 @@ impl Process {
         self.exited.wake_all();
         if let Some(parent) = self.parent.and_then(Process::find) {
             // Queue the signal first: a parent woken from `wait4` must already see it pending.
-            crate::signal::child_exited(&parent, self.pid);
+            let (code, status) = match status {
+                ExitStatus::Code(c) => (crate::signal::cld::EXITED, c & 0xff),
+                ExitStatus::Signal(s) => (crate::signal::cld::KILLED, i32::from(s)),
+            };
+            crate::signal::child_exited(&parent, self.pid, code, status);
             // `SIG_IGN` or `SA_NOCLDWAIT` for `SIGCHLD`: no zombie is left to wait for.
             let act = parent.signals.action(crate::signal::sig::SIGCHLD);
             if act.handler == crate::signal::SIG_IGN || act.flags & crate::signal::sa::NOCLDWAIT != 0 {

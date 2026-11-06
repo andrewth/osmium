@@ -478,7 +478,12 @@ fn exec_frames() -> &'static HeapFrames {
     F.get_or_init(leaked_frames)
 }
 
-static ACTIVATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+std::thread_local! {
+    /// The root `Platform::activate` last loaded on this test thread: per
+    /// thread, because exec tests run in parallel and each activates on the
+    /// thread that called `execve`.
+    static ACTIVATED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
 
 const STACK_TOP: u64 = 0x7000_0000;
 
@@ -488,7 +493,7 @@ fn platform() {
     P.get_or_init(|| {
         set_platform(Platform {
             new_memory: || Ok(Box::new(space(exec_frames()))),
-            activate: |root| ACTIVATED.store(root.0, std::sync::atomic::Ordering::SeqCst),
+            activate: |root| ACTIVATED.set(root.0),
             resume: |_| unreachable!("host tests never resume user mode"),
             stack_top: STACK_TOP,
             stack_size: 0x4000,
@@ -595,7 +600,7 @@ fn execve_loads_a_program_with_its_arguments() {
         panic!("no exec")
     };
     assert_eq!(pc, ENTRY);
-    assert_eq!(ACTIVATED.load(std::sync::atomic::Ordering::SeqCst), p.root().0);
+    assert_eq!(ACTIVATED.get(), p.root().0);
     assert_eq!(frames.live(), 1, "the old space is freed; its kernel root was leaked");
     assert_eq!(p.name(), "prog");
     assert_eq!(get(&p, ENTRY, 4), [0x90, 0x90, 0x0f, 0x05]);
@@ -958,6 +963,7 @@ mod oom;
 mod pie;
 mod restart;
 mod review;
+mod sigframe;
 mod sigthread;
 mod smp;
 mod unix;

@@ -13,7 +13,10 @@ use super::*;
 use crate::signal::{self, sa, sig::*};
 use crate::sigqueue::code::{SI_QUEUE, SI_TKILL};
 use crate::thread::Thread;
-use crate::uregs::{NREGS, UserRegs};
+use crate::uregs::{SigFrame, UserRegs, X86_64_FRAME, set_word, word as mc_word};
+
+/// General registers of the test register file besides `pc` and `sp`.
+const NREGS: usize = 30;
 
 const EINVAL: i64 = -(Errno::EINVAL.0 as i64);
 const EAGAIN: i64 = -(Errno::EAGAIN.0 as i64);
@@ -47,7 +50,7 @@ impl Regs {
 
 impl UserRegs for Regs {
     const RED_ZONE: u64 = 128;
-    const RET_ON_STACK: bool = true;
+    const FRAME: SigFrame = X86_64_FRAME;
 
     fn user_pc(&self) -> u64 {
         self.pc
@@ -63,14 +66,18 @@ impl UserRegs for Regs {
     }
     fn set_ret(&mut self, _: u64) {}
     fn set_tls(&mut self, _: u64) {}
-    fn save_user(&self) -> [u64; NREGS] {
-        let mut s = self.gp;
-        (s[0], s[1]) = (self.pc, self.sp);
-        s
+    fn save_mcontext(&self, mc: &mut [u8], _fault: u64, _mask: u64) {
+        set_word(mc, 0, self.pc);
+        set_word(mc, 1, self.sp);
+        for (i, &r) in self.gp.iter().enumerate() {
+            set_word(mc, 2 + i, r);
+        }
     }
-    fn restore_user(&mut self, s: &[u64; NREGS]) {
-        self.gp = *s;
-        (self.pc, self.sp) = (s[0], s[1]);
+    fn restore_mcontext(&mut self, mc: &[u8]) {
+        (self.pc, self.sp) = (mc_word(mc, 0), mc_word(mc, 1));
+        for (i, r) in self.gp.iter_mut().enumerate() {
+            *r = mc_word(mc, 2 + i);
+        }
     }
     fn enter_handler(&mut self, pc: u64, sp: u64, ra: u64, args: [u64; 3]) {
         (self.pc, self.sp, self.ra, self.args) = (pc, sp, ra, args);
@@ -382,7 +389,8 @@ fn sigsuspend_waits_for_an_unblocked_signal_and_restores_the_mask() {
         assert_eq!(signal::deliver_to(p, &th, &mut regs), None);
         assert_eq!(regs.pc, HANDLER, "the handler runs before the program sees sigsuspend return");
         // The frame carries the mask from before the call, not the temporary one.
-        s.store(u64::from_ne_bytes(get(p, regs.args[2], 8).try_into().unwrap()), Ordering::SeqCst);
+        // uc_sigmask follows x86_64's 256-byte sigcontext.
+        s.store(u64::from_ne_bytes(get(p, regs.args[2] + 296, 8).try_into().unwrap()), Ordering::SeqCst);
         assert_eq!(th.signal_mask(), bit(SIGUSR1) | bit(SIGUSR2), "SIGUSR1 as before plus the handler's own");
         r
     });
