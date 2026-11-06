@@ -57,8 +57,11 @@ impl Mmio {
     }
 
     fn offset(&self, reg: u8) -> usize {
-        // A shift that overflows gives an offset outside the window.
-        ((reg & LAST_REG) as usize).checked_shl(self.shift as u32).unwrap_or(usize::MAX)
+        // A shift that loses bits (`checked_shl` only catches shifts of the
+        // word size or more) gives an offset outside the window rather than
+        // aliasing a lower register.
+        let reg = (reg & LAST_REG) as usize;
+        reg.checked_shl(self.shift as u32).filter(|&o| o >> self.shift == reg).unwrap_or(usize::MAX)
     }
 }
 
@@ -225,5 +228,24 @@ mod tests {
         assert!(Mmio::try_new(io(32), 62).is_err(), "7 << 62 overflows");
         assert!(Mmio::try_new(io(32), 64).is_err());
         assert!(Mmio::try_new(io(32), 255).is_err());
+    }
+
+    #[test]
+    fn huge_reg_shift_does_not_alias_register_zero() {
+        let mut regs = [0u8; 8];
+        regs[0] = 0x5a;
+        // SAFETY: the window covers a local array.
+        let io = unsafe { IoMem::new(regs.as_mut_ptr(), regs.len()) };
+        for shift in [61, 62, 63, 64, 200] {
+            // SAFETY: as above.
+            let m = Mmio::new(unsafe { IoMem::new(io.base(), io.len()) }, shift);
+            for reg in 1..=LAST_REG {
+                assert_ne!(m.offset(reg), 0, "register {reg} << {shift}");
+                assert_eq!(m.read(reg), 0xff, "register {reg} << {shift} is outside the window");
+                m.write(reg, 0);
+            }
+        }
+        drop(io);
+        assert_eq!(regs[0], 0x5a, "register 0 never written");
     }
 }
