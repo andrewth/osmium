@@ -38,6 +38,8 @@
 //! spanning several TRBs or more than [`ISOCH_SLOT_LEN`] bytes, warm reset of
 //! SuperSpeed hub ports, and more than one interrupter.
 
+#[cfg(test)]
+mod model;
 pub mod ring;
 pub mod trb;
 
@@ -773,7 +775,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
             if deadline.expired() {
                 return Err(UsbError::Timeout);
             }
-            osmium_arch::cpu::spin_hint();
+            crate::usbhc::pause();
         }
     }
 
@@ -828,7 +830,7 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
             } else if deadline.expired() {
                 return Err(UsbError::Timeout);
             } else {
-                osmium_arch::cpu::spin_hint();
+                crate::usbhc::pause();
             }
         }
     }
@@ -918,22 +920,24 @@ impl<'d, D: DmaAllocator + ?Sized> Xhci<'d, D> {
     }
 
     /// Takes the timed-out command at `addr` off the ring (xHCI 1.2
-    /// §4.6.1.2): Command Abort, wait for the ring to stop, and drain the
-    /// Command Ring Stopped event. A ring that stopped on the command, or
+    /// §4.6.1.2): Command Abort, drain the Command Ring Stopped event, and
+    /// check the ring has stopped. A ring that stopped on the command, or
     /// never fetched it, would run it at the next doorbell, so it becomes a
     /// No Op. If the ring will not stop, no further commands are issued.
     fn abort_command(&mut self, addr: PhysAddr) {
         if self.op_read(CRCR) & CRCR_CRR != 0 {
             // The pointer bits are ignored while the ring runs.
             self.op_write(CRCR, CRCR_CA);
-            if self.poll(REGISTER_TIMEOUT_NS, |hc| hc.op_read(CRCR) & CRCR_CRR == 0).is_err() {
-                self.commands_stuck = true;
-                return;
-            }
+            // The controller clears CRR when it posts the event, so waiting
+            // for the event first also gives it time to stop.
             let stopped = |e: &Trb| {
                 e.kind() == kind::COMMAND_COMPLETION && e.completion_code() == completion::COMMAND_RING_STOPPED
             };
             let _ = self.wait_event(REGISTER_TIMEOUT_NS, stopped);
+            if self.poll(REGISTER_TIMEOUT_NS, |hc| hc.op_read(CRCR) & CRCR_CRR == 0).is_err() {
+                self.commands_stuck = true;
+                return;
+            }
         }
         self.commands.cancel(addr);
     }
@@ -1436,7 +1440,22 @@ impl<D: DmaAllocator + ?Sized> UsbHost for Xhci<'_, D> {
         ctx_set(&slot.input, c, 0, (dw0 & !(0x1f << 27)) | entries << 27);
         let input = slot.input.device_addr().as_u64();
 
-        self.command(Trb::configure_endpoint(dev.0, input))?;
+        if let Err(e) = self.command(Trb::configure_endpoint(dev.0, input)) {
+            if self.commands_stuck {
+                // The command could not be aborted and may still run, pointing
+                // the endpoint contexts at the new rings and stream arrays:
+                // they are leaked rather than freed under the controller (the
+                // isochronous buffers are only reached through TRBs, none
+                // queued yet). Which endpoints the slot ends up with is
+                // unknown, so it takes no more transfers.
+                core::mem::forget(new_rings);
+                core::mem::forget(new_streams);
+                if let Ok(slot) = self.slot(dev) {
+                    slot.dead = true;
+                }
+            }
+            return Err(e);
+        }
         // Rebuilt endpoints lose their queued isochronous transfers.
         for e in self.isoch.iter_mut() {
             if e.as_ref().is_some_and(replaced) {

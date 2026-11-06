@@ -619,7 +619,7 @@ pub mod fakedev {
 
     use osmium_hal::dma::{DmaAllocator, DmaBuffer};
     use osmium_hal::timer::Clock;
-    use osmium_hal::usb::{DeviceDescriptor, EndpointDescriptor, SetupPacket, UsbError, UsbHost, enumerate};
+    use osmium_hal::usb::{DeviceDescriptor, DeviceId, EndpointDescriptor, SetupPacket, UsbError, UsbHost, enumerate};
     use osmium_mm::PhysAddr;
 
     std::thread_local! {
@@ -996,7 +996,22 @@ pub mod fakedev {
         assert_eq!(dev.borrow().address, found.id.0, "the device took the address it was given");
         assert_eq!(dev.borrow().configured, 1);
         let id = found.id;
+        exercise_device(host, dev, id);
 
+        // A configuration without endpoints leaves none, and a device that is gone.
+        let eps: [EndpointDescriptor; 0] = [];
+        host.configure_endpoints(id, &eps).unwrap();
+        assert_eq!(host.transfer_out(id, 0x02, &[1]), Err(UsbError::BadEndpoint));
+        host.detach(id);
+        assert_eq!(host.transfer_out(id, 0x02, &[1]), Err(UsbError::NoDevice));
+    }
+
+    /// The transfers of [`exercise`] against `dev`, which is already
+    /// addressed as `id` and configured with [`CONFIG`]: bulk transfers
+    /// across packet and toggle boundaries, a zero-length packet, a stall
+    /// and its recovery, an interrupt transfer that is started before its
+    /// data exists, and an endpoint that was never configured.
+    pub fn exercise_device<H: UsbHost>(host: &mut H, dev: &Rc<RefCell<Device>>, id: DeviceId) {
         // Bulk OUT then IN, with sizes on both sides of the packet size.
         for len in [1usize, 63, 64, 65, 200, 1000] {
             let data: Vec<u8> = (0..len).map(|i| (i * 7 + len) as u8).collect();
@@ -1053,12 +1068,7 @@ pub mod fakedev {
         assert_eq!(again, Some(Ok(8)));
         assert_eq!(dev.borrow().toggle_errors, 0);
 
-        // Endpoints that were never configured, and a device that is gone.
+        // An endpoint that was never configured.
         assert_eq!(host.transfer_in(id, 0x84, &mut three), Err(UsbError::BadEndpoint));
-        let eps: [EndpointDescriptor; 0] = [];
-        host.configure_endpoints(id, &eps).unwrap();
-        assert_eq!(host.transfer_out(id, 0x02, &[1]), Err(UsbError::BadEndpoint));
-        host.detach(id);
-        assert_eq!(host.transfer_out(id, 0x02, &[1]), Err(UsbError::NoDevice));
     }
 }
