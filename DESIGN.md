@@ -1,6 +1,6 @@
 # Osmium Design
 
-Visual identity for **osmium**, a Rust library of operating-system code. This file is the source of truth for the logo, color, type and usage. The rendered reference is the published "Osmium Mark" page.
+Visual identity for **osmium**, a Rust library of operating-system code. This file is the source of truth for the logo, color, type and usage. The rendered reference is [docs/logo/osmium-mark.html](docs/logo/osmium-mark.html) (the "Osmium Mark" page), and the studies the mark was chosen from are in [docs/logo/osmium-logos.html](docs/logo/osmium-logos.html). The SVG lockups are in `docs/logo/`.
 
 ## Concept
 
@@ -101,11 +101,11 @@ Google Fonts: `family=Archivo:wdth,wght@62..125,300..900`, `family=JetBrains+Mon
 
 ## Usage
 
-- **README / crates.io header:** horizontal reversed lockup on Ink, followed by `cargo add osmium` and badges (`no_std`, supported architectures, license).
+- **README / crates.io header:** horizontal reversed lockup on Ink (`docs/logo/osmium-horizontal-reversed.svg`), followed by how to depend on the crate and badges (`no_std`, supported architectures, license).
 - **Favicon, docs.rs sidebar, app icon:** simplified core in full color. For an app icon, put the reversed core on an Ink rounded square.
 - **Social avatar:** stacked lockup, or the full mark alone on Ink.
 - **Voice:** plain and technical. Name things by what they do. Write the crate name in lowercase, `osmium`, in code and in running text.
 
 ## Provenance
 
-Chosen from ten studies. Picks: No. 02 Close-Packed, No. 06 Tetroxide, No. 07 Boot Prompt. The others were Element Tile, Ingot, Cog, Ring Zero, Six Shells, Lustre and Page Table.
+Chosen from ten studies (`docs/logo/osmium-logos.html`). Picks: No. 02 Close-Packed, No. 06 Tetroxide, No. 07 Boot Prompt. The others were Element Tile, Ingot, Cog, Ring Zero, Six Shells, Lustre and Page Table.
