@@ -35,7 +35,6 @@
 //! [`Function::ats`](crate::pci::Function::ats) and
 //! [`Function::pasid`](crate::pci::Function::pasid).
 
-use alloc::vec::Vec;
 use core::mem::ManuallyDrop;
 use core::ops::Range;
 
@@ -611,7 +610,7 @@ impl<I: Iommu, A: TableAlloc> Drop for IoDomain<'_, I, A> {
 /// Maximum free extents an [`IovaAllocator`] remembers.
 const FREE_EXTENTS: usize = 64;
 /// Maximum live allocations an [`IovaAllocator`] records.
-const LIVE_ALLOCATIONS: usize = 4096;
+const LIVE_ALLOCATIONS: usize = 512;
 
 /// A first-fit allocator of page-granular IOVA ranges.
 ///
@@ -621,8 +620,8 @@ const LIVE_ALLOCATIONS: usize = 4096;
 /// [`free`](Self::free) that cannot be recorded reports it and counts it in
 /// [`leaked_pages`](Self::leaked_pages).
 ///
-/// It also records each live allocation (on the heap, at most 4096 of
-/// them; an allocation that cannot be recorded fails and changes nothing),
+/// It also records each live allocation (at most 512 of them; an
+/// allocation that cannot be recorded fails and changes nothing),
 /// so [`free`](Self::free) refuses any range that is not exactly one live
 /// allocation: unaligned, empty, outside the window, free already (a double
 /// free), part of an allocation, or spanning parts of several.
@@ -632,8 +631,9 @@ pub struct IovaAllocator {
     free: [(u64, u64); FREE_EXTENTS],
     len: usize,
     leaked: u64,
-    /// Live allocations as `(start, pages)`, sorted by start.
-    live: Vec<(u64, usize)>,
+    /// Live allocations as `(start, pages)`, sorted by start; `live_len` are used.
+    live: [(u64, u64); LIVE_ALLOCATIONS],
+    live_len: usize,
     /// The page-trimmed window.
     window: Range<u64>,
 }
@@ -664,7 +664,7 @@ impl IovaAllocator {
             *first = (window.start, window.end);
             len = 1;
         }
-        Self { free, len, leaked: 0, live: Vec::new(), window }
+        Self { free, len, leaked: 0, live: [(0, 0); LIVE_ALLOCATIONS], live_len: 0, window }
     }
 
     /// Pages returned by [`free`](Self::free) that could not be recorded
@@ -675,6 +675,10 @@ impl IovaAllocator {
 
     fn extents(&self) -> &[(u64, u64)] {
         self.free.get(..self.len).unwrap_or(&[])
+    }
+
+    fn lives(&self) -> &[(u64, u64)] {
+        self.live.get(..self.live_len).unwrap_or(&[])
     }
 
     /// Removes extent `i`, shifting the rest down.
@@ -705,12 +709,12 @@ impl IovaAllocator {
     /// `align` bytes (a power of two; less than a page means a page), so
     /// that a mapping can use 2 MiB or 1 GiB blocks. The skipped space stays
     /// free. If the allocation would split an extent in two and the table
-    /// is full, or it cannot be recorded (4096 are live, or the heap is
-    /// exhausted), it fails (nothing is lost).
+    /// is full, or it cannot be recorded (512 are live), it fails (nothing
+    /// is lost).
     pub fn alloc_aligned(&mut self, pages: usize, align: u64) -> Option<u64> {
         let bytes = (pages as u64).checked_mul(PAGE_SIZE as u64).filter(|&b| b != 0)?;
         let align = align.max(PAGE_SIZE as u64);
-        if !align.is_power_of_two() || self.live.len() >= LIVE_ALLOCATIONS || self.live.try_reserve(1).is_err() {
+        if !align.is_power_of_two() || self.live_len >= LIVE_ALLOCATIONS {
             return None;
         }
         let (i, start) = self.extents().iter().enumerate().find_map(|(i, &(s, e))| {
@@ -731,9 +735,11 @@ impl IovaAllocator {
                 self.insert_at(i + 1, (end, e));
             }
         }
-        // Room was reserved above, so this does not allocate.
-        let at = self.live.partition_point(|&(s, _)| s < start);
-        self.live.insert(at, (start, pages));
+        // There is room: checked above.
+        let at = self.lives().partition_point(|&(s, _)| s < start);
+        self.live.copy_within(at..self.live_len, at + 1);
+        *self.live.get_mut(at)? = (start, pages as u64);
+        self.live_len += 1;
         Some(start)
     }
 
@@ -753,10 +759,10 @@ impl IovaAllocator {
         if !iova.is_multiple_of(PAGE_SIZE as u64) || iova < self.window.start || end > self.window.end {
             return Err(IovaFreeError::NotAllocated);
         }
-        let Ok(at) = self.live.binary_search_by_key(&iova, |&(s, _)| s) else {
+        let Ok(at) = self.lives().binary_search_by_key(&iova, |&(s, _)| s) else {
             return Err(IovaFreeError::NotAllocated);
         };
-        if self.live.get(at).is_none_or(|&(_, n)| n != pages) {
+        if self.lives().get(at).is_none_or(|&(_, n)| n != pages as u64) {
             return Err(IovaFreeError::NotAllocated);
         }
         let i = self.extents().partition_point(|&(s, _)| s < iova);
@@ -769,7 +775,8 @@ impl IovaAllocator {
             return Err(IovaFreeError::NotAllocated);
         }
         // From here on the allocation is returned, recorded as free or not.
-        self.live.remove(at);
+        self.live.copy_within(at + 1..self.live_len, at);
+        self.live_len -= 1;
         let prev = i.checked_sub(1).filter(|&p| self.extents().get(p).is_some_and(|e| e.1 == iova));
         let next = Some(i).filter(|&n| self.extents().get(n).is_some_and(|e| e.0 == end));
         match (prev, next) {
