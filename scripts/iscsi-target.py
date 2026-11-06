@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """A minimal iSCSI target (RFC 7143) serving one raw image as LUN 0.
 
-Standard library only. One connection at a time, error recovery level 0,
-no authentication and no digests. The target is named
-iqn.2026-10.org.osmium:disk0.
+Standard library only. One connection at a time, error recovery level 0;
+no authentication and no digests unless asked for with --chap and
+--digests (see below). The target is named iqn.2026-10.org.osmium:disk0.
 
 By default it speaks iSCSI on stdin/stdout, which suits QEMU's user-mode
 network forwarding, launched once per connection:

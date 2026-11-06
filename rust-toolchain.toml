@@ -1,4 +1,14 @@
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "clippy", "rustfmt"]
-targets = ["x86_64-unknown-none", "aarch64-unknown-none-softfloat", "riscv64imac-unknown-none-elf", "x86_64-unknown-uefi", "aarch64-unknown-uefi"]
+# The bare-metal and UEFI targets the examples build for, and the two musl
+# targets scripts/check.sh type-checks the FP-saving context switch with.
+targets = [
+    "x86_64-unknown-none",
+    "aarch64-unknown-none-softfloat",
+    "riscv64imac-unknown-none-elf",
+    "x86_64-unknown-uefi",
+    "aarch64-unknown-uefi",
+    "aarch64-unknown-linux-musl",
+    "riscv64gc-unknown-linux-musl",
+]
