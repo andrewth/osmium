@@ -657,11 +657,10 @@ fn write_multi() {
                 .unwrap();
             let text = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success() && text.contains(&format!("dev_item.devid\t\t{}", i + 1)), "{text}");
-            // Random UUIDs are hex and may contain "bad", so look at the other lines only.
-            let damaged = |l: &&str| {
-                !l.contains("uuid") && (l.contains("FAILED") || l.contains("bad") || l.contains("DON'T MATCH"))
-            };
-            assert!(!text.lines().any(|l| damaged(&l)), "{text}");
+            // dump-super marks a checksum or magic it rejects with "[DON'T MATCH]"
+            // and an unreadable copy with "FAILED"; UUIDs and checksums are hex, so
+            // a bare "bad" can be part of a good value.
+            assert!(!text.contains("DON'T MATCH") && !text.contains("FAILED"), "{text}");
         }
         // Every copy was written: with any set of devices gone that the
         // profiles cover (one for RAID1 and RAID10, two for RAID1C3, three
