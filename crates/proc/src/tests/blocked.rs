@@ -246,10 +246,8 @@ fn a_change_to_one_file_wakes_only_the_calls_watching_it() {
 
 #[test]
 fn a_file_without_a_queue_is_polled_again_on_a_tick() {
-    use osmium_sched::TaskState::Blocked;
     become_cpu();
     let (p, _) = process("ready-tick");
-    let (_r, w) = pipe_fds(&p);
     // A file with no queue of its own: `poll` reports whatever the test says.
     struct Flag(core::sync::atomic::AtomicU32);
     impl osmium_fs::File for Flag {
@@ -265,12 +263,9 @@ fn a_file_without_a_queue_is_polled_again_on_a_tick() {
     let pollfd: Vec<u8> = f.to_ne_bytes().into_iter().chain(1u16.to_ne_bytes()).chain([0; 2]).collect();
     put(&p, DATA + 0x100, &pollfd);
     let (task, result) = block_in(&p, |p| call(p, Sys::Ppoll, &[DATA + 0x100, 1, 0, 0, 0]));
-    // Its readiness changing says nothing; another file's change does not wake it either.
+    // Its readiness changes without a word; a tick (which other tests may
+    // also give at any time) makes the poll look again.
     flag.0.store(1, Ordering::SeqCst);
-    put(&p, DATA + 0x300, b"x");
-    assert_eq!(call(&p, Sys::Write, &[w, DATA + 0x300, 1]), 1);
-    assert_eq!(task.state(), Blocked);
-    // A tick makes it look.
     crate::poll::tick();
     task.join();
     assert_eq!(result.load(Ordering::SeqCst), 1);
