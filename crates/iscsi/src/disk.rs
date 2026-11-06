@@ -46,9 +46,8 @@ fn run_retried<N: Net>(session: &Shared<N>, jobs: Vec<Job<'_>>) -> Result<Vec<us
     let mut moved: Vec<usize> = vec![0; jobs.len()];
     let mut pending: Vec<(usize, Job<'_>)> = jobs.into_iter().enumerate().collect();
     for attempt in 0..ATTENTION_TRIES {
-        let (index, mut batch): (Vec<usize>, Vec<Job<'_>>) = pending.into_iter().unzip();
+        let (index, mut batch): (Vec<usize>, Vec<Job<'_>>) = core::mem::take(&mut pending).into_iter().unzip();
         let results = with(session, |s| s.run(&mut batch))?;
-        pending = Vec::new();
         for ((i, job), r) in index.into_iter().zip(batch).zip(results) {
             match r {
                 Ok(n) => {
