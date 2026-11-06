@@ -20,6 +20,13 @@ pub use queue::{Desc, DescChain, QueueError, SplitQueue};
 pub use osmium_hal::virtio::{device_id, feature, status};
 
 /// A virtio device model, independent of the transport.
+///
+/// [`VirtioMmio`] reads the device ID, features, queue count and maximum
+/// queue size once, when it wraps the device; they must not change.
+/// [`notify`](Self::notify) runs with the host's interrupts as the
+/// accessing vCPU had them (not masked by the transport), so a backend may
+/// wait for its own interrupt or block; it should still return after one
+/// [`DeviceCtx`] budget of work, which [`DeviceCtx::pop`] enforces.
 pub trait VirtioDevice: Send {
     /// virtio device ID (1 net, 2 block, 3 console, ...).
     fn device_id(&self) -> u32;
