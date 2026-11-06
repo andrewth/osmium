@@ -46,4 +46,6 @@ pub use request::{HttpError, Limits, Method, Request, Version};
 pub use response::{Response, content_type, reason};
 
 #[cfg(test)]
+mod fuzz;
+#[cfg(test)]
 mod tests;

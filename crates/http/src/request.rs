@@ -14,8 +14,30 @@ pub struct Limits {
     /// Number of header fields (431 when exceeded).
     pub max_headers: usize,
     /// Body, after any chunked decoding, in bytes (413 when exceeded).
+    ///
+    /// A chunked body may also spend up to `max_body` + 1 KiB on chunk size
+    /// lines, extensions and CRLFs (400 when exceeded), and up to `max_head`
+    /// on trailer fields (431 when exceeded).
     pub max_body: usize,
 }
+
+impl Limits {
+    /// The most bytes one request within these limits can take on the wire:
+    /// the head (with any empty lines before it), the body, chunk framing,
+    /// and trailers with their closing CRLF.
+    pub(crate) fn max_request(&self) -> usize {
+        self.max_head
+            .saturating_mul(2)
+            .saturating_add(self.max_body.saturating_mul(2))
+            .saturating_add(CHUNK_FRAMING_SLACK)
+            // A chunk size line still arriving, and the CRLFs that end the body.
+            .saturating_add(CHUNK_FRAMING_SLACK + 8)
+    }
+}
+
+/// Chunk framing allowed beyond [`Limits::max_body`]: the last-chunk line
+/// and one size line with extensions at its longest.
+const CHUNK_FRAMING_SLACK: usize = 1024;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -87,7 +109,10 @@ impl Method {
 pub struct Request {
     /// The method.
     pub method: Method,
-    /// The request target as sent: usually a path and query, such as `/vms?state=running`.
+    /// The request target as sent: usually a path and query, such as
+    /// `/vms?state=running`, but also `*` or the absolute form
+    /// `http://host/vms?state=running`. [`path`](Self::path) and
+    /// [`query`](Self::query) handle every form.
     pub target: String,
     /// The HTTP version.
     pub version: Version,
@@ -108,14 +133,40 @@ impl Request {
         self.headers.iter().filter(move |(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 
-    /// The path part of the target, still percent-encoded.
+    /// The path part of the target, still percent-encoded. For an
+    /// absolute-form target (`http://host/a?b`) this is the path after the
+    /// authority (`/a`), or `/` if there is none, so routing sees the same
+    /// path whichever form the client used (RFC 9112, section 3.2.2).
     pub fn path(&self) -> &str {
-        self.target.split_once('?').map_or(self.target.as_str(), |(p, _)| p)
+        let pq = self.path_and_query();
+        let path = pq.split_once('?').map_or(pq, |(p, _)| p);
+        if path.is_empty() { "/" } else { path }
     }
 
     /// The query part of the target, without the `?`.
     pub fn query(&self) -> Option<&str> {
-        self.target.split_once('?').map(|(_, q)| q)
+        self.path_and_query().split_once('?').map(|(_, q)| q)
+    }
+
+    /// The authority (`host[:port]`) of an absolute-form target, which RFC
+    /// 9112 section 3.2.2 says takes the place of the `Host` header. `None`
+    /// for the usual origin-form targets.
+    pub fn authority(&self) -> Option<&str> {
+        let rest = self.after_scheme()?;
+        Some(rest.find(['/', '?']).and_then(|i| rest.get(..i)).unwrap_or(rest))
+    }
+
+    /// The target after `http://` or `https://`, for an absolute-form target.
+    fn after_scheme(&self) -> Option<&str> {
+        ["http://", "https://"].iter().find_map(|scheme| self.target.strip_prefix(scheme))
+    }
+
+    /// The target with any scheme and authority removed: the path and query.
+    fn path_and_query(&self) -> &str {
+        match self.after_scheme() {
+            Some(rest) => rest.find(['/', '?']).and_then(|i| rest.get(i..)).unwrap_or(""),
+            None => &self.target,
+        }
     }
 
     /// The decoded value of the first query parameter named `name`.
@@ -210,16 +261,17 @@ enum Framing {
 
 /// Parses one request from the front of `buf`.
 pub(crate) fn parse(buf: &[u8], limits: &Limits) -> Result<Parsed, HttpError> {
-    // Empty lines before a request line are ignored (RFC 9112, section 2.2).
+    // Empty lines before a request line are ignored (RFC 9112, section 2.2),
+    // but count towards the head's size limit.
     let skip = buf.iter().take_while(|&&b| b == b'\r' || b == b'\n').count();
     let buf = buf.get(skip..).unwrap_or(&[]);
     let Some(head_len) = find(buf, b"\r\n\r\n").map(|i| i + 4) else {
-        if buf.len() > limits.max_head {
+        if skip.saturating_add(buf.len()) > limits.max_head {
             return Err(HttpError::HeadersTooLarge);
         }
         return Ok(Parsed::Incomplete { expects_continue: false });
     };
-    if head_len > limits.max_head {
+    if skip.saturating_add(head_len) > limits.max_head {
         return Err(HttpError::HeadersTooLarge);
     }
     let head = buf.get(..head_len - 4).unwrap_or(&[]);
@@ -363,6 +415,13 @@ fn dechunk(buf: &[u8], limits: &Limits) -> Result<Option<(Vec<u8>, usize)>, Http
         }
         let size = usize::from_str_radix(size, 16).map_err(|_| HttpError::BodyTooLarge)?;
         pos += eol + 2;
+        // Framing is everything used so far that isn't chunk data. Without a
+        // bound, tiny chunks with long extensions could fill the connection's
+        // buffer before the body limit is reached, and the request would
+        // stall instead of being refused.
+        if pos - total > limits.max_body.saturating_add(CHUNK_FRAMING_SLACK) {
+            return Err(HttpError::BadRequest("too much chunk framing"));
+        }
         if size == 0 {
             break;
         }
@@ -382,7 +441,11 @@ fn dechunk(buf: &[u8], limits: &Limits) -> Result<Option<(Vec<u8>, usize)>, Http
     loop {
         let rest = buf.get(pos..).unwrap_or(&[]);
         let Some(eol) = find(rest, b"\r\n") else {
-            return if rest.len() > limits.max_head { Err(HttpError::HeadersTooLarge) } else { Ok(None) };
+            return if trailer_bytes.saturating_add(rest.len()) > limits.max_head {
+                Err(HttpError::HeadersTooLarge)
+            } else {
+                Ok(None)
+            };
         };
         pos += eol + 2;
         if eol == 0 {
