@@ -165,8 +165,7 @@ fn a_signal_wakes_only_the_threads_it_concerns() {
     let (a, _) = process("wake-a");
     let (b, _) = process("wake-b");
     let (ra, _wa) = pipe_fds(&a);
-    // `b` waits in `sigsuspend`, which only a signal for it can end (a pipe
-    // read could be woken by any other test's pipe traffic).
+    // `b` waits in `sigsuspend`, which only a signal for it can end.
     put(&b, DATA + 0x200, &0u64.to_ne_bytes());
     let (ta, result_a) = block_in(&a, move |p| call(p, Sys::Read, &[ra, DATA + 0x100, 8]));
     let (tb, result_b) = block_in(&b, move |p| call(p, Sys::RtSigsuspend, &[DATA + 0x200, 8]));
