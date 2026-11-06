@@ -8,9 +8,9 @@
 //! is in flight on a matching connection (a UDP or echo packet needs a
 //! socket on the quoted port or identifier), and the quoted packet is larger
 //! than the MTU reported. TCP then sizes its segments to the cached MTU and
-//! resends what the smaller path dropped; datagrams larger than it are
-//! fragmented (IPv4) or not sent (IPv6, which this stack does not
-//! fragment).
+//! resends what the smaller path dropped; other datagrams larger than it
+//! are fragmented (IPv4, and IPv6 with a Fragment header, see
+//! [`frag6`](crate::frag6)).
 //!
 //! A cached MTU only ever falls, never below a floor ([`MIN_MTU_V4`],
 //! [`MIN_MTU_V6`]): a router claiming less is taken to claim the floor. An
