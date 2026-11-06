@@ -7,7 +7,10 @@
 //! after it. Only then are the blocks written to their places and the device
 //! flushed once more (the checkpoint). File data is not logged: it is
 //! written in place before the commit (`data=ordered`), and a block freed by
-//! a transaction is not reused until it commits.
+//! a transaction is not reused until it commits. The one exception is the
+//! last block of a file cut inside it, whose zeroed tail is logged with the
+//! new size (only the last transaction is ever replayed, so a logged data
+//! block cannot be put back over a later use of it).
 //!
 //! Because a transaction is checkpointed before the next begins, the log
 //! always starts at its first block, and the only transaction a crash can
@@ -151,7 +154,12 @@ impl Journal {
             return Ok(None);
         }
         let mut inode = fs.read_inode(inum)?;
-        let blocks = (inode.size() / fs.block_size as u64).min(u32::MAX as u64);
+        // Each journal block needs a file system block of its own, so a
+        // journal longer than the file system is corrupt; capping it there
+        // also bounds the block-by-block mapping below, which a crafted
+        // inode size (with overlapping extents) could otherwise make run
+        // for hours.
+        let blocks = (inode.size() / fs.block_size as u64).min(u32::MAX as u64).min(fs.blocks_count());
         if inode.kind() != FileKind::Regular || blocks < MIN_BLOCKS {
             return Err(Errno::EINVAL);
         }

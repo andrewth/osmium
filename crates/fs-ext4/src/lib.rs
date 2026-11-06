@@ -10,17 +10,38 @@
 //! (preallocated) extents read as zeroes and are split as they are written.
 //! Every checksum is verified on read and kept current on write.
 //!
-//! A JBD2 journal inside the file system (ext3's or ext4's) is used. Each
-//! operation writes its metadata changes to the log and commits them before
-//! they go to their places, and file data is written first (`data=ordered`),
-//! so a crash leaves the file system as it was before the operation or after
-//! it. Mounting replays what a crash left in the log, including logs written
+//! Permission bits, 32-bit owners and device numbers are kept as Linux keeps
+//! them, and changed through [`File::chmod`], [`File::chown`] and
+//! [`File::mknod_as`] (device numbers in the old or new `i_block` encoding,
+//! up to Linux's 12-bit majors and 20-bit minors). A file unlinked while
+//! still open goes on the superblock's orphan list until its last reference
+//! goes; mounting frees what a crash left on the list, as Linux and e2fsck
+//! do.
+//!
+//! A JBD2 journal inside the file system (ext3's or ext4's) is used, with
+//! the guarantees of Linux's `data=ordered` mode. Each operation's metadata
+//! (inodes, bitmaps, directories, block maps, attribute blocks) is written
+//! to the log and committed as one transaction before it goes to its
+//! places, so an operation that changes only metadata (creating, linking,
+//! renaming over a target, removing, `chmod`, `chown`, attributes,
+//! truncating) is atomic: a crash leaves it done or not done. File data is
+//! not logged; it is written in place before the transaction that makes it
+//! reachable commits. So data written to new blocks or past the end of a
+//! file (appending, filling a hole) appears with the size and mapping that
+//! go with it or not at all, and a crash never exposes a stale block; but
+//! an overwrite of bytes already in the file is not atomic, and a crash
+//! part way through one leaves any mix of old and new contents, block by
+//! block. A truncate that cuts inside a block logs that block, its tail
+//! zeroed, with the new size. An operation too large for the journal is
+//! logged as several transactions, split by block rather than by meaning, so
+//! a crash between them can leave it part done for e2fsck to repair.
+//!
+//! Mounting replays what a crash left in the log, including logs written
 //! by Linux (revoke records, `64bit` tags, `csum_v3` checksums). Without a
 //! journal, or with one of a kind this driver does not understand (on
 //! another device, `csum_v2`, `async_commit`, fast commits), changes are
 //! written in place and are not crash safe; if such a journal needs
-//! recovery the mount fails with `ENOSYS`. An operation too large for the
-//! journal is logged as several transactions. The other incompatible
+//! recovery the mount fails with `ENOSYS`. The other incompatible
 //! features (`inline_data`, `largedir`, `ea_inode`, encryption, casefolding,
 //! compression) are refused. A file system with an unknown read-only
 //! feature (`quota`, `bigalloc`, ...) mounts read-only.
@@ -63,6 +84,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::{MaybeUninit, offset_of};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use osmium_hal::block::{BlockDevice, BlockError};
 use osmium_sync::arc::ArcTree;
@@ -72,7 +94,7 @@ use osmium_sync::{Once, SpinLock};
 
 use csum::{crc16, crc32c};
 use journal::Journal;
-use osmium_fs::dev::makedev;
+use osmium_fs::dev::{self, makedev};
 use osmium_fs::{Clock, ClockSlot, DirEntry, Errno, File, FileKind, NAME_MAX, PATH_MAX, Stat, Timestamp, XattrSet};
 
 const MAGIC: u16 = 0xef53;
@@ -161,6 +183,8 @@ mod sb {
     pub const DEF_HASH_VERSION: usize = 0xfc;
     pub const FLAGS: usize = 0x160;
     pub const JOURNAL_INUM: usize = 0xe0;
+    /// The head of the orphan list (`s_last_orphan`).
+    pub const LAST_ORPHAN: usize = 0xe8;
     pub const DESC_SIZE: usize = 0xfe;
     pub const FIRST_META_BG: usize = 0x104;
     pub const BLOCKS_COUNT_HI: usize = 0x150;
@@ -322,6 +346,23 @@ fn set_bits(bits: &mut [u8], start: usize, count: usize) {
     }
 }
 
+/// The first three words of a device inode's `i_block` for `rdev`, as Linux
+/// writes them: the old 16-bit form (`old_encode_dev`) in the first when the
+/// major and minor both fit a byte, else the new 32-bit form
+/// (`new_encode_dev`) in the second. `EINVAL` for a major past 12 bits or a
+/// minor past 20, which neither form holds.
+fn encode_rdev(rdev: u64) -> Result<[u32; 3], Errno> {
+    let (major, minor) = (dev::major(rdev), dev::minor(rdev));
+    if major > 0xfff || minor > 0xf_ffff {
+        return Err(Errno::EINVAL);
+    }
+    Ok(if major < 0x100 && minor < 0x100 {
+        [major << 8 | minor, 0, 0]
+    } else {
+        [0, (minor & 0xff) | major << 8 | (minor & !0xff) << 12, 0]
+    })
+}
+
 /// An inode's on-disk bytes.
 struct Inode {
     raw: Vec<u8>,
@@ -358,6 +399,43 @@ impl Inode {
 
     fn gid(&self) -> u32 {
         (get16(&self.raw, ino::GID_HIGH) as u32) << 16 | get16(&self.raw, ino::GID) as u32
+    }
+
+    /// Sets the owner, both 16-bit halves (the high one is in `osd2`, as
+    /// Linux keeps it).
+    fn set_uid(&mut self, uid: u32) {
+        put16(&mut self.raw, ino::UID, uid as u16);
+        put16(&mut self.raw, ino::UID_HIGH, (uid >> 16) as u16);
+    }
+
+    fn set_gid(&mut self, gid: u32) {
+        put16(&mut self.raw, ino::GID, gid as u16);
+        put16(&mut self.raw, ino::GID_HIGH, (gid >> 16) as u16);
+    }
+
+    /// Replaces the permission bits (`0o7777`), keeping the type.
+    fn set_permissions(&mut self, mode: u32) {
+        let mode = (self.mode() & 0o170000) | (mode & 0o7777) as u16;
+        put16(&mut self.raw, ino::MODE, mode);
+    }
+
+    /// The device number of a device inode, which Linux keeps in `i_block`:
+    /// in the old 16-bit form in the first word when the major and minor
+    /// both fit a byte, and in the new 32-bit form in the second otherwise.
+    fn rdev(&self) -> u64 {
+        let (old, new) = (self.block(0), self.block(1));
+        if old != 0 {
+            makedev((old >> 8) & 0xff, old & 0xff)
+        } else {
+            makedev((new & 0xfff00) >> 8, (new & 0xff) | ((new >> 12) & 0xfff00))
+        }
+    }
+
+    /// Records a device number encoded by [`encode_rdev`].
+    fn set_rdev(&mut self, words: [u32; 3]) {
+        for (i, w) in words.into_iter().enumerate() {
+            self.set_block(i, w);
+        }
     }
 
     fn set_links(&mut self, links: u16) {
@@ -608,6 +686,9 @@ struct Node<D: BlockDevice + Send + 'static> {
     /// Itself, for [`Fs::nodes`] to hand out references without allocating.
     me: Once<Weak<Node<D>>>,
     link: SharedLink<TreeLink>,
+    /// Whether the node was ever put in [`Fs::nodes`]. One that never was
+    /// owns nothing and drops without the lock, which its creator may hold.
+    indexed: AtomicBool,
 }
 
 /// `raw` as text, with anything that is not UTF-8 replaced (like
@@ -704,6 +785,9 @@ impl<D: BlockDevice + Send + 'static> Ext2<D> {
             let flags = get32(&fs.sb, sb::FEATURE_INCOMPAT) | INCOMPAT_RECOVER;
             put32(&mut fs.sb, sb::FEATURE_INCOMPAT, flags);
             fs.journal = Some(journal);
+        }
+        if !fs.read_only && get32(&fs.sb, sb::LAST_ORPHAN) != 0 {
+            fs.free_orphans();
         }
         let shared = try_arc(Shared { fs: SpinLock::new(fs) })?;
         Ok(Ext2 { shared })
@@ -902,7 +986,13 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         };
         let node = init_arc(
             slot,
-            Node { shared: shared.clone(), ino, me: Once::new(), link: SharedLink::new(TreeLink::new()) },
+            Node {
+                shared: shared.clone(),
+                ino,
+                me: Once::new(),
+                link: SharedLink::new(TreeLink::new()),
+                indexed: AtomicBool::new(false),
+            },
         );
         let _ = node.me.set(Arc::downgrade(&node));
         // One whose last reference is going (its `Drop` waits for this lock)
@@ -911,10 +1001,12 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         // SAFETY: the node takes itself out when dropped, and its inode
         // number never changes.
         let indexed = unsafe { self.nodes.insert(&node) };
-        // The key was just freed, so this holds.
+        // The key was just freed, so this holds. (The node is dropped here
+        // otherwise, with the lock held: `indexed` keeps its `Drop` off it.)
         if !indexed {
             return Err(Errno::EIO);
         }
+        node.indexed.store(true, Ordering::Relaxed);
         Ok(node)
     }
 
@@ -1183,6 +1275,11 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         self.changes += 1;
         if self.in_meta_zone(b) || b == 0 || b >= self.blocks_count() {
             return Err(Errno::EIO);
+        }
+        // A block the operation logged (see `zero_tail`) would be put back
+        // as logged when it commits: keep the logged copy current too.
+        if let Some(logged) = self.tx_block_mut(b) {
+            put_bytes(logged, 0, buf)?;
         }
         self.dev_write_block(b, buf)
     }
@@ -2006,6 +2103,12 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             return Err(Errno::EINVAL);
         }
         let bs = self.block_size as u64;
+        if off > inode.size() {
+            // The gap from the old end must read as zeroes, whatever a crash
+            // left past it.
+            let size = inode.size();
+            self.zero_tail(ino, &mut inode, size, false)?;
+        }
         let mut done = 0;
         let result = loop {
             if done == buf.len() {
@@ -2053,6 +2156,35 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         }
     }
 
+    /// Zeroes the bytes from `end` to the end of its block, if `end` is
+    /// inside a mapped block. With `logged` the block goes into the
+    /// transaction, to reach its place with the operation's metadata;
+    /// otherwise it is written in place now, which is only right for bytes
+    /// past the file's committed size (nothing can read them, so a crash
+    /// before the commit shows nothing).
+    ///
+    /// The bytes past a file's end are kept zero when it shrinks; zeroing
+    /// them again before it grows covers what a crash during an earlier
+    /// write that extended the file (its data in place, its new size not
+    /// yet committed) left there.
+    fn zero_tail(&mut self, ino: u32, inode: &mut Inode, end: u64, logged: bool) -> Result<(), Errno> {
+        let bs = self.block_size as u64;
+        if end.is_multiple_of(bs) {
+            return Ok(());
+        }
+        let b = self.bmap(ino, inode, end / bs, false)?;
+        if b == 0 {
+            return Ok(());
+        }
+        let mut block = self.read_block(b)?;
+        let tail = (end % bs) as usize;
+        if block.get(tail..).is_some_and(|t| t.iter().all(|&x| x == 0)) {
+            return Ok(());
+        }
+        fill_range(&mut block, tail..self.block_size, 0)?;
+        if logged { self.write_block(b, &block) } else { self.write_data_block(b, &block) }
+    }
+
     /// Sets RO_COMPAT_LARGE_FILE (and persists the superblock) before a file
     /// first grows past 2 GiB.
     fn note_file_size(&mut self, size: u64) -> Result<(), Errno> {
@@ -2079,19 +2211,17 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             }
             self.truncate_blocks(ino, &mut inode, len.div_ceil(bs))?;
             // Zero the tail of the new last block, so that growing the file
-            // again reads zeroes.
-            if !len.is_multiple_of(bs) {
-                let b = self.bmap(ino, &mut inode, len / bs, false)?;
-                if b != 0 {
-                    let mut block = self.read_block(b)?;
-                    let tail = (len % bs) as usize;
-                    fill_range(&mut block, tail..self.block_size, 0)?;
-                    self.write_data_block(b, &block)?;
-                }
-            }
+            // again reads zeroes. Those bytes are still in the file until
+            // the new size commits, so the block goes through the journal
+            // with it rather than in place: a crash leaves the file whole
+            // or cut, never with zeroes inside its old size.
+            self.zero_tail(ino, &mut inode, len, true)?;
         } else if len > 0 && (len - 1) / bs >= self.max_blocks(&inode) {
             // Beyond what the block map or extent tree can reach.
             return Err(Errno::EFBIG);
+        } else if len > inode.size() {
+            let size = inode.size();
+            self.zero_tail(ino, &mut inode, size, false)?;
         }
         self.note_file_size(len)?;
         inode.set_size(len);
@@ -2389,8 +2519,24 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok(found.is_none())
     }
 
-    fn create(&mut self, dir: u32, name: &str, kind: FileKind, mode: u32) -> Result<u32, Errno> {
+    /// Creates `dir/name`: a node of `kind` with permission bits `mode`,
+    /// owned by `owner` (user and group), and for a device node the device
+    /// number `rdev` (ignored for other kinds, as Linux does).
+    fn create(
+        &mut self,
+        dir: u32,
+        name: &str,
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+        (uid, gid): (u32, u32),
+    ) -> Result<u32, Errno> {
         self.writable()?;
+        // Checked before anything changes.
+        let rdev = match kind {
+            FileKind::CharDevice | FileKind::BlockDevice => Some(encode_rdev(rdev)?),
+            _ => None,
+        };
         if name.len() > NAME_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
@@ -2419,6 +2565,14 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
             self.group_of(dir)
         };
         let (ino, mut inode) = self.alloc_inode(goal, kind.mode_bits() as u16 | (mode & 0o7777) as u16)?;
+        if (uid, gid) != (0, 0) || rdev.is_some() {
+            inode.set_uid(uid);
+            inode.set_gid(gid);
+            if let Some(words) = rdev {
+                inode.set_rdev(words);
+            }
+            self.write_inode(ino, &inode)?;
+        }
         if kind == FileKind::Directory {
             let b = match self.bmap(ino, &mut inode, 0, true) {
                 Ok(b) => b,
@@ -2486,12 +2640,123 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         self.write_inode(dir, &parent)?;
         inode.set_times(now, &[ino::CTIME]);
         self.write_inode(ino, &inode)?;
-        // An open file is freed when its last reference goes.
+        // An open file is freed when its last reference goes; until then it
+        // is on the orphan list, for the next mount to free after a crash.
         let open = self.nodes.find(&ino).is_some_and(|n| n.me.get().is_some_and(|w| w.strong_count() > 0));
-        if inode.links() == 0 && !open {
-            self.free_inode(ino)?;
+        if inode.links() == 0 {
+            if open {
+                self.orphan_add(ino, &mut inode)?;
+            } else {
+                self.free_inode(ino)?;
+            }
         }
         Ok(())
+    }
+
+    // ---- The orphan list ----
+
+    /// Puts `ino`, which has no links left but is still open, at the head of
+    /// the superblock's orphan list, as Linux does: `s_last_orphan` names
+    /// the first orphan and each one's `i_dtime` the next (0 ends the list).
+    /// A crash before the inode is freed then leaves it for the next mount
+    /// (see [`Fs::free_orphans`]) or e2fsck to free, rather than leaked.
+    fn orphan_add(&mut self, ino: u32, inode: &mut Inode) -> Result<(), Errno> {
+        put32(&mut inode.raw, ino::DTIME, get32(&self.sb, sb::LAST_ORPHAN));
+        self.write_inode(ino, inode)?;
+        put32(&mut self.sb, sb::LAST_ORPHAN, ino);
+        self.write_super()
+    }
+
+    /// The orphan after `ino` on the list (its `i_dtime`), or 0 at the end
+    /// or for a link that cannot be an inode number.
+    fn next_orphan(&self, inode: &Inode) -> u32 {
+        let next = get32(&inode.raw, ino::DTIME);
+        if next >= self.first_ino && next <= get32(&self.sb, sb::INODES_COUNT) { next } else { 0 }
+    }
+
+    /// Takes `ino` off the orphan list. Nothing changes if it is not on it
+    /// (it was unlinked by an older driver, or the list is corrupt).
+    fn orphan_remove(&mut self, ino: u32) -> Result<(), Errno> {
+        let mut prev: Option<(u32, Inode)> = None;
+        let mut at = get32(&self.sb, sb::LAST_ORPHAN);
+        // Bounded, since a corrupt list may loop.
+        for _ in 0..get32(&self.sb, sb::INODES_COUNT) {
+            if at < self.first_ino || at > get32(&self.sb, sb::INODES_COUNT) {
+                return Ok(());
+            }
+            let inode = self.read_inode(at)?;
+            let next = self.next_orphan(&inode);
+            if at == ino {
+                return match prev {
+                    None => {
+                        put32(&mut self.sb, sb::LAST_ORPHAN, next);
+                        self.write_super()
+                    }
+                    Some((p, mut before)) => {
+                        put32(&mut before.raw, ino::DTIME, next);
+                        self.write_inode(p, &before)
+                    }
+                };
+            }
+            prev = Some((at, inode));
+            at = next;
+        }
+        Ok(())
+    }
+
+    /// Whether `ino`'s bit is set in its group's inode bitmap.
+    fn inode_in_use(&mut self, ino: u32) -> Result<bool, Errno> {
+        let per_group = get32(&self.sb, sb::INODES_PER_GROUP);
+        let (g, i) = (self.group_of(ino), ino.saturating_sub(1) % per_group.max(1));
+        let bits = self.load_bitmap(g, Bitmap::Inode)?;
+        Ok(bits.get(i as usize / 8).is_some_and(|b| b & (1 << (i % 8)) != 0))
+    }
+
+    /// Finishes what a crash left on the orphan list, as Linux does at
+    /// mount: frees each orphan with no links, and cuts back to its size one
+    /// that still has links (Linux lists a file while truncating it). Each
+    /// orphan is one transaction. A list that cannot be followed (an inode
+    /// that fails its checksum, say) is dropped, leaving the rest to e2fsck.
+    fn free_orphans(&mut self) {
+        let count = get32(&self.sb, sb::INODES_COUNT);
+        for _ in 0..count {
+            let head = get32(&self.sb, sb::LAST_ORPHAN);
+            if head == 0 {
+                return;
+            }
+            if self.transact_all(|fs| fs.free_orphan(head)).is_err() {
+                break;
+            }
+        }
+        // A loop, or a failure: give up on the list.
+        let _ = self.transact_all(|fs| {
+            put32(&mut fs.sb, sb::LAST_ORPHAN, 0);
+            fs.write_super()
+        });
+    }
+
+    /// Takes the orphan `ino`, the head of the list, off it and finishes it.
+    fn free_orphan(&mut self, ino: u32) -> Result<(), Errno> {
+        if ino < self.first_ino || ino > get32(&self.sb, sb::INODES_COUNT) {
+            return Err(Errno::EIO);
+        }
+        let mut inode = self.read_inode(ino)?;
+        let next = self.next_orphan(&inode);
+        put32(&mut self.sb, sb::LAST_ORPHAN, next);
+        self.write_super()?;
+        if !self.inode_in_use(ino)? || inode.mode() == 0 {
+            // Already free: nothing to finish.
+            return Ok(());
+        }
+        if inode.links() == 0 {
+            return self.free_inode(ino);
+        }
+        if inode.kind() == FileKind::Regular && self.has_block_map(&inode) {
+            let keep = inode.size().div_ceil(self.block_size as u64);
+            self.truncate_blocks(ino, &mut inode, keep)?;
+        }
+        put32(&mut inode.raw, ino::DTIME, 0);
+        self.write_inode(ino, &inode)
     }
 
     /// Checks a name for a new entry.
@@ -2650,19 +2915,35 @@ impl<D: BlockDevice + Send + 'static> Fs<D> {
         Ok(())
     }
 
+    /// Sets the permission bits of `ino` (`chmod`), keeping its type.
+    fn chmod(&mut self, ino: u32, mode: u32) -> Result<(), Errno> {
+        self.writable()?;
+        let mut inode = self.read_inode(ino)?;
+        inode.set_permissions(mode);
+        let now = self.now();
+        inode.set_times(now, &[ino::CTIME]);
+        self.write_inode(ino, &inode)
+    }
+
+    /// Sets the owner and/or group of `ino` (`chown`).
+    fn chown(&mut self, ino: u32, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.writable()?;
+        let mut inode = self.read_inode(ino)?;
+        if let Some(uid) = uid {
+            inode.set_uid(uid);
+        }
+        if let Some(gid) = gid {
+            inode.set_gid(gid);
+        }
+        let now = self.now();
+        inode.set_times(now, &[ino::CTIME]);
+        self.write_inode(ino, &inode)
+    }
+
     fn stat(&mut self, ino: u32) -> Result<Stat, Errno> {
         let inode = self.read_inode(ino)?;
         let kind = inode.kind();
-        let rdev = if matches!(kind, FileKind::CharDevice | FileKind::BlockDevice) {
-            let (old, new) = (inode.block(0), inode.block(1));
-            if old != 0 {
-                makedev((old >> 8) & 0xff, old & 0xff)
-            } else {
-                makedev((new & 0xfff00) >> 8, (new & 0xff) | ((new >> 12) & 0xfff00))
-            }
-        } else {
-            0
-        };
+        let rdev = if matches!(kind, FileKind::CharDevice | FileKind::BlockDevice) { inode.rdev() } else { 0 };
         Ok(Stat {
             dev: self.st_dev,
             ino: ino as u64,
@@ -2728,11 +3009,35 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
     }
 
     fn create(&self, name: &str, kind: FileKind, mode: u32) -> Result<Arc<dyn File>, Errno> {
+        self.mknod_as(name, kind, mode, 0, 0, 0)
+    }
+
+    fn mknod(&self, name: &str, kind: FileKind, mode: u32, rdev: u64) -> Result<Arc<dyn File>, Errno> {
+        self.mknod_as(name, kind, mode, rdev, 0, 0)
+    }
+
+    fn mknod_as(
+        &self,
+        name: &str,
+        kind: FileKind,
+        mode: u32,
+        rdev: u64,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Arc<dyn File>, Errno> {
         let mut fs = self.shared.fs.lock();
         // Reserved first: once the inode is on disk, nothing may fail.
         let slot = try_arc_uninit()?;
-        let ino = fs.transact(|fs| fs.create(self.ino, name, kind, mode))?;
+        let ino = fs.transact(|fs| fs.create(self.ino, name, kind, mode, rdev, (uid, gid)))?;
         fs.node(&self.shared, ino, Some(slot))
+    }
+
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        self.with(|fs| fs.transact_all(|fs| fs.chmod(self.ino, mode)))
+    }
+
+    fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.with(|fs| fs.transact_all(|fs| fs.chown(self.ino, uid, gid)))
     }
 
     fn remove(&self, name: &str, dir: bool) -> Result<(), Errno> {
@@ -2795,6 +3100,13 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
 
 impl<D: BlockDevice + Send + 'static> Drop for Node<D> {
     fn drop(&mut self) {
+        // Only this node's creator, holding the lock, sets the flag, and it
+        // does so before anyone else can have the node, so it reads true
+        // here exactly when the node was indexed. One that never was may be
+        // dropped by its creator with the lock held, and must not take it.
+        if !self.indexed.load(Ordering::Relaxed) {
+            return;
+        }
         let mut fs = self.shared.fs.lock();
         // Another lookup may have replaced this node in the index with a live
         // one, which then owns the inode.
@@ -2806,13 +3118,25 @@ impl<D: BlockDevice + Send + 'static> Drop for Node<D> {
         if fs.read_only {
             return;
         }
+        // Unlinked while open: on the orphan list, where its `i_dtime` is a
+        // link (0 at the end). A freed inode's deletion time is past the
+        // inode count (see `free_inode`).
         if let Ok(inode) = fs.read_inode(self.ino)
             && inode.links() == 0
             && inode.mode() != 0
-            && get32(&inode.raw, ino::DTIME) == 0
+            && get32(&inode.raw, ino::DTIME) <= get32(&fs.sb, sb::INODES_COUNT)
         {
-            // Nowhere to report an error from a drop.
-            let _ = fs.transact(|fs| fs.free_inode(self.ino));
+            // Nowhere to report an error from a drop. One that cannot be
+            // taken off the list is still freed; mounting skips a freed one.
+            // One transaction, so a crash cannot leave it off the list but
+            // not freed.
+            let _ = fs.transact(|fs| {
+                // It changes nothing unless it succeeds.
+                if let Err(Errno::ENOMEM) = fs.orphan_remove(self.ino) {
+                    return Err(Errno::ENOMEM);
+                }
+                fs.free_inode(self.ino)
+            });
         }
     }
 }
@@ -2888,8 +3212,19 @@ mod tests {
     /// `uninit_bg`'s CRC16 group descriptors without `metadata_csum`.
     const EXT4_CRC16: Kind = Kind("ext4", &["-g", "1024", "-O", "^metadata_csum,uninit_bg"]);
 
+    /// Reports that the external tool `name` is missing. Tests that need one
+    /// fail without it, so a machine without the tools cannot pass them
+    /// silently; set `OSMIUM_SKIP_TOOL_TESTS=1` to skip them instead.
+    fn missing_tool(name: &str) {
+        if std::env::var_os("OSMIUM_SKIP_TOOL_TESTS").is_some_and(|v| v == "1") {
+            std::eprintln!("{name} not installed; skipping (OSMIUM_SKIP_TOOL_TESTS=1)");
+        } else {
+            panic!("{name} not installed: install it, or set OSMIUM_SKIP_TOOL_TESTS=1 to skip the tests that need it");
+        }
+    }
+
     /// Runs `mkfs` on a fresh image of `size` bytes, filled from `tree` if
-    /// given; `None` if e2fsprogs is not installed.
+    /// given; `None` if e2fsprogs is not installed (see `missing_tool`).
     fn mkfs(scratch: &Scratch, kind: Kind, block: usize, size: usize, tree: Option<&Path>) -> Option<Vec<u8>> {
         let img = scratch.0.join("image");
         fs::write(&img, vec![0u8; size]).unwrap();
@@ -2899,7 +3234,7 @@ mod tests {
             cmd.arg("-d").arg(tree);
         }
         let Ok(status) = cmd.arg(&img).status() else {
-            std::eprintln!("mkfs.{} not installed; skipping", kind.0);
+            missing_tool(&format!("mkfs.{}", kind.0));
             return None;
         };
         assert!(status.success(), "mkfs.{} {:?} failed", kind.0, kind.1);
@@ -3510,6 +3845,240 @@ mod tests {
                 fsck(&scratch, &unmount(ext2), &[]);
             }
         }
+    }
+
+    /// `debugfs stat` of `path`.
+    fn debugfs_stat(scratch: &Scratch, image: &[u8], path: &str) -> String {
+        let img = scratch.0.join("stat");
+        fs::write(&img, image).unwrap();
+        let out = Command::new("debugfs").arg("-R").arg(format!("stat {path}")).arg(&img).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    #[test]
+    fn modes_owners_and_device_numbers_pass_fsck() {
+        let scratch = Scratch::new("owners");
+        for kind in [EXT2, EXT4] {
+            let Some(image) = mkfs(&scratch, kind, 1024, 4 << 20, None) else { return };
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let vfs = Vfs::new(ext2.root().unwrap());
+            // Old-style numbers, new-style ones, and owners past 16 bits.
+            vfs.mknod_dev_as("/null", FileKind::CharDevice, 0o666, makedev(1, 3), Some((0, 5))).unwrap();
+            vfs.mknod_dev_as("/sda", FileKind::BlockDevice, 0o660, makedev(8, 0), Some((0, 6))).unwrap();
+            vfs.mknod_dev("/big", FileKind::CharDevice, 0o600, makedev(300, 70000)).unwrap();
+            vfs.mknod_dev("/fifo", FileKind::Fifo, 0o644, 0).unwrap();
+            assert_eq!(
+                vfs.mknod_dev("/huge", FileKind::CharDevice, 0o600, makedev(4096, 0)).err(),
+                Some(Errno::EINVAL)
+            );
+            assert_eq!(
+                vfs.mknod_dev("/huge", FileKind::CharDevice, 0o600, makedev(0, 1 << 20)).err(),
+                Some(Errno::EINVAL)
+            );
+            assert!(vfs.lookup("/huge").is_err());
+            let owned =
+                vfs.open_as("/owned", OpenFlags::WRITE | OpenFlags::CREATE, 0o640, Some((70000, 123456))).unwrap();
+            owned.write(0, b"mine").unwrap();
+            let file = vfs.open("/file", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
+            file.chmod(0o4751).unwrap();
+            file.chown(Some(1000), None).unwrap();
+            file.chown(None, Some(0x1_0002)).unwrap();
+            let dir = vfs.lookup("/").unwrap();
+            dir.chmod(0o1777).unwrap();
+            let st = file.stat();
+            assert_eq!((st.kind, st.mode, st.uid, st.gid), (FileKind::Regular, 0o4751, 1000, 0x1_0002));
+            drop((owned, file, dir, vfs));
+            let image = unmount(ext2);
+            fsck(&scratch, &image, &[]);
+
+            let null = debugfs_stat(&scratch, &image, "/null");
+            assert!(null.contains("Type: character special") && null.contains("Mode:  0666"), "{null}");
+            assert!(null.contains("Device major/minor number: 01:03"), "{null}");
+            assert!(null.contains("Group:     5"), "{null}");
+            let sda = debugfs_stat(&scratch, &image, "/sda");
+            assert!(sda.contains("Type: block special") && sda.contains("Device major/minor number: 08:00"), "{sda}");
+            let big = debugfs_stat(&scratch, &image, "/big");
+            assert!(big.contains("(New-style) Device major/minor number: 300:70000"), "{big}");
+            assert!(debugfs_stat(&scratch, &image, "/fifo").contains("Type: FIFO"));
+            let owned = debugfs_stat(&scratch, &image, "/owned");
+            assert!(owned.contains("User: 70000") && owned.contains("Group: 123456"), "{owned}");
+            let file = debugfs_stat(&scratch, &image, "/file");
+            assert!(
+                file.contains("Mode:  04751") && file.contains("User:  1000") && file.contains("Group: 65538"),
+                "{file}"
+            );
+            assert!(debugfs_stat(&scratch, &image, "/").contains("Mode:  01777"));
+
+            // And they read back.
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let vfs = Vfs::new(ext2.root().unwrap());
+            let st = vfs.stat("/big", false).unwrap();
+            assert_eq!((st.kind, st.rdev, st.mode), (FileKind::CharDevice, makedev(300, 70000), 0o600));
+            assert_eq!(vfs.stat("/null", false).unwrap().rdev, makedev(1, 3));
+            assert_eq!(vfs.stat("/sda", false).unwrap().kind, FileKind::BlockDevice);
+            let st = vfs.stat("/owned", false).unwrap();
+            assert_eq!((st.uid, st.gid, st.mode), (70000, 123456, 0o640));
+        }
+    }
+
+    /// The free block and inode counts.
+    fn free_of(ext2: &Ext2<VecDisk>) -> (u64, u32) {
+        let fs = ext2.shared.fs.lock();
+        (fs.free_blocks(), get32(&fs.sb, sb::FREE_INODES))
+    }
+
+    /// What the disk holds right now, as a crash would leave it.
+    fn crash_image(ext2: &Ext2<VecDisk>) -> Vec<u8> {
+        ext2.shared.fs.lock().dev.0.clone()
+    }
+
+    #[test]
+    fn a_crash_with_unlinked_open_files_frees_them_at_mount() {
+        let scratch = Scratch::new("orphan-list");
+        for kind in [EXT2, EXT4] {
+            let Some(image) = mkfs(&scratch, kind, 1024, 4 << 20, None) else { return };
+            let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+            let before = free_of(&ext2);
+            let vfs = Vfs::new(ext2.root().unwrap());
+            let open: Vec<_> = ["a", "b", "c"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let f = vfs.open(&format!("/{name}"), OpenFlags::WRITE | OpenFlags::CREATE, 0o644).unwrap();
+                    f.write(0, &pattern(20_000 + i * 5000, i as u8)).unwrap();
+                    f
+                })
+                .collect();
+            vfs.mkdir("/gone", 0o755).unwrap();
+            let gone = vfs.lookup("/gone").unwrap();
+            for name in ["a", "b", "c"] {
+                vfs.unlink(&format!("/{name}")).unwrap();
+            }
+            vfs.rmdir("/gone").unwrap();
+            // The list is now gone -> c -> b -> a; closing b takes it out of
+            // the middle.
+            let mut open = open.into_iter();
+            let (a, b, c) = (open.next().unwrap(), open.next().unwrap(), open.next().unwrap());
+            drop(b);
+            assert_eq!(read_all(&*c), pattern(30_000, 2));
+            let crashed = crash_image(&ext2);
+            // Linux's e2fsck frees them from the list, rather than finding
+            // them unattached.
+            let repaired = fsck_repair(&scratch, &crashed);
+            fsck(&scratch, &repaired, &[]);
+            let theirs = Ext2::mount(VecDisk(repaired), 1).unwrap();
+            assert_eq!(free_of(&theirs), before, "{kind:?} after e2fsck", kind = kind.0);
+            assert_eq!(names(&*theirs.root().unwrap()), ["lost+found"]);
+            let lost = theirs.root().unwrap().lookup("lost+found").unwrap();
+            assert!(names(&*lost).is_empty());
+            drop(lost);
+            // Mounting frees them too.
+            let ours = Ext2::mount(VecDisk(crashed), 1).unwrap();
+            assert_eq!(free_of(&ours), before, "{kind:?} after mounting", kind = kind.0);
+            assert_eq!(get32(&ours.shared.fs.lock().sb, sb::LAST_ORPHAN), 0);
+            fsck(&scratch, &unmount(ours), &[]);
+            // Closed normally, they leave an empty list behind.
+            drop((a, c, gone, vfs));
+            assert_eq!(get32(&ext2.shared.fs.lock().sb, sb::LAST_ORPHAN), 0);
+            assert_eq!(free_of(&ext2), before);
+            fsck(&scratch, &unmount(ext2), &[]);
+        }
+    }
+
+    #[test]
+    fn mounting_finishes_an_orphan_list_linux_left() {
+        let scratch = Scratch::new("linux-orphans");
+        let Some(image) = mkfs(&scratch, EXT4, 1024, 4 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let before = free_of(&ext2);
+        let root = ext2.root().unwrap();
+        // One unlinked file, and one Linux was truncating: blocks past its size.
+        root.create("unlinked", FileKind::Regular, 0o644).unwrap().write(0, &pattern(10_000, 1)).unwrap();
+        let cut = root.create("cut", FileKind::Regular, 0o644).unwrap();
+        cut.write(0, &pattern(10_000, 2)).unwrap();
+        let (unlinked, cut_ino) = (root.lookup("unlinked").unwrap().stat().ino, cut.stat().ino);
+        drop((cut, root));
+        let image = unmount(ext2);
+        let image = debugfs(
+            &scratch,
+            image,
+            &[
+                "unlink /unlinked",
+                &format!("sif <{unlinked}> links_count 0"),
+                &format!("sif <{unlinked}> dtime {cut_ino}"),
+                &format!("sif <{cut_ino}> size 3000"),
+                &format!("ssv last_orphan {unlinked}"),
+            ],
+        );
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let cut = ext2.root().unwrap().lookup("cut").unwrap();
+        assert_eq!(read_all(&*cut), pattern(10_000, 2)[..3000]);
+        drop(cut);
+        // The unlinked file is gone, and the cut one holds three blocks.
+        assert_eq!(free_of(&ext2), (before.0 - 3, before.1 - 1));
+        fsck(&scratch, &unmount(ext2), &[]);
+    }
+
+    #[test]
+    fn a_node_never_indexed_drops_without_the_lock() {
+        let scratch = Scratch::new("drop-locked");
+        let Some(image) = mkfs(&scratch, EXT2, 1024, 1 << 20, None) else { return };
+        let ext2 = Ext2::mount(VecDisk(image), 1).unwrap();
+        let shared = ext2.shared.clone();
+        let (done, wait) = std::sync::mpsc::channel();
+        // A thread, so that a deadlock fails the test rather than hanging it.
+        std::thread::spawn(move || {
+            let guard = shared.fs.lock();
+            let node = Arc::new(Node {
+                shared: shared.clone(),
+                ino: ROOT_INO,
+                me: Once::new(),
+                link: SharedLink::new(TreeLink::new()),
+                indexed: AtomicBool::new(false),
+            });
+            // As `Fs::node` does when the index refuses it.
+            drop(node);
+            drop(guard);
+            done.send(()).unwrap();
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(20)).expect("dropping the node under the lock deadlocked");
+        fsck(&scratch, &unmount(ext2), &[]);
+    }
+
+    #[test]
+    fn a_journal_longer_than_the_file_system_is_refused() {
+        let scratch = Scratch::new("long-journal");
+        let Some(mut image) = mkfs(&scratch, Kind("ext4", &["-O", "^metadata_csum"]), 1024, 3 << 20, None) else {
+            return;
+        };
+        let (inode_at, head, blocks) = {
+            let ext2 = Ext2::mount(VecDisk(image.clone()), 1).unwrap();
+            let mut fs = ext2.shared.fs.lock();
+            let mut journal = fs.read_inode(8).unwrap();
+            let head = fs.bmap(8, &mut journal, 0, false).unwrap();
+            (fs.inode_offset(8).unwrap() as usize, head, fs.blocks_count())
+        };
+        // The journal's longest piece, which becomes its start.
+        let (l0, l1, start) = journal_map(&scratch, &image).into_iter().max_by_key(|&(l0, l1, _)| l1 - l0).unwrap();
+        let len = l1 - l0 + 1;
+        assert!(4 * len as u64 > blocks, "{len} of {blocks}");
+        let jsb = start as usize * 1024;
+        image.copy_within(head as usize * 1024..head as usize * 1024 + 1024, jsb);
+        // Four extents, every one over the same blocks: four times as long
+        // as that piece, and longer than the file system.
+        let raw = &mut image[inode_at..inode_at + 256];
+        put32(raw, ino::SIZE, 4 * len * 1024);
+        let root = &mut raw[ino::BLOCK..ino::BLOCK + 60];
+        root[..12].copy_from_slice(&[0x0a, 0xf3, 4, 0, 4, 0, 0, 0, 0, 0, 0, 0]);
+        for i in 0..4 {
+            let e = &mut root[12 + 12 * i..24 + 12 * i];
+            put32(e, 0, i as u32 * len);
+            put16(e, 4, len as u16);
+            put16(e, 6, 0);
+            put32(e, 8, start as u32);
+        }
+        put_be32(&mut image, jsb + 0x10, 4 * len);
+        assert_eq!(Ext2::mount(VecDisk(image), 1).err(), Some(Errno::EINVAL));
     }
 
     #[test]
@@ -4185,13 +4754,26 @@ mod tests {
         }
     }
 
-    /// Every file, directory and symbolic link below `dir`, with contents.
+    /// Every file, directory and symbolic link below `dir`, with contents;
+    /// and under `path@meta`, each one's kind, mode, owner, link count and
+    /// extended attributes.
     fn snapshot(dir: &dyn File) -> std::collections::BTreeMap<String, Vec<u8>> {
         fn walk(dir: &dyn File, path: &str, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
             for name in names(dir) {
                 let child = dir.lookup(&name).unwrap();
                 let path = format!("{path}/{name}");
-                match child.stat().kind {
+                let st = child.stat();
+                let mut meta = format!("{:?} {:o} {}:{} {}", st.kind, st.mode, st.uid, st.gid, st.nlink).into_bytes();
+                let mut attrs = child.xattr_list().unwrap();
+                attrs.sort();
+                for attr in attrs {
+                    meta.extend_from_slice(b"\n");
+                    meta.extend_from_slice(&attr);
+                    meta.extend_from_slice(b"=");
+                    meta.extend_from_slice(&child.xattr_get(&attr).unwrap());
+                }
+                out.insert(format!("{path}@meta"), meta);
+                match st.kind {
                     FileKind::Directory => {
                         out.insert(path.clone(), Vec::new());
                         walk(&*child, &path, out);
@@ -4272,9 +4854,47 @@ mod tests {
             steps.push(Box::new(move |r| {
                 r.lookup("d").unwrap().lookup("a").unwrap().truncate(4 * block as u64).unwrap()
             }));
+            // Cut inside a block (its tail is zeroed), grow again (the gap
+            // reads as zeroes), and write past the end from inside a block.
+            steps.push(Box::new(move |r| {
+                r.lookup("d").unwrap().lookup("a").unwrap().truncate(3 * block as u64 + 100).unwrap()
+            }));
+            steps.push(Box::new(move |r| {
+                r.lookup("d").unwrap().lookup("a").unwrap().truncate(3 * block as u64 + 900).unwrap()
+            }));
+            steps.push(Box::new(move |r| {
+                let a = r.lookup("d").unwrap().lookup("a").unwrap();
+                a.write(4 * block as u64 - 7, &pattern(block + 50, 3)).unwrap();
+            }));
             steps.push(Box::new(|r| drop(r.create("link", FileKind::Symlink, 0o777).unwrap())));
             steps.push(Box::new(|r| {
                 r.lookup("link").unwrap().write(0, LONG_TARGET.as_bytes()).unwrap();
+            }));
+            // A hard link, and a rename over an existing file (which frees it).
+            steps.push(Box::new(|r| {
+                let d = r.lookup("d").unwrap();
+                d.link("hard", &*d.lookup("a").unwrap()).unwrap();
+            }));
+            steps.push(Box::new(|r| drop(r.lookup("d").unwrap().create("victim", FileKind::Regular, 0o600).unwrap())));
+            steps.push(Box::new(move |r| {
+                r.lookup("d").unwrap().lookup("victim").unwrap().write(0, &pattern(6 * block, 4)).unwrap();
+            }));
+            steps.push(Box::new(|r| {
+                let d = r.lookup("d").unwrap();
+                d.rename("hard", &*d, "victim").unwrap();
+            }));
+            // Attributes in the inode, then one big enough for a block of
+            // its own, then one removed; and a mode and owner change.
+            steps.push(Box::new(|r| {
+                r.lookup("d").unwrap().xattr_set(b"user.small", b"in the inode", XattrSet::Any).unwrap();
+            }));
+            steps.push(Box::new(|r| {
+                r.lookup("d").unwrap().xattr_set(b"user.big", &pattern(700, 5), XattrSet::Any).unwrap();
+            }));
+            steps.push(Box::new(|r| r.lookup("d").unwrap().xattr_remove(b"user.small").unwrap()));
+            steps.push(Box::new(|r| r.lookup("d").unwrap().lookup("victim").unwrap().chmod(0o640).unwrap()));
+            steps.push(Box::new(|r| {
+                r.lookup("d").unwrap().lookup("victim").unwrap().chown(Some(70000), Some(70001)).unwrap()
             }));
             steps.push(Box::new(|r| r.lookup("d").unwrap().remove("a", false).unwrap()));
 

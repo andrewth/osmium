@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! End-to-end tests against FAT12, FAT16 and FAT32 volumes made by
 //! `mkfs.fat` and checked with `fsck.fat` (dosfstools), and against
-//! hand-made ones. The dosfstools tests are skipped, with a note, if the
-//! tools are missing.
+//! hand-made ones. The dosfstools tests fail if the tools are missing,
+//! unless `OSMIUM_SKIP_TOOL_TESTS=1` is set to skip them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +39,17 @@ impl BlockDevice for MemDisk {
     }
 }
 
+/// Reports that the external tool `name` is missing. Tests that need one
+/// fail without it, so a machine without the tools cannot pass them
+/// silently; set `OSMIUM_SKIP_TOOL_TESTS=1` to skip them instead.
+fn missing_tool(name: &str) {
+    if std::env::var_os("OSMIUM_SKIP_TOOL_TESTS").is_some_and(|v| v == "1") {
+        std::eprintln!("{name} not installed; skipping (OSMIUM_SKIP_TOOL_TESTS=1)");
+    } else {
+        panic!("{name} not installed: install it, or set OSMIUM_SKIP_TOOL_TESTS=1 to skip the tests that need it");
+    }
+}
+
 fn tool(name: &str) -> Option<PathBuf> {
     [Path::new("/usr/sbin"), Path::new("/sbin"), Path::new("/usr/bin")]
         .iter()
@@ -57,7 +68,7 @@ fn scratch(name: &str) -> PathBuf {
 /// installed.
 fn mkfs(name: &str, fat: &str, kib: &str) -> Option<(PathBuf, MemDisk)> {
     let Some(mkfs) = tool("mkfs.fat") else {
-        eprintln!("mkfs.fat not found; skipping");
+        missing_tool("mkfs.fat");
         return None;
     };
     let path = scratch(name);
@@ -639,6 +650,32 @@ fn small_volumes_mount_as_the_right_type() {
 }
 
 #[test]
+fn a_stray_high_word_in_dotdot_does_not_hide_an_ancestor() {
+    for small in [FLOPPY, DISK16] {
+        let disk = small.make();
+        let fs = FatFs::mount(disk.clone(), 1).unwrap();
+        let root = fs.root();
+        let a = root.create("a", FileKind::Directory, 0o755).unwrap();
+        let b = a.create("b", FileKind::Directory, 0o755).unwrap();
+        // b's `..` names a; before FAT32 the entry's high cluster word is
+        // not part of the cluster (FAT12 and FAT16 use it for other things).
+        let mut found = 0;
+        for sector in disk.sectors.lock().unwrap().values_mut() {
+            for e in sector.as_chunks_mut::<32>().0 {
+                if &e[..11] == b"..         " && e[11] & 0x10 != 0 && e[26..28] != [0, 0] {
+                    e[20..22].copy_from_slice(&1u16.to_le_bytes());
+                    found += 1;
+                }
+            }
+        }
+        assert_eq!(found, 1);
+        assert_eq!(root.rename("a", &*b, "inside").err(), Some(Errno::EINVAL));
+        assert_eq!(root.rename("A", &*b, "inside").err(), Some(Errno::EINVAL));
+        assert!(root.lookup("a").is_ok() && b.lookup("inside").is_err());
+    }
+}
+
+#[test]
 fn existing_chains_across_fat12_sector_boundaries() {
     // Cluster 341's 12 bits straddle FAT sectors 0 and 1 (bytes 511 and 512).
     let disk = FLOPPY.make();
@@ -798,6 +835,72 @@ fn a_full_mkfs_floppy_stays_consistent() {
     drop(vfs);
     fsck(&path, &disk);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_write_that_runs_out_of_space_leaves_no_clusters_past_the_end() {
+    let Some((path, disk)) = mkfs("short12.img", "12", "1440") else { return };
+    let fs = FatFs::mount(disk.clone(), 1).unwrap();
+    let vfs = Vfs::new(fs.root());
+    let f = vfs.open("/fill", NEW, 0o644).unwrap();
+    let mut off = 0u64;
+    while f.write(off, &pattern(512, 1)).is_ok() {
+        off += 512;
+    }
+    // Three clusters of room, and a write that wants seven.
+    off -= 3 * 512;
+    f.truncate(off).unwrap();
+    assert_eq!(fs.free_bytes(), Some(3 * 512));
+    assert_eq!(f.write(off, &pattern(7 * 512, 2)).err(), Some(Errno::ENOSPC));
+    assert_eq!(f.stat().size, off);
+    assert_eq!(fs.free_bytes(), Some(3 * 512), "what the failed write took is given back");
+    // Still open: fsck finds the chain as long as the size says.
+    fsck(&path, &disk);
+    drop((f, vfs));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn names_are_found_by_short_alias_and_unicode_case() {
+    let fs = FatFs::mount(crafted(65535), 1).unwrap();
+    let root = fs.root();
+    let long = root.create("Long File Name.html", FileKind::Regular, 0o644).unwrap();
+    long.write(0, b"long").unwrap();
+    let ino = long.stat().ino;
+    assert_eq!(root.lookup("LONGFI~1.HTM").unwrap().stat().ino, ino);
+    assert_eq!(root.lookup("longfi~1.htm").unwrap().stat().ino, ino);
+    assert_eq!(root.lookup("LONG FILE NAME.HTML").unwrap().stat().ino, ino);
+    assert_eq!(root.lookup("LONGFI~2.HTM").err(), Some(Errno::ENOENT));
+    // The alias is taken: making it would give one name two entries.
+    assert_eq!(root.create("longfi~1.htm", FileKind::Regular, 0o644).err(), Some(Errno::EEXIST));
+    let umlaut = root.create("Ärger.txt", FileKind::Regular, 0o644).unwrap();
+    assert_eq!(root.lookup("äRGER.TXT").unwrap().stat().ino, umlaut.stat().ino);
+    assert_eq!(root.create("ÄRGER.txt", FileKind::Regular, 0o644).err(), Some(Errno::EEXIST));
+    // Renaming by the alias moves the file.
+    let sub = root.create("sub", FileKind::Directory, 0o755).unwrap();
+    root.rename("LONGFI~1.HTM", &*sub, "moved.html").unwrap();
+    assert_eq!(read_all(&*sub.lookup("moved.html").unwrap()), b"long");
+    let mut left = names(&*root);
+    left.sort();
+    assert_eq!(left, ["sub", "Ärger.txt"]);
+}
+
+#[path = "../../fs/tests/shared/hammer.rs"]
+mod hammer;
+
+#[test]
+fn many_threads_at_once_leave_a_clean_volume() {
+    for (image, fat, kib) in [("conc32.img", "32", "40000"), ("conc16.img", "16", "16000")] {
+        let Some((path, disk)) = mkfs(image, fat, kib) else { return };
+        let fs = FatFs::mount(disk.clone(), 1).unwrap();
+        let vfs = Arc::new(Vfs::new(fs.root()));
+        vfs.mkdir("/work", 0o755).unwrap();
+        hammer::hammer(vfs.clone(), "/work", 6, 120);
+        fs.root().sync().unwrap();
+        drop(vfs);
+        fsck(&path, &disk);
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[test]

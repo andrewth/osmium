@@ -256,6 +256,36 @@ fn damaged_joliet_images() {
     fuzz(Flavour::Joliet, 3000, 0x5555_aaaa_1357_9bdf);
 }
 
+/// The names in the root directory.
+fn root_names(fs: &IsoFs<MemDisk>) -> Vec<String> {
+    let root = fs.root();
+    (0..).map_while(|i| root.readdir(i).unwrap()).map(|e| e.name).collect()
+}
+
+#[test]
+fn a_damaged_descriptor_is_skipped() {
+    let good = image(Flavour::Joliet);
+    let joliet = root_names(&IsoFs::mount(good.clone(), 1).unwrap());
+    assert!(joliet.iter().any(|n| n == "Joliet Name.txt"), "{joliet:?}");
+    // A Joliet descriptor with a block size that cannot be: the primary tree.
+    let mut img = (*good.0).clone();
+    img[17 * B + 128..17 * B + 130].copy_from_slice(&3000u16.to_le_bytes());
+    let names = root_names(&IsoFs::mount(MemDisk(Arc::new(img)), 1).unwrap());
+    assert!(names.iter().any(|n| n == "a.txt"), "{names:?}");
+    // A descriptor without its signature, between the primary and the
+    // terminator: skipped, and the Joliet tree beyond it still found.
+    let mut img = vec![0u8; 64 * B];
+    img.copy_from_slice(&good.0);
+    img.copy_within(17 * B..19 * B, 18 * B);
+    img[17 * B..18 * B].fill(0x5a);
+    let names = root_names(&IsoFs::mount(MemDisk(Arc::new(img)), 1).unwrap());
+    assert_eq!(names, joliet);
+    // No signature where the first descriptor should be: not ISO 9660.
+    let mut img = (*good.0).clone();
+    img[16 * B + 1] = b'X';
+    assert!(IsoFs::mount(MemDisk(Arc::new(img)), 1).is_err());
+}
+
 #[test]
 fn garbage_images_do_not_mount() {
     let mut rng = Rng(7);

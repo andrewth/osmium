@@ -2,7 +2,7 @@
 //! Running out of memory in the middle of an ext2/3/4 call is `ENOMEM`, and
 //! leaves a file system `e2fsck` finds clean: no leaked block or inode.
 //! Each test fails every allocation of a call in turn on an image made by
-//! `mkfs.ext*` (skipped, with a note, if e2fsprogs is missing).
+//! `mkfs.ext*` (failing if e2fsprogs is missing, unless `OSMIUM_SKIP_TOOL_TESTS=1`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -45,6 +45,17 @@ impl BlockDevice for MemDisk {
     }
 }
 
+/// Reports that the external tool `name` is missing. Tests that need one
+/// fail without it, so a machine without the tools cannot pass them
+/// silently; set `OSMIUM_SKIP_TOOL_TESTS=1` to skip them instead.
+fn missing_tool(name: &str) {
+    if std::env::var_os("OSMIUM_SKIP_TOOL_TESTS").is_some_and(|v| v == "1") {
+        std::eprintln!("{name} not installed; skipping (OSMIUM_SKIP_TOOL_TESTS=1)");
+    } else {
+        panic!("{name} not installed: install it, or set OSMIUM_SKIP_TOOL_TESTS=1 to skip the tests that need it");
+    }
+}
+
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("osmium-ext4-oom-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -61,6 +72,7 @@ fn mkfs(kind: &str, mib: usize) -> Option<(PathBuf, MemDisk)> {
         .args(["-q", "-F", "-b", "1024", "-I", "256", "-E", "hash_seed=01234567-89ab-cdef-0123-456789abcdef"])
         .arg(&path)
         .status()
+        .map_err(|_| missing_tool(&format!("mkfs.{kind}")))
         .ok()?;
     assert!(status.success());
     Some((path.clone(), MemDisk(Arc::new(Mutex::new(std::fs::read(&path).unwrap())))))
@@ -90,7 +102,6 @@ const RW: OpenFlags = OpenFlags::READ.union(OpenFlags::WRITE);
 /// Walks the file system's calls through every allocation failure.
 fn run(kind: &str) {
     let Some((path, disk)) = mkfs(kind, 32) else {
-        eprintln!("mkfs.{kind} not found; skipping");
         return;
     };
     // Mounting.

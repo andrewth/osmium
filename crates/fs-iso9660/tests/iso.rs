@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::unreachable)]
 //! End-to-end tests against images made by `xorriso` and `genisoimage`.
-//! Each test is skipped, with a note, if its tool is missing.
+//! Each test fails if its tool is missing, unless `OSMIUM_SKIP_TOOL_TESTS=1`
+//! is set to skip it.
 
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -45,10 +46,21 @@ impl BlockDevice for MemDisk {
     }
 }
 
+/// Reports that the external tool `name` is missing. Tests that need one
+/// fail without it, so a machine without the tools cannot pass them
+/// silently; set `OSMIUM_SKIP_TOOL_TESTS=1` to skip them instead.
+fn missing_tool(name: &str) {
+    if std::env::var_os("OSMIUM_SKIP_TOOL_TESTS").is_some_and(|v| v == "1") {
+        std::eprintln!("{name} not installed; skipping (OSMIUM_SKIP_TOOL_TESTS=1)");
+    } else {
+        panic!("{name} not installed: install it, or set OSMIUM_SKIP_TOOL_TESTS=1 to skip the tests that need it");
+    }
+}
+
 fn tool(name: &str) -> Option<PathBuf> {
     let found = ["/usr/bin", "/usr/sbin", "/bin"].iter().map(|d| Path::new(d).join(name)).find(|p| p.exists());
     if found.is_none() {
-        eprintln!("{name} not found; skipping");
+        missing_tool(name);
     }
     found
 }
