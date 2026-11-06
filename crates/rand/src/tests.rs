@@ -128,3 +128,20 @@ fn wipe_zeroes() {
     wipe(&mut b);
     assert_eq!(b, [0; 9]);
 }
+
+#[test]
+fn dropping_the_generator_wipes_its_key_and_buffered_output() {
+    let mut slot = core::mem::MaybeUninit::new(ChaChaRng::from_seed([7; 32]));
+    // SAFETY: `slot` was initialized just above and is not dropped until below.
+    let rng = unsafe { slot.assume_init_mut() };
+    rng.fill(&mut [0u8; 10]);
+    assert!(rng.key.iter().any(|&w| w != 0) && rng.buf.iter().any(|&b| b != 0), "something to wipe");
+    // SAFETY: the value is initialized and dropped exactly once; its storage stays alive in `slot`.
+    unsafe { core::ptr::drop_in_place(slot.as_mut_ptr()) };
+    let p = slot.as_ptr();
+    // SAFETY: the fields are plain integer arrays, still initialized (to whatever `drop` left) and inside
+    // `slot`'s live storage; they are copied out, not used as a `ChaChaRng`.
+    let (key, buf) = unsafe { (core::ptr::addr_of!((*p).key).read(), core::ptr::addr_of!((*p).buf).read()) };
+    assert_eq!(key, [0; 8]);
+    assert!(buf.iter().all(|&b| b == 0));
+}
