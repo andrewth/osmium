@@ -262,12 +262,13 @@ unsafe impl StackAllocator for GuardedStacks {
 /// taken below it moves to the exception stack.
 fn on_switch(next: &osmium::sched::Task) {
     // Each process runs on its own page table; kernel tasks on the kernel's.
-    let root = osmium::proc::root_for(next).map_or(SATP_ROOT.load(Ordering::Relaxed), |r| r.0);
+    let kernel = SATP_ROOT.load(Ordering::Relaxed);
+    let root = osmium::proc::switch_root(next, osmium::mm::PhysAddr::new(kernel)).0;
     if riscv64::read_satp() & ((1 << 44) - 1) != (root >> 12) as usize {
         // SAFETY: both kinds of table map the kernel (shared root entries).
         unsafe { riscv64::write_satp(SatpMode::Sv39, 0, root) };
     }
-    if osmium::proc::root_for(next).is_some() {
+    if root != kernel {
         // User code may have been written on another hart (by fork, exec or
         // a loader) since this hart last fetched from those frames.
         // SAFETY: fence.i only synchronizes this hart's instruction stream.

@@ -568,6 +568,10 @@ pub(crate) fn sigaction(p: &Process, sig: u64, act: u64, old: u64, size: u64) ->
             ensure_trampoline(p)?;
         }
         p.signals.set_action(sig, new);
+        if p.signals.ignored.load(Ordering::SeqCst) & bit(sig) != 0 {
+            // Ignoring a signal discards it wherever it is pending, as on Linux.
+            p.group.each(|t| t.discard_pending(bit(sig)));
+        }
     }
     Ok(0)
 }

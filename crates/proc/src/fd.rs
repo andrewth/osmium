@@ -9,7 +9,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use osmium_sched::{Mutex, MutexGuard};
 use osmium_sync::Once;
@@ -36,11 +36,42 @@ impl Access {
     pub const RW: Self = Self { read: true, write: true, append: false };
 }
 
-/// An open file description: a file, a position and an access mode, shared
-/// by every descriptor duplicated from the same open.
+/// The file status flags of an open file description, in Linux's encoding:
+/// the ones `fcntl(F_SETFL)` may change.
+pub(crate) mod status {
+    pub const APPEND: u32 = 0o2000;
+    pub const NONBLOCK: u32 = 0o4000;
+    pub const ASYNC: u32 = 0o20000;
+    #[cfg(target_arch = "aarch64")]
+    pub const DIRECT: u32 = 0o200000;
+    #[cfg(not(target_arch = "aarch64"))]
+    pub const DIRECT: u32 = 0o40000;
+    pub const NOATIME: u32 = 0o1000000;
+    /// What `F_SETFL` changes; it ignores every other bit, as Linux does.
+    pub const SETTABLE: u32 = APPEND | NONBLOCK | ASYNC | DIRECT | NOATIME;
+}
+
+/// [`OpenFile::kind`]: not yet known.
+const KIND_UNKNOWN: u8 = 0;
+/// A stream (pipe, socket, device), which has no position.
+const KIND_STREAM: u8 = 1;
+/// A file with a position.
+const KIND_SEEKABLE: u8 = 2;
+
+/// An open file description: a file, a position, an access mode and status
+/// flags, shared by every descriptor duplicated from the same open.
 pub struct OpenFile {
     file: Arc<dyn File>,
+    /// Read and write; append lives in `status`, which `F_SETFL` changes.
     access: Access,
+    /// [`status`] flags. `O_NONBLOCK` of a pipe or socket is kept by the
+    /// pipe or socket itself; for other files it is only recorded, as are
+    /// `O_ASYNC` (there is no `F_SETOWN`, so no `SIGIO` is ever sent, as on
+    /// Linux without an owner), `O_DIRECT` and `O_NOATIME`.
+    status: AtomicU32,
+    /// Whether the file is a stream, found out once: a file's kind never
+    /// changes, and asking it costs a `stat` on every read and write.
+    kind: AtomicU8,
     /// Shared by every descriptor duplicated from this open (including across
     /// `fork`), so it is only ever advanced with an atomic read-modify-write.
     offset: AtomicU64,
@@ -63,7 +94,33 @@ impl OpenFile {
 
     /// [`OpenFile::new`], failing with `ENOMEM` instead of panicking.
     pub fn try_new(file: Arc<dyn File>, access: Access) -> Result<Arc<Self>, Errno> {
-        try_arc(Self { file, access, offset: AtomicU64::new(0), io: Mutex::new(()), path: None }).map_err(crate::oom)
+        Self::build(file, access, 0, None)
+    }
+
+    fn build(file: Arc<dyn File>, access: Access, flags: u32, path: Option<String>) -> Result<Arc<Self>, Errno> {
+        let append = if access.append { status::APPEND } else { 0 };
+        try_arc(Self {
+            file,
+            access: Access { append: false, ..access },
+            status: AtomicU32::new((flags | append) & status::SETTABLE),
+            kind: AtomicU8::new(KIND_UNKNOWN),
+            offset: AtomicU64::new(0),
+            io: Mutex::new(()),
+            path,
+        })
+        .map_err(crate::oom)
+    }
+
+    /// [`OpenFile::try_with_path`] that also records the open's [`status`]
+    /// flags (`O_NONBLOCK`, `O_DIRECT`, `O_NOATIME`, ...), as `F_GETFL`
+    /// reports them.
+    pub(crate) fn try_opened(
+        file: Arc<dyn File>,
+        access: Access,
+        path: String,
+        flags: u32,
+    ) -> Result<Arc<Self>, Errno> {
+        Self::build(file, access, flags, Some(path))
     }
 
     /// Opens `file`, found at the absolute `path`, at offset 0.
@@ -77,8 +134,7 @@ impl OpenFile {
 
     /// [`OpenFile::with_path`], failing with `ENOMEM` instead of panicking.
     pub fn try_with_path(file: Arc<dyn File>, access: Access, path: String) -> Result<Arc<Self>, Errno> {
-        try_arc(Self { file, access, offset: AtomicU64::new(0), io: Mutex::new(()), path: Some(path) })
-            .map_err(crate::oom)
+        Self::build(file, access, 0, Some(path))
     }
 
     /// The path it was opened by, if any.
@@ -93,7 +149,18 @@ impl OpenFile {
 
     /// The access mode.
     pub fn access(&self) -> Access {
-        self.access
+        Access { append: self.status.load(Ordering::Relaxed) & status::APPEND != 0, ..self.access }
+    }
+
+    /// The [`status`] flags recorded for this description.
+    pub(crate) fn status_flags(&self) -> u32 {
+        self.status.load(Ordering::Relaxed)
+    }
+
+    /// `F_SETFL`: replaces the settable [`status`] flags with those in
+    /// `flags`, ignoring the rest.
+    pub(crate) fn set_status_flags(&self, flags: u32) {
+        self.status.store(flags & status::SETTABLE, Ordering::Relaxed);
     }
 
     /// The current position.
@@ -122,8 +189,17 @@ impl OpenFile {
     /// (pipes, sockets, devices) can block indefinitely and ignore the
     /// offset, so they are not serialised.
     fn position_lock(&self) -> Result<Option<MutexGuard<'_, ()>>, Errno> {
-        let kind = self.file.try_stat()?.kind;
-        Ok((!matches!(kind, FileKind::CharDevice | FileKind::Fifo | FileKind::Socket)).then(|| self.io.lock()))
+        let kind = match self.kind.load(Ordering::Relaxed) {
+            KIND_UNKNOWN => {
+                let stream =
+                    matches!(self.file.try_stat()?.kind, FileKind::CharDevice | FileKind::Fifo | FileKind::Socket);
+                let kind = if stream { KIND_STREAM } else { KIND_SEEKABLE };
+                self.kind.store(kind, Ordering::Relaxed);
+                kind
+            }
+            kind => kind,
+        };
+        Ok((kind == KIND_SEEKABLE).then(|| self.io.lock()))
     }
 
     /// Reads at the current position and advances it.
@@ -144,7 +220,7 @@ impl OpenFile {
             return Err(Errno::EBADF);
         }
         let _pos = self.position_lock()?;
-        if self.access.append {
+        if self.access().append {
             // An append lands at the end and leaves the position just past it.
             let off = self.file.try_stat()?.size;
             let n = self.file.write(off, buf)?;

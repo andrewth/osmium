@@ -224,8 +224,13 @@ impl Process {
     pub(crate) fn exec_commit(&self, prepared: Prepared) -> UserEntry {
         let Prepared { name, memory, mmap, brk, brk_limit, activate, entry } = prepared;
         let root = memory.root();
+        let new = memory.clone();
         let old = self.replace_image(name, memory, brk, brk_limit, mmap);
         activate(root);
+        // This CPU has let go of the old table; one that runs another thread
+        // of the process, doomed but not yet switched away, still holds it,
+        // and keeps it from being freed until it has (see `crate::active`).
+        crate::active::loaded_here(new);
         // Shared file mappings are saved before the image goes. A failure has nowhere to be reported.
         let _ = old.sync_files();
         drop(old);

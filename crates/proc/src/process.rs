@@ -211,9 +211,9 @@ impl Process {
         // SAFETY: `Drop` takes the process out again before it is freed, and
         // the pid never changes.
         let fresh = unsafe { TABLE.lock().insert(&p) };
-        // The id counter wrapped onto a live process: refuse rather than alias it.
-        // (`Drop` takes `p` out of the table again.)
-        if !fresh {
+        // The id counter wrapped onto a live process or thread: refuse rather
+        // than alias it. (`Drop` takes `p` out of the table again.)
+        if !fresh || crate::thread::tid_in_use(p.pid.0) {
             return Err(Errno::EAGAIN);
         }
         Ok(p)
@@ -362,7 +362,8 @@ impl Process {
         self.spawn_with_fp(builder, FpState::new(), entry)
     }
 
-    /// [`Process::spawn`], with the FP/SIMD registers starting as `fp`.
+    /// [`Process::spawn`], with the FP/SIMD registers starting as `fp`. The
+    /// task runs the leader thread.
     pub(crate) fn spawn_with_fp(
         self: &Arc<Self>,
         builder: TaskBuilder,
@@ -370,21 +371,26 @@ impl Process {
         entry: impl FnOnce() + Send + 'static,
     ) -> Arc<Task> {
         let builder = if osmium_arch::fp::enabled() { builder.fp_state(fp) } else { builder };
-        builder.data(self.clone()).spawn(entry)
+        let thread = self.leader();
+        let task = builder.data(UserTask { process: self.clone(), thread: thread.clone() }).spawn(entry);
+        thread.ext.bind(&task);
+        task
     }
 
     /// [`Process::spawn`], failing with [`OutOfMemory`] (and creating no
     /// task) instead of panicking, for a task made on behalf of a system
-    /// call, with the FP/SIMD registers starting as `fp`.
+    /// call to run `thread`, with the FP/SIMD registers starting as `fp`.
+    /// The caller binds the thread to the returned task.
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64", all(target_os = "none", target_arch = "x86_64")))]
     pub(crate) fn try_spawn_with_fp(
         self: &Arc<Self>,
         builder: TaskBuilder,
         fp: FpState,
+        thread: Arc<crate::thread::Thread>,
         entry: impl FnOnce() + Send + 'static,
     ) -> Result<Arc<Task>, OutOfMemory> {
         let builder = if osmium_arch::fp::enabled() { builder.fp_state(fp) } else { builder };
-        builder.try_data(self.clone())?.try_spawn(entry)
+        builder.try_data(UserTask { process: self.clone(), thread })?.try_spawn(entry)
     }
 
     /// Finds a live process by id.
@@ -642,9 +648,17 @@ fn intern_in(names: &mut [Option<&'static str>], name: &str) -> Result<&'static 
     Ok(n)
 }
 
+/// What the task of a process carries ([`osmium_sched::Task::data`]): the
+/// process, and the thread the task runs, so that finding either from the
+/// running task is a lookup rather than a search of the thread group.
+pub(crate) struct UserTask {
+    pub(crate) process: Arc<Process>,
+    pub(crate) thread: Arc<crate::thread::Thread>,
+}
+
 /// The process the running task belongs to, if it is a user task.
 pub fn current() -> Option<Arc<Process>> {
-    osmium_sched::current().data::<Arc<Process>>().cloned()
+    osmium_sched::current().data::<UserTask>().map(|u| u.process.clone())
 }
 
 /// [`Process::handle_page_fault`] for the calling task's process. A trap
@@ -655,12 +669,49 @@ pub fn handle_page_fault(addr: u64, write: bool) -> bool {
     current().is_some_and(|p| p.handle_page_fault(addr, write) || (write && crate::thread::stale_write_fault(&p, addr)))
 }
 
-/// The root table to activate for `next`, for the scheduler's switch hook
-/// ([`osmium_sched::set_switch_hook`]). `None` means `next` is a kernel task,
-/// which may keep running on whichever table is active, provided every
-/// process table shares the kernel's mappings.
+/// The root table to load for `next` in the scheduler's switch hook
+/// ([`osmium_sched::set_switch_hook`]): its process's table, or
+/// `kernel_root`, a table with only the kernel's mappings, if `next` is a
+/// kernel task. The hook must load the returned root before it returns.
+///
+/// This is how the process layer learns which address space each CPU has
+/// loaded: one is not freed while a CPU may still walk it, even after
+/// `execve` replaced it or its process was reaped (see [`root_for`] for the
+/// details). Prefer it to [`root_for`], which cannot tell whether the hook
+/// keeps the previous table for a kernel task and so must assume it does.
+pub fn switch_root(next: &Task, kernel_root: PhysAddr) -> PhysAddr {
+    match next.data::<UserTask>() {
+        Some(u) => {
+            let memory = u.process.memory();
+            let root = memory.root();
+            crate::active::switching_to(next, Some(memory));
+            root
+        }
+        None => {
+            crate::active::switching_to(next, None);
+            kernel_root
+        }
+    }
+}
+
+/// The root table to load for `next` in the scheduler's switch hook
+/// ([`osmium_sched::set_switch_hook`]), or `None` if `next` is a kernel
+/// task. Call it in the hook, and load the returned root before the hook
+/// returns; calling it again for the same task in the same hook is harmless.
+///
+/// Each CPU keeps the address space it was last told to load, and the one
+/// before it, alive, so a table is not freed while its CPU may still use it:
+/// not when `execve` replaces the image while another thread of the process
+/// is still in the kernel on another CPU, and not when the process is freed
+/// as its last task switches away. For a kernel task (`None`) the hook may
+/// load a kernel-only table or keep whichever table is active; the table
+/// that stays active is then kept alive too, until the CPU next runs a
+/// task of a process. [`switch_root`] lets go of it sooner.
 pub fn root_for(next: &Task) -> Option<PhysAddr> {
-    next.data::<Arc<Process>>().map(|p| p.root())
+    let memory = next.data::<UserTask>()?.process.memory();
+    let root = memory.root();
+    crate::active::switching_to(next, Some(memory));
+    Some(root)
 }
 
 /// Ends the calling thread with `status`, and its process with it unless

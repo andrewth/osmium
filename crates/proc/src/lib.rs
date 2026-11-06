@@ -19,8 +19,8 @@
 //! }
 //!
 //! fn on_switch(next: &Task) {
-//!     let root = osmium_proc::root_for(next).unwrap_or(KERNEL_ROOT);
-//!     // ... load satp / TTBR0 / CR3 with `root` ...
+//!     let root = osmium_proc::switch_root(next, KERNEL_ROOT);
+//!     // ... load satp / TTBR0 / CR3 with `root`, flushing the TLB ...
 //! }
 //!
 //! fn spawn(image: &[u8]) -> Arc<Task> {
@@ -68,12 +68,14 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod active;
 mod bytes;
 mod epoll;
 mod exec;
 pub mod fd;
 pub mod futex;
 mod futex_pi;
+mod jobctl;
 mod memory;
 mod mmap;
 pub mod net;
@@ -83,7 +85,6 @@ mod process;
 mod reloc;
 mod restart;
 mod scm;
-mod jobctl;
 pub mod signal;
 mod sigqueue;
 pub mod socket;
@@ -96,7 +97,7 @@ mod uregs;
 pub use exec::{ARG_MAX, INTERP_OFFSET, Platform, UserEntry, set_platform};
 pub use fd::{FdTable, OpenFile, set_console};
 pub use memory::{AddressSpace, FileMapping, UserMemory};
-pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for};
+pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for, switch_root};
 pub use syscall::{Outcome, Sys, dispatch, dispatch_as};
 pub use thread::Thread;
 pub use unix::{MAX_IN_FLIGHT, UnixSocket, in_flight};
