@@ -1,7 +1,11 @@
 <p><img src="docs/logo/osmium-horizontal-reversed.svg" alt="osmium" width="360"></p>
 
-```sh
-cargo add osmium
+osmium is not published on crates.io. Depend on it by path, or from a git
+checkout:
+
+```toml
+[dependencies]
+osmium = { path = "../osmium/crates/osmium", features = ["full"] }
 ```
 
 ![no_std](https://img.shields.io/badge/no__std-yes-4E6984)
@@ -28,31 +32,31 @@ hypervisor with `osmium-virt`. To build your own kernel, start with the
 | Crate | What it provides | Needs `alloc` |
 |---|---|---|
 | `osmium-arch` | IRQ flag control, CPU id, hardware random numbers, trap entry with a portable `Trap` cause, per-task FP/SIMD state, wait-for-interrupt, counters, TLB maintenance, x86 port I/O/MSRs/CRs, AArch64 sysregs and PSCI, RISC-V CSRs and SBI | no |
-| `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, `RwSpinLock`, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
+| `osmium-sync` | ticket `SpinLock` generic over IRQ/preemption guards, MCS lock, `RwSpinLock` (with `try_read`/`try_write`), `SeqLock`, RCU (`Rcu`, `RcuCell`), intrusive lists and trees, `Once`, `Lazy`, `PerCpu`, `PerCpuCell`, lock-free SPSC ring | no |
 | `osmium-mm` | `PhysAddr`/`VirtAddr`, `MemoryMap`, buddy and bitmap frame allocators, generic `PageTable` (x86_64 4/5-level, AArch64, Sv39/Sv48/Sv57, EPT, Arm stage 2, RISC-V G-stage, AArch64 EL2, IOMMU formats), slab heap as `#[global_allocator]` | no |
 | `osmium-hal` | MMIO register cells and bounds-checked `IoMem`, x86 `Port<T>`, device traits (serial, IRQ controller, clock, block, DMA, display), IOMMU domains and `IommuDma`, linear framebuffers with pixel formats, `IrqTable`, global console with `println!` | no |
 | `osmium-drivers` | virtio core: MMIO and PCI transports (legacy and 1.x) and the split virtqueue, and the virtio-console driver | no |
 | `osmium-display` | virtio-gpu (also as virtio-vga), Bochs DISPI (QEMU std VGA, bochs-display) and VESA BIOS (VBE) mode setting | no |
-| `osmium-sysdrv` | NS16550A, PL011, i8254 PIT, QEMU `fw_cfg` (ports or MMIO, DMA), RISC-V PLIC and CLINT, GICv2, GICv3 (with LPIs, the ITS and GICv4 virtual LPIs), x86 local APIC (with INIT/SIPI), x86 I/O APIC, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers | no |
+| `osmium-sysdrv` | NS16550A, PL011, i8254 PIT, HPET, QEMU `fw_cfg` (ports or MMIO, DMA), RISC-V PLIC and CLINT, GICv2, GICv3 (with LPIs, the ITS and GICv4 virtual LPIs), x86 local APIC (with INIT/SIPI), x86 I/O APIC, Intel VT-d, AMD-Vi, Arm SMMUv3 and RISC-V IOMMU drivers | no |
 | `osmium-storage` | RAM disk, virtio-blk (MMIO, legacy and 1.x), AHCI (SATA) and NVMe disks | no |
 | `osmium-usb` | xHCI USB host controller (interrupt-driven), UHCI, OHCI and EHCI (polled or interrupt-driven), hubs, isochronous endpoints, USB mass storage and HID (report descriptors, keyboards, mice, boot keyboards) | no |
-| `osmium-netdev` | virtio-net (MMIO or PCI, legacy and 1.x), Mellanox ConnectX-3 (mlx4) Ethernet (polled or MSI-X, checksum and segmentation offload; no RSS or steering) and InfiniBand (subnet management, unreliable datagrams, multicast, reliable connections with RDMA, IPoIB; no SR-IOV; both simulator-tested only), USB CDC-ECM and CDC-NCM Ethernet (NCM simulator-tested only) | no |
+| `osmium-netdev` | virtio-net (MMIO or PCI, legacy and 1.x), Mellanox ConnectX, ConnectX-2 and ConnectX-3 (mlx4) Ethernet (polled or MSI-X, checksum and segmentation offload; no RSS or steering) and InfiniBand (subnet management, unreliable datagrams, multicast, reliable connections with RDMA, IPoIB; no SR-IOV); the whole mlx4 driver is simulator-tested only, USB CDC-ECM and CDC-NCM Ethernet (NCM simulator-tested only) | no |
 | `osmium-boot` | zero-copy FDT parser, FDT writer, Multiboot2 and PVH parsers (all fill a `MemoryMap`), ACPI MADT/MCFG/DMAR/IVRS reader, ELF64 loader, PE32+ loader and relocator, UEFI system table, GOP and loader boot services (pages, memory map, `ExitBootServices`, files) | writer only |
 | `osmium-acpi` | ACPI: FADT, an AML interpreter (namespace, control methods, operation regions and fields), `_CRS` resource decoding, `_PRT` PCI interrupt routing, sleep states and power off, reset, SCI fixed events and GPEs | yes |
-| `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO and priority policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
-| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension, AArch64 EL2 (non-VHE or VHE host) and AMD SVM vCPUs with SBI and PSCI (multi-vCPU guests), emulated PLIC, GICv2, 8259 PIC, 8254 PIT and local APIC, virtio-net | yes |
+| `osmium-sched` | context switch, `Task`, injectable `Scheduler` (FIFO, priority and earliest-deadline-first policies included), `WaitQueue`, `Mutex`, `Semaphore`, `TimerQueue` | yes |
+| `osmium-virt` | `GuestMemory`, stage-2 table helpers, MMIO/PIO `Bus`, normalized `VmExit`, `Vcpu` trait and `run_vcpu` loop, emulated 16550, virtio-mmio console and block devices, RISC-V H-extension, AArch64 EL2 (non-VHE or VHE host), AMD SVM and Intel VMX vCPUs with SBI and PSCI (multi-vCPU guests), emulated PLIC, APLIC and IMSIC, GICv2 and GICv3, PL011, 8259 PIC, 8254 PIT, local APIC and I/O APIC, virtio-net | yes |
 | `osmium-exec` | heap-free async executor (fixed task slots, interrupt-safe wakers), `Signal`, `StaticCell` | no |
-| `osmium-fs` | `File` trait and `Vfs` namespace (mounts, `..` across mounts, symlinks), Linux `Errno`, RAM file system, `/dev` nodes, cpio initramfs unpacking | yes |
-| `osmium-proc` | `Process` (address space, fd table, cwd, exit status, `wait`), `AddressSpace` with page-table-checked user copies, and one portable system-call dispatcher using each architecture's Linux numbers and structure layouts, including sockets (loopback, `socketpair`, `sendmsg`/`recvmsg`) and `poll`/`select`/`epoll` | yes |
-| `osmium-fs-fat` | FAT12, FAT16 and FAT32 for the `osmium-fs` VFS over any `BlockDevice`: long (VFAT) names, create, write, truncate, remove | yes |
-| `osmium-net` | Polled IPv4 and IPv6 stack over any `NetDevice`: ARP, neighbor discovery and SLAAC, ICMP echo, UDP, TCP (SACK, timestamps), DHCP client, DNS (UDP and TCP), IP fragmentation, IGMPv2 multicast | yes |
-| `osmium-iscsi` | iSCSI initiator over `osmium-net` TCP as a `BlockDevice`: login and negotiation, R2T and immediate-data writes, SendTargets discovery | yes |
+| `osmium-fs` | `File` trait and `Vfs` namespace (mounts, `..` across mounts, symlinks), Linux `Errno`, RAM file system, overlay and synthetic trees, `/dev` nodes, cpio initramfs unpacking | yes |
+| `osmium-proc` | `Process` (address space, fd table, cwd, exit status, `wait`), `AddressSpace` with page-table-checked user copies, and one portable system-call dispatcher using each architecture's Linux numbers and structure layouts: `fork` (copy-on-write), threads, `execve` of static, PIE and dynamically linked ELF files, POSIX signals, futexes (including priority inheritance), pipes, sockets (IP, `AF_UNIX`, `socketpair`, `sendmsg`/`recvmsg` with `SCM_RIGHTS`) and `poll`/`select`/`epoll` | yes |
+| `osmium-fs-fat` | FAT12, FAT16 and FAT32 for the `osmium-fs` VFS over any `BlockDevice`: long (VFAT) names, create, write, truncate, rename, remove | yes |
+| `osmium-net` | Polled IPv4 and IPv6 stack over any `NetDevice`: ARP, neighbor discovery and SLAAC, ICMP echo, UDP, TCP (SACK, timestamps), DHCP and DHCPv6 clients, DNS (UDP and TCP), IPv4 and IPv6 fragmentation, path-MTU discovery, IPv6 privacy addresses, IGMPv2 multicast | yes |
+| `osmium-iscsi` | iSCSI initiator over `osmium-net` TCP as a `BlockDevice`: login and negotiation, CHAP (one-way or mutual), CRC32C header and data digests, R2T and immediate-data writes, SendTargets discovery | yes |
 | `osmium-rand` | Entropy sources over the CPU's random number instructions (RDRAND/RDSEED, RNDR, Zkr), SHA-256, and a ChaCha20 generator with fast key erasure, shareable across CPUs and interrupt handlers | no |
 | `osmium-tls` | TLS 1.3 servers over rustls: a pure-Rust provider (ChaCha20-Poly1305, X25519, ECDSA P-256), a sans-I/O `ServerSession`, self-signed certificates and a boot-time self-test. Uses crates.io dependencies | yes |
 | `osmium-http` | Sans-I/O HTTP/1.1 server: strict request parsing (chunked bodies, limits, request-smuggling defences), keep-alive and pipelining, response building. No dependencies | yes |
-| `osmium-fs-ext4` | ext2/ext3/ext4 (read and write) for the `osmium-fs` VFS over any `BlockDevice` | yes |
+| `osmium-fs-ext4` | ext2/ext3/ext4 (read and write) for the `osmium-fs` VFS over any `BlockDevice`: extents, `metadata_csum`, the JBD2 journal (replayed at mount) | yes |
 | `osmium-fs-iso9660` | read-only ISO 9660 for the `osmium-fs` VFS over any `BlockDevice`: Rock Ridge, Joliet, deep-directory relocation, multi-extent and interleaved files | yes |
-| `osmium-fs-btrfs` | btrfs (read and write) for the `osmium-fs` VFS over any `BlockDevice`: copy-on-write transactions committed per call, subvolumes and snapshots (created, written on either side, deleted), CRC32C and xxHash64 checksums with fallback to a second copy, zlib, LZO and zstd extents read, new chunks as it fills, orphans for open unlinked files | yes |
+| `osmium-fs-btrfs` | btrfs (read and write) for the `osmium-fs` VFS over any `BlockDevice`: copy-on-write transactions committed per call, subvolumes and snapshots (created, written on either side, deleted), CRC32C and xxHash64 checksums with fallback to a second copy, zlib, LZO and zstd extents read, new chunks as it fills, orphans for open unlinked files, multi-device volumes (`mount_multi`) | yes |
 | `osmium` | re-exports everything behind features of the same names (`full` enables all) | |
 
 The library never defines an entry point, panic handler or global allocator;
@@ -70,33 +74,44 @@ paging (Sv39 or AArch64 stage 1), moves the console to the UART driver
 (16550 or PL011), brings up the other CPUs (SBI HSM or PSCI), and runs the
 shared demos in [`examples/demos`](examples/demos): tasks with timer
 preemption, a sleeping mutex, timer sleeps, cross-CPU wake-ups by IPI, task
-migration, and recovery from a breakpoint and a page fault:
+migration, and recovery from a breakpoint and a page fault. Task stacks have
+guard pages, so a kernel stack overflow is caught. All three then run the
+same Rust user programs from `examples/user` as `osmium-proc` processes, each
+in its own address space: an init program forks (copy-on-write), execs,
+waits, starts threads and works on files in an `osmium-fs` RAM file system.
+A run looks like this:
 
 ```console
 $ cd examples/riscv-virt && cargo run --release
-osmium riscv-virt example (hart 0)
-[fdt]   riscv-virtio,qemu, 9271 bytes, bootargs ""
+osmium riscv-virt example (hart 3)
+[fdt]   riscv-virtio,qemu, 12367 bytes, bootargs ""
 [uart]  ns16550a at 0x10000000, console switched from SBI
-[frame] buddy allocator: 32625 free frames (127 MiB)
-[mmu]   Sv39 on, root 0x80062000; kmain mapped R|X|G via Size4K page
+...
+[frame] buddy allocator: 30907 free frames (120 MiB)
+[mmu]   Sv39 on, root 0x808df000; kmain mapped R|X|G via Size4K page
+...
 [sched] FIFO scheduler, 10 ms tick
 [smp]   hart 0 online as CPU 1
-[smp]   hart 2 online as CPU 2
-[smp]   hart 3 online as CPU 3
+[smp]   hart 1 online as CPU 2
+[smp]   hart 2 online as CPU 3
 [smp]   4 CPUs online
+...
 [task]  A0
 ...
 [mutex] 4 tasks x 1000 increments across yields = 4000
-[preempt] busy-looping task was preempted after 2 ticks
-[timer] slept 51 ms (asked for 50)
+[preempt] busy-looping task was preempted after 3 ticks
+[timer] slept 53 ms (asked for 50)
 [smp]   8 tasks on 4 CPUs (ran on mask 0b1111), mutex total 2000
 [smp]   migrating task visited CPUs [0, 1, 2, 3, 0]
 [trap]  recovered from Breakpoint
 [trap]  recovered from PageFault { addr: 4096, access: Read }
-[done]  10 timer ticks, 32545 free frames; shutting down
+...
+[done]  410 timer ticks, 29382 free frames; shutting down
 ```
 
-(Press `Ctrl-A X` to leave QEMU if it does not exit on its own.)
+OpenSBI may start the kernel on any hart. That hart becomes CPU 0 and the
+others are numbered in order. (Press `Ctrl-A X` to leave QEMU if it does not
+exit on its own.)
 
 [`examples/riscv-firmware`](examples/riscv-firmware) shows the other end of
 the range: machine-mode firmware started with `-bios none`, with no heap and
@@ -113,7 +128,7 @@ switch is the real one, running on host threads.
 
 ```sh
 cargo test --workspace --all-features
-./scripts/check.sh   # tests, clippy, rustdoc, all bare-metal targets, QEMU boot
+./scripts/check.sh   # tests, clippy, rustdoc, bare-metal builds, every example linted and built, the QEMU boots
 ```
 
 Requires a nightly toolchain (pinned in `rust-toolchain.toml`) for the
@@ -122,39 +137,31 @@ features.
 
 ## Current limitations
 
-- User mode works on all three architectures: the examples run the same
-  user programs, each in its own address space (sharing the kernel's root
-  page-table entries), with system calls, and all three load the same
-  Rust user program from an ELF file as an `osmium-proc` process, which
-  opens, writes and lists files in an `osmium-fs` RAM file system. On
-  all three an init program also forks, waits and execs; `fork` copies
-  memory copy-on-write, and a process can have several threads (`clone` with `CLONE_THREAD`, joined with `futex`). Kernel stack overflows are caught on all three
-  architectures when task stacks have guard pages.
-- SMP has been exercised under QEMU (4 CPUs, multi-threaded TCG) but not on
-  physical hardware. Load balancing (`with_stealing`) is opt-in; by default tasks
-  move only when `Task::set_cpu` asks.
+- Nothing has run on physical hardware. Everything, including SMP (4 CPUs,
+  multi-threaded TCG), has been exercised only under QEMU.
+- The Intel VMX backend has only run under nested KVM, because QEMU's TCG
+  does not emulate VMX.
+- The mlx4 driver (Ethernet, InfiniBand, MSI-X and offloads) has only been
+  tested against a simulated HCA, since QEMU has no mlx4 device; several
+  register details were taken from the Linux driver, not a datasheet.
+- USB hubs have been exercised against a scripted xHCI model (enumeration,
+  routing, connect and disconnect) and isochronous endpoints against a
+  simulated controller, not under QEMU or on hardware. Isochronous transfers
+  carry at most 4 KiB per service interval, xHCI streams have no secondary
+  arrays (at most 7 streams on each of 4 endpoints), and a SuperSpeed hub
+  port that needs a warm reset is not recovered. UHCI, OHCI and EHCI have no
+  isochronous endpoints, and EHCI supports no hubs. CDC-NCM has only been
+  tested against a simulated device.
+- Signal frames hold the FP/SIMD registers but not SVE state beyond them.
+- A process's threads share one CPU unless the kernel registers a remote TLB
+  flush (`osmium::arch::mmu::set_remote_flush`; AArch64 needs none). Load
+  balancing between CPUs (`with_stealing`) is opt-in.
 - The context switch saves FP registers only on targets that have them
-  enabled (`neon`, `d`). Soft-float kernels are unaffected.
-- The hypervisor has RISC-V H, AArch64 EL2 (for a non-VHE host, or a VHE
-  host with `aarch64-vhe`), AMD SVM and Intel VMX backends.
-  The VMX backend has only run under nested KVM (QEMU's TCG does not emulate
-  VMX); `x86_64-hyp` uses SVM or VMX, whichever the CPU has. None of the
-  backends has run on physical hardware.
+  enabled (`neon`, `d`); soft-float kernels are unaffected.
 - When the heap is backed by `LockedFrames`, it can return large blocks to
   the frame allocator only if the mapper implements `virt_to_phys`
   (`OffsetMapper` does).
-- USB: hubs and isochronous endpoints are implemented but have only been
-  tested against a simulated xHCI controller, not QEMU or hardware.
-- mlx4: MSI-X interrupts, checksum and segmentation offload and InfiniBand have only been
-  tested against a simulated HCA (QEMU has no mlx4 device); several register
-  details were written from the Linux driver, not a datasheet.
-- `osmium-net` sockets now take `SocketAddr`; a socket serves one address
-  family, and there is no IPv6 fragmentation or path-MTU discovery.
-  Isochronous transfers are limited to 4 KiB per service interval, xHCI
-  streams have no secondary arrays (at most 7 streams on each of 4 endpoints), and a SuperSpeed hub
-  port needing a warm reset is not recovered.
-- UHCI, OHCI and EHCI have no isochronous endpoints, and EHCI supports no
-  hubs.
+- An `osmium-net` socket serves one address family.
 
 ## License
 

@@ -49,14 +49,15 @@ x86_64, AArch64 and RISC-V 64. It is a library, not a kernel:
 
 | Need | For | Notes |
 |---|---|---|
-| rustup | everything | `rust-toolchain.toml` pins nightly with `rust-src`, `clippy` and `rustfmt`, plus the three bare-metal targets and the two UEFI targets. rustup installs them on first use. |
-| `aarch64-unknown-linux-musl`, `riscv64gc-unknown-linux-musl` targets | `scripts/check.sh` only | Not in the toolchain file. Install them with `rustup target add aarch64-unknown-linux-musl riscv64gc-unknown-linux-musl`. |
+| rustup | everything | `rust-toolchain.toml` pins nightly with `rust-src`, `clippy` and `rustfmt`, plus the three bare-metal targets, the two UEFI targets and the two musl targets `check.sh` type-checks the FP-saving context switch with. rustup installs them on first use. |
 | `qemu-system-riscv64`, `qemu-system-aarch64`, `qemu-system-x86_64` | running the examples | Must support RISC-V `virt` with the H extension, AArch64 `virt,virtualization=on`, x86 `q35` with `-cpu max` (TCG exposes AMD SVM), PVH `-kernel` loading, and `qemu-xhci`, `usb-*` and `virtio-*-device` devices. |
-| dosfstools (`mkfs.fat`, `fsck.fat`) | FAT32 tests, the USB-stick boot check | Optional: tests skip without them |
-| e2fsprogs (`mkfs.ext2`, `e2fsck`, `debugfs`) | ext2/3/4 tests | Optional |
-| GNU `cpio` | cpio round-trip test | Optional |
-| `python3` | the iSCSI test target (`scripts/iscsi-target.py`) and the screen checks (`scripts/screen.py`) | Optional: standard library only |
-| OVMF (`/usr/share/ovmf/OVMF.fd`), AAVMF (`/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd`) | the UEFI example | Optional |
+| dosfstools (`mkfs.fat`, `fsck.fat`) | FAT tests, the USB-stick boot check | The tests fail without them unless `OSMIUM_SKIP_TOOL_TESTS=1`; `check.sh` skips the boot check |
+| e2fsprogs (`mkfs.ext2`, `e2fsck`, `debugfs`) | ext2/3/4 tests | Fail without them unless `OSMIUM_SKIP_TOOL_TESTS=1` |
+| `xorriso`, `genisoimage` | ISO 9660 tests | Fail without them unless `OSMIUM_SKIP_TOOL_TESTS=1` |
+| GNU `cpio` | cpio round-trip test | Fails without it unless `OSMIUM_SKIP_TOOL_TESTS=1` |
+| btrfs-progs (`mkfs.btrfs`, `btrfs`), `zstd` | btrfs tests | Skipped with a note without them |
+| `python3` | the iSCSI test target (`scripts/iscsi-target.py`), its self-test and the screen checks (`scripts/screen.py`) | Standard library only; `check.sh` skips the boots without it |
+| OVMF (`/usr/share/ovmf/OVMF.fd`), AAVMF (`/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd`) | the UEFI example | Optional: without them `check.sh` boots the images bundled in `fw/` (needs `bzip2`); see `fw/README.md` |
 
 The library crates use only stable Rust features (MSRV 1.88, edition 2024).
 Nightly is needed for the examples and for building for bare-metal targets.
@@ -76,9 +77,12 @@ means `cargo run` must be run **inside the example directory**. Press
 
 ### Adding osmium to your own project
 
+osmium is not published on crates.io; depend on a checkout by path (or by
+git URL):
+
 ```toml
 [dependencies]
-osmium = { version = "0.1", features = ["full"] }
+osmium = { path = "../osmium/crates/osmium", features = ["full"] }
 
 [profile.dev]
 panic = "abort"
@@ -87,8 +91,10 @@ panic = "abort"
 ```
 
 A bare-metal kernel also needs a target (e.g. `riscv64imac-unknown-none-elf`),
-a linker script passed through `build.rs` (`-T link.x`), and `_start`
-assembly. Copy them from whichever example is closest to your platform:
+a linker script passed through `build.rs` (the examples share
+`examples/link/riscv64.x`, `aarch64.x` and `x86_64.x`, passed as
+`cargo::rustc-link-arg=-T<path>`), and `_start` assembly. Copy them from
+whichever example is closest to your platform:
 
 | Example | Target | Load address |
 |---|---|---|
@@ -116,13 +122,22 @@ assembly. Copy them from whichever example is closest to your platform:
 Shared code lives in two places:
 
 - `examples/demos` is a library with the scheduler, SMP, network, storage and
-  USB demos, plus `demos::user` (a console device and the RAM file system the
-  user programs see).
-- `examples/user` holds `hello.rs` and `init.rs`, two `no_std` user programs
-  that make raw Linux-numbered system calls. Each kernel's `build.rs`
-  compiles them with `rustc` and embeds the result with
-  `include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"))`. Each kernel
-  installs `init` as `/bin/init`, which forks, execs itself and waits.
+  USB demos, and the plumbing that is the same on every platform:
+  `demos::kernel` (the frame allocator, `GuardedStacks`, the clock, CPU
+  bring-up bookkeeping), `demos::fault` (the breakpoint, page-fault and
+  stack-overflow demos), `demos::user` (the user address-space layout, the
+  RAM file system the user programs see, spawning processes, and the
+  user-mode half of a trap handler) and `demos::guest` (for the
+  hypervisors). What is left in each kernel is what differs between
+  platforms.
+- `examples/user` holds `no_std` user programs (`hello.rs`, `init.rs`, and on
+  RISC-V `net.rs`, a PIE, a dynamically linked program and its interpreter
+  `ld.rs`) that make raw Linux-numbered system calls. `examples/demos`'s
+  `build.rs` compiles them with `rustc` for the kernel's target (behind the
+  default `user` feature, which the hypervisors turn off), and `demos::user`
+  embeds them as `HELLO_ELF`, `INIT_ELF`, `NET_ELF`, `PIE_ELF`, `DYN_ELF` and
+  `LD_ELF`. Each kernel installs `init` as `/bin/init`, which forks, execs
+  itself and waits.
 
 All three hypervisor examples can boot the matching osmium kernel as their
 guest. QEMU loads the guest image beside the hypervisor, so build both and
@@ -204,27 +219,31 @@ on the `osmium` facade, which re-exports them as `osmium::mm`,
 
 | Feature | Crate | Needs `alloc` | Use it for |
 |---|---|---|---|
-| `sync` | osmium-sync | no | Spin locks, `Once`, `Lazy`, per-CPU data, SPSC ring, `SeqLock` |
+| `sync` | osmium-sync | no | Spin and MCS locks, `RwSpinLock`, `SeqLock`, RCU, `Once`, `Lazy`, per-CPU data, SPSC ring, intrusive lists and trees |
 | `mm` | osmium-mm | no | Addresses, memory maps, frame allocators, page tables, the heap |
 | `hal` | osmium-hal | no | MMIO and port I/O, device traits (including `Display` and `Framebuffer`), `IrqTable`, the console and `println!` |
 | `usb` | osmium-usb | no | xHCI, EHCI, OHCI and UHCI host controllers, USB class drivers |
 | `netdev` | osmium-netdev | no | virtio-net, mlx4, USB CDC-ECM and CDC-NCM network drivers |
 | `drivers` | osmium-drivers | no | virtio core: MMIO and PCI transports, virtqueue |
 | `display` | osmium-display | no | virtio-gpu, Bochs DISPI, VESA BIOS Extensions |
-| `sysdrv` | osmium-sysdrv | no | UARTs, PIT, `fw_cfg`, interrupt controllers (PLIC, CLINT, GICv2, local APIC, I/O APIC) and IOMMUs (VT-d, AMD-Vi, SMMUv3, RISC-V) |
+| `sysdrv` | osmium-sysdrv | no | UARTs, PIT, HPET, `fw_cfg`, interrupt controllers (PLIC, CLINT, GICv2, GICv3, local APIC, I/O APIC) and IOMMUs (VT-d, AMD-Vi, SMMUv3, RISC-V) |
 | `storage` | osmium-storage | no | virtio-blk, AHCI, NVMe and RAM disk (enables `drivers`) |
 | `boot` | osmium-boot | `FdtWriter` only | FDT, Multiboot2, PVH, UEFI (system table, GOP, loader boot services), ACPI, ELF loading |
 | `acpi` | osmium-acpi | yes | FADT, an AML interpreter, `_CRS`, `_PRT`, sleep states, power off, SCI and GPEs (enables `boot`) |
 | `exec` | osmium-exec | no | A heap-free async executor |
 | `sched` | osmium-sched | yes | Tasks, context switch, scheduler, `Mutex`, `WaitQueue`, timers |
-| `fs` | osmium-fs | yes | VFS, RamFs, `/dev`, cpio, ext2/ext3/ext4 |
+| `fs` | osmium-fs | yes | VFS, RamFs, overlay and synthetic trees, `/dev`, cpio |
+| `fs-ext4` | osmium-fs-ext4 | yes | ext2/ext3/ext4, read and write (enables `fs`) |
 | `fs-fat` | osmium-fs-fat | yes | FAT12/16/32 (enables `fs`) |
 | `fs-iso9660` | osmium-fs-iso9660 | yes | Read-only ISO 9660 with Rock Ridge and Joliet (enables `fs`) |
 | `fs-btrfs` | osmium-fs-btrfs | yes | btrfs, read and write, with subvolumes, checksums and compression (enables `fs`) |
-| `proc` | osmium-proc | yes | Processes and the system-call dispatcher (enables `sched`, `fs`, `mm`, `boot`) |
-| `net` | osmium-net | yes | IPv4, IPv6, ARP, ICMP, UDP, TCP, DHCP |
+| `proc` | osmium-proc | yes | Processes and the system-call dispatcher (enables `sched`, `fs`, `mm`, `boot`, `net`) |
+| `net` | osmium-net | yes | IPv4, IPv6, ARP, ICMP, UDP, TCP, DHCP, DHCPv6, DNS |
 | `iscsi` | osmium-iscsi | yes | iSCSI initiator: a remote disk over TCP as a `BlockDevice` (enables `net`) |
 | `virt` | osmium-virt | yes | Hypervisor building blocks |
+| `rand` | osmium-rand | no | CPU entropy sources, SHA-256, a ChaCha20 generator |
+| `tls` | osmium-tls | yes | TLS 1.3 servers over rustls (crates.io dependencies) |
+| `http` | osmium-http | yes | A sans-I/O HTTP/1.1 server |
 
 `default` is `sync`, `mm`, `hal`, `drivers`, `sysdrv`, `storage`, `display`, `usb`, `netdev` and `boot`. `full` turns on all
 of the above.
@@ -273,16 +292,38 @@ The handler gets a `&mut TrapFrame` and decides what to do from the portable
 
 ```rust
 fn on_trap(frame: &mut TrapFrame) {
-    match frame.cause() {
+    let cause = frame.cause();
+    match cause {
         Trap::Interrupt(Interrupt::Timer) => { on_timer(); osmium::sched::preempt_if_needed(); }
         Trap::Interrupt(Interrupt::External) => { if let Some(plic) = PLIC.get() { IRQS.handle_pending(plic); } }
-        Trap::Syscall => return syscall(frame),
-        Trap::PageFault { addr, access } if frame.from_user() => osmium::proc::exit(ExitStatus::Signal(11)),
+        Trap::Syscall => return syscall(frame),  // section 10; delivers signals itself
+        // A user page fault may be one the process's memory resolves: a write to a
+        // page fork shares copy-on-write, or the first touch of a demand-paged mmap
+        // page. Only if it is not does the program get SIGSEGV (or dies).
+        Trap::PageFault { addr, access } if frame.from_user() => {
+            if !osmium::proc::handle_page_fault(addr as u64, access == Access::Write) {
+                user_fault(frame, 11, addr);
+            }
+        }
         Trap::Breakpoint => frame.set_pc(frame.pc() + 4),  // skip ebreak (2 bytes if compressed)
         other => panic!("unexpected trap {other:?} at {:#x}", frame.pc()),
     }
+    // About to return to user mode from an interrupt: deliver pending signals.
+    if frame.from_user() && matches!(cause, Trap::Interrupt(_)) {
+        if let Some(status) = osmium::proc::signal::deliver(frame) { osmium::proc::exit(status); }
+    }
+}
+
+fn user_fault(frame: &mut TrapFrame, sig: u8, addr: usize) {
+    // Runs the program's handler, or ends the process with the default action.
+    if let Some(status) = osmium::proc::signal::user_fault(frame, sig, addr) {
+        osmium::proc::exit(status);
+    }
 }
 ```
+
+`demos::user::handle` and `demos::user::before_return` in `examples/demos`
+are the complete version of the user-mode half, shared by all three kernels.
 
 ### 5.2 A console
 
@@ -358,9 +399,15 @@ pm.enable(aml.host_mut()).unwrap();       // switch the chipset to ACPI mode
 pm.power_off(&mut aml).unwrap();          // _PTS(5), then SLP_TYP and SLP_EN from \_S5_
 ```
 
-AML is firmware's code, so the interpreter treats it as untrusted: a call that loops, recurses or
-sleeps without end is cut off by the limits in `Config` (`max_depth`, `max_steps`, `max_sleep_us`), and
-objects have size limits. The interpreter recurses once per nesting level and needs about 0.65 KiB of
+AML is firmware's code, so the interpreter treats it as untrusted. The limits in `Config` cut off a
+call that loops, recurses, sleeps or allocates without end: `max_depth` (nesting and calls, default 96),
+`max_steps` (terms per call, default 20 million, with the work inside a term counted too: one step per
+64 bytes copied, converted or compared, per 64 field bits moved, and per access the `Host` sees),
+`max_sleep_us`, `max_total_steps` and `max_total_sleep_us` (for a whole `initialize` or device search),
+`max_alloc_bytes` (64 MiB allocated per call), `max_total_alloc_bytes` (256 MiB per batch) and
+`max_retained_bytes` (64 MiB of strings, buffers and packages kept in the namespace between calls).
+Running out of memory budget fails the call with `AmlError::OutOfMemory`; a reference that outlived the
+method frame it points into fails with `AmlError::StaleReference`. The interpreter recurses once per nesting level and needs about 0.65 KiB of
 stack for each in a release build (the default `max_depth` of 96 fits in 64 KiB; a debug build needs
 about eight times that), and `Interpreter::peak_depth` says how deep your firmware actually goes (QEMU's
 q35 DSDT peaks at 8).
@@ -426,7 +473,8 @@ unsafe { riscv64::write_satp(SatpMode::Sv39, 0, pt.root().0) };
 | `SpinLock<T>` | Short critical sections between CPUs. Disables preemption. |
 | `IrqSpinLock<T>` | The data is also touched by an IRQ handler. Disables interrupts. |
 | `RawSpinLock<T>` | IRQs are already masked, or there is only one CPU. |
-| `RwSpinLock`, `SeqLock` | Read-mostly data |
+| `McsLock<T>` | Contended locks: each waiter spins on its own node |
+| `RwSpinLock` (`try_read`, `try_write`), `SeqLock`, `Rcu`/`RcuCell` | Read-mostly data |
 | `Once`, `Lazy` | Statics that are initialised at boot |
 | `PerCpu<T>`, `PerCpuCell<T>` | Per-CPU state. `PerCpuCell::with` masks IRQs and panics on re-entry. |
 | `SpscRing<T, N>` | IRQ handler to task, lock-free |
@@ -462,8 +510,11 @@ for (cpu, apic_id) in APIC_IDS.iter().enumerate().take(ncpus).skip(1) {
         entry: ap_start64 as *const () as u64,     // from pvh_start!(kmain, ap: ap_main)
         cpu,
     };
-    unsafe { apic.start_ap(apic_id.load(Relaxed) as u8, &boot, |ns| pit.wait_ns(ns)) };
-    while ONLINE.load(Acquire) <= cpu { core::hint::spin_loop(); }  // wait for it to check in
+    // Err(IpiTimeout) if the APIC never accepted an IPI (e.g. a stale APIC id).
+    if unsafe { apic.start_ap(apic_id.load(Relaxed) as u8, &boot, |ns| pit.wait_ns(ns)) }.is_err() {
+        break;  // keep CPU indices dense: run with the CPUs started so far
+    }
+    while ONLINE.load(Acquire) <= cpu { core::hint::spin_loop(); }  // wait for it to check in (with a timeout in practice)
 }
 ```
 
@@ -480,7 +531,10 @@ the CPU to the scheduler for good.
 static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing(); // 2-tick slices
 static TIMERS: TimerQueue = TimerQueue::new();
 
-osmium::sched::set_stack_allocator(&GuardedStacks);  // optional: default is the heap
+// optional: default is the heap. demos::kernel::GuardedStacks<F> maps each stack
+// in the kernel table with an unmapped guard page below it.
+static STACKS: GuardedStacks<Sv39> = GuardedStacks::new(&PT, |va| remote_sfence_vma(va, PAGE_SIZE));
+osmium::sched::set_stack_allocator(&STACKS);
 osmium::sched::set_switch_hook(on_switch);           // optional: per-task page table, kernel stack
 osmium::sched::inject_scheduler(&SCHED);
 osmium::sched::set_remote_wake_hook(|cpu| { let _ = sbi::send_ipi(1, HARTS[cpu].load(Relaxed)); });
@@ -507,8 +561,11 @@ Each `inject_*` and `set_*_hook` function may be called only once.
   CPUs steal queued tasks they are allowed to run, and new or woken tasks go
   to idle CPUs. `SCHED.steals()` counts the steals.
 - **Stack guards.** Implement `StackAllocator` to give each task a stack
-  with an unmapped guard page below it. riscv-virt's `GuardedStacks` does
-  this, and `TrapCpu::overflowed` then reports overflows instead of
+  with an unmapped guard page below it. `GuardedStacks` in
+  `examples/demos/src/kernel.rs` does this (`GuardedStacks::new(&PT,
+  flush_others)` over the kernel's `KernelTable`; `leak` gives boot and
+  secondary-CPU stacks guard pages too). With `TrapCpu::set_stack_limit` set
+  in the switch hook, `TrapCpu::overflowed` then reports overflows instead of
   corrupting memory.
 
 ### Spawning and affinity
@@ -615,14 +672,14 @@ the queue takes no more requests until you reset the device. Call
 `enable_memory_and_dma()` on the function before handing its BAR to a
 driver. riscv-virt's `find_pci` shows the whole sequence.
 
-The two PCIe storage drivers are polled and have one command in flight.
-For their timeouts they take an `osmium::hal::timer::Clock` (anything with
-`now_ns()`):
+The two PCIe storage drivers poll for completions unless you enable their
+interrupts. For their timeouts they take an `osmium::hal::timer::Clock`
+(anything with `now_ns()`):
 
 | Driver | Finds | Use |
 |---|---|---|
 | `ahci::Ahci` | class 01/06/01, registers in BAR 5 | `Ahci::new(io, &dma, Some(&clock))` brings the ports up; with `None`, its timeouts count polls instead of time. `disks()` lists the SATA disk ports, and `take_disk(port)` returns an `AhciDisk`, a `BlockDevice` with `model()` and `serial()` that outlives the HBA. With both the HBA and the disk supporting it, NCQ keeps up to 8 commands in flight per call. `Ahci::enable_interrupts()` and `AhciDisk::enable_interrupts(idle)` wait for completions by sleeping in `idle` instead of spinning; the kernel's IRQ handler (INTx or MSI) calls `Ahci::irq().handle()`. `atapi_drives()` and `take_atapi(port)` give an `AhciAtapi`, a read-only `BlockDevice` over a disc (2048-byte blocks, `reload()` after a disc change) that `osmium_fs_iso9660` can mount. Not supported: port multipliers, hot plug, queued or interrupt-driven ATAPI. |
-| `nvme::Nvme` | class 01/08/02, BAR 0 (64-bit) | `Nvme::new(io, &dma, &clock)` is a `BlockDevice` on the first active namespace. Use `select_namespace(nsid)` to pick another. It has `model()`, `serial()` and `firmware()`, uses one I/O queue pair (or up to eight with `Nvme::with_queues(io, &dma, &clock, irq, n)`, which negotiates the count and falls back to one) with up to four commands in flight per queue for transfers that split, and shuts the controller down on drop. `Nvme::with_interrupts(io, &dma, &clock, Interrupts { vector, signal, idle })` creates the I/O completion queue on an MSI-X table entry you have set up; your handler calls `IrqSignal::notify()` and the driver sleeps in `idle` between completions (admin commands are still polled; every queue shares that one vector). With several queues, `Nvme` is `Sync` for I/O: `queue(i)` returns a `BlockDevice` handle and `read_blocks_on`/`write_blocks_on`/`flush_on` take `&self`, so CPUs on different queues (`queue_for_cpu(cpu)`) do not contend; users of one queue take turns. |
+| `nvme::Nvme` | class 01/08/02, BAR 0 (64-bit) | `Nvme::new(io, &dma, &clock)` is a `BlockDevice` on the first active namespace. Use `select_namespace(nsid)` to pick another. It has `model()`, `serial()` and `firmware()`, uses one I/O queue pair (or up to eight with `Nvme::with_queues(io, &dma, &clock, irq, n)`, which negotiates the count and falls back to one) with up to four commands in flight per queue for transfers that split, and shuts the controller down on drop. `Nvme::with_interrupts(io, &dma, &clock, Interrupts { vector, signal, idle })` creates the I/O completion queue on an MSI-X table entry you have set up; your handler calls `IrqSignal::notify()` and the driver sleeps in `idle` between completions (admin commands are still polled; every queue shares that one vector). `idle` is a `&(dyn Fn() + Sync)` that runs with a queue's spin lock held, so it must not block or yield to the scheduler; halting until the next interrupt is fine. With several queues, `Nvme` is `Sync` for I/O: `queue(i)` returns a `BlockDevice` handle and `read_blocks_on`/`write_blocks_on`/`flush_on` take `&self`, so CPUs on different queues (`queue_for_cpu(cpu)`) do not contend; users of one queue take turns. |
 
 ### Displays
 
@@ -704,7 +761,7 @@ Each one mounts any `BlockDevice` and returns a root that you can mount
 anywhere:
 
 ```rust
-let ext = Ext2::mount(disk, 3)?;           // ext2, ext3 or ext4; EINVAL if not ext*, ENOSYS if unsupported
+let ext = osmium::fs_ext4::Ext2::mount(disk, 3)?;   // ext2, ext3 or ext4; EINVAL if not ext*, ENOSYS if unsupported
 vfs.mount("/mnt", ext.root())?;
 
 let fat = osmium::fs_fat::FatFs::mount(stick, 4)?;   // FAT12, FAT16 or FAT32
@@ -716,22 +773,31 @@ vfs.mount("/cdrom", iso.root())?;
 
 let btrfs = osmium::fs_btrfs::BtrfsFs::mount(ssd, 6)?;            // the default subvolume, read-write if it can be
 let home = osmium::fs_btrfs::BtrfsFs::mount_subvol(ssd2, 7, 257)?; // or one by id (5 is the top level)
-let opts = osmium::fs_btrfs::MountOptions { subvol: None, read_only: true };
+let opts = osmium::fs_btrfs::MountOptions { read_only: true, ..Default::default() };
 let backup = osmium::fs_btrfs::BtrfsFs::mount_with(ssd3, 8, opts)?; // never written
 vfs.mount("/data", btrfs.root())?;
+// a volume over several devices: give it all of them (read-only if one is missing)
+let pool = osmium::fs_btrfs::BtrfsFs::mount_multi(devices, 9, osmium::fs_btrfs::MountOptions::default())?;
 ```
 
-| | ext2/3/4 (`osmium::fs::Ext2`) | FAT12/16/32 (`osmium::fs_fat::FatFs`) | ISO 9660 (`osmium::fs_iso9660::IsoFs`) |
+| | ext2/3/4 (`osmium::fs_ext4::Ext2`) | FAT12/16/32 (`osmium::fs_fat::FatFs`) | ISO 9660 (`osmium::fs_iso9660::IsoFs`) |
 |---|---|---|---|
 | Read/write | yes, or read-only if the volume has an unknown read-only feature (`quota`, `bigalloc`, …) | yes | read-only |
-| Names | ext directories; hashed indexes are scanned linearly and dropped on change | VFAT long names, generated 8.3 aliases | Rock Ridge if present, else Joliet, else lower-cased ISO names (`names()` says which) |
-| Extras | extents, `64bit`, `flex_bg`, `metadata_csum` (verified and kept); the JBD2 journal (metadata logged, data ordered, replayed at mount); `set_clock` for timestamps; `into_device` to unmount and mark the journal clean | `free_bytes` from FSInfo | Symlinks and device nodes via Rock Ridge; files over 4 GiB; any device block size |
-| Not supported | external journals, `csum_v2`, `async_commit` and fast-commit journals (a clean one is left alone and changes go in place; one needing recovery fails with `ENOSYS`), `inline_data`, encryption, casefolding, rename, hard links | exFAT, timestamps, rename; a FAT12/16 root directory cannot grow (`ENOSPC` when full); device block sizes that are not a power of two up to 4 KiB; directories over 65536 entries | timestamps, multi-session beyond the first, UDF |
+| Names | ext directories; hashed (htree) indexes are followed and kept indexed as directories change | VFAT long names, generated 8.3 aliases; matched without regard to case (Unicode simple case folding), and found by their 8.3 alias too | Rock Ridge if present, else Joliet, else lower-cased ISO names (`names()` says which) |
+| Extras | extents, `64bit`, `flex_bg`, `metadata_csum` (verified and kept); the JBD2 journal (`data=ordered`, replayed at mount); rename and hard links; extended attributes; `chmod`, `chown` and `mknod` with device numbers; files unlinked while open go on the orphan list, which the next mount frees; `set_clock` for timestamps; `into_device` to unmount and mark the journal clean | rename; timestamps from a clock; `free_bytes` from FSInfo | Symlinks and device nodes via Rock Ridge; timestamps; files over 4 GiB; any device block size; a damaged volume descriptor is skipped, as Linux skips it |
+| Not supported | external journals, `csum_v2`, `async_commit` and fast-commit journals (a clean one is left alone and changes go in place; one needing recovery fails with `ENOSYS`), `inline_data`, `largedir`, `ea_inode`, encryption, casefolding | exFAT, hard links (`EPERM`), permissions beyond the read-only attribute; a FAT12/16 root directory cannot grow (`ENOSPC` when full) | owners, multi-session beyond the first, UDF |
 
-The ext driver journals metadata when the volume has an internal JBD2
-journal (`Ext2::is_journaled`): a crash leaves each operation done or not
-done, and the next mount replays the log, which means that mounting can write
-to the device. It flushes the device several times per operation and has no
+The ext driver uses the volume's internal JBD2 journal
+(`Ext2::is_journaled`) with the guarantees of Linux's `data=ordered` mode.
+An operation that changes only metadata (create, link, rename, remove,
+`chmod`, `chown`, attributes, truncate) is atomic: a crash leaves it done or
+not done. File data is not logged but written before the transaction that
+makes it reachable, so an append or a hole fill appears whole or not at all;
+an overwrite of bytes already in the file is not atomic, and a crash part way
+through leaves a mix of old and new blocks. An operation too large for the
+journal is split into several transactions by block, so a crash between them
+can leave it part done for e2fsck to repair. The next mount replays the log,
+which means that mounting can write to the device. It flushes the device several times per operation and has no
 block cache. Unmount with `into_device`, which marks the journal clean;
 `sync()` is not needed for the journal's sake. Without a journal changes go
 in place, so call `sync()` before removing the device. A corrupt layout
@@ -765,33 +831,37 @@ Readers see the last commit and are not blocked while a writer works. Space a
 commit frees is not reused until no reader can still be reading it.
 Timestamps come from the global clock unless `set_clock_source` gives one.
 
-A volume mounts read-only when the driver cannot keep it consistent: more than
-one device, quotas, an fsync log to replay, mixed or zoned block groups, no
-skinny metadata, a free space tree that Linux marked invalid, or read-only
-compatible features it does not know. In a subvolume that shares blocks with
-a snapshot, writes fail with `EOPNOTSUPP`, because the driver does not count
-shared references. Read-only subvolumes return `EROFS`. Subvolumes cannot be
-created, renamed or removed. The crate's tests run `btrfs check` after each
-kind of change. They also boot Linux on the images under QEMU, which mounts,
-reads and writes them. Set `OSMIUM_LINUX_KERNEL` and `OSMIUM_LINUX_MODULES`
-to run that part.
+A volume mounts read-only when the driver cannot keep it consistent: a
+`RAID5` or `RAID6` chunk, a device missing or stale, quotas, mixed or zoned
+block groups, no skinny metadata, a free space tree that Linux marked
+invalid, or read-only compatible features it does not know. A volume over
+several devices is mounted with `mount_multi` and given all of them; with
+every device present it is writable (single, `DUP`, `RAID0`, `RAID1*` and
+`RAID10`). An fsync log is replayed at mount. Snapshots share blocks with
+their source and either side can be written, with reference counts kept as
+Linux keeps them; blocks that Linux's balance flagged `RELOC` are treated as
+shared. `create_subvolume`, `create_snapshot` and `delete_subvolume` manage
+subvolumes, and `scrub`, `balance`, `add_device`, `remove_device` and
+`replace_device` maintain the volume. Read-only subvolumes return `EROFS`.
+The crate's tests run `btrfs check` after each kind of change and fuzz the
+write path (`OSMIUM_FUZZ_SEED`, `OSMIUM_FUZZ_ROUNDS`). An opt-in suite boots
+Linux on the images under QEMU, which mounts, reads and writes them: set
+`OSMIUM_LINUX_KERNEL` to a kernel image (a distribution's works) and
+`OSMIUM_LINUX_MODULES` to its `/lib/modules/<version>` directory.
 
 On reading, it checks every tree
-block and data sector against its checksum (CRC32C or xxHash64; SHA-256 and
-BLAKE2b volumes fail the mount with `EINVAL`), and reads a block or sector
-that fails from its other copy where the profile keeps one on the device
-(DUP, RAID1, RAID1C3 and RAID1C4). A sector that has no good copy, or is
+block and data sector against its checksum (CRC32C, xxHash64, SHA-256 or
+BLAKE2b), and reads a block or sector that fails from its other copy where
+the profile keeps one (DUP, RAID1, RAID1C3, RAID1C4 and the mirror of a
+RAID10 stripe), or rebuilds it from the rest of its row (RAID5, RAID6). A sector that has no good copy, or is
 missing its checksum, returns `EIO`, so the driver never returns bad data.
 Files marked `nodatasum` are not checked. Extents compressed with zlib, LZO
 or zstd are decompressed by decoders in the crate. Other subvolumes and
 snapshots appear as directories. Their inode numbers are mixed with the
 subvolume id so that they do not collide with the mounted subvolume's
-numbers. Linux gives each subvolume its own `st_dev` instead. It reads only
-the device it is given, so striped chunks (RAID0, RAID10, RAID5, RAID6) of a
-multi-device volume return `EIO`. It does not replay the fsync log, so data
-fsynced after the last commit is not visible, as with Linux's `nologreplay`.
-Volumes with `extent-tree-v2` or the RAID stripe tree fail the mount.
-Owners are not reported because `Stat` has no field for them.
+numbers. Linux gives each subvolume its own `st_dev` instead. Volumes with
+`extent-tree-v2` or the RAID stripe tree fail the mount. `Stat` reports
+owners, and `chown` and `chmod` change them.
 
 To unpack an initramfs, use `osmium::fs::cpio::unpack(vfs, "/", archive)`,
 which reads the newc format.
@@ -821,7 +891,27 @@ pub struct Platform {
     pub new_memory: fn() -> Result<Box<dyn UserMemory>, Errno>,
     pub activate: fn(PhysAddr),       // switch to this root
     pub resume: fn(TrapFrame) -> !,   // e.g. osmium::arch::riscv64::resume_user
-    pub stack_top: u64, pub stack_size: u64, pub mmap_area: Range<u64>,
+    pub stack_top: u64,               // top of a new program's stack (16-byte aligned)
+    pub stack_size: u64,              // bytes mapped below it
+    pub mmap_area: Range<u64>,        // where mmap places anonymous memory
+    pub load_base: u64,               // where a PIE (ET_DYN) program goes; its interpreter INTERP_OFFSET (1 GiB) above
+}
+```
+
+A kernel fills it in like this (`demos::user::platform` does the same with
+the examples' layout):
+
+```rust
+fn platform() -> Platform {
+    Platform {
+        new_memory: new_space,              // an AddressSpace sharing the kernel's root entries, boxed
+        activate,                           // write satp/TTBR0/CR3 (and fence.i on RISC-V)
+        resume: riscv64::resume_user,
+        stack_top: 0x11_0000_0000,
+        stack_size: 64 * 1024,
+        mmap_area: 0x12_0000_0000..0x13_0000_0000,
+        load_base: 0x14_0000_0000,
+    }
 }
 ```
 
@@ -838,16 +928,24 @@ Your switch hook also has to load each task's page table:
 
 ```rust
 fn on_switch(next: &Task) {
-    if let Some(root) = osmium::proc::root_for(next) { /* write satp / TTBR0 / CR3 */ }
+    let root = osmium::proc::switch_root(next, KERNEL_ROOT);  // the process's table, or the kernel-only one
+    /* write satp / TTBR0 / CR3 with root, and flush */
     // and point TrapCpu at next.kernel_stack_range()
 }
 ```
+
+`switch_root` also tells the process layer which address space each CPU has
+loaded, so a table is not freed while a CPU may still walk it (after `execve`
+replaced it, or as its process is reaped). `root_for` returns `None` for a
+kernel task instead, and then has to assume the hook kept the previous table
+loaded.
 
 ### Starting a process
 
 Starting from an ELF image already in memory:
 
 ```rust
+// SAFETY: the kernel table lives for the whole run.
 let space = unsafe { AddressSpace::new(&FRAMES, &KERNEL_PT, 0..64) }.unwrap(); // shares kernel root entries
 let elf = Elf::new(HELLO_ELF).unwrap();
 let brk = space.load_elf(&elf).unwrap();
@@ -882,20 +980,37 @@ fn syscall(frame: &mut TrapFrame) {
 ```
 
 `handle` decodes the registers, runs the call, writes the result back,
-starts forked children through `Platform::resume` and sets up the new image
-on `execve`. If you need your own register handling, call
+starts forked children through `Platform::resume`, sets up the new image
+on `execve`, and delivers pending signals before returning. If you need your own register handling, call
 `syscall::dispatch(&process, nr, args) -> Outcome` instead.
 
 The supported calls are listed in the [appendix](#appendix-system-call-numbers).
 Unknown numbers return `-ENOSYS`. Some limits apply:
 
-- `fork` shares memory copy-on-write.
-- `clone` creates processes, or threads with `CLONE_THREAD` (which needs `CLONE_VM|FS|FILES|SIGHAND`); all threads of a process share one CPU. `futex` has wait, wake, requeue, `WAKE_OP`, bitsets, timeouts (once the kernel gives `osmium_proc::futex::set_clock` a clock and calls `futex::tick`) and robust lists, but no priority-inheritance operations (`ENOSYS`).
-- `execve` loads only static, non-PIE ELF files. It refuses an image whose
-  segments reach kernel address ranges (`ENOEXEC`) or need more than 1 GiB
-  in total (`ENOMEM`).
+- `fork` shares memory copy-on-write; the trap handler must pass user page
+  faults to `osmium::proc::handle_page_fault` first (section 5.1).
+- `clone` creates processes, or threads with `CLONE_THREAD` (which needs
+  `CLONE_VM|FS|FILES|SIGHAND`). The threads of a process run on several CPUs
+  once the kernel registers a remote TLB flush with
+  `osmium::arch::mmu::set_remote_flush` (AArch64 needs none); otherwise they
+  share one CPU.
+- `futex` has wait, wake, requeue, `WAKE_OP`, bitsets, timeouts (once the
+  kernel gives `osmium_proc::futex::set_clock` a clock and calls
+  `futex::tick`), robust lists and priority inheritance (`LOCK_PI`,
+  `UNLOCK_PI`, `TRYLOCK_PI`; not the `REQUEUE_PI` pair).
+  `FUTEX_PRIVATE_FLAG` is honoured, and a non-private futex in `MAP_SHARED`
+  memory works across forked processes.
+- `execve` loads static ELF files, static PIEs (which it relocates at
+  `Platform::load_base`) and dynamically linked programs, whose `PT_INTERP`
+  interpreter it loads beside them. It refuses an image whose segments reach
+  kernel address ranges (`ENOEXEC`) or need more than 1 GiB in total
+  (`ENOMEM`).
 - `mmap` with `PROT_NONE` reserves the range without mapping anything.
-- There are no signals.
+- Signals: dispositions, masks, `sigaltstack`, queued real-time signals, job
+  control and delivery on Linux's `rt_sigframe`, with the FP/SIMD registers
+  saved (SVE state beyond them is not). `ppoll`, `pselect6` and
+  `epoll_pwait` install their mask atomically with the wait. A user fault
+  raises `SIGSEGV`, `SIGBUS` or `SIGILL` through `signal::user_fault`.
 
 ## 11. Networking
 
@@ -904,7 +1019,7 @@ and never reads a clock: you pass in the time and decide when to poll.
 
 ```rust
 let now = || Instant::from_nanos(now_ns());
-let mut iface = Interface::new(dev, now_ns());          // seed for ports and ISNs
+let mut iface = Interface::new(&dev, now_ns());         // seed for ports and ISNs
 let mut sockets = SocketSet::new();
 let dhcp = sockets.add(DhcpClient::new());
 let tcp  = sockets.add(TcpSocket::new(1024, 1024));      // rx/tx buffer sizes
@@ -912,7 +1027,7 @@ let udp  = sockets.add(UdpSocket::new(4, 4));            // rx/tx packet slots
 let ping = sockets.add(IcmpSocket::new(0x05ef, 2));
 
 loop {
-    iface.poll(now(), dev, &mut sockets);
+    iface.poll(now(), &mut dev, &mut sockets);
     if let Some(DhcpEvent::Configured(cfg)) = sockets.get_mut::<DhcpClient>(dhcp).take_event() {
         sockets.get_mut::<TcpSocket>(tcp).connect(SocketAddrV4::new(server, 7), 0).unwrap();
     }
@@ -944,16 +1059,20 @@ loop {
   a `UdpSocket` with `bind_addr` (or a `TcpSocket` with `listen_on`) to a
   `[::]:port` address for IPv6, and `connect` or `send_to` an IPv6 remote.
   A socket serves one family. `DnsClient::resolve6` looks up AAAA records
-  (collect with `result_ip`). IPv6 fragments are dropped, and datagrams over
-  the MTU are not fragmented on send.
-- Not supported: IPv6 fragmentation, privacy addresses, DHCPv6, forwarding,
-  IGMPv3 membership reports (IGMPv3 queries are answered with v2 reports).
+  (collect with `result_ip`). IPv6 datagrams are fragmented and reassembled,
+  path-MTU discovery runs for both families, privacy addresses (RFC 7217
+  stable and RFC 4941 temporary) are available, and a DHCPv6 client takes
+  leases and DNS servers.
+- Not supported: forwarding, IGMPv3 membership reports (IGMPv3 queries are
+  answered with v2 reports).
 - `osmium-proc` exposes this stack as sockets: `net::set_stack` takes a
   `NetStack`, and `socket`, `sendmsg`/`recvmsg`, `socketpair`, `poll`,
   `select` and `epoll` work on descriptors. 127.0.0.0/8 is delivered inside
   the stack without a device. A file reports readiness through
-  `osmium_fs::File::poll` (default: always ready); call `poll::tick()` from a
-  timer, and `poll::set_clock` if there is no stack, so timeouts are noticed.
+  `osmium_fs::File::poll` (default: always ready) and names the wait queue to
+  notify on a change with `File::poll_queue`, so a change wakes only the calls
+  watching that file; call `poll::tick()` from a timer, and `poll::set_clock`
+  if there is no stack, so timeouts are noticed.
 
 ### iSCSI
 
@@ -969,15 +1088,20 @@ let disk = IscsiDisk::connect(net, SocketAddrV4::new(portal, 3260), &opts)?;
 ```
 
 `Stack` is the ready-made `iscsi::Net` for an osmium-net interface.
-`iscsi::discover` lists the targets on a portal (SendTargets). There is no
-CHAP and no header or data digests, and error recovery is level 0.
+`iscsi::discover` lists the targets on a portal (SendTargets). Set
+`opts.chap` to a `Chap` to log in with CHAP-MD5 (one-way, or mutual), and
+`opts.offer.header_digest` / `data_digest` to ask for CRC32C digests.
+`opts.offer.error_recovery_level` 1 or 2 recovers lost PDUs and connections
+instead of dropping the session; `max_connections` asks for several
+connections (MC/S). A target redirect is followed, and `IscsiSession` shares
+one session between all of a target's LUNs.
 
 For testing, `scripts/iscsi-target.py IMAGE` is a small target that needs
 only the Python standard library. Under QEMU, attach it with
 `guestfwd=tcp:10.0.2.100:3260-cmd:"python3 scripts/iscsi-target.py IMAGE"`
 (see section 3). To run it standalone, use `--listen 3260`; it binds 127.0.0.1 unless you
-pass `--bind ADDR`. It also takes
-`--read-only`, `--log FILE` and `--self-test`.
+pass `--bind ADDR`. It also takes `--chap USER:SECRET`, `--mutual-chap NAME:SECRET`,
+`--digests`, `--read-only`, `--log FILE` and `--self-test` (which `check.sh` runs).
 
 ## 12. Hypervisors
 
@@ -985,10 +1109,16 @@ pass `--bind ADDR`. It also takes
 run guests:
 
 ```rust
-let exit = run_vcpu(&mut vcpu, &mmio_bus, &pio_bus, |v, exit| match exit {
-    VmExit::Hypercall { .. } => /* SBI, PSCI or your own ABI */,
-    VmExit::Halt => /* wait for v.interrupt_pending(..) */,
-    VmExit::ExternalInterrupt => ControlFlow::Continue(()),
+let exit = run_vcpu(&mut vcpu, &mmio_bus, &pio_bus, |vcpu, exit| match exit {
+    VmExit::Hypercall { nr, args } => {
+        vcpu.complete_hypercall(my_abi(nr, args)); // or riscv::sbi / aarch64::psci
+        ControlFlow::Continue(())
+    }
+    VmExit::Halt => {
+        while !vcpu.interrupt_pending(now()) { /* wait, or yield the host CPU */ }
+        ControlFlow::Continue(())
+    }
+    VmExit::ExternalInterrupt => ControlFlow::Continue(()), // the host already handled it
     other => ControlFlow::Break(other),
 });
 ```
@@ -998,15 +1128,17 @@ let exit = run_vcpu(&mut vcpu, &mmio_bus, &pio_bus, |v, exit| match exit {
 | `riscv::RiscvVcpu` | `riscv64-hs` | HS-mode | `VirtualPlic` |
 | `aarch64::Aarch64Vcpu` | `aarch64-el2` or `aarch64-vhe` | EL2, non-VHE or VHE | `VirtualGicV2` |
 | `x86::svm::SvmVcpu` | none | long mode + AMD SVM | `VirtualPic`, or a `VirtualLapic` per vCPU plus `VirtualIoApic` |
+| `x86::vmx::VmxVcpu` | none | long mode + Intel VMX (EPT) | as for SVM; has only run under nested KVM |
 
-Device models are an emulated 16550, an 8254 PIT, and virtio-mmio console,
-block and net. Multi-vCPU guests run on all three architectures through
+Device models are an emulated 16550 and PL011, an 8254 PIT, and virtio-mmio
+console, block and net. Multi-vCPU guests run on all three architectures through
 `smp::GuestCpus`, with each vCPU in a task pinned to its own host CPU. Create
 it with `with_kick` so that an interrupt aimed at a vCPU running on another
 host CPU makes that vCPU exit at once (an IPI on RISC-V and x86, a host SGI
 on AArch64). x86 guests start their APs the PC way, with INIT and STARTUP
-through the `VirtualLapic` (`decode_icr`, then `SvmVcpu::set_real_mode`), and
-`attach_svm` records which host CPU each vCPU runs on.
+through the `VirtualLapic` (`decode_icr`, then the backend's
+`set_real_mode`), and `GuestCpus::attach(cpu, &mut vcpu)` records which host
+CPU each vCPU runs on, for any backend.
 `examples/riscv-hyp`, `examples/aarch64-hyp` and `examples/x86_64-hyp` show
 the whole path: each boots an unmodified osmium kernel (riscv-virt,
 aarch64-virt or x86_64-pc) as an SMP guest, with a generated device tree on
@@ -1040,8 +1172,10 @@ cargo test --workspace --all-features
 cargo test -p osmium-net               # one crate
 ```
 
-The ext2, FAT and cpio tests check their output against the real host tools
-when those are installed.
+The ext2/3/4, FAT, ISO 9660 and cpio tests check their output against the
+real host tools (section 2) and fail when a tool is missing; set
+`OSMIUM_SKIP_TOOL_TESTS=1` to skip those tests instead. The btrfs tests skip
+with a note without btrfs-progs.
 
 ### scripts/check.sh
 
@@ -1052,22 +1186,36 @@ This is the gate every change to main passes. It takes no arguments:
 3. `cargo doc` with `RUSTDOCFLAGS="-D warnings"`
 4. `cargo build` for the three bare-metal targets
 5. `cargo check` for the two musl targets, which builds the FP-saving context switch
-6. Each example is built and booted under QEMU with a 60-second timeout,
-   and its serial log is grepped for expected lines. For riscv-virt, the FAT32
-   image it wrote is afterwards checked with `fsck.fat`.
-7. Where an example draws, `scripts/screen.py` takes screendumps over
+6. `scripts/iscsi-target.py --self-test`, the test target against its own
+   initiator
+7. Every example linted with `cargo clippy --release -- -D warnings` and
+   built (the UEFI app for both targets, `examples/demos` with and without
+   its `user` feature), whether or not QEMU is there to boot them
+8. Each example booted under QEMU with a timeout, and its serial log grepped
+   for expected lines: the three kernels (aarch64-virt on GICv2 and GICv3),
+   the IOMMU boots, riscv-firmware, the hypervisors with the example kernels
+   as guests (riscv-hyp, aarch64-hyp on GICv2, GICv3 and GICv4, aarch64-vhe,
+   x86_64-hyp on SVM and, under nested KVM, VMX), and the UEFI app on OVMF
+   and AAVMF (the system's, or the images in `fw/`; `OSMIUM_FW=bundled`
+   forces `fw/`). There is no RISC-V UEFI boot, as Rust has no RISC-V UEFI
+   target. For riscv-virt, the FAT32 image it wrote is afterwards checked
+   with `fsck.fat`.
+9. Where an example draws, `scripts/screen.py` takes screendumps over
    QEMU's QMP socket until the expected colour bars appear. This covers
    riscv-virt, x86_64-pc and the UEFI app on OVMF and AAVMF.
 
-If a QEMU binary or optional tool is missing, that step is skipped with a
-message rather than failing. If an expected line is missing, the script
-prints the log and exits non-zero.
+A step whose Rust target, QEMU binary or device, firmware or optional tool
+is missing is skipped with a message, and every skip is listed again at the
+end; a skip does not fail the gate. If an expected line is missing, the
+script prints the log and exits non-zero. Its temporary files live in one
+directory that is removed on every exit. `.github/workflows/check.yml` runs
+the script on every push and pull request.
 
 If you add a feature to an example, add its log line to the `EXPECT` list
 for that boot in `check.sh`. Match on what was delivered or the order it
 happened in, never on counts that depend on timing: multi-threaded TCG makes
-those flaky. Serial logs end lines with `\r\n`, so don't anchor patterns
-with `$`.
+those flaky. The script strips CRs and escape sequences from each serial
+log before grepping it.
 
 ### Formatting
 
@@ -1084,7 +1232,11 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
 ### Current limitations
 
 - Only QEMU has been tested (TCG, up to 4 CPUs), never physical hardware.
-- All threads of a process run on one CPU.
+- The threads of a process share one CPU unless the kernel registers a
+  remote TLB flush (`osmium::arch::mmu::set_remote_flush`; AArch64 needs
+  none).
+- The mlx4 driver has only run against a simulated HCA, and the Intel VMX
+  backend only under nested KVM.
 - FP/SIMD registers are switched per task only when the kernel calls
   `osmium_arch::fp::enable` on every CPU and gives user tasks an `FpState`
   (`TaskBuilder::fp_state`). Kernels are soft-float and never touch them.
@@ -1101,16 +1253,17 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
   not kept).
 - The heap can return large blocks to the frame allocator only if the
   mapper implements `virt_to_phys` (`OffsetMapper` does).
-- The Intel VMX backend has only run under nested KVM, and x86 MMIO emulation does not
-  walk 32-bit guest page tables. Guest FP/SIMD state is switched only on the
+- Guest FP/SIMD state is switched only on the
   assumption that the host kernel is soft-float. On x86 that switching is
   opt-in (`with_fp_switching`: x87 and SSE, not AVX), and SVE is not
   switched on AArch64. See HYPERVISOR.md's
   [current limits](HYPERVISOR.md#current-limits).
-- USB hubs (`usb::class::hub`) and isochronous endpoints (`IsochHost`, `usb::class::isoch`)
-  have only been tested against a simulated xHCI controller. Isochronous
-  transfers carry at most 4 KiB per service interval, SuperSpeed burst sizes
-  from companion descriptors are ignored, and a SuperSpeed hub port that
+- USB hubs (`usb::class::hub`) have been exercised against a scripted xHCI
+  model (enumeration, routing, connect and disconnect) and isochronous
+  endpoints (`IsochHost`, `usb::class::isoch`) against a simulated xHCI
+  controller, not under QEMU or on hardware. Isochronous transfers carry at
+  most 4 KiB per service interval, xHCI streams have no secondary arrays (at
+  most 7 streams on each of 4 endpoints), and a SuperSpeed hub port that
   needs a warm reset is not recovered.
 - UHCI, OHCI and EHCI have no isochronous endpoints, and EHCI supports no
   hubs.
@@ -1130,7 +1283,8 @@ rustfmt --edition 2024 --config max_width=120,use_small_heuristics=Max path/to/f
 | `fork`/`execve` return `ENOSYS` | `osmium::proc::set_platform` was never called. |
 | `no virtio-blk device` / `no xHCI controller` | That device is not on the QEMU command line. See [section 3](#3-the-examples). |
 | `cannot enable SVM` in x86_64-hyp | Run QEMU with `-cpu max`. |
-| `check.sh` fails at `cargo check` for musl | Install the two musl targets (section 2). |
+| `check.sh` lists a step under "skipped" | Its Rust target, QEMU, device, firmware or tool is missing; the message names which. |
+| A tool-backed fs test fails with "not installed" | Install the tool (section 2), or set `OSMIUM_SKIP_TOOL_TESTS=1`. |
 | A `check.sh` expectation fails only sometimes | The pattern depends on timing under multi-threaded TCG. Assert on what was delivered instead. |
 
 ## Appendix: system call numbers
@@ -1150,11 +1304,35 @@ x86_64 table, and the asm-generic table that RISC-V and AArch64 share.
 | getcwd, chdir | 79, 80 | 17, 49 |
 | mkdirat, unlinkat | 258, 263 | 34, 35 |
 | exit, exit_group | 60, 231 | 93, 94 |
-| getpid, getppid, gettid | 39, 110, 186 | 172, 173, 178 |
+| getpid, getppid, gettid, getcpu | 39, 110, 186, 309 | 172, 173, 178, 168 |
 | brk, mmap, munmap | 12, 9, 11 | 214, 222, 215 |
+| mprotect, msync | 10, 26 | 226, 227 |
 | sched_yield | 24 | 124 |
 | uname | 63 | 160 |
 | clone, execve, wait4 | 56, 59, 61 | 220, 221, 260 |
 | fork, vfork | 57, 58 | — |
 | dup, dup3, fcntl | 32, 292, 72 | 23, 24, 25 |
 | dup2 | 33 | — |
+| pipe2 | 293 | 59 |
+| pipe | 22 | — |
+| socket, socketpair | 41, 53 | 198, 199 |
+| bind, listen, connect | 49, 50, 42 | 200, 201, 203 |
+| accept, accept4 | 43, 288 | 202, 242 |
+| sendto, recvfrom | 44, 45 | 206, 207 |
+| sendmsg, recvmsg | 46, 47 | 211, 212 |
+| shutdown | 48 | 210 |
+| getsockname, getpeername | 51, 52 | 204, 205 |
+| setsockopt, getsockopt | 54, 55 | 208, 209 |
+| ppoll, pselect6 | 271, 270 | 73, 72 |
+| poll, select | 7, 23 | — |
+| epoll_create1, epoll_ctl, epoll_pwait | 291, 233, 281 | 20, 21, 22 |
+| epoll_create, epoll_wait | 213, 232 | — |
+| rt_sigaction, rt_sigprocmask, rt_sigreturn | 13, 14, 15 | 134, 135, 139 |
+| rt_sigpending, rt_sigsuspend, sigaltstack | 127, 130, 131 | 136, 133, 132 |
+| rt_sigqueueinfo, rt_tgsigqueueinfo | 129, 297 | 138, 240 |
+| kill, tkill, tgkill | 62, 200, 234 | 129, 130, 131 |
+| futex | 202 | 98 |
+| restart_syscall | 219 | 128 |
+| set_tid_address | 218 | 96 |
+| set_robust_list, get_robust_list | 273, 274 | 99, 100 |
+| arch_prctl | 158 | — |
