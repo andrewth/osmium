@@ -39,6 +39,17 @@ impl BlockDevice for MemDisk {
     }
 }
 
+/// Reports that the external tool `name` is missing. Tests that need one
+/// fail without it, so a machine without the tools cannot pass them
+/// silently; set `OSMIUM_SKIP_TOOL_TESTS=1` to skip them instead.
+fn missing_tool(name: &str) {
+    if std::env::var_os("OSMIUM_SKIP_TOOL_TESTS").is_some_and(|v| v == "1") {
+        std::eprintln!("{name} not installed; skipping (OSMIUM_SKIP_TOOL_TESTS=1)");
+    } else {
+        panic!("{name} not installed: install it, or set OSMIUM_SKIP_TOOL_TESTS=1 to skip the tests that need it");
+    }
+}
+
 fn tool(name: &str) -> Option<PathBuf> {
     [Path::new("/usr/sbin"), Path::new("/sbin"), Path::new("/usr/bin")]
         .iter()
@@ -57,7 +68,7 @@ fn scratch(name: &str) -> PathBuf {
 /// installed.
 fn mkfs(name: &str, fat: &str, kib: &str) -> Option<(PathBuf, MemDisk)> {
     let Some(mkfs) = tool("mkfs.fat") else {
-        eprintln!("mkfs.fat not found; skipping");
+        missing_tool("mkfs.fat");
         return None;
     };
     let path = scratch(name);

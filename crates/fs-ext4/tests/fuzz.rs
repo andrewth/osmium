@@ -54,6 +54,17 @@ impl Rng {
     }
 }
 
+/// Reports that the external tool `name` is missing. Tests that need one
+/// fail without it, so a machine without the tools cannot pass them
+/// silently; set `OSMIUM_SKIP_TOOL_TESTS=1` to skip them instead.
+fn missing_tool(name: &str) {
+    if std::env::var_os("OSMIUM_SKIP_TOOL_TESTS").is_some_and(|v| v == "1") {
+        std::eprintln!("{name} not installed; skipping (OSMIUM_SKIP_TOOL_TESTS=1)");
+    } else {
+        panic!("{name} not installed: install it, or set OSMIUM_SKIP_TOOL_TESTS=1 to skip the tests that need it");
+    }
+}
+
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("osmium-ext4-fuzz-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -69,6 +80,7 @@ fn mkfs(name: &str, kind: &str, args: &[&str]) -> Option<Vec<u8>> {
         .args(args)
         .arg(&path)
         .status()
+        .map_err(|_| missing_tool(&format!("mkfs.{kind}")))
         .ok()?;
     assert!(status.success());
     Some(std::fs::read(&path).unwrap())
@@ -232,7 +244,6 @@ fn corrupt(image: &mut [u8], used: &[usize], rng: &mut Rng) {
 
 fn fuzz(name: &str, kind: &str, args: &[&str], clean: bool, seed: u64, iterations: usize) {
     let Some(image) = mkfs(name, kind, args) else {
-        eprintln!("mkfs.{kind} not found; skipping");
         return;
     };
     let disk = MemDisk(Arc::new(Mutex::new(image)));

@@ -71,6 +71,18 @@ pub const fn makedev(major: u32, minor: u32) -> u64 {
     (major & 0xfff) << 8 | (major & !0xfff) << 32 | (minor & 0xff) | (minor & !0xff) << 12
 }
 
+/// The major number of the device number `rdev`, as Linux's `major(3)`
+/// decodes it (the inverse of [`makedev`]).
+pub const fn major(rdev: u64) -> u32 {
+    ((rdev >> 8) & 0xfff | (rdev >> 32) & !0xfff) as u32
+}
+
+/// The minor number of the device number `rdev`, as Linux's `minor(3)`
+/// decodes it (the inverse of [`makedev`]).
+pub const fn minor(rdev: u64) -> u32 {
+    ((rdev & 0xff) | (rdev >> 12) & 0xffff_ff00) as u32
+}
+
 static NEXT_INO: AtomicU64 = AtomicU64::new(1 << 32);
 
 fn char_stat(ino: u64, rdev: u64) -> Stat {
@@ -150,6 +162,16 @@ impl File for Zero {
 mod tests {
     use super::*;
     use crate::{OpenFlags, RamFs, Vfs};
+
+    #[test]
+    fn device_numbers_round_trip() {
+        for (major, minor) in [(0, 0), (1, 3), (8, 0), (255, 255), (256, 1), (4095, 0xf_ffff), (u32::MAX, u32::MAX)] {
+            let rdev = makedev(major, minor);
+            assert_eq!((super::major(rdev), super::minor(rdev)), (major, minor), "{rdev:#x}");
+        }
+        // glibc's encoding.
+        assert_eq!(makedev(0x123, 0x45678), 0x4561_2378);
+    }
 
     #[test]
     fn dev_directory() {
