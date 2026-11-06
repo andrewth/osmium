@@ -213,3 +213,195 @@ fn sigchld_carries_how_the_child_ended() {
     assert_eq!(i32_at(&p, info + 24), 3, "si_status");
     assert_eq!(call(&p, Sys::Wait4, &[child.0 as u64, 0, 0, 0]), child.0 as i64);
 }
+
+/// FP/SIMD state, set as the calling thread's registers for one test.
+fn fp_regs(len: usize, xfeatures: u64, fill: impl Fn(&mut [u8])) -> Vec<u8> {
+    let mut b: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+    fill(&mut b);
+    crate::sigfp::test_regs::set(Some(crate::sigfp::Image::new(&b, xfeatures).unwrap()));
+    b
+}
+
+fn x86_regs() -> X86_64 {
+    X86_64 { cs: 0x33, ss: 0x2b, rflags: 0x202, rip: 0x40_0000, rsp: STACK, ..Default::default() }
+}
+
+/// An x86_64 FXSAVE image with a valid MXCSR.
+fn fxsave(b: &mut [u8]) {
+    b[24..28].copy_from_slice(&0x1f80u32.to_ne_bytes());
+}
+
+#[test]
+fn x86_64_frames_point_at_an_fxsave_area() {
+    let regs = fp_regs(512, 0, fxsave);
+    let mut r = x86_regs();
+    let p = deliver("fp-fx", &mut r);
+    let (frame, mc) = (r.rsp, r.rsp + 8 + 40);
+    let area = word(&p, mc + 184);
+    assert_eq!(area % 64, 0, "fpstate is 64-byte aligned");
+    assert!(frame + 440 <= area && area + 512 <= STACK - 128, "between the frame and the red zone");
+    assert_eq!(get(&p, area, 464), regs[..464], "the FXSAVE image");
+    assert_eq!(get(&p, area + 464, 48), [0; 48], "no fpx_sw_bytes");
+    assert_eq!(word(&p, frame + 8), 6, "uc_flags without UC_FP_XSTATE");
+    assert_eq!(crate::sigfp::test_regs::loaded(), [None], "the handler starts with the registers reset");
+
+    // The handler changes xmm0; the change comes back.
+    put(&p, area + 160, &[0xee; 16]);
+    r.rsp = frame + 8;
+    assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), None);
+    let mut want = regs.clone();
+    want[160..176].fill(0xee);
+    want[464..].fill(0);
+    assert_eq!(crate::sigfp::test_regs::loaded().last().unwrap().as_deref(), Some(&want[..]));
+    crate::sigfp::test_regs::set(None);
+}
+
+#[test]
+fn x86_64_frames_carry_an_xsave_area_with_its_software_bytes() {
+    let regs = fp_regs(832, 7, |b| {
+        fxsave(b);
+        b[512..576].fill(0);
+        b[512..520].copy_from_slice(&7u64.to_ne_bytes());
+    });
+    let mut r = x86_regs();
+    let p = deliver("fp-xsave", &mut r);
+    let (frame, mc) = (r.rsp, r.rsp + 8 + 40);
+    let area = word(&p, mc + 184);
+    assert_eq!(area % 64, 0);
+    assert!(frame + 440 <= area && area + 836 <= STACK - 128);
+    assert_eq!(get(&p, area + 464, 4), 0x4650_5853u32.to_ne_bytes(), "FP_XSTATE_MAGIC1");
+    assert_eq!(get(&p, area + 468, 4), 836u32.to_ne_bytes(), "extended_size");
+    assert_eq!(word(&p, area + 472), 7, "xfeatures");
+    assert_eq!(get(&p, area + 480, 4), 832u32.to_ne_bytes(), "xstate_size");
+    assert_eq!(get(&p, area + 512, 320), regs[512..], "the XSAVE header and AVX state");
+    assert_eq!(get(&p, area + 832, 4), 0x4650_5845u32.to_ne_bytes(), "FP_XSTATE_MAGIC2");
+    assert_eq!(word(&p, frame + 8), 7, "uc_flags with UC_FP_XSTATE");
+    let th = p.leader();
+
+    // Returned as it was, the whole area comes back.
+    r.rsp = frame + 8;
+    assert_eq!(signal::sigreturn(&p, &th, &mut r), None);
+    let loaded = crate::sigfp::test_regs::loaded().last().cloned().flatten().unwrap();
+    assert_eq!((&loaded[..464], &loaded[512..]), (&regs[..464], &regs[512..]));
+
+    // Without valid software bytes, only x87 and SSE come back; AVX is reset.
+    let mut r = x86_regs();
+    let p = deliver("fp-xsave-legacy", &mut r);
+    let (frame, area) = (r.rsp, word(&p, r.rsp + 8 + 40 + 184));
+    put(&p, area + 464, &0u32.to_ne_bytes());
+    r.rsp = frame + 8;
+    assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), None);
+    let loaded = crate::sigfp::test_regs::loaded().last().cloned().flatten().unwrap();
+    assert_eq!(loaded[..464], regs[..464]);
+    assert_eq!(u64::from_ne_bytes(loaded[512..520].try_into().unwrap()), 3, "XSTATE_BV: x87 | SSE");
+    assert!(loaded[520..].iter().all(|&b| b == 0), "the rest reset");
+
+    // A null fpstate resets the registers.
+    let mut r = x86_regs();
+    let p = deliver("fp-null", &mut r);
+    let frame = r.rsp;
+    put(&p, frame + 8 + 40 + 184, &0u64.to_ne_bytes());
+    r.rsp = frame + 8;
+    assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), None);
+    assert_eq!(crate::sigfp::test_regs::loaded().last(), Some(&None));
+    crate::sigfp::test_regs::set(None);
+}
+
+#[test]
+fn x86_64_sigreturn_refuses_fp_state_that_would_fault() {
+    fp_regs(512, 0, fxsave);
+    for (what, forge) in [
+        ("a reserved MXCSR bit", (24usize, 0x1_1f80u32.to_ne_bytes().to_vec())),
+        ("DAZ where the CPU lacks it", (24, 0x1fc0u32.to_ne_bytes().to_vec())),
+    ] {
+        let mut r = x86_regs();
+        let p = deliver("fp-forged", &mut r);
+        let (frame, area) = (r.rsp, word(&p, r.rsp + 8 + 40 + 184));
+        put(&p, area + forge.0 as u64, &forge.1);
+        r.rsp = frame + 8;
+        assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), Some(ExitStatus::Signal(SIGSEGV)), "{what}");
+    }
+    // An fpstate that is not mapped.
+    let mut r = x86_regs();
+    let p = deliver("fp-unmapped", &mut r);
+    let frame = r.rsp;
+    put(&p, frame + 8 + 40 + 184, &0x7777_0000u64.to_ne_bytes());
+    r.rsp = frame + 8;
+    assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), Some(ExitStatus::Signal(SIGSEGV)));
+    crate::sigfp::test_regs::set(None);
+}
+
+#[test]
+fn aarch64_frames_carry_an_fpsimd_record() {
+    let regs = fp_regs(528, 0, |b| {
+        b[512..520].copy_from_slice(&0x0300_0000u64.to_ne_bytes());
+        b[520..528].copy_from_slice(&0x1fu64.to_ne_bytes());
+    });
+    let mut r = Aarch64 { sp: STACK, elr: 0x40_0000, ..Default::default() };
+    let p = deliver("fp-a64", &mut r);
+    let rec = r.sp + 128 + 176 + 288;
+    assert_eq!(get(&p, rec, 4), 0x4650_8001u32.to_ne_bytes(), "FPSIMD_MAGIC");
+    assert_eq!(get(&p, rec + 4, 4), 528u32.to_ne_bytes(), "size");
+    assert_eq!(get(&p, rec + 8, 4), 0x1fu32.to_ne_bytes(), "fpsr");
+    assert_eq!(get(&p, rec + 12, 4), 0x0300_0000u32.to_ne_bytes(), "fpcr");
+    assert_eq!(get(&p, rec + 16, 512), regs[..512], "vregs");
+    assert_eq!(get(&p, rec + 528, 8), [0; 8], "then the terminating record");
+    assert!(crate::sigfp::test_regs::loaded().is_empty(), "the handler keeps the registers");
+
+    put(&p, rec + 16 + 3 * 16, &[0xee; 16]);
+    put(&p, rec + 12, &0x0040_0000u32.to_ne_bytes());
+    assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), None);
+    let mut want = regs.clone();
+    want[48..64].fill(0xee);
+    want[512..520].copy_from_slice(&0x0040_0000u64.to_ne_bytes());
+    assert_eq!(crate::sigfp::test_regs::loaded().last().unwrap().as_deref(), Some(&want[..]), "q3 and FPCR changed");
+
+    // Forged records end the program.
+    for (what, at, bytes) in [
+        ("no fpsimd_context", 0u64, [0u8; 8]),
+        ("an unknown record", 0, [1, 0, 0, 0, 16, 0, 0, 0]),
+        ("a wrong size", 4, [0, 1, 0, 0, 0, 0, 0, 0]),
+        ("an unterminated list", 528, [0, 0, 0, 0, 16, 0, 0, 0]),
+    ] {
+        let mut r = Aarch64 { sp: STACK, elr: 0x40_0000, ..Default::default() };
+        let p = deliver("fp-a64-forged", &mut r);
+        let rec = r.sp + 128 + 176 + 288;
+        put(&p, rec + at, &bytes);
+        assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), Some(ExitStatus::Signal(SIGSEGV)), "{what}");
+    }
+    // With FP off there is no record, and none is needed.
+    crate::sigfp::test_regs::set(None);
+    let mut r = Aarch64 { sp: STACK, elr: 0x40_0000, ..Default::default() };
+    let p = deliver("fp-a64-off", &mut r);
+    assert_eq!(get(&p, r.sp + 128 + 176 + 288, 8), [0; 8]);
+    assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), None);
+}
+
+#[test]
+fn riscv64_frames_carry_the_d_state() {
+    let regs = fp_regs(264, 0, |b| {
+        b[256..264].copy_from_slice(&0xe5u64.to_ne_bytes());
+    });
+    let mut r = Riscv64 { epc: 0x40_0000, ..Default::default() };
+    r.x[2] = STACK;
+    let p = deliver("fp-rv", &mut r);
+    let fp = r.x[2] + 128 + 176 + 256;
+    assert_eq!(get(&p, fp, 256), regs[..256], "f0..f31");
+    assert_eq!(get(&p, fp + 256, 4), 0xe5u32.to_ne_bytes(), "fcsr");
+    assert_eq!(get(&p, fp + 260, 268), [0; 268], "the rest, and the terminating extension header");
+
+    put(&p, fp + 8, &[0xee; 8]);
+    assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), None);
+    let mut want = regs.clone();
+    want[8..16].fill(0xee);
+    assert_eq!(crate::sigfp::test_regs::loaded().last().unwrap().as_deref(), Some(&want[..]), "f1 changed");
+
+    for (what, at) in [("a reserved word", 516u64), ("an extension header", 520)] {
+        let mut r = Riscv64 { epc: 0x40_0000, ..Default::default() };
+        r.x[2] = STACK;
+        let p = deliver("fp-rv-forged", &mut r);
+        put(&p, r.x[2] + 128 + 176 + 256 + at, &1u32.to_ne_bytes());
+        assert_eq!(signal::sigreturn(&p, &p.leader(), &mut r), Some(ExitStatus::Signal(SIGSEGV)), "{what}");
+    }
+    crate::sigfp::test_regs::set(None);
+}

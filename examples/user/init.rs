@@ -490,6 +490,14 @@ extern "C" fn on_signal(sig: i32, _info: *const u8, _ctx: *const u8) {
     GOT_SIGNAL.store(sig as u32, Ordering::SeqCst);
 }
 
+static GOT_FP_SIGNAL: AtomicU32 = AtomicU32::new(0);
+
+/// Changes the FP registers, which the interrupted code must not see.
+extern "C" fn on_fp_signal(_sig: i32, _info: *const u8, _ctx: *const u8) {
+    sys::fp_set(0x5555_aaaa_5555_aaaa, false);
+    GOT_FP_SIGNAL.fetch_add(1, Ordering::SeqCst);
+}
+
 extern "C" fn on_chld(_sig: i32, _info: *const u8, _ctx: *const u8) {
     GOT_CHLD.fetch_add(1, Ordering::SeqCst);
 }
@@ -1214,6 +1222,14 @@ unsafe extern "C" fn main(sp: *const u64) -> ! {
         let (_, code) = wait(-1);
         let ok = kept && code == 0 && sys::fp_get() == ours;
         say!("fp: FP registers inherited by fork and kept across switches: {}", if ok { "ok" } else { "FAILED" });
+
+        // A handler that changes them leaves the program's as they were: the
+        // signal frame saves them and `rt_sigreturn` restores them.
+        catch(10, on_fp_signal);
+        let me = sys::call(sys::GETPID, [0; 5]) as u64;
+        let r = sys::call(sys::KILL, [me, 10, 0, 0, 0]);
+        let ok = r == 0 && GOT_FP_SIGNAL.load(Ordering::SeqCst) == 1 && sys::fp_get() == ours;
+        say!("fp: FP registers restored after a signal handler changed them: {}", if ok { "ok" } else { "FAILED" });
     } else {
         say!("fp: the kernel does not offer FP (AT_HWCAP)");
     }
