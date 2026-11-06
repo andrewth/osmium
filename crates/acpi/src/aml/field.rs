@@ -55,14 +55,22 @@ impl<H: Host> Interpreter<H> {
         let unit_bytes = acc / 8;
         let first = f.bit_offset / acc;
         let last = f.bit_offset.checked_add(f.bit_len - 1).ok_or(AmlError::OutOfBounds)? / acc;
+        let units = last - first + 1;
+        // The raw units, then the field's bits copied out of them.
+        let raw_len = to_usize(units.saturating_mul(unit_bytes))?;
+        self.charge_alloc(raw_len.saturating_add(to_usize(f.bit_len.div_ceil(8))?))?;
+        self.charge_bits(f.bit_len)?;
         let mut raw = Vec::new();
+        raw.try_reserve_exact(raw_len).map_err(|_| AmlError::OutOfMemory)?;
         for u in first..=last {
             let off = u.checked_mul(unit_bytes).ok_or(AmlError::OutOfBounds)?;
+            // Each access the host sees is a step, so a huge field cannot make one term do unbounded I/O.
+            self.charge(1)?;
             let v = self.unit_read(f, off, acc)?;
             raw.extend(v.to_le_bytes().into_iter().take(unit_bytes as usize));
         }
         let shift = to_usize(f.bit_offset - first * acc)?;
-        let bits = ops::get_bits(&raw, shift, to_usize(f.bit_len)?).ok_or(AmlError::OutOfBounds)?;
+        let bits = ops::get_bits(&raw, shift, to_usize(f.bit_len)?)?;
         Ok(if f.bit_len <= if f.int64 { 64 } else { 32 } {
             Value::Integer(ops::le_to_u64(&bits))
         } else {
@@ -88,7 +96,9 @@ impl<H: Host> Interpreter<H> {
         let unit_bytes = acc / 8;
         let end = f.bit_offset.checked_add(f.bit_len).ok_or(AmlError::OutOfBounds)?;
         let mask = if acc == 64 { u64::MAX } else { (1u64 << acc) - 1 };
+        self.charge_bits(f.bit_len)?;
         for u in f.bit_offset / acc..=(end - 1) / acc {
+            self.charge(1)?;
             let unit_start = u * acc;
             let lo = f.bit_offset.max(unit_start);
             let hi = end.min(unit_start + acc);
@@ -96,7 +106,10 @@ impl<H: Host> Interpreter<H> {
             let mut unit = [0u8; 8];
             if lo != unit_start || hi != unit_start + acc {
                 unit = match f.update {
-                    Update::Preserve => self.unit_read(f, off, acc)?.to_le_bytes(),
+                    Update::Preserve => {
+                        self.charge(1)?;
+                        self.unit_read(f, off, acc)?.to_le_bytes()
+                    }
                     Update::Ones => [0xff; 8],
                     Update::Zeros => [0; 8],
                 };
@@ -104,7 +117,7 @@ impl<H: Host> Interpreter<H> {
             let n = to_usize(hi - lo)?;
             let from = to_usize(lo - f.bit_offset)?;
             let available = src.len().saturating_mul(8).saturating_sub(from).min(n);
-            let piece = ops::get_bits(&src, from.min(src.len() * 8), available).ok_or(AmlError::OutOfBounds)?;
+            let piece = ops::get_bits(&src, from.min(src.len() * 8), available)?;
             ops::put_bits(&mut unit, to_usize(lo - unit_start)?, n, &piece).ok_or(AmlError::OutOfBounds)?;
             self.unit_write(f, off, acc, u64::from_le_bytes(unit) & mask)?;
         }
@@ -272,8 +285,21 @@ impl<H: Host> Interpreter<H> {
     // ----- buffer fields -----
 
     pub(crate) fn buffer_field_read(&mut self, b: &BufferField) -> Result<Value, AmlError> {
-        let Value::Buffer(buf) = self.read_data(&b.source)? else { return Err(AmlError::TypeMismatch) };
-        let bits = ops::get_bits(&buf, to_usize(b.bit_offset)?, to_usize(b.bit_len)?).ok_or(AmlError::OutOfBounds)?;
+        let (off, len) = (to_usize(b.bit_offset)?, to_usize(b.bit_len)?);
+        self.charge_alloc(len.div_ceil(8))?;
+        self.charge_bits(b.bit_len)?;
+        // Take the bits from the buffer where it lives: copying all of a large buffer out to read a few
+        // bits of it would cost its whole size on every read.
+        let place = self.resolve_place(b.source.clone())?;
+        let bits = match self.place_value(&place) {
+            Ok(Value::Buffer(buf)) => ops::get_bits(buf, off, len)?,
+            Ok(_) => return Err(AmlError::TypeMismatch),
+            Err(e @ AmlError::StaleReference) => return Err(e),
+            Err(_) => {
+                let Value::Buffer(buf) = self.read_data(&b.source)? else { return Err(AmlError::TypeMismatch) };
+                ops::get_bits(&buf, off, len)?
+            }
+        };
         Ok(if b.bit_len <= if b.int64 { 64 } else { 32 } {
             Value::Integer(ops::le_to_u64(&bits))
         } else {
@@ -291,6 +317,7 @@ impl<H: Host> Interpreter<H> {
         };
         let place = self.resolve_place(b.source.clone())?;
         let (off, len) = (to_usize(b.bit_offset)?, to_usize(b.bit_len)?);
+        self.charge_bits(b.bit_len)?;
         match self.place_value(&place)? {
             Value::Buffer(buf) => ops::put_bits(buf, off, len, &src).ok_or(AmlError::OutOfBounds),
             _ => Err(AmlError::TypeMismatch),

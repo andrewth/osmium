@@ -18,17 +18,20 @@ full = ["sync", "mm", "hal", "drivers", "sysdrv", "storage", "display", "usb", "
 sync = ["dep:osmium-sync"]
 mm = ["sync", "dep:osmium-mm"]
 hal = ["sync", "mm", "dep:osmium-hal"]
+## The virtio core: MMIO and PCI transports, split virtqueues and the virtio console.
 drivers = ["hal", "mm", "sync", "dep:osmium-drivers"]
-## Interrupt controllers (PLIC, CLINT, GICv2, local APIC, I/O APIC) and IOMMUs (VT-d, AMD-Vi, SMMUv3, RISC-V).
+## System devices: UARTs (16550, PL011), `fw_cfg`, timers (PIT, HPET), interrupt controllers (PLIC, CLINT, GICv2, GICv3,
+## local APIC, I/O APIC) and IOMMUs (VT-d, AMD-Vi, SMMUv3, RISC-V).
 sysdrv = ["hal", "mm", "sync", "dep:osmium-sysdrv"]
 ## Storage drivers: virtio-blk, AHCI, NVMe and RAM disk.
 storage = ["hal", "drivers", "dep:osmium-storage"]
-## Display drivers: virtio-gpu, Bochs DISPI and VESA BIOS Extensions.
+## Display drivers: virtio-gpu, Bochs DISPI and VESA BIOS Extensions, and EDID parsing.
 display = ["hal", "mm", "drivers", "dep:osmium-display"]
-## USB host controllers (xHCI, EHCI, OHCI, UHCI) and class drivers.
+## USB host controllers (xHCI, EHCI, OHCI, UHCI) and class drivers (mass storage, HID).
 usb = ["hal", "mm", "dep:osmium-usb"]
-## Network device drivers: virtio-net, mlx4, USB CDC-ECM and CDC-NCM.
+## Network device drivers: virtio-net, mlx4 (Ethernet and IPoIB), USB CDC-ECM and CDC-NCM.
 netdev = ["hal", "drivers", "dep:osmium-netdev"]
+## Boot protocols and images: FDT (and an FDT writer), Multiboot2, PVH, ELF64, PE32+, UEFI and the static ACPI tables.
 boot = ["mm", "hal", "dep:osmium-boot"]
 ## Tasks and scheduling (needs `alloc`).
 sched = ["sync", "dep:osmium-sched"]
@@ -36,13 +39,13 @@ sched = ["sync", "dep:osmium-sched"]
 virt = ["boot", "hal", "mm", "sync", "dep:osmium-virt"]
 ## Heap-free async executor.
 exec = ["sync", "dep:osmium-exec"]
-## Virtual file system and RAM file system (needs `alloc`).
+## Virtual file system, RAM file system, overlay, synthetic trees, `/dev` and cpio initramfs (needs `alloc`).
 fs = ["sync", "dep:osmium-fs"]
 ## Processes, user address spaces and Linux-numbered system calls (needs `alloc`).
 proc = ["dep:osmium-proc", "sched", "fs", "mm", "boot", "net", "sync", "hal"]
-## FAT32 on any block device (needs `alloc`).
+## FAT12, FAT16 and FAT32 with long names on any block device (needs `alloc`).
 fs-fat = ["fs", "hal", "sync", "dep:osmium-fs-fat"]
-## IPv4 network stack: ARP, ICMP, UDP, TCP, DHCP (needs `alloc`).
+## IPv4 and IPv6 network stack: ARP and neighbor discovery, ICMP, UDP, TCP, DHCP and DHCPv6, DNS (needs `alloc`).
 net = ["hal", "dep:osmium-net"]
 ## ext2, ext3 and ext4, read and write, on any block device (needs `alloc`).
 fs-ext4 = ["fs", "hal", "sync", "dep:osmium-fs-ext4"]

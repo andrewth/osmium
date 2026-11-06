@@ -22,9 +22,15 @@
 //! # Limits
 //!
 //! AML comes from firmware, which is not trusted any more than a disk image is. Nothing in it can make
-//! the interpreter panic, recurse past [`Config::max_depth`], run past [`Config::max_steps`] terms or
-//! allocate more than a megabyte per object. A table with an error stops loading at that point, and a
-//! method with an error fails that one call.
+//! the interpreter panic or recurse past [`Config::max_depth`]. One call runs at most [`Config::max_steps`]
+//! steps, where a step is a term, 64 bytes of data copied, converted or compared, 64 bits of a field
+//! moved, or one access to an operation region; and it allocates at most [`Config::max_alloc_bytes`] in
+//! all, with no single buffer or string over a megabyte and no package over 65536 elements. Every
+//! allocation whose size the AML chooses (buffers, strings, packages and copies of them) is fallible, so a
+//! heap smaller than the budget gives [`AmlError::OutOfMemory`] rather than the allocation-failure handler;
+//! the small fixed-size ones (a namespace entry's maps, a reference) are not. Between calls the namespace holds at most [`Config::max_retained_bytes`]
+//! of data. A table with an error stops loading at that point, and a method with an error fails that one
+//! call.
 //!
 //! Not implemented: `Load`, `LoadTable`, `Unload` and `DataTableRegion` (return
 //! [`AmlError::Unsupported`]); the Global Lock handshake (`Acquire(\_GL_)` always succeeds, so a field

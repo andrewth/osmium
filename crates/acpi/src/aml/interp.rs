@@ -33,17 +33,31 @@ pub struct Config {
     /// how deep real firmware goes.
     pub max_depth: usize,
     /// How many terms one call to [`evaluate`](Interpreter::evaluate) may execute, to stop a loop that
-    /// never ends.
+    /// never ends. Work inside a term is counted too: copying, converting or comparing a buffer, string or
+    /// package counts as one term per 64 bytes, moving the bits of a field one term per 64 bits, and each
+    /// access to an operation region (each read or write the [`Host`] sees) as one term.
     pub max_steps: u64,
     /// How many microseconds of `Sleep` and `Stall` one call may request in total.
     pub max_sleep_us: u64,
     /// How many terms all the methods run by one [`initialize`](Interpreter::initialize),
     /// [`devices`](Interpreter::devices) or [`find_devices`](Interpreter::find_devices) may execute in total,
-    /// so that many methods each just under [`max_steps`](Self::max_steps) cannot add up to a hang. Copying
-    /// a buffer, string or package counts as one term per 64 bytes, in this limit and in `max_steps`.
+    /// so that many methods each just under [`max_steps`](Self::max_steps) cannot add up to a hang. Work
+    /// inside a term counts here as it does in `max_steps`.
     pub max_total_steps: u64,
     /// How many microseconds of `Sleep` and `Stall` such a batch may request in total.
     pub max_total_sleep_us: u64,
+    /// How many bytes one call may allocate in total, counting every buffer, string and package it creates
+    /// or copies and every object it adds to the namespace. Nothing is credited back when a value is freed,
+    /// so this is a bound on what the call can hold at once as well. Running out fails the call with
+    /// [`AmlError::OutOfMemory`].
+    pub max_alloc_bytes: u64,
+    /// The same for everything one batch ([`initialize`](Interpreter::initialize) and the like) runs.
+    pub max_total_alloc_bytes: u64,
+    /// How many bytes of data (strings, buffers, packages) the namespace may hold between calls. Without
+    /// this a method run again and again, such as an embedded-controller query, could grow a package by an
+    /// element each time. A call that leaves the namespace above it fails with [`AmlError::OutOfMemory`],
+    /// and the objects that call grew are emptied (set to uninitialized) to bring it back down.
+    pub max_retained_bytes: u64,
 }
 
 impl Default for Config {
@@ -56,6 +70,9 @@ impl Default for Config {
             max_sleep_us: 10_000_000,
             max_total_steps: 200_000_000,
             max_total_sleep_us: 60_000_000,
+            max_alloc_bytes: 64 << 20,
+            max_total_alloc_bytes: 256 << 20,
+            max_retained_bytes: 64 << 20,
         }
     }
 }
@@ -116,6 +133,8 @@ pub struct DeviceInfo {
 
 /// One method invocation (or one evaluation of lazy data, or one definition block being loaded).
 pub(crate) struct Frame {
+    /// Unique for the life of the interpreter; [`Ref::Local`](super::Ref::Local) names a frame by it.
+    pub serial: usize,
     pub args: [Value; 7],
     pub locals: [Value; 8],
     pub scope: NodeId,
@@ -139,6 +158,12 @@ pub struct Interpreter<H> {
     /// Terms and sleep of everything run since the current batch (`initialize`, `devices`) began.
     pub(crate) batch_steps: u64,
     pub(crate) batch_sleep_us: u64,
+    /// Bytes allocated by the current outermost call, and by the current batch.
+    pub(crate) alloc_bytes: u64,
+    pub(crate) batch_alloc_bytes: u64,
+    /// Namespace objects whose data the current outermost call may have changed; measured when it ends.
+    pub(crate) touched: BTreeSet<NodeId>,
+    next_serial: usize,
     /// How many batches are open (they nest: `initialize` runs `evaluate_node`).
     batches: u32,
     pub(crate) events: BTreeMap<NodeId, u64>,
@@ -169,6 +194,10 @@ impl<H: Host> Interpreter<H> {
             sleep_us: 0,
             batch_steps: 0,
             batch_sleep_us: 0,
+            alloc_bytes: 0,
+            batch_alloc_bytes: 0,
+            touched: BTreeSet::new(),
+            next_serial: 0,
             batches: 0,
             events: BTreeMap::new(),
             pci_cache: BTreeMap::new(),
@@ -192,7 +221,8 @@ impl<H: Host> Interpreter<H> {
         &self.ns
     }
 
-    /// The tables loaded so far, in load order.
+    /// The tables that loaded completely, in load order. A table that failed part way is not listed, though
+    /// what it declared before the error stays in the namespace.
     pub fn tables(&self) -> &[TableInfo] {
         &self.tables
     }
@@ -225,7 +255,6 @@ impl<H: Host> Interpreter<H> {
         let info = parse_header(table)?;
         let len = info.length as usize;
         let code: Arc<[u8]> = Arc::from(table.get(..len).ok_or(AmlError::InvalidTable)?);
-        self.tables.push(info.clone());
         self.enter(|s| {
             s.push_frame(ROOT, code.clone(), info.revision >= 2, false, Vec::new())?;
             let mut c = Cursor::new(&code, HEADER, len);
@@ -236,6 +265,7 @@ impl<H: Host> Interpreter<H> {
                 _ => Err(AmlError::BadControlFlow),
             }
         })?;
+        self.tables.push(info.clone());
         Ok(info)
     }
 
@@ -278,6 +308,7 @@ impl<H: Host> Interpreter<H> {
         if self.batches == 0 {
             self.batch_steps = 0;
             self.batch_sleep_us = 0;
+            self.batch_alloc_bytes = 0;
         }
         self.batches += 1;
         let r = f(self);
@@ -474,15 +505,45 @@ impl<H: Host> Interpreter<H> {
         if base == 0 {
             self.steps = 0;
             self.sleep_us = 0;
+            self.alloc_bytes = 0;
             if self.batches == 0 {
                 self.batch_steps = 0;
                 self.batch_sleep_us = 0;
+                self.batch_alloc_bytes = 0;
             }
         }
         let r = f(self);
         self.unwind(base);
         self.depth = depth;
+        if base == 0 {
+            let settled = self.settle_retained();
+            return r.and_then(|v| settled.map(|()| v));
+        }
         r
+    }
+
+    /// Measures the data of every object the call that just ended touched, and if the namespace now holds
+    /// more than [`Config::max_retained_bytes`], empties the objects that grew and fails.
+    fn settle_retained(&mut self) -> Result<(), AmlError> {
+        let mut grew = Vec::new();
+        for id in core::mem::take(&mut self.touched) {
+            let Some(Object::Data(Data::Ready(v))) = self.ns.object(id) else { continue };
+            let now = v.copy_size();
+            if now > self.ns.retained_of(id) {
+                grew.push(id);
+            }
+            self.ns.set_retained(id, now);
+        }
+        if self.ns.retained_bytes() as u64 <= self.config.max_retained_bytes {
+            return Ok(());
+        }
+        for id in grew {
+            if let Some(Object::Data(d)) = self.ns.object_mut(id) {
+                *d = Data::Ready(Value::Uninit);
+            }
+            self.ns.set_retained(id, 0);
+        }
+        Err(AmlError::OutOfMemory)
     }
 
     pub(crate) fn push_frame(
@@ -498,7 +559,10 @@ impl<H: Host> Interpreter<H> {
         for (slot, v) in a.iter_mut().zip(args) {
             *slot = v;
         }
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1);
         self.frames.push(Frame {
+            serial,
             args: a,
             locals: core::array::from_fn(|_| Value::Uninit),
             scope,
@@ -514,7 +578,11 @@ impl<H: Host> Interpreter<H> {
         self.depth = self.depth.saturating_sub(1);
         if let Some(f) = self.frames.pop() {
             for id in f.created {
-                self.ns.remove(id);
+                for gone in self.ns.remove(id) {
+                    self.events.remove(&gone);
+                    self.pci_cache.remove(&gone);
+                    self.touched.remove(&gone);
+                }
             }
         }
     }

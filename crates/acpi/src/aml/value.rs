@@ -4,6 +4,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::error::AmlError;
 use super::namespace::NodeId;
 
 /// A value an AML expression can have.
@@ -29,16 +30,17 @@ pub enum Value {
 pub enum Ref {
     /// A namespace object.
     Node(NodeId),
-    /// A method local; `frame` is the depth of the method invocation that owns it.
+    /// A method local; `frame` identifies the method invocation that owns it. Once that invocation returns,
+    /// the reference is stale and using it fails with [`AmlError::StaleReference`].
     Local {
-        /// The invocation's depth in the call stack.
+        /// The invocation's serial number, unique for the life of the interpreter.
         frame: usize,
         /// The local's number, 0 to 7.
         n: u8,
     },
-    /// A method argument.
+    /// A method argument, with the same lifetime as [`Ref::Local`].
     Arg {
-        /// The invocation's depth in the call stack.
+        /// The invocation's serial number, unique for the life of the interpreter.
         frame: usize,
         /// The argument's number, 0 to 6.
         n: u8,
@@ -64,14 +66,40 @@ impl Value {
         }
     }
 
-    /// Roughly how many bytes cloning this value copies.
+    /// Roughly how many bytes of heap cloning this value allocates.
     pub(crate) fn copy_size(&self) -> usize {
         match self {
             Value::String(s) => s.len(),
             Value::Buffer(b) => b.len(),
-            Value::Package(p) => p.iter().map(|v| 32 + v.copy_size()).fold(0, usize::saturating_add),
+            Value::Package(p) => {
+                p.iter().map(|v| core::mem::size_of::<Value>() + v.copy_size()).fold(0, usize::saturating_add)
+            }
+            Value::Reference(r) => r.depth().saturating_mul(core::mem::size_of::<Ref>()),
             _ => 0,
         }
+    }
+
+    /// A copy made with fallible allocations: [`AmlError::OutOfMemory`] if the heap cannot hold it. The
+    /// recursion is as deep as the value nests, which the interpreter keeps below `max_depth`.
+    pub(crate) fn try_clone(&self) -> Result<Value, AmlError> {
+        Ok(match self {
+            Value::String(s) => {
+                let mut t = String::new();
+                t.try_reserve_exact(s.len()).map_err(|_| AmlError::OutOfMemory)?;
+                t.push_str(s);
+                Value::String(t)
+            }
+            Value::Buffer(b) => Value::Buffer(try_copy(b)?),
+            Value::Package(p) => {
+                let mut v = Vec::new();
+                v.try_reserve_exact(p.len()).map_err(|_| AmlError::OutOfMemory)?;
+                for x in p {
+                    v.push(x.try_clone()?);
+                }
+                Value::Package(v)
+            }
+            other => other.clone(),
+        })
     }
 
     /// The integer, if this is one.
@@ -105,6 +133,22 @@ impl Value {
             _ => None,
         }
     }
+}
+
+/// `n` zero bytes, or [`AmlError::OutOfMemory`].
+pub(crate) fn try_zeroed(n: usize) -> Result<Vec<u8>, AmlError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| AmlError::OutOfMemory)?;
+    v.resize(n, 0);
+    Ok(v)
+}
+
+/// A copy of `b`, or [`AmlError::OutOfMemory`].
+pub(crate) fn try_copy(b: &[u8]) -> Result<Vec<u8>, AmlError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(b.len()).map_err(|_| AmlError::OutOfMemory)?;
+    v.extend_from_slice(b);
+    Ok(v)
 }
 
 impl Ref {

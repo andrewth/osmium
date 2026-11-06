@@ -14,9 +14,11 @@ use super::error::AmlError;
 use super::host::Host;
 use super::interp::Interpreter;
 use super::name::{NameSeg, NameString};
-use super::namespace::{BufferField, Data, FieldKind, FieldUnit, Lazy, Method, NodeId, Object, Region, Update};
+use super::namespace::{
+    BufferField, Data, FieldKind, FieldUnit, Lazy, Method, NODE_COST, NodeId, Object, Region, Update,
+};
 use super::ops;
-use super::value::{Ref, Value, type_code};
+use super::value::{Ref, Value, try_copy, try_zeroed, type_code};
 
 /// Largest buffer or string AML may create.
 pub(crate) const MAX_OBJECT: u64 = 1 << 20;
@@ -74,6 +76,38 @@ impl<H: Host> Interpreter<H> {
         self.charge(bytes as u64 / 64)
     }
 
+    /// Counts `bytes` bytes of allocation against the per-call and the batch memory budgets.
+    pub(crate) fn charge_alloc(&mut self, bytes: usize) -> Result<(), AmlError> {
+        self.alloc_bytes = self.alloc_bytes.saturating_add(bytes as u64);
+        self.batch_alloc_bytes = self.batch_alloc_bytes.saturating_add(bytes as u64);
+        if self.alloc_bytes > self.config.max_alloc_bytes || self.batch_alloc_bytes > self.config.max_total_alloc_bytes
+        {
+            Err(AmlError::OutOfMemory)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Counts making a new copy of `bytes` bytes: the work, and the memory.
+    pub(crate) fn charge_copy(&mut self, bytes: usize) -> Result<(), AmlError> {
+        self.charge_bytes(bytes)?;
+        self.charge_alloc(bytes)
+    }
+
+    /// Counts moving `bits` bits one at a time: one term per 64.
+    pub(crate) fn charge_bits(&mut self, bits: u64) -> Result<(), AmlError> {
+        self.charge(bits / 64)
+    }
+
+    /// Stores the result `r` of an operator in its target, and gives it back.
+    fn store_result(&mut self, t: &Target, r: Value) -> Result<Value, AmlError> {
+        if !matches!(t, Target::Null) {
+            let copy = self.copy_value(&r)?;
+            self.store_target(t, copy)?;
+        }
+        Ok(r)
+    }
+
     pub(crate) fn int_arg(&mut self, c: &mut Cursor<'_>) -> Result<u64, AmlError> {
         let v = self.arg(c)?;
         self.integer_from(v)
@@ -105,7 +139,11 @@ impl<H: Host> Interpreter<H> {
             0x0a => Value::Integer(u64::from(c.byte()?)),
             0x0b => Value::Integer(u64::from(c.word()?)),
             0x0c => Value::Integer(u64::from(c.dword()?)),
-            0x0d => Value::String(string_constant(c)?),
+            0x0d => {
+                let s = string_constant(c)?;
+                self.charge_copy(s.len())?;
+                Value::String(s)
+            }
             0x0e => Value::Integer(self.trunc(c.qword()?)),
             0x06 | 0x08 | 0x10 | 0x14 | 0x15 => {
                 self.declare(op, c)?;
@@ -114,18 +152,18 @@ impl<H: Host> Interpreter<H> {
             0x11 => self.buffer_term(c)?,
             0x12 | 0x13 => self.package_term(op, c)?,
             0x5b => return self.ext_term(c),
-            0x60..=0x67 => {
-                self.frames.last().and_then(|f| f.locals.get(usize::from(op - 0x60))).cloned().unwrap_or_default()
-            }
-            0x68..=0x6e => {
-                self.frames.last().and_then(|f| f.args.get(usize::from(op - 0x68))).cloned().unwrap_or_default()
+            0x60..=0x6e => {
+                fn slot(f: &super::interp::Frame, op: u8) -> Option<&Value> {
+                    if op < 0x68 { f.locals.get(usize::from(op - 0x60)) } else { f.args.get(usize::from(op - 0x68)) }
+                }
+                let size = self.frames.last().and_then(|f| slot(f, op)).map_or(0, Value::copy_size);
+                self.charge_copy(size)?;
+                self.frames.last().and_then(|f| slot(f, op)).map_or(Ok(Value::Uninit), Value::try_clone)?
             }
             0x70 => {
                 let v = self.arg(c)?;
                 let t = self.target(c)?;
-                self.charge_bytes(v.copy_size())?;
-                self.store_target(&t, v.clone())?;
-                v
+                self.store_result(&t, v)?
             }
             0x71 => match self.operand(c)? {
                 Operand::Place(r) => Value::Reference(r),
@@ -180,9 +218,10 @@ impl<H: Host> Interpreter<H> {
             0x9d => {
                 let v = self.arg(c)?;
                 let t = self.target(c)?;
+                let copy = self.copy_value(&v)?;
                 match t {
-                    Target::Place(r) => self.write_ref(&r, v.clone(), Mode::Copy)?,
-                    other => self.store_target(&other, v.clone())?,
+                    Target::Place(r) => self.write_ref(&r, copy, Mode::Copy)?,
+                    other => self.store_target(&other, copy)?,
                 }
                 v
             }
@@ -239,10 +278,15 @@ impl<H: Host> Interpreter<H> {
     /// and gives `None`.
     pub(crate) fn create(&mut self, name: &NameString<'_>, object: Object) -> Result<Option<NodeId>, AmlError> {
         let (parent, seg) = self.ns.locate_new(self.scope(), name)?;
+        self.charge_alloc(NODE_COST)?;
+        let data = matches!(object, Object::Data(_));
         match self.ns.insert(parent, seg, object) {
             Ok(id) => {
                 if let Some(f) = self.frames.last_mut().filter(|f| f.track) {
                     f.created.push(id);
+                }
+                if data {
+                    self.touched.insert(id);
                 }
                 Ok(Some(id))
             }
@@ -257,6 +301,7 @@ impl<H: Host> Interpreter<H> {
 
     /// A node with no name holding `v`, so that a reference to it can be made.
     pub(crate) fn anonymous(&mut self, v: Value) -> Result<Ref, AmlError> {
+        self.charge_alloc(NODE_COST)?;
         let id = self.ns.insert_anonymous(Object::Data(Data::Ready(v)))?;
         if let Some(f) = self.frames.last_mut() {
             f.created.push(id);
@@ -425,7 +470,8 @@ impl<H: Host> Interpreter<H> {
                         return Err(AmlError::TooLarge);
                     }
                     let unit = FieldUnit { kind, bit_offset: bit, bit_len: len, access, update, int64 };
-                    let (parent, _) = (self.scope(), ());
+                    let parent = self.scope();
+                    self.charge_alloc(NODE_COST)?;
                     match self.ns.insert(parent, seg, Object::Field(unit)) {
                         Ok(id) => {
                             if let Some(f) = self.frames.last_mut().filter(|f| f.track) {
@@ -545,8 +591,7 @@ impl<H: Host> Interpreter<H> {
                 let t = self.target(c)?;
                 let r = if op == 0x28 { ops::from_bcd(v) } else { ops::to_bcd(v) }.ok_or(AmlError::InvalidOperand)?;
                 let r = Value::Integer(self.trunc(r));
-                self.store_target(&t, r.clone())?;
-                r
+                self.store_result(&t, r)?
             }
             0x30 => Value::Integer(self.config.revision),
             0x31 => Value::Uninit,
@@ -618,8 +663,8 @@ impl<H: Host> Interpreter<H> {
         if size > MAX_OBJECT {
             return Err(AmlError::TooLarge);
         }
-        self.charge_bytes(size as usize)?;
-        let mut buf = alloc::vec![0u8; size as usize];
+        self.charge_copy(size as usize)?;
+        let mut buf = try_zeroed(size as usize)?;
         let init = b.data.get(b.pos..b.end).unwrap_or_default();
         let n = init.len().min(buf.len());
         if let (Some(dst), Some(src)) = (buf.get_mut(..n), init.get(..n)) {
@@ -637,8 +682,9 @@ impl<H: Host> Interpreter<H> {
             return Err(AmlError::TooLarge);
         }
         let n = n as usize;
-        self.charge_bytes(n.saturating_mul(32))?;
-        let mut items = Vec::with_capacity(n.min(64));
+        self.charge_copy(n.saturating_mul(core::mem::size_of::<Value>()))?;
+        let mut items = Vec::new();
+        items.try_reserve_exact(n).map_err(|_| AmlError::OutOfMemory)?;
         while !b.at_end() && items.len() < n {
             let item = self.package_element(&mut b)?;
             self.check_nesting(&item)?;
@@ -706,8 +752,7 @@ impl<H: Host> Interpreter<H> {
             _ => a.checked_rem(b).ok_or(AmlError::DivideByZero)?,
         };
         let r = Value::Integer(self.trunc(r));
-        self.store_target(&t, r.clone())?;
-        Ok(r)
+        self.store_result(&t, r)
     }
 
     fn divide(&mut self, c: &mut Cursor<'_>) -> Result<Value, AmlError> {
@@ -732,17 +777,16 @@ impl<H: Host> Interpreter<H> {
             _ => ops::find_set_right(a),
         };
         let r = Value::Integer(self.trunc(r));
-        self.store_target(&t, r.clone())?;
-        Ok(r)
+        self.store_result(&t, r)
     }
 
     fn increment(&mut self, up: bool, c: &mut Cursor<'_>) -> Result<Value, AmlError> {
         let Operand::Place(r) = self.operand(c)? else { return Err(AmlError::TypeMismatch) };
         let cur = self.read_ref(&r)?;
         let n = self.integer_from(cur)?;
-        let n = Value::Integer(self.trunc(if up { n.wrapping_add(1) } else { n.wrapping_sub(1) }));
-        self.write_ref(&r, n.clone(), Mode::Store)?;
-        Ok(n)
+        let n = self.trunc(if up { n.wrapping_add(1) } else { n.wrapping_sub(1) });
+        self.write_ref(&r, Value::Integer(n), Mode::Store)?;
+        Ok(Value::Integer(n))
     }
 
     /// Orders two values by the type of the first, converting the second to match.
@@ -753,9 +797,14 @@ impl<H: Host> Interpreter<H> {
             Value::Integer(x) => Ok(x.cmp(&self.integer_from(b)?)),
             Value::String(s) => {
                 let t = self.string_from(b)?;
+                self.charge_bytes(s.len().min(t.len()))?;
                 Ok(s.as_bytes().cmp(t.as_bytes()))
             }
-            Value::Buffer(x) => Ok(x.cmp(&self.buffer_from(b)?)),
+            Value::Buffer(x) => {
+                let y = self.buffer_from(b)?;
+                self.charge_bytes(x.len().min(y.len()))?;
+                Ok(x.cmp(&y))
+            }
             _ => Err(AmlError::TypeMismatch),
         }
     }
@@ -774,25 +823,37 @@ impl<H: Host> Interpreter<H> {
                 Value::Buffer(buf)
             }
             Value::String(mut s) => {
-                s.push_str(&self.string_from(b)?);
-                if s.len() as u64 > MAX_OBJECT {
+                let t = self.string_from(b)?;
+                let total = s.len().saturating_add(t.len());
+                if total as u64 > MAX_OBJECT {
                     return Err(AmlError::TooLarge);
                 }
-                self.charge_bytes(s.len())?;
+                self.charge_copy(total)?;
+                s.try_reserve_exact(t.len()).map_err(|_| AmlError::OutOfMemory)?;
+                s.push_str(&t);
                 Value::String(s)
             }
-            Value::Buffer(mut x) => {
-                x.extend(self.buffer_from(b)?);
-                if x.len() as u64 > MAX_OBJECT {
-                    return Err(AmlError::TooLarge);
-                }
-                self.charge_bytes(x.len())?;
-                Value::Buffer(x)
+            Value::Buffer(x) => {
+                let y = self.buffer_from(b)?;
+                Value::Buffer(self.join(&x, &y)?)
             }
             _ => return Err(AmlError::TypeMismatch),
         };
-        self.store_target(&t, r.clone())?;
-        Ok(r)
+        self.store_result(&t, r)
+    }
+
+    /// `a` followed by `b`, within [`MAX_OBJECT`] and charged as a copy.
+    fn join(&mut self, a: &[u8], b: &[u8]) -> Result<Vec<u8>, AmlError> {
+        let total = a.len().saturating_add(b.len());
+        if total as u64 > MAX_OBJECT {
+            return Err(AmlError::TooLarge);
+        }
+        self.charge_copy(total)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(total).map_err(|_| AmlError::OutOfMemory)?;
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        Ok(out)
     }
 
     /// `ConcatenateResTemplate`: two resource templates joined, dropping the first's end tag.
@@ -806,14 +867,8 @@ impl<H: Host> Interpreter<H> {
         if a.len() >= 2 && a.get(a.len() - 2) == Some(&0x79) {
             a.truncate(a.len() - 2);
         }
-        a.extend(b);
-        if a.len() as u64 > MAX_OBJECT {
-            return Err(AmlError::TooLarge);
-        }
-        self.charge_bytes(a.len())?;
-        let r = Value::Buffer(a);
-        self.store_target(&t, r.clone())?;
-        Ok(r)
+        let r = Value::Buffer(self.join(&a, &b)?);
+        self.store_result(&t, r)
     }
 
     fn mid(&mut self, c: &mut Cursor<'_>) -> Result<Value, AmlError> {
@@ -830,16 +885,19 @@ impl<H: Host> Interpreter<H> {
         let r = match src {
             Value::String(s) => {
                 let (a, b) = window(s.len());
-                Value::String(s.bytes().skip(a).take(b - a).map(char::from).collect())
+                self.charge_copy(b - a)?;
+                let bytes = try_copy(s.as_bytes().get(a..b).unwrap_or_default())?;
+                // The interpreter's strings are ASCII, so any byte range of one is a string.
+                Value::String(String::from_utf8(bytes).map_err(|_| AmlError::InvalidOperand)?)
             }
             other => {
                 let buf = self.buffer_from(other)?;
                 let (a, b) = window(buf.len());
-                Value::Buffer(buf.get(a..b).unwrap_or_default().to_vec())
+                self.charge_copy(b - a)?;
+                Value::Buffer(try_copy(buf.get(a..b).unwrap_or_default())?)
             }
         };
-        self.store_target(&t, r.clone())?;
-        Ok(r)
+        self.store_result(&t, r)
     }
 
     /// `ToBuffer`, `ToDecimalString`, `ToHexString`, `ToInteger` and `ToString`.
@@ -861,13 +919,12 @@ impl<H: Host> Interpreter<H> {
                         Some(l) if l != 0 && l < u64::from(u32::MAX) => l as usize,
                         _ => usize::MAX,
                     };
-                    Value::String(
-                        b.iter()
-                            .take(n)
-                            .take_while(|&&x| x != 0)
-                            .map(|&x| if x < 0x80 { char::from(x) } else { '?' })
-                            .collect(),
-                    )
+                    let len = b.iter().take(n).take_while(|&&x| x != 0).count();
+                    self.charge_copy(len)?;
+                    let mut s = String::new();
+                    s.try_reserve_exact(len).map_err(|_| AmlError::OutOfMemory)?;
+                    s.extend(b.iter().take(len).map(|&x| if x < 0x80 { char::from(x) } else { '?' }));
+                    Value::String(s)
                 }
                 other => Value::String(self.string_from(other)?),
             },
@@ -876,19 +933,16 @@ impl<H: Host> Interpreter<H> {
                 match v {
                     Value::Integer(i) => Value::String(if hex { ops::hex_string(i, 0) } else { alloc::format!("{i}") }),
                     Value::Buffer(b) => {
-                        let parts: Vec<String> = b
-                            .iter()
-                            .map(|&x| if hex { ops::hex_string(u64::from(x), 2) } else { alloc::format!("{x}") })
-                            .collect();
-                        Value::String(parts.join(","))
+                        let s = ops::bytes_to_text(&b, hex, MAX_OBJECT as usize)?;
+                        self.charge_copy(s.len())?;
+                        Value::String(s)
                     }
                     Value::String(s) => Value::String(s),
                     _ => return Err(AmlError::TypeMismatch),
                 }
             }
         };
-        self.store_target(&t, r.clone())?;
-        Ok(r)
+        self.store_result(&t, r)
     }
 
     fn deref_of(&mut self, c: &mut Cursor<'_>) -> Result<Value, AmlError> {
@@ -908,7 +962,17 @@ impl<H: Host> Interpreter<H> {
 
     fn size_of(&mut self, c: &mut Cursor<'_>) -> Result<Value, AmlError> {
         let v = match self.operand(c)? {
-            Operand::Place(r) => self.read_data(&r)?,
+            Operand::Place(r) => {
+                // Measure data in place rather than copying it out.
+                let place = self.resolve_place(r.clone())?;
+                match self.place_value(&place) {
+                    Ok(Value::String(s)) => return Ok(Value::Integer(s.len() as u64)),
+                    Ok(Value::Buffer(b)) => return Ok(Value::Integer(b.len() as u64)),
+                    Ok(Value::Package(p)) => return Ok(Value::Integer(p.len() as u64)),
+                    Err(e @ AmlError::StaleReference) => return Err(e),
+                    _ => self.read_data(&r)?,
+                }
+            }
             Operand::Value(v) => v,
         };
         let n = match v {
@@ -940,8 +1004,7 @@ impl<H: Host> Interpreter<H> {
             return Err(AmlError::TooDeep);
         }
         let r = Value::Reference(Ref::Index { base: alloc::boxed::Box::new(base), index: index as usize });
-        self.store_target(&t, r.clone())?;
-        Ok(r)
+        self.store_result(&t, r)
     }
 
     fn match_term(&mut self, c: &mut Cursor<'_>) -> Result<Value, AmlError> {
@@ -953,6 +1016,7 @@ impl<H: Host> Interpreter<H> {
         let start = self.int_arg(c)?;
         let Value::Package(items) = self.deref_data(pkg)? else { return Err(AmlError::TypeMismatch) };
         for (i, item) in items.into_iter().enumerate().skip(start.min(usize::MAX as u64) as usize) {
+            self.charge(1)?;
             if !matches!(item, Value::Integer(_) | Value::String(_) | Value::Buffer(_)) {
                 continue;
             }
@@ -967,7 +1031,8 @@ impl<H: Host> Interpreter<H> {
         if op == 0 {
             return Ok(true);
         }
-        let ord = match self.compare(item.clone(), obj.clone()) {
+        let (item, obj) = (self.copy_value(item)?, self.copy_value(obj)?);
+        let ord = match self.compare(item, obj) {
             Ok(o) => o,
             Err(AmlError::TypeMismatch | AmlError::InvalidOperand) => return Ok(false),
             Err(e) => return Err(e),

@@ -12,9 +12,23 @@ use super::name::NameString;
 use super::namespace::{Data, NodeId, Object, ROOT};
 use super::ops;
 
+use super::value::{Ref, Value};
+
 /// How many steps through [`Ref::Index`] one lookup of a place may take (see `place_value_at`).
 const INDEX_FUEL: u32 = 256;
-use super::value::{Ref, Value};
+/// Values larger than this, in bytes, are summarized rather than printed when stored to `Debug`.
+const DEBUG_LIMIT: usize = 4096;
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Uninit => "uninitialized",
+        Value::Integer(_) => "integer",
+        Value::String(_) => "string",
+        Value::Buffer(_) => "buffer",
+        Value::Package(_) => "package",
+        Value::Reference(_) => "reference",
+    }
+}
 
 /// How a value is written to a place.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,8 +80,20 @@ impl<H: Host> Interpreter<H> {
         self.trunc(u64::MAX)
     }
 
+    /// The serial number of the running frame, which [`Ref::Local`] and [`Ref::Arg`] name it by.
     fn top(&self) -> usize {
-        self.frames.len().saturating_sub(1)
+        self.frames.last().map_or(usize::MAX, |f| f.serial)
+    }
+
+    /// The frame with serial number `serial`, if it is still running.
+    fn frame_mut(&mut self, serial: usize) -> Result<&mut super::interp::Frame, AmlError> {
+        self.frames.iter_mut().rev().find(|f| f.serial == serial).ok_or(AmlError::StaleReference)
+    }
+
+    /// A copy of `v`, charged against the step and memory budgets.
+    pub(crate) fn copy_value(&mut self, v: &Value) -> Result<Value, AmlError> {
+        self.charge_copy(v.copy_size())?;
+        v.try_clone()
     }
 
     // ----- operands and targets -----
@@ -146,7 +172,14 @@ impl<H: Host> Interpreter<H> {
         match t {
             Target::Null => Ok(()),
             Target::Debug => {
-                let msg = alloc::format!("{v:?}");
+                // Formatting a large value would take several times its size; describe it instead.
+                let size = v.copy_size();
+                self.charge_bytes(size)?;
+                let msg = if size > DEBUG_LIMIT {
+                    alloc::format!("{} of {size} bytes", type_name(&v))
+                } else {
+                    alloc::format!("{v:?}")
+                };
                 self.host.debug(&msg);
                 Ok(())
             }
@@ -197,8 +230,9 @@ impl<H: Host> Interpreter<H> {
             Value::String(s) => Ok(s),
             Value::Integer(i) => Ok(ops::hex_string(i, if int64 { 16 } else { 8 })),
             Value::Buffer(b) => {
-                let parts: Vec<String> = b.iter().map(|&x| ops::hex_string(u64::from(x), 2)).collect();
-                Ok(parts.join(","))
+                let s = ops::bytes_to_text(&b, true, super::exec::MAX_OBJECT as usize)?;
+                self.charge_copy(s.len())?;
+                Ok(s)
             }
             Value::Reference(r) => match self.read_ref(&r)? {
                 Value::Reference(_) => Err(AmlError::TypeMismatch),
@@ -256,6 +290,7 @@ impl<H: Host> Interpreter<H> {
             _ => return Ok(()),
         };
         let scope = self.ns.parent(id).unwrap_or(ROOT);
+        self.touched.insert(id);
         let r = self.push_frame(scope, lazy.code.clone(), lazy.int64, false, Vec::new()).and_then(|()| {
             let mut c = Cursor::new(&lazy.code, lazy.start, lazy.end);
             let r = self.arg(&mut c);
@@ -279,8 +314,13 @@ impl<H: Host> Interpreter<H> {
         match self.ns.object(id).ok_or(AmlError::NotFound)? {
             Object::Data(_) => {
                 self.ensure_ready(id)?;
+                let size = match self.ns.object(id) {
+                    Some(Object::Data(Data::Ready(v))) => v.copy_size(),
+                    _ => return Err(AmlError::TypeMismatch),
+                };
+                self.charge_copy(size)?;
                 match self.ns.object(id) {
-                    Some(Object::Data(Data::Ready(v))) => Ok(v.clone()),
+                    Some(Object::Data(Data::Ready(v))) => v.try_clone(),
                     _ => Err(AmlError::TypeMismatch),
                 }
             }
@@ -310,17 +350,17 @@ impl<H: Host> Interpreter<H> {
             Ref::Node(id) => {
                 let id = self.ns.resolve_alias(*id);
                 self.ensure_ready(id)?;
+                // The caller may change it through the reference; measure it when the call ends.
+                self.touched.insert(id);
                 match self.ns.object_mut(id) {
                     Some(Object::Data(Data::Ready(v))) => Ok(v),
                     _ => Err(AmlError::TypeMismatch),
                 }
             }
             Ref::Local { frame, n } => {
-                self.frames.get_mut(*frame).and_then(|f| f.locals.get_mut(usize::from(*n))).ok_or(AmlError::OutOfBounds)
+                self.frame_mut(*frame)?.locals.get_mut(usize::from(*n)).ok_or(AmlError::OutOfBounds)
             }
-            Ref::Arg { frame, n } => {
-                self.frames.get_mut(*frame).and_then(|f| f.args.get_mut(usize::from(*n))).ok_or(AmlError::OutOfBounds)
-            }
+            Ref::Arg { frame, n } => self.frame_mut(*frame)?.args.get_mut(usize::from(*n)).ok_or(AmlError::OutOfBounds),
             Ref::Index { base, index } => {
                 *fuel = fuel.checked_sub(1).ok_or(AmlError::TooDeep)?;
                 let base = self.resolve_place_at(base.as_ref().clone(), fuel)?;
@@ -341,7 +381,7 @@ impl<H: Host> Interpreter<H> {
         for _ in 0..8 {
             match self.place_value_at(&r, fuel) {
                 Ok(Value::Reference(inner)) => r = inner.clone(),
-                Err(AmlError::TooDeep) => return Err(AmlError::TooDeep),
+                Err(e @ (AmlError::TooDeep | AmlError::StaleReference)) => return Err(e),
                 _ => return Ok(r),
             }
         }
@@ -351,11 +391,22 @@ impl<H: Host> Interpreter<H> {
     pub(crate) fn read_ref(&mut self, r: &Ref) -> Result<Value, AmlError> {
         match r {
             Ref::Node(id) => self.read_node(*id),
-            Ref::Local { .. } | Ref::Arg { .. } => Ok(self.place_value(r)?.clone()),
+            Ref::Local { .. } | Ref::Arg { .. } => {
+                let size = self.place_value(r)?.copy_size();
+                self.charge_copy(size)?;
+                self.place_value(r)?.try_clone()
+            }
             Ref::Index { base, index } => {
                 let base = self.resolve_place(base.as_ref().clone())?;
                 let whole = match self.place_value(&base) {
-                    Ok(Value::Package(p)) => return p.get(*index).cloned().ok_or(AmlError::OutOfBounds),
+                    Ok(Value::Package(p)) => {
+                        let size = p.get(*index).ok_or(AmlError::OutOfBounds)?.copy_size();
+                        self.charge_copy(size)?;
+                        return match self.place_value(&base)? {
+                            Value::Package(p) => p.get(*index).ok_or(AmlError::OutOfBounds)?.try_clone(),
+                            _ => Err(AmlError::TypeMismatch),
+                        };
+                    }
                     Ok(Value::Buffer(b)) => {
                         return b.get(*index).map(|&x| Value::Integer(u64::from(x))).ok_or(AmlError::OutOfBounds);
                     }
@@ -367,6 +418,7 @@ impl<H: Host> Interpreter<H> {
                             .ok_or(AmlError::OutOfBounds);
                     }
                     Ok(_) => return Err(AmlError::TypeMismatch),
+                    Err(e @ AmlError::StaleReference) => return Err(e),
                     Err(_) => {
                         self.descend()?;
                         let whole = self.read_ref(&base);
@@ -448,6 +500,10 @@ impl<H: Host> Interpreter<H> {
             n => {
                 let mut b = self.buffer_from(v)?;
                 let old = n - 3;
+                if old > b.len() {
+                    self.charge_copy(old - b.len())?;
+                    b.try_reserve_exact(old - b.len()).map_err(|_| AmlError::OutOfMemory)?;
+                }
                 if old != 0 {
                     b.resize(old, 0);
                 }

@@ -13,13 +13,21 @@ use super::value::{Ref, Value};
 /// Most objects the namespace may hold, a bound on what a hostile table can make the interpreter allocate.
 const MAX_NODES: usize = 1 << 20;
 
+/// Roughly what one namespace entry costs to hold, not counting its data. Creating an object charges this
+/// against [`Config::max_alloc_bytes`](super::Config::max_alloc_bytes).
+pub(crate) const NODE_COST: usize = core::mem::size_of::<Node>() + 32;
+
 /// A handle to an object in the [`Namespace`]. It stays valid until the object is removed, which only
-/// happens to objects a method created for itself.
+/// happens to objects a method created for itself. A handle to a removed object never refers to anything
+/// again: the slot's next occupant gets a new generation, so the stale handle finds nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct NodeId(pub(crate) u32);
+pub struct NodeId {
+    pub(crate) index: u32,
+    pub(crate) generation: u32,
+}
 
 /// The root of the namespace, `\`.
-pub const ROOT: NodeId = NodeId(0);
+pub const ROOT: NodeId = NodeId { index: 0, generation: 0 };
 
 /// What kind of object a namespace entry is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +153,10 @@ pub(crate) enum Object {
 }
 
 struct Node {
+    /// Bumped each time the slot is reused, so a [`NodeId`] of an earlier occupant no longer matches.
+    generation: u32,
+    /// The bytes of data this object held when last measured (see [`Namespace::retained_bytes`]).
+    retained: usize,
     name: NameSeg,
     parent: Option<NodeId>,
     /// Children by name, for lookup.
@@ -158,22 +170,34 @@ struct Node {
 pub struct Namespace {
     nodes: Vec<Node>,
     free: Vec<u32>,
+    /// The sum of every node's `retained`.
+    retained: usize,
 }
 
 impl Namespace {
     pub(crate) fn new() -> Self {
         let root = Node {
+            generation: 0,
+            retained: 0,
             name: NameSeg(*b"\\___"),
             parent: None,
             children: BTreeMap::new(),
             order: Vec::new(),
             object: Object::Scope,
         };
-        Self { nodes: alloc::vec![root], free: Vec::new() }
+        Self { nodes: alloc::vec![root], free: Vec::new(), retained: 0 }
     }
 
     fn node(&self, id: NodeId) -> Option<&Node> {
-        self.nodes.get(id.0 as usize).filter(|n| !matches!(n.object, Object::Removed))
+        self.nodes
+            .get(id.index as usize)
+            .filter(|n| n.generation == id.generation && !matches!(n.object, Object::Removed))
+    }
+
+    fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.nodes
+            .get_mut(id.index as usize)
+            .filter(|n| n.generation == id.generation && !matches!(n.object, Object::Removed))
     }
 
     pub(crate) fn object(&self, id: NodeId) -> Option<&Object> {
@@ -181,7 +205,25 @@ impl Namespace {
     }
 
     pub(crate) fn object_mut(&mut self, id: NodeId) -> Option<&mut Object> {
-        self.nodes.get_mut(id.0 as usize).filter(|n| !matches!(n.object, Object::Removed)).map(|n| &mut n.object)
+        self.node_mut(id).map(|n| &mut n.object)
+    }
+
+    /// How many bytes of data (strings, buffers and packages) the objects in the namespace held when they
+    /// were last measured, which is at the end of each outermost call. The interpreter keeps this at or
+    /// below [`Config::max_retained_bytes`](super::Config::max_retained_bytes).
+    pub fn retained_bytes(&self) -> usize {
+        self.retained
+    }
+
+    pub(crate) fn retained_of(&self, id: NodeId) -> usize {
+        self.node(id).map_or(0, |n| n.retained)
+    }
+
+    /// Records that `id` now holds `bytes` bytes of data.
+    pub(crate) fn set_retained(&mut self, id: NodeId, bytes: usize) {
+        let Some(n) = self.node_mut(id) else { return };
+        let old = core::mem::replace(&mut n.retained, bytes);
+        self.retained = self.retained.saturating_sub(old).saturating_add(bytes);
     }
 
     /// Whether `id` still names an object.
@@ -336,9 +378,8 @@ impl Namespace {
         if self.node(parent).ok_or(AmlError::NotFound)?.children.contains_key(&name) {
             return Err(AmlError::AlreadyExists);
         }
-        let id =
-            self.alloc(Node { name, parent: Some(parent), children: BTreeMap::new(), order: Vec::new(), object })?;
-        if let Some(p) = self.nodes.get_mut(parent.0 as usize) {
+        let id = self.alloc(name, Some(parent), object)?;
+        if let Some(p) = self.node_mut(parent) {
             p.children.insert(name, id);
             p.order.push(id);
         }
@@ -347,48 +388,68 @@ impl Namespace {
 
     /// An object with no name, for values that need a place to live.
     pub(crate) fn insert_anonymous(&mut self, object: Object) -> Result<NodeId, AmlError> {
-        self.alloc(Node { name: NameSeg(*b"____"), parent: None, children: BTreeMap::new(), order: Vec::new(), object })
+        self.alloc(NameSeg(*b"____"), None, object)
     }
 
-    fn alloc(&mut self, node: Node) -> Result<NodeId, AmlError> {
+    fn alloc(&mut self, name: NameSeg, parent: Option<NodeId>, object: Object) -> Result<NodeId, AmlError> {
+        let fresh = |generation| Node {
+            generation,
+            retained: 0,
+            name,
+            parent,
+            children: BTreeMap::new(),
+            order: Vec::new(),
+            object,
+        };
         if let Some(slot) = self.free.pop()
             && let Some(n) = self.nodes.get_mut(slot as usize)
         {
-            *n = node;
-            return Ok(NodeId(slot));
+            // A slot is only freed while its generation can still be bumped (see `remove`).
+            let generation = n.generation.wrapping_add(1);
+            *n = fresh(generation);
+            return Ok(NodeId { index: slot, generation });
         }
         if self.nodes.len() >= MAX_NODES {
             return Err(AmlError::TooLarge);
         }
-        self.nodes.push(node);
-        Ok(NodeId((self.nodes.len() - 1) as u32))
+        self.nodes.try_reserve(1).map_err(|_| AmlError::OutOfMemory)?;
+        self.nodes.push(fresh(0));
+        Ok(NodeId { index: (self.nodes.len() - 1) as u32, generation: 0 })
     }
 
-    /// Removes `id` and everything under it.
-    pub(crate) fn remove(&mut self, id: NodeId) {
-        if id == ROOT {
-            return;
+    /// Removes `id` and everything under it, and gives what was removed.
+    pub(crate) fn remove(&mut self, id: NodeId) -> Vec<NodeId> {
+        if id == ROOT || self.node(id).is_none() {
+            return Vec::new();
         }
         let mut doomed = self.descendants(id);
         doomed.push(id);
         if let Some(Node { parent: Some(p), name, .. }) = self.node(id) {
             let (p, name) = (*p, *name);
-            if let Some(pn) = self.nodes.get_mut(p.0 as usize)
+            if let Some(pn) = self.node_mut(p)
                 && pn.children.get(&name) == Some(&id)
             {
                 pn.children.remove(&name);
                 pn.order.retain(|&c| c != id);
             }
         }
-        for d in doomed {
-            if let Some(n) = self.nodes.get_mut(d.0 as usize) {
+        for &d in &doomed {
+            if let Some(n) = self.node_mut(d) {
                 n.object = Object::Removed;
-                n.children.clear();
-                n.order.clear();
+                n.children = BTreeMap::new();
+                n.order = Vec::new();
                 n.parent = None;
-                self.free.push(d.0);
+                let retained = core::mem::take(&mut n.retained);
+                // A slot whose generation would wrap is retired rather than reused, so that no handle to an
+                // earlier occupant can ever match again.
+                let reusable = n.generation != u32::MAX;
+                self.retained = self.retained.saturating_sub(retained);
+                if reusable {
+                    self.free.push(d.index);
+                }
             }
         }
+        doomed
     }
 }
 
