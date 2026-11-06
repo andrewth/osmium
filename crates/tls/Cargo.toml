@@ -10,14 +10,16 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
-hmac = { version = "0.13.0", default-features = false }
+# The crates.io dependencies are pinned to exact versions (matching Cargo.lock) so that a library user
+# resolving without our lock file gets the reviewed crypto code; bump them deliberately. See deny.toml.
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
+hmac = { version = "=0.13.0", default-features = false }
 osmium-rand.workspace = true
-p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "alloc", "pem"] }
-rustls = { version = "0.23", default-features = false }
-sha2 = { version = "0.11.1", default-features = false }
-x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "alloc", "pem"] }
+rustls = { version = "=0.23.46", default-features = false }
+sha2 = { version = "=0.11.1", default-features = false }
+x25519-dalek = { version = "=3.0.0", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
 
 [dev-dependencies]
 # The client side of the tests uses rustls's buffered (std) API with this crate's provider.
-rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
