@@ -64,8 +64,9 @@ impl Restart {
 /// block remembers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Block {
-    /// `FUTEX_WAIT` or `FUTEX_WAIT_BITSET`, with its absolute deadline.
-    FutexWait { uaddr: u64, val: u32, bitset: u32, deadline: Option<u64> },
+    /// `FUTEX_WAIT` or `FUTEX_WAIT_BITSET`, with its absolute deadline, and
+    /// whether it was `FUTEX_PRIVATE_FLAG`.
+    FutexWait { uaddr: u64, val: u32, bitset: u32, deadline: Option<u64>, private: bool },
 }
 
 /// Plans the continuation of system call `nr` with arguments `a` that just
@@ -97,7 +98,9 @@ pub(crate) fn plan(th: &Thread, nr: u64, a: &[u64; 6]) -> Option<Restart> {
 pub(crate) fn restart_syscall(p: &Process, th: &Thread) -> Result<u64, Errno> {
     let block = th.ext.restart.lock().take();
     match block {
-        Some(Block::FutexWait { uaddr, val, bitset, deadline }) => futex::wait(p, th, uaddr, val, bitset, deadline),
+        Some(Block::FutexWait { uaddr, val, bitset, deadline, private }) => {
+            futex::wait(p, th, uaddr, val, bitset, deadline, private)
+        }
         None => Err(Errno::EINTR),
     }
 }

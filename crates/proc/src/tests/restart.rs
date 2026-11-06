@@ -112,7 +112,7 @@ fn futex_wait_continues_through_restart_syscall() {
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 0, 7, 0]), EINTR);
     assert_eq!(
         *th.ext.restart.lock(),
-        Some(Block::FutexWait { uaddr: addr, val: 7, bitset: u32::MAX, deadline: None })
+        Some(Block::FutexWait { uaddr: addr, val: 7, bitset: u32::MAX, deadline: None, private: false })
     );
 
     // With a handler, even SA_RESTART gives EINTR: the wait is a restart-block call.
@@ -145,7 +145,7 @@ fn futex_wait_continues_through_restart_syscall() {
 }
 
 /// A thread of `p` whose task has `prio`, bound for priority inheritance.
-fn thread_at(p: &Process, main: &Thread, slot: u64, prio: u8) -> (Arc<Thread>, Arc<Task>) {
+pub(super) fn thread_at(p: &Process, main: &Thread, slot: u64, prio: u8) -> (Arc<Thread>, Arc<Task>) {
     let Outcome::Thread { tid, .. } =
         clone_thread(p, main, clone_flags(), STACK - 0x400 * slot, DATA + 0x10 * slot, DATA + 0x400 + 0x10 * slot, 0)
     else {
@@ -157,16 +157,16 @@ fn thread_at(p: &Process, main: &Thread, slot: u64, prio: u8) -> (Arc<Thread>, A
     (th, task)
 }
 
-fn word(p: &Process, addr: u64) -> u32 {
+pub(super) fn word(p: &Process, addr: u64) -> u32 {
     u32::from_ne_bytes(get(p, addr, 4).try_into().unwrap())
 }
 
-fn lock_in(p: &Arc<Process>, th: &Arc<Thread>, addr: u64) -> (Arc<Task>, Arc<core::sync::atomic::AtomicI64>) {
+pub(super) fn lock_in(p: &Arc<Process>, th: &Arc<Thread>, addr: u64) -> (Arc<Task>, Arc<core::sync::atomic::AtomicI64>) {
     let th = th.clone();
     block_in(p, move |p| callt(p, &th, Sys::Futex, &[addr, LOCK_PI, 0, 0]))
 }
 
-fn op(p: &Process, th: &Thread, addr: u64, op: u64) -> i64 {
+pub(super) fn op(p: &Process, th: &Thread, addr: u64, op: u64) -> i64 {
     callt(p, th, Sys::Futex, &[addr, op, 0, 0])
 }
 

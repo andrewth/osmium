@@ -18,10 +18,24 @@ static WATCHED: StdMutex<Option<&'static HeapFrames>> = StdMutex::new(None);
 /// One test at a time owns the marked page and the log.
 static SERIAL: StdMutex<()> = StdMutex::new(());
 
-fn install() {
+/// Every shootdown sent with interrupts masked, `(start, pages)`: the target
+/// CPUs may be spinning, interrupts masked, on a lock the sender holds, and
+/// never acknowledge it.
+pub(super) static MASKED: StdMutex<Vec<(usize, usize)>> = StdMutex::new(Vec::new());
+
+/// Whether a shootdown with interrupts masked covered the page at `va`.
+pub(super) fn masked_flush_of(va: u64) -> bool {
+    let va = va as usize;
+    MASKED.lock().unwrap().iter().any(|&(start, pages)| (start..start + pages * 0x1000).contains(&va))
+}
+
+pub(super) fn install() {
     static ONCE: StdOnce = StdOnce::new();
     ONCE.call_once(|| {
         osmium_arch::mmu::set_remote_flush(|start, pages| {
+            if !osmium_arch::irq::are_enabled() {
+                MASKED.lock().unwrap().push((start, pages));
+            }
             let mark = MARK as usize;
             if (start..start + pages * 0x1000).contains(&mark) {
                 let live = WATCHED.lock().unwrap().map_or(0, |f| f.live());

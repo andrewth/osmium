@@ -536,7 +536,7 @@ fn futex_wait_and_wake() {
     assert_eq!(sigaction(&p, SIGUSR1, handler(0, 0)), 0);
     call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 0, 7, 0]), EINTR);
-    assert!(futex::wake(p.pid(), addr, 10) == 0, "an interrupted waiter leaves the queue");
+    assert!(futex::wake(&p, addr, 10) == 0, "an interrupted waiter leaves the queue");
 }
 
 #[test]
