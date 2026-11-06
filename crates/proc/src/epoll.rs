@@ -5,13 +5,20 @@
 //! reports a condition when it newly appears since the last time the file
 //! was checked, and `EPOLLONESHOT` disarms an entry after one report. An
 //! epoll descriptor may be watched by another, to one level of nesting.
+//!
+//! Each watch registers the instance with its file's
+//! [`poll_queue`](osmium_fs::File::poll_queue) (the global one, for a file
+//! without), so a change to a watched file wakes the instance's waiters,
+//! and nothing else does.
 
 use alloc::sync::{Arc, Weak};
+use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::task::Waker;
 
-use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, Stat};
+use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, PollQueue, Stat};
 use osmium_sync::IrqSpinLock;
 use osmium_sync::arc::ArcTree;
 use osmium_sync::fallible::{try_arc, try_zeroed};
@@ -19,7 +26,7 @@ use osmium_sync::intrusive::{Adapter, KeyAdapter, Shared, TreeLink};
 
 use crate::bytes;
 use crate::fd::{Access, OpenFile};
-use crate::poll::{notify, user_add, user_sigmask, wait};
+use crate::poll::{queue_of, user_add, user_sigmask, wait};
 use crate::process::Process;
 
 type SysResult = Result<u64, Errno>;
@@ -71,20 +78,31 @@ struct Watch {
     /// A one-shot entry that has reported.
     disarmed: AtomicBool,
     link: Shared<TreeLink>,
+    /// The file whose queue the instance is registered with, and the token.
+    queued: Weak<dyn File>,
+    token: u64,
 }
 
 impl Watch {
-    fn new(fd: i32, file: Weak<OpenFile>, events: u32, data: u64) -> Result<Arc<Self>, Errno> {
+    /// A watch of `target`, registering `waker` (the instance's) with its queue.
+    fn new(fd: i32, target: &Arc<OpenFile>, events: u32, data: u64, waker: &Waker) -> Result<Arc<Self>, Errno> {
+        let file = target.file();
+        let token = queue_of(&**file).register_token(waker)?;
         try_arc(Self {
             fd,
-            file,
+            file: Arc::downgrade(target),
             events: AtomicU32::new(events),
             data: AtomicU64::new(data),
             last: AtomicU32::new(0),
             disarmed: AtomicBool::new(false),
             link: Shared::new(TreeLink::new()),
+            queued: Arc::downgrade(file),
+            token,
         })
-        .map_err(crate::oom)
+        .map_err(|e| {
+            queue_of(&**file).unregister(token);
+            crate::oom(e)
+        })
     }
 
     /// `MOD`: new interest, new data, and a fresh edge and one-shot state.
@@ -93,6 +111,15 @@ impl Watch {
         self.data.store(data, Ordering::Relaxed);
         self.last.store(0, Ordering::Relaxed);
         self.disarmed.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        // A file that is gone took its queue, and the registration, with it.
+        if let Some(f) = self.queued.upgrade() {
+            queue_of(&*f).unregister(self.token);
+        }
     }
 }
 
@@ -112,13 +139,34 @@ impl KeyAdapter<TreeLink> for ByFd {
     }
 }
 
+/// What the watched files' queues wake: the instance's own queue, which its
+/// waiters (and instances watching it) are registered with.
+struct EpollWake {
+    queue: PollQueue,
+}
+
+impl Wake for EpollWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.queue.notify();
+    }
+}
+
 /// An epoll instance, as a file in the descriptor table.
-#[derive(Default)]
 pub struct EpollFile {
     watches: IrqSpinLock<ArcTree<ByFd>>,
+    wake: Arc<EpollWake>,
 }
 
 impl EpollFile {
+    fn try_new() -> Result<Self, Errno> {
+        let wake = try_arc(EpollWake { queue: PollQueue::new() }).map_err(crate::oom)?;
+        Ok(Self { watches: IrqSpinLock::new(ArcTree::new()), wake })
+    }
+
     /// The ready events, at most `max`. Each carries what it changed, so
     /// [`Self::restore`] can undo it if the events cannot be delivered.
     ///
@@ -219,6 +267,10 @@ impl File for EpollFile {
         self.any_ready()
     }
 
+    fn poll_queue(&self) -> Option<&PollQueue> {
+        Some(&self.wake.queue)
+    }
+
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
@@ -228,7 +280,7 @@ pub(crate) fn create1(p: &Process, flags: u64) -> SysResult {
     if flags & !EPOLL_CLOEXEC != 0 {
         return Err(Errno::EINVAL);
     }
-    let file = try_arc(EpollFile::default()).map_err(crate::oom)?;
+    let file = try_arc(EpollFile::try_new()?).map_err(crate::oom)?;
     let open = OpenFile::try_new(file, Access::RW)?;
     p.files().lock().insert_from(0, open, flags & EPOLL_CLOEXEC != 0).map(|fd| fd as u64)
 }
@@ -271,7 +323,8 @@ pub(crate) fn ctl(p: &Process, epfd: i32, op: u64, fd: i32, event: u64) -> SysRe
         }
     }
     // Made before the lock is taken, where memory running out is an error.
-    let node = if op == EPOLL_CTL_ADD { Some(Watch::new(fd, Arc::downgrade(&target), events, data)?) } else { None };
+    let waker = Waker::from(ep.wake.clone());
+    let node = if op == EPOLL_CTL_ADD { Some(Watch::new(fd, &target, events, data, &waker)?) } else { None };
     // Looked up before the lock: a stat may do file I/O.
     let always_ready = op == EPOLL_CTL_ADD
         && matches!(target.file().try_stat()?.kind, FileKind::Regular | FileKind::Directory | FileKind::Symlink);
@@ -302,7 +355,8 @@ pub(crate) fn ctl(p: &Process, epfd: i32, op: u64, fd: i32, event: u64) -> SysRe
     }
     drop(watches);
     drop(nest_guard);
-    notify();
+    // The waiters look at the new interest list.
+    ep.wake.queue.notify();
     Ok(0)
 }
 
@@ -323,7 +377,7 @@ pub(crate) fn wait_events(p: &Process, epfd: i32, events: u64, max: u64, timeout
     let mut ready: Vec<Ready> = Vec::new();
     ready.try_reserve_exact(max).map_err(|_| Errno::ENOMEM)?;
     let mut out = try_zeroed(max * EVENT_LEN).map_err(crate::oom)?;
-    wait(timeout, || {
+    wait([&ep.wake.queue], timeout, || {
         ep.collect_into(&mut ready, max);
         (!ready.is_empty()).then_some(())
     })?;

@@ -18,6 +18,8 @@
 //!   whiteouts.
 //! - [`cpio`]: reads `newc` cpio archives and unpacks an initramfs.
 //! - [`dev`]: [`DevDir`](dev::DevDir) for `/dev`, plus null and zero devices.
+//! - [`PollQueue`]: how a file tells waiters its [`File::poll`] readiness
+//!   may have changed ([`File::poll_queue`]).
 //! - [`Errno`]: Linux error numbers, which system calls return negated.
 //! - [`OpenFlags`]: osmium's own open flags; system call layers translate
 //!   each architecture's `O_*` values into them.
@@ -34,6 +36,7 @@ pub mod dev;
 mod errno;
 mod file;
 pub mod overlay;
+mod pollq;
 mod ramfs;
 pub mod synth;
 mod vfs;
@@ -41,5 +44,6 @@ mod vfs;
 pub use clock::{Clock, ClockSlot, ManualClock, Timestamp};
 pub use errno::Errno;
 pub use file::{DirEntry, File, FileKind, OpenFlags, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, Stat, XattrSet};
+pub use pollq::{PollQueue, PollRegistration};
 pub use ramfs::{Limits, RamFs};
 pub use vfs::{NAME_MAX, PATH_MAX, Vfs};

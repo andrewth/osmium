@@ -182,3 +182,96 @@ fn a_signal_wakes_only_the_threads_it_concerns() {
     tb.join();
     assert_eq!(result_b.load(Ordering::SeqCst), EINTR);
 }
+
+/// Two descriptors from a call that fills an `int[2]` at `DATA`.
+fn fd_pair(p: &Process) -> (u64, u64) {
+    let b = get(p, DATA, 8);
+    (u32::from_ne_bytes(b[..4].try_into().unwrap()) as u64, u32::from_ne_bytes(b[4..].try_into().unwrap()) as u64)
+}
+
+#[test]
+fn a_change_to_one_file_wakes_only_the_calls_watching_it() {
+    use osmium_sched::TaskState::Blocked;
+    become_cpu();
+    let poll_on = |p: &Process, fd: u64| {
+        let pollfd: Vec<u8> = (fd as i32).to_ne_bytes().into_iter().chain(1u16.to_ne_bytes()).chain([0; 2]).collect();
+        put(p, DATA + 0x100, &pollfd);
+    };
+    // `a` polls its pipe; `b` polls another pipe, `c` waits in epoll on
+    // that pipe and `d` reads a socket pair.
+    let (a, _) = process("ready-a");
+    let (ra, wa) = pipe_fds(&a);
+    poll_on(&a, ra);
+    let (ta, result_a) = block_in(&a, |p| call(p, Sys::Ppoll, &[DATA + 0x100, 1, 0, 0, 0]));
+    let (b, _) = process("ready-b");
+    let (rb, wb) = pipe_fds(&b);
+    poll_on(&b, rb);
+    let (tb, result_b) = block_in(&b, |p| call(p, Sys::Ppoll, &[DATA + 0x100, 1, 0, 0, 0]));
+    let ep = call(&b, Sys::EpollCreate1, &[0]) as u64;
+    #[cfg(target_arch = "x86_64")]
+    let event = [1u32.to_ne_bytes().as_slice(), &7u64.to_ne_bytes()].concat();
+    #[cfg(not(target_arch = "x86_64"))]
+    let event = [1u32.to_ne_bytes().as_slice(), &[0; 4], &7u64.to_ne_bytes()].concat();
+    put(&b, DATA + 0x400, &event);
+    assert_eq!(call(&b, Sys::EpollCtl, &[ep, 1, rb, DATA + 0x400]), 0);
+    let (tc, result_c) = block_in(&b, move |p| call(p, Sys::EpollPwait, &[ep, DATA + 0x500, 4, u64::MAX, 0, 8]));
+    let (d, _) = process("ready-d");
+    assert_eq!(call(&d, Sys::Socketpair, &[1, 1, 0, DATA]), 0);
+    let (s0, s1) = fd_pair(&d);
+    let (td, result_d) = block_in(&d, move |p| call(p, Sys::Read, &[s0, DATA + 0x200, 8]));
+
+    // Data in `a`'s pipe wakes `a`'s poll alone.
+    put(&a, DATA + 0x300, b"x");
+    assert_eq!(call(&a, Sys::Write, &[wa, DATA + 0x300, 1]), 1);
+    assert_ne!(ta.state(), Blocked, "the poller of the pipe written to wakes");
+    for (t, what) in [(&tb, "a poll of another pipe"), (&tc, "an epoll of another pipe"), (&td, "a socket read")] {
+        assert_eq!(t.state(), Blocked, "{what} sleeps on");
+    }
+    ta.join();
+    assert_eq!(result_a.load(Ordering::SeqCst), 1);
+
+    // `b`'s pipe wakes both its waiters, and the socket pair its reader.
+    put(&b, DATA + 0x300, b"y");
+    assert_eq!(call(&b, Sys::Write, &[wb, DATA + 0x300, 1]), 1);
+    assert_eq!(td.state(), Blocked);
+    put(&d, DATA + 0x300, b"z");
+    assert_eq!(call(&d, Sys::Write, &[s1, DATA + 0x300, 1]), 1);
+    for t in [&tb, &tc, &td] {
+        t.join();
+    }
+    assert_eq!(result_b.load(Ordering::SeqCst), 1);
+    assert_eq!(result_c.load(Ordering::SeqCst), 1);
+    assert_eq!(result_d.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_file_without_a_queue_is_polled_again_on_a_tick() {
+    use osmium_sched::TaskState::Blocked;
+    become_cpu();
+    let (p, _) = process("ready-tick");
+    let (_r, w) = pipe_fds(&p);
+    // A file with no queue of its own: `poll` reports whatever the test says.
+    struct Flag(core::sync::atomic::AtomicU32);
+    impl osmium_fs::File for Flag {
+        fn stat(&self) -> osmium_fs::Stat {
+            osmium_fs::Stat::default()
+        }
+        fn poll(&self) -> u32 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let flag = Arc::new(Flag(core::sync::atomic::AtomicU32::new(0)));
+    let f = p.files().lock().insert(crate::fd::OpenFile::new(flag.clone(), crate::fd::Access::RW)).unwrap();
+    let pollfd: Vec<u8> = f.to_ne_bytes().into_iter().chain(1u16.to_ne_bytes()).chain([0; 2]).collect();
+    put(&p, DATA + 0x100, &pollfd);
+    let (task, result) = block_in(&p, |p| call(p, Sys::Ppoll, &[DATA + 0x100, 1, 0, 0, 0]));
+    // Its readiness changing says nothing; another file's change does not wake it either.
+    flag.0.store(1, Ordering::SeqCst);
+    put(&p, DATA + 0x300, b"x");
+    assert_eq!(call(&p, Sys::Write, &[w, DATA + 0x300, 1]), 1);
+    assert_eq!(task.state(), Blocked);
+    // A tick makes it look.
+    crate::poll::tick();
+    task.join();
+    assert_eq!(result.load(Ordering::SeqCst), 1);
+}

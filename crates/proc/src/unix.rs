@@ -28,12 +28,12 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use osmium_fs::{Errno, File, FileKind, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, Stat};
+use osmium_fs::{Errno, File, FileKind, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, PollQueue, Stat};
 use osmium_sync::IrqSpinLock;
 use osmium_sync::fallible::{try_arc, try_string, try_to_vec};
 
 use crate::fd::OpenFile;
-use crate::poll::{notify, wait};
+use crate::poll::wait;
 
 /// Bytes a stream buffers in each direction.
 const STREAM_CAP: usize = 64 * 1024;
@@ -283,6 +283,9 @@ pub(crate) struct Sock {
     dgram: bool,
     passcred: AtomicBool,
     st: IrqSpinLock<St>,
+    /// Notified when what `poll` reports for this socket may have changed:
+    /// its own state, or its peer's (see [`Sock::changed`]).
+    queue: PollQueue,
 }
 
 impl Sock {
@@ -303,7 +306,8 @@ impl Sock {
             owner,
             peer_cred: None,
         };
-        try_arc(Sock { dgram, passcred: AtomicBool::new(false), st: IrqSpinLock::new(st) }).map_err(crate::oom)
+        try_arc(Sock { dgram, passcred: AtomicBool::new(false), st: IrqSpinLock::new(st), queue: PollQueue::new() })
+            .map_err(crate::oom)
     }
 
     /// Whether a receive would return something or fail at once.
@@ -343,6 +347,16 @@ impl Sock {
     /// The socket a send goes to, when it has no name to go to.
     fn peer(&self) -> Option<Weak<Sock>> {
         self.st.lock().peer.clone()
+    }
+
+    /// Wakes the waiters after this socket's state changed: its own, and its
+    /// peer's, whose readiness depends on this one's (end of file, room to
+    /// send). Call it without either socket's state locked.
+    fn changed(&self) {
+        self.queue.notify();
+        if let Some(peer) = self.peer().and_then(|w| w.upgrade()) {
+            peer.queue.notify();
+        }
     }
 }
 
@@ -610,7 +624,8 @@ impl UnixSocket {
                     }
                     b.queue.push_back(server);
                     drop(g);
-                    notify();
+                    target.changed();
+                    self.sock.changed();
                     return Ok(());
                 }
             }
@@ -622,7 +637,7 @@ impl UnixSocket {
                 let g = target.st.lock();
                 g.closed || g.listen.as_ref().is_none_or(|b| b.queue.len() < b.max)
             };
-            if let Err(e) = wait(None, || room().then_some(())) {
+            if let Err(e) = wait([&target.queue, &self.sock.queue], None, || room().then_some(())) {
                 undo();
                 return Err(e);
             }
@@ -637,7 +652,7 @@ impl UnixSocket {
                 let Some(b) = g.listen.as_mut() else { return Err(Errno::EINVAL) };
                 if let Some(sock) = b.queue.pop_front() {
                     drop(g);
-                    notify();
+                    self.sock.changed();
                     let client = sock.st.lock().peer.as_ref().and_then(Weak::upgrade);
                     let from = client.and_then(|p| p.st.lock().addr.clone());
                     return Ok((UnixSocket { sock, nonblock: AtomicBool::new(nonblock) }, from));
@@ -646,7 +661,7 @@ impl UnixSocket {
             if !wait_for_one {
                 return Err(Errno::EAGAIN);
             }
-            wait(None, || self.sock.readable().then_some(()))?;
+            wait([&self.sock.queue], None, || self.sock.readable().then_some(()))?;
         }
     }
 
@@ -674,7 +689,7 @@ impl UnixSocket {
                             (d.anc, d.from)
                         };
                         drop(g);
-                        notify();
+                        self.sock.changed();
                         return Ok(Received { copied, truncated, anc, from });
                     }
                 } else if !g.stream.is_empty() {
@@ -706,7 +721,7 @@ impl UnixSocket {
                         g.consumed = consumed.wrapping_add(copied as u64);
                     }
                     drop(g);
-                    notify();
+                    self.sock.changed();
                     return Ok(Received { copied, truncated: false, anc, from: None });
                 }
                 drop(g);
@@ -717,7 +732,7 @@ impl UnixSocket {
             if !wait_for_data {
                 return Err(Errno::EAGAIN);
             }
-            wait(None, || self.sock.readable().then_some(()))?;
+            wait([&self.sock.queue], None, || self.sock.readable().then_some(()))?;
         }
     }
 
@@ -776,7 +791,7 @@ impl UnixSocket {
                         let anc = with_cred(out.anc.take(), passcred, out.cred);
                         g.dgrams.push_back(Dgram { data, anc, from });
                         drop(g);
-                        notify();
+                        target.changed();
                         return Ok(out.data.len());
                     }
                 } else {
@@ -799,7 +814,7 @@ impl UnixSocket {
                         g.queued = g.queued.wrapping_add(n as u64);
                         done += n;
                         drop(g);
-                        notify();
+                        target.changed();
                         if done == out.data.len() || !wait_for_room {
                             return Ok(done);
                         }
@@ -815,7 +830,7 @@ impl UnixSocket {
             if !wait_for_room {
                 return Err(Errno::EAGAIN);
             }
-            wait(None, || self.sock.has_room(&target).then_some(()))?;
+            wait([&target.queue, &self.sock.queue], None, || self.sock.has_room(&target).then_some(()))?;
         }
     }
 
@@ -829,7 +844,7 @@ impl UnixSocket {
             g.shut_rd |= how != 1;
             g.shut_wr |= how != 0;
         }
-        notify();
+        self.sock.changed();
         Ok(())
     }
 }
@@ -854,7 +869,7 @@ impl Drop for UnixSocket {
         }
         // Queued files may be sockets that take their own locks as they go.
         drop((stream, dgrams, ancs, backlog));
-        notify();
+        self.sock.changed();
     }
 }
 
@@ -870,6 +885,10 @@ impl File for UnixSocket {
 
     fn stat(&self) -> Stat {
         Stat { kind: FileKind::Socket, mode: 0o777, nlink: 1, ..Stat::default() }
+    }
+
+    fn poll_queue(&self) -> Option<&PollQueue> {
+        Some(&self.sock.queue)
     }
 
     fn poll(&self) -> u32 {
