@@ -8,7 +8,7 @@
 //! | `IOIO` (non-string) | [`VmExit::PioIn`] / [`VmExit::PioOut`] |
 //! | `HLT` | [`VmExit::Halt`] |
 //! | `VMMCALL` | [`VmExit::Hypercall`]: `nr` = `rax`, `args` = `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, `r8` |
-//! | Nested page fault on an unmapped page | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], from the instruction ([`decode`]) |
+//! | Nested page fault on an unmapped page outside guest RAM (`with_memory`) | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], from the instruction ([`decode`]) |
 //! | `INTR` | [`VmExit::ExternalInterrupt`] |
 //! | `SHUTDOWN` (triple fault) | [`VmExit::Shutdown`] |
 //! | Anything else | [`VmExit::Unhandled`] with the exit code |
@@ -18,8 +18,12 @@
 //! Guests start in 32-bit protected mode ([`SvmVcpu::new`]), in real mode
 //! like an AP after STARTUP ([`SvmVcpu::set_real_mode`]) or, after
 //! [`SvmVcpu::set_long_mode`], in 64-bit mode on their own page tables;
-//! MMIO instructions are fetched through those tables when the CPU has no
-//! decode assists.
+//! MMIO instructions are fetched through the guest's tables (32-bit, PAE or
+//! long mode) when the CPU has no decode assists. A guest cannot see SVM or
+//! MONITOR/MWAIT ([`patch_cpuid`](super::patch_cpuid)); its SVM
+//! instructions, `XSETBV`, `MONITOR` and `MWAIT` raise `#UD`. With
+//! [`SvmVcpu::connect_lapic`] the guest's `CR8` is its local APIC's task
+//! priority.
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod hw;
@@ -38,6 +42,7 @@ use super::decode::{self, Access, Operand};
 #[cfg(any(test, all(target_arch = "x86_64", target_os = "none")))]
 use super::patch_cpuid;
 use super::{APIC_BASE_ADDR, APIC_BASE_BSP, APIC_BASE_ENABLE, FxArea, apic_base_write_ok, injectable, size_mask};
+use crate::devices::VirtualLapic;
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 
@@ -160,6 +165,12 @@ pub mod exit {
     pub const VMLOAD: u64 = 0x82;
     /// SKINIT, the last SVM instruction.
     pub const SKINIT: u64 = 0x86;
+    /// MONITOR (and MONITORX).
+    pub const MONITOR: u64 = 0x8a;
+    /// MWAIT (and MWAITX).
+    pub const MWAIT: u64 = 0x8b;
+    /// MWAIT with a monitor armed.
+    pub const MWAIT_CONDITIONAL: u64 = 0x8c;
     /// XSETBV.
     pub const XSETBV: u64 = 0x8d;
     /// MOV from DR0 (DRn: + n); MOV to DR0 is `DR_READ + 0x10`.
@@ -275,6 +286,11 @@ pub struct SvmVcpu {
     /// The host CPU running this vCPU's guest code, for kicks.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     pub(crate) running: Option<Arc<core::sync::atomic::AtomicUsize>>,
+    /// The local APIC whose task priority the guest's `CR8` (the VMCB's
+    /// `V_TPR`) is, from [`connect_lapic`](Self::connect_lapic).
+    lapic: Option<Arc<VirtualLapic>>,
+    /// `V_TPR` as the last entry set it, to see the guest change it.
+    vtpr: u64,
 }
 
 // SAFETY: the vCPU owns its VMCB page exclusively.
@@ -317,6 +333,8 @@ impl SvmVcpu {
             pending_exception: None,
             virtual_irq: None,
             last_cpu: crate::vcpu::NO_CPU,
+            lapic: None,
+            vtpr: 0,
         };
         use vmcb::*;
         // INTR, NMI, CPUID, INVD, HLT, INVLPGA, IOIO, MSR, SHUTDOWN; and every
@@ -327,7 +345,10 @@ impl SvmVcpu {
         let misc1 = 1 << 0 | 1 << 1 | 1 << 18 | 1 << 22 | 1 << 24 | 1 << 26 | 1 << 27 | 1 << 28 | 1 << 31;
         v.write32(INTERCEPT_MISC1, misc1);
         // XSETBV too: the guest is not offered XSAVE (XCR0 is the host's).
-        v.write32(INTERCEPT_MISC2, 0x7f | 1 << 13);
+        // And MONITOR and MWAIT (both forms; MONITORX/MWAITX with them),
+        // which CPUID hides and which raise #UD: an MWAIT the guest could
+        // execute would idle the host CPU without the Halt exit.
+        v.write32(INTERCEPT_MISC2, 0x7f | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13);
         // DR0-DR3 reads and writes (DR6/DR7 are in the VMCB): no breakpoint
         // addresses pass between VMs or to the host.
         v.write32(INTERCEPT_DR, 0x000f_000f);
@@ -431,71 +452,30 @@ impl SvmVcpu {
         self.write64(vmcb::EFER, EFER_SVME | 1 << 8 | 1 << 10 | 1 << 11); // LME, LMA, NXE
     }
 
-    /// Translates a guest linear address through the guest's 4-level page
-    /// tables (long mode), or returns it unchanged with paging off.
+    /// Translates a guest linear address through the guest's page tables
+    /// in whatever paging mode it uses (32-bit, PAE or 4-level long mode;
+    /// with PSE-36, 2 MiB and 1 GiB pages), or returns it unchanged with paging off.
+    /// `None` if the address is not mapped or the vCPU has no guest memory
+    /// ([`with_memory`](Self::with_memory)) to walk.
     pub fn translate(&self, linear: u64) -> Option<u64> {
         if self.read64(vmcb::CR0) & (1 << 31) == 0 {
             return Some(linear);
         }
-        let mem = self.mem.as_ref()?;
-        if self.read64(vmcb::EFER) & (1 << 10) == 0 {
-            return self.translate_legacy(mem, linear);
-        }
-        let mut table = self.read64(vmcb::CR3) & 0x000f_ffff_ffff_f000;
-        for level in (0..4).rev() {
-            let index = (linear >> (12 + 9 * level)) & 0x1ff;
-            let pte: u64 = mem.read_obj(GuestPhysAddr(table.wrapping_add(index * 8))).ok()?;
-            if pte & 1 == 0 {
-                return None;
-            }
-            let addr = pte & 0x000f_ffff_ffff_f000;
-            // A large page at level 1 (2 MiB) or 2 (1 GiB).
-            if level == 0 || (level <= 2 && pte & (1 << 7) != 0) {
-                let mask = (1u64 << (12 + 9 * level)) - 1;
-                return Some((addr & !mask) | (linear & mask));
-            }
-            table = addr;
-        }
-        None
+        let paging = super::Paging {
+            cr0: self.read64(vmcb::CR0),
+            cr3: self.read64(vmcb::CR3),
+            cr4: self.read64(vmcb::CR4),
+            efer: self.read64(vmcb::EFER),
+            pdptes: None,
+        };
+        super::translate(self.mem.as_ref()?, &paging, linear)
     }
 
-    /// Walks 32-bit paging (two levels, 4 MiB pages when CR4.PSE) or PAE
-    /// paging (three levels) for a guest that is not in long mode.
-    fn translate_legacy(&self, mem: &GuestMemory, linear: u64) -> Option<u64> {
-        let linear = linear & 0xffff_ffff;
-        let cr3 = self.read64(vmcb::CR3);
-        let cr4 = self.read64(vmcb::CR4);
-        if cr4 & (1 << 5) == 0 {
-            let pde: u32 = mem.read_obj(GuestPhysAddr((cr3 & 0xffff_f000) + (linear >> 22) * 4)).ok()?;
-            if pde & 1 == 0 {
-                return None;
-            }
-            if pde & (1 << 7) != 0 && cr4 & (1 << 4) != 0 {
-                // 4 MiB page; bits 20:13 of the PDE are address bits 39:32.
-                let base = (pde as u64 & 0xffc0_0000) | (pde as u64 >> 13 & 0xff) << 32;
-                return Some(base | (linear & 0x3f_ffff));
-            }
-            let pte: u32 = mem.read_obj(GuestPhysAddr((pde as u64 & 0xffff_f000) + (linear >> 12 & 0x3ff) * 4)).ok()?;
-            return (pte & 1 != 0).then_some((pte as u64 & 0xffff_f000) | (linear & 0xfff));
-        }
-        let pdpte: u64 = mem.read_obj(GuestPhysAddr((cr3 & 0xffff_ffe0) + (linear >> 30) * 8)).ok()?;
-        if pdpte & 1 == 0 {
-            return None;
-        }
-        let pde: u64 =
-            mem.read_obj(GuestPhysAddr((pdpte & 0x000f_ffff_ffff_f000) + (linear >> 21 & 0x1ff) * 8)).ok()?;
-        if pde & 1 == 0 {
-            return None;
-        }
-        if pde & (1 << 7) != 0 {
-            return Some((pde & 0x000f_ffff_ffe0_0000) | (linear & 0x1f_ffff));
-        }
-        let pte: u64 = mem.read_obj(GuestPhysAddr((pde & 0x000f_ffff_ffff_f000) + (linear >> 12 & 0x1ff) * 8)).ok()?;
-        (pte & 1 != 0).then_some((pte & 0x000f_ffff_ffff_f000) | (linear & 0xfff))
-    }
-
-    /// Lets the vCPU read instructions from guest memory to emulate MMIO
-    /// when the CPU has no decode assists (guest paging must be off).
+    /// Gives the vCPU its guest memory: MMIO instructions are fetched from
+    /// it through the guest's page tables when the CPU has no decode
+    /// assists, and a nested fault on an address it backs (guest RAM the
+    /// host unmapped from the nested tables) is reported as
+    /// [`VmExit::Unhandled`] rather than emulated as MMIO.
     pub fn with_memory(mut self, mem: Arc<GuestMemory>) -> Self {
         self.mem = Some(mem);
         self
@@ -632,6 +612,38 @@ impl SvmVcpu {
         self.ack = Some(Box::new(ack));
     }
 
+    /// Connects the vCPU's local APIC: interrupts are acknowledged from it
+    /// (as [`connect_intr`](Self::connect_intr) with
+    /// [`VirtualLapic::acknowledge`]), and the guest's `CR8` is its task
+    /// priority. A 64-bit guest writes `CR8` without an exit (into the VMCB's
+    /// `V_TPR`); the vCPU copies it to the APIC after every exit and back
+    /// before every entry, and while the task priority alone holds back a
+    /// pending interrupt it asks for an exit as soon as the guest lowers
+    /// `CR8` far enough to take it. Wire the APIC's output to the INTR line
+    /// ([`irq_line`](Self::irq_line)). Without an APIC, `CR8` is the
+    /// guest's own and gates nothing.
+    pub fn connect_lapic(&mut self, apic: Arc<VirtualLapic>) {
+        let a = apic.clone();
+        self.connect_intr(move || a.acknowledge());
+        self.lapic = Some(apic);
+    }
+
+    /// The guest's `V_TPR` (its `CR8`).
+    fn v_tpr(&self) -> u64 {
+        self.read64(vmcb::V_INTR) & 0xf
+    }
+
+    /// After an exit: a `CR8` the guest wrote becomes the APIC's task priority.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
+    fn tpr_from_guest(&mut self) {
+        let Some(apic) = &self.lapic else { return };
+        let v = self.v_tpr();
+        if v != self.vtpr {
+            apic.set_tpr((v << 4) as u8);
+            self.vtpr = v;
+        }
+    }
+
     /// Whether a vCPU halted in `hlt` should run again: its INTR line is up
     /// and the guest has interrupts enabled.
     pub fn interrupt_pending(&self) -> bool {
@@ -648,11 +660,19 @@ impl SvmVcpu {
     /// can take it now, or else asks for an exit when it can.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     fn prepare_interrupts(&mut self) {
+        // The APIC's task priority (which an MMIO write to its TPR may have
+        // changed) is what the guest reads as CR8.
+        if let Some(apic) = &self.lapic {
+            let t = (apic.tpr() >> 4) as u64;
+            let v = self.read64(vmcb::V_INTR) & !0xf | t;
+            self.write64(vmcb::V_INTR, v);
+            self.vtpr = t;
+        }
         // An undelivered injection comes back in EXITINTINFO, never here.
         self.write64(vmcb::EVENTINJ, 0);
         let pending = self.read64(vmcb::EXITINTINFO);
         self.write64(vmcb::EXITINTINFO, 0);
-        let mut window = false;
+        let mut window = None;
         if let Some(e) = self.pending_exception.take() {
             // An exception raised while an event was being delivered (the
             // reflected #DB or #AC) is benign: the two are handled serially,
@@ -672,26 +692,32 @@ impl SvmVcpu {
                     self.write64(vmcb::EVENTINJ, vector as u64 | EVENT_VALID); // type 0: external interrupt
                 }
             } else {
-                window = true;
+                window = Some(0xf);
             }
+        } else if let Some(class) = self.lapic.as_ref().and_then(|a| a.tpr_blocked()) {
+            // Only the task priority holds an interrupt back: exit once the
+            // guest lowers CR8 (V_TPR) below its class.
+            window = Some(class);
         }
         self.set_window(window);
     }
 
     /// Arms or clears the interrupt-window request. A virtual interrupt is
-    /// taken (and VINTR fires) only when V_INTR_PRIO exceeds V_TPR, so the
-    /// request uses the highest priority. The VMCB has one virtual-interrupt
-    /// slot: while [`set_virtual_irq`](Self::set_virtual_irq) holds it, that
-    /// interrupt is what is armed and no window exit is requested (the
-    /// pending INTR line is looked at again at the next exit).
-    fn set_window(&mut self, window: bool) {
+    /// taken (and VINTR fires) only when V_INTR_PRIO exceeds V_TPR, so a
+    /// request for any interrupt uses the highest priority (`Some(0xf)`), and
+    /// one for an interrupt the task priority holds back uses that
+    /// interrupt's class. The VMCB has one virtual-interrupt slot: while
+    /// [`set_virtual_irq`](Self::set_virtual_irq) holds it, that interrupt
+    /// is what is armed and no window exit is requested (the pending INTR
+    /// line is looked at again at the next exit).
+    fn set_window(&mut self, prio: Option<u8>) {
         let mut v = self.read64(vmcb::V_INTR) & !(1 << 8);
-        let mut want_exit = window;
+        let mut want_exit = prio.is_some();
         if let Some(vec) = self.virtual_irq {
             v = v & !(0xff << 32) | 1 << 8 | 0xf << 16 | (vec as u64) << 32;
             want_exit = false;
-        } else if window {
-            v = v & !(0xf << 16) | 1 << 8 | 0xf << 16;
+        } else if let Some(p) = prio {
+            v = v & !(0xf << 16) | 1 << 8 | (p as u64 & 0xf) << 16;
         }
         self.write64(vmcb::V_INTR, v);
         let i = self.intercepts() & !INTERCEPT_VINTR;
@@ -705,7 +731,7 @@ impl SvmVcpu {
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
     fn resample_irq(&mut self) {
         if self.irq.load(Ordering::Acquire) {
-            self.set_window(true);
+            self.set_window(Some(0xf));
         }
     }
 
@@ -854,11 +880,12 @@ impl SvmVcpu {
     /// when the guest has interrupts enabled.
     pub fn set_virtual_irq(&mut self, vector: Option<u8>) {
         self.virtual_irq = vector;
-        self.set_window(false);
+        self.set_window(None);
     }
 
     /// Handles the exits the guest must never see the host for: SVM
-    /// instructions (and VMMCALL outside ring 0) raise #UD in the guest,
+    /// instructions, `XSETBV`, `MONITOR` and `MWAIT` (and VMMCALL outside
+    /// ring 0) raise #UD in the guest,
     /// INVD retires as a no-op, and intercepted #DB/#AC are reflected
     /// back. Returns whether it did.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
@@ -866,7 +893,7 @@ impl SvmVcpu {
         const UD: u64 = 6 | 3 << 8 | EVENT_VALID; // #UD, type 3 (exception)
         let cpl = self.read64(vmcb::CPL & !7) >> (8 * (vmcb::CPL & 7)) & 3;
         match code {
-            exit::VMRUN | exit::INVLPGA | exit::VMLOAD..=exit::SKINIT | exit::XSETBV => {
+            exit::VMRUN | exit::INVLPGA | exit::VMLOAD..=exit::SKINIT | exit::MONITOR..=exit::XSETBV => {
                 self.pending_exception = Some(UD)
             }
             // MOV to or from DR0-DR3: read as zero, writes ignored.
@@ -950,6 +977,13 @@ impl SvmVcpu {
             // page tables, not an access by the instruction.)
             exit::NPF if info1 & 1 == 0 && info1 & (1 << 33) == 0 => {
                 let addr = GuestPhysAddr(self.read64(vmcb::EXITINFO2));
+                // Guest RAM missing from the nested tables is the host's
+                // mistake (or a page it took away), not a device: emulating
+                // it would read all ones and drop stores. This needs the
+                // memory map (`with_memory`).
+                if self.mem.as_ref().is_some_and(|m| m.host_ptr(addr, 1).is_some()) {
+                    return VmExit::Unhandled { reason: code };
+                }
                 let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(b.get(..n)?, self.code_bits())) else {
                     return VmExit::Unhandled { reason: code };
                 };
@@ -981,6 +1015,9 @@ impl Vcpu for SvmVcpu {
             self.write32(vmcb::CLEAN, 0);
             self.prepare_interrupts();
             hw::run(self);
+            // Before any exit is handled: a device read of the APIC's TPR
+            // must see a CR8 the guest just wrote.
+            self.tpr_from_guest();
             match self.read64(vmcb::EXITCODE) {
                 // An interrupt window opened: deliver on the next entry.
                 exit::VINTR => {}
@@ -1055,5 +1092,21 @@ impl Vcpu for SvmVcpu {
 
     fn complete_hypercall(&mut self, ret: u64) {
         self.write64(vmcb::RAX, ret);
+    }
+
+    fn interrupt_pending(&self, _now: u64) -> bool {
+        SvmVcpu::interrupt_pending(self)
+    }
+
+    fn flush_stage2(&mut self) {
+        SvmVcpu::flush_stage2(self);
+    }
+
+    fn irq_line(&self) -> Arc<AtomicBool> {
+        SvmVcpu::irq_line(self)
+    }
+
+    fn connect_cpu(&mut self, link: crate::smp::CpuLink) {
+        self.running = Some(link.running().clone());
     }
 }

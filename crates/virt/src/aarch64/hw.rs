@@ -329,12 +329,37 @@ fn save_vgic(l: &mut VgicLink) {
 /// `HCR_EL2` while a guest runs: stage 2 on (VM), set/way invalidation
 /// upgraded (SWIO), physical IRQ/FIQ/SError to EL2 (IMO, FMO, AMO), WFI and
 /// SMC trapped (TWI, TSC), IMPLEMENTATION DEFINED and auxiliary control
-/// registers trapped (TIDCP, TACR), and an AArch64 EL1 (RW). FB (bit 9)
-/// forces the guest's TLB and instruction-cache maintenance to broadcast:
-/// the vCPUs of a VM share a VMID and may run on other CPUs, so a "local"
-/// invalidation by the guest must reach every CPU that can hold its entries.
+/// registers trapped (TIDCP, TACR), the ID registers trapped (TID3, so
+/// the guest reads them through [`Aarch64Vcpu::emulate_sysreg`] with the
+/// features whose state is not switched hidden), and an AArch64 EL1 (RW).
+/// FB (bit 9) forces the guest's TLB and instruction-cache maintenance to
+/// broadcast: the vCPUs of a VM share a VMID and may run on other CPUs, so a
+/// "local" invalidation by the guest must reach every CPU that can hold its
+/// entries.
 pub const HCR_GUEST: u64 =
-    1 << 0 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 9 | 1 << 13 | 1 << 19 | 1 << 20 | 1 << 21 | 1 << 31;
+    1 << 0 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 9 | 1 << 13 | 1 << 18 | 1 << 19 | 1 << 20 | 1 << 21 | 1 << 31;
+
+/// Reads the host's ID register `S3_0_C0_C<crm>_<op2>` (`crm` 1..=7, the
+/// space `HCR_EL2.TID3` traps); unallocated encodings there read as zero.
+pub(super) fn id_register(crm: u64, op2: u64) -> u64 {
+    macro_rules! id_regs {
+        ($($crm:literal: $($op2:literal)*;)*) => {
+            match (crm, op2) {
+                $($(($crm, $op2) => mrs!(concat!("S3_0_C0_C", $crm, "_", $op2)),)*)*
+                _ => 0,
+            }
+        };
+    }
+    id_regs! {
+        1: 0 1 2 3 4 5 6 7;
+        2: 0 1 2 3 4 5 6 7;
+        3: 0 1 2 3 4 5 6 7;
+        4: 0 1 2 3 4 5 6 7;
+        5: 0 1 2 3 4 5 6 7;
+        6: 0 1 2 3 4 5 6 7;
+        7: 0 1 2 3 4 5 6 7;
+    }
+}
 /// `HCR_EL2.VI`: a virtual IRQ is pending for the guest.
 pub const HCR_VI: u64 = 1 << 7;
 /// `HCR_EL2.TGE`: a VHE host's own EL0 traps to EL2. Set while a VHE host

@@ -20,7 +20,8 @@
 //!
 //! | Exception | Exit |
 //! |---|---|
-//! | Stage-2 translation fault on a data access from EL1/EL0 with a valid syndrome (ISV), not in a stage-1 walk | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], address from `HPFAR_EL2` and `FAR_EL2` |
+//! | Stage-2 translation fault on a data access from EL1/EL0 with a valid syndrome (ISV), not in a stage-1 walk, outside guest RAM ([`Aarch64Vcpu::with_memory`]) | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], address from `HPFAR_EL2` and `FAR_EL2` |
+//! | Trapped ID-register read (`HCR_EL2.TID3`) or other trapped system register | completed in place ([`Aarch64Vcpu::emulate_sysreg`]), no exit |
 //! | `HVC` (or a trapped `SMC`) | [`VmExit::Hypercall`]: `nr` = `x0` (the SMCCC function ID), `args` = `x1`..`x6` |
 //! | Trapped `WFI` (`HCR_EL2.TWI`) | [`VmExit::Halt`] |
 //! | IRQ or FIQ taken while the guest ran | [`VmExit::ExternalInterrupt`] |
@@ -54,7 +55,7 @@ mod hw;
 pub use hw::{HCR_E2H, HCR_GUEST, HCR_TGE, VTCR_48, counter, init_cpu};
 
 use crate::devices::VirtualGicV3;
-use crate::memory::GuestPhysAddr;
+use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 
 /// The most list registers a GICv3 implements.
@@ -247,6 +248,8 @@ pub struct Aarch64Vcpu {
     /// The CPU this vCPU last ran on ([`NO_CPU`](crate::vcpu::NO_CPU) before the first run).
     #[cfg_attr(not(aarch64_hw), allow(dead_code))]
     pub(crate) last_cpu: usize,
+    /// Guest memory, to tell RAM from MMIO in stage-2 faults.
+    mem: Option<Arc<GuestMemory>>,
 }
 
 impl Aarch64Vcpu {
@@ -282,7 +285,18 @@ impl Aarch64Vcpu {
             running: None,
             flush: false,
             last_cpu: crate::vcpu::NO_CPU,
+            mem: None,
         }
+    }
+
+    /// Gives the vCPU its guest memory map: a stage-2 translation fault on
+    /// an address it backs (guest RAM the host unmapped from the stage-2
+    /// tables) is then reported as [`VmExit::Unhandled`] rather than
+    /// emulated as MMIO, which would read zeroes or all ones and drop the
+    /// guest's stores. Without it every such fault is treated as MMIO.
+    pub fn with_memory(mut self, mem: Arc<GuestMemory>) -> Self {
+        self.mem = Some(mem);
+        self
     }
 
     /// The vCPU's IRQ line, for an interrupt controller (a
@@ -375,10 +389,15 @@ impl Aarch64Vcpu {
         }
     }
 
-    /// Completes a trapped system-register access (IMPLEMENTATION DEFINED,
+    /// Completes a trapped system-register access and steps past it. Reads
+    /// of the ID registers (`HCR_EL2.TID3`) return the host's values with
+    /// SVE, SME, MTE and pointer authentication hidden ([`guest_id_register`]),
+    /// whose registers are not part of the world switch and whose
+    /// instructions trap; the guest's `ICC_SGI*R_EL1` writes go to its
+    /// virtual GICv3; every other trapped register (IMPLEMENTATION DEFINED,
     /// auxiliary control, PMU, debug and physical-timer registers, which
-    /// `HCR_EL2`, `MDCR_EL2` and `CNTHCTL_EL2` trap) as read-as-zero,
-    /// write-ignored, and steps past it. Returns whether the exit was one.
+    /// `HCR_EL2`, `MDCR_EL2` and `CNTHCTL_EL2` trap) reads as zero and
+    /// ignores writes. Returns whether the exit was one.
     pub fn emulate_sysreg(&mut self) -> bool {
         let s = &mut self.state;
         if s.vector != vector::SYNC || s.esr >> 26 != ec::SYSREG {
@@ -400,10 +419,18 @@ impl Aarch64Vcpu {
             s.pc = s.pc.wrapping_add(4);
             return true;
         }
+        // The ID registers (Op0 3, Op1 0, CRn 0, CRm 1-7), trapped by
+        // HCR_EL2.TID3: the host's values with the features hidden whose
+        // state the world switch does not move.
+        let value = if (op0, op1, crn) == (3, 0, 0) && (1..=7).contains(&crm) {
+            guest_id_register(crm, op2, host_id_register(crm, op2))
+        } else {
+            0
+        };
         if s.esr & 1 != 0
             && let Some(r) = s.x.get_mut(rt)
         {
-            *r = 0;
+            *r = value;
         }
         s.pc = s.pc.wrapping_add(4);
         true
@@ -440,6 +467,9 @@ impl Aarch64Vcpu {
                 let size = 1u8 << ((esr >> 22) & 3);
                 let reg = ((esr >> 16) & 31) as u8;
                 let addr = GuestPhysAddr((s.hpfar & 0x0fff_ffff_fff0) << 8 | (s.far & 0xfff));
+                if self.mem.as_ref().is_some_and(|m| m.host_ptr(addr, 1).is_some()) {
+                    return VmExit::Unhandled { reason: esr };
+                }
                 if esr & (1 << 6) != 0 {
                     let data = s.x.get(reg as usize).copied().unwrap_or(0); // xzr (31) reads as zero
                     let data = data & crate::x86::size_mask(size);
@@ -453,6 +483,40 @@ impl Aarch64Vcpu {
             }
             _ => VmExit::Unhandled { reason: esr },
         }
+    }
+}
+
+/// The host's ID register `S3_0_C0_C<crm>_<op2>`.
+#[cfg(aarch64_hw)]
+fn host_id_register(crm: u64, op2: u64) -> u64 {
+    hw::id_register(crm, op2)
+}
+
+/// A stand-in host for the host-side tests, with every 4-bit ID field 1.
+#[cfg(not(aarch64_hw))]
+fn host_id_register(_crm: u64, _op2: u64) -> u64 {
+    0x1111_1111_1111_1111
+}
+
+/// What the guest reads as ID register `S3_0_C0_C<crm>_<op2>` when the
+/// host's reads `host`: the same, but without the features a guest cannot
+/// use here because their state is not switched and their instructions
+/// trap to EL2 (where they would end the guest as [`VmExit::Unhandled`]):
+///
+/// - `ID_AA64PFR0_EL1.SVE` and `ID_AA64PFR1_EL1.SME` (`CPTR_EL2` traps
+///   them), and `ID_AA64ZFR0_EL1`/`ID_AA64SMFR0_EL1` entirely;
+/// - `ID_AA64PFR1_EL1.MTE` (`HCR_EL2.ATA` is clear);
+/// - pointer authentication: `ID_AA64ISAR1_EL1.{APA, API, GPA, GPI}` and
+///   `ID_AA64ISAR2_EL1.{GPA3, APA3}` (`HCR_EL2.API` and `APK` are clear).
+pub fn guest_id_register(crm: u64, op2: u64, host: u64) -> u64 {
+    let field = |lsb: u32| !(0xfu64 << lsb);
+    match (crm, op2) {
+        (4, 0) => host & field(32),
+        (4, 1) => host & field(24) & field(8),
+        (4, 4) | (4, 5) => 0,
+        (6, 1) => host & field(4) & field(8) & field(24) & field(28),
+        (6, 2) => host & field(8) & field(12),
+        _ => host,
     }
 }
 
@@ -502,6 +566,22 @@ impl Vcpu for Aarch64Vcpu {
     fn complete_hypercall(&mut self, ret: u64) {
         self.state.x[0] = ret;
     }
+
+    fn interrupt_pending(&self, now: u64) -> bool {
+        Aarch64Vcpu::interrupt_pending(self, now)
+    }
+
+    fn flush_stage2(&mut self) {
+        Aarch64Vcpu::flush_stage2(self);
+    }
+
+    fn irq_line(&self) -> Arc<AtomicBool> {
+        Aarch64Vcpu::irq_line(self)
+    }
+
+    fn connect_cpu(&mut self, link: crate::smp::CpuLink) {
+        self.running = Some(link.running().clone());
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +618,48 @@ mod tests {
         assert_eq!(v.state.x[3], 7);
         v.state.esr = ec::HVC64 << 26;
         assert!(!v.emulate_sysreg());
+    }
+
+    /// `HCR_EL2.TID3` traps the ID registers; a guest reads the host's with
+    /// SVE, SME, MTE and pointer authentication hidden, so it never probes
+    /// state the world switch does not carry (an SVE-aware Linux would
+    /// otherwise stop at its first `ZCR_EL1` access).
+    #[test]
+    fn id_registers_hide_unswitched_features() {
+        let read = |crm: u64, op2: u64| {
+            let mut v = Aarch64Vcpu::new(GuestPhysAddr(0x4000_0000), 0, 0);
+            v.state.vector = vector::SYNC;
+            // MRS x2, S3_0_C0_C<crm>_<op2>.
+            v.state.esr = ec::SYSREG << 26 | 1 << 25 | 3 << 20 | op2 << 17 | 2 << 5 | crm << 1 | 1;
+            assert!(v.emulate_sysreg());
+            assert_eq!(v.state.pc, 0x4000_0004);
+            v.state.x[2]
+        };
+        let host = 0x1111_1111_1111_1111u64;
+        assert_eq!(read(4, 0), host & !(0xf << 32), "ID_AA64PFR0_EL1 without SVE");
+        assert_eq!(read(4, 1), host & !(0xf << 24 | 0xf << 8), "ID_AA64PFR1_EL1 without SME or MTE");
+        assert_eq!((read(4, 4), read(4, 5)), (0, 0), "no SVE or SME feature registers");
+        assert_eq!(read(6, 1), host & !(0xf << 4 | 0xf << 8 | 0xf << 24 | 0xf << 28), "ID_AA64ISAR1_EL1 without PAuth");
+        assert_eq!(read(6, 2), host & !(0xf << 8 | 0xf << 12), "ID_AA64ISAR2_EL1 without PAuth (QARMA3)");
+        assert_eq!(read(6, 0), host, "ID_AA64ISAR0_EL1 as it is");
+        assert_eq!(read(7, 0), host, "ID_AA64MMFR0_EL1 as it is");
+    }
+
+    /// A translation fault on guest RAM (unmapped from stage 2 by the host)
+    /// is not emulated as MMIO once the vCPU knows the memory map.
+    #[test]
+    fn stage2_fault_on_guest_ram_is_not_mmio() {
+        let mut ram = alloc::vec![0u8; 0x1000];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives the vCPU's use of `mem` in this test.
+        unsafe { mem.add_region(GuestPhysAddr(0x4000_0000), ram.as_mut_ptr(), 0x1000) };
+        let mut v = Aarch64Vcpu::new(GuestPhysAddr(0x4000_0000), 0, 0).with_memory(Arc::new(mem));
+        let esr = ec::DABT_LOWER << 26 | IL | ISV | 2 << 22 | 1 << 6 | TRANS;
+        assert_eq!(exit(&mut v, vector::SYNC, esr, 0x10, 0x4000_0000 >> 8), VmExit::Unhandled { reason: esr });
+        assert_eq!(v.state.pc, 0x4000_0000, "not stepped past");
+        assert!(matches!(exit(&mut v, vector::SYNC, esr, 0x10, 0x0900_0000 >> 8), VmExit::MmioWrite { .. }));
+        drop(v);
+        drop(ram);
     }
 
     #[test]

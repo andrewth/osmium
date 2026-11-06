@@ -5,7 +5,12 @@
 //! general-purpose registers, and executes VMLAUNCH or VMRESUME. On a VM
 //! exit the CPU lands in `osmium_vmx_exit` with that stack pointer; it stores
 //! the guest's registers and restores the host's. Host interrupts are off
-//! from before the entry until the exit has been handled.
+//! from before the VMCS is bound and the entry prepared until the exit has
+//! been taken (and a host NMI delivered); they are back on, as the caller
+//! had them, while the exit is classified and emulated. Each VMCS access
+//! (`vmread`, `vmwrite`) therefore masks interrupts itself around making
+//! the VMCS current and using it: a task switch between the two could run
+//! another VMX vCPU on this CPU and leave its VMCS current instead.
 
 use core::arch::{asm, global_asm};
 use core::mem::offset_of;
@@ -212,23 +217,35 @@ fn make_current(pa: u64) {
 }
 
 /// Reads `field` of the VMCS at `pa`, making it current first.
+///
+/// Interrupts are off from the `VMPTRLD` check to the `VMREAD`: otherwise
+/// an interrupt could switch this CPU to another task that runs another
+/// VMX vCPU here, which makes its own VMCS current, and the read would
+/// return that guest's field.
 pub(super) fn vmread(pa: u64, field: u32) -> u64 {
-    make_current(pa);
-    let v: u64;
-    // SAFETY: a VMCS is current; a bad field only sets the error flags.
-    unsafe { asm!("vmread {}, {}", out(reg) v, in(reg) field as u64, options(nomem, nostack)) };
-    v
+    osmium_arch::irq::without(|| {
+        make_current(pa);
+        let v: u64;
+        // SAFETY: a VMCS is current, and stays so with interrupts off; a bad
+        // field only sets the error flags.
+        unsafe { asm!("vmread {}, {}", out(reg) v, in(reg) field as u64, options(nomem, nostack)) };
+        v
+    })
 }
 
-/// Writes `field` of the VMCS at `pa`, making it current first.
+/// Writes `field` of the VMCS at `pa`, making it current first (with
+/// interrupts off throughout, as for [`vmread`]).
 pub(super) fn vmwrite(pa: u64, field: u32, v: u64) {
-    make_current(pa);
-    // SAFETY: as above.
-    unsafe { asm!("vmwrite {}, {}", in(reg) field as u64, in(reg) v, options(nomem, nostack)) };
+    osmium_arch::irq::without(|| {
+        make_current(pa);
+        // SAFETY: as above.
+        unsafe { asm!("vmwrite {}, {}", in(reg) field as u64, in(reg) v, options(nomem, nostack)) };
+    })
 }
 
 /// Binds a vCPU's VMCS to this CPU: clears it, loads it, and copies in the
-/// fields written so far.
+/// fields written so far. Call with interrupts off, so the task is not moved
+/// to another CPU, nor another VMCS made current here, half way through.
 fn load(v: &mut VmxVcpu) {
     let cpu = osmium_arch::cpu::current_id();
     let pa = v.vmcs.pa;
@@ -246,69 +263,6 @@ fn load(v: &mut VmxVcpu) {
             vmwrite(pa, f, val);
         }
     }
-}
-
-/// Every field the vCPU writes, plus the exit information it reads, for
-/// [`unbind`] to carry to another CPU.
-fn fields() -> impl Iterator<Item = u32> {
-    use vmcs::*;
-    let single = [
-        VPID,
-        MSR_BITMAP,
-        EXIT_MSR_STORE_ADDR,
-        EXIT_MSR_LOAD_ADDR,
-        ENTRY_MSR_LOAD_ADDR,
-        EPTP,
-        GUEST_PHYS_ADDR,
-        LINK_POINTER,
-        GUEST_DEBUGCTL,
-        GUEST_PAT,
-        GUEST_EFER,
-        PIN_CTLS,
-        PROC_CTLS,
-        EXCEPTION_BITMAP,
-        PF_MASK,
-        PF_MATCH,
-        CR3_TARGET_COUNT,
-        EXIT_CTLS,
-        EXIT_MSR_STORE_COUNT,
-        EXIT_MSR_LOAD_COUNT,
-        ENTRY_CTLS,
-        ENTRY_MSR_LOAD_COUNT,
-        ENTRY_INTR_INFO,
-        ENTRY_ERRCODE,
-        ENTRY_INSN_LEN,
-        PROC2_CTLS,
-        INSN_ERROR,
-        EXIT_REASON,
-        EXIT_INTR_INFO,
-        EXIT_INTR_ERRCODE,
-        EXIT_INSN_LEN,
-        GUEST_GDTR_LIMIT,
-        GUEST_IDTR_LIMIT,
-        GUEST_INTERRUPTIBILITY,
-        GUEST_ACTIVITY,
-        GUEST_SYSENTER_CS,
-        CR0_MASK,
-        CR4_MASK,
-        CR0_SHADOW,
-        CR4_SHADOW,
-        EXIT_QUAL,
-        GUEST_CR0,
-        GUEST_CR3,
-        GUEST_CR4,
-        GUEST_GDTR_BASE,
-        GUEST_IDTR_BASE,
-        GUEST_DR7,
-        GUEST_RSP,
-        GUEST_RIP,
-        GUEST_RFLAGS,
-        GUEST_PENDING_DBG,
-        GUEST_SYSENTER_ESP,
-        GUEST_SYSENTER_EIP,
-    ];
-    let segments = (0..8).flat_map(|i| [GUEST_SEL, GUEST_LIMIT, GUEST_AR, GUEST_BASE].map(|f| f + 2 * i));
-    single.into_iter().chain(segments).chain((0..4).map(|i| GUEST_PDPTE0 + 2 * i))
 }
 
 /// Releases `v`'s VMCS from this CPU so that any CPU can run the vCPU next:
@@ -331,7 +285,7 @@ pub(super) fn unbind(v: &mut VmxVcpu) {
     }
     let pa = v.vmcs.pa;
     v.saved_vectoring = Some((vmread(pa, vmcs::IDT_VECTORING_INFO), vmread(pa, vmcs::IDT_VECTORING_ERRCODE)));
-    for f in fields() {
+    for f in super::carried_fields() {
         v.vmcs.pending.insert(f, vmread(pa, f));
     }
     // SAFETY: `pa` is a VMCS page with the right revision identifier.
@@ -352,15 +306,18 @@ pub(super) fn unbind(v: &mut VmxVcpu) {
 /// Clears `v`'s VMCS from this CPU if it is active here, so that its page
 /// can be reused: an active VMCS may be written back to memory at any time.
 pub(super) fn release(v: &mut VmxVcpu) {
-    let cpu = osmium_arch::cpu::current_id();
-    if v.vmcs.loaded && v.cpu == Some(cpu) {
-        let pa = v.vmcs.pa;
-        // SAFETY: `pa` is a VMCS page with the right revision identifier.
-        unsafe { asm!("vmclear [{}]", in(reg) &pa, options(nostack)) };
-        clear_current(cpu);
-        v.vmcs.loaded = false;
-        v.vmcs.forget_all();
-    }
+    // With interrupts off, the task stays on `cpu` until CURRENT is updated.
+    osmium_arch::irq::without(|| {
+        let cpu = osmium_arch::cpu::current_id();
+        if v.vmcs.loaded && v.cpu == Some(cpu) {
+            let pa = v.vmcs.pa;
+            // SAFETY: `pa` is a VMCS page with the right revision identifier.
+            unsafe { asm!("vmclear [{}]", in(reg) &pa, options(nostack)) };
+            clear_current(cpu);
+            v.vmcs.loaded = false;
+            v.vmcs.forget_all();
+        }
+    })
 }
 
 /// Runs the host's NMI handler as the CPU would have: on this stack, with a
@@ -518,21 +475,26 @@ fn write_host_state(v: &mut VmxVcpu) -> (DescTable, DescTable) {
 /// Enters the guest and returns at its next VM exit; `Err` if the entry
 /// instruction itself failed (see [`VmxVcpu::instruction_error`]).
 pub(super) fn run(v: &mut VmxVcpu) -> Result<(), ()> {
+    let flags: u64;
+    // SAFETY: reads RFLAGS.
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
+    let if_on = flags & (1 << 9) != 0;
+    // SAFETY: interrupts stay off from here until the exit is handled, so the
+    // task stays on this CPU and no other code here changes the current VMCS
+    // or the state written below (the binding in `load` included).
+    unsafe { asm!("cli", options(nomem, nostack)) };
     let cpu = osmium_arch::cpu::current_id();
     if !v.vmcs.loaded {
         load(v);
     }
     if v.cpu != Some(cpu) {
         // A VMX vCPU runs only on the CPU it is bound to; unbind it first or use with_migration.
+        if if_on {
+            // SAFETY: restores the caller's interrupt state.
+            unsafe { asm!("sti", options(nomem, nostack)) };
+        }
         return Err(());
     }
-    let flags: u64;
-    // SAFETY: reads RFLAGS.
-    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags)) };
-    let if_on = flags & (1 << 9) != 0;
-    // SAFETY: interrupts stay off from here until the exit is handled, so no
-    // other code on this CPU changes the current VMCS or the state written below.
-    unsafe { asm!("cli", options(nomem, nostack)) };
     make_current(v.vmcs.pa);
     v.resample_irq();
     if core::mem::take(&mut v.flush) {

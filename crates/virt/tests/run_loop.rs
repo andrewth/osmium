@@ -3,9 +3,11 @@
 
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use osmium_virt::devices::Uart16550;
+use osmium_virt::smp::CpuLink;
 use osmium_virt::{Bus, GuestPhysAddr, Vcpu, VmExit, run_vcpu};
 
 /// Replays exits and records what the hypervisor fed back.
@@ -25,6 +27,14 @@ impl Vcpu for ScriptedVcpu {
     fn complete_hypercall(&mut self, ret: u64) {
         self.hypercall_ret = Some(ret);
     }
+    fn interrupt_pending(&self, _now: u64) -> bool {
+        false
+    }
+    fn flush_stage2(&mut self) {}
+    fn irq_line(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+    fn connect_cpu(&mut self, _link: CpuLink) {}
 }
 
 const UART: u64 = 0x1000_0000;

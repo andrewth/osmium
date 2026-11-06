@@ -1,9 +1,12 @@
 //! Virtual CPUs and exit handling.
 
+use alloc::sync::Arc;
 use core::ops::ControlFlow;
+use core::sync::atomic::AtomicBool;
 
 use crate::bus::Bus;
 use crate::memory::GuestPhysAddr;
+use crate::smp::CpuLink;
 
 /// Why a virtual CPU stopped running guest code, independent of the
 /// virtualization extension that reported it.
@@ -43,8 +46,17 @@ pub enum VmExit {
         data: u32,
     },
     /// The guest made a hypercall (VMCALL, HVC, SBI ecall).
+    ///
+    /// `nr` follows each architecture's calling convention, so a host that
+    /// serves several backends decodes it per backend:
+    ///
+    /// | Backend | `nr` | `args` |
+    /// |---|---|---|
+    /// | x86 (SVM `VMMCALL`, VMX `VMCALL`) | `rax` | `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, `r8` |
+    /// | AArch64 (`HVC`, trapped `SMC`) | `x0`, the SMCCC function ID | `x1`..`x6` |
+    /// | RISC-V (`ecall`) | SBI EID (`a7`) in bits 31:0, FID (`a6`) in bits 63:32 | `a0`..`a5` |
     Hypercall {
-        /// Call number.
+        /// Call number (see above).
         nr: u64,
         /// Arguments.
         args: [u64; 6],
@@ -72,7 +84,6 @@ pub(crate) fn new_vcpu_id() -> u64 {
 }
 
 /// "No CPU yet": the initial value of a vCPU's last-run CPU.
-#[cfg_attr(not(any(target_os = "none", target_arch = "aarch64", target_arch = "riscv64")), allow(dead_code))]
 pub(crate) const NO_CPU: usize = usize::MAX;
 
 /// Whether the translations cached on `cpu` may be stale for a vCPU about to
@@ -82,13 +93,33 @@ pub(crate) const NO_CPU: usize = usize::MAX;
 /// invalidations that never reached `cpu`. So flush if the vCPU that last
 /// ran on `cpu` was another (`last_on_cpu` against `this`), or if this vCPU
 /// last ran on another CPU (`last_cpu` against `cpu`).
-#[cfg_attr(not(any(target_os = "none", target_arch = "aarch64", target_arch = "riscv64")), allow(dead_code))]
+///
+/// Only the world switches use it: SVM's on bare-metal x86_64, the AArch64
+/// one (`aarch64_hw`) and the RISC-V one (`riscv64-hs`).
+#[cfg_attr(
+    not(any(
+        test,
+        all(target_arch = "x86_64", target_os = "none"),
+        aarch64_hw,
+        all(target_arch = "riscv64", feature = "riscv64-hs")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn tlb_may_be_stale<T: PartialEq>(last_on_cpu: T, this: T, last_cpu: usize, cpu: usize) -> bool {
     last_on_cpu != this || last_cpu != cpu
 }
 
 /// A virtual CPU that a hardware backend (VMX, SVM, EL2, H-extension)
 /// implements.
+///
+/// The trait covers what a backend-generic host loop needs: running the
+/// guest, completing the exits [`run_vcpu`] does not finish itself, waking a
+/// halted vCPU, flushing stage-2 translations after the tables change, the
+/// interrupt line a controller model drives, and the link to the guest's
+/// [`GuestCpus`](crate::smp::GuestCpus) (made by
+/// [`GuestCpus::attach`](crate::smp::GuestCpus::attach)). Setup (entry state,
+/// memory, interrupt-controller attachments) stays with each backend's own
+/// constructor and builder methods.
 pub trait Vcpu {
     /// Runs guest code until the next exit.
     fn run(&mut self) -> VmExit;
@@ -99,6 +130,29 @@ pub trait Vcpu {
 
     /// Completes a [`VmExit::Hypercall`] with return value `ret`.
     fn complete_hypercall(&mut self, ret: u64);
+
+    /// Whether a vCPU that exited with [`VmExit::Halt`] has a reason to run
+    /// again: an interrupt it can take is pending. `now` is the clock the
+    /// guest's own timer compares against (the counter on AArch64, the
+    /// `time` CSR on RISC-V); x86 vCPUs, whose timers are device models that
+    /// raise the interrupt line, ignore it.
+    fn interrupt_pending(&self, now: u64) -> bool;
+
+    /// Arranges for the guest's cached stage-2 translations to be flushed
+    /// before the next entry. Call it after editing the guest's stage-2
+    /// tables (unmapping a page or reducing its permissions).
+    fn flush_stage2(&mut self);
+
+    /// The vCPU's interrupt line, for an interrupt-controller model to drive:
+    /// INTR on x86, the IRQ line (`HCR_EL2.VI`) on AArch64, the supervisor
+    /// external interrupt (`hvip.VSEIP`) on RISC-V.
+    fn irq_line(&self) -> Arc<AtomicBool>;
+
+    /// Connects the vCPU to its slot of a [`GuestCpus`](crate::smp::GuestCpus):
+    /// the record of which host CPU runs it (for kicks) and, on backends that
+    /// use them, the slot's IPI and remote-fence lines. Called by
+    /// [`GuestCpus::attach`](crate::smp::GuestCpus::attach).
+    fn connect_cpu(&mut self, link: CpuLink);
 }
 
 /// Runs `vcpu`, servicing device exits from `mmio` and `pio`, and passes

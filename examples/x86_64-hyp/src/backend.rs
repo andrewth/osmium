@@ -11,10 +11,11 @@ use osmium::arch::x86_64 as x86;
 use osmium::mm::paging::formats::{Ept, X86_64};
 use osmium::mm::{FrameAllocator, MapFlags, PageTable, PhysAddr, VirtAddr};
 use osmium::sync::Once;
-use osmium::virt::smp::GuestCpus;
+use osmium::virt::devices::VirtualLapic;
+use osmium::virt::smp::CpuLink;
 use osmium::virt::stage2::eptp;
-use osmium::virt::x86::vmx::{self, VmxPages, VmxVcpu};
 use osmium::virt::x86::svm::{self, SvmPages, SvmVcpu};
+use osmium::virt::x86::vmx::{self, VmxPages, VmxVcpu};
 use osmium::virt::{GuestMemory, GuestPhysAddr, Vcpu, VmExit};
 
 use crate::{FRAMES, Frames, block};
@@ -201,8 +202,9 @@ impl Cpu {
         each!(self, v => v.connect_intr(ack))
     }
 
-    pub fn interrupt_pending(&self) -> bool {
-        each!(self, v => v.interrupt_pending())
+    /// Takes interrupts from `apic` and makes the guest's CR8 its task priority.
+    pub fn connect_lapic(&mut self, apic: Arc<VirtualLapic>) {
+        each!(self, v => v.connect_lapic(apic))
     }
 
     pub fn set_apic_id(&mut self, id: u8) {
@@ -228,14 +230,6 @@ impl Cpu {
 
     pub fn set_reg(&mut self, n: u8, value: u64) {
         each!(self, v => v.set_reg(n, value))
-    }
-
-    /// Connects this vCPU as guest CPU `cpu`, so kicks find it.
-    pub fn attach(&mut self, cpus: &GuestCpus, cpu: usize) {
-        match self {
-            Self::Svm(v) => cpus.attach_svm(cpu, v),
-            Self::Vmx(v) => cpus.attach_vmx(cpu, v),
-        }
     }
 
     /// Where and why the vCPU stopped, for a diagnostic.
@@ -276,6 +270,22 @@ impl Vcpu for Cpu {
 
     fn complete_hypercall(&mut self, ret: u64) {
         each!(self, v => v.complete_hypercall(ret))
+    }
+
+    fn interrupt_pending(&self, now: u64) -> bool {
+        each!(self, v => Vcpu::interrupt_pending(&**v, now))
+    }
+
+    fn flush_stage2(&mut self) {
+        each!(self, v => Vcpu::flush_stage2(&mut **v))
+    }
+
+    fn irq_line(&self) -> Arc<core::sync::atomic::AtomicBool> {
+        each!(self, v => Vcpu::irq_line(&**v))
+    }
+
+    fn connect_cpu(&mut self, link: CpuLink) {
+        each!(self, v => v.connect_cpu(link))
     }
 }
 
