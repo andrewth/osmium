@@ -173,6 +173,9 @@ pub struct FakePort {
     pub short_by: u32,
     /// Queued commands leave the header's byte count at zero, as QEMU does.
     pub ncq_no_prdbc: bool,
+    /// Queued commands in these slots leave the byte count at zero (an HBA
+    /// that reports only some counts).
+    pub ncq_drop_prdbc: u32,
     /// IDENTIFY DEVICE words to replace: (index, value).
     pub identify_words: Vec<(usize, u16)>,
 
@@ -686,7 +689,7 @@ impl FakeHba {
         };
         match result {
             Ok(bytes) => {
-                if !(queued && port.ncq_no_prdbc) {
+                if !(queued && (port.ncq_no_prdbc || port.ncq_drop_prdbc & (1 << slot) != 0)) {
                     hdr[4..8].copy_from_slice(&(bytes as u32).to_le_bytes());
                 }
                 port.ci &= !(1 << slot);

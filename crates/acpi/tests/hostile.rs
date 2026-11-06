@@ -278,6 +278,7 @@ fn truncated_tables_fail_at_the_break() {
     let mut bad = method(b"BAD_", 0, &[RETURN, ONE]);
     bad[1] += 20;
     assert!(aml.load_table(&dsdt(&[good, bad])).is_err());
+    assert!(aml.tables().is_empty(), "a table that failed part way is not listed as loaded");
     assert_eq!(aml.evaluate("\\GOOD", &[]), Ok(Value::Integer(1)));
     assert_eq!(aml.evaluate("\\BAD_", &[]), Err(AmlError::NotFound));
 }

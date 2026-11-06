@@ -141,3 +141,34 @@ fn hostile_cell_counts_yield_no_regs() {
     let fdt = Fdt::new(&blob).unwrap();
     assert_eq!(fdt.find_node("/dev").unwrap().reg().count(), 0);
 }
+
+#[test]
+fn a_too_deep_subtree_is_skipped_not_the_end_of_the_walk() {
+    let mut w = FdtWriter::new();
+    w.begin_node("");
+    w.property_u32("#address-cells", 2);
+    w.property_u32("#size-cells", 2);
+    // 40 levels of nesting, deeper than the walk tracks.
+    for _ in 0..40 {
+        w.begin_node("deep");
+    }
+    for _ in 0..40 {
+        w.end_node();
+    }
+    // RAM after it, at the top level.
+    w.begin_node("memory@80000000");
+    w.property_string("device_type", "memory");
+    w.property_cells("reg", &[0, 0x8000_0000, 0, 0x800_0000]);
+    w.end_node();
+    w.end_node();
+    let blob = w.finish(0);
+    let fdt = Fdt::new(&blob).unwrap();
+    let mut nodes = fdt.all_nodes();
+    let visited = nodes.by_ref().count();
+    // The root and the first 31 levels; the 9 below them are skipped; then the memory node.
+    assert_eq!((visited, nodes.skipped()), (33, 9));
+    assert_eq!(fdt.memory().collect::<Vec<_>>(), [(0x8000_0000, 0x800_0000)]);
+    let mut map = MemoryMap::<16>::new();
+    assert_eq!(fdt.fill_memory_map(&mut map, None), Ok(0));
+    assert_eq!(map.total(RegionKind::Usable), 0x800_0000);
+}

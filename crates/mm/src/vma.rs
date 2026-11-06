@@ -27,9 +27,11 @@ use osmium_sync::intrusive::{Adapter, KeyAdapter, Shared, TreeLink};
 
 use crate::paging::MapFlags;
 
-/// One area in a [`VmaTree`]. Ordered by `start`, which only ever changes to
-/// a value that is still above the previous area's end and below the next
-/// area's start, so the order holds.
+/// One area in a [`VmaTree`]. Ordered by `start`, which only ever changes
+/// (in [`VmaTree::insert`], `split_at` and [`VmaTree::remove`], between tree
+/// operations) to a value that is still above the previous area's end and
+/// below the next area's start, so the order holds. That is the in-place key
+/// change `KeyAdapter::key` permits for a linked node.
 struct Vma {
     start: UnsafeCell<u64>,
     end: UnsafeCell<u64>,

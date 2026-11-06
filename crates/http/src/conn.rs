@@ -44,7 +44,8 @@ impl Connection {
     /// Takes bytes received from the client, returning how many it took.
     ///
     /// It buffers at most one request's worth (the head and body limits
-    /// together, with room for chunk framing). Fewer than `data.len()` means
+    /// together, with room for chunk framing and trailers), so a request
+    /// within the [`Limits`] always fits. Fewer than `data.len()` means
     /// the buffer is full: answer the pending request, then offer the rest
     /// again. Until then, stop reading from the transport. After the
     /// connection has started closing, input is discarded and counted as taken.
@@ -52,8 +53,7 @@ impl Connection {
         if self.closing {
             return data.len();
         }
-        let cap = self.limits.max_head.saturating_add(self.limits.max_body.saturating_mul(2)).saturating_add(1024);
-        let take = data.len().min(cap.saturating_sub(self.incoming.len()));
+        let take = data.len().min(self.limits.max_request().saturating_sub(self.incoming.len()));
         self.incoming.extend_from_slice(data.get(..take).unwrap_or(&[]));
         take
     }
@@ -67,7 +67,16 @@ impl Connection {
         if self.awaiting.is_some() || self.closing {
             return None;
         }
-        match request::parse(&self.incoming, &self.limits) {
+        let parsed = match request::parse(&self.incoming, &self.limits) {
+            // A full buffer that still holds no whole request can never
+            // complete, since `receive` takes no more: refuse it rather than
+            // stalling. The parser's own limits should catch this first.
+            Ok(Parsed::Incomplete { .. }) if self.incoming.len() >= self.limits.max_request() => {
+                Err(HttpError::BodyTooLarge)
+            }
+            other => other,
+        };
+        match parsed {
             Ok(Parsed::Complete(req, used)) => {
                 self.incoming.drain(..used.min(self.incoming.len()));
                 self.continue_sent = false;

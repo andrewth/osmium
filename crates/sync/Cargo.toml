@@ -1,6 +1,6 @@
 [package]
 name = "osmium-sync"
-description = "Osmium: spin locks, once cells, per-CPU data and lock-free rings for kernels"
+description = "Osmium: spin, MCS, reader-writer and sequence locks, RCU, once cells, per-CPU data, lock-free rings and intrusive collections for kernels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

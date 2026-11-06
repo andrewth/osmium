@@ -38,6 +38,16 @@
 //! anywhere in a queued round fails the whole call, after the port is
 //! recovered and the device's NCQ error log read.
 //!
+//! Every read checks the byte count the HBA reports (PRDBC) and fails a
+//! short one rather than return stale bounce-buffer bytes, with one
+//! exception: AHCI 1.3.1 §5.3.2 does not require the count for queued
+//! commands, and some HBAs (QEMU's among them) leave it at zero, so a
+//! queued read whose count is zero is accepted as "not reported". That case
+//! cannot be told apart from a read that moved nothing, so on such an HBA a
+//! queued read relies on the device's status alone. Once a port's HBA has
+//! reported a count for any queued command, or reports one for some but not
+//! all of a round, a zero count fails like any other short transfer.
+//!
 //! **ATAPI.** [`Ahci::take_atapi`] turns a packet device (an optical drive)
 //! into an [`AhciAtapi`], a read-only [`BlockDevice`](osmium_hal::block::BlockDevice) over the disc's
 //! 2048-byte blocks, using IDENTIFY PACKET DEVICE and the PACKET command

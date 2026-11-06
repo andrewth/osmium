@@ -18,9 +18,23 @@ const ID: &[u8; 20] = b"osmium-virtio-blk\0\0\0";
 /// Bytes moved per step of a read or write, so the guest's descriptor
 /// lengths never size a host allocation.
 const CHUNK: usize = 64 * 1024;
+/// `VIRTIO_BLK_F_SIZE_MAX` and `VIRTIO_BLK_F_SEG_MAX`: the config space
+/// gives the largest segment and the most segments per request.
+const F_SIZE_MAX: u64 = 1 << 1;
+const F_SEG_MAX: u64 = 1 << 2;
+/// Config-space offsets of `size_max` and `seg_max` (le32 each).
+const CONFIG_SIZE_MAX: usize = 8;
+const CONFIG_SEG_MAX: usize = 12;
+/// The segment limits offered, and the data one request may move: a guest
+/// that ignores them gets `VIRTIO_BLK_S_IOERR` for a larger request, so one
+/// request (and one notify's queue of them) is bounded host work.
+const SIZE_MAX: u32 = CHUNK as u32;
+const SEG_MAX: u32 = 64;
+const MAX_REQUEST: usize = SIZE_MAX as usize * SEG_MAX as usize;
 
 /// A virtio block device that serves guest requests from a host
-/// [`BlockDevice`]. Requests are handled synchronously on notify.
+/// [`BlockDevice`]. Requests are handled synchronously on notify, at most
+/// 4 MiB of data each (offered to the driver as `size_max` and `seg_max`).
 pub struct VirtioBlock<B> {
     disk: B,
     read_only: bool,
@@ -55,7 +69,13 @@ impl<B: BlockDevice + Send> VirtioBlock<B> {
         let (ty, sector) = (hdr as u32, (hdr >> 64) as u64);
         let status_at = wlen - 1;
 
+        let data_len = match ty {
+            T_IN => status_at,
+            T_OUT => chain.readable_len().saturating_sub(HEADER),
+            _ => 0,
+        };
         let (status, data) = match ty {
+            T_IN | T_OUT if data_len > MAX_REQUEST => (S_IOERR, 0),
             T_IN => match self.transfer(mem, chain, sector, status_at, false) {
                 Ok(n) => (S_OK, n),
                 Err(_) => (S_IOERR, 0),
@@ -141,7 +161,7 @@ impl<B: BlockDevice + Send> VirtioDevice for VirtioBlock<B> {
     }
 
     fn features(&self) -> u64 {
-        let mut f = F_FLUSH | F_BLK_SIZE;
+        let mut f = F_FLUSH | F_BLK_SIZE | F_SIZE_MAX | F_SEG_MAX;
         if self.read_only {
             f |= F_RO;
         }
@@ -162,6 +182,11 @@ impl<B: BlockDevice + Send> VirtioDevice for VirtioBlock<B> {
         }
         for (d, s) in cfg.iter_mut().skip(CONFIG_BLK_SIZE).zip((bs as u32).to_le_bytes()) {
             *d = s;
+        }
+        for (at, v) in [(CONFIG_SIZE_MAX, SIZE_MAX), (CONFIG_SEG_MAX, SEG_MAX)] {
+            for (d, s) in cfg.iter_mut().skip(at).zip(v.to_le_bytes()) {
+                *d = s;
+            }
         }
         for (i, d) in data.iter_mut().enumerate() {
             let at = usize::try_from(offset).ok().and_then(|o| o.checked_add(i));
@@ -323,6 +348,45 @@ mod tests {
         notify(&blk, 0);
         assert_eq!(status(&mem), S_IOERR);
         assert_eq!(d.used(&mem, 2).1, 1);
+    }
+
+    /// One request moves at most `seg_max * size_max` bytes, which the device
+    /// offers; a larger one fails before the disk is touched.
+    #[test]
+    fn requests_past_the_offered_limits_fail() {
+        let mut ram = vec![0u8; 0x60_0000];
+        let mem = Arc::new(guest(&mut ram));
+        let blk = VirtioMmio::new(VirtioBlock::new(Disk(vec![7; 0x80_0000])), mem.clone(), |_| {});
+        bring_up(&blk, &[(0, 0)]);
+        let f = blk.with_device(|b, _| b.features());
+        assert_eq!(f & (F_SIZE_MAX | F_SEG_MAX), F_SIZE_MAX | F_SEG_MAX);
+        let cfg = |off: u64| {
+            let mut b = [0u8; 4];
+            blk.read(0x100 + off, &mut b);
+            u32::from_le_bytes(b)
+        };
+        assert_eq!((cfg(8), cfg(12)), (SIZE_MAX, SEG_MAX));
+        let mut d = Driver::new(8);
+        const BIG: u64 = 0x10000;
+        // Exactly the limit is served.
+        header(&mem, T_IN, 0);
+        d.post(&mem, &[(HDR, 16, false), (BIG, MAX_REQUEST as u32, true), (STATUS, 1, true)]);
+        notify(&blk, 0);
+        assert_eq!(status(&mem), S_OK);
+        assert_eq!(mem.read_obj::<u8>(GuestPhysAddr(BIG + MAX_REQUEST as u64 - 1)), Ok(7));
+        // One block more is refused, in either direction.
+        mem.write(GuestPhysAddr(BIG), &vec![0u8; MAX_REQUEST + 4096]).unwrap();
+        header(&mem, T_IN, 0);
+        d.post(&mem, &[(HDR, 16, false), (BIG, MAX_REQUEST as u32 + 4096, true), (STATUS, 1, true)]);
+        notify(&blk, 0);
+        assert_eq!(status(&mem), S_IOERR);
+        assert_eq!(d.used(&mem, 1).1, 1, "only the status byte");
+        assert_eq!(mem.read_obj::<u8>(GuestPhysAddr(BIG)), Ok(0), "nothing was read into the guest");
+        header(&mem, T_OUT, 0);
+        d.post(&mem, &[(HDR, 16, false), (BIG, MAX_REQUEST as u32 + 4096, false), (STATUS, 1, true)]);
+        notify(&blk, 0);
+        assert_eq!(status(&mem), S_IOERR);
+        blk.with_device(|b, _| assert!(b.disk().0.iter().all(|&x| x == 7)));
     }
 
     #[test]

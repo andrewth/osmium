@@ -37,6 +37,37 @@ const FENCE_SPINS: u32 = 50_000_000;
 /// Not in the guest.
 pub(crate) const NOT_RUNNING: usize = usize::MAX;
 
+/// A vCPU's connection to its slot of a [`GuestCpus`], which
+/// [`GuestCpus::attach`] hands to [`Vcpu::connect_cpu`](crate::Vcpu::connect_cpu).
+#[derive(Clone)]
+pub struct CpuLink {
+    ipi: Arc<AtomicBool>,
+    fence: Arc<AtomicBool>,
+    running: Arc<AtomicUsize>,
+}
+
+impl CpuLink {
+    /// The slot's software-interrupt (IPI) line, raised by
+    /// [`GuestCpus::send_ipi`].
+    pub fn ipi(&self) -> &Arc<AtomicBool> {
+        &self.ipi
+    }
+
+    /// The slot's remote-fence request, set by [`GuestCpus::remote_fence`]:
+    /// the vCPU flushes its guest translations and clears it before it next
+    /// runs guest code.
+    pub fn fence(&self) -> &Arc<AtomicBool> {
+        &self.fence
+    }
+
+    /// Where the vCPU stores the host CPU it is running guest code on
+    /// (`osmium_arch::cpu::current_id`) for the duration of a run, and
+    /// `usize::MAX` otherwise, so [`GuestCpus::kick`] can find it.
+    pub fn running(&self) -> &Arc<AtomicUsize> {
+        &self.running
+    }
+}
+
 type Kick = Box<dyn Fn(usize) + Send + Sync>;
 
 /// Why a CPU could not be started.
@@ -51,8 +82,8 @@ pub enum StartError {
 }
 
 /// Shared state for a guest's CPUs. Each vCPU's host task takes start
-/// requests with [`take_start`](Self::take_start) and connects its vCPU
-/// (`attach` on RISC-V, [`attach_arm`](Self::attach_arm) on AArch64); the
+/// requests with [`take_start`](Self::take_start) and connects its vCPU,
+/// of any backend, with [`attach`](Self::attach); the
 /// guest's firmware calls (`riscv::sbi::handle_smp`,
 /// `aarch64::psci::handle_smp`) start, stop, query and signal CPUs through
 /// it.
@@ -88,14 +119,22 @@ impl GuestCpus {
         Self { slots, kick }
     }
 
-    /// Connects a RISC-V vCPU as hart `hart`: its IPI line, its remote-fence
-    /// line, and the record of which host CPU it runs on (for kicks).
-    /// Does nothing if there is no such hart.
-    pub fn attach(&self, hart: usize, vcpu: &mut crate::riscv::RiscvVcpu) {
-        let Some(slot) = self.slots.get(hart) else { return };
-        vcpu.connect_ipi(slot.ipi.clone());
-        vcpu.running = Some(slot.running.clone());
-        vcpu.fence = Some(slot.fence.clone());
+    /// Connects `vcpu`, of any backend, as CPU `cpu` (through
+    /// [`Vcpu::connect_cpu`](crate::Vcpu::connect_cpu)): every backend records
+    /// which host CPU runs it, so kicks find it; a RISC-V vCPU also takes the
+    /// slot's IPI line (as `hvip.VSSIP`) and remote-fence line. Does nothing
+    /// if there is no such CPU.
+    pub fn attach<V: crate::Vcpu + ?Sized>(&self, cpu: usize, vcpu: &mut V) {
+        if let Some(link) = self.link(cpu) {
+            vcpu.connect_cpu(link);
+        }
+    }
+
+    /// CPU `cpu`'s slot, for [`Vcpu::connect_cpu`](crate::Vcpu::connect_cpu);
+    /// `None` if there is no such CPU.
+    pub fn link(&self, cpu: usize) -> Option<CpuLink> {
+        let s = self.slots.get(cpu)?;
+        Some(CpuLink { ipi: s.ipi.clone(), fence: s.fence.clone(), running: s.running.clone() })
     }
 
     /// Number of harts.
@@ -129,27 +168,6 @@ impl GuestCpus {
             && host != osmium_arch::cpu::current_id()
         {
             kick(host);
-        }
-    }
-
-    /// Connects an AArch64 vCPU as CPU `cpu`, so kicks find it.
-    pub fn attach_arm(&self, cpu: usize, vcpu: &mut crate::aarch64::Aarch64Vcpu) {
-        if let Some(slot) = self.slots.get(cpu) {
-            vcpu.running = Some(slot.running.clone());
-        }
-    }
-
-    /// Connects an SVM vCPU as CPU `cpu`, so kicks find it.
-    pub fn attach_svm(&self, cpu: usize, vcpu: &mut crate::x86::svm::SvmVcpu) {
-        if let Some(slot) = self.slots.get(cpu) {
-            vcpu.running = Some(slot.running.clone());
-        }
-    }
-
-    /// Connects a VMX vCPU as CPU `cpu`, so kicks find it.
-    pub fn attach_vmx(&self, cpu: usize, vcpu: &mut crate::x86::vmx::VmxVcpu) {
-        if let Some(slot) = self.slots.get(cpu) {
-            vcpu.running = Some(slot.running.clone());
         }
     }
 
@@ -198,6 +216,11 @@ impl GuestCpus {
     /// guest flushes before it next enters, so it is not waited for. The wait
     /// is bounded, for a target that cannot be kicked.
     pub fn remote_fence(&self, mask: u64, base: u64) -> Result<(), i64> {
+        self.remote_fence_within(mask, base, FENCE_SPINS)
+    }
+
+    /// [`remote_fence`](Self::remote_fence), waiting at most `limit` spins for each target.
+    fn remote_fence_within(&self, mask: u64, base: u64, limit: u32) -> Result<(), i64> {
         self.each(mask, base, |s| s.fence.store(true, Ordering::SeqCst));
         // Pairs with the vCPU storing `running` and then taking the flag.
         core::sync::atomic::fence(Ordering::SeqCst);
@@ -209,7 +232,7 @@ impl GuestCpus {
             let mut spins = 0u32;
             while s.fence.load(Ordering::Acquire) {
                 let host = s.running.load(Ordering::SeqCst);
-                if host == NOT_RUNNING || host == me || spins >= FENCE_SPINS {
+                if host == NOT_RUNNING || host == me || spins >= limit {
                     break;
                 }
                 if spins % 1024 == 0 {
@@ -276,10 +299,50 @@ mod tests {
         h.send_ipi(0b10, 0).unwrap();
         assert_eq!(kicked.load(Ordering::SeqCst), 3);
         kicked.store(NOT_RUNNING, Ordering::SeqCst);
-        h.remote_fence(0b10, 0).unwrap();
+        h.remote_fence_within(0b10, 0, 10_000).unwrap();
         assert_eq!(kicked.load(Ordering::SeqCst), 3, "fences kick too");
         assert!(h.slots[1].fence.load(Ordering::SeqCst));
         assert!(!h.slots[0].fence.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn remote_fence_gives_up_on_a_hart_that_never_takes_it() {
+        let h = GuestCpus::new(2);
+        // Running elsewhere, and no kick can make it exit: the wait is bounded.
+        h.slots[1].running.store(usize::MAX - 1, Ordering::SeqCst);
+        h.remote_fence_within(0b10, 0, 10_000).unwrap();
+        assert!(h.slots[1].fence.load(Ordering::SeqCst), "the request stays for its next entry");
+    }
+
+    /// Every backend connects through the one `attach`, and kicks then find it.
+    #[test]
+    fn attach_is_backend_generic() {
+        use crate::Vcpu;
+        let kicked = Arc::new(AtomicUsize::new(NOT_RUNNING));
+        let k = kicked.clone();
+        let h = GuestCpus::with_kick(4, move |cpu| k.store(cpu, Ordering::SeqCst));
+        let mut riscv =
+            crate::riscv::RiscvVcpu::new(crate::GuestPhysAddr(0), crate::riscv::HartId(0), 0, crate::stage2::Hgatp(0));
+        let mut arm = crate::aarch64::Aarch64Vcpu::new(crate::GuestPhysAddr(0), 0, 0);
+        let cpus: [&mut dyn Vcpu; 2] = [&mut riscv, &mut arm];
+        for (i, v) in cpus.into_iter().enumerate() {
+            h.attach(i, v);
+        }
+        assert!(h.link(4).is_none());
+        // The RISC-V vCPU took the IPI line: an IPI wakes it from `wfi`.
+        riscv.csrs.vsie = 1 << 1;
+        assert!(!riscv.interrupt_pending(0));
+        h.send_ipi(0b1, 0).unwrap();
+        assert!(Vcpu::interrupt_pending(&riscv, 0));
+        // The running record is the slot's: a vCPU on host CPU 6 is kicked there.
+        for (i, running) in [riscv.running.clone(), arm.running.clone()].into_iter().enumerate() {
+            let r = running.expect("attached");
+            r.store(6, Ordering::SeqCst);
+            kicked.store(NOT_RUNNING, Ordering::SeqCst);
+            h.kick(i);
+            assert_eq!(kicked.load(Ordering::SeqCst), 6, "cpu {i}");
+            r.store(NOT_RUNNING, Ordering::SeqCst);
+        }
     }
 
     #[test]

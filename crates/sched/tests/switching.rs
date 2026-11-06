@@ -437,3 +437,24 @@ fn pin_while_queued_survives_scheduling() {
     assert_eq!(ran_on.load(Ordering::Relaxed), away);
     assert_eq!(t.affinity(), 1 << away, "scheduling does not rewrite the affinity");
 }
+
+#[test]
+fn wake_task_wakes_one_named_waiter() {
+    become_cpu();
+    static Q: WaitQueue = WaitQueue::new();
+    static GO: [std::sync::atomic::AtomicBool; 2] =
+        [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)];
+    let tasks: Vec<_> = (0..2)
+        .map(|i| builder("waiter").spawn(move || Q.wait_until(|| GO[i].load(Ordering::SeqCst).then_some(()))))
+        .collect();
+    osmium_sched::yield_now();
+    assert!(tasks.iter().all(|t| t.state() == TaskState::Blocked));
+    GO[1].store(true, Ordering::SeqCst);
+    assert!(Q.wake_task(&tasks[1]), "it was waiting here");
+    assert_eq!(tasks[0].state(), TaskState::Blocked, "the other waiter sleeps on");
+    tasks[1].join();
+    assert!(!Q.wake_task(&tasks[1]), "no longer waiting");
+    GO[0].store(true, Ordering::SeqCst);
+    assert_eq!(Q.wake_all(), 1);
+    tasks[0].join();
+}

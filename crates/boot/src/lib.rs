@@ -15,8 +15,8 @@
 //!   boot services a loader needs: pages, files on the boot volume, the
 //!   configuration tables, the memory map and `ExitBootServices`.
 //!
-//! Both can populate an [`osmium_mm::MemoryMap`], the starting point for
-//! the frame allocator.
+//! The device tree, Multiboot2 and PVH parsers can populate an
+//! [`osmium_mm::MemoryMap`], the starting point for the frame allocator.
 #![no_std]
 
 #[cfg(feature = "alloc")]

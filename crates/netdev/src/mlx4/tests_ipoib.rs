@@ -275,6 +275,10 @@ fn group_traffic_and_limits() {
     let mac = ip.mac_address();
     let mut buf = [0u8; 2100];
 
+    // A receive the adapter failed is skipped, not reported as a device error.
+    assert!(hca.fail_receive(IPOIB_QPN, 0x02));
+    assert_eq!(ip.receive(&mut buf), Err(NetError::WouldBlock));
+
     // A request from a neighbor arrives by multicast and comes out as a broadcast.
     let gid = peer_gid(3);
     let asking = ipoib(0x0806, &arp_ib(1, hw(0x77, &gid), [10, 0, 0, 3], [0; 20], [10, 0, 0, 1]));

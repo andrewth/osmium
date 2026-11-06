@@ -35,7 +35,10 @@ pub struct Volume {
 }
 
 impl Descriptor {
-    /// Parses one descriptor; `EINVAL` if it has no `CD001` signature.
+    /// Parses one descriptor; `EINVAL` if it has no `CD001` signature. A
+    /// primary or Joliet descriptor whose fields make no sense (a bad block
+    /// size, say) is [`Descriptor::Other`]: the set may hold a good one too,
+    /// and Linux skips what it cannot use.
     pub fn parse(d: &[u8]) -> Result<Self, Errno> {
         if d.len() < SIZE {
             return Err(Errno::EINVAL);
@@ -48,10 +51,22 @@ impl Descriptor {
         }
         Ok(match kind {
             255 => Descriptor::Terminator,
-            1 => Descriptor::Primary(Volume::parse(d, false)?),
-            2 if field::<3>(d, 88).is_some_and(|esc| is_joliet(&esc)) => Descriptor::Joliet(Volume::parse(d, true)?),
+            1 => usable(Volume::parse(d, false))?.map_or(Descriptor::Other, Descriptor::Primary),
+            2 if field::<3>(d, 88).is_some_and(|esc| is_joliet(&esc)) => {
+                usable(Volume::parse(d, true))?.map_or(Descriptor::Other, Descriptor::Joliet)
+            }
             _ => Descriptor::Other,
         })
+    }
+}
+
+/// A parsed volume, `None` for one that makes no sense; running out of
+/// memory is still an error.
+fn usable(v: Result<Volume, Errno>) -> Result<Option<Volume>, Errno> {
+    match v {
+        Ok(v) => Ok(Some(v)),
+        Err(Errno::ENOMEM) => Err(Errno::ENOMEM),
+        Err(_) => Ok(None),
     }
 }
 

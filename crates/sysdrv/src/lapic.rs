@@ -21,6 +21,16 @@ const ICR_LEVEL_ASSERT: u32 = 1 << 14;
 const LVT_MASKED: u32 = 1 << 16;
 const LVT_PERIODIC: u32 = 1 << 17;
 
+/// Polls of the ICR delivery-status bit before giving up on an APIC that
+/// never accepts the interrupt.
+pub const SPIN_LIMIT: u32 = 1_000_000;
+
+/// The local APIC kept the ICR delivery-status bit set for
+/// [`SPIN_LIMIT`] polls: the interrupt was not accepted (for example, no CPU
+/// answers to the destination APIC id).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpiTimeout;
+
 /// Default physical base of the local APIC.
 pub const DEFAULT_BASE: u64 = 0xfee0_0000;
 
@@ -62,54 +72,68 @@ impl LocalApic {
     }
 
     /// Sends fixed-delivery interrupt `vector` to the CPU with APIC id `dest`.
-    pub fn send_ipi(&self, dest: u8, vector: u8) {
-        self.send_icr(dest, vector as u32);
+    ///
+    /// Waits a bounded time for the APIC to accept it; see [`IpiTimeout`].
+    pub fn send_ipi(&self, dest: u8, vector: u8) -> Result<(), IpiTimeout> {
+        self.send_icr(dest, vector as u32)
     }
 
     /// Sends an INIT IPI to the CPU with APIC id `dest`: the first step of
     /// starting an application processor.
-    pub fn send_init(&self, dest: u8) {
-        self.send_icr(dest, ICR_INIT | ICR_LEVEL_ASSERT);
+    pub fn send_init(&self, dest: u8) -> Result<(), IpiTimeout> {
+        self.send_icr(dest, ICR_INIT | ICR_LEVEL_ASSERT)
     }
 
     /// Sends a STARTUP IPI: CPU `dest` starts in real mode at physical
     /// address `page << 12` (so the entry must be page aligned and below 1 MiB).
-    pub fn send_startup(&self, dest: u8, page: u8) {
-        self.send_icr(dest, ICR_STARTUP | page as u32);
+    pub fn send_startup(&self, dest: u8, page: u8) -> Result<(), IpiTimeout> {
+        self.send_icr(dest, ICR_STARTUP | page as u32)
     }
 
     /// Starts the application processor with APIC id `dest` through the
     /// trampoline in `osmium_arch::x86_64::smp`: fills its slots from `boot`,
     /// then INIT, 10 ms, and STARTUP twice, 200 µs apart. `delay_ns` busy-waits
     /// (a calibrated PIT or TSC). Returns once the IPIs are sent; the caller
-    /// waits for the AP to check in before starting the next one.
+    /// waits for the AP to check in before starting the next one. Fails with
+    /// [`IpiTimeout`], without sending the rest, if the APIC never accepts one
+    /// of the IPIs (for example, a stale APIC id).
     ///
     /// # Safety
     /// As for `smp::prepare`: the trampoline is installed and no other AP is
     /// still in it. `boot` must describe a valid stack and entry.
     #[cfg(all(target_arch = "x86_64", target_os = "none"))]
-    pub unsafe fn start_ap(&self, dest: u8, boot: &osmium_arch::x86_64::smp::ApBoot, delay_ns: impl Fn(u64)) {
+    pub unsafe fn start_ap(
+        &self,
+        dest: u8,
+        boot: &osmium_arch::x86_64::smp::ApBoot,
+        delay_ns: impl Fn(u64),
+    ) -> Result<(), IpiTimeout> {
         use osmium_arch::x86_64::smp;
         // SAFETY: the caller upholds `prepare`'s contract.
         unsafe { smp::prepare(boot) };
-        self.send_init(dest);
+        self.send_init(dest)?;
         delay_ns(10_000_000);
         for _ in 0..2 {
-            self.send_startup(dest, (smp::TRAMPOLINE >> 12) as u8);
+            self.send_startup(dest, (smp::TRAMPOLINE >> 12) as u8)?;
             delay_ns(200_000);
         }
+        Ok(())
     }
 
-    fn send_icr(&self, dest: u8, low: u32) {
+    fn send_icr(&self, dest: u8, low: u32) -> Result<(), IpiTimeout> {
         // ICR_HIGH latches the destination for the ICR_LOW write: an interrupt handler on this CPU
         // that sent its own IPI in between would redirect ours.
         osmium_arch::irq::without(|| {
             self.write(ICR_HIGH, (dest as u32) << 24);
             self.write(ICR_LOW, low);
         });
-        while self.read(ICR_LOW) & ICR_PENDING != 0 {
+        for _ in 0..SPIN_LIMIT {
+            if self.read(ICR_LOW) & ICR_PENDING == 0 {
+                return Ok(());
+            }
             core::hint::spin_loop();
         }
+        Err(IpiTimeout)
     }
 
     /// Starts the timer: `count` ticks of the bus clock divided by 16, then
@@ -153,7 +177,7 @@ mod tests {
         let apic = LocalApic::new(unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) });
         apic.enable(0xff);
         assert_eq!(apic.id(), 3);
-        apic.send_ipi(2, 0x40);
+        assert_eq!(apic.send_ipi(2, 0x40), Ok(()));
         apic.start_timer(0x20, 1000, true);
         apic.eoi();
         drop(apic);
@@ -169,11 +193,23 @@ mod tests {
         let mut regs = [0u32; 0x1000 / 4];
         // SAFETY: the window covers a local array.
         let apic = LocalApic::new(unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) });
-        apic.send_init(3);
+        assert_eq!(apic.send_init(3), Ok(()));
         assert_eq!(read_icr(&apic), (3 << 24, 0x4500));
-        apic.send_startup(3, 0x08);
+        assert_eq!(apic.send_startup(3, 0x08), Ok(()));
         drop(apic);
         assert_eq!((regs[ICR_HIGH / 4], regs[ICR_LOW / 4]), (3 << 24, 0x0608));
+    }
+
+    #[test]
+    fn stuck_delivery_status_times_out() {
+        let mut regs = [0u32; 0x1000 / 4];
+        // SAFETY: the window covers a local array.
+        let apic = LocalApic::new(unsafe { IoMem::new(regs.as_mut_ptr().cast(), 0x1000) });
+        // A plain memory window keeps whatever is written: an ICR_LOW value
+        // with the delivery-status bit set reads back pending forever, as an
+        // APIC that never accepts the interrupt would.
+        assert_eq!(apic.send_icr(5, ICR_PENDING | 0x40), Err(IpiTimeout));
+        assert_eq!(apic.send_ipi(5, 0x40), Ok(()), "a later IPI that is accepted succeeds");
     }
 
     #[test]

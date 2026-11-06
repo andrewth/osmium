@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::offset_of;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use osmium_boot::elf::Elf;
 use osmium_mm::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
@@ -44,15 +44,50 @@ pub trait UserMemory: Send + Sync {
     /// Copies `data` to user address `va`.
     fn write(&self, va: u64, data: &[u8]) -> Result<(), Errno>;
     /// Makes `va..va + len` resident (and, if `write`, privately writable),
-    /// loading file pages and breaking copy-on-write, without copying. A
-    /// caller that must read or write user memory under a spin lock calls
-    /// this first, so the copy under the lock finds the pages present and
-    /// never has to allocate, do file I/O or shoot down other CPUs (a page
-    /// that is swapped out or unshared in between still can, rarely). The
-    /// default does nothing.
+    /// loading file pages and breaking copy-on-write, without copying. Call
+    /// it with no spin lock held: it may allocate, do file I/O and shoot
+    /// down other CPUs. Nothing keeps the pages ready afterwards (a `fork`,
+    /// `munmap` or `mprotect` may get in first), so an access under a spin
+    /// lock uses [`with_word`](UserMemory::with_word), which never faults,
+    /// and calls this and retries when the page is not ready. The default
+    /// does nothing.
     fn prefault(&self, _va: u64, _len: usize, _write: bool) -> Result<(), Errno> {
         Ok(())
     }
+    /// Runs `f` on the 32-bit word at `va` (4-aligned), for a futex
+    /// operation that holds a spin lock of its own: the word is reached
+    /// through the physical mapping as an atomic, under the space's lock, so
+    /// nothing here faults, allocates, does file I/O or shoots down other
+    /// CPUs, and the mapping cannot change while `f` runs. `f` is also told
+    /// where the word is ([`WordAt`]), so that a process-shared futex can be
+    /// keyed by its frame.
+    ///
+    /// Returns `Ok(false)` without calling `f` if the page is not ready for
+    /// the access (not loaded yet; for a write, copy-on-write or a clean
+    /// shared file page): the caller drops its locks, calls
+    /// [`prefault`](UserMemory::prefault) and tries again. Fails with
+    /// `EFAULT` if the access can never succeed.
+    ///
+    /// The default copies the word in with [`read`](UserMemory::read) and
+    /// back with [`write`](UserMemory::write) if `f` changed it, which is
+    /// neither atomic against user threads nor free of faults: a space whose
+    /// threads run on several CPUs, or whose copies can fault, overrides it.
+    fn with_word(&self, va: u64, write: bool, f: &mut dyn FnMut(&AtomicU32, WordAt)) -> Result<bool, Errno> {
+        if !va.is_multiple_of(4) {
+            return Err(Errno::EINVAL);
+        }
+        let mut b = [0; 4];
+        self.read(va, &mut b)?;
+        let old = u32::from_ne_bytes(b);
+        let word = AtomicU32::new(old);
+        f(&word, WordAt { pa: PhysAddr(0), shared: false });
+        let new = word.into_inner();
+        if write && new != old {
+            self.write(va, &new.to_ne_bytes())?;
+        }
+        Ok(true)
+    }
+
     /// Maps zeroed, user-accessible pages over `va..va + len` (page-aligned)
     /// with `flags`. Pages already mapped are left as they are.
     fn map_anon(&self, va: u64, len: u64, flags: MapFlags) -> Result<(), Errno>;
@@ -142,6 +177,17 @@ pub trait UserMemory: Send + Sync {
     fn sync_files(&self) -> Result<(), Errno> {
         Ok(())
     }
+}
+
+/// Where [`UserMemory::with_word`] found a word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WordAt {
+    /// The word's physical address.
+    pub pa: PhysAddr,
+    /// Whether the page is memory this space shares with others on purpose
+    /// (a `MAP_SHARED` mapping, whose frames `fork` keeps shared): a
+    /// process-shared futex there is keyed by the frame, not the address.
+    pub shared: bool,
 }
 
 /// A page of a space: where it is, the frame behind it, and whether a write
@@ -591,11 +637,50 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
         })
     }
 
+    fn with_word(&self, va: u64, write: bool, f: &mut dyn FnMut(&AtomicU32, WordAt)) -> Result<bool, Errno> {
+        if !va.is_multiple_of(4) {
+            return Err(Errno::EINVAL);
+        }
+        let inner = self.inner.lock();
+        let page = va & !(PAGE - 1);
+        let Some(t) = inner.pt.translate(VirtAddr::new(va)) else {
+            // Not loaded yet: `prefault` loads a page of a lazy area or a file mapping.
+            let loadable = inner.vmas.find(page).is_some() || inner.maps.find(page).is_some();
+            return if loadable { Ok(false) } else { Err(Errno::EFAULT) };
+        };
+        if !t.flags.contains(MapFlags::USER | MapFlags::READ) {
+            return Err(Errno::EFAULT);
+        }
+        let map = inner.maps.find(page);
+        if write && !t.flags.contains(MapFlags::WRITE) {
+            // `prefault` gives a copy-on-write page its own frame, and makes a
+            // clean page of a writable shared mapping writable (and dirty).
+            let cow = inner.pages.find(&page).is_some_and(|p| p.is_cow() && !p.is_ro());
+            let clean = map.is_some_and(|v| v.shared() && v.prot().contains(MapFlags::WRITE));
+            return if cow || clean { Ok(false) } else { Err(Errno::EFAULT) };
+        }
+        let at = WordAt { pa: t.pa, shared: map.is_some_and(|v| v.shared()) };
+        // SAFETY: `t.pa` is 4-aligned (as `va` is) inside a frame this space
+        // maps for the user, reached through the allocator's mapping. The
+        // frame can be neither unmapped nor freed while we hold the lock, and
+        // `AtomicU32` has the layout of the `u32` that user threads access
+        // with their own atomic instructions.
+        let word = unsafe { &*self.alloc.phys_to_virt(t.pa).cast::<AtomicU32>() };
+        f(word, at);
+        Ok(true)
+    }
+
     fn map_anon(&self, va: u64, len: u64, flags: MapFlags) -> Result<(), Errno> {
         if !va.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
             return Err(Errno::EINVAL);
         }
         let end = va.checked_add(len).ok_or(Errno::ENOMEM)?;
+        // Outside the user half a page would land at a table index the
+        // hardware never uses, or among the kernel's shared entries (which
+        // translate, and so would be skipped as "already mapped").
+        if len != 0 && !self.is_user_range(va, end) {
+            return Err(Errno::ENOMEM);
+        }
         let mut inner = self.inner.lock();
         for page in (va..end).step_by(PAGE_SIZE) {
             if inner.pt.translate(VirtAddr::new(page)).is_some() {

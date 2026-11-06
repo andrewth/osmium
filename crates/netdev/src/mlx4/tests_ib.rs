@@ -445,6 +445,36 @@ fn general_services_on_queue_pair_1() {
 }
 
 #[test]
+fn a_bad_datagram_is_dropped_and_a_flush_is_an_error() {
+    let hca = FakeHca::new(IB);
+    let dma = HostDma::default();
+    let mlx = bring_up(&hca, &dma).unwrap();
+    let mut ib = mlx.open_ib(1, QKEY).unwrap();
+    let qpn = ib.qpn();
+    hca.sm_configure(1, 7);
+    let mut buf = [0u8; 256];
+
+    // A local error on one receive (0x02: local queue pair operation error) loses that datagram only.
+    assert!(hca.fail_receive(qpn, 0x02));
+    assert!(hca.deliver_ud(1, qpn, QKEY, peer(9, 0x55), None, b"after"));
+    assert_eq!(ib.receive(&mut buf).map(|d| d.len), Ok(5));
+    assert_eq!(&buf[..5], b"after");
+    assert!(hca.fail_receive(qpn, 0x02));
+    assert_eq!(ib.receive(&mut buf), Err(NetError::WouldBlock), "dropped; nothing else waiting");
+
+    // Flushed receives mean the queue pair is in the error state.
+    assert!(hca.fail_receive(qpn, queue::SYNDROME_FLUSHED));
+    assert_eq!(ib.receive(&mut buf), Err(NetError::Io));
+
+    // So does a failed send, for the sends after it.
+    let dest = Destination::local(9, 0x55, QKEY);
+    hca.fail_next_send(qpn, 0x04);
+    ib.send(&dest, b"lost").unwrap();
+    assert!(hca.sent(qpn).is_empty());
+    assert_eq!(ib.send(&dest, b"next"), Err(NetError::Io));
+}
+
+#[test]
 fn datagrams() {
     let hca = FakeHca::new(IB);
     let dma = HostDma::default();

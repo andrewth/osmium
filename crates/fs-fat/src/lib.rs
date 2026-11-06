@@ -3,7 +3,11 @@
 //! [`FatFs::mount`] reads the volume and [`FatFs::root`] hands out its root
 //! directory as an [`osmium_fs::File`], ready for `Vfs::mount`. Long (VFAT)
 //! names are read and written; new names that do not fit 8.3 get a
-//! generated `NAME~N.EXT` short name alongside.
+//! generated `NAME~N.EXT` short name alongside. Names are matched without
+//! regard to case (Unicode's one-character upper case, as the Windows and
+//! Linux upcase tables fold), and a lookup finds an entry by its short alias
+//! too (`PROGRA~1` for `Program Files`), so a new name that is an existing
+//! alias is `EEXIST`.
 //!
 //! The device and all volume state sit behind one lock, and every node is
 //! known by the disk position of its directory entry, which serves as its
@@ -379,6 +383,11 @@ impl<D: BlockDevice + Send + 'static> Volume<D> {
         // SAFETY: the entry is owned by `nodes`, which outlives its place in
         // `by_ino`: it leaves `by_ino` first (see `Volume::forget`).
         let indexed = unsafe { self.by_ino.insert(&entry) };
+        // Invariants, not conditions of the disk: `by_ino` has no entry for
+        // `ino` (the lookup above found none, and the lock has been held
+        // since), and ids come from `next_id`, which only grows, so neither
+        // insert can collide. A failure would be a bug in this driver, and
+        // carrying on would leave a node outside the tables.
         assert!(indexed, "inode numbers are indexed once");
         assert!(self.nodes.insert(entry).is_ok(), "node ids are never reused");
         Ok(node)
@@ -958,9 +967,10 @@ impl<D: BlockDevice + Send + 'static> Node<D> {
     fn find(vol: &mut Volume<D>, dir: u32, name: &str) -> Result<Option<Entry>, Errno> {
         let bytes = vol.dir_bytes(dir)?;
         let mut found = None;
+        let alias = name::alias_form(name);
         for e in dir::entries(&bytes) {
             let e = e?;
-            if name::same(&e.name, name) {
+            if name::finds(&e.name, &e.short, name, alias.as_ref()) {
                 found = Some(e);
                 break;
             }
@@ -1005,7 +1015,12 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
             }
             vol.write_chain(&mut first, off, buf)
         })();
-        // Record whatever was allocated even if the write failed part way.
+        if result.is_err() {
+            // The size stays as it was: give back what the write allocated
+            // past it, which fsck would find linked beyond the end. If even
+            // that fails, record what is there; a truncate frees it later.
+            let _ = vol.shrink_chain(&mut first, size);
+        }
         let s = self.state(&mut vol)?;
         s.first = first;
         if result.is_ok() && end > size {
@@ -1142,8 +1157,11 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
         // The memory for the new node, before the disk is touched.
         let spare = vol.prepare(&self.shared)?;
         let bytes = vol.dir_bytes(dir_first)?;
+        // A name that is another entry's short alias names that entry.
+        let alias = name::alias_form(name);
         for e in dir::entries(&bytes) {
-            if name::same(&e?.name, name) {
+            let e = e?;
+            if name::finds(&e.name, &e.short, name, alias.as_ref()) {
                 return Err(Errno::EEXIST);
             }
         }
@@ -1266,7 +1284,11 @@ impl<D: BlockDevice + Send + 'static> File for Node<D> {
                 }
                 let mut dotdot = [0u8; ENTRY_SIZE];
                 vol.read_chain(cur, ENTRY_SIZE as u64, &mut dotdot, u64::MAX)?;
-                cur = match dir::first_cluster(&dotdot) {
+                let parent = dir::first_cluster(&dotdot);
+                // As in `find`: before FAT32 the high word is not part of
+                // the cluster, and a stray one must not hide an ancestor.
+                let parent = if vol.geo.kind == FatKind::Fat32 { parent } else { parent & 0xffff };
+                cur = match parent {
                     0 => vol.geo.root_cluster,
                     parent => parent,
                 };

@@ -25,7 +25,7 @@ fn normalize(v: &mut Vec<(u64, u64)>) {
             continue;
         }
         match out.last_mut() {
-            Some(last) if last.0 + last.1 >= s => last.1 = last.1.max(s + l - last.0),
+            Some(last) if last.0.saturating_add(last.1) >= s => last.1 = last.1.max(s.saturating_add(l) - last.0),
             _ => {
                 if out.try_reserve(1).is_err() {
                     return;
@@ -44,7 +44,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         let per = ((self.leaf_space() / 2 - ITEM) / cs).max(1);
         for chunk in sums.chunks(per * cs) {
             self.insert(tree::CSUM, Key::new(tree::EXTENT_CSUM, item::EXTENT_CSUM, start), chunk)?;
-            start += (chunk.len() / cs) as u64 * self.sh.sectorsize;
+            start = start.checked_add((chunk.len() / cs) as u64 * self.sh.sectorsize).ok_or(Errno::EIO)?;
         }
         Ok(())
     }
@@ -52,9 +52,9 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     /// Deletes the checksums of logical `start..start + len`.
     pub(crate) fn csum_delete(&mut self, start: u64, len: u64) -> Result<(), Errno> {
         let (cs, ss) = (self.sh.csum_size, self.sh.sectorsize);
-        let end = start + len;
+        let end = start.checked_add(len).ok_or(Errno::EIO)?;
         let ours = |k: &Key| k.objectid == tree::EXTENT_CSUM && k.ty == item::EXTENT_CSUM;
-        let span = |k: &Key, d: &[u8]| k.offset + (d.len() / cs) as u64 * ss;
+        let span = |k: &Key, d: &[u8]| k.offset.saturating_add((d.len() / cs) as u64 * ss);
         let key = Key::new(tree::EXTENT_CSUM, item::EXTENT_CSUM, start);
         if let Some((k, d)) = self.prev_item(tree::CSUM, key)?
             && ours(&k)
@@ -92,9 +92,10 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     /// group `g`, and the ranges free in it once committed.
     fn group_change(&self, gstart: u64, gend: u64) -> i64 {
         let inside = |s: u64| s >= gstart && s < gend;
-        let taken: u64 = self.allocs.iter().filter(|a| !a.dead && inside(a.start)).map(|a| a.len).sum();
-        let given: u64 = self.pinned.iter().filter(|p| inside(p.0)).map(|p| p.1).sum();
-        taken as i64 - given as i64
+        let taken =
+            self.allocs.iter().filter(|a| !a.dead && inside(a.start)).fold(0u64, |t, a| t.saturating_add(a.len));
+        let given = self.pinned.iter().filter(|p| inside(p.0)).fold(0u64, |t, p| t.saturating_add(p.1));
+        (taken as i64).saturating_sub(given as i64)
     }
 
     /// The block groups this transaction touched.
@@ -126,7 +127,8 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
             }
             let g = self.w.groups.iter().find(|g| g.start == gs).ok_or(Errno::EIO)?;
             let (start, len) = (g.start, g.len);
-            let used = (g.used as i64 + self.group_change(start, start + len)).max(0) as u64;
+            let used =
+                (g.used as i64).saturating_add(self.group_change(start, start.saturating_add(len))).max(0) as u64;
             try_push(&mut used_after, (start, used))?;
             let bg_tree = self.w.bg_tree;
             let key = Key::new(start, item::BLOCK_GROUP_ITEM, len);
@@ -337,9 +339,9 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         let mut sb = try_to_vec(&self.w.sb)?;
         // Before anything is written: writing the superblocks may not fail for want of memory.
         let mut others = sh.super_buffers()?;
-        let taken: u64 = self.allocs.iter().filter(|a| !a.dead).map(|a| a.len).sum();
-        let given: u64 = self.pinned.iter().map(|p| p.1).sum();
-        let bytes_used = (le64(&sb, 120)? + taken).saturating_sub(given);
+        let taken = self.allocs.iter().filter(|a| !a.dead).fold(0u64, |t, a| t.saturating_add(a.len));
+        let given = self.pinned.iter().fold(0u64, |t, p| t.saturating_add(p.1));
+        let bytes_used = le64(&sb, 120)?.saturating_add(taken).saturating_sub(given);
         put64(&mut sb, 72, self.transid)?;
         put64(&mut sb, 80, root_tree.addr)?;
         disk::put(&mut sb, 198, &[root_tree.level])?;

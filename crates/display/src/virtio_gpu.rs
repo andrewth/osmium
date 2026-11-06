@@ -189,8 +189,7 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioGpu<'d, T, D> {
             n if n >= 2 => 1 << n.ilog2(),
             _ => return Err(VirtioError::BadQueue),
         };
-        let num_scanouts =
-            u32::from_le_bytes(core::array::from_fn(|i| transport.config_read8(CONFIG_NUM_SCANOUTS + i)));
+        let num_scanouts = transport.config_read32(CONFIG_NUM_SCANOUTS);
         // Plain values until all succeed, so a failure frees the others.
         let queue = VirtQueue::new(dma, CONTROL_QUEUE, size)?;
         // The cursor queue is optional: without it there is no hardware cursor.

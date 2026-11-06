@@ -6,15 +6,37 @@
 //! modified) frame. [`TrapFrame::cause`] decodes the architecture's cause
 //! registers into a portable [`Trap`].
 //!
-//! Traps are taken on the current kernel stack, so a handler may switch tasks
-//! (for example `osmium_sched::preempt_if_needed`): the frame stays on the
-//! preempted task's stack until it resumes. User mode is not supported yet.
+//! Traps from kernel mode are taken on the current kernel stack, so a handler
+//! may switch tasks (for example `osmium_sched::preempt_if_needed`): the frame
+//! stays on the preempted task's stack until it resumes. Traps from user mode
+//! are taken on the running task's kernel stack (see below). If the
+//! interrupted kernel stack has overflowed, RISC-V and AArch64 switch to a
+//! per-CPU emergency stack (`TrapCpu::set_exception_stack`); x86_64 uses an
+//! IST stack for the vectors given to `set_ist`.
 //!
 //! Supported: RISC-V 64 (S-mode, or M-mode with `riscv-m-mode`), AArch64
 //! (EL1, EL2 with `aarch64-el2`, or EL2 under VHE with the EL1 vectors and
-//! `aarch64-vhe`) and x86_64 (an IDT of interrupt gates,
-//! no IST yet). On hosted targets a simulation lets
-//! tests drive handlers with [`simulate`].
+//! `aarch64-vhe`) and x86_64 (an IDT of interrupt gates, with optional IST
+//! stacks and an optional `syscall` entry). On hosted targets a simulation
+//! lets tests drive handlers with [`simulate`].
+//!
+//! # User mode
+//!
+//! Each architecture enters user mode with its own `enter_user` and resumes a
+//! saved user frame with `resume_user`; their signatures differ because each
+//! CPU finds the kernel stack for traps from user mode differently:
+//!
+//! | Arch | Entry | Kernel stack for traps from user mode |
+//! |------|-------|---------------------------------------|
+//! | RISC-V (S-mode) | `riscv64::enter_user(entry, user_sp)`, `resume_user(frame)` | `TrapCpu::set_kernel_stack`, read by the stub; update it on every switch to a user task |
+//! | AArch64 (EL1) | `aarch64::enter_user(entry, user_sp, kernel_sp)`, `resume_user(frame, kernel_sp)` | `SP_EL1`, loaded from `kernel_sp`; `TrapCpu::set_kernel_stack` is not consulted |
+//! | x86_64 | `x86_64::enter_user(entry, stack_top)`, `resume_user(frame)` | the TSS's `rsp[0]` (`x86_64::CpuTables`), also used by the `syscall` stub |
+//!
+//! There is no `enter_user` in RISC-V M-mode (`riscv-m-mode`) or AArch64 EL2
+//! (`aarch64-el2`) builds. The argument types also differ (`usize` on
+//! RISC-V, `u64` elsewhere). `TrapFrame::syscall_args` returns eight
+//! registers on RISC-V and AArch64 and seven values on x86_64; its docs on
+//! each frame say where the call number is.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -142,14 +164,34 @@ impl OnceFlag {
     }
 
     /// Runs `f` exactly once; concurrent callers wait until it finishes.
+    ///
+    /// If `f` unwinds (hosted builds only; kernels abort on panic), the flag
+    /// goes back to unset, so a waiting or later caller runs its own `f`
+    /// instead of spinning forever.
     pub(crate) fn call_once(&self, f: impl FnOnce()) {
-        use core::sync::atomic::Ordering;
-        if self.0.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
-            f();
-            self.0.store(2, Ordering::Release);
-        } else {
-            while self.0.load(Ordering::Acquire) != 2 {
-                core::hint::spin_loop();
+        use core::sync::atomic::{AtomicU8, Ordering};
+        /// Puts the flag back to unset unless forgotten after `f` returns.
+        struct Reset<'flag>(&'flag AtomicU8);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(0, Ordering::Release);
+            }
+        }
+        loop {
+            match self.0.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire) {
+                Ok(_) => {
+                    let reset = Reset(&self.0);
+                    f();
+                    core::mem::forget(reset);
+                    self.0.store(2, Ordering::Release);
+                    return;
+                }
+                Err(2) => return,
+                Err(_) => {
+                    while self.0.load(Ordering::Acquire) == 1 {
+                        core::hint::spin_loop();
+                    }
+                }
             }
         }
     }
@@ -171,6 +213,11 @@ mod aarch64;
 pub use aarch64::{TrapFrame, VectorKind, install};
 
 #[cfg(all(bare, target_arch = "x86_64"))]
+mod x86_64;
+// Hosted x86_64 test builds compile the x86_64 frame (without its entry stubs
+// or IDT) so its decoding is unit-tested; the hosted `TrapFrame` stays `host`'s.
+#[cfg(all(test, not(bare), target_arch = "x86_64"))]
+#[allow(dead_code, clippy::wrong_self_convention)] // `from_user` names the trap's origin, as on every frame.
 mod x86_64;
 #[cfg(all(bare, target_arch = "x86_64"))]
 pub use x86_64::{SYSCALL_VECTOR, TrapFrame, allow_from_user, install, set_ist};
@@ -205,5 +252,22 @@ mod tests {
         assert_eq!(f.pc(), 0x1004);
         let f = simulate(Trap::Interrupt(Interrupt::Timer), 0x2000);
         assert_eq!(f.pc(), 0x2000);
+    }
+
+    #[test]
+    fn once_flag_runs_once_and_survives_an_unwinding_initializer() {
+        use core::sync::atomic::AtomicUsize;
+        static FLAG: OnceFlag = OnceFlag::new();
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        let r = std::panic::catch_unwind(|| FLAG.call_once(|| panic!("initializer failed")));
+        assert!(r.is_err());
+        // Without the reset this would spin forever; instead the next caller initializes.
+        FLAG.call_once(|| {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+        });
+        FLAG.call_once(|| {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(RUNS.load(Ordering::Relaxed), 1);
     }
 }

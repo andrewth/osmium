@@ -292,6 +292,43 @@ fn udp_is_fragmented_to_the_path_mtu() {
     assert!(narrow.longest.get() <= 1000);
 }
 
+/// Knowing which UDP port is bound is not enough to shrink the path MTU: the
+/// report has to quote the header of a datagram that was really sent.
+#[test]
+fn a_udp_report_must_quote_a_datagram_we_sent() {
+    let (mut a, _b) = pair();
+    let now = Instant::ZERO;
+    let a_mac = a.iface.mac_address();
+    let sent: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+    let log = sent.clone();
+    a.set_filter(move |_, f| {
+        log.borrow_mut().push(f.to_vec());
+        true
+    });
+    let tx = a.sockets.add(UdpSocket::new(4, 4));
+    a.sockets.get_mut::<UdpSocket>(tx).bind(5000).unwrap();
+    // B's address is resolved first, so the datagram goes out at once.
+    a.iface.arp.insert(B_IP, MacAddress([2, 0, 0, 0, 0, 2]), now, None);
+    a.sockets.get_mut::<UdpSocket>(tx).send_to(&[7; 1400], sa(B_IP, 6000)).unwrap();
+    a.poll(now);
+    let frame = sent.borrow().iter().find(|f| f.len() > 1400).cloned().expect("the datagram");
+    let real = frame[ETH_HEADER_LEN..ETH_HEADER_LEN + 28].to_vec();
+    assert_eq!((real[9], be16(&real, 20), be16(&real, 22)), (PROTO_UDP, 5000, 6000));
+    let send = |a: &mut Host, quote: &[u8]| {
+        a.inject(frag_needed(a_mac, A_IP, quote, 1000));
+        a.poll(now);
+        a.iface.path_mtu(B_IP.into(), now)
+    };
+    // The right ports and length with a guessed checksum, a datagram to a
+    // port nothing was sent to, and one of another length.
+    for (at, flip) in [(26, 0x01), (23, 0x01), (25, 0x10)] {
+        let mut forged = real.clone();
+        forged[at] ^= flip;
+        assert_eq!(send(&mut a, &forged), 1500, "byte {at} changed");
+    }
+    assert_eq!(send(&mut a, &real), 1000, "the real datagram's header is believed");
+}
+
 #[test]
 fn ipv6_packet_too_big_shrinks_tcp() {
     let (mut a, mut b, mut now) = pair6();

@@ -30,7 +30,7 @@ impl<A: KeyAdapter<TreeLink>> RbTree<A> {
     ///
     /// `value` must stay valid and must not move until it is removed from the
     /// tree or the tree is dropped or cleared. Its key must not change while
-    /// it is linked.
+    /// it is linked, except as [`KeyAdapter::key`] allows.
     ///
     /// # Panics
     ///

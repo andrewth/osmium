@@ -9,7 +9,7 @@ use osmium_sync::IrqSpinLock;
 
 use crate::core_sched::{block_current, current, wake};
 use crate::queue::TaskList;
-use crate::task::TaskState;
+use crate::task::{Task, TaskState};
 
 /// A queue of tasks waiting for a condition.
 ///
@@ -53,6 +53,15 @@ impl WaitQueue {
                 return true;
             }
         }
+    }
+
+    /// Wakes `task` if it waits in this queue, leaving the other waiters
+    /// asleep: for a waker that knows whom its news concerns. Returns false
+    /// if `task` was not waiting here. Costs a walk of the queue, not a
+    /// wake-up of everyone in it.
+    pub fn wake_task(&self, task: &Task) -> bool {
+        let found = self.waiters.lock().remove_first_where(|t| core::ptr::eq(t, task));
+        found.is_some_and(wake)
     }
 
     /// Wakes every waiting task; returns how many were woken.

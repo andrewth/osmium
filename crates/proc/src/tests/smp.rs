@@ -18,10 +18,24 @@ static WATCHED: StdMutex<Option<&'static HeapFrames>> = StdMutex::new(None);
 /// One test at a time owns the marked page and the log.
 static SERIAL: StdMutex<()> = StdMutex::new(());
 
-fn install() {
+/// Every shootdown sent with interrupts masked, `(start, pages)`: the target
+/// CPUs may be spinning, interrupts masked, on a lock the sender holds, and
+/// never acknowledge it.
+pub(super) static MASKED: StdMutex<Vec<(usize, usize)>> = StdMutex::new(Vec::new());
+
+/// Whether a shootdown with interrupts masked covered the page at `va`.
+pub(super) fn masked_flush_of(va: u64) -> bool {
+    let va = va as usize;
+    MASKED.lock().unwrap().iter().any(|&(start, pages)| (start..start + pages * 0x1000).contains(&va))
+}
+
+pub(super) fn install() {
     static ONCE: StdOnce = StdOnce::new();
     ONCE.call_once(|| {
         osmium_arch::mmu::set_remote_flush(|start, pages| {
+            if !osmium_arch::irq::are_enabled() {
+                MASKED.lock().unwrap().push((start, pages));
+            }
             let mark = MARK as usize;
             if (start..start + pages * 0x1000).contains(&mark) {
                 let live = WATCHED.lock().unwrap().map_or(0, |f| f.live());
@@ -127,4 +141,59 @@ fn threads_on_many_cpus_map_unmap_and_fault_together() {
     }
     drop(p);
     assert_eq!(frames.live(), 1, "only the kernel table is left: no frame was leaked or freed twice");
+}
+
+/// Runs `f` on a host thread that plays CPU `cpu`.
+fn on_cpu(cpu: usize, f: impl FnOnce() + Send) {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // SAFETY: no other thread plays this CPU: each test that does picks its own.
+            unsafe { osmium_arch::cpu::set_current_id(cpu) };
+            f();
+        })
+        .join()
+        .unwrap();
+    });
+}
+
+#[test]
+fn exec_keeps_the_old_tables_while_another_cpu_may_walk_them() {
+    use crate::process::UserTask;
+    platform();
+    let (p, frames) = process("smp-exec");
+    let main = p.leader();
+    let Outcome::Thread { tid, .. } =
+        sigthread::clone_thread(&p, &main, sigthread::clone_flags(), sigthread::STACK, DATA + 0x10, DATA + 0x20, 0)
+    else {
+        panic!("no thread")
+    };
+    let other = p.group.find(tid).unwrap();
+    let task = osmium_sched::TaskBuilder::new("other")
+        .data(UserTask { process: p.clone(), thread: other.clone() })
+        .build(|| {});
+    // CPU 7 switches to the other thread, so it loads the process's table.
+    const CPU: usize = 7;
+    on_cpu(CPU, || assert_eq!(crate::root_for(&task), Some(p.root())));
+    assert!(crate::active::holds(CPU, &p.memory()));
+
+    // The thread ends, as a doomed one does when `execve` ends it: it says
+    // it is gone, but its CPU has not switched away yet. The exec goes ahead.
+    crate::thread::exit_thread(&p, &other, ExitStatus::Code(0));
+    let live = frames.live();
+    put(&p, DATA, b"/bin/prog\0");
+    let Outcome::Exec { .. } = dispatch(&p, Sys::Execve.number(), [DATA, 0, 0, 0, 0, 0]) else { panic!("no exec") };
+    assert_eq!(frames.live(), live, "CPU 7 may still walk the old tables, so they are not freed");
+
+    // CPU 7 switches to a kernel task: the hook loads the kernel's table, but
+    // until it returns the old one may still be in the register.
+    let kernel = osmium_sched::TaskBuilder::new("kernel").build(|| {});
+    let other_kernel = osmium_sched::TaskBuilder::new("kernel-2").build(|| {});
+    let kernel_root = osmium_mm::addr::PhysAddr::new(0x1000);
+    on_cpu(CPU, || assert_eq!(crate::switch_root(&kernel, kernel_root), kernel_root));
+    assert_eq!(frames.live(), live, "held until the next switch");
+    on_cpu(CPU, || {
+        crate::switch_root(&other_kernel, kernel_root);
+    });
+    assert_eq!(frames.live(), 1, "freed once no CPU can have it loaded; only the leaked kernel root remains");
+    drop(task);
 }

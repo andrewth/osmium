@@ -29,6 +29,7 @@
 //! Generated files report size 0, as the files of `/proc` do: the length is
 //! not known until the contents are, and they may differ at the next read.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -52,51 +53,70 @@ type ReadAtFn = Arc<dyn Fn(u64, &mut [u8]) -> Result<usize, Errno> + Send + Sync
 enum Body {
     File(GenFn, Option<WriteFn>),
     Dir(ListFn, Option<NameFn>, Option<NameFn>),
-    Link(String),
+    Link(Cow<'static, str>),
     Binary(ReadAtFn),
     /// An existing node, spliced into the tree as it is.
     Node(Arc<dyn File>),
 }
 
 /// An entry of a synthetic directory: a name and what it is.
+///
+/// Names and link targets are [`Cow`]s: a `&'static str` is used as it is
+/// and a `String` is moved in, so they cost no allocation here (a directory
+/// function that makes names can make them with
+/// [`try_string`] and return `ENOMEM`).
+/// The functions of a file or directory entry are put in an `Arc`, which,
+/// like the `Vec` a directory function returns, is allocated infallibly: a
+/// directory function runs on every lookup and listing, so running out of
+/// memory there aborts. Everything else (copying names and contents out,
+/// making nodes) fails with `ENOMEM`.
 pub struct Entry {
-    name: String,
+    name: Cow<'static, str>,
     perm: Option<u32>,
     body: Body,
 }
 
 impl Entry {
-    fn new(name: impl Into<String>, body: Body) -> Self {
+    fn new(name: impl Into<Cow<'static, str>>, body: Body) -> Self {
         Entry { name: name.into(), perm: None, body }
     }
 
     /// A file whose contents are the bytes `f` returns each time it is read
     /// from offset 0. Permission bits `0o444` unless [`Entry::on_write`] or
     /// [`Entry::mode`] says otherwise.
-    pub fn file(name: impl Into<String>, f: impl Fn() -> Result<Vec<u8>, Errno> + Send + Sync + 'static) -> Self {
+    pub fn file(
+        name: impl Into<Cow<'static, str>>,
+        f: impl Fn() -> Result<Vec<u8>, Errno> + Send + Sync + 'static,
+    ) -> Self {
         Self::new(name, Body::File(Arc::new(f), None))
     }
 
     /// [`Entry::file`] for text.
-    pub fn text(name: impl Into<String>, f: impl Fn() -> Result<String, Errno> + Send + Sync + 'static) -> Self {
+    pub fn text(
+        name: impl Into<Cow<'static, str>>,
+        f: impl Fn() -> Result<String, Errno> + Send + Sync + 'static,
+    ) -> Self {
         Self::file(name, move || Ok(f()?.into_bytes()))
     }
 
     /// A directory whose entries are those `f` returns each time it is
     /// searched or listed. Permission bits `0o555`.
-    pub fn dir(name: impl Into<String>, f: impl Fn() -> Result<Vec<Entry>, Errno> + Send + Sync + 'static) -> Self {
+    pub fn dir(
+        name: impl Into<Cow<'static, str>>,
+        f: impl Fn() -> Result<Vec<Entry>, Errno> + Send + Sync + 'static,
+    ) -> Self {
         Self::new(name, Body::Dir(Arc::new(f), None, None))
     }
 
     /// A symbolic link to `target`.
-    pub fn link(name: impl Into<String>, target: impl Into<String>) -> Self {
+    pub fn link(name: impl Into<Cow<'static, str>>, target: impl Into<Cow<'static, str>>) -> Self {
         Self::new(name, Body::Link(target.into()))
     }
 
     /// A binary file read in place: `f(offset, buf)` fills `buf` and returns
     /// the bytes read (0 at the end). There is no snapshot, and the size is 0.
     pub fn binary(
-        name: impl Into<String>,
+        name: impl Into<Cow<'static, str>>,
         f: impl Fn(u64, &mut [u8]) -> Result<usize, Errno> + Send + Sync + 'static,
     ) -> Self {
         Self::new(name, Body::Binary(Arc::new(f)))
@@ -104,7 +124,7 @@ impl Entry {
 
     /// An existing node under `name`, reached as it is: reads, writes and
     /// everything else go to it, and `stat` is its own.
-    pub fn node(name: impl Into<String>, node: Arc<dyn File>) -> Self {
+    pub fn node(name: impl Into<Cow<'static, str>>, node: Arc<dyn File>) -> Self {
         Self::new(name, Body::Node(node))
     }
 
@@ -191,7 +211,7 @@ enum NodeBody {
     /// The snapshot is what the last read from offset 0 generated.
     File(GenFn, Option<WriteFn>, SpinLock<Option<Vec<u8>>>),
     Dir(ListFn, Option<NameFn>, Option<NameFn>),
-    Link(String),
+    Link(Cow<'static, str>),
     Binary(ReadAtFn),
 }
 
@@ -324,7 +344,11 @@ impl File for SynthNode {
             Body::Node(node) => node.stat().ino,
             _ => child_ino(self.ino, &entry.name),
         };
-        Ok(Some(DirEntry { ino, kind, name: entry.name }))
+        let name = match entry.name {
+            Cow::Owned(name) => name,
+            Cow::Borrowed(name) => try_string(name)?,
+        };
+        Ok(Some(DirEntry { ino, kind, name }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {

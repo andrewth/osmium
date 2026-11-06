@@ -19,8 +19,8 @@
 //! }
 //!
 //! fn on_switch(next: &Task) {
-//!     let root = osmium_proc::root_for(next).unwrap_or(KERNEL_ROOT);
-//!     // ... load satp / TTBR0 / CR3 with `root` ...
+//!     let root = osmium_proc::switch_root(next, KERNEL_ROOT);
+//!     // ... load satp / TTBR0 / CR3 with `root`, flushing the TLB ...
 //! }
 //!
 //! fn spawn(image: &[u8]) -> Arc<Task> {
@@ -42,8 +42,10 @@
 //! - Copies to and from user memory walk the process's own page table and
 //!   go through the frame allocator's physical mapping, so the kernel needs
 //!   no SUM, PAN or SMAP handling for system calls.
-//! - A process is freed when its task has exited and its CPU has switched
-//!   away; until then its address space may still be active.
+//! - Call [`switch_root`] (or [`root_for`]) in the scheduler's switch hook
+//!   and load the root it returns: an address space is freed only once no
+//!   CPU may still have it loaded, even after `execve` replaced it while
+//!   another thread was still in the kernel on another CPU.
 //!
 //! - [`set_platform`] enables `fork` and `execve`: it tells them how to make
 //!   and activate address spaces, how to resume a forked child in user mode
@@ -60,20 +62,23 @@
 //! [`thread`]), and [`signal`] delivers signals to user handlers. Forked
 //! memory is shared copy-on-write: a trap handler passes user write faults to
 //! [`handle_page_fault`] before raising a signal, and copies to user memory
-//! break the sharing themselves. `execve` loads static, non-PIE ELF
-//! executables only.
+//! break the sharing themselves. `execve` loads static executables, static
+//! position-independent ones (which it relocates itself), and dynamically
+//! linked ones, whose `PT_INTERP` interpreter it loads beside them.
 #![no_std]
 
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod active;
 mod bytes;
 mod epoll;
 mod exec;
 pub mod fd;
 pub mod futex;
 mod futex_pi;
+mod jobctl;
 mod memory;
 mod mmap;
 pub mod net;
@@ -83,7 +88,6 @@ mod process;
 mod reloc;
 mod restart;
 mod scm;
-mod jobctl;
 pub mod signal;
 mod sigqueue;
 pub mod socket;
@@ -95,8 +99,8 @@ mod uregs;
 
 pub use exec::{ARG_MAX, INTERP_OFFSET, Platform, UserEntry, set_platform};
 pub use fd::{FdTable, OpenFile, set_console};
-pub use memory::{AddressSpace, FileMapping, UserMemory};
-pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for};
+pub use memory::{AddressSpace, FileMapping, UserMemory, WordAt};
+pub use process::{ExitStatus, Pid, Process, current, exit, handle_page_fault, root_for, switch_root};
 pub use syscall::{Outcome, Sys, dispatch, dispatch_as};
 pub use thread::Thread;
 pub use unix::{MAX_IN_FLIGHT, UnixSocket, in_flight};

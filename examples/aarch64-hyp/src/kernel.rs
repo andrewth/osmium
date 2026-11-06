@@ -77,7 +77,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
                 crate::mask_vtimer(level);
             }
         });
-        vm.cpus.attach_arm(me, &mut vcpu);
+        vm.cpus.attach(me, &mut vcpu);
         let mut stopped = false;
         let exit = run_vcpu(&mut vcpu, bus, &pio, |v, exit| match exit {
             VmExit::Hypercall { .. } => match vm::psci::handle_smp(v, exit, Some((&vm.cpus, me))) {

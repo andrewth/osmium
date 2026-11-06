@@ -13,7 +13,10 @@
 //! chooses ([`Elf::load_into_at`], [`Elf::segments_at`]); [`Elf::interp`]
 //! names the program interpreter of a dynamically linked one, and
 //! [`Elf::dynamic`] reads the relocation tables a loader has to apply. Every
-//! field is untrusted: offsets, sizes and addresses are checked arithmetic.
+//! field is untrusted: offsets, sizes and addresses are checked arithmetic,
+//! and [`Elf::load_into`] bounds the memory an image may take
+//! ([`DEFAULT_MAX_MEMORY`], or the caller's choice with
+//! [`Elf::load_into_limited`]).
 
 use osmium_mm::frame::OwnedFrame;
 use osmium_mm::paging::{MapError, MapFlags, PageTable, PageTableFormat, TableAlloc};
@@ -90,6 +93,11 @@ const PT_INTERP: u32 = 3;
 const INTERP_MAX: usize = 4096;
 /// Most `PT_DYNAMIC` entries read.
 const DYNAMIC_MAX: usize = 4096;
+
+/// How much memory [`Elf::load_into`] and [`Elf::load_into_at`] let an image take: 1 GiB. The image chooses
+/// its segments' memory sizes, so without a bound a hostile one could take every free frame.
+/// [`Elf::load_into_limited`] takes a different bound.
+pub const DEFAULT_MAX_MEMORY: u64 = 1 << 30;
 
 /// What the `PT_DYNAMIC` segment says about relocation, as virtual
 /// addresses and sizes in the image (before any load bias).
@@ -209,6 +217,9 @@ impl<'src> Elf<'src> {
     ///
     /// Relocations are not applied. On error, pages mapped so far stay mapped; drop the table.
     ///
+    /// An image whose segments would take more than [`DEFAULT_MAX_MEMORY`] is refused with
+    /// [`MapError::OutOfMemory`] before any page is mapped; see [`load_into_limited`](Self::load_into_limited).
+    ///
     /// Every page the image touches is mapped by this call: a page that is
     /// already mapped (other than by an earlier segment of this image) is
     /// [`MapError::AlreadyMapped`], and [`PageTable::map`] refuses the root
@@ -232,6 +243,20 @@ impl<'src> Elf<'src> {
         pt: &mut PageTable<F, A>,
         extra: MapFlags,
         bias: u64,
+        alloc_frame: impl FnMut() -> Option<OwnedFrame<A>>,
+    ) -> Result<(), MapError> {
+        self.load_into_limited(pt, extra, bias, DEFAULT_MAX_MEMORY, alloc_frame)
+    }
+
+    /// Like [`load_into_at`](Self::load_into_at), refusing with [`MapError::OutOfMemory`] (before mapping
+    /// anything) an image whose segments cover more than `max_memory` bytes of pages. A page two segments
+    /// share counts twice, so the bound is slightly conservative.
+    pub fn load_into_limited<F: PageTableFormat, A: TableAlloc>(
+        &self,
+        pt: &mut PageTable<F, A>,
+        extra: MapFlags,
+        bias: u64,
+        max_memory: u64,
         mut alloc_frame: impl FnMut() -> Option<OwnedFrame<A>>,
     ) -> Result<(), MapError> {
         self.span_at(bias).ok_or(MapError::InvalidAddress)?;
@@ -246,6 +271,14 @@ impl<'src> Elf<'src> {
             let end = s.vaddr.checked_add(s.mem_size)?.checked_next_multiple_of(page)?;
             Some(s.vaddr & !(page - 1)..end)
         };
+        let mut total = 0u64;
+        for seg in self.segments_at(bias) {
+            let span = pages(&seg).ok_or(MapError::InvalidAddress)?;
+            total = total.saturating_add(span.end - span.start);
+        }
+        if total > max_memory {
+            return Err(MapError::OutOfMemory);
+        }
         for (i, seg) in self.segments_at(bias).enumerate() {
             let mut flags = extra | MapFlags::READ;
             if seg.flags.write {
@@ -302,6 +335,13 @@ impl<'src> Elf<'src> {
     /// as the file gives it.
     pub fn segments_at(&self, bias: u64) -> impl Iterator<Item = Segment<'src>> + use<'src> {
         self.segments().filter_map(move |s| Some(Segment { vaddr: s.vaddr.checked_add(bias)?, ..s }))
+    }
+
+    /// The bytes of memory the loadable segments ask for (the sum of their memory sizes, saturating). A
+    /// loader that places the image itself, rather than through [`load_into`](Self::load_into), can bound
+    /// this before it starts.
+    pub fn memory_size(&self) -> u64 {
+        self.segments().fold(0, |a, s| a.saturating_add(s.mem_size))
     }
 
     /// The page-aligned addresses the non-empty segments cover when loaded
@@ -699,6 +739,58 @@ mod tests {
             elf.load_into_at(&mut pt, MapFlags::USER, u64::MAX - 0xfff, || OwnedFrame::claim(&Host, page())),
             Err(MapError::InvalidAddress)
         );
+    }
+
+    #[test]
+    fn an_image_larger_than_the_cap_is_refused_before_anything_is_mapped() {
+        use osmium_mm::paging::formats::X86_64;
+        use osmium_mm::{PhysMapper, paging::TableAlloc};
+        use std::alloc::{Layout, alloc_zeroed};
+        use std::cell::Cell;
+
+        struct Host;
+        // SAFETY: host addresses are directly dereferenceable.
+        unsafe impl PhysMapper for Host {
+            fn phys_to_virt(&self, pa: PhysAddr) -> *mut u8 {
+                pa.0 as *mut u8
+            }
+        }
+        fn page() -> PhysAddr {
+            // SAFETY: non-zero size; leaked for the test's duration.
+            PhysAddr::new(unsafe { alloc_zeroed(Layout::from_size_align(4096, 4096).unwrap()) } as u64)
+        }
+        // SAFETY: fresh, exclusive, page-aligned host pages.
+        unsafe impl TableAlloc for Host {
+            fn alloc_table(&self) -> Option<PhysAddr> {
+                Some(page())
+            }
+            unsafe fn free_table(&self, _: PhysAddr) {}
+            fn claim_frame(&self, _: PhysAddr) -> bool {
+                true
+            }
+        }
+        // A .bss of 2 GiB: a few bytes of file asking for half a million frames.
+        let mut f = sample();
+        f[120 + 40..120 + 48].copy_from_slice(&(2u64 << 30).to_le_bytes());
+        let elf = Elf::new(&f).unwrap();
+        assert_eq!(elf.memory_size(), 4 + (2 << 30));
+        let frames = Cell::new(0);
+        let mut alloc = || {
+            frames.set(frames.get() + 1);
+            OwnedFrame::claim(&Host, page())
+        };
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&Host).unwrap();
+        assert_eq!(elf.load_into(&mut pt, MapFlags::USER, &mut alloc), Err(MapError::OutOfMemory));
+        assert_eq!(frames.get(), 0, "refused before taking a frame");
+        assert!(pt.translate(VirtAddr::new(0x40_1000)).is_none());
+        // A caller-chosen cap: the sample's two pages fit in two pages, not in one.
+        let g = sample();
+        let small = Elf::new(&g).unwrap();
+        let mut pt: PageTable<X86_64, &Host> = PageTable::new_owned(&Host).unwrap();
+        assert_eq!(small.load_into_limited(&mut pt, MapFlags::USER, 0, 4096, &mut alloc), Err(MapError::OutOfMemory));
+        assert_eq!(frames.get(), 0);
+        small.load_into_limited(&mut pt, MapFlags::USER, 0, 2 * 4096, &mut alloc).unwrap();
+        assert_eq!(frames.get(), 2);
     }
 
     #[test]

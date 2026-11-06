@@ -596,3 +596,98 @@ fn stage2_flush_is_requested() {
     v.flush_stage2();
     assert!(v.flush);
 }
+
+/// MMIO from 32-bit and PAE guest code: the instruction is fetched through
+/// the guest's legacy page tables (it used to be refused outright).
+#[test]
+fn legacy_paging_is_walked() {
+    let (ram, mem) = crate::x86::tests::ram(0x10000);
+    crate::x86::tests::legacy_tables(&mem);
+    // mov %al, (%ebx) at linear 0x3000 (32-bit paging: physical 0x7000).
+    mem.write(GuestPhysAddr(0x7000), &[0x88, 0x03]).unwrap();
+    let mut v = vcpu().with_memory(Arc::new(mem));
+    v.write(vmcs::GUEST_CR0, 0x8000_0031);
+    v.write(vmcs::CR0_SHADOW, 0x8000_0011);
+    v.write(vmcs::GUEST_CR3, 0x1000);
+    assert_eq!(v.translate(0x3abc), Some(0x7abc), "32-bit paging");
+    v.write(vmcs::GUEST_RIP, 0x3000);
+    v.regs.rax = 0x4d;
+    exit_with(&mut v, exit::EPT_VIOLATION, 0b10, 0);
+    v.write(vmcs::GUEST_PHYS_ADDR, 0xfed0_0000);
+    assert_eq!(v.classify(), VmExit::MmioWrite { addr: GuestPhysAddr(0xfed0_0000), size: 1, data: 0x4d });
+    // PAE: the walk starts from the PDPTEs the VMCS holds.
+    v.write(vmcs::GUEST_CR4, v.read(vmcs::GUEST_CR4) | 1 << 5);
+    v.write(vmcs::CR4_SHADOW, 1 << 5);
+    v.write(vmcs::GUEST_CR3, 0x3000);
+    assert_eq!(v.translate(0x4000_2abc), None, "PDPTE 1 is not cached yet");
+    v.write(vmcs::GUEST_PDPTE0 + 2, 0x4001);
+    assert_eq!(v.translate(0x4000_2abc), Some(0x8abc));
+    drop(v);
+    drop(ram);
+}
+
+#[test]
+fn ept_violation_on_guest_ram_is_not_mmio() {
+    let (ram, mem) = crate::x86::tests::ram(0x20_0000);
+    mem.write(GuestPhysAddr(0x10_0000), &[0x88, 0x03]).unwrap();
+    let mut v = vcpu().with_memory(Arc::new(mem));
+    exit_with(&mut v, exit::EPT_VIOLATION, 0b10, 0);
+    v.write(vmcs::GUEST_PHYS_ADDR, 0x1_5000);
+    assert_eq!(v.classify(), VmExit::Unhandled { reason: exit::EPT_VIOLATION as u64 });
+    assert_eq!(v.rip(), 0x10_0000);
+    v.write(vmcs::GUEST_PHYS_ADDR, 0xfed0_0000);
+    assert!(matches!(v.classify(), VmExit::MmioWrite { .. }));
+    drop(v);
+    drop(ram);
+}
+
+/// MOV to and from CR8 reach the local APIC's task priority, which decides
+/// what the next entry injects.
+#[test]
+fn cr8_is_the_apic_task_priority() {
+    use crate::bus::BusDevice;
+    use crate::devices::VirtualLapic;
+    let mut v = vcpu();
+    v.set_long_mode(0x1000);
+    let line = v.irq_line();
+    let l = line.clone();
+    let apic = Arc::new(VirtualLapic::new(0, 1_000_000, || 0, move |lvl| l.store(lvl, Ordering::SeqCst)));
+    apic.write(0xf0, &0x1ffu32.to_le_bytes());
+    v.connect_lapic(apic.clone());
+    v.write(vmcs::GUEST_RFLAGS, 2 | RFLAGS_IF);
+    apic.deliver(0x52);
+    // mov %rax, %cr8 with rax = 6.
+    v.regs.rax = 6;
+    exit_with(&mut v, exit::CR_ACCESS, 8, 4);
+    assert!(v.emulate_cr());
+    assert_eq!(apic.tpr(), 0x60);
+    assert!(!line.load(Ordering::SeqCst), "0x52 is held back");
+    v.prepare_entry();
+    assert_eq!(v.read(vmcs::ENTRY_INTR_INFO), 0);
+    // mov %cr8, %rbx reads the APIC's priority (here set through MMIO).
+    apic.write(0x80, &0x30u32.to_le_bytes());
+    exit_with(&mut v, exit::CR_ACCESS, 8 | 1 << 4 | 3 << 8, 4);
+    assert!(v.emulate_cr());
+    assert_eq!(v.regs.rbx, 3);
+    assert!(line.load(Ordering::SeqCst), "lowered below class 5");
+    v.prepare_entry();
+    assert_eq!(v.read(vmcs::ENTRY_INTR_INFO), 0x52 | EVENT_VALID);
+}
+
+/// Every field a vCPU can have written survives an unbind: `carried_fields`
+/// lists them all (the host-state fields, type 3, are rewritten every run).
+#[test]
+fn unbind_carries_every_written_field() {
+    let mut v = vcpu();
+    v.set_long_mode(0x1000);
+    v.set_real_mode(8);
+    v.set_debug_registers([1, 2, 3, 4], 0, 0x3);
+    for msr in [0xc000_0080u32, 0x174, 0x175, 0x176, 0x277, 0xc000_0100, 0xc000_0101] {
+        wrmsr(&mut v, msr, 0);
+    }
+    v.prepare_entry();
+    let carried: alloc::collections::BTreeSet<u32> = carried_fields().collect();
+    for f in v.vmcs.pending.keys() {
+        assert!(f >> 10 & 3 == 3 || carried.contains(f), "field {f:#06x} would be lost");
+    }
+}

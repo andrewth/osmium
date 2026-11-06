@@ -1,10 +1,21 @@
 //! The virtio-mmio transport, version 2 (virtio 1.x §4.2), as a [`BusDevice`].
+//!
+//! # Locking
+//!
+//! The transport registers (status, feature selection, interrupt status)
+//! sit behind an [`IrqSpinLock`] that is held only for register updates. The
+//! device and its queues sit behind a second lock that never masks
+//! interrupts, so a device's work (a disk read, a frame handed to a NIC
+//! backend) runs with the host's interrupts as the caller had them, and
+//! a backend may wait for its own interrupt or block. A notify that finds
+//! the device busy on another CPU does not wait: it leaves a request that the
+//! busy context serves before it lets go of the device.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use osmium_sync::IrqSpinLock;
+use osmium_sync::{IrqSpinLock, RawSpinLock, SpinLockGuard};
 
 use super::queue::{DescChain, QueueError, SplitQueue};
 use osmium_hal::virtio::feature::VERSION_1;
@@ -69,9 +80,8 @@ impl<'ctx> DeviceCtx<'ctx> {
     }
 }
 
-struct Inner<D> {
-    device: D,
-    queues: Vec<SplitQueue>,
+/// The transport's own registers.
+struct Regs {
     status: u32,
     device_features_sel: u32,
     driver_features_sel: u32,
@@ -79,26 +89,48 @@ struct Inner<D> {
     queue_sel: u32,
     interrupt_status: u32,
     config_generation: u32,
+    /// Queues (bit `q`) notified while another context held the device,
+    /// which that context serves before it lets the device go.
+    pending: u64,
 }
+
+/// The device and its queues.
+struct Work<D> {
+    device: D,
+    queues: Vec<SplitQueue>,
+}
+
+type WorkGuard<'a, D> = SpinLockGuard<'a, Work<D>, osmium_sync::NoGuard>;
 
 /// A virtio device behind a virtio-mmio register window. Place it on the
 /// MMIO [`Bus`](crate::Bus) with length [`MMIO_SIZE`].
 ///
 /// `irq` is called with the new level of the device's interrupt line
-/// whenever it changes.
+/// whenever it changes, with local interrupts masked.
+///
+/// The device's work runs without interrupts masked (see the module
+/// documentation). The lock order is the device's, then the registers';
+/// [`with_device`](Self::with_device) waits for a device another context
+/// is using, so do not call it from an interrupt handler.
 pub struct VirtioMmio<D> {
-    inner: IrqSpinLock<Inner<D>>,
+    regs: IrqSpinLock<Regs>,
+    work: RawSpinLock<Work<D>>,
     mem: Arc<GuestMemory>,
     irq: Box<dyn Fn(bool) + Send + Sync>,
+    /// The device's identity and geometry, which do not change.
+    device_id: u32,
+    features: u64,
+    queue_max: u16,
+    num_queues: usize,
 }
 
 impl<D: VirtioDevice> VirtioMmio<D> {
     /// Wraps `device`, which accesses the guest through `mem`.
     pub fn new(device: D, mem: Arc<GuestMemory>, irq: impl Fn(bool) + Send + Sync + 'static) -> Self {
-        let queues = (0..device.num_queues()).map(|_| SplitQueue::new(device.queue_max_size())).collect();
-        let inner = Inner {
-            device,
-            queues,
+        let (device_id, features, queue_max, num_queues) =
+            (device.device_id(), device.features() | VERSION_1, device.queue_max_size(), device.num_queues());
+        let queues = (0..num_queues).map(|_| SplitQueue::new(queue_max)).collect();
+        let regs = Regs {
             status: 0,
             device_features_sel: 0,
             driver_features_sel: 0,
@@ -106,37 +138,49 @@ impl<D: VirtioDevice> VirtioMmio<D> {
             queue_sel: 0,
             interrupt_status: 0,
             config_generation: 0,
+            pending: 0,
         };
-        Self { inner: IrqSpinLock::new(inner), mem, irq: Box::new(irq) }
+        Self {
+            regs: IrqSpinLock::new(regs),
+            work: RawSpinLock::new(Work { device, queues }),
+            mem,
+            irq: Box::new(irq),
+            device_id,
+            features,
+            queue_max,
+            num_queues,
+        }
     }
 
     /// Runs `f` on the device with access to its queues, for host-side
     /// events such as input arriving. Raises the interrupt if `f` used a
-    /// buffer.
+    /// buffer. Waits while another context uses the device (a guest notify
+    /// on another CPU), so it must not be called from an interrupt handler.
     pub fn with_device<R>(&self, f: impl FnOnce(&mut D, &mut DeviceCtx<'_>) -> R) -> R {
-        let mut s = self.inner.lock();
-        let s = &mut *s;
-        let mut ctx = DeviceCtx::new(&mut s.queues, &self.mem);
-        let r = f(&mut s.device, &mut ctx);
+        let mut w = self.work.lock();
+        let w2 = &mut *w;
+        let mut ctx = DeviceCtx::new(&mut w2.queues, &self.mem);
+        let r = f(&mut w2.device, &mut ctx);
         if ctx.interrupt {
-            self.raise(s, USED_BUFFER);
+            self.raise(&mut self.regs.lock(), USED_BUFFER);
         }
+        self.release(w);
         r
     }
 
     /// Tells the driver the device's config space changed.
     pub fn config_changed(&self) {
-        let mut s = self.inner.lock();
+        let mut s = self.regs.lock();
         s.config_generation = s.config_generation.wrapping_add(1);
         self.raise(&mut s, CONFIG_CHANGE);
     }
 
     /// Whether the interrupt line is asserted.
     pub fn irq_pending(&self) -> bool {
-        self.inner.lock().interrupt_status != 0
+        self.regs.lock().interrupt_status != 0
     }
 
-    fn raise(&self, s: &mut Inner<D>, bits: u32) {
+    fn raise(&self, s: &mut Regs, bits: u32) {
         let was = s.interrupt_status;
         s.interrupt_status |= bits;
         if was == 0 {
@@ -144,38 +188,92 @@ impl<D: VirtioDevice> VirtioMmio<D> {
         }
     }
 
-    fn reset(&self, s: &mut Inner<D>) {
-        s.device.reset();
-        let size = s.device.queue_max_size();
-        s.queues.iter_mut().for_each(|q| q.reset(size));
+    /// The driver notified `queue`: serve it now, or, if another context
+    /// holds the device, leave the request for it. Never waits.
+    fn notify(&self, queue: u32) {
+        {
+            let mut s = self.regs.lock();
+            if s.status & u32::from(status::DRIVER_OK) == 0 {
+                return;
+            }
+            // A queue the device does not have is ignored.
+            if (queue as usize) < self.num_queues.min(64) {
+                s.pending |= 1 << queue;
+            }
+        }
+        if let Some(w) = self.work.try_lock() {
+            self.release(w);
+        }
+    }
+
+    /// Lets go of the device, after serving the notifies that arrived while
+    /// it was held. The last check for them and the release happen under the
+    /// register lock, where a notifier records its request: either this
+    /// context sees the request, or the notifier finds the device free.
+    fn release(&self, mut w: WorkGuard<'_, D>) {
+        loop {
+            let bits = {
+                let mut s = self.regs.lock();
+                let bits = core::mem::take(&mut s.pending);
+                if bits == 0 || s.status & u32::from(status::DRIVER_OK) == 0 {
+                    drop(w);
+                    return;
+                }
+                bits
+            };
+            // Each round serves requests the guest made since the last one,
+            // each at most one budget's worth: the work is paid for by notifies.
+            let w2 = &mut *w;
+            let mut used = false;
+            for q in (0..64).filter(|q| bits & (1 << q) != 0) {
+                let mut ctx = DeviceCtx::new(&mut w2.queues, &self.mem);
+                w2.device.notify(q, &mut ctx);
+                used |= ctx.interrupt;
+            }
+            if used {
+                self.raise(&mut self.regs.lock(), USED_BUFFER);
+            }
+        }
+    }
+
+    /// Resets the device. Holds both locks.
+    fn reset(&self, w: &mut Work<D>, s: &mut Regs) {
+        w.device.reset();
+        w.queues.iter_mut().for_each(|q| q.reset(self.queue_max));
         s.status = 0;
         s.driver_features = 0;
         s.device_features_sel = 0;
         s.driver_features_sel = 0;
         s.queue_sel = 0;
+        s.pending = 0;
         if s.interrupt_status != 0 {
             s.interrupt_status = 0;
             (self.irq)(false);
         }
     }
 
-    fn read_reg(&self, s: &mut Inner<D>, offset: u64) -> u32 {
-        let q = s.queues.get(s.queue_sel as usize);
+    fn read_reg(&self, offset: u64) -> u32 {
+        if offset as usize == QUEUE_READY {
+            // The queues are the device's: lock it first.
+            let w = self.work.lock();
+            let sel = self.regs.lock().queue_sel as usize;
+            let ready = w.queues.get(sel).is_some_and(|q| q.ready);
+            self.release(w);
+            return ready as u32;
+        }
+        let s = self.regs.lock();
+        let queue_exists = (s.queue_sel as usize) < self.num_queues;
         match offset as usize {
             MAGIC_VALUE => MAGIC,
             VERSION => VERSION_MODERN,
-            DEVICE_ID => s.device.device_id(),
+            DEVICE_ID => self.device_id,
             VENDOR_ID => VENDOR,
-            DEVICE_FEATURES => {
-                let f = s.device.features() | VERSION_1;
-                match s.device_features_sel {
-                    0 => f as u32,
-                    1 => (f >> 32) as u32,
-                    _ => 0,
-                }
-            }
-            QUEUE_NUM_MAX => q.map_or(0, |_| s.device.queue_max_size() as u32),
-            QUEUE_READY => q.is_some_and(|q| q.ready) as u32,
+            DEVICE_FEATURES => match s.device_features_sel {
+                0 => self.features as u32,
+                1 => (self.features >> 32) as u32,
+                _ => 0,
+            },
+            QUEUE_NUM_MAX if queue_exists => self.queue_max as u32,
             INTERRUPT_STATUS => s.interrupt_status,
             STATUS => s.status,
             CONFIG_GENERATION => s.config_generation,
@@ -183,24 +281,51 @@ impl<D: VirtioDevice> VirtioMmio<D> {
         }
     }
 
-    fn write_reg(&self, s: &mut Inner<D>, offset: u64, v: u32) {
-        let sel = s.queue_sel as usize;
-        let max = s.device.queue_max_size();
-        let q = s.queues.get_mut(sel);
+    fn write_reg(&self, offset: u64, v: u32) {
+        match offset as usize {
+            QUEUE_NOTIFY => return self.notify(v),
+            DEVICE_FEATURES_SEL => return self.regs.lock().device_features_sel = v,
+            DRIVER_FEATURES_SEL => return self.regs.lock().driver_features_sel = v,
+            QUEUE_SEL => return self.regs.lock().queue_sel = v,
+            DRIVER_FEATURES => {
+                let mut s = self.regs.lock();
+                if s.status & u32::from(status::FEATURES_OK) == 0 {
+                    let shift = match s.driver_features_sel {
+                        0 => 0,
+                        1 => 32,
+                        _ => return,
+                    };
+                    s.driver_features = s.driver_features & !(0xffff_ffff << shift) | (v as u64) << shift;
+                }
+                return;
+            }
+            INTERRUPT_ACK => {
+                let mut s = self.regs.lock();
+                let was = s.interrupt_status;
+                s.interrupt_status &= !v;
+                if was != 0 && s.interrupt_status == 0 {
+                    (self.irq)(false);
+                }
+                return;
+            }
+            _ => {}
+        }
+        // The rest change the queues or the device: lock it first.
+        let mut w = self.work.lock();
+        {
+            let mut s = self.regs.lock();
+            self.write_work_reg(&mut w, &mut s, offset, v);
+        }
+        self.release(w);
+    }
+
+    /// The registers that reach the device or its queues, with both locks held.
+    fn write_work_reg(&self, w: &mut Work<D>, s: &mut Regs, offset: u64, v: u32) {
+        let max = self.queue_max;
         let set_lo = |a: &mut GuestPhysAddr| a.0 = a.0 & !0xffff_ffff | v as u64;
         let set_hi = |a: &mut GuestPhysAddr| a.0 = a.0 & 0xffff_ffff | (v as u64) << 32;
+        let q = w.queues.get_mut(s.queue_sel as usize);
         match (offset as usize, q) {
-            (DEVICE_FEATURES_SEL, _) => s.device_features_sel = v,
-            (DRIVER_FEATURES_SEL, _) => s.driver_features_sel = v,
-            (DRIVER_FEATURES, _) if s.status & u32::from(status::FEATURES_OK) == 0 => {
-                let shift = match s.driver_features_sel {
-                    0 => 0,
-                    1 => 32,
-                    _ => return,
-                };
-                s.driver_features = s.driver_features & !(0xffff_ffff << shift) | (v as u64) << shift;
-            }
-            (QUEUE_SEL, _) => s.queue_sel = v,
             (QUEUE_NUM, Some(q)) if !q.ready => q.size = (v as u16).min(max),
             (QUEUE_READY, Some(q)) => q.ready = v & 1 != 0,
             (QUEUE_DESC_LOW, Some(q)) if !q.ready => set_lo(&mut q.desc),
@@ -209,21 +334,7 @@ impl<D: VirtioDevice> VirtioMmio<D> {
             (QUEUE_DRIVER_HIGH, Some(q)) if !q.ready => set_hi(&mut q.avail),
             (QUEUE_DEVICE_LOW, Some(q)) if !q.ready => set_lo(&mut q.used),
             (QUEUE_DEVICE_HIGH, Some(q)) if !q.ready => set_hi(&mut q.used),
-            (QUEUE_NOTIFY, _) if s.status & u32::from(status::DRIVER_OK) != 0 => {
-                let mut ctx = DeviceCtx::new(&mut s.queues, &self.mem);
-                s.device.notify(v as usize, &mut ctx);
-                if ctx.interrupt {
-                    self.raise(s, USED_BUFFER);
-                }
-            }
-            (INTERRUPT_ACK, _) => {
-                let was = s.interrupt_status;
-                s.interrupt_status &= !v;
-                if was != 0 && s.interrupt_status == 0 {
-                    (self.irq)(false);
-                }
-            }
-            (STATUS, _) if v == 0 => self.reset(s),
+            (STATUS, _) if v == 0 => self.reset(w, s),
             (STATUS, _) => {
                 let mut v = v;
                 let bit = |b: u8| u32::from(b);
@@ -241,10 +352,9 @@ impl<D: VirtioDevice> VirtioMmio<D> {
                     v &= !bit(status::DRIVER_OK);
                 }
                 if v & u32::from(status::FEATURES_OK) != 0 && s.status & u32::from(status::FEATURES_OK) == 0 {
-                    let offered = s.device.features() | VERSION_1;
-                    let ok = s.driver_features & !offered == 0 && s.driver_features & VERSION_1 != 0;
+                    let ok = s.driver_features & !self.features == 0 && s.driver_features & VERSION_1 != 0;
                     if ok {
-                        s.device.ack_features(s.driver_features);
+                        w.device.ack_features(s.driver_features);
                     } else {
                         v &= !u32::from(status::FEATURES_OK);
                     }
@@ -258,12 +368,13 @@ impl<D: VirtioDevice> VirtioMmio<D> {
 
 impl<D: VirtioDevice> BusDevice for VirtioMmio<D> {
     fn read(&self, offset: u64, data: &mut [u8]) {
-        let mut s = self.inner.lock();
         if offset >= CONFIG as u64 {
-            s.device.read_config(offset - CONFIG as u64, data);
+            let w = self.work.lock();
+            w.device.read_config(offset - CONFIG as u64, data);
+            self.release(w);
             return;
         }
-        let v = self.read_reg(&mut s, offset & !3);
+        let v = self.read_reg(offset & !3);
         let b = v.to_le_bytes();
         let at = (offset & 3) as usize;
         for (i, d) in data.iter_mut().enumerate() {
@@ -272,9 +383,10 @@ impl<D: VirtioDevice> BusDevice for VirtioMmio<D> {
     }
 
     fn write(&self, offset: u64, data: &[u8]) {
-        let mut s = self.inner.lock();
         if offset >= CONFIG as u64 {
-            s.device.write_config(offset - CONFIG as u64, data);
+            let mut w = self.work.lock();
+            w.device.write_config(offset - CONFIG as u64, data);
+            self.release(w);
             return;
         }
         // Registers take aligned 32-bit writes only.
@@ -283,7 +395,7 @@ impl<D: VirtioDevice> BusDevice for VirtioMmio<D> {
             return;
         }
         let v = u32::from_le_bytes([a, b, c, d]);
-        self.write_reg(&mut s, offset, v);
+        self.write_reg(offset, v);
     }
 }
 
@@ -348,6 +460,58 @@ pub(crate) mod tests {
             data.fill(offset as u8);
         }
         fn notify(&mut self, _queue: usize, _ctx: &mut DeviceCtx<'_>) {}
+    }
+
+    /// Records each notify, whether interrupts were masked during it, and
+    /// can hold the first one until released.
+    struct Probe {
+        calls: Arc<std::sync::Mutex<Vec<(usize, bool)>>>,
+        entered: Arc<core::sync::atomic::AtomicBool>,
+        go: Arc<core::sync::atomic::AtomicBool>,
+    }
+    impl VirtioDevice for Probe {
+        fn device_id(&self) -> u32 {
+            42
+        }
+        fn num_queues(&self) -> usize {
+            2
+        }
+        fn notify(&mut self, queue: usize, _ctx: &mut DeviceCtx<'_>) {
+            use core::sync::atomic::Ordering::SeqCst;
+            self.calls.lock().unwrap().push((queue, osmium_arch::irq::are_enabled()));
+            if !self.entered.swap(true, SeqCst) {
+                while !self.go.load(SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// The device's work does not run with interrupts masked, and a notify
+    /// that finds the device busy on another CPU returns at once; the busy
+    /// context serves it.
+    #[test]
+    fn notify_runs_unmasked_and_never_waits_for_a_busy_device() {
+        use core::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (entered, go) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let probe = Probe { calls: calls.clone(), entered: entered.clone(), go: go.clone() };
+        let dev = Arc::new(VirtioMmio::new(probe, Arc::new(GuestMemory::new()), |_| {}));
+        bring_up(&dev, &[(0, 0), (1, 0)]);
+        let d = dev.clone();
+        let vcpu0 = std::thread::spawn(move || notify(&d, 0));
+        while !entered.load(SeqCst) {
+            std::thread::yield_now();
+        }
+        // Another vCPU's notify while queue 0 is being served: no wait.
+        notify(&dev, 1);
+        assert_eq!(*calls.lock().unwrap(), [(0, true)], "not served yet: the device is busy");
+        go.store(true, SeqCst);
+        vcpu0.join().unwrap();
+        assert_eq!(*calls.lock().unwrap(), [(0, true), (1, true)], "served by the busy context, unmasked");
+        // Interrupts stay as the caller had them on this thread too.
+        notify(&dev, 0);
+        assert_eq!(calls.lock().unwrap().last(), Some(&(0, true)));
     }
 
     #[test]

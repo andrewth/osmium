@@ -1,12 +1,13 @@
 //! Device nodes: a directory of kernel-provided files, `/dev/null` and
 //! `/dev/zero`.
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use osmium_sync::RwSpinLock;
+use osmium_sync::fallible::try_string;
 
 use crate::{DirEntry, Errno, File, FileKind, Stat};
 
@@ -16,23 +17,60 @@ use crate::{DirEntry, Errno, File, FileKind, Stat};
 pub struct DevDir {
     dev: u64,
     ino: u64,
-    entries: RwSpinLock<BTreeMap<String, Arc<dyn File>>>,
+    /// Sorted by name.
+    entries: RwSpinLock<Vec<(String, Arc<dyn File>)>>,
+}
+
+/// Where `name` is in `entries`, or where it would go.
+fn position(entries: &[(String, Arc<dyn File>)], name: &str) -> Result<usize, usize> {
+    entries.binary_search_by(|(n, _)| n.as_str().cmp(name))
 }
 
 impl DevDir {
     /// An empty directory reporting `dev` and inode 1.
     pub fn new(dev: u64) -> Self {
-        DevDir { dev, ino: 1, entries: RwSpinLock::new(BTreeMap::new()) }
+        DevDir { dev, ino: 1, entries: RwSpinLock::new(Vec::new()) }
     }
 
-    /// Adds `file` as `name`, replacing any entry of that name.
+    /// Adds `file` as `name`, replacing any entry of that name. Allocates
+    /// as `Vec::push` does, aborting if memory runs out: for setting up
+    /// `/dev` at boot. [`try_insert`](DevDir::try_insert) fails instead.
     pub fn insert(&self, name: &str, file: Arc<dyn File>) {
-        self.entries.write().insert(String::from(name), file);
+        let mut entries = self.entries.write();
+        match position(&entries, name) {
+            Ok(i) => {
+                if let Some(slot) = entries.get_mut(i) {
+                    slot.1 = file;
+                }
+            }
+            Err(i) => entries.insert(i, (String::from(name), file)),
+        }
+    }
+
+    /// [`insert`](DevDir::insert), failing with `ENOMEM` (and changing
+    /// nothing) if memory runs out.
+    pub fn try_insert(&self, name: &str, file: Arc<dyn File>) -> Result<(), Errno> {
+        let mut entries = self.entries.write();
+        match position(&entries, name) {
+            Ok(i) => {
+                if let Some(slot) = entries.get_mut(i) {
+                    slot.1 = file;
+                }
+            }
+            Err(i) => {
+                let name = try_string(name)?;
+                entries.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+                entries.insert(i, (name, file));
+            }
+        }
+        Ok(())
     }
 
     /// Removes the entry `name`, returning it.
     pub fn take(&self, name: &str) -> Option<Arc<dyn File>> {
-        self.entries.write().remove(name)
+        let mut entries = self.entries.write();
+        let i = position(&entries, name).ok()?;
+        Some(entries.remove(i).1)
     }
 }
 
@@ -47,13 +85,15 @@ impl File for DevDir {
 
     fn readdir(&self, index: usize) -> Result<Option<DirEntry>, Errno> {
         let entries = self.entries.read();
-        let Some((name, file)) = entries.iter().nth(index) else { return Ok(None) };
+        let Some((name, file)) = entries.get(index) else { return Ok(None) };
         let st = file.try_stat()?;
-        Ok(Some(DirEntry { ino: st.ino, kind: st.kind, name: osmium_sync::fallible::try_string(name)? }))
+        Ok(Some(DirEntry { ino: st.ino, kind: st.kind, name: try_string(name)? }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn File>, Errno> {
-        self.entries.read().get(name).cloned().ok_or(Errno::ENOENT)
+        let entries = self.entries.read();
+        let i = position(&entries, name).map_err(|_| Errno::ENOENT)?;
+        entries.get(i).map(|(_, f)| f.clone()).ok_or(Errno::ENOENT)
     }
 
     fn create(&self, _: &str, _: FileKind, _: u32) -> Result<Arc<dyn File>, Errno> {
@@ -61,7 +101,7 @@ impl File for DevDir {
     }
 
     fn remove(&self, name: &str, _: bool) -> Result<(), Errno> {
-        if self.entries.read().contains_key(name) { Err(Errno::EPERM) } else { Err(Errno::ENOENT) }
+        if position(&self.entries.read(), name).is_ok() { Err(Errno::EPERM) } else { Err(Errno::ENOENT) }
     }
 }
 
@@ -69,6 +109,18 @@ impl File for DevDir {
 pub const fn makedev(major: u32, minor: u32) -> u64 {
     let (major, minor) = (major as u64, minor as u64);
     (major & 0xfff) << 8 | (major & !0xfff) << 32 | (minor & 0xff) | (minor & !0xff) << 12
+}
+
+/// The major number of the device number `rdev`, as Linux's `major(3)`
+/// decodes it (the inverse of [`makedev`]).
+pub const fn major(rdev: u64) -> u32 {
+    ((rdev >> 8) & 0xfff | (rdev >> 32) & !0xfff) as u32
+}
+
+/// The minor number of the device number `rdev`, as Linux's `minor(3)`
+/// decodes it (the inverse of [`makedev`]).
+pub const fn minor(rdev: u64) -> u32 {
+    ((rdev & 0xff) | (rdev >> 12) & 0xffff_ff00) as u32
 }
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1 << 32);
@@ -150,6 +202,16 @@ impl File for Zero {
 mod tests {
     use super::*;
     use crate::{OpenFlags, RamFs, Vfs};
+
+    #[test]
+    fn device_numbers_round_trip() {
+        for (major, minor) in [(0, 0), (1, 3), (8, 0), (255, 255), (256, 1), (4095, 0xf_ffff), (u32::MAX, u32::MAX)] {
+            let rdev = makedev(major, minor);
+            assert_eq!((super::major(rdev), super::minor(rdev)), (major, minor), "{rdev:#x}");
+        }
+        // glibc's encoding.
+        assert_eq!(makedev(0x123, 0x45678), 0x4561_2378);
+    }
 
     #[test]
     fn dev_directory() {

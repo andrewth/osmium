@@ -4,7 +4,10 @@
 //! A file reports its readiness through [`osmium_fs::File::poll`]. A call that has to
 //! wait sleeps on one global queue, which every source of readiness wakes
 //! after it changes: the [`NetStack`](crate::net::NetStack) whenever it runs,
-//! and the in-memory socket pairs whenever they move data.
+//! and the in-memory socket pairs whenever they move data. (`File` has no
+//! way to name a queue of its own, so a change to one file wakes every
+//! poller.) A signal or the end of a process wakes only the threads it
+//! concerns, wherever they sleep (`signal::wait_on`).
 //!
 //! # Timeouts
 //!
@@ -15,8 +18,12 @@
 //! should call [`tick`] from its timer (polling the network stack does it
 //! too).
 //!
-//! The signal mask arguments of `ppoll`, `pselect6` and `epoll_pwait` are
-//! validated and ignored, and the remaining time is not written back.
+//! `ppoll`, `pselect6` and `epoll_pwait` install their signal mask for the
+//! wait, atomically with it, as Linux does: a signal the new mask lets in
+//! interrupts the wait (`EINTR`), and its handler runs with the new mask
+//! still in place; the caller's own mask comes back when the handler
+//! returns, or when the call returns if no handler runs. The remaining time
+//! is not written back.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -29,6 +36,7 @@ use osmium_sync::fallible::try_zeroed;
 use crate::fd::{MAX_FDS, OpenFile};
 use crate::net::stack;
 use crate::process::Process;
+use crate::thread::Thread;
 
 type SysResult = Result<u64, Errno>;
 
@@ -81,7 +89,7 @@ pub(crate) fn wait<R>(timeout_ns: Option<u64>, mut scan: impl FnMut() -> Option<
         return Ok(None);
     }
     let deadline = timeout_ns.and_then(|t| now().map(|n| n.saturating_add(t)));
-    READY.wait_until(|| match scan() {
+    crate::signal::wait_on(&READY, || match scan() {
         Some(r) => Some(Ok(Some(r))),
         None if crate::signal::current_interrupted() => Some(Err(Errno::EINTR)),
         None if deadline.is_some_and(|d| now().is_some_and(|n| n >= d)) => Some(Ok(None)),
@@ -113,15 +121,18 @@ fn user_timeout(p: &Process, va: u64, usec: bool) -> Result<Option<u64>, Errno> 
     Ok(Some(ns.unwrap_or(u64::MAX)))
 }
 
-/// Checks the `sigset_t` pointer and size that `ppoll` and `epoll_pwait` take.
-pub(crate) fn check_sigmask(p: &Process, mask: u64, size: u64) -> Result<(), Errno> {
+/// Reads the `sigset_t` pointer and size that `ppoll` and `epoll_pwait`
+/// take: `None` for a null pointer, which leaves the mask alone.
+pub(crate) fn user_sigmask(p: &Process, mask: u64, size: u64) -> Result<Option<u64>, Errno> {
     if mask == 0 {
-        return Ok(());
+        return Ok(None);
     }
     if size != 8 {
         return Err(Errno::EINVAL);
     }
-    p.memory().read(mask, &mut [0u8; 8])
+    let mut b = [0u8; 8];
+    p.memory().read(mask, &mut b)?;
+    Ok(Some(u64::from_ne_bytes(b)))
 }
 
 /// One `struct pollfd` of a `poll` call.
@@ -186,10 +197,10 @@ pub(crate) fn poll(p: &Process, fds: u64, nfds: u64, timeout_ms: u64) -> SysResu
     do_poll(p, fds, nfds, timeout)
 }
 
-pub(crate) fn ppoll(p: &Process, fds: u64, nfds: u64, ts: u64, mask: u64, size: u64) -> SysResult {
+pub(crate) fn ppoll(p: &Process, th: &Thread, fds: u64, nfds: u64, ts: u64, mask: u64, size: u64) -> SysResult {
     let timeout = user_timeout(p, ts, false)?;
-    check_sigmask(p, mask, size)?;
-    do_poll(p, fds, nfds, timeout)
+    let mask = user_sigmask(p, mask, size)?;
+    th.sig.with_mask(th, mask, || do_poll(p, fds, nfds, timeout))
 }
 
 /// The three `fd_set`s of a `select` call.
@@ -266,15 +277,18 @@ pub(crate) fn select(p: &Process, nfds: u64, r: u64, w: u64, e: u64, tv: u64) ->
     do_select(p, nfds, [r, w, e], user_timeout(p, tv, true)?)
 }
 
-pub(crate) fn pselect6(p: &Process, nfds: u64, r: u64, w: u64, e: u64, ts: u64, sig: u64) -> SysResult {
+#[allow(clippy::too_many_arguments)] // the system call's own six, and the thread.
+pub(crate) fn pselect6(p: &Process, th: &Thread, nfds: u64, r: u64, w: u64, e: u64, ts: u64, sig: u64) -> SysResult {
     let timeout = user_timeout(p, ts, false)?;
-    if sig != 0 {
+    let mask = if sig != 0 {
         // struct { const sigset_t *mask; size_t size; }
         let mut b = [0u8; 16];
         p.memory().read(sig, &mut b)?;
         let mask = crate::bytes::u64_at(&b, 0)?;
         let size = crate::bytes::u64_at(&b, 8)?;
-        check_sigmask(p, mask, size)?;
-    }
-    do_select(p, nfds, [r, w, e], timeout)
+        user_sigmask(p, mask, size)?
+    } else {
+        None
+    };
+    th.sig.with_mask(th, mask, || do_select(p, nfds, [r, w, e], timeout))
 }

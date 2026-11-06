@@ -10,13 +10,25 @@
 //! user mode, which is when `deliver` (after every system call, in
 //! `syscall::handle`) or a kernel's own call to it runs.
 //!
-//! The signal frame is Osmium's own layout, not Linux's `ucontext`: 128 bytes
-//! of `siginfo` (`si_signo`, `si_code`, `si_pid` or `si_addr`, and at offset
-//! 24 `si_value` of a queued signal, where Linux has them), then the saved signal mask, then the saved user
-//! registers. Handlers get `(signo, &siginfo, &frame_tail)` in the first three
-//! argument registers, and return through a trampoline that calls
+//! The signal frame is Linux's `struct rt_sigframe` for the architecture: a
+//! `siginfo_t` (`si_signo`, `si_code`, and `si_addr` for a fault, or
+//! `si_pid`, `si_uid` and `si_value` or `si_status`) and a `ucontext_t` with
+//! `uc_stack` (the alternate stack), `uc_sigmask` (the mask to return to) and
+//! `uc_mcontext` (the architecture's `sigcontext` of user registers), at the
+//! offsets Linux uses; see the `uregs` module. Handlers get
+//! `(signo, &siginfo, &ucontext)` in the first three argument registers,
+//! with or without `SA_SIGINFO`, and return through a trampoline that calls
 //! `rt_sigreturn`: the one the caller names with `SA_RESTORER` (x86_64), or a
-//! page the kernel maps in the process's `mmap` area.
+//! page the kernel maps in the process's `mmap` area. `rt_sigreturn` restores
+//! the registers, the mask and the alternate stack from the `ucontext`, as a
+//! handler may have changed them.
+//!
+//! The FP/SIMD registers are not part of the frame: x86_64's `fpstate` is
+//! null, AArch64's `sigcontext` has no `fpsimd_context` record (only the
+//! terminating one) and RISC-V's FP state is zero. They are not saved across
+//! a handler either, so a handler must leave them as it found them (code
+//! built with FP or vector instructions, including a C library's `memcpy`,
+//! may not).
 //!
 //! `sigaltstack` and `SA_ONSTACK`, `rt_sigsuspend`, queued real-time signals, and
 //! stopping and continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT`, reported by
@@ -45,7 +57,7 @@ use crate::bytes::{put, slice};
 use crate::process::{ExitStatus, Pid, Process};
 use crate::sigqueue::{Info, SIGRTMIN, code};
 use crate::thread::Thread;
-use crate::uregs::{NREGS, UserRegs};
+use crate::uregs::{HEAD_MAX, UserRegs};
 
 /// The signals' numbers on Linux, for the architectures Osmium has.
 #[allow(missing_docs)]
@@ -99,6 +111,14 @@ pub mod sa {
 const SI_USER: i32 = 0;
 const SI_KERNEL: i32 = 0x80;
 const SEGV_MAPERR: i32 = 1;
+
+/// `si_code` of a `SIGCHLD`, saying what happened to the child.
+pub(crate) mod cld {
+    pub const EXITED: i32 = 1;
+    pub const KILLED: i32 = 2;
+    pub const STOPPED: i32 = 5;
+    pub const CONTINUED: i32 = 6;
+}
 
 /// The mask bit of signal `sig`; 0 for a number outside `1..=NSIG`.
 pub(crate) fn bit(sig: u8) -> u64 {
@@ -226,23 +246,60 @@ impl Signals {
     }
 }
 
-/// Wakes everything a signal may have to interrupt: futex waiters, and a
-/// parent in `wait4`.
-fn poke(p: &Process) {
-    wake_blocked();
+/// Wakes what a signal to `p` (or to its thread `th` alone) may have to
+/// interrupt: the threads it concerns, wherever they wait, and the
+/// process's `wait4`.
+fn poke(p: &Process, th: Option<&Thread>) {
+    match th {
+        Some(th) => wake_thread(th),
+        None => wake_threads(p),
+    }
+    // Futex waits are not yet registered per thread (see `wait_on`).
+    crate::futex::interrupt();
     p.child_exited.wake_all();
 }
 
-/// Makes every thread blocked in a futex wait, `poll`, `select`, `epoll`,
-/// pipe, socket or `accept`/`connect`/`recv`/`send` look again, so that one
-/// that is interrupted or whose process is ending gives up.
-pub(crate) fn wake_blocked() {
-    crate::futex::interrupt();
-    crate::jobctl::wake();
-    crate::poll::notify();
-    if let Some(stack) = crate::net::stack() {
-        stack.wake_waiters();
+/// Makes every thread of `p` that is blocked in an interruptible wait
+/// (`poll`, `select`, `epoll`, pipe and socket I/O, `accept`, `connect`, a
+/// stop, `sigsuspend`, `execve`'s wait for the other threads) look again,
+/// so that one that is interrupted or whose process is ending gives up.
+/// Other processes' sleepers are left alone.
+pub(crate) fn wake_threads(p: &Process) {
+    p.group.each(wake_thread);
+}
+
+/// [`wake_threads`] for one thread.
+fn wake_thread(th: &Thread) {
+    let sleep = th.sleep.lock();
+    if *sleep == 0 {
+        return;
     }
+    if let Some(task) = th.ext.task() {
+        // SAFETY: `wait_on` stores the address of a queue it borrows for as
+        // long as the address is set, and clears it under this lock before
+        // the borrow ends, so the queue is alive while the lock is held.
+        let queue = unsafe { &*core::ptr::with_exposed_provenance::<osmium_sched::WaitQueue>(*sleep) };
+        queue.wake_task(&task);
+    }
+}
+
+/// Waits in `queue` until `cond` returns `Some`, as
+/// [`osmium_sched::WaitQueue::wait_until`] does, registered as the calling
+/// thread's interruptible wait so that a signal for it (or its process
+/// ending) wakes it alone. Every wait that gives up on
+/// [`current_interrupted`] must go through here.
+///
+/// Lock order: a thread's `sleep` lock is taken before the queue's, so
+/// `cond`, which runs under the queue's lock, must not take a thread
+/// group's lock.
+pub(crate) fn wait_on<R>(queue: &osmium_sched::WaitQueue, cond: impl FnMut() -> Option<R>) -> R {
+    let task = osmium_sched::current();
+    let Some(user) = task.data::<crate::process::UserTask>() else { return queue.wait_until(cond) };
+    let th = &user.thread;
+    *th.sleep.lock() = core::ptr::from_ref(queue).expose_provenance();
+    let r = queue.wait_until(cond);
+    *th.sleep.lock() = 0;
+    r
 }
 
 /// Sends `sig` to the process as a whole (`kill`): any thread that does not
@@ -301,7 +358,7 @@ pub(crate) fn post(
     }
     p.signals.set_sender(sig, from);
     pending.fetch_or(bit(sig), Ordering::SeqCst);
-    poke(p);
+    poke(p, th);
     Ok(())
 }
 
@@ -319,12 +376,15 @@ fn check(p: &Process, sig: u8) -> Result<(), Errno> {
 /// time it is in the kernel.
 pub(crate) fn kill_group(p: &Process, status: ExitStatus) {
     let _ = p.group.exiting.set(status);
-    poke(p);
+    poke(p, None);
 }
 
-/// Wakes a parent's blocking calls and queues `SIGCHLD` for it.
-pub(crate) fn child_exited(parent: &Process, child: Pid) {
-    let _ = send(parent, SIGCHLD, child);
+/// Wakes a parent's blocking calls and queues `SIGCHLD` for it, with the
+/// `siginfo` Linux gives it: `si_code` one of [`cld`], `si_pid` the child and
+/// `si_status` its exit code or signal.
+pub(crate) fn child_exited(parent: &Process, child: Pid, code: i32, status: i32) {
+    let info = Info { code, pid: child.0, value: status as u32 as u64 };
+    let _ = post(parent, None, SIGCHLD, child, Some(info), false);
 }
 
 /// Whether `th` has a signal that a blocked call should be interrupted for,
@@ -370,10 +430,6 @@ fn take_next(p: &Process, th: &Thread) -> Option<(u8, SigAction, Option<Info>)> 
         }
     }
 }
-
-const FRAME_SIZE: usize = (128 + 8 + NREGS * 8).next_multiple_of(16);
-const FRAME_MASK: usize = 128;
-const FRAME_REGS: usize = 136;
 
 /// Delivers one pending, unblocked signal to `th` if there is one that does
 /// something: runs the default action, or redirects `regs` to the handler on
@@ -451,6 +507,7 @@ fn push_frame<R: UserRegs>(
     act: SigAction,
     info: Option<Info>,
 ) -> Result<(), Errno> {
+    let f = R::FRAME;
     let ra = if act.flags & sa::RESTORER != 0 && act.restorer != 0 {
         act.restorer
     } else {
@@ -460,40 +517,63 @@ fn push_frame<R: UserRegs>(
     if ra == 0 || !R::valid_pc(act.handler) {
         return Err(Errno::EFAULT);
     }
-    let (code, value, queued) = match (th.take_fault(sig), info) {
-        (Some(addr), _) => (SEGV_MAPERR, addr, 0),
-        (None, Some(i)) => (i.code, u64::from(i.pid), i.value),
-        (None, None) => {
-            let from = p.signals.sender(sig);
-            if from == 0 { (SI_KERNEL, 0, 0) } else { (SI_USER, from as u64, 0) }
+    let mut buf = [0u8; HEAD_MAX];
+    let head = buf.get_mut(..f.head).ok_or(Errno::EFAULT)?;
+    // siginfo_t: si_signo, si_errno, si_code, then the union at 16.
+    put(head, f.info, &i32::from(sig).to_ne_bytes())?;
+    let fault = th.take_fault(sig);
+    let code = match (fault, info) {
+        (Some(addr), _) => {
+            put(head, f.info + 16, &addr.to_ne_bytes())?;
+            SEGV_MAPERR
         }
+        (None, Some(i)) => {
+            // si_pid, si_uid (0: there are no users), si_value or si_status.
+            put(head, f.info + 16, &i.pid.to_ne_bytes())?;
+            put(head, f.info + 24, &i.value.to_ne_bytes())?;
+            i.code
+        }
+        (None, None) => match p.signals.sender(sig) {
+            0 => SI_KERNEL,
+            from => {
+                put(head, f.info + 16, &from.to_ne_bytes())?;
+                SI_USER
+            }
+        },
     };
-    let mut buf = [0u8; FRAME_SIZE];
-    put(&mut buf, 0, &i32::from(sig).to_ne_bytes())?;
-    put(&mut buf, 8, &code.to_ne_bytes())?;
-    put(&mut buf, 16, &value.to_ne_bytes())?;
-    put(&mut buf, 24, &queued.to_ne_bytes())?;
+    put(head, f.info + 8, &code.to_ne_bytes())?;
+    // ucontext_t: uc_flags, uc_link (null), uc_stack, then the mask and registers.
+    let user_sp = regs.user_sp();
+    let uc = f.uc;
+    put(head, uc, &f.uc_flags.to_ne_bytes())?;
+    let (alt_sp, alt_flags, alt_size) = th.sig.alt_state(user_sp);
+    put(head, uc + 16, &alt_sp.to_ne_bytes())?;
+    put(head, uc + 24, &alt_flags.to_ne_bytes())?;
+    put(head, uc + 32, &alt_size.to_ne_bytes())?;
     // The mask to return to: `sigsuspend`'s caller gets its own back, not the temporary one.
     let saved_mask = th.sig.take_saved_mask().unwrap_or_else(|| th.mask.load(Ordering::SeqCst));
-    put(&mut buf, FRAME_MASK, &saved_mask.to_ne_bytes())?;
-    for (i, w) in regs.save_user().iter().enumerate() {
-        put(&mut buf, FRAME_REGS + i * 8, &w.to_ne_bytes())?;
-    }
-    let user_sp = regs.user_sp();
+    put(head, uc + f.sigmask, &saved_mask.to_ne_bytes())?;
+    regs.save_mcontext(head.get_mut(uc + f.mcontext..).ok_or(Errno::EFAULT)?, fault.unwrap_or(0), saved_mask);
+    // Below the stack (or at the top of the alternate one), aligned as a
+    // handler entered by a call expects.
+    let place = |below: u64| below.checked_sub(f.size).and_then(|b| (b & !15).checked_sub(f.misalign));
     let base = match th.sig.alt_top(act.flags, user_sp) {
         // `SA_ONSTACK` with an alternate stack that is not in use: its top, with no red zone to keep.
-        Some((top, low)) => top.checked_sub(FRAME_SIZE as u64).map(|sp| sp & !15).filter(|&sp| sp >= low),
-        None => user_sp.checked_sub(R::RED_ZONE + FRAME_SIZE as u64).map(|sp| sp & !15),
+        Some((top, low)) => place(top).filter(|&sp| sp >= low),
+        None => user_sp.checked_sub(R::RED_ZONE).and_then(place),
     }
     .filter(|&sp| sp != 0)
     .ok_or(Errno::EFAULT)?;
-    p.memory().write(base, &buf)?;
-    let sp = if R::RET_ON_STACK {
-        p.memory().write(base - 8, &ra.to_ne_bytes())?;
-        base - 8
-    } else {
-        base
-    };
+    if let Some(slot) = f.ret_slot {
+        put(head, slot, &ra.to_ne_bytes())?;
+    }
+    p.memory().write(base, head)?;
+    if let Some((off, words)) = regs.frame_record() {
+        let mut record = [0u8; 16];
+        put(&mut record, 0, &words[0].to_ne_bytes())?;
+        put(&mut record, 8, &words[1].to_ne_bytes())?;
+        p.memory().write(base.checked_add(off as u64).ok_or(Errno::EFAULT)?, &record)?;
+    }
     let mut blocked = th.mask.load(Ordering::SeqCst) | act.mask;
     if act.flags & sa::NODEFER == 0 {
         blocked |= bit(sig);
@@ -502,28 +582,31 @@ fn push_frame<R: UserRegs>(
     if act.flags & sa::RESETHAND != 0 {
         p.signals.set_action(sig, SigAction::default());
     }
-    regs.enter_handler(act.handler, sp, ra, [sig as u64, base, base + FRAME_MASK as u64]);
+    regs.enter_handler(act.handler, base, ra, [sig as u64, base + f.info as u64, base + uc as u64]);
     Ok(())
 }
 
-/// `rt_sigreturn`: restores the registers and mask saved on the signal frame
-/// at the stack pointer, where the handler's return left it. Only
-/// unprivileged registers can be restored, so a forged frame is no more
-/// than the program could do anyway.
+/// `rt_sigreturn`: restores the registers, mask and alternate stack saved in
+/// the signal frame's `ucontext` (as the handler may have changed them),
+/// finding the frame at the stack pointer, where the handler's return left
+/// it. Only unprivileged registers can be restored, so a forged frame is no
+/// more than the program could do anyway.
 pub(crate) fn sigreturn<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) -> Option<ExitStatus> {
-    let mut buf = [0u8; FRAME_SIZE];
-    if p.memory().read(regs.user_sp(), &mut buf).is_err() {
+    let f = R::FRAME;
+    let mut buf = [0u8; HEAD_MAX];
+    let head = buf.get_mut(..f.head)?;
+    let frame = regs.user_sp().wrapping_sub(f.sigreturn_back);
+    if p.memory().read(frame, head).is_err() {
         let status = ExitStatus::Signal(SIGSEGV);
         kill_group(p, status);
         return Some(status);
     }
-    let word = |off: usize| crate::bytes::u64_at(&buf, off).unwrap_or(0);
-    th.mask.store(word(FRAME_MASK) & !UNBLOCKABLE, Ordering::SeqCst);
-    let mut saved = [0; NREGS];
-    for (i, w) in saved.iter_mut().enumerate() {
-        *w = word(FRAME_REGS + i * 8);
-    }
-    regs.restore_user(&saved);
+    let uc = f.uc;
+    let word = |off: usize| crate::bytes::u64_at(head, off).unwrap_or(0);
+    th.mask.store(word(uc + f.sigmask) & !UNBLOCKABLE, Ordering::SeqCst);
+    regs.restore_mcontext(head.get(uc + f.mcontext..).unwrap_or_default());
+    let alt_flags = crate::bytes::i32_at(head, uc + 24).unwrap_or(0);
+    th.sig.restore_alt((word(uc + 16), alt_flags, word(uc + 32)), regs.user_sp());
     if !R::valid_pc(regs.user_pc()) {
         // A forged frame: the program cannot continue.
         let status = ExitStatus::Signal(SIGSEGV);
@@ -568,6 +651,10 @@ pub(crate) fn sigaction(p: &Process, sig: u64, act: u64, old: u64, size: u64) ->
             ensure_trampoline(p)?;
         }
         p.signals.set_action(sig, new);
+        if p.signals.ignored.load(Ordering::SeqCst) & bit(sig) != 0 {
+            // Ignoring a signal discards it wherever it is pending, as on Linux.
+            p.group.each(|t| t.discard_pending(bit(sig)));
+        }
     }
     Ok(0)
 }

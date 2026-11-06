@@ -216,15 +216,30 @@ mod cell {
             Self { ptr: AtomicPtr::new(Box::into_raw(value)), _owns: PhantomData }
         }
 
-        /// Reads the current value; it stays valid for as long as the guard.
+        /// Reads the current value; it stays valid for as long as both the guard and the cell.
         ///
         /// The guard must belong to the domain updaters synchronize on.
-        pub fn read<'g>(&self, _guard: &'g RcuReadGuard<'_>) -> &'g T {
+        ///
+        /// The result borrows the cell as well as the guard, because dropping the cell frees the current
+        /// value without a grace period. A reference cannot outlive the cell:
+        ///
+        /// ```compile_fail,E0505
+        /// use osmium_sync::{Rcu, RcuCell};
+        ///
+        /// let rcu = Rcu::new();
+        /// let cell = RcuCell::new(Box::new(1u32));
+        /// let g = rcu.read_lock();
+        /// let r = cell.read(&g);
+        /// drop(cell); // error: `cell` is still borrowed by `r`
+        /// assert_eq!(*r, 1);
+        /// ```
+        pub fn read<'g, 's: 'g>(&'s self, _guard: &'g RcuReadGuard<'_>) -> &'g T {
             // Acquire pairs with the Release half of the swap in `replace`, so the new value's initialization
             // is visible (Rust has no consume ordering).
             let p = self.ptr.load(Ordering::Acquire);
             // SAFETY: `ptr` always holds a live `Box` allocation; `replace` frees the old one only after
-            // `synchronize`, which waits for this guard's section to end.
+            // `synchronize`, which waits for this guard's section to end, and `Drop` (which frees the
+            // current one at once) cannot run while the returned borrow of the cell (`'s: 'g`) is alive.
             unsafe { &*p }
         }
 

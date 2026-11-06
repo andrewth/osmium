@@ -91,6 +91,29 @@ fn power_off_writes_the_sleep_type_then_enable() {
 }
 
 #[test]
+fn both_control_registers_get_their_type_before_either_gets_the_enable_bit() {
+    // The same FADT with a PM1b control block at 0x704.
+    let mut f = fadt(0x1000);
+    f[68..72].copy_from_slice(&0x704u32.to_le_bytes());
+    let f = seal(f);
+    let pm = Pm::new(Fadt::parse(Table { data: &f }).unwrap());
+    let mut aml = machine();
+    aml.host_mut().clear_log();
+    pm.power_off(&mut aml).unwrap();
+    let writes: Vec<_> =
+        aml.host().log.iter().filter(|a| matches!(a, IoW(0x604, ..) | IoW(0x704, ..))).cloned().collect();
+    assert_eq!(
+        writes,
+        [
+            IoW(0x604, 16, 7 << 10),
+            IoW(0x704, 16, 7 << 10),
+            IoW(0x604, 16, 7 << 10 | 1 << 13),
+            IoW(0x704, 16, 7 << 10 | 1 << 13),
+        ]
+    );
+}
+
+#[test]
 fn a_sleep_state_the_firmware_lacks() {
     let pm = pm();
     let mut aml = machine();

@@ -196,6 +196,9 @@ osmium_trap_common_sp_saved:
     str x0, [sp, #288]
     mov x0, sp
     bl osmium_trap_dispatch
+    // Exceptions stay masked from here to eret even if the handler unmasked
+    // them: one taken after ELR/SPSR are loaded would overwrite them.
+    msr daifset, #0xf
     ldr x1, [sp, #256]
     msr elr_el2, x1
     ldr x1, [sp, #264]

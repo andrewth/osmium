@@ -385,8 +385,11 @@ impl<D: DmaAllocator + ?Sized> NetDevice for IpoibPort<'_, '_, D> {
         self.poll();
         let mut datagram = [0u8; HEADER + 4096];
         loop {
-            let d = self.ib.receive(&mut datagram)?;
-            // (`ib.receive` reports a datagram too big for the buffer as an error.)
+            // A datagram too big for the buffer has been dropped: take the next.
+            let d = match self.ib.receive(&mut datagram) {
+                Err(NetError::TooLarge) => continue,
+                r => r?,
+            };
             let Some(payload) = datagram.get(..d.len) else { continue };
             if let Some(n) = self.decapsulate(&d, payload, buf) {
                 return Ok(n);

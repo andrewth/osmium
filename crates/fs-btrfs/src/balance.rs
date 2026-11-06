@@ -341,6 +341,8 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     /// emptied, with its checksums, and moves its references there. Returns
     /// the bytes copied (0 if the extent is no longer there).
     pub(crate) fn relocate_data(&mut self, bytenr: u64) -> Result<u64, Errno> {
+        // Read-only subvolumes' extents move too: what they hold stays the same.
+        self.relocating = true;
         let Some((k, d)) = self
             .next_item(tree::EXTENT, Key::new(bytenr, item::EXTENT_ITEM, 0))?
             .filter(|(k, _)| k.objectid == bytenr && k.ty == item::EXTENT_ITEM)
@@ -416,12 +418,20 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         if self.pinned.iter().any(|p| p.0 == addr) {
             return Ok(false);
         }
-        let (owner, first, generation) = {
+        self.relocating = true;
+        let (owner, first, reloc) = {
             let n = self.load(addr)?;
-            (n.owner, n.first_key(), n.generation)
+            (n.owner, n.first_key(), n.reloc)
         };
         // A block a snapshot may share cannot be moved for one tree alone.
-        if self.root(owner)?.last_snapshot >= generation && self.root(owner)?.last_snapshot != 0 {
+        // One Linux's balance wrote may be, and its owner need not be a tree
+        // that refers to it (it may be the relocation tree, gone since).
+        if reloc {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let r = self.root(owner)?;
+        let n = self.load(addr)?;
+        if crate::write::may_be_shared(&r, n) {
             return Err(Errno::EOPNOTSUPP);
         }
         self.path(owner, first.unwrap_or(Key::new(0, 0, 0)), 0)?;

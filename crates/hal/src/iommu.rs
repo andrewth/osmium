@@ -617,12 +617,30 @@ const FREE_EXTENTS: usize = 64;
 /// would split an extent in two fails (nothing is lost), and a
 /// [`free`](Self::free) that cannot be recorded reports it and counts it in
 /// [`leaked_pages`](Self::leaked_pages).
+///
+/// [`free`](Self::free) refuses a range that is not allocated: unaligned,
+/// empty, outside the window, or overlapping free space (a double free).
+/// It keeps no record of individual allocations, so a range made of parts
+/// of several live allocations is not told apart from one allocation.
 #[derive(Debug)]
 pub struct IovaAllocator {
     /// Free `[start, end)` extents, sorted, non-adjacent; `len` are used.
     free: [(u64, u64); FREE_EXTENTS],
     len: usize,
     leaked: u64,
+    /// The page-trimmed window.
+    window: Range<u64>,
+}
+
+/// Why [`IovaAllocator::free`] refused a range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IovaFreeError {
+    /// The range is not allocated: unaligned, empty, outside the window, or
+    /// (partly) free already. Nothing changed.
+    NotAllocated,
+    /// The range was valid but the extent table is full, so it is lost; it
+    /// is counted in [`IovaAllocator::leaked_pages`].
+    TableFull,
 }
 
 impl IovaAllocator {
@@ -639,7 +657,7 @@ impl IovaAllocator {
             *first = (window.start, window.end);
             len = 1;
         }
-        Self { free, len, leaked: 0 }
+        Self { free, len, leaked: 0, window }
     }
 
     /// Pages returned by [`free`](Self::free) that could not be recorded
@@ -708,12 +726,30 @@ impl IovaAllocator {
         Some(start)
     }
 
-    /// Returns `pages` pages at `iova`, from [`alloc`](Self::alloc). False
-    /// if the range could not be recorded because the table is full (it is
-    /// then counted in [`leaked_pages`](Self::leaked_pages)).
-    pub fn free(&mut self, iova: u64, pages: usize) -> bool {
-        let end = (pages as u64).saturating_mul(PAGE_SIZE as u64).saturating_add(iova);
+    /// Returns `pages` pages at `iova`, from [`alloc`](Self::alloc).
+    ///
+    /// Fails with [`IovaFreeError::NotAllocated`], changing nothing, for a
+    /// range that is not allocated (see the type's documentation), and with
+    /// [`IovaFreeError::TableFull`] if the range could not be recorded (it
+    /// is then counted in [`leaked_pages`](Self::leaked_pages)).
+    pub fn free(&mut self, iova: u64, pages: usize) -> Result<(), IovaFreeError> {
+        let end = (pages as u64)
+            .checked_mul(PAGE_SIZE as u64)
+            .filter(|&b| b != 0)
+            .and_then(|b| iova.checked_add(b))
+            .ok_or(IovaFreeError::NotAllocated)?;
+        if !iova.is_multiple_of(PAGE_SIZE as u64) || iova < self.window.start || end > self.window.end {
+            return Err(IovaFreeError::NotAllocated);
+        }
         let i = self.extents().partition_point(|&(s, _)| s < iova);
+        // Extents are sorted and disjoint: only the one before `i` (which
+        // starts below `iova`) and the one at `i` (which starts at or above
+        // it) can overlap the range.
+        let overlaps_prev = i.checked_sub(1).and_then(|p| self.extents().get(p)).is_some_and(|e| e.1 > iova);
+        let overlaps_next = self.extents().get(i).is_some_and(|e| e.0 < end);
+        if overlaps_prev || overlaps_next {
+            return Err(IovaFreeError::NotAllocated);
+        }
         let prev = i.checked_sub(1).filter(|&p| self.extents().get(p).is_some_and(|e| e.1 == iova));
         let next = Some(i).filter(|&n| self.extents().get(n).is_some_and(|e| e.0 == end));
         match (prev, next) {
@@ -737,12 +773,12 @@ impl IovaAllocator {
             (None, None) => {
                 if self.len == FREE_EXTENTS {
                     self.leaked = self.leaked.saturating_add(pages as u64);
-                    return false;
+                    return Err(IovaFreeError::TableFull);
                 }
                 self.insert_at(i, (iova, end));
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -811,7 +847,8 @@ impl<I: Iommu, A: TableAlloc, B: DmaAllocator> DmaAllocator for IommuDma<'_, I, 
         let mapped = found.and_then(|iova| match st.domain.map(iova, buf.device_addr(), bytes as u64, MapFlags::RW) {
             Ok(()) => Some(iova),
             Err(_) => {
-                st.iovas.free(iova, pages);
+                // Just allocated, so it is valid; a full table only leaks it.
+                let _ = st.iovas.free(iova, pages);
                 None
             }
         });
@@ -836,7 +873,9 @@ impl<I: Iommu, A: TableAlloc, B: DmaAllocator> DmaAllocator for IommuDma<'_, I, 
         // the IOVA and the memory out of circulation instead of reusing them.
         let flushed = st.domain.unmap(iova, bytes as u64).is_ok();
         if flushed {
-            st.iovas.free(iova, bytes / PAGE_SIZE);
+            // Mapped by `alloc_coherent` from this allocator; a full table
+            // only leaks the range (counted in `leaked_pages`).
+            let _ = st.iovas.free(iova, bytes / PAGE_SIZE);
         }
         drop(st);
         if flushed {
@@ -1006,12 +1045,39 @@ mod tests {
         let z = a.alloc(8).unwrap();
         assert_eq!((x, y, z), (0x10000, 0x14000, 0x18000));
         assert_eq!(a.alloc(1), None, "window exhausted");
-        a.free(y, 4);
-        a.free(x, 4);
+        assert_eq!(a.free(y, 4), Ok(()));
+        assert_eq!(a.free(x, 4), Ok(()));
         assert_eq!(a.extents().len(), 1, "x and y coalesced");
-        a.free(z, 8);
+        assert_eq!(a.free(z, 8), Ok(()));
         assert_eq!(a.extents(), [(0x10000, 0x20000)]);
         assert_eq!(a.alloc(16), Some(0x10000));
+    }
+
+    #[test]
+    fn iova_allocator_rejects_ranges_it_did_not_allocate() {
+        let mut a = IovaAllocator::new(0x10000..0x20000);
+        let x = a.alloc(4).unwrap();
+        let y = a.alloc(4).unwrap();
+        let before = a.extents().to_vec();
+        for (iova, pages, why) in [
+            (0x1_8000, 1, "never allocated"),
+            (0x1_f000, 2, "runs past the window"),
+            (0x8000, 1, "below the window"),
+            (x + 1, 1, "unaligned"),
+            (x, 0, "empty"),
+            (u64::MAX - 0xfff, 2, "overflows"),
+            (y + 0x3000, 2, "half allocated, half free"),
+        ] {
+            assert_eq!(a.free(iova, pages), Err(IovaFreeError::NotAllocated), "{why}");
+            assert_eq!(a.extents(), before, "{why}: nothing changed");
+        }
+        assert_eq!(a.free(x, 4), Ok(()));
+        assert_eq!(a.free(x, 4), Err(IovaFreeError::NotAllocated), "double free");
+        assert_eq!(a.free(x + 0x1000, 1), Err(IovaFreeError::NotAllocated), "part of a freed range");
+        assert_eq!(a.free(y, 4), Ok(()));
+        assert_eq!(a.extents(), [(0x10000, 0x20000)]);
+        assert_eq!(a.alloc(16), Some(0x10000), "the window is whole again, not doubled");
+        assert_eq!(a.alloc(1), None);
     }
 
     #[test]
@@ -1019,7 +1085,7 @@ mod tests {
         let mut a = IovaAllocator::new(0x1000..0x1000 + 200 * 4096);
         let all: Vec<u64> = (0..200).map(|_| a.alloc(1).unwrap()).collect();
         // Free every other page: 100 extents, more than the table holds.
-        let freed: Vec<bool> = all.iter().step_by(2).map(|&p| a.free(p, 1)).collect();
+        let freed: Vec<bool> = all.iter().step_by(2).map(|&p| a.free(p, 1).is_ok()).collect();
         let kept = freed.iter().filter(|&&k| k).count();
         assert_eq!(kept, FREE_EXTENTS, "the table fills, then frees are reported");
         assert_eq!(a.leaked_pages(), (100 - kept) as u64, "every unrecorded free is counted");
@@ -1035,7 +1101,7 @@ mod tests {
         let pages: Vec<u64> = (0..2 * FREE_EXTENTS).map(|_| c.alloc(1).unwrap()).collect();
         // 63 freed pages plus the untouched tail make 64 extents: full.
         for &p in pages.iter().step_by(2).take(FREE_EXTENTS - 1) {
-            assert!(c.free(p, 1));
+            assert_eq!(c.free(p, 1), Ok(()));
         }
         assert_eq!(c.extents().len(), FREE_EXTENTS);
         let before = c.extents().to_vec();
@@ -1188,8 +1254,8 @@ mod tests {
         assert_eq!(a.alloc(2), Some(0x1000));
         assert_eq!(a.alloc_aligned(512, MIB2), Some(2 * MIB2));
         assert_eq!(a.alloc_aligned(1, 0x3000), None, "not a power of two");
-        a.free(MIB2, 1);
-        a.free(2 * MIB2, 512);
+        assert_eq!(a.free(MIB2, 1), Ok(()));
+        assert_eq!(a.free(2 * MIB2, 512), Ok(()));
         assert_eq!(a.alloc_aligned(513, MIB2), Some(MIB2), "freed neighbours coalesced");
         let mut b = IovaAllocator::new(0x1000..0x20_0000);
         assert_eq!(b.alloc_aligned(1, MIB2), None, "no aligned room");

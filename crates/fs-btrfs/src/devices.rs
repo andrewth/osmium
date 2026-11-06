@@ -20,8 +20,8 @@
 //!   and it is handed back.
 //!
 //! A volume mounted afterwards sees the devices only if the mount knows all
-//! of them; this driver's mount takes one device, and mounts a volume with
-//! more read-only.
+//! of them: `BtrfsFs::mount_multi` given every device mounts it writable,
+//! and one given fewer mounts it read-only (degraded).
 
 use alloc::vec::Vec;
 

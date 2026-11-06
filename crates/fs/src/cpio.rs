@@ -349,8 +349,11 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
         else {
-            std::eprintln!("cpio not installed; skipping");
-            return;
+            if std::env::var_os("OSMIUM_SKIP_TOOL_TESTS").is_some_and(|v| v == "1") {
+                std::eprintln!("cpio not installed; skipping (OSMIUM_SKIP_TOOL_TESTS=1)");
+                return;
+            }
+            panic!("cpio not installed: install it, or set OSMIUM_SKIP_TOOL_TESTS=1 to skip this test");
         };
         child.stdin.take().unwrap().write_all(b".\na\na/b\na/b/file\na/link\n").unwrap();
         let archive = child.wait_with_output().unwrap().stdout;

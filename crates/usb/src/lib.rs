@@ -2,13 +2,17 @@
 //!
 //! | Driver | Device | Implements |
 //! |---|---|---|
-//! | [`xhci::Xhci`] | xHCI USB host controller | `UsbHost` |
-//! | [`ehci::Ehci`] | EHCI USB 2.0 host controller (high-speed devices; polled) | `UsbHost` |
-//! | [`ohci::Ohci`] | OHCI USB 1.1 host controller (polled) | `UsbHost` |
-//! | [`uhci::Uhci`] | UHCI USB 1.1 host controller (I/O ports or MMIO; polled) | `UsbHost` |
+//! | [`xhci::Xhci`] | xHCI USB host controller (polled or interrupt-driven; hubs, isochronous, streams) | `UsbHost`, `IsochHost` |
+//! | [`ehci::Ehci`] | EHCI USB 2.0 host controller (high-speed devices; polled or interrupt-driven) | `UsbHost` |
+//! | [`ohci::Ohci`] | OHCI USB 1.1 host controller (polled or interrupt-driven) | `UsbHost` |
+//! | [`uhci::Uhci`] | UHCI USB 1.1 host controller (I/O ports or MMIO; polled or interrupt-driven) | `UsbHost` |
 //! | [`class::storage::UsbStorage`] | USB mass storage (SCSI, Bulk-Only) on any `UsbHost` | `BlockDevice` |
 //! | [`class::hid::BootKeyboard`] | USB keyboard (HID boot protocol) on any `UsbHost` | key events |
 //! | [`class::hid::HidKeyboard`], [`class::hid::HidMouse`] | USB keyboards and pointers driven by their HID report descriptors | key and pointer events |
+//! | [`class::hub::Hub`] | USB 2 and USB 3 hubs on any `UsbHost` that addresses devices behind hubs | port events |
+//! | [`class::isoch::IsochIn`], [`class::isoch::IsochOut`] | isochronous streams on any `IsochHost` | chunks in and out |
+//!
+//! USB network adapters (CDC-ECM, CDC-NCM) are in `osmium-netdev`.
 //!
 //! Every controller is constructed from an [`osmium_hal::mmio::IoMem`] (or a
 //! port base), so it works the same under any memory map and can be tested

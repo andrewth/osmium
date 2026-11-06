@@ -161,7 +161,8 @@ impl FdtWriter {
     }
 
     fn string_offset(&mut self, name: &str) -> u32 {
-        // Reuse an existing copy (a suffix match also works, as in dtc).
+        // Reuse an existing copy of the whole name. (dtc also points a name at the tail of a longer one;
+        // this only does that for the empty name.)
         let needle: Vec<u8> = name.bytes().chain([0]).collect();
         if let Some(pos) = self.strings.windows(needle.len()).position(|w| w == needle.as_slice())
             && (pos == 0 || pos.checked_sub(1).and_then(|p| self.strings.get(p)) == Some(&0) || name.is_empty())

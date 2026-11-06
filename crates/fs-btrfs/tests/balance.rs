@@ -235,3 +235,45 @@ fn crash_at_every_write() {
         f(n);
     }
 }
+
+/// A read-only subvolume (not a snapshot, so nothing is shared) is moved
+/// like any other, and stays read-only.
+#[test]
+fn moves_read_only_subvolume() {
+    let dir = scratch("bal-ro");
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("ro/d")).unwrap();
+    std::fs::create_dir_all(src.join("rw")).unwrap();
+    let mut files = Vec::new();
+    for i in 0..40 {
+        let (path, data) = (format!("ro/d/f{i}"), distinct(20_000 + i * 4096, i as u32));
+        std::fs::write(src.join(&path), &data).unwrap();
+        files.push((format!("/{path}"), data));
+    }
+    std::fs::write(src.join("rw/x"), b"rw").unwrap();
+    let Some(img) = mkfs(&dir, 128 << 20, &["-n", "4096", "--rootdir", src.to_str().unwrap(), "--subvol", "ro:ro"])
+    else {
+        return;
+    };
+    check(&img);
+    let fs = mount(&img);
+    let before = fs.chunks().unwrap();
+    let rep = fs.balance(&BalanceFilter::default()).unwrap();
+    assert!(rep.relocated >= 2 && rep.skipped.is_empty() && rep.busy.is_empty(), "{rep:?}");
+    let after = fs.chunks().unwrap();
+    for c in after.iter().filter(|c| c.flags & 2 == 0) {
+        assert!(before.iter().all(|b| b.logical != c.logical), "{c:?} is old");
+    }
+    let vfs = Vfs::new(fs.root());
+    let write = vfs.open("/ro/d/f0", OpenFlags::WRITE, 0).and_then(|f| f.write(0, b"no"));
+    assert_eq!(write.err(), Some(osmium_fs::Errno::EROFS));
+    assert_eq!(vfs.open("/ro/new", OpenFlags::WRITE | OpenFlags::CREATE, 0o644).err(), Some(osmium_fs::Errno::EROFS));
+    drop(vfs);
+    drop(fs);
+    check(&img);
+    let vfs = Vfs::new(mount(&img).root());
+    for (path, data) in &files {
+        assert!(cat(&vfs, path) == *data, "{path} differs");
+    }
+    assert_eq!(cat(&vfs, "/rw/x"), b"rw");
+}

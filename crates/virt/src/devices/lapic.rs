@@ -214,8 +214,11 @@ pub fn decode_icr(high: u32, low: u32) -> (IpiTarget, IpiKind) {
 /// An emulated local APIC in xAPIC (MMIO) mode, for one vCPU: task and
 /// processor priority, IRR/ISR, EOI, the spurious-vector enable, and the
 /// timer in one-shot and periodic modes. Put it on the vCPU's MMIO bus at
-/// `0xfee0_0000` ([`LAPIC_WINDOW`] bytes) and hand an SVM vCPU
-/// [`acknowledge`](Self::acknowledge) with `connect_intr`.
+/// `0xfee0_0000` ([`LAPIC_WINDOW`] bytes) and connect it to its x86 vCPU
+/// with `connect_lapic` ([`SvmVcpu`](crate::x86::svm::SvmVcpu::connect_lapic),
+/// [`VmxVcpu`](crate::x86::vmx::VmxVcpu::connect_lapic)), which takes
+/// interrupts with [`acknowledge`](Self::acknowledge) and makes the guest's
+/// `CR8` the task priority ([`tpr`](Self::tpr), [`set_tpr`](Self::set_tpr)).
 ///
 /// The timer counts at `timer_hz` (before the divide configuration) in host
 /// time from a nanosecond clock, computed when read; deliver its
@@ -310,6 +313,37 @@ impl VirtualLapic {
         s.isr.set(v);
         self.update(&s);
         Some(v)
+    }
+
+    /// The task-priority register. A 64-bit guest's `CR8` is its bits 7:4,
+    /// which the x86 vCPUs keep in step with it
+    /// ([`SvmVcpu::connect_lapic`](crate::x86::svm::SvmVcpu::connect_lapic),
+    /// [`VmxVcpu::connect_lapic`](crate::x86::vmx::VmxVcpu::connect_lapic)).
+    pub fn tpr(&self) -> u8 {
+        self.state.lock().tpr
+    }
+
+    /// Sets the task-priority register (a guest `MOV CR8` writes `cr8 << 4`):
+    /// raising it can hold back the pending interrupt, lowering it can let
+    /// one through, and the output follows.
+    pub fn set_tpr(&self, tpr: u8) {
+        let mut s = self.state.lock();
+        s.tpr = tpr;
+        self.update(&s);
+    }
+
+    /// The priority class (vector bits 7:4) of the highest pending interrupt
+    /// if only the task priority holds it back: lowering the TPR below this
+    /// class delivers it. `None` if nothing is pending, it is deliverable, or
+    /// an interrupt in service blocks it as well.
+    pub fn tpr_blocked(&self) -> Option<u8> {
+        let s = self.state.lock();
+        if s.svr & SVR_ENABLE == 0 {
+            return None;
+        }
+        let class = s.irr.highest()? >> 4;
+        let isr = s.isr.highest().map_or(0, |v| v >> 4);
+        (class > isr && class <= s.tpr >> 4).then_some(class)
     }
 
     /// Whether this APIC has an interrupt for the CPU.
@@ -514,6 +548,25 @@ mod tests {
         assert_eq!(r.r(ISR + 0x20), 1 << 1, "ISR word 2 bit 1 = vector 0x41");
         r.w(EOI, 0);
         assert_eq!(r.apic.acknowledge(), None);
+    }
+
+    #[test]
+    fn task_priority_from_outside() {
+        let r = rig();
+        r.w(SVR, 0x1ff);
+        r.apic.deliver(0x52);
+        assert!(r.line());
+        assert_eq!(r.apic.tpr_blocked(), None, "deliverable");
+        r.apic.set_tpr(0x60);
+        assert!(!r.line(), "CR8 6 holds back 0x52");
+        assert_eq!((r.apic.tpr(), r.r(TPR)), (0x60, 0x60));
+        assert_eq!(r.apic.tpr_blocked(), Some(5), "lowering CR8 below 5 delivers it");
+        r.apic.set_tpr(0x40);
+        assert!(r.line());
+        assert_eq!(r.apic.acknowledge(), Some(0x52));
+        r.apic.deliver(0x51);
+        r.apic.set_tpr(0x60);
+        assert_eq!(r.apic.tpr_blocked(), None, "0x52 in service blocks 0x51 as well");
     }
 
     #[test]

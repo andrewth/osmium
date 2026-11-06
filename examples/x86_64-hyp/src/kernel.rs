@@ -22,7 +22,7 @@ use osmium::virt::devices::{
 };
 use osmium::virt::smp::GuestCpus;
 use osmium::virt::x86::pc::{PcBoot, pvh_entry};
-use osmium::virt::{Bus, BusDevice, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
+use osmium::virt::{Bus, BusDevice, GuestMemory, GuestPhysAddr, Vcpu, VmExit, run_vcpu};
 
 use crate::{FRAMES, HOST_APIC_IDS, KICK_VECTOR, LAPIC, clock};
 
@@ -142,9 +142,8 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
             v.set_application_processor();
         }
-        let a = apic.clone();
-        v.connect_intr(move || a.acknowledge());
-        v.attach(&vm.cpus, me);
+        v.connect_lapic(apic.clone());
+        vm.cpus.attach(me, &mut v);
         let poll = |vm: &KernelVm| {
             apic.poll();
             if me == 0 {
@@ -162,7 +161,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
                     }
                     // Idle in hlt: wait for an interrupt, polling the timers.
                     poll(vm);
-                    if v.interrupt_pending() {
+                    if v.interrupt_pending(0) {
                         break ControlFlow::Continue(());
                     }
                     if vm.run.done() {
@@ -247,7 +246,11 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
 
     let run = Arc::new(GuestRun::new(ncpus));
     let cpus = GuestCpus::with_kick(ncpus, |host| {
-        LAPIC.get().expect("LAPIC initialised").send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
+        LAPIC
+            .get()
+            .expect("LAPIC initialised")
+            .send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR)
+            .expect("kick IPI accepted by the local APIC");
     });
     // Interrupt routing: COM1 -> I/O APIC -> the destination's local APIC.
     let apics: Arc<[Once<Arc<VirtualLapic>>; MAX_CPUS]> = Arc::new([const { Once::new() }; MAX_CPUS]);

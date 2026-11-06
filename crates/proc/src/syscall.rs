@@ -373,9 +373,9 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
             return Outcome::Exit(ExitStatus::Code(a[0] as i32));
         }
         Sys::Read => read(p, fd, a[1], a[2]),
-        Sys::Write => write(p, fd, a[1], a[2]),
+        Sys::Write => write(p, fd, a[1], a[2]).inspect_err(|&e| sigpipe(p, th, fd, e)),
         Sys::Readv => readv(p, fd, a[1], a[2]),
-        Sys::Writev => writev(p, fd, a[1], a[2]),
+        Sys::Writev => writev(p, fd, a[1], a[2]).inspect_err(|&e| sigpipe(p, th, fd, e)),
         Sys::Openat => openat(p, fd, a[1], a[2], a[3] as u32),
         Sys::Close => p.files().lock().close(fd).map(|()| 0),
         Sys::Lseek => lseek(p, fd, a[1] as i64, a[2]),
@@ -425,24 +425,32 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Accept => crate::socket::accept(p, fd, a[1], a[2], 0),
         Sys::Accept4 => crate::socket::accept(p, fd, a[1], a[2], a[3]),
         Sys::Connect => crate::socket::connect(p, fd, a[1], a[2]),
-        Sys::Sendto => crate::socket::sendto(p, fd, a[1], a[2], a[3], a[4], a[5]),
+        Sys::Sendto => crate::socket::sendto(p, fd, a[1], a[2], a[3], a[4], a[5]).inspect_err(|&e| {
+            if a[3] & crate::socket::MSG_NOSIGNAL == 0 {
+                sigpipe(p, th, fd, e)
+            }
+        }),
         Sys::Recvfrom => crate::socket::recvfrom(p, fd, a[1], a[2], a[3], a[4], a[5]),
         Sys::Shutdown => crate::socket::shutdown(p, fd, a[1]),
         Sys::Getsockname => crate::socket::getsockname(p, fd, a[1], a[2]),
         Sys::Getpeername => crate::socket::getpeername(p, fd, a[1], a[2]),
         Sys::Setsockopt => crate::socket::setsockopt(p, fd, a[1], a[2], a[3], a[4]),
         Sys::Getsockopt => crate::socket::getsockopt(p, fd, a[1], a[2], a[3], a[4]),
-        Sys::Sendmsg => crate::socket::sendmsg(p, fd, a[1], a[2]),
+        Sys::Sendmsg => crate::socket::sendmsg(p, fd, a[1], a[2]).inspect_err(|&e| {
+            if a[2] & crate::socket::MSG_NOSIGNAL == 0 {
+                sigpipe(p, th, fd, e)
+            }
+        }),
         Sys::Recvmsg => crate::socket::recvmsg(p, fd, a[1], a[2]),
         Sys::Socketpair => crate::socket::socketpair(p, a[0], a[1], a[2], a[3]),
         Sys::Pipe2 => crate::pipe::pipe2(p, a[0], a[1]),
         #[cfg(target_arch = "x86_64")]
         Sys::Pipe => crate::pipe::pipe2(p, a[0], 0),
-        Sys::Ppoll => crate::poll::ppoll(p, a[0], a[1], a[2], a[3], a[4]),
-        Sys::Pselect6 => crate::poll::pselect6(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        Sys::Ppoll => crate::poll::ppoll(p, th, a[0], a[1], a[2], a[3], a[4]),
+        Sys::Pselect6 => crate::poll::pselect6(p, th, a[0], a[1], a[2], a[3], a[4], a[5]),
         Sys::EpollCreate1 => crate::epoll::create1(p, a[0]),
         Sys::EpollCtl => crate::epoll::ctl(p, fd, a[1], a[2] as i32, a[3]),
-        Sys::EpollPwait => crate::epoll::pwait(p, fd, a[1], a[2], a[3], a[4], a[5]),
+        Sys::EpollPwait => crate::epoll::pwait(p, th, fd, a[1], a[2], a[3], a[4], a[5]),
         #[cfg(target_arch = "x86_64")]
         Sys::Poll => crate::poll::poll(p, a[0], a[1], a[2]),
         #[cfg(target_arch = "x86_64")]
@@ -552,10 +560,7 @@ fn write(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
         let n = match bytes::slice(&kbuf, 0, want).and_then(|k| f.write(k)) {
             Ok(n) => n,
             Err(_) if done > 0 => break,
-            Err(e) => {
-                sigpipe(p, &f, e);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
         done += n as u64;
         if n < want {
@@ -565,10 +570,18 @@ fn write(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
     Ok(done)
 }
 
-/// Raises `SIGPIPE` when a write to a pipe found no reader.
-fn sigpipe(p: &Process, f: &OpenFile, e: Errno) {
-    if e == Errno::EPIPE && crate::pipe::is_writer(f.file()) {
-        let _ = crate::signal::send(p, crate::signal::sig::SIGPIPE, p.pid());
+/// Raises `SIGPIPE` in the calling thread, as Linux does, when a write to
+/// a pipe found no reader or one to a stream socket (TCP, Unix stream or
+/// seqpacket) found the connection shut: the write failed with `EPIPE`. A
+/// datagram socket's `EPIPE` raises nothing. `send` with `MSG_NOSIGNAL`
+/// does not call this.
+fn sigpipe(p: &Process, th: &Thread, fd: i32, e: Errno) {
+    if e != Errno::EPIPE {
+        return;
+    }
+    let Ok(f) = p.files().lock().get(fd) else { return };
+    if crate::pipe::is_writer(f.file()) || crate::socket::is_stream(f.file()) {
+        let _ = crate::signal::send_to_thread(p, th, crate::signal::sig::SIGPIPE, p.pid());
     }
 }
 
@@ -622,10 +635,7 @@ fn writev(p: &Process, fd: i32, iov: u64, count: u64) -> SysResult {
                     pending.clear();
                     return Ok(false);
                 }
-                Err(e) => {
-                    sigpipe(p, &f, e);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         };
         *total += n as u64;
@@ -765,7 +775,7 @@ fn openat(p: &Process, dirfd: i32, path: u64, flags: u64, mode: u32) -> SysResul
     if access.write && file.try_stat()?.kind == FileKind::Directory {
         return Err(Errno::EISDIR);
     }
-    let open = OpenFile::try_with_path(file, access, path)?;
+    let open = OpenFile::try_opened(file, access, path, flags as u32)?;
     p.files().lock().insert_from(0, open, flags & oflag::CLOEXEC != 0).map(|fd| fd as u64)
 }
 
@@ -836,7 +846,14 @@ fn put_stat(p: &Process, buf: u64, st: &Stat) -> SysResult {
     Ok(0)
 }
 
+/// Most bytes one `getdents64` call returns. The entries are gathered in a
+/// kernel buffer before they are copied out, so the caller's buffer size
+/// alone must not decide how much kernel memory that takes; a program reads
+/// a large directory in several calls anyway.
+const GETDENTS_MAX: u64 = 64 * 1024;
+
 fn getdents64(p: &Process, fd: i32, buf: u64, len: u64) -> SysResult {
+    let len = len.min(GETDENTS_MAX);
     let f = p.files().lock().get(fd)?;
     let st = f.file().try_stat()?;
     let mut out = alloc::vec::Vec::new();
@@ -1171,12 +1188,14 @@ fn fcntl(p: &Process, fd: i32, cmd: u64, arg: u64) -> SysResult {
                 _ => 0,
             };
             Ok(mode
-                | if a.append { oflag::APPEND } else { 0 }
+                | u64::from(f.status_flags())
                 | crate::socket::status_flags(f.file())
                 | crate::pipe::status_flags(f.file()))
         }
-        // Only a socket's or pipe's O_NONBLOCK can be changed so far.
+        // The flags Linux lets a program change: `O_APPEND`, `O_NONBLOCK`,
+        // `O_ASYNC`, `O_DIRECT` and `O_NOATIME`. The rest are ignored.
         F_SETFL => {
+            f.set_status_flags(arg as u32);
             crate::socket::set_status_flags(f.file(), arg);
             crate::pipe::set_status_flags(f.file(), arg);
             Ok(0)
@@ -1259,8 +1278,14 @@ pub fn handle(frame: &mut TrapFrame) -> Option<ExitStatus> {
             let resume = platform.resume;
             // The child continues with the parent's FP registers.
             let fp = osmium_sched::current_fp_state();
+            let leader = child.leader();
             let spawned =
-                child.try_spawn_with_fp(osmium_sched::TaskBuilder::new(child.name()), fp, move || resume(regs));
+                child.try_spawn_with_fp(osmium_sched::TaskBuilder::new(child.name()), fp, leader.clone(), move || {
+                    resume(regs)
+                });
+            if let Ok(task) = &spawned {
+                leader.ext.bind(task);
+            }
             if spawned.is_err() {
                 // `fork` registered the child, but it will never run.
                 p.forget_child(child.pid());

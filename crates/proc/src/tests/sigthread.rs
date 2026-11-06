@@ -8,7 +8,10 @@ use super::*;
 use crate::futex;
 use crate::signal::{self, SIG_IGN, SigAction, sa, sig::*};
 use crate::thread::{self, Thread};
-use crate::uregs::{NREGS, UserRegs};
+use crate::uregs::{RISCV64_FRAME, SigFrame, UserRegs, X86_64_FRAME, set_word, word as mc_word};
+
+/// General registers of the test register file besides `pc` and `sp`.
+pub(super) const NREGS: usize = 30;
 
 const EINVAL: i64 = -(Errno::EINVAL.0 as i64);
 const ESRCH: i64 = -3;
@@ -42,9 +45,18 @@ impl<const S: bool> Regs<S> {
     }
 }
 
+impl<const S: bool> Regs<S> {
+    /// Everything `rt_sigreturn` restores.
+    pub(super) fn snapshot(&self) -> ([u64; NREGS], u64, u64) {
+        (self.gp, self.pc, self.sp)
+    }
+}
+
 impl<const S: bool> UserRegs for Regs<S> {
     const RED_ZONE: u64 = if S { 128 } else { 0 };
-    const RET_ON_STACK: bool = S;
+    /// x86_64's frame for the register file that returns through the stack,
+    /// RISC-V's for the other.
+    const FRAME: SigFrame = if S { X86_64_FRAME } else { RISCV64_FRAME };
 
     fn user_pc(&self) -> u64 {
         self.pc
@@ -65,14 +77,18 @@ impl<const S: bool> UserRegs for Regs<S> {
     fn set_tls(&mut self, tls: u64) {
         self.tls = tls;
     }
-    fn save_user(&self) -> [u64; NREGS] {
-        let mut s = self.gp;
-        (s[0], s[1]) = (self.pc, self.sp);
-        s
+    fn save_mcontext(&self, mc: &mut [u8], _fault: u64, _mask: u64) {
+        set_word(mc, 0, self.pc);
+        set_word(mc, 1, self.sp);
+        for (i, &r) in self.gp.iter().enumerate() {
+            set_word(mc, 2 + i, r);
+        }
     }
-    fn restore_user(&mut self, s: &[u64; NREGS]) {
-        self.gp = *s;
-        (self.pc, self.sp) = (s[0], s[1]);
+    fn restore_mcontext(&mut self, mc: &[u8]) {
+        (self.pc, self.sp) = (mc_word(mc, 0), mc_word(mc, 1));
+        for (i, r) in self.gp.iter_mut().enumerate() {
+            *r = mc_word(mc, 2 + i);
+        }
     }
     fn enter_handler(&mut self, pc: u64, sp: u64, ra: u64, args: [u64; 3]) {
         (self.pc, self.sp, self.ra, self.args) = (pc, sp, ra, args);
@@ -179,17 +195,25 @@ fn handler_runs_and_returns<const S: bool>() {
     call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
     assert_eq!(signal::deliver_to(&p, &th, &mut regs), None);
     assert_eq!(regs.pc, HANDLER);
-    let base = regs.args[1];
-    assert_eq!(regs.args[0], SIGUSR1 as u64);
-    assert_eq!(regs.args[2], base + 128);
-    assert_eq!(base % 16, 0);
-    assert!(base < STACK - if S { 128 } else { 0 }, "below the red zone");
-    assert_eq!(regs.sp, if S { base - 8 } else { base });
+    // Linux's rt_sigframe: on x86_64 `pretcode`, `ucontext` at 8 and
+    // `siginfo` at 312, the frame 8 below a 16-byte boundary; elsewhere
+    // `siginfo`, then `ucontext` at 128, the frame 16-byte aligned.
+    let frame = regs.sp;
+    let (info, uc) = if S { (frame + 312, frame + 8) } else { (frame, frame + 128) };
+    assert_eq!(regs.args, [SIGUSR1 as u64, info, uc]);
+    assert_eq!(frame % 16, if S { 8 } else { 0 });
+    assert!(frame + if S { 440 } else { 1088 } <= STACK - if S { 128 } else { 0 }, "below the red zone");
     assert_eq!(th.signal_mask(), bit(SIGUSR1) | bit(SIGUSR2), "the signal and the action's mask are blocked");
-    let siginfo = get(&p, base, 24);
+    let siginfo = get(&p, info, 24);
     assert_eq!(i32::from_ne_bytes(siginfo[..4].try_into().unwrap()), SIGUSR1 as i32);
-    assert_eq!(u64::from_ne_bytes(siginfo[16..24].try_into().unwrap()), p.pid().0 as u64, "si_pid");
-    let tramp = if S { word(&p, base - 8) } else { regs.ra };
+    assert_eq!(i32::from_ne_bytes(siginfo[8..12].try_into().unwrap()), 0, "SI_USER");
+    assert_eq!(u64::from_ne_bytes(siginfo[16..24].try_into().unwrap()), p.pid().0 as u64, "si_pid, si_uid 0");
+    // uc_sigmask (x86_64: after the 256-byte sigcontext; elsewhere at 40) is the mask to return to.
+    let sigmask = if S { uc + 296 } else { uc + 40 };
+    assert_eq!(word(&p, sigmask), 0);
+    assert_eq!(word(&p, uc + 16), 0, "uc_stack.ss_sp");
+    assert_eq!(get(&p, uc + 24, 4), 2i32.to_ne_bytes(), "no alternate stack: SS_DISABLE");
+    let tramp = if S { word(&p, frame) } else { regs.ra };
     assert!((0x100_0000..0x110_0000).contains(&tramp), "the return address is the trampoline in the mmap area");
 }
 
@@ -204,7 +228,7 @@ fn sigreturn_restores_registers_and_mask() {
     let (p, _) = process("sig-return");
     let th = p.leader();
     let mut regs = Regs::<true>::new();
-    let before = regs.save_user();
+    let before = regs.snapshot();
     assert_eq!(sigaction(&p, SIGUSR1, handler(0, 0)), 0);
     call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
     assert_eq!(signal::deliver_to(&p, &th, &mut regs), None);
@@ -222,7 +246,7 @@ fn sigreturn_restores_registers_and_mask() {
     let frame_sp = regs.sp;
     assert_eq!(signal::sigreturn(&p, &th, &mut regs), None);
     // ...and the interrupted code sees its registers again, with the old mask.
-    assert_eq!(regs.save_user(), before);
+    assert_eq!(regs.snapshot(), before);
     assert_eq!(regs.sp, STACK);
     assert_eq!(th.signal_mask(), 0);
     assert_ne!(frame_sp, STACK);
@@ -277,10 +301,12 @@ fn a_handler_the_cpu_cannot_return_to_ends_the_process() {
     assert_eq!(sigaction(&p, SIGUSR1, handler(0, 0)), 0);
     call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
     assert_eq!(signal::deliver_to(&p, &th, &mut regs), None);
-    let frame = regs.sp + 8;
-    // The saved pc is the first register word after the mask.
-    put(&p, frame + 136, &0xffff_8000_0000_0000u64.to_ne_bytes());
-    regs.sp = frame;
+    // `rt_sigreturn` comes with the stack pointer at the `ucontext`, past the
+    // popped `pretcode`; the test register file saves its pc first in
+    // `uc_mcontext`, 40 bytes in.
+    let uc = regs.sp + 8;
+    put(&p, uc + 40, &0xffff_8000_0000_0000u64.to_ne_bytes());
+    regs.sp = uc;
     assert_eq!(signal::sigreturn(&p, &th, &mut regs), Some(ExitStatus::Signal(11)));
 }
 
@@ -536,7 +562,7 @@ fn futex_wait_and_wake() {
     assert_eq!(sigaction(&p, SIGUSR1, handler(0, 0)), 0);
     call(&p, Sys::Kill, &[p.pid().0 as u64, SIGUSR1 as u64]);
     assert_eq!(callt(&p, &th, Sys::Futex, &[addr, 0, 7, 0]), EINTR);
-    assert!(futex::wake(p.pid(), addr, 10) == 0, "an interrupted waiter leaves the queue");
+    assert!(futex::wake(&p, addr, 10) == 0, "an interrupted waiter leaves the queue");
 }
 
 #[test]

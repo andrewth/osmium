@@ -405,3 +405,86 @@ fn efer_rules_and_32_bit_paging_dr_access() {
     assert!(v.reflect(exit::DR_READ));
     assert_eq!((v.regs.rbx, v.rip()), (0, 0x40_0004));
 }
+
+#[test]
+fn legacy_paging_is_walked() {
+    let (ram, mem) = crate::x86::tests::ram(0x10000);
+    crate::x86::tests::legacy_tables(&mem);
+    let mut v = vcpu().with_memory(Arc::new(mem));
+    v.write64(vmcb::CR0, 0x8000_0011);
+    v.write64(vmcb::CR3, 0x1000);
+    assert_eq!(v.translate(0x3abc), Some(0x7abc), "32-bit paging");
+    v.write64(vmcb::CR3, 0x3000);
+    v.write64(vmcb::CR4, 1 << 5);
+    assert_eq!(v.translate(0x4000_2abc), Some(0x8abc), "PAE paging");
+    drop(v);
+    drop(ram);
+}
+
+#[test]
+fn monitor_and_mwait_raise_ud() {
+    let mut v = vcpu();
+    let misc2 = v.read64(vmcb::INTERCEPT_MISC2) as u32;
+    assert_eq!(misc2 & (1 << 10 | 1 << 11 | 1 << 12), 1 << 10 | 1 << 11 | 1 << 12, "intercepted");
+    for code in [exit::MONITOR, exit::MWAIT, exit::MWAIT_CONDITIONAL] {
+        assert!(v.reflect(code));
+        assert_eq!(v.pending_exception.take(), Some(6 | 3 << 8 | EVENT_VALID), "#UD for {code:#x}");
+    }
+}
+
+/// A nested fault on guest RAM (a page the host took out of the nested
+/// tables) is not MMIO: emulating it would hand the guest all ones.
+#[test]
+fn nested_fault_on_guest_ram_is_not_mmio() {
+    let (ram, mem) = crate::x86::tests::ram(0x20_0000);
+    // mov %al, (%ebx) at the reset RIP.
+    mem.write(GuestPhysAddr(0x10_0000), &[0x88, 0x03]).unwrap();
+    let mut v = vcpu().with_memory(Arc::new(mem));
+    v.write64(vmcb::EXITCODE, exit::NPF);
+    v.write64(vmcb::EXITINFO1, 0b110);
+    v.write64(vmcb::EXITINFO2, 0x1_5000);
+    assert_eq!(v.classify(), VmExit::Unhandled { reason: exit::NPF });
+    assert_eq!(v.rip(), 0x10_0000, "not stepped past");
+    v.write64(vmcb::EXITINFO2, 0xfed0_0000);
+    assert!(matches!(v.classify(), VmExit::MmioWrite { .. }), "outside RAM it is MMIO");
+    drop(v);
+    drop(ram);
+}
+
+/// The guest's CR8 (V_TPR) and the local APIC's TPR are one register.
+#[test]
+fn cr8_is_the_apic_task_priority() {
+    use crate::bus::BusDevice;
+    use crate::devices::VirtualLapic;
+    let mut v = vcpu();
+    let line = v.irq_line();
+    let l = line.clone();
+    let apic = Arc::new(VirtualLapic::new(0, 1_000_000, || 0, move |lvl| l.store(lvl, Ordering::SeqCst)));
+    apic.write(0xf0, &0x1ffu32.to_le_bytes()); // software-enable
+    v.connect_lapic(apic.clone());
+    v.write64(vmcb::RFLAGS, 2 | RFLAGS_IF);
+    // The guest raises CR8 to 6 (no exit): the next exit carries it over.
+    let vi = v.read64(vmcb::V_INTR);
+    v.write64(vmcb::V_INTR, vi & !0xf | 6);
+    v.tpr_from_guest();
+    assert_eq!(apic.tpr(), 0x60);
+    // 0x52 is held back by the task priority: no injection, but an exit is
+    // asked for when the guest's V_TPR drops below class 5.
+    apic.deliver(0x52);
+    assert!(!line.load(Ordering::SeqCst));
+    v.prepare_interrupts();
+    assert_eq!(v.read64(vmcb::EVENTINJ), 0);
+    let vi = v.read64(vmcb::V_INTR);
+    assert_eq!((vi & 1 << 8 != 0, vi >> 16 & 0xf, vi & 0xf), (true, 5, 6), "V_IRQ at priority 5 over V_TPR 6");
+    assert_ne!(v.intercepts() & INTERCEPT_VINTR, 0);
+    // The guest lowers CR8 to 4; the VINTR exit delivers 0x52.
+    v.write64(vmcb::V_INTR, vi & !0xf | 4);
+    v.tpr_from_guest();
+    assert!(line.load(Ordering::SeqCst));
+    v.prepare_interrupts();
+    assert_eq!(v.read64(vmcb::EVENTINJ), 0x52 | EVENT_VALID);
+    // A TPR the guest writes through the APIC's MMIO window is its CR8 at the next entry.
+    apic.write(0x80, &0x90u32.to_le_bytes());
+    v.prepare_interrupts();
+    assert_eq!(v.read64(vmcb::V_INTR) & 0xf, 9);
+}

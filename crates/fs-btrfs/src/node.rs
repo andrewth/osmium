@@ -16,6 +16,11 @@ pub const PTR: usize = Key::SIZE + 16;
 
 /// `BTRFS_HEADER_FLAG_WRITTEN` and the mixed back reference revision.
 const FLAGS: u64 = 1 | 1 << 56;
+/// Where a block's header keeps its flags.
+const FLAGS_AT: usize = 56;
+/// `BTRFS_HEADER_FLAG_RELOC`: a relocation (Linux's balance) wrote the block,
+/// and it may be shared whatever its generation.
+pub const FLAG_RELOC: u64 = 1 << 1;
 
 /// One item of a leaf.
 pub struct Item {
@@ -54,6 +59,9 @@ pub struct TNode {
     pub level: u8,
     /// The generation it was last written in.
     pub generation: u64,
+    /// Whether its header has [`FLAG_RELOC`]. It is never written: a copy
+    /// does not have it.
+    pub reloc: bool,
     /// Its items or pointers.
     pub body: Body,
 }
@@ -88,7 +96,8 @@ impl TNode {
             }
             Body::Node(ptrs)
         };
-        Ok(TNode { addr: le64(b, header::BYTENR)?, owner: le64(b, 88)?, level, generation: le64(b, 80)?, body })
+        let reloc = le64(b, FLAGS_AT)? & FLAG_RELOC != 0;
+        Ok(TNode { addr: le64(b, header::BYTENR)?, owner: le64(b, 88)?, level, generation: le64(b, 80)?, reloc, body })
     }
 
     /// Encodes the block for writing: header, items or pointers, checksum.
@@ -106,7 +115,7 @@ impl TNode {
         };
         put(&mut b, header::FSID, fsid)?;
         put(&mut b, header::BYTENR, &self.addr.to_le_bytes())?;
-        put(&mut b, 56, &FLAGS.to_le_bytes())?;
+        put(&mut b, FLAGS_AT, &FLAGS.to_le_bytes())?;
         put(&mut b, 64, chunk_uuid)?;
         put(&mut b, 80, &self.generation.to_le_bytes())?;
         put(&mut b, 88, &self.owner.to_le_bytes())?;

@@ -24,6 +24,7 @@ const END_NODE: u32 = 2;
 const PROP: u32 = 3;
 const NOP: u32 = 4;
 const END: u32 = 9;
+/// How deeply [`Fdt::all_nodes`] tracks nesting. Real trees are under ten levels deep.
 const MAX_DEPTH: usize = 32;
 
 /// Why a blob is not a usable device tree.
@@ -130,9 +131,10 @@ impl<'src> Fdt<'src> {
         Some(node)
     }
 
-    /// Every node, depth-first.
+    /// Every node, depth-first. A node nested more than 32 levels below the root is skipped with all of its
+    /// subtree, and the walk carries on with what follows it; [`AllNodes::skipped`] counts such nodes.
     pub fn all_nodes(&self) -> AllNodes<'src> {
-        AllNodes { fdt: *self, off: self.root().begin, stack: [Cells::ROOT; MAX_DEPTH], depth: 0 }
+        AllNodes { fdt: *self, off: self.root().begin, stack: [Cells::ROOT; MAX_DEPTH], depth: 0, deep: 0, skipped: 0 }
     }
 
     /// The first node compatible with any of `compatible`.
@@ -187,6 +189,9 @@ impl<'src> Fdt<'src> {
     /// the map runs out of room, it gives up detail or RAM as
     /// [`MemoryMap::add_lossy`] describes; the result is the number of usable
     /// bytes dropped, worth logging if not zero.
+    ///
+    /// RAM is found by [`all_nodes`](Self::all_nodes), so a memory node nested more than 32 levels deep
+    /// (which no real tree has) is not seen; one after a too-deep subtree is.
     ///
     /// Dynamic `/reserved-memory` children (a `size` but no `reg`) ask the OS
     /// to allocate a pool, for drivers that want one; firmware uses no memory
@@ -447,6 +452,16 @@ pub struct AllNodes<'src> {
     /// Child cells of each open ancestor.
     stack: [Cells; MAX_DEPTH],
     depth: usize,
+    /// How many levels of a too-deep subtree are open below `depth`.
+    deep: usize,
+    skipped: usize,
+}
+
+impl AllNodes<'_> {
+    /// How many nodes so far were nested too deeply to visit.
+    pub fn skipped(&self) -> usize {
+        self.skipped
+    }
 }
 
 impl<'src> Iterator for AllNodes<'src> {
@@ -459,13 +474,25 @@ impl<'src> Iterator for AllNodes<'src> {
                     let parent_cells =
                         self.depth.checked_sub(1).and_then(|d| self.stack.get(d)).copied().unwrap_or(Cells::ROOT);
                     let node = Node { fdt: self.fdt, begin: self.off, parent_cells };
-                    *self.stack.get_mut(self.depth)? = node.child_cells();
-                    self.depth += 1;
                     self.off = node.props_start();
-                    return Some(node);
+                    match self.stack.get_mut(self.depth) {
+                        Some(slot) if self.deep == 0 => {
+                            *slot = node.child_cells();
+                            self.depth += 1;
+                            return Some(node);
+                        }
+                        // Too deep to track its ancestors' cells: step over it and its children.
+                        _ => {
+                            self.deep += 1;
+                            self.skipped += 1;
+                        }
+                    }
                 }
                 END_NODE => {
-                    self.depth = self.depth.checked_sub(1)?;
+                    match self.deep.checked_sub(1) {
+                        Some(d) => self.deep = d,
+                        None => self.depth = self.depth.checked_sub(1)?,
+                    }
                     self.off += 4;
                 }
                 PROP => self.off = self.fdt.prop_at(self.off)?.1,

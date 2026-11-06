@@ -217,6 +217,36 @@ mod tests {
         assert_eq!(d(&[0x8b, 0x05, 0x10, 0, 0, 0], 64).len, 6);
     }
 
+    /// Real-mode and 16-bit protected-mode code: 16-bit operands and
+    /// ModRM addressing by default, 32-bit ones with the 66/67 prefixes.
+    #[test]
+    fn sixteen_bit_code() {
+        // mov [bx+si], ax: a word by default
+        let a = d(&[0x89, 0x00], 16);
+        assert_eq!((a.store, a.size, a.operand, a.len), (true, 2, Operand::Reg(0), 2));
+        // mov eax, [bx+0x10] with 66: a dword
+        assert_eq!(d(&[0x66, 0x8b, 0x47, 0x10], 16).size, 4);
+        // mov al, [0x1234]: mod 0, rm 6 is disp16 alone
+        let a = d(&[0x8a, 0x06, 0x34, 0x12], 16);
+        assert_eq!((a.store, a.size, a.len), (false, 1, 4));
+        // mov word [bp+di+0x1234], 0x5678: disp16 then imm16
+        let a = d(&[0xc7, 0x83, 0x34, 0x12, 0x78, 0x56], 16);
+        assert_eq!((a.operand, a.len), (Operand::Imm(0x5678), 6));
+        // mov ax, [0xb800]: moffs16
+        let a = d(&[0xa1, 0x00, 0xb8], 16);
+        assert_eq!((a.store, a.size, a.len), (false, 2, 3));
+        // mov [eax + ecx*2], cx with 67: 32-bit addressing, with a SIB byte
+        let a = d(&[0x67, 0x89, 0x0c, 0x48], 16);
+        assert_eq!((a.size, a.operand, a.len), (2, Operand::Reg(1), 4));
+        // movzx eax, byte [si] with 66: a dword destination
+        let a = d(&[0x66, 0x0f, 0xb6, 0x04], 16);
+        assert_eq!((a.size, a.dest_size, a.len), (1, 4, 4));
+        // test byte [di], 1
+        let a = d(&[0xf6, 0x05, 0x01], 16);
+        assert_eq!((a.test, a.size, a.operand, a.len), (true, 1, Operand::Imm(1), 3));
+        assert_eq!(decode(&[0x8a, 0x06, 0x34], 16), None, "truncated disp16");
+    }
+
     #[test]
     fn rejected() {
         assert_eq!(decode(&[0x89, 0xc3], 32), None, "mov ebx, eax");

@@ -49,7 +49,10 @@ impl TrapFrame {
         self.status & SPP_OR_MPP == 0
     }
 
-    /// System-call argument registers `a0`..=`a7`.
+    /// System-call argument registers `a0`..=`a7`; under the Linux ABI the
+    /// last element (`a7`) is the call number. (AArch64 returns `x0..=x7`
+    /// and leaves the number in `x8`; x86_64 returns seven values with the
+    /// number first. See `syscall_args` on each frame.)
     pub fn syscall_args(&self) -> [u64; 8] {
         let [_, _, _, _, _, _, _, _, _, _, a0, a1, a2, a3, a4, a5, a6, a7, ..] = self.x;
         [a0, a1, a2, a3, a4, a5, a6, a7]

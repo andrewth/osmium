@@ -8,11 +8,15 @@
 //!
 //! Port 0 implements [`SerialPort`], so `SerialConsole::new(console)` makes it
 //! the global console. Reads never block; writes are synchronous (the driver
-//! polls the transmit queue for completion, at most [`POLL_LIMIT`] times).
+//! polls the transmit queue for completion, at most [`POLL_LIMIT`] times per
+//! request). Each write is one request per 512 bytes, and
+//! `SerialConsole` passes text a line at a time, so a line costs one device
+//! round trip, made with interrupts off under the console's lock.
 //!
-//! Not supported: `VIRTIO_CONSOLE_F_EMERG_WRITE` (it needs a configuration
-//! space write, which [`Transport`] does not offer); port names are read and
-//! ignored.
+//! With `VIRTIO_CONSOLE_F_EMERG_WRITE`, [`VirtioConsole::emergency_write`]
+//! writes a byte to port 0 through the configuration space instead, without
+//! queues (for panic output when the queues may be broken). Port names are
+//! read and ignored.
 
 use core::mem::ManuallyDrop;
 
@@ -20,12 +24,14 @@ use osmium_hal::dma::{DmaAllocator, OwnedDma};
 use osmium_hal::serial::SerialPort;
 
 use super::queue::{Segment, VirtQueue};
-use super::{DeviceType, POLL_LIMIT, Transport, VirtioError, driver_ok, negotiate, reset};
+use super::{DeviceType, POLL_LIMIT, Transport, VirtioError, config_consistent, driver_ok, negotiate, reset};
 
 /// Feature: the configuration space holds the console size.
 pub const F_SIZE: u64 = 1 << 0;
 /// Feature: multiple ports and a control queue pair.
 pub const F_MULTIPORT: u64 = 1 << 1;
+/// Feature: emergency writes through the configuration space.
+pub const F_EMERG_WRITE: u64 = 1 << 2;
 
 /// Configuration space: columns (u16).
 pub const CONFIG_COLS: usize = 0;
@@ -33,6 +39,8 @@ pub const CONFIG_COLS: usize = 0;
 pub const CONFIG_ROWS: usize = 2;
 /// Configuration space: `max_nr_ports` (u32).
 pub const CONFIG_MAX_PORTS: usize = 4;
+/// Configuration space: `emerg_wr` (u32, write-only).
+pub const CONFIG_EMERG_WR: usize = 8;
 
 /// Control events (`VIRTIO_CONSOLE_*`).
 pub mod event {
@@ -210,6 +218,8 @@ pub struct VirtioConsole<'d, T: Transport, D: DmaAllocator + ?Sized> {
     // Freed in `drop` only once the device has acknowledged its reset.
     inner: ManuallyDrop<Inner<'d, D>>,
     num_ports: usize,
+    /// `VIRTIO_CONSOLE_F_EMERG_WRITE` was negotiated.
+    emergency: bool,
 }
 
 impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioConsole<'d, T, D> {
@@ -223,18 +233,17 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioConsole<'d, T, D> {
         if transport.device_type() != DeviceType::Console {
             return Err(VirtioError::WrongDevice);
         }
-        let features = negotiate(&transport, 0, F_SIZE | F_MULTIPORT)?;
+        let features = negotiate(&transport, 0, F_SIZE | F_MULTIPORT | F_EMERG_WRITE)?;
         let multiport = features & F_MULTIPORT != 0;
-        let num_ports = if multiport {
-            let n = u32::from(transport.config_read16(CONFIG_MAX_PORTS))
-                | u32::from(transport.config_read16(CONFIG_MAX_PORTS + 2)) << 16;
-            (n as usize).clamp(1, MAX_PORTS)
+        let num_ports =
+            if multiport { (transport.config_read32(CONFIG_MAX_PORTS) as usize).clamp(1, MAX_PORTS) } else { 1 };
+        let size = if features & F_SIZE != 0 {
+            // Both fields of one resize: read them under the same generation.
+            Some(config_consistent(&transport, |t| (t.config_read16(CONFIG_COLS), t.config_read16(CONFIG_ROWS)))?)
         } else {
-            1
-        };
-        let size = (features & F_SIZE != 0)
-            .then(|| (transport.config_read16(CONFIG_COLS), transport.config_read16(CONFIG_ROWS)))
-            .filter(|&(c, r)| c != 0 && r != 0);
+            None
+        }
+        .filter(|&(c, r)| c != 0 && r != 0);
 
         // Build everything before touching the device's queues, so a failure frees it all.
         let mut sizes = [(0u16, 0u16); MAX_PORTS];
@@ -272,7 +281,8 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioConsole<'d, T, D> {
             control.rx.fill();
             inner.control = Some(control);
         }
-        let mut con = Self { transport, inner: ManuallyDrop::new(inner), num_ports };
+        let emergency = features & F_EMERG_WRITE != 0;
+        let mut con = Self { transport, inner: ManuallyDrop::new(inner), num_ports, emergency };
         driver_ok(&con.transport);
         for i in 0..num_ports {
             con.transport.notify(rx_index(i));
@@ -309,6 +319,16 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioConsole<'d, T, D> {
     /// True if the device designated `port` a console (`CONSOLE_PORT`).
     pub fn is_console(&self, port: usize) -> bool {
         self.inner.ports.get(port).and_then(Option::as_ref).is_some_and(|p| p.console)
+    }
+
+    /// Writes `byte` to port 0 through the configuration space
+    /// (`emerg_wr`), bypassing the queues. Returns false, writing nothing,
+    /// if the device does not offer `VIRTIO_CONSOLE_F_EMERG_WRITE`.
+    pub fn emergency_write(&self, byte: u8) -> bool {
+        if self.emergency {
+            self.transport.config_write32(CONFIG_EMERG_WR, u32::from(byte));
+        }
+        self.emergency
     }
 
     /// The console size in (columns, rows), if the device reports one.
@@ -534,6 +554,18 @@ mod tests {
     }
 
     #[test]
+    fn emergency_write_goes_through_the_config_space() {
+        let dma = HostDma::default();
+        let t = device(F_EMERG_WRITE, 1);
+        t.config.borrow_mut().resize(12, 0);
+        let con = VirtioConsole::new(t, &dma).unwrap();
+        assert_ne!(con.transport().accepted.get() & F_EMERG_WRITE, 0);
+        assert!(con.emergency_write(b'!'));
+        assert_eq!(con.transport().config_read32(CONFIG_EMERG_WR), u32::from(b'!'));
+        assert!(con.transport().notified.borrow().iter().all(|&q| q % 2 == 0), "no transmit queue used");
+    }
+
+    #[test]
     fn single_port() {
         let dma = HostDma::default();
         let mut con = VirtioConsole::new(device(F_SIZE, 1), &dma).unwrap();
@@ -553,6 +585,7 @@ mod tests {
         });
         assert_eq!(got, big);
         assert_eq!(con.write(1, b"x"), Err(VirtioError::NotPresent));
+        assert!(!con.emergency_write(b'!'), "not offered");
 
         // Input, read in pieces smaller than a buffer.
         let mut rx = dev(&con, 0);

@@ -35,9 +35,10 @@ mod rc;
 
 use super::mad::{self, CLASS_PERF, GrhFields, LID_PERMISSIVE, MAD_LEN, MadWc, QP1_QKEY, UdHeader};
 use super::queue::{
-    CTRL_COMPLETE, Geometry, OPCODE_SEND, QpSetup, Queues, RC_QPS, SEG_LEN, SET_DATA, SET_QP0, SET_QP1, optpar,
+    CTRL_COMPLETE, Geometry, OPCODE_SEND, QpSetup, Queues, RC_QPS, SEG_LEN, SET_DATA, SET_QP0, SET_QP1,
+    SYNDROME_FLUSHED, SendEntry, optpar,
 };
-use super::{LOG_NUM_MCGS, MCG_ENTRY_LEN, Mlx4, Mlx4Error, PD, put32};
+use super::{LOG_NUM_MCGS, MCG_ENTRY_LEN, Mlx4, Mlx4Error, PD};
 
 pub use super::mad::GRH_LEN;
 pub use rc::{MAX_MESSAGE, RcEvent, RcFailure, RcId, RcInfo, RcParams, RcState, RcWindow, WINDOW_LEN};
@@ -399,46 +400,46 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> Special<'h, 'd, D> {
         let mut packed = [0u8; mad::UD_HEADER_MAX];
         let n = header.pack(&mut packed);
 
-        let (wqe, slot) = self.q.begin_send();
+        let slot = self.q.tx_slot();
         self.q.mem.tx.write(slot, mad);
         let buf = self.q.mem.tx.device_addr().as_u64() + slot as u64;
         let lkey = self.q.hca.lkey;
-        let wq = self.q.wq();
+        let mut e = SendEntry::new();
 
         // Inline segments may not cross a 64-byte boundary, so a header that
         // does not fit up to the next one takes two.
-        let inline = wqe + SEG_LEN;
+        let inline = SEG_LEN;
         let room = 64 - ((inline + 4) % 64);
         let header_bytes = packed.get(..n).unwrap_or_default();
         let seg_len = if n <= room {
-            put32(wq, inline, INLINE | n as u32);
-            wq.write(inline + 4, header_bytes);
+            e.put32(inline, INLINE | n as u32);
+            e.write(inline + 4, header_bytes);
             (4 + n).next_multiple_of(16)
         } else {
             let (head, tail) = header_bytes.split_at_checked(room).unwrap_or_default();
-            put32(wq, inline, INLINE | room as u32);
-            wq.write(inline + 4, head);
+            e.put32(inline, INLINE | room as u32);
+            e.write(inline + 4, head);
             let second = inline + 4 + room;
-            wq.write(second + 4, tail);
-            put32(wq, second, INLINE | (n - room) as u32);
+            e.write(second + 4, tail);
+            e.put32(second, INLINE | (n - room) as u32);
             (8 + n).next_multiple_of(16)
         };
-        let data = wqe + SEG_LEN + seg_len;
-        put32(wq, data, MAD_LEN as u32);
-        put32(wq, data + 4, lkey);
-        wq.store(data + 8, buf.to_be());
+        let data = SEG_LEN + seg_len;
+        e.put32(data, MAD_LEN as u32);
+        e.put32(data + 4, lkey);
+        e.put64(data + 8, buf);
         let icrc = data + SEG_LEN;
-        put32(wq, icrc + 4, 0);
-        put32(wq, icrc, INLINE | 4);
+        e.put32(icrc + 4, 0);
+        e.put32(icrc, INLINE | 4);
 
         let flags = CTRL_COMPLETE & !2 // completion, not solicited
             | if self.is_qp0() { MLX_VL15 } else { 0 }
             | if permissive { MLX_SLR } else { 0 }
             | (dest.sl as u32 & 0xf) << 8;
-        put32(wq, wqe + 4, ((SEG_LEN + seg_len + 2 * SEG_LEN) / SEG_LEN) as u32);
-        put32(wq, wqe + 8, flags);
-        put32(wq, wqe + 12, (dest.lid as u32) << 16);
-        self.q.finish_send(wqe, OPCODE_SEND);
+        e.put32(4, ((SEG_LEN + seg_len + 2 * SEG_LEN) / SEG_LEN) as u32);
+        e.put32(8, flags);
+        e.put32(12, (dest.lid as u32) << 16);
+        self.q.finish_send(&e, OPCODE_SEND);
         Ok(())
     }
 
@@ -836,69 +837,82 @@ impl<'h, 'd, D: DmaAllocator + ?Sized> IbPort<'h, 'd, D> {
         if payload.len() > self.max_payload() {
             return Err(NetError::TooLarge);
         }
-        if self.ud.tx_full() {
+        // Reaping frees slots and tells of sends that failed.
+        if self.ud.tx_head != self.ud.tx_done {
             self.ud.poll_cq();
-            if self.ud.tx_full() {
-                return Err(NetError::WouldBlock);
-            }
         }
-        let (wqe, slot) = self.ud.begin_send();
+        if self.ud.tx_error.is_some() {
+            return Err(NetError::Io);
+        }
+        if self.ud.tx_full() {
+            return Err(NetError::WouldBlock);
+        }
+        let slot = self.ud.tx_slot();
         self.ud.mem.tx.write(slot, payload);
         let buf = self.ud.mem.tx.device_addr().as_u64() + slot as u64;
         let lkey = self.ud.hca.lkey;
         let port = self.ud.port;
-        let wq = self.ud.wq();
-        put32(wq, wqe + 4, SEND_SEGMENTS as u32);
-        put32(wq, wqe + 8, CTRL_COMPLETE);
+        let mut e = SendEntry::new();
+        e.put32(4, SEND_SEGMENTS as u32);
+        e.put32(8, CTRL_COMPLETE);
 
         // The datagram segment: address vector, then queue pair and key.
-        let av = wqe + DATAGRAM_SEG;
+        let av = DATAGRAM_SEG;
         let (route, grh) = (dest.route.unwrap_or(Route::NONE), dest.route.is_some());
-        put32(wq, av, PD | (port as u32) << 24);
+        e.put32(av, PD | (port as u32) << 24);
         let g_slid = (dest.path_bits & 0x7f) as u32 | if grh { 0x80 } else { 0 };
-        put32(wq, av + 4, g_slid << 16 | dest.lid as u32);
-        put32(wq, av + 8, (route.sgid_index as u32) << 16 | route.hop_limit as u32); // maximum static rate: 0
+        e.put32(av + 4, g_slid << 16 | dest.lid as u32);
+        e.put32(av + 8, (route.sgid_index as u32) << 16 | route.hop_limit as u32); // maximum static rate: 0
         let tclass_flow = (route.traffic_class as u32) << 20 | route.flow_label & 0xf_ffff;
-        put32(wq, av + 12, (dest.sl as u32 & 0xf) << 28 | tclass_flow);
-        wq.write(av + 16, &route.dgid.0);
-        put32(wq, av + 32, dest.qpn & 0xff_ffff);
-        put32(wq, av + 36, dest.qkey);
+        e.put32(av + 12, (dest.sl as u32 & 0xf) << 28 | tclass_flow);
+        e.write(av + 16, &route.dgid.0);
+        e.put32(av + 32, dest.qpn & 0xff_ffff);
+        e.put32(av + 36, dest.qkey);
 
-        let data = wqe + DATA_SEG;
-        put32(wq, data, payload.len() as u32);
-        put32(wq, data + 4, lkey);
-        wq.store(data + 8, buf.to_be());
-        self.ud.finish_send(wqe, OPCODE_SEND);
+        let data = DATA_SEG;
+        e.put32(data, payload.len() as u32);
+        e.put32(data + 4, lkey);
+        e.put64(data + 8, buf);
+        self.ud.finish_send(&e, OPCODE_SEND);
         Ok(())
     }
 
     /// Takes the next received datagram's payload into `buf`.
     ///
     /// A datagram larger than `buf` is dropped ([`NetError::TooLarge`]).
+    /// One the adapter failed to receive, or that is too short to hold the
+    /// header slot, is dropped and the next one taken. [`NetError::Io`]
+    /// means the queue pair is in the error state (its receives are being
+    /// flushed) and the port must be reopened.
     pub fn receive(&mut self, buf: &mut [u8]) -> Result<Datagram, NetError> {
-        let Some(got) = self.ud.next_received() else {
-            return Err(NetError::WouldBlock);
-        };
-        // The device counts the header slot whether or not the sender used one.
-        let result = match (got.len as usize).checked_sub(GRH_LEN) {
-            Some(len) if !got.error => match buf.get_mut(..len) {
-                Some(dst) => {
-                    self.ud.read_rx(got.slot, GRH_LEN, dst);
-                    Ok(Datagram {
-                        len,
-                        src_lid: got.src_lid,
-                        src_qpn: got.src_qpn,
-                        sl: got.sl,
-                        path_bits: got.src_path_bits,
-                        grh: got.grh.then(|| self.read_grh(got.slot)),
-                    })
-                }
-                None => Err(NetError::TooLarge),
-            },
-            _ => Err(NetError::Io),
-        };
-        self.ud.repost();
-        result
+        loop {
+            let Some(got) = self.ud.next_received() else {
+                return Err(NetError::WouldBlock);
+            };
+            // The device counts the header slot whether or not the sender used one.
+            let result = match (got.len as usize).checked_sub(GRH_LEN) {
+                _ if got.error && got.syndrome == SYNDROME_FLUSHED => Some(Err(NetError::Io)),
+                Some(len) if !got.error => Some(match buf.get_mut(..len) {
+                    Some(dst) => {
+                        self.ud.read_rx(got.slot, GRH_LEN, dst);
+                        Ok(Datagram {
+                            len,
+                            src_lid: got.src_lid,
+                            src_qpn: got.src_qpn,
+                            sl: got.sl,
+                            path_bits: got.src_path_bits,
+                            grh: got.grh.then(|| self.read_grh(got.slot)),
+                        })
+                    }
+                    None => Err(NetError::TooLarge),
+                }),
+                _ => None, // one bad datagram
+            };
+            self.ud.repost();
+            if let Some(result) = result {
+                return result;
+            }
+        }
     }
 
     fn read_grh(&self, slot: u16) -> GlobalHeader {

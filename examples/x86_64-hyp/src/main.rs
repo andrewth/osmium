@@ -46,7 +46,7 @@ use osmium::virt::devices::{
     VirtualPic, VirtualPit, decode_icr,
 };
 use osmium::virt::smp::GuestCpus;
-use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
+use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, Vcpu, VmExit, run_vcpu};
 
 mod backend;
 
@@ -664,7 +664,8 @@ fn start_host_cpu(cpu: usize) {
     let pit = Pit::new(unsafe { PitPio::new() });
     let id = HOST_APIC_IDS[cpu].load(Ordering::Relaxed);
     // SAFETY: the trampoline is installed and no other AP is in it.
-    unsafe { LAPIC.get().expect("LAPIC initialised").start_ap(id, &boot, |ns| pit.wait_ns(ns)) };
+    unsafe { LAPIC.get().expect("LAPIC initialised").start_ap(id, &boot, |ns| pit.wait_ns(ns)) }
+        .expect("the host CPU accepts the startup IPIs");
     while demos::kernel::online() <= cpu {
         core::hint::spin_loop();
     }
@@ -826,7 +827,7 @@ fn guest_demo() {
             // would arm a timer for the deadline and run something else.
             loop {
                 pit.poll();
-                if v.interrupt_pending() {
+                if v.interrupt_pending(0) {
                     break ControlFlow::Continue(());
                 }
                 let Some(deadline) = pit.next_deadline() else { break ControlFlow::Break(VmExit::Halt) };
@@ -1049,8 +1050,7 @@ fn long_mode_demo() {
         .with_memory(mem.clone())
         .with_irq_line(intr);
     vcpu.set_long_mode(0x1000);
-    let a = apic.clone();
-    vcpu.connect_intr(move || a.acknowledge());
+    vcpu.connect_lapic(apic.clone());
     let now = clock();
     let mut typed = false;
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
@@ -1062,7 +1062,7 @@ fn long_mode_demo() {
                 com1.push_input(b'z');
             }
             apic.poll();
-            if v.interrupt_pending() {
+            if v.interrupt_pending(0) {
                 break ControlFlow::Continue(());
             }
             let Some(deadline) = apic.next_deadline() else { break ControlFlow::Break(VmExit::Halt) };
@@ -1126,13 +1126,12 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
         if me > 0 {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
         }
-        let a = apic.clone();
-        v.connect_intr(move || a.acknowledge());
-        v.attach(&vm.cpus, me);
+        v.connect_lapic(apic.clone());
+        vm.cpus.attach(me, &mut v);
         let exit = run_vcpu(&mut v, bus, &vm.pio, |v, exit| match exit {
             VmExit::Hypercall { nr: 1 | 2, .. } => ControlFlow::Break(exit),
             VmExit::Halt => loop {
-                if v.interrupt_pending() {
+                if v.interrupt_pending(0) {
                     break ControlFlow::Continue(());
                 }
                 if vm.done.load(Ordering::Acquire) {
@@ -1199,7 +1198,11 @@ fn smp_demo() {
     let k = kicks.clone();
     let cpus = GuestCpus::with_kick(N, move |host| {
         k.fetch_add(1, Ordering::Relaxed);
-        LAPIC.get().expect("LAPIC initialised").send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
+        LAPIC
+            .get()
+            .expect("LAPIC initialised")
+            .send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR)
+            .expect("kick IPI accepted by the local APIC");
     });
     // One local APIC per vCPU. An ICR write the sender cannot deliver
     // itself lands in the hook: STARTUP becomes a start request, a fixed

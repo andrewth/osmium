@@ -189,9 +189,56 @@ pub fn lfn_units(e: &[u8]) -> impl Iterator<Item = u16> + '_ {
         .take_while(|&u| u != 0 && u != 0xffff)
 }
 
-/// Case-insensitive name comparison, as FAT requires (ASCII folding only).
+/// `c` upper-cased when that is one character (Unicode's simple mapping),
+/// as the upcase tables of Windows and Linux's vfat fold names; `ß`, whose
+/// upper case is two characters, stays as it is.
+fn fold(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
+}
+
+/// Case-insensitive name comparison, as FAT requires: ASCII and the rest of
+/// Unicode alike.
 pub fn same(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
+    a.chars().map(fold).eq(b.chars().map(fold))
+}
+
+/// `name` as the 11 bytes of a short name it could be the alias for
+/// (`LONGFI~1.HTM` as `LONGFI~1HTM`, in any case), or `None` if it cannot be
+/// one: not ASCII, or not 8.3.
+pub fn alias_form(name: &str) -> Option<[u8; 11]> {
+    if !name.is_ascii() || name.starts_with('.') {
+        return None;
+    }
+    let (base, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 || base.contains('.') {
+        return None;
+    }
+    let mut short = [b' '; 11];
+    for (slot, b) in short.iter_mut().zip(base.bytes()) {
+        *slot = b.to_ascii_uppercase();
+    }
+    for (slot, b) in short.iter_mut().skip(8).zip(ext.bytes()) {
+        *slot = b.to_ascii_uppercase();
+    }
+    if short[0] == 0xe5 {
+        short[0] = 0x05;
+    }
+    Some(short)
+}
+
+/// Whether a lookup of `name`, whose [`alias_form`] is `alias`, finds the
+/// entry with long (or shown) name `long` and short name `short`: by its
+/// name, or by its short alias, as Windows and Linux find `PROGRA~1` for
+/// `Program Files`.
+pub fn finds(long: &str, short: &[u8; 11], name: &str, alias: Option<&[u8; 11]>) -> bool {
+    same(long, name) || alias.is_some_and(|a| a == short)
 }
 
 #[cfg(test)]
@@ -260,6 +307,30 @@ mod tests {
         // Exactly 13 units: no terminator, no padding.
         let one = lfn_entries("abcdefghijklm", 0).unwrap();
         assert_eq!((one.len(), lfn_units(&one[0]).count()), (1, 13));
+    }
+
+    #[test]
+    fn names_fold_beyond_ascii() {
+        assert!(same("Readme.TXT", "README.txt"));
+        assert!(same("Ärger.txt", "äRGER.TXT"));
+        assert!(same("ΣΊΣΥΦΟΣ", "σίσυφοσ"));
+        assert!(!same("straße", "STRASSE"), "ß has no one-character upper case");
+        assert!(same("straße", "STRAßE"));
+        assert!(!same("a", "b"));
+    }
+
+    #[test]
+    fn short_aliases() {
+        let short = *b"LONGFI~1HTM";
+        assert_eq!(alias_form("longfi~1.htm"), Some(short));
+        assert_eq!(alias_form("PROGRA~1"), Some(*b"PROGRA~1   "));
+        assert_eq!(alias_form("toolongbase"), None);
+        assert_eq!(alias_form("a.b.c"), None);
+        assert_eq!(alias_form(".bashrc"), None);
+        assert_eq!(alias_form("näive"), None);
+        assert!(finds("Long File Name.html", &short, "LongFi~1.Htm", alias_form("LongFi~1.Htm").as_ref()));
+        assert!(finds("Long File Name.html", &short, "long file name.HTML", None));
+        assert!(!finds("Long File Name.html", &short, "LONGFI~2.HTM", alias_form("LONGFI~2.HTM").as_ref()));
     }
 
     #[test]

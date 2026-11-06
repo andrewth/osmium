@@ -10,9 +10,10 @@
 //!
 //! These functions only build the command words, from the same
 //! [`ats_span`] encoding the generic layer uses, so a driver with a queue
-//! can post them. The VT-d driver still invalidates through registers (a
-//! queue the firmware left on is switched off) and the SMMUv3 driver does not
-//! enable ATS in its stream table entries, so neither posts these today; the layouts follow
+//! can post them. The VT-d driver has an invalidation queue (in scalable mode
+//! and with interrupt remapping) but does not enable device IOTLBs in its
+//! context entries, and the SMMUv3 driver does not enable ATS in its stream
+//! table entries, so neither posts these today; the layouts follow
 //! the specifications and are checked only against the field positions
 //! written here, not against hardware.
 

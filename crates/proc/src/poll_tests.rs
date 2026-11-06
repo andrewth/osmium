@@ -162,6 +162,49 @@ fn stream_pair_with_peek_and_vectors() {
     assert_eq!(call(&p, Sys::Write, &[b, B1, 1]), err(Errno::EPIPE));
 }
 
+/// The signals pending for the process's leader.
+fn pending(p: &Process) -> u64 {
+    assert_eq!(call(p, Sys::RtSigpending, &[SETS, 8]), 0);
+    u64::from_ne_bytes(get(p, SETS, 8).try_into().unwrap())
+}
+
+/// Sets `SIGPIPE` to `SIG_IGN` (discarding a pending one) and back.
+fn forget_sigpipe(p: &Process) {
+    for handler in [1u64, 0] {
+        let mut act = [0u8; 32];
+        act[..8].copy_from_slice(&handler.to_ne_bytes());
+        put(p, B2, &act);
+        assert_eq!(call(p, Sys::RtSigaction, &[13, B2, 0, 8]), 0);
+    }
+}
+
+#[test]
+fn a_stream_socket_raises_sigpipe_unless_msg_nosignal() {
+    const SIGPIPE: u64 = 1 << 12;
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    let p = process();
+    // Blocked, so that it stays visible in the pending set.
+    put(&p, SETS, &SIGPIPE.to_ne_bytes());
+    assert_eq!(call(&p, Sys::RtSigprocmask, &[0, SETS, 0, 8]), 0);
+    let (a, _b) = pair(&p, STREAM);
+    assert_eq!(call(&p, Sys::Shutdown, &[a, 1]), 0);
+    put(&p, B1, b"x");
+    assert_eq!(call(&p, Sys::Sendto, &[a, B1, 1, MSG_NOSIGNAL, 0, 0]), err(Errno::EPIPE));
+    assert_eq!(pending(&p), 0, "MSG_NOSIGNAL");
+    assert_eq!(call(&p, Sys::Sendto, &[a, B1, 1, 0, 0, 0]), err(Errno::EPIPE));
+    assert_eq!(pending(&p), SIGPIPE, "send");
+    forget_sigpipe(&p);
+    assert_eq!(call(&p, Sys::Write, &[a, B1, 1]), err(Errno::EPIPE));
+    assert_eq!(pending(&p), SIGPIPE, "write");
+    forget_sigpipe(&p);
+
+    // A datagram socket's EPIPE raises nothing, as on Linux.
+    let (c, _d) = pair(&p, DGRAM);
+    assert_eq!(call(&p, Sys::Shutdown, &[c, 1]), 0);
+    assert_eq!(call(&p, Sys::Write, &[c, B1, 1]), err(Errno::EPIPE));
+    assert_eq!(pending(&p), 0);
+}
+
 #[test]
 fn datagram_pair_keeps_boundaries_and_reports_truncation() {
     let p = process();

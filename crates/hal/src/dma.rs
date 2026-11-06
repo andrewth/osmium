@@ -20,16 +20,25 @@ pub struct DmaBuffer {
     len: usize,
 }
 
-// SAFETY: the buffer is exclusively owned memory; all access is volatile.
+// SAFETY: the descriptor holds only addresses of memory that `new`'s
+// contract keeps valid; every access through it is volatile, so using it
+// from another thread is no different from using it on this one.
 unsafe impl Send for DmaBuffer {}
 
 impl DmaBuffer {
     /// Describes `len` bytes at CPU pointer `cpu` and device address `device`.
     ///
     /// # Safety
-    /// The memory must be exclusively owned by the buffer, valid for `len`
-    /// bytes, and appear at `device` in the device's address space
-    /// (accounting for any IOMMU or bus offset).
+    /// The `len` bytes at `cpu` must stay valid for volatile reads and
+    /// writes for as long as this descriptor is used, must not be accessed
+    /// through ordinary Rust references meanwhile, and must appear at
+    /// `device` in the device's address space (accounting for any IOMMU or
+    /// bus offset).
+    ///
+    /// Several descriptors may describe the same memory, since every access
+    /// through one is volatile (drivers keep such copies in tables they
+    /// index). Only one of them may be passed to
+    /// [`DmaAllocator::free_coherent`], and none may be used after that.
     pub const unsafe fn new(cpu: NonNull<u8>, device: PhysAddr, len: usize) -> Self {
         Self { cpu, device, len }
     }
@@ -64,12 +73,22 @@ impl DmaBuffer {
         (p as usize).is_multiple_of(size).then_some(p.cast())
     }
 
-    /// Volatile load of the little-endian integer at `offset`, which must be
-    /// in bounds and naturally aligned (else this reads as zero, like a bus
-    /// with nothing there).
+    /// Volatile load of the native-endian integer at `offset`, which must be
+    /// in bounds and naturally aligned.
+    ///
+    /// Offsets are the driver's own layout, so a bad one is a driver bug:
+    /// debug builds panic on it, and release builds read zero, like a bus
+    /// with nothing there.
     #[inline]
     pub fn load<T: RegValue>(&self, offset: usize) -> T {
-        match self.typed::<T>(offset) {
+        let p = self.typed::<T>(offset);
+        debug_assert!(
+            p.is_some(),
+            "DMA load of {} bytes at {offset:#x} outside or misaligned in a {}-byte buffer",
+            core::mem::size_of::<T>(),
+            self.len
+        );
+        match p {
             // SAFETY: in bounds and aligned (checked).
             Some(p) => unsafe { p.read_volatile() },
             None => T::default(),
@@ -77,10 +96,18 @@ impl DmaBuffer {
     }
 
     /// Volatile store of an integer at `offset`, under the same conditions
-    /// as [`load`](Self::load).
+    /// as [`load`](Self::load): a bad offset panics in debug builds and the
+    /// write is dropped in release builds.
     #[inline]
     pub fn store<T: RegValue>(&self, offset: usize, value: T) {
-        if let Some(p) = self.typed::<T>(offset) {
+        let p = self.typed::<T>(offset);
+        debug_assert!(
+            p.is_some(),
+            "DMA store of {} bytes at {offset:#x} outside or misaligned in a {}-byte buffer",
+            core::mem::size_of::<T>(),
+            self.len
+        );
+        if let Some(p) = p {
             // SAFETY: in bounds and aligned (checked).
             unsafe { p.write_volatile(value) }
         }
@@ -204,5 +231,46 @@ impl<A: FrameAllocator, M: PhysMapper> DmaAllocator for LockedFrames<A, M> {
         // SAFETY: allocated by this allocator's `alloc_coherent` with the
         // same order, and no longer used by a device (caller's contract).
         unsafe { self.lock().dealloc(buf.device_addr(), order) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buf(mem: &mut [u64; 4]) -> DmaBuffer {
+        // SAFETY: the array outlives every use in these tests and is only
+        // accessed through the descriptor meanwhile.
+        unsafe { DmaBuffer::new(NonNull::new(mem.as_mut_ptr().cast()).unwrap(), PhysAddr::new(0x1000), 32) }
+    }
+
+    #[test]
+    fn in_bounds_accesses() {
+        let mut mem = [0u64; 4];
+        let b = buf(&mut mem);
+        b.store::<u32>(28, 0x1234_5678);
+        assert_eq!(b.load::<u32>(28), 0x1234_5678);
+        b.write(30, &[1, 2]);
+        let mut two = [0u8; 2];
+        b.read(30, &mut two);
+        assert_eq!(two, [1, 2]);
+        let mut big = [9u8; 4];
+        b.read(30, &mut big);
+        assert_eq!(big, [0; 4], "an out-of-range copy zero-fills");
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "outside or misaligned"))]
+    fn out_of_bounds_load_is_caught_in_debug_builds() {
+        let mut mem = [0u64; 4];
+        assert_eq!(buf(&mut mem).load::<u64>(32), 0);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "outside or misaligned"))]
+    fn misaligned_store_is_caught_in_debug_builds() {
+        let mut mem = [0u64; 4];
+        buf(&mut mem).store::<u32>(2, 1);
+        assert_eq!(mem, [0; 4], "dropped in release builds");
     }
 }

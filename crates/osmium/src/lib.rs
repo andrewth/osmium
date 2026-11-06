@@ -6,27 +6,27 @@
 //!
 //! | Module | Crate | Contents |
 //! |---|---|---|
-//! | [`arch`] | `osmium-arch` | IRQ flags, CPU id, TLB maintenance, arch registers |
-//! | `sync` | `osmium-sync` | spin locks, once cells, per-CPU data, SPSC ring, intrusive lists |
-//! | `mm` | `osmium-mm` | addresses, memory maps, frame allocators, page tables, heap |
-//! | `hal` | `osmium-hal` | MMIO/port I/O, device traits, IRQ dispatch, console |
-//! | `drivers` | `osmium-drivers` | 16550, PL011, PIT, `fw_cfg`, virtio transports and GPU, displays |
-//! | `sysdrv` | `osmium-sysdrv` | PLIC, CLINT, GICv2, local APIC, I/O APIC, VT-d, AMD-Vi, SMMUv3, RISC-V IOMMU |
+//! | [`arch`] | `osmium-arch` | IRQ flags, CPU id, traps, TLB maintenance, MMU and system registers |
+//! | `sync` | `osmium-sync` | ticket, MCS, reader/writer and sequence locks, RCU, once cells, per-CPU data, SPSC ring, intrusive lists and trees |
+//! | `mm` | `osmium-mm` | addresses, memory maps, frame allocators, page tables, heap, VMAs, swap |
+//! | `hal` | `osmium-hal` | MMIO/port I/O, device-class traits, IRQ dispatch, console, PCI, USB and virtio definitions, DMA and IOMMU model |
+//! | `drivers` | `osmium-drivers` | the virtio core: MMIO and PCI transports, split virtqueues, virtio console |
+//! | `sysdrv` | `osmium-sysdrv` | 16550 and PL011 UARTs, `fw_cfg`, PIT, HPET, PLIC, CLINT, GICv2, GICv3, local APIC, I/O APIC, VT-d, AMD-Vi, SMMUv3, RISC-V IOMMU |
 //! | `storage` | `osmium-storage` | virtio-blk, AHCI, NVMe, RAM disk |
-//! | `display` | `osmium-display` | virtio-gpu, Bochs DISPI, VESA BIOS Extensions |
-//! | `usb` | `osmium-usb` | xHCI, EHCI, OHCI and UHCI host controllers, USB class drivers |
-//! | `netdev` | `osmium-netdev` | virtio-net, mlx4 and USB CDC network drivers |
-//! | `boot` | `osmium-boot` | FDT and Multiboot2 parsing, FDT writer |
+//! | `display` | `osmium-display` | virtio-gpu, Bochs DISPI, VESA BIOS Extensions, EDID |
+//! | `usb` | `osmium-usb` | xHCI, EHCI, OHCI and UHCI host controllers; mass-storage and HID class drivers |
+//! | `netdev` | `osmium-netdev` | virtio-net, mlx4 (Ethernet and IPoIB), USB CDC-ECM and CDC-NCM network drivers |
+//! | `boot` | `osmium-boot` | FDT parsing and writer, Multiboot2, PVH, ELF64, PE32+, UEFI, static ACPI tables (RSDP, MADT, MCFG) |
 //! | `sched` | `osmium-sched` | tasks, context switch, schedulers, wait queues, timers |
-//! | `virt` | `osmium-virt` | guest memory, stage-2 tables, device buses, VM exits |
+//! | `virt` | `osmium-virt` | guest memory, stage-2 tables, device buses and emulated devices, virtio models, RISC-V H, AArch64 EL2, AMD SVM and Intel VMX vCPUs |
 //! | `exec` | `osmium-exec` | heap-free async executor for firmware |
-//! | `fs` | `osmium-fs` | virtual file system, mounts, RAM file system, initramfs |
-//! | `fs_fat` | `osmium-fs-fat` | FAT32 with long names on any block device |
+//! | `fs` | `osmium-fs` | virtual file system, mounts, RAM file system, overlay, synthetic trees, `/dev`, cpio initramfs |
+//! | `fs_fat` | `osmium-fs-fat` | FAT12, FAT16 and FAT32 with long names on any block device |
 //! | `fs_ext4` | `osmium-fs-ext4` | ext2, ext3 and ext4, read and write, on any block device |
 //! | `fs_iso9660` | `osmium-fs-iso9660` | read-only ISO 9660 with Rock Ridge and Joliet on any block device |
 //! | `fs_btrfs` | `osmium-fs-btrfs` | btrfs, read and write: subvolumes, checksums, zlib, LZO and zstd, on any block device |
 //! | `proc` | `osmium-proc` | processes, user address spaces, fd tables, Linux-numbered system calls |
-//! | `net` | `osmium-net` | IPv4 stack: ARP, ICMP echo, UDP, TCP, DHCP client |
+//! | `net` | `osmium-net` | IPv4 and IPv6 stack: ARP and neighbor discovery, ICMP, UDP, TCP, DHCP and DHCPv6, DNS, multicast |
 //! | `iscsi` | `osmium-iscsi` | iSCSI initiator: a remote SCSI disk over TCP as a block device |
 //! | `rand` | `osmium-rand` | entropy sources, SHA-256, ChaCha20 random number generator |
 //! | `tls` | `osmium-tls` | TLS 1.3 servers over rustls, self-signed certificates |

@@ -12,15 +12,21 @@
 //! | I/O instruction (non-string) | [`VmExit::PioIn`] / [`VmExit::PioOut`] |
 //! | `HLT` | [`VmExit::Halt`] |
 //! | `VMCALL` | [`VmExit::Hypercall`]: `nr` = `rax`, `args` = `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, `r8` |
-//! | EPT violation on an unmapped page | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], from the instruction ([`decode`]) |
+//! | EPT violation on an unmapped page outside guest RAM (`with_memory`) | [`VmExit::MmioRead`] / [`VmExit::MmioWrite`], from the instruction ([`decode`]) |
 //! | External interrupt, NMI | [`VmExit::ExternalInterrupt`], after the host's own handler has run (an NMI gets a hardware-style frame and is delivered through IDT vector 2) |
 //! | Triple fault | [`VmExit::Shutdown`] |
 //! | Anything else | [`VmExit::Unhandled`] with the exit reason |
 //!
 //! Unlike SVM, VMX has no decode assists, so MMIO instructions are always
-//! fetched through the guest's page tables. A guest cannot see VMX
-//! ([`patch_cpuid`]), and its VMX instructions, `XSETBV` and `MWAIT` raise
-//! `#UD`.
+//! fetched through the guest's page tables (32-bit, PAE or long mode). A
+//! guest cannot see VMX or MONITOR/MWAIT ([`patch_cpuid`]), and its VMX
+//! instructions, `XSETBV`, `MONITOR` and `MWAIT` raise `#UD`. `MOV CR8`
+//! exits; with [`VmxVcpu::connect_lapic`] it reads and writes the local
+//! APIC's task priority.
+//!
+//! On bare metal every VMCS access masks host interrupts while it makes
+//! the VMCS current and uses it, so another VMX vCPU's task, scheduled on
+//! this CPU in between, cannot leave its own VMCS current under it.
 //!
 //! The VMCS is bound to the host CPU that first runs the vCPU, because it is
 //! `VMPTRLD`ed there and stays active; use the vCPU only from that CPU, or
@@ -54,6 +60,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::decode::{self, Access, Operand};
 use super::{APIC_BASE_ADDR, FxArea, apic_base_write_ok, injectable, size_mask};
+use crate::devices::VirtualLapic;
 use crate::memory::{GuestMemory, GuestPhysAddr};
 use crate::vcpu::{Vcpu, VmExit};
 
@@ -487,7 +494,11 @@ pub struct VmxVcpu {
     /// The guest has used the debug registers: they are swapped around each
     /// entry and `MOV DR` no longer exits.
     dr_switch: bool,
+    /// The guest's `CR8` while no local APIC is connected.
     cr8: u64,
+    /// The local APIC whose task priority `CR8` is, from
+    /// [`connect_lapic`](Self::connect_lapic).
+    lapic: Option<Arc<VirtualLapic>>,
     cstar: u64,
     /// Bare-metal only: the host CPU the VMCS is bound to.
     #[cfg_attr(not(all(target_arch = "x86_64", target_os = "none")), allow(dead_code))]
@@ -560,6 +571,7 @@ impl VmxVcpu {
             dr6: 0xffff_0ff0,
             dr_switch: false,
             cr8: 0,
+            lapic: None,
             cstar: 0,
             cpu: None,
             migratable: false,
@@ -739,35 +751,34 @@ impl VmxVcpu {
         self.vmcs.write(vmcs::GUEST_EFER, EFER_LME | EFER_LMA | 1 << 11); // LME, LMA, NXE
     }
 
-    /// Translates a guest linear address through the guest's 4-level page
-    /// tables (long mode), or returns it unchanged with paging off.
+    /// Translates a guest linear address through the guest's page tables
+    /// in whatever paging mode it uses (32-bit, PAE with the PDPTEs the VMCS
+    /// caches, or 4-level long mode), or returns it
+    /// unchanged with paging off. `None` if the address is not mapped or the
+    /// vCPU has no guest memory ([`with_memory`](Self::with_memory)) to walk.
     pub fn translate(&self, linear: u64) -> Option<u64> {
-        if self.cr0() & CR0_PG == 0 {
+        let cr0 = self.cr0();
+        if cr0 & CR0_PG == 0 {
             return Some(linear);
         }
-        if self.vmcs.read(vmcs::GUEST_EFER) & EFER_LMA == 0 {
-            return None; // 32-bit paging is not walked
+        let mut pdptes = [0u64; 4];
+        for (i, p) in pdptes.iter_mut().enumerate() {
+            *p = self.vmcs.read(vmcs::GUEST_PDPTE0 + 2 * i as u32);
         }
-        let mem = self.mem.as_ref()?;
-        let mut table = self.vmcs.read(vmcs::GUEST_CR3) & 0x000f_ffff_ffff_f000;
-        for level in (0..4).rev() {
-            let index = (linear >> (12 + 9 * level)) & 0x1ff;
-            let pte: u64 = mem.read_obj(GuestPhysAddr(table.wrapping_add(index * 8))).ok()?;
-            if pte & 1 == 0 {
-                return None;
-            }
-            let addr = pte & 0x000f_ffff_ffff_f000;
-            // A large page at level 1 (2 MiB) or 2 (1 GiB).
-            if level == 0 || (level <= 2 && pte & (1 << 7) != 0) {
-                let mask = (1u64 << (12 + 9 * level)) - 1;
-                return Some((addr & !mask) | (linear & mask));
-            }
-            table = addr;
-        }
-        None
+        let paging = super::Paging {
+            cr0,
+            cr3: self.vmcs.read(vmcs::GUEST_CR3),
+            cr4: self.cr4(),
+            efer: self.vmcs.read(vmcs::GUEST_EFER),
+            pdptes: Some(pdptes),
+        };
+        super::translate(self.mem.as_ref()?, &paging, linear)
     }
 
-    /// Lets the vCPU read instructions from guest memory to emulate MMIO.
+    /// Gives the vCPU its guest memory: MMIO instructions are fetched from
+    /// it through the guest's page tables, and an EPT violation on an
+    /// address it backs (guest RAM the host unmapped from the EPT) is
+    /// reported as [`VmExit::Unhandled`] rather than emulated as MMIO.
     pub fn with_memory(mut self, mem: Arc<GuestMemory>) -> Self {
         self.mem = Some(mem);
         self
@@ -880,6 +891,19 @@ impl VmxVcpu {
     /// cycle): returns the vector.
     pub fn connect_intr(&mut self, ack: impl Fn() -> Option<u8> + Send + Sync + 'static) {
         self.ack = Some(Box::new(ack));
+    }
+
+    /// Connects the vCPU's local APIC: interrupts are acknowledged from it
+    /// (as [`connect_intr`](Self::connect_intr) with
+    /// [`VirtualLapic::acknowledge`]), and the guest's `CR8`, whose moves
+    /// exit, reads and writes its task priority, so a raised `CR8` holds an
+    /// interrupt back and a lowered one lets it through at the next entry.
+    /// Wire the APIC's output to the INTR line ([`irq_line`](Self::irq_line)).
+    /// Without an APIC, `CR8` is the guest's own and gates nothing.
+    pub fn connect_lapic(&mut self, apic: Arc<VirtualLapic>) {
+        let a = apic.clone();
+        self.connect_intr(move || a.acknowledge());
+        self.lapic = Some(apic);
     }
 
     /// Whether a vCPU halted in `hlt` should run again: its INTR line is up
@@ -1156,9 +1180,18 @@ impl VmxVcpu {
                     self.inject_gp();
                     return true;
                 }
-                self.cr8 = v;
+                // CR8 is TPR bits 7:4: a new priority can hold back or let
+                // through the APIC's pending interrupt, which the next
+                // entry's injection then sees.
+                match &self.lapic {
+                    Some(apic) => apic.set_tpr((v << 4) as u8),
+                    None => self.cr8 = v,
+                }
             }
-            (1, 8) => self.set_reg(gpr, self.cr8),
+            (1, 8) => {
+                let v = self.lapic.as_ref().map_or(self.cr8, |a| (a.tpr() >> 4) as u64);
+                self.set_reg(gpr, v);
+            }
             (2, _) => self.set_cr0(cr0 & !8),
             // LMSW loads the low four bits, but cannot clear PE.
             (3, _) => self.write_cr0((cr0 & !0xe) | (q >> 16 & 0xe) | (cr0 | q >> 16) & 1),
@@ -1377,6 +1410,10 @@ impl VmxVcpu {
             // paging structure) is not an access by the instruction.
             exit::EPT_VIOLATION if q & 3 != 0 && q & 0x38 == 0 && q & 0x180 != 0x80 => {
                 let addr = GuestPhysAddr(self.vmcs.read(vmcs::GUEST_PHYS_ADDR));
+                // Guest RAM missing from the EPT is not a device (see SvmVcpu::classify).
+                if self.mem.as_ref().is_some_and(|m| m.host_ptr(addr, 1).is_some()) {
+                    return VmExit::Unhandled { reason: reason as u64 };
+                }
                 let Some(a) = self.insn_bytes().and_then(|(b, n)| decode::decode(b.get(..n)?, self.code_bits())) else {
                     return VmExit::Unhandled { reason: reason as u64 };
                 };
@@ -1395,6 +1432,72 @@ impl VmxVcpu {
             _ => VmExit::Unhandled { reason: reason as u64 },
         }
     }
+}
+
+/// Every field the vCPU writes, plus the exit information it reads, for
+/// `hw::unbind` to carry to another CPU. (The host-state fields are
+/// rewritten by every run, and the read-only IDT-vectoring information is
+/// kept apart.)
+#[cfg_attr(not(any(test, all(target_arch = "x86_64", target_os = "none"))), allow(dead_code))]
+fn carried_fields() -> impl Iterator<Item = u32> {
+    use vmcs::*;
+    let single = [
+        VPID,
+        MSR_BITMAP,
+        EXIT_MSR_STORE_ADDR,
+        EXIT_MSR_LOAD_ADDR,
+        ENTRY_MSR_LOAD_ADDR,
+        EPTP,
+        GUEST_PHYS_ADDR,
+        LINK_POINTER,
+        GUEST_DEBUGCTL,
+        GUEST_PAT,
+        GUEST_EFER,
+        PIN_CTLS,
+        PROC_CTLS,
+        EXCEPTION_BITMAP,
+        PF_MASK,
+        PF_MATCH,
+        CR3_TARGET_COUNT,
+        EXIT_CTLS,
+        EXIT_MSR_STORE_COUNT,
+        EXIT_MSR_LOAD_COUNT,
+        ENTRY_CTLS,
+        ENTRY_MSR_LOAD_COUNT,
+        ENTRY_INTR_INFO,
+        ENTRY_ERRCODE,
+        ENTRY_INSN_LEN,
+        PROC2_CTLS,
+        INSN_ERROR,
+        EXIT_REASON,
+        EXIT_INTR_INFO,
+        EXIT_INTR_ERRCODE,
+        EXIT_INSN_LEN,
+        GUEST_GDTR_LIMIT,
+        GUEST_IDTR_LIMIT,
+        GUEST_INTERRUPTIBILITY,
+        GUEST_ACTIVITY,
+        GUEST_SYSENTER_CS,
+        CR0_MASK,
+        CR4_MASK,
+        CR0_SHADOW,
+        CR4_SHADOW,
+        EXIT_QUAL,
+        GUEST_CR0,
+        GUEST_CR3,
+        GUEST_CR4,
+        GUEST_GDTR_BASE,
+        GUEST_IDTR_BASE,
+        GUEST_DR7,
+        GUEST_RSP,
+        GUEST_RIP,
+        GUEST_RFLAGS,
+        GUEST_PENDING_DBG,
+        GUEST_SYSENTER_ESP,
+        GUEST_SYSENTER_EIP,
+    ];
+    let segments = (0..8).flat_map(|i| [GUEST_SEL, GUEST_LIMIT, GUEST_AR, GUEST_BASE].map(|f| f + 2 * i));
+    single.into_iter().chain(segments).chain((0..4).map(|i| GUEST_PDPTE0 + 2 * i))
 }
 
 /// The capabilities `enable` found.
@@ -1502,6 +1605,22 @@ impl Vcpu for VmxVcpu {
 
     fn complete_hypercall(&mut self, ret: u64) {
         self.regs.rax = ret;
+    }
+
+    fn interrupt_pending(&self, _now: u64) -> bool {
+        VmxVcpu::interrupt_pending(self)
+    }
+
+    fn flush_stage2(&mut self) {
+        VmxVcpu::flush_stage2(self);
+    }
+
+    fn irq_line(&self) -> Arc<AtomicBool> {
+        VmxVcpu::irq_line(self)
+    }
+
+    fn connect_cpu(&mut self, link: crate::smp::CpuLink) {
+        self.running = Some(link.running().clone());
     }
 }
 

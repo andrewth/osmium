@@ -46,6 +46,14 @@ pub enum AmlError {
     Timeout,
     /// An object, field or namespace would be larger than the interpreter allows.
     TooLarge,
+    /// The memory budget ([`Config::max_alloc_bytes`](super::Config::max_alloc_bytes),
+    /// [`Config::max_total_alloc_bytes`](super::Config::max_total_alloc_bytes) or
+    /// [`Config::max_retained_bytes`](super::Config::max_retained_bytes)) ran out, or the heap could not
+    /// satisfy an allocation.
+    OutOfMemory,
+    /// A reference to a local or argument of a method invocation that has returned. (A reference to a
+    /// namespace object that has been removed gives [`NotFound`](Self::NotFound).)
+    StaleReference,
     /// A construct that this interpreter does not implement (named in the message).
     Unsupported(&'static str),
     /// The host refused an access to an operation region.
@@ -89,6 +97,8 @@ impl fmt::Display for AmlError {
             AmlError::TooDeep => f.write_str("nesting too deep"),
             AmlError::Timeout => f.write_str("step or sleep budget exhausted"),
             AmlError::TooLarge => f.write_str("object too large"),
+            AmlError::OutOfMemory => f.write_str("memory budget exhausted"),
+            AmlError::StaleReference => f.write_str("reference to an object that no longer exists"),
             AmlError::Unsupported(what) => write!(f, "unsupported: {what}"),
             AmlError::Host(e) => write!(f, "host access failed: {e:?}"),
             AmlError::Fatal { kind, code, arg } => {

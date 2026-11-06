@@ -1,6 +1,6 @@
 [package]
 name = "osmium-sysdrv"
-description = "Osmium: system device drivers (16550, PL011, PIT, fw_cfg, PLIC, CLINT, GICv2, local APIC, I/O APIC, Intel VT-d, AMD-Vi, Arm SMMUv3, RISC-V IOMMU)"
+description = "Osmium: system device drivers (16550, PL011, PIT, HPET, fw_cfg, PLIC, CLINT, GICv2, GICv3 with ITS and GICv4, local APIC, I/O APIC, Intel VT-d, AMD-Vi, Arm SMMUv3, RISC-V IOMMU)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

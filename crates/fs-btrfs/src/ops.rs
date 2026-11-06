@@ -100,6 +100,10 @@ pub(crate) fn entries(d: &[u8]) -> Result<Vec<Entry<'_>>, Errno> {
         let rest = d.get(p..).ok_or(Errno::EIO)?;
         let (dl, nl) = (le16(rest, 25)? as usize, le16(rest, 27)? as usize);
         let len = 30 + nl + dl;
+        // Each entry whole within the item.
+        if len > rest.len() {
+            return Err(Errno::EIO);
+        }
         try_push(&mut v, (p, p + len, disk::bytes(rest, 30, nl)?))?;
         p += len;
     }
@@ -109,7 +113,8 @@ pub(crate) fn entries(d: &[u8]) -> Result<Vec<Entry<'_>>, Errno> {
 /// `d` without bytes `from..to`.
 pub(crate) fn without(d: &[u8], from: usize, to: usize) -> Result<Vec<u8>, Errno> {
     let mut v = Vec::new();
-    v.try_reserve_exact(d.len() - (to - from)).map_err(|_| Errno::ENOMEM)?;
+    let len = to.checked_sub(from).and_then(|n| d.len().checked_sub(n)).ok_or(Errno::EIO)?;
+    v.try_reserve_exact(len).map_err(|_| Errno::ENOMEM)?;
     v.extend_from_slice(d.get(..from).ok_or(Errno::EIO)?);
     v.extend_from_slice(d.get(to..).ok_or(Errno::EIO)?);
     Ok(v)
@@ -217,7 +222,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
         }
         self.insert(t, Key::new(dir, item::DIR_INDEX, idx), &e)?;
         let mut d = self.inode(t, dir)?;
-        let size = le64(&d, ino::SIZE)? + 2 * name.len() as u64;
+        let size = le64(&d, ino::SIZE)?.checked_add(2 * name.len() as u64).ok_or(Errno::EIO)?;
         put64(&mut d, ino::SIZE, size)?;
         self.stamp(&mut d, true)?;
         self.set_inode(t, dir, &d)
@@ -630,15 +635,7 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     /// `ino`, replacing what was there, compressed with `comp` where that
     /// saves at least a sector; returns bytes added to `nbytes` less those
     /// dropped.
-    fn put_extents(
-        &mut self,
-        t: u64,
-        ino: u64,
-        at: u64,
-        buf: &[u8],
-        sums: bool,
-        comp: u8,
-    ) -> Result<i64, Errno> {
+    fn put_extents(&mut self, t: u64, ino: u64, at: u64, buf: &[u8], sums: bool, comp: u8) -> Result<i64, Errno> {
         match self.put_extents_part(t, ino, at, buf, sums, comp)? {
             (delta, done) if done == buf.len() as u64 => Ok(delta),
             _ => Err(Errno::ENOSPC),
@@ -704,6 +701,10 @@ impl<D: BlockDevice + Send + 'static> Tx<'_, D> {
     /// it lies in one plain regular extent that only this file refers to, and
     /// that no snapshot can share.
     fn nocow_target(&mut self, t: u64, ino: u64, a: u64, e: u64) -> Result<Option<u64>, Errno> {
+        // Not even in place: a read-only subvolume's files do not change.
+        if self.root(t)?.read_only {
+            return Err(Errno::EROFS);
+        }
         let Some((k, d)) = self.prev_item(t, Key::new(ino, item::EXTENT_DATA, a))? else { return Ok(None) };
         if k.objectid != ino || k.ty != item::EXTENT_DATA || d.len() < 53 {
             return Ok(None);

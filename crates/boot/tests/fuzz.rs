@@ -307,6 +307,13 @@ fn pe_survives_garbage() {
     for _ in 0..30_000 {
         let m = rng.mutate(&seed);
         if let Ok(info) = pe::parse(&m, pe::MACHINE_X86_64) {
+            // What parse accepted has sections in order, apart and inside the image.
+            let mut floor = info.size_of_headers;
+            for s in pe::sections(&m, &info) {
+                let s = s.expect("parse checked the section table");
+                assert!(s.rva >= floor && s.range().end <= info.size_of_image);
+                floor = s.range().end;
+            }
             // Destinations both big enough and too small for the image.
             let dest_len = if rng.below(4) == 0 { rng.below(0x4000) } else { 0x4000 };
             let dest = &mut mem[..dest_len];

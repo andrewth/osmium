@@ -33,6 +33,14 @@ const MAX_CLASS: usize = 1 << (MIN_CLASS_SHIFT + CLASSES - 1);
 /// `alloc_pages` must return memory that is exclusively owned, writable,
 /// `count * PAGE_SIZE` bytes long and aligned to `align` (a power of two of
 /// at least `PAGE_SIZE`).
+///
+/// # Calling context
+/// [`LockedHeap`] calls the source without holding its own lock, so the
+/// source may take locks of its own (and may even allocate from the same
+/// heap). It is called from whatever context allocates: if the heap is used
+/// with interrupts masked or from an interrupt handler, the source must be
+/// safe to call there too (for example by using an IRQ-safe lock, as
+/// [`LockedFrames`] does).
 pub unsafe trait PageSource {
     /// Allocates `count` pages aligned to `align` bytes.
     fn alloc_pages(&self, count: usize, align: usize) -> Option<NonNull<u8>>;
@@ -239,13 +247,21 @@ impl<S: PageSource> Default for LockedHeap<S> {
 unsafe impl<S: PageSource + Sync + Send> GlobalAlloc for LockedHeap<S> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let Some(source) = self.source.get() else { return ptr::null_mut() };
-        let mut st = self.state.lock();
-        let result = match Self::class_of(&layout) {
+        // The page source is always called with the heap lock released (see `PageSource`): it may take
+        // locks of its own, or allocate from this heap, without deadlocking or running with IRQs masked
+        // for longer than the free-list update.
+        let (mut st, result) = match Self::class_of(&layout) {
             Some(c) => {
                 let size = 1 << (c + MIN_CLASS_SHIFT);
+                let mut st = self.state.lock();
                 if st.head(c) == 0 {
-                    // Carve a fresh page into blocks of this class.
-                    if let Some(page) = source.alloc_pages(1, PAGE_SIZE) {
+                    drop(st);
+                    let page = source.alloc_pages(1, PAGE_SIZE);
+                    st = self.state.lock();
+                    // Another CPU may have refilled the class meanwhile; carving this page too only adds
+                    // free blocks to it.
+                    if let Some(page) = page {
+                        // Carve the fresh page into blocks of this class.
                         st.stats.reserved += PAGE_SIZE;
                         let base = page.as_ptr();
                         for off in (0..PAGE_SIZE).step_by(size).rev() {
@@ -262,17 +278,19 @@ unsafe impl<S: PageSource + Sync + Send> GlobalAlloc for LockedHeap<S> {
                     st.set_head(c, next);
                     st.stats.allocated += size;
                 }
-                block as *mut u8
+                (st, block as *mut u8)
             }
             None => {
                 let pages = Self::large_pages(&layout);
-                match source.alloc_pages(pages, layout.align().max(PAGE_SIZE)) {
+                let p = source.alloc_pages(pages, layout.align().max(PAGE_SIZE));
+                let mut st = self.state.lock();
+                match p {
                     Some(p) => {
                         st.stats.allocated += pages * PAGE_SIZE;
                         st.stats.reserved += pages * PAGE_SIZE;
-                        p.as_ptr()
+                        (st, p.as_ptr())
                     }
-                    None => ptr::null_mut(),
+                    None => (st, ptr::null_mut()),
                 }
             }
         };
@@ -404,6 +422,44 @@ mod tests {
         assert_eq!(st.allocated, 0);
         assert_eq!(st.failures, 0);
         assert_eq!(st.allocs, 32);
+    }
+
+    #[test]
+    fn page_source_is_called_without_the_heap_lock() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static ARENA: StaticArena<16> = StaticArena::new();
+        static HEAP: LockedHeap<Checked> = LockedHeap::new();
+        static CALLS_UNDER_LOCK: AtomicUsize = AtomicUsize::new(0);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        struct Checked;
+        // SAFETY: forwards to the arena.
+        unsafe impl PageSource for Checked {
+            fn alloc_pages(&self, count: usize, align: usize) -> Option<NonNull<u8>> {
+                CALLS.fetch_add(1, Ordering::Relaxed);
+                if HEAP.state.is_locked() {
+                    CALLS_UNDER_LOCK.fetch_add(1, Ordering::Relaxed);
+                }
+                ARENA.alloc_pages(count, align)
+            }
+            unsafe fn free_pages(&self, ptr: NonNull<u8>, count: usize) {
+                // SAFETY: forwarded contract.
+                unsafe { ARENA.free_pages(ptr, count) }
+            }
+        }
+        HEAP.init(Checked);
+        let small = Layout::new::<u64>();
+        let large = Layout::from_size_align(2 * PAGE_SIZE, 8).unwrap();
+        // SAFETY: non-zero sizes; freed with the same layouts.
+        unsafe {
+            let a = HEAP.alloc(small);
+            let b = HEAP.alloc(large);
+            assert!(!a.is_null() && !b.is_null());
+            HEAP.dealloc(b, large);
+            HEAP.dealloc(a, small);
+        }
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2, "one page for the class, one large block");
+        assert_eq!(CALLS_UNDER_LOCK.load(Ordering::Relaxed), 0);
+        assert_eq!(HEAP.stats().allocated, 0);
     }
 }
 

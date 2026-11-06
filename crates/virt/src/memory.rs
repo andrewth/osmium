@@ -105,10 +105,8 @@ impl GuestMemory {
     pub fn read(&self, gpa: GuestPhysAddr, buf: &mut [u8]) -> Result<(), OutOfBounds> {
         self.for_each_chunk(gpa, buf.len(), |host, done, n| {
             let end = done.saturating_add(n);
-            for (i, d) in buf.get_mut(done..end).unwrap_or_default().iter_mut().enumerate() {
-                // SAFETY: `host..host+n` lies inside a region.
-                *d = unsafe { host.add(i).read_volatile() };
-            }
+            // SAFETY: `host..host+n` lies inside a region.
+            unsafe { copy_from_volatile(host, buf.get_mut(done..end).unwrap_or_default()) };
         })
     }
 
@@ -116,20 +114,30 @@ impl GuestMemory {
     pub fn write(&self, gpa: GuestPhysAddr, buf: &[u8]) -> Result<(), OutOfBounds> {
         self.for_each_chunk(gpa, buf.len(), |host, done, n| {
             let end = done.saturating_add(n);
-            for (i, &b) in buf.get(done..end).unwrap_or_default().iter().enumerate() {
-                // SAFETY: `host..host+n` lies inside a region.
-                unsafe { host.add(i).write_volatile(b) };
-            }
+            // SAFETY: `host..host+n` lies inside a region.
+            unsafe { copy_to_volatile(host, buf.get(done..end).unwrap_or_default()) };
         })
     }
 
     /// Copies the loadable segments of `elf`, a kernel linked where it runs
     /// (guest-physical = virtual addresses), into guest memory and zeroes
     /// the rest of each segment's memory size. Returns the guest-physical
-    /// range the image now occupies. A segment that is not wholly inside
+    /// range the image now occupies. An image whose segments add up to
+    /// more memory than the guest has fails before anything is written. A
+    /// segment that is not wholly inside
     /// guest memory (or wraps the address space) fails before it is
     /// written; segments before it stay loaded.
     pub fn load_elf(&self, elf: &osmium_boot::elf::Elf<'_>) -> Result<core::ops::Range<u64>, OutOfBounds> {
+        // The segments together may not claim more memory than the guest
+        // has: overlapping segments could otherwise each have the host write
+        // (zero) all of guest RAM, so a small image would cost work far
+        // beyond its size. Checked before anything is written.
+        let ram = self.regions.iter().fold(0u64, |n, r| n.saturating_add(r.len));
+        let claimed = elf.segments().try_fold(0u64, |n, s| n.checked_add(s.mem_size));
+        if claimed.is_none_or(|c| c > ram) {
+            let at = elf.segments().next().map_or(GuestPhysAddr(0), |s| GuestPhysAddr(s.vaddr));
+            return Err(OutOfBounds(at));
+        }
         let (mut low, mut high) = (u64::MAX, 0);
         for s in elf.segments() {
             let start = GuestPhysAddr(s.vaddr);
@@ -197,14 +205,137 @@ impl GuestMemory {
     }
 }
 
+const WORD: usize = size_of::<u64>();
+
+/// Copies `dst.len()` bytes from `src` with volatile loads: bytes up to the
+/// first 8-byte boundary of `src`, then whole aligned words, then the bytes
+/// left. An aligned word the guest updates is never torn.
+///
+/// # Safety
+/// `src..src + dst.len()` must be readable.
+unsafe fn copy_from_volatile(src: *const u8, dst: &mut [u8]) {
+    let head = src.align_offset(WORD).min(dst.len());
+    let (head, rest) = dst.split_at_mut(head);
+    let mut p = src;
+    for d in head {
+        // SAFETY: `p` is inside the range the caller vouches for.
+        unsafe {
+            *d = p.read_volatile();
+            p = p.add(1);
+        }
+    }
+    let (words, tail) = rest.as_chunks_mut::<WORD>();
+    for w in words {
+        // SAFETY: as above; `p` is 8-byte aligned here.
+        unsafe {
+            *w = p.cast::<u64>().read_volatile().to_ne_bytes();
+            p = p.add(WORD);
+        }
+    }
+    for d in tail {
+        // SAFETY: as above.
+        unsafe {
+            *d = p.read_volatile();
+            p = p.add(1);
+        }
+    }
+}
+
+/// Copies `src` to `dst` with volatile stores, a word at a time where `dst`
+/// is aligned (as [`copy_from_volatile`]).
+///
+/// # Safety
+/// `dst..dst + src.len()` must be writable.
+unsafe fn copy_to_volatile(dst: *mut u8, src: &[u8]) {
+    let head = dst.align_offset(WORD).min(src.len());
+    let (head, rest) = src.split_at(head);
+    let mut p = dst;
+    for &b in head {
+        // SAFETY: `p` is inside the range the caller vouches for.
+        unsafe {
+            p.write_volatile(b);
+            p = p.add(1);
+        }
+    }
+    let (words, tail) = rest.as_chunks::<WORD>();
+    for &w in words {
+        // SAFETY: as above; `p` is 8-byte aligned here.
+        unsafe {
+            p.cast::<u64>().write_volatile(u64::from_ne_bytes(w));
+            p = p.add(WORD);
+        }
+    }
+    for &b in tail {
+        // SAFETY: as above.
+        unsafe {
+            p.write_volatile(b);
+            p = p.add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn loads_an_elf() {
-        // A minimal ELF64 with one PT_LOAD: 4 bytes of data, 0x2000 in memory.
-        let mut image = alloc::vec![0u8; 0x100];
+    fn copies_at_every_alignment_and_length() {
+        let mut ram = alloc::vec![0u8; 64];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives `mem` and is only accessed through it until the end.
+        unsafe { mem.add_region(GuestPhysAddr(0x1000), ram.as_mut_ptr(), 64) };
+        for at in 0..24u64 {
+            for len in 0..33usize {
+                let data: alloc::vec::Vec<u8> =
+                    (0..len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(at as u8)).collect();
+                mem.write(GuestPhysAddr(0x1000), &[0xee; 64]).unwrap();
+                mem.write(GuestPhysAddr(0x1000 + at), &data).unwrap();
+                let mut back = alloc::vec![0u8; len];
+                mem.read(GuestPhysAddr(0x1000 + at), &mut back).unwrap();
+                assert_eq!(back, data, "at {at}, len {len}");
+                let mut all = [0u8; 64];
+                mem.read(GuestPhysAddr(0x1000), &mut all).unwrap();
+                let at = at as usize;
+                assert!(
+                    all[..at].iter().chain(&all[at + len..]).all(|&b| b == 0xee),
+                    "nothing outside, at {at}, len {len}"
+                );
+            }
+        }
+        drop(mem);
+        drop(ram);
+    }
+
+    /// An aligned 8-byte value the guest updates is read whole, never a mix
+    /// of its old and new bytes (a byte-at-a-time copy tears it).
+    #[test]
+    fn aligned_words_are_not_torn() {
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let word = alloc::sync::Arc::new(AtomicU64::new(0));
+        let mut mem = GuestMemory::new();
+        // SAFETY: `word` outlives `mem`; the guest stand-in below only writes it atomically.
+        unsafe { mem.add_region(GuestPhysAddr(0), word.as_ptr().cast(), 8) };
+        let stop = alloc::sync::Arc::new(AtomicBool::new(false));
+        let (w, s) = (word.clone(), stop.clone());
+        let guest = std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                w.store(u64::MAX, Ordering::Relaxed);
+                w.store(0, Ordering::Relaxed);
+            }
+        });
+        for _ in 0..200_000 {
+            let v: u64 = mem.read_obj(GuestPhysAddr(0)).unwrap();
+            assert!(v == 0 || v == u64::MAX, "torn read {v:#x}");
+        }
+        stop.store(true, Ordering::Relaxed);
+        guest.join().unwrap();
+    }
+
+    /// A minimal ELF64 with `n` identical PT_LOADs at 0x1000: 4 bytes of
+    /// data ("code"), 0x2000 in memory.
+    fn elf_image(n: u16) -> alloc::vec::Vec<u8> {
+        let data = 64 + 56 * n as usize;
+        let mut image = alloc::vec![0u8; data + 4];
         image[0..4].copy_from_slice(b"\x7fELF");
         image[4] = 2; // 64-bit
         image[5] = 1; // little-endian
@@ -216,17 +347,43 @@ mod tests {
         image[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
         image[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize
         image[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
-        image[56..58].copy_from_slice(&1u16.to_le_bytes()); // phnum
-        let ph = 64;
-        image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-        image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // R X
-        image[ph + 8..ph + 16].copy_from_slice(&0xf0u64.to_le_bytes()); // offset
-        image[ph + 16..ph + 24].copy_from_slice(&0x1000u64.to_le_bytes()); // vaddr
-        image[ph + 24..ph + 32].copy_from_slice(&0x1000u64.to_le_bytes()); // paddr
-        image[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes()); // filesz
-        image[ph + 40..ph + 48].copy_from_slice(&0x2000u64.to_le_bytes()); // memsz
-        image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // align
-        image[0xf0..0xf4].copy_from_slice(b"code");
+        image[56..58].copy_from_slice(&n.to_le_bytes()); // phnum
+        for i in 0..n as usize {
+            let ph = 64 + 56 * i;
+            image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // R X
+            image[ph + 8..ph + 16].copy_from_slice(&(data as u64).to_le_bytes()); // offset
+            image[ph + 16..ph + 24].copy_from_slice(&0x1000u64.to_le_bytes()); // vaddr
+            image[ph + 24..ph + 32].copy_from_slice(&0x1000u64.to_le_bytes()); // paddr
+            image[ph + 32..ph + 40].copy_from_slice(&4u64.to_le_bytes()); // filesz
+            image[ph + 40..ph + 48].copy_from_slice(&0x2000u64.to_le_bytes()); // memsz
+            image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // align
+        }
+        image[data..data + 4].copy_from_slice(b"code");
+        image
+    }
+
+    /// Overlapping segments that each fit, but together claim more memory
+    /// than the guest has, are refused before anything is written.
+    #[test]
+    fn elf_segments_may_not_claim_more_than_guest_ram() {
+        let mut ram = alloc::vec![0xffu8; 0x4000];
+        let mut mem = GuestMemory::new();
+        // SAFETY: `ram` outlives `mem`.
+        unsafe { mem.add_region(GuestPhysAddr(0), ram.as_mut_ptr(), 0x4000) };
+        let two = elf_image(2);
+        assert_eq!(mem.load_elf(&osmium_boot::elf::Elf::new(&two).unwrap()), Ok(0x1000..0x3000), "0x4000 claimed");
+        mem.write(GuestPhysAddr(0x1000), &[0xff; 8]).unwrap();
+        let three = elf_image(3);
+        assert!(mem.load_elf(&osmium_boot::elf::Elf::new(&three).unwrap()).is_err(), "0x6000 claimed");
+        assert_eq!(mem.read_obj::<u64>(GuestPhysAddr(0x1000)), Ok(u64::MAX), "nothing was written");
+        drop(mem);
+        drop(ram);
+    }
+
+    #[test]
+    fn loads_an_elf() {
+        let image = elf_image(1);
         let elf = osmium_boot::elf::Elf::new(&image).unwrap();
 
         let mut ram = alloc::vec![0xffu8; 0x4000];

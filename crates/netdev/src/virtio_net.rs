@@ -64,7 +64,11 @@ impl<'d, T: Transport, D: DmaAllocator + ?Sized> VirtioNet<'d, T, D> {
         let slots = |n: u16| OwnedDma::new(dma, n as usize * SLOT_LEN).ok_or(VirtioError::NoMemory);
 
         let mac = if features & net::F_MAC != 0 {
-            MacAddress(core::array::from_fn(|i| transport.config_read8(net::CONFIG_MAC + i)))
+            // Six byte fields: read under the configuration generation so
+            // that a MAC changed mid-read is not half old, half new.
+            let mut mac = [0u8; 6];
+            transport.config_read_bytes(net::CONFIG_MAC, &mut mac)?;
+            MacAddress(mac)
         } else {
             MacAddress([0x02, 0, 0, 0, 0, 1])
         };
@@ -162,21 +166,30 @@ impl<T: Transport, D: DmaAllocator + ?Sized> NetDevice for VirtioNet<'_, T, D> {
     }
 
     fn receive(&mut self, buf: &mut [u8]) -> Result<usize, NetError> {
-        let (head, len) = self.rx.pop_used().ok_or(NetError::WouldBlock)?;
-        let frame_len = (len as usize).saturating_sub(self.header_len).min(SLOT_LEN - self.header_len);
-        let result = match buf.get_mut(..frame_len) {
-            Some(dst) => {
-                self.rx_slots.read(head as usize * SLOT_LEN + self.header_len, dst);
-                Ok(frame_len)
+        loop {
+            let (head, len) = self.rx.pop_used().ok_or(NetError::WouldBlock)?;
+            // A used length that does not cover the header holds no frame:
+            // drop it rather than hand up an empty one.
+            let frame_len = (len as usize).checked_sub(self.header_len).filter(|&n| n > 0);
+            let result = frame_len.map(|n| {
+                let n = n.min(SLOT_LEN - self.header_len);
+                match buf.get_mut(..n) {
+                    Some(dst) => {
+                        self.rx_slots.read(head as usize * SLOT_LEN + self.header_len, dst);
+                        Ok(n)
+                    }
+                    None => Err(NetError::TooLarge),
+                }
+            });
+            // Popping freed exactly this one descriptor, so it is the next head.
+            self.post_rx();
+            if self.rx.needs_notify() {
+                self.transport.notify(RX);
             }
-            None => Err(NetError::TooLarge),
-        };
-        // Popping freed exactly this one descriptor, so it is the next head.
-        self.post_rx();
-        if self.rx.needs_notify() {
-            self.transport.notify(RX);
+            if let Some(result) = result {
+                return result;
+            }
         }
-        result
     }
 
     fn can_receive(&self) -> bool {
@@ -226,6 +239,22 @@ mod tests {
     }
 
     #[test]
+    fn mac_is_read_under_the_config_generation() {
+        let dma = HostDma::default();
+        let t = device(true);
+        // The device changes its configuration during the first reads: the
+        // driver reads again until a whole pass sees no change.
+        t.churn.set(4);
+        let nic = VirtioNet::new(t, &dma).unwrap();
+        assert_eq!(nic.mac_address().0, MAC[..6]);
+        drop(nic);
+        let t = device(true);
+        t.churn.set(u32::MAX);
+        assert_eq!(VirtioNet::new(t, &dma).err(), Some(VirtioError::ConfigUnstable));
+        assert_eq!(dma.live.get(), 0);
+    }
+
+    #[test]
     fn init_and_receive() {
         let dma = HostDma::default();
         let mut net = VirtioNet::new(device(true), &dma).unwrap();
@@ -260,6 +289,29 @@ mod tests {
         dev.push_used(again, 12 + 100);
         assert_eq!(net.receive(&mut buf[..50]), Err(NetError::TooLarge));
         assert!(dev.pop_avail().is_some(), "reposted even when dropped");
+    }
+
+    #[test]
+    fn a_used_length_short_of_the_header_is_dropped() {
+        let dma = HostDma::default();
+        let mut net = VirtioNet::new(device(true), &dma).unwrap();
+        let (size, addrs) = net.transport().queue(RX);
+        let mut dev = DeviceSide::new(size, addrs);
+        let posted: std::vec::Vec<_> = core::iter::from_fn(|| dev.pop_avail()).collect();
+        let mut buf = [0u8; 64];
+
+        // Nothing but (part of) a header: no frame, and the slot goes back.
+        dev.push_used(posted[0].0, 5);
+        dev.push_used(posted[1].0, 12);
+        assert_eq!(net.receive(&mut buf), Err(NetError::WouldBlock), "no empty frames");
+        assert_eq!(core::iter::from_fn(|| dev.pop_avail()).count(), 2, "both slots reposted");
+
+        // A good frame behind a short one is still delivered.
+        dev.push_used(posted[2].0, 3);
+        mem(posted[3].1[0].0, 12 + 3).copy_from_slice(b"\0\0\0\0\0\0\0\0\0\0\0\0abc");
+        dev.push_used(posted[3].0, 12 + 3);
+        assert_eq!(net.receive(&mut buf), Ok(3));
+        assert_eq!(&buf[..3], b"abc");
     }
 
     #[test]

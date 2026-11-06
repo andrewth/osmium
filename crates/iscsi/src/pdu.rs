@@ -2,7 +2,9 @@
 //!
 //! Every PDU is a 48-byte Basic Header Segment (BHS), optional Additional
 //! Header Segments, and a data segment padded to a multiple of four bytes.
-//! Header and data digests are never negotiated, so neither is present.
+//! When a connection negotiates them, a CRC32C header digest follows the
+//! BHS and a data digest follows the padded data segment
+//! ([`Pdu::to_bytes_with`], [`PduReader::set_digests`]).
 //!
 //! [`Pdu`] is the raw form: the BHS bytes and the data segment.
 //! [`Message`] is the decoded form, one variant per PDU type an initiator

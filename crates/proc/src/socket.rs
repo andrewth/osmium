@@ -42,7 +42,7 @@ const MSG_PEEK: u64 = 0x2;
 const MSG_CTRUNC: u64 = 0x8;
 const MSG_TRUNC: u64 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
-const MSG_NOSIGNAL: u64 = 0x4000;
+pub(crate) const MSG_NOSIGNAL: u64 = 0x4000;
 const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 const SOL_SOCKET: u64 = 1;
 const IPPROTO_TCP: u64 = 6;
@@ -738,6 +738,14 @@ pub(crate) fn set_status_flags(file: &Arc<dyn File>, flags: u64) {
     if let Some(s) = file.as_any().and_then(|a| a.downcast_ref::<UnixSocket>()) {
         s.set_nonblocking(flags & O_NONBLOCK != 0);
     }
+}
+
+/// Whether `file` is a connection-oriented socket (TCP, Unix stream or
+/// seqpacket), whose `EPIPE` raises `SIGPIPE`.
+pub(crate) fn is_stream(file: &Arc<dyn File>) -> bool {
+    let any = file.as_any();
+    any.and_then(|a| a.downcast_ref::<SocketFile>()).is_some_and(|s| s.type_code() != SOCK_DGRAM)
+        || any.and_then(|a| a.downcast_ref::<UnixSocket>()).is_some_and(|u| !u.is_dgram())
 }
 
 /// An `AF_INET` socket, for the calls only those have (`bind`, `connect`...).

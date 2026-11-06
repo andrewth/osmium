@@ -36,12 +36,19 @@ pub struct GicV2 {
     /// Source-CPU bits of the SGI each CPU last claimed; GICv2 requires them
     /// in the matching end-of-interrupt write.
     sgi_source: PerCpu<AtomicU32>,
+    /// One bit per line: a target has been chosen for it.
+    routed: [AtomicU32; MAX_IRQS.div_ceil(32) as usize],
 }
 
 impl GicV2 {
     /// Wraps the distributor and CPU-interface windows.
     pub fn new(gicd: IoMem, gicc: IoMem) -> Self {
-        Self { gicd, gicc, sgi_source: PerCpu::new([const { AtomicU32::new(0) }; MAX_CPUS]) }
+        Self {
+            gicd,
+            gicc,
+            sgi_source: PerCpu::new([const { AtomicU32::new(0) }; MAX_CPUS]),
+            routed: [const { AtomicU32::new(0) }; MAX_IRQS.div_ceil(32) as usize],
+        }
     }
 
     /// Sends software-generated interrupt `sgi` (0–15) to every CPU whose
@@ -82,20 +89,38 @@ impl GicV2 {
     fn set_byte(&self, base: usize, irq: u32, value: u8) {
         let _ = self.gicd.write(base + irq as usize, value);
     }
+
+    /// Marks `irq` routed; returns whether it already was.
+    fn mark_routed(&self, irq: u32) -> bool {
+        let bit = 1 << (irq % 32);
+        self.routed.get(irq as usize / 32).is_some_and(|w| w.fetch_or(bit, Ordering::Relaxed) & bit != 0)
+    }
 }
 
 impl InterruptController for GicV2 {
-    /// Enables `irq`; shared peripheral interrupts are also routed to the
-    /// current CPU. Does nothing if the distributor lacks `irq`.
+    /// Enables `irq`. A shared peripheral interrupt without a target yet
+    /// is routed to the current CPU first; one with a target keeps it. Does
+    /// nothing if the distributor lacks `irq`.
     fn enable(&self, irq: u32) {
         if !self.valid(irq) {
             return;
         }
-        if irq >= FIRST_SPI {
+        if irq >= FIRST_SPI && !self.mark_routed(irq) {
             let cpu = osmium_arch::cpu::current_id() % 8;
             self.set_byte(GICD_ITARGETSR, irq, 1 << cpu);
         }
         let _ = self.gicd.write(GICD_ISENABLER + (irq as usize / 32) * 4, 1u32 << (irq % 32));
+    }
+
+    /// Routes SPI `irq` to CPU interface `cpu` (0-7). Fails for private
+    /// lines, lines the distributor lacks and CPUs past 7.
+    fn set_target(&self, irq: u32, cpu: usize) -> bool {
+        if irq < FIRST_SPI || !self.valid(irq) || cpu >= 8 {
+            return false;
+        }
+        self.set_byte(GICD_ITARGETSR, irq, 1 << cpu);
+        self.mark_routed(irq);
+        true
     }
 
     /// Does nothing if the distributor lacks `irq`.
@@ -167,6 +192,29 @@ mod tests {
         assert_eq!(d[GICD_IPRIORITYR / 4 + 8] >> 8 & 0xff, 0);
         assert_eq!(c[GICC_EOIR / 4], 33);
         assert_eq!(c[GICC_PMR / 4], 0xff);
+    }
+
+    #[test]
+    fn enable_keeps_an_explicit_target() {
+        let mut d = [0u32; 0x1000 / 4];
+        let mut c = [0u32; 0x100 / 4];
+        d[GICD_TYPER / 4] = 2; // 96 lines
+        // SAFETY: the windows cover local arrays.
+        let gic =
+            unsafe { GicV2::new(IoMem::new(d.as_mut_ptr().cast(), 0x1000), IoMem::new(c.as_mut_ptr().cast(), 0x100)) };
+        assert!(gic.set_target(40, 3));
+        gic.enable(40);
+        assert!(!gic.set_target(20, 1), "private lines have no target");
+        assert!(!gic.set_target(40, 8), "only eight CPU interfaces");
+        assert!(!gic.set_target(96, 0), "no such line");
+        // A line enabled first is routed to this CPU, once.
+        gic.enable(41);
+        assert!(gic.set_target(41, 2));
+        gic.disable(41);
+        gic.enable(41);
+        drop(gic);
+        assert_eq!(d[GICD_ITARGETSR / 4 + 10] & 0xff, 1 << 3, "enable did not move line 40 to CPU 0");
+        assert_eq!(d[GICD_ITARGETSR / 4 + 10] >> 8 & 0xff, 1 << 2, "nor line 41 back");
     }
 
     #[test]

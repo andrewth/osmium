@@ -655,6 +655,13 @@ impl InterruptController for PhysGic {
         }
     }
 
+    fn set_target(&self, irq: u32, cpu: usize) -> bool {
+        match self {
+            PhysGic::V2(g) => g.set_target(irq, cpu),
+            PhysGic::V3(g) => g.set_target(irq, cpu),
+        }
+    }
+
     fn disable(&self, irq: u32) {
         match self {
             PhysGic::V2(g) => g.disable(irq),
@@ -1231,7 +1238,7 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             Some(g) => vcpu.with_vgic_v3(g.clone(), me),
             None => vcpu,
         };
-        vm.cpus.attach_arm(me, &mut vcpu);
+        vm.cpus.attach(me, &mut vcpu);
         let mut stopped = false;
         let exit = run_vcpu(&mut vcpu, bus, &pio, |v, exit| match exit {
             VmExit::Hypercall { .. } => {

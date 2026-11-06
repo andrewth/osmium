@@ -478,7 +478,12 @@ fn exec_frames() -> &'static HeapFrames {
     F.get_or_init(leaked_frames)
 }
 
-static ACTIVATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+std::thread_local! {
+    /// The root `Platform::activate` last loaded on this test thread: per
+    /// thread, because exec tests run in parallel and each activates on the
+    /// thread that called `execve`.
+    static ACTIVATED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
 
 const STACK_TOP: u64 = 0x7000_0000;
 
@@ -488,7 +493,7 @@ fn platform() {
     P.get_or_init(|| {
         set_platform(Platform {
             new_memory: || Ok(Box::new(space(exec_frames()))),
-            activate: |root| ACTIVATED.store(root.0, std::sync::atomic::Ordering::SeqCst),
+            activate: |root| ACTIVATED.set(root.0),
             resume: |_| unreachable!("host tests never resume user mode"),
             stack_top: STACK_TOP,
             stack_size: 0x4000,
@@ -595,7 +600,7 @@ fn execve_loads_a_program_with_its_arguments() {
         panic!("no exec")
     };
     assert_eq!(pc, ENTRY);
-    assert_eq!(ACTIVATED.load(std::sync::atomic::Ordering::SeqCst), p.root().0);
+    assert_eq!(ACTIVATED.get(), p.root().0);
     assert_eq!(frames.live(), 1, "the old space is freed; its kernel root was leaked");
     assert_eq!(p.name(), "prog");
     assert_eq!(get(&p, ENTRY, 4), [0x90, 0x90, 0x0f, 0x05]);
@@ -866,14 +871,100 @@ fn a_child_that_never_got_a_task_can_be_forgotten() {
     assert_eq!(call(&p, Sys::Wait4, &[u64::MAX, 0, 1, 0]), -(Errno::ECHILD.0 as i64));
 }
 
+#[test]
+fn anonymous_memory_and_the_break_stay_in_the_user_half() {
+    let frames = leaked_frames();
+    let s = space(frames);
+    // Sv39: the user half ends at 1 << 38.
+    let top = 1u64 << 38;
+    assert_eq!(s.map_anon(top, 0x1000, MapFlags::RW), Err(Errno::ENOMEM), "past the user half");
+    assert_eq!(s.map_anon(top - 0x1000, 0x2000, MapFlags::RW), Err(Errno::ENOMEM), "straddling its end");
+    // A break that starts near the top cannot grow past it.
+    let p = Process::new("brk-top", s, top - 0x2000);
+    assert_eq!(p.brk(top), top, "up to the end of the user half");
+    let live = frames.live();
+    assert_eq!(p.brk(top + 0x3000), top, "refused: the break stays");
+    assert_eq!(frames.live(), live, "nothing was mapped");
+}
+
+#[test]
+fn getdents64_returns_a_bounded_amount_per_call() {
+    let (p, _) = process("dents");
+    let names: Vec<(&'static str, Arc<dyn File>)> = (0..3000)
+        .map(|i| {
+            let name: &'static str = std::format!("an-entry-with-a-fairly-long-name-{i:05}").leak();
+            (name, Arc::new(Text("", 100 + i)) as Arc<dyn File>)
+        })
+        .collect();
+    let dir = OpenFile::new(Arc::new(Dir(names)), crate::fd::Access { read: true, write: false, append: false });
+    let fd = p.files().lock().insert(dir).unwrap() as u64;
+    p.memory().map_anon(0x20_0000, 0x40_0000, MapFlags::RW).unwrap();
+    let mut total = 0;
+    let mut calls = 0;
+    loop {
+        let n = call(&p, Sys::Getdents64, &[fd, 0x20_0000, 0x40_0000]);
+        assert!(n >= 0, "{n}");
+        assert!(n <= 64 * 1024, "one call returned {n} bytes");
+        if n == 0 {
+            break;
+        }
+        total += n;
+        calls += 1;
+    }
+    assert!(calls > 1, "the listing came in several calls");
+    // "." and "..", then 3000 entries of 64 bytes each.
+    assert_eq!(total, 2 * 24 + 3000 * 64);
+}
+
+#[test]
+fn fcntl_setfl_changes_the_flags_linux_lets_it() {
+    let (p, _) = process("setfl");
+    put(&p, DATA, b"/tmp/setfl\0");
+    const O_APPEND: i64 = 0o2000;
+    const O_NONBLOCK: i64 = 0o4000;
+    const O_ASYNC: i64 = 0o20000;
+    const O_NOATIME: i64 = 0o1000000;
+    let o_direct: i64 = if cfg!(target_arch = "aarch64") { 0o200000 } else { 0o40000 };
+    let fd = call(&p, Sys::Openat, &[-100i64 as u64, DATA, 0o102, 0o644]) as u64;
+    assert_eq!(call(&p, Sys::Fcntl, &[fd, 3, 0]), 2, "O_RDWR");
+    put(&p, DATA + 0x100, b"abc");
+    assert_eq!(call(&p, Sys::Write, &[fd, DATA + 0x100, 3]), 3);
+    assert_eq!(call(&p, Sys::Lseek, &[fd, 0, 0]), 0);
+
+    // O_TRUNC and the access mode are not status flags: ignored.
+    let all = O_APPEND | O_NONBLOCK | O_ASYNC | O_NOATIME | o_direct;
+    assert_eq!(call(&p, Sys::Fcntl, &[fd, 4, (all | 0o1000 | 1) as u64]), 0);
+    assert_eq!(call(&p, Sys::Fcntl, &[fd, 3, 0]), 2 | all);
+    // O_APPEND now sends every write to the end.
+    assert_eq!(call(&p, Sys::Write, &[fd, DATA + 0x100, 1]), 1);
+    assert_eq!(call(&p, Sys::Lseek, &[fd, 0, 1]), 4, "the position follows the append");
+    let r = call(&p, Sys::Openat, &[-100i64 as u64, DATA, 0, 0]) as u64;
+    assert_eq!(call(&p, Sys::Read, &[r, DATA + 0x200, 8]), 4);
+    assert_eq!(get(&p, DATA + 0x200, 4), b"abca");
+    // And clearing it writes at the position again.
+    assert_eq!(call(&p, Sys::Fcntl, &[fd, 4, 0]), 0);
+    assert_eq!(call(&p, Sys::Fcntl, &[fd, 3, 0]), 2);
+    assert_eq!(call(&p, Sys::Lseek, &[fd, 0, 0]), 0);
+    assert_eq!(call(&p, Sys::Write, &[fd, DATA + 0x100, 1]), 1);
+    let r = call(&p, Sys::Openat, &[-100i64 as u64, DATA, 0, 0]) as u64;
+    assert_eq!(call(&p, Sys::Read, &[r, DATA + 0x200, 8]), 4);
+    assert_eq!(get(&p, DATA + 0x200, 4), b"abca");
+
+    // Open's own status flags are reported.
+    let fd2 = call(&p, Sys::Openat, &[-100i64 as u64, DATA, (O_NONBLOCK | O_APPEND) as u64, 0]) as u64;
+    assert_eq!(call(&p, Sys::Fcntl, &[fd2, 3, 0]), O_NONBLOCK | O_APPEND);
+}
+
 mod blocked;
 mod filemap;
+mod futex;
 mod hostile;
 mod jobsig;
 mod oom;
 mod pie;
 mod restart;
 mod review;
+mod sigframe;
 mod sigthread;
 mod smp;
 mod unix;

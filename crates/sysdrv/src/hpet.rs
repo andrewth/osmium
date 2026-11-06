@@ -40,7 +40,9 @@ const TIMER_BASE: usize = 0x100;
 const TIMER_STRIDE: usize = 0x20;
 const TIMER_COMPARATOR: usize = 0x08;
 
-/// Size of the register block in bytes.
+/// Size of the register block in bytes. It holds the registers of 24
+/// comparators; [`Hpet::new`] ignores comparators the window it is given
+/// does not cover, though the capabilities register can report up to 32.
 pub const REGISTER_BYTES: usize = 0x400;
 
 const ENABLE_CNF: u64 = 1 << 0;
@@ -112,16 +114,21 @@ pub struct Hpet {
 impl Hpet {
     /// Wraps the register block (mapped uncached; [`REGISTER_BYTES`] long) and checks that it
     /// looks like an HPET. The counter is left as it is: call [`Hpet::enable`] to run it.
+    ///
+    /// Only the comparators whose registers lie inside `io` are used: a 1 KiB window holds 24,
+    /// even if the capabilities register reports more.
     pub fn new(io: IoMem) -> Result<Self, HpetError> {
         let cap: u64 = io.rd(GCAP_ID);
         let period_fs = (cap >> 32) as u32;
         if cap == u64::MAX || period_fs == 0 || period_fs > MAX_PERIOD_FS {
             return Err(HpetError::BadDevice);
         }
+        // At most 32 (a 5-bit field plus one), so the cast is exact.
+        let timers = ((((cap >> 8) & 0x1f) + 1) as usize).min(io.len().saturating_sub(TIMER_BASE) / TIMER_STRIDE) as u8;
         let hpet = Self {
             io,
             period_fs,
-            timers: (((cap >> 8) & 0x1f) + 1) as u8,
+            timers,
             counter64: cap & GCAP_COUNT_SIZE_CAP != 0,
             legacy_cap: cap & GCAP_LEG_RT_CAP != 0,
             extended: AtomicU64::new(0),
@@ -278,10 +285,13 @@ impl Hpet {
         if mask != u64::MAX {
             delta = delta.min(mask >> 1);
         }
-        let cfg = (cfg & !(TN_TYPE_PERIODIC | TN_VAL_SET | TN_FSB_EN | TN_32MODE)) | TN_INT_ENB;
+        // Interrupts stay off until the new comparator value is in place: the old one could
+        // otherwise match while the counter passes it.
+        let cfg = cfg & !(TN_TYPE_PERIODIC | TN_VAL_SET | TN_FSB_EN | TN_32MODE | TN_INT_ENB);
         self.io.wr(reg, cfg);
         let mut cmp = now.wrapping_add(delta) & mask;
         self.write_comparator(index, mask, cmp);
+        self.io.wr(reg, cfg | TN_INT_ENB);
         // Writing took time: if the counter has already passed the match value the interrupt
         // would only come after a full wrap, so move it a little ahead of the counter instead.
         for _ in 0..4 {
@@ -309,12 +319,14 @@ impl Hpet {
         if period == 0 || period > mask >> 1 {
             return Err(HpetError::BadPeriod);
         }
-        let cfg = (cfg & !(TN_FSB_EN | TN_32MODE)) | TN_TYPE_PERIODIC | TN_INT_ENB;
+        let cfg = (cfg & !(TN_FSB_EN | TN_32MODE | TN_INT_ENB | TN_VAL_SET)) | TN_TYPE_PERIODIC;
         // With VAL_SET the first comparator write sets the accumulator (the next match), the
-        // second the period that is added after each match.
+        // second the period that is added after each match. Interrupts are enabled only once
+        // both are in place.
         self.io.wr(reg, cfg | TN_VAL_SET);
         self.write_comparator(index, mask, self.ticks().wrapping_add(period.max(MIN_TICKS)) & mask);
         self.write_comparator(index, mask, period);
+        self.io.wr(reg, cfg | TN_INT_ENB);
         Ok(())
     }
 
@@ -392,7 +404,8 @@ mod tests {
         /// `timers` comparators, all 64-bit and periodic-capable and routable to inputs 20-23
         /// except comparator 0 (inputs 0 and 2 as well), with a 64-bit counter if `wide`.
         fn new(period: u64, timers: u64, wide: bool) -> Self {
-            let regs: Vec<_> = (0..REGISTER_BYTES / 8).map(|_| AtomicU64::new(0)).collect();
+            let len = REGISTER_BYTES.max(TIMER_BASE + TIMER_STRIDE * timers as usize);
+            let regs: Vec<_> = (0..len / 8).map(|_| AtomicU64::new(0)).collect();
             let cap =
                 (period << 32) | GCAP_LEG_RT_CAP | (timers - 1) << 8 | if wide { GCAP_COUNT_SIZE_CAP } else { 0 } | 1;
             regs[GCAP_ID / 8].store(cap, Ordering::Relaxed);
@@ -444,6 +457,22 @@ mod tests {
         fn hpet_err(&self) -> HpetError {
             Hpet::new(unsafe_io(self)).err().expect("rejected")
         }
+    }
+
+    #[test]
+    fn comparators_outside_the_window_are_ignored() {
+        let f = Fake::new(PERIOD, 32, true);
+        let h = f.hpet();
+        assert_eq!(h.timer_count(), 24, "comparators 24-31 lie past the 1 KiB window");
+        assert!(h.timer(23).is_some());
+        assert!(h.timer(24).is_none());
+        assert_eq!(h.arm_oneshot(31, 5), Err(HpetError::NoSuchTimer));
+        h.arm_oneshot(23, 5).unwrap();
+        assert_ne!(f.cfg(23) & TN_INT_ENB, 0);
+        // A larger window reaches them all.
+        // SAFETY: the window covers the buffer, which outlives the driver.
+        let all = Hpet::new(unsafe { IoMem::new(f.regs.as_ptr() as *mut u8, f.regs.len() * 8) }).unwrap();
+        assert_eq!(all.timer_count(), 32);
     }
 
     #[test]
@@ -528,7 +557,7 @@ mod tests {
         f.set(MAIN_COUNTER, 100);
         h.start_periodic(2, 1_000_000).unwrap(); // 1 ms = 10_000 ticks
         assert_eq!(f.cmp(2), 10_000, "period is the last comparator write");
-        assert_eq!(f.cfg(2) & (TN_TYPE_PERIODIC | TN_INT_ENB | TN_VAL_SET), TN_TYPE_PERIODIC | TN_INT_ENB | TN_VAL_SET);
+        assert_eq!(f.cfg(2) & (TN_TYPE_PERIODIC | TN_INT_ENB | TN_VAL_SET), TN_TYPE_PERIODIC | TN_INT_ENB);
         assert_eq!(h.start_periodic(2, 0), Err(HpetError::BadPeriod));
         assert_eq!(h.start_periodic(2, 50), Err(HpetError::BadPeriod), "under one tick");
         assert_eq!(h.start_periodic(7, 1_000_000), Err(HpetError::NoSuchTimer));

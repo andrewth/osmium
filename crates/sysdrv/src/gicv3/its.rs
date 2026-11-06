@@ -449,6 +449,7 @@ impl<'d, D: DmaAllocator + ?Sized> Its<'d, D> {
 
         let virt = typer & TYPER_VIRTUAL != 0;
         let mut tables: [Option<Table<'d, D>>; 8] = [const { None }; 8];
+        let mut failed = None;
         for (n, slot) in tables.iter_mut().enumerate() {
             let off = GITS_BASER + n * 8;
             let v: u64 = io.rd(off);
@@ -459,10 +460,25 @@ impl<'d, D: DmaAllocator + ?Sized> Its<'d, D> {
                 TableType::Vpes if virt => u64::from(config.vpes.max(1)),
                 TableType::Vpes => continue,
             };
-            *slot = Some(Self::setup_table(&io, off, v, ty, entries, dma)?);
+            match Self::setup_table(&io, off, v, ty, entries, dma) {
+                Ok(table) => *slot = Some(table),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
         }
-        if tables.iter().flatten().all(|t| t.ty != TableType::Devices) {
-            return Err(ItsError::Unsupported);
+        if failed.is_none() && tables.iter().flatten().all(|t| t.ty != TableType::Devices) {
+            failed = Some(ItsError::Unsupported);
+        }
+        if let Some(e) = failed {
+            // The queue and the tables already programmed are freed on
+            // return: invalidate the registers that point at them first.
+            for (n, _) in tables.iter().enumerate().filter(|(_, t)| t.is_some()) {
+                io.wr(GITS_BASER + n * 8, 0u64);
+            }
+            io.wr(GITS_CBASER, 0u64);
+            return Err(e);
         }
 
         osmium_arch::barrier::mb();

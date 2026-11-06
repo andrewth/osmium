@@ -235,7 +235,8 @@ static CPU_TABLES: [core::sync::atomic::AtomicPtr<x86::CpuTables>; MAX_CPUS] =
 /// will put the trap frame when that task traps out of ring 3.
 fn on_switch(next: &osmium::sched::Task) {
     // Each process runs on its own page table; kernel tasks on the kernel's.
-    let root = osmium::proc::root_for(next).map_or(CR3.load(Ordering::Relaxed), |r| r.0);
+    let kernel = osmium::mm::PhysAddr::new(CR3.load(Ordering::Relaxed));
+    let root = osmium::proc::switch_root(next, kernel).0;
     if x86::read_cr3() & !0xfff != root {
         // SAFETY: both kinds of table map the kernel (shared root entry 0).
         unsafe { x86::write_cr3(root) };
@@ -279,6 +280,10 @@ fn shootdown_service() {
 /// `osmium::arch::mmu::flush_remote`, for user threads on several CPUs).
 /// Waiting CPUs keep servicing requests, so two initiators cannot deadlock
 /// even when interrupts are off.
+#[allow(
+    clippy::expect_used,
+    reason = "a lost shootdown IPI would leave a stale TLB entry or hang the wait; neither can be recovered from"
+)]
 fn shootdown_others(va: usize, pages: usize) {
     let me = cpu::current_id();
     let others = ((1usize << demos::kernel::online()) - 1) & !(1 << me);
@@ -294,7 +299,9 @@ fn shootdown_others(va: usize, pages: usize) {
     SHOOT_PENDING.store(others, Ordering::Release);
     if let Some(apic) = LAPIC.get() {
         for (_, id) in APIC_IDS.iter().enumerate().filter(|&(c, _)| others & (1 << c) != 0) {
-            apic.send_ipi(id.load(Ordering::Relaxed) as u8, SHOOTDOWN_VECTOR);
+            // The wait below would never end without the IPI.
+            apic.send_ipi(id.load(Ordering::Relaxed) as u8, SHOOTDOWN_VECTOR)
+                .expect("shootdown IPI accepted by the local APIC");
         }
     }
     while SHOOT_PENDING.load(Ordering::Acquire) != 0 {
@@ -580,8 +587,9 @@ extern "C" fn kmain(start_info: usize) -> ! {
 
     // --- Application processors (INIT, STARTUP, STARTUP) ---------------------
     osmium::sched::set_remote_wake_hook(|cpu| {
+        // A lost wake-up is picked up at that CPU's next tick.
         if let (Some(apic), Some(id)) = (LAPIC.get(), APIC_IDS.get(cpu)) {
-            apic.send_ipi(id.load(Ordering::Relaxed) as u8, IPI_VECTOR)
+            let _ = apic.send_ipi(id.load(Ordering::Relaxed) as u8, IPI_VECTOR);
         }
     });
     osmium::arch::mmu::set_remote_flush(shootdown_others);
@@ -599,7 +607,15 @@ extern "C" fn kmain(start_info: usize) -> ! {
         };
         // SAFETY: the trampoline is installed and the previous AP has
         // checked in (below); the boot tables identity-map it and the kernel.
-        unsafe { apic.start_ap(apic_id.load(Ordering::Relaxed) as u8, &boot, |ns| pit.wait_ns(ns)) };
+        let started = unsafe { apic.start_ap(apic_id.load(Ordering::Relaxed) as u8, &boot, |ns| pit.wait_ns(ns)) };
+        if started.is_err() {
+            println!(
+                "[smp]   APIC id {} did not accept the startup IPIs; continuing with {cpu} CPUs",
+                apic_id.load(Ordering::Relaxed)
+            );
+            ncpus = cpu;
+            break;
+        }
         // One AP at a time: they share the trampoline's slots. One that
         // never checks in ends the bring-up (it may still be in the
         // trampoline), so CPU indices stay dense.

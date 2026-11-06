@@ -47,7 +47,12 @@ pub trait KeyAdapter<L>: Adapter<L> {
     /// The ordering key.
     type Key: Ord + ?Sized;
 
-    /// The key of `value`. It must not change while `value` is in a tree.
+    /// The key of `value`. It must not change while `value` is in a tree,
+    /// with one exception: between operations on the tree (never during one,
+    /// for example from inside a comparison), it may change to a value that
+    /// keeps the element strictly between its in-order neighbours' keys, so
+    /// the tree's order is unchanged. Anything else breaks the order: lookups
+    /// then miss elements, although memory safety is unaffected.
     fn key(value: &Self::Value) -> &Self::Key;
 }
 
