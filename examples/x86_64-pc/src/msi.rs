@@ -15,15 +15,14 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+pub use demos::kernel::Uptime;
 use osmium::boot::acpi::EcamWindow;
-use osmium::sysdrv::lapic;
-use osmium::storage::nvme::{self, Interrupts, IrqSignal, Nvme, NvmeError};
 use osmium::hal::block::BlockDevice;
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci::{self, Function, MsiError};
 use osmium::hal::println;
-use osmium::hal::timer::Clock;
-use osmium::mm::{MapFlags, PAGE_SIZE, PhysAddr, VirtAddr};
+use osmium::storage::nvme::{self, Interrupts, IrqSignal, Nvme, NvmeError};
+use osmium::sysdrv::lapic;
 
 /// The IDT vector entry 0 is programmed to raise.
 pub const VECTOR: u8 = 0x50;
@@ -38,15 +37,7 @@ static SIGNAL: IrqSignal = IrqSignal::new();
 pub fn on_interrupt() {
     DELIVERED.fetch_add(1, Ordering::Relaxed);
     SIGNAL.notify();
-    crate::LAPIC.get().expect("LAPIC initialised").eoi();
-}
-
-pub struct Uptime;
-
-impl Clock for Uptime {
-    fn now_ns(&self) -> u64 {
-        crate::now_ns()
-    }
+    crate::eoi();
 }
 
 #[derive(Debug)]
@@ -69,41 +60,28 @@ impl From<NvmeError> for Error {
     }
 }
 
-/// Identity-maps `[addr, addr + size)` as device memory (the pages not
-/// mapped yet) and returns a window onto it.
-pub fn map(addr: u64, size: u64) -> IoMem {
-    let mut guard = crate::PT.lock();
-    let pt = guard.as_mut().expect("as_mut returned None");
-    let end = (addr + size).next_multiple_of(PAGE_SIZE as u64);
-    for page in (addr & !(PAGE_SIZE as u64 - 1)..end).step_by(PAGE_SIZE) {
-        if pt.translate(VirtAddr::new(page)).is_none() {
-            let flags = MapFlags::RW | MapFlags::DEVICE | MapFlags::GLOBAL;
-            pt.map_range(VirtAddr::new(page), PhysAddr::new(page), PAGE_SIZE as u64, flags).expect("map_range failed");
-        }
-    }
-    // SAFETY: just mapped as device memory; the demo owns the device.
-    unsafe { IoMem::new(addr as *mut u8, size as usize) }
+/// Identity-maps `[addr, addr + size)` in the kernel's table as device
+/// memory and returns a window onto it.
+///
+/// # Safety
+/// The window must be a device's registers that the calling demo owns.
+pub unsafe fn map(addr: u64, size: u64) -> IoMem {
+    // SAFETY: the caller's contract.
+    unsafe { demos::kernel::map_io(&crate::PT, addr, size) }
 }
 
 /// Spins for up to 100 ms until `done` holds.
 fn wait(done: impl Fn() -> bool) -> bool {
-    let deadline = crate::now_ns() + 100_000_000;
-    while !done() {
-        if crate::now_ns() > deadline {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-    true
+    demos::kernel::wait_for(100_000_000, done)
 }
-
 /// Finds the first NVMe controller on bus 0 and runs the demo on it.
 pub fn demo(ecam: Option<EcamWindow>) {
     let Some(ecam) = ecam else {
         println!("[msi]   no ECAM window; skipping");
         return;
     };
-    let cfg = pci::Ecam::new(map(ecam.base, 1 << 20), 0);
+    // SAFETY: the ECAM window from the MCFG; only this demo uses it meanwhile.
+    let cfg = pci::Ecam::new(unsafe { map(ecam.base, 1 << 20) }, 0);
     let mut found = None;
     pci::for_each_function(&cfg, 0, |f| {
         if found.is_none() && f.class() == pci::Class::NVME {
@@ -126,11 +104,13 @@ fn run(func: &Function<'_, pci::Ecam>) -> Result<(), Error> {
     let bar = |i| func.bar(i).filter(|b| b.address != 0).ok_or(Error::NoBar(i));
     let (regs, table_bar, pba_bar) = (bar(nvme::BAR)?, bar(msix.table_bir())?, bar(msix.pba_bir())?);
     func.enable_memory_and_dma();
-    let table = msix.table(&map(table_bar.address, table_bar.size))?;
-    let pba = msix.pba(&map(pba_bar.address, pba_bar.size))?;
+    // SAFETY: the BARs holding the MSI-X table and PBA; only this demo uses them.
+    let (table_io, pba_io) = unsafe { (map(table_bar.address, table_bar.size), map(pba_bar.address, pba_bar.size)) };
+    let table = msix.table(&table_io)?;
+    let pba = msix.pba(&pba_io)?;
 
     // Everything masked but entry 0, which goes to this CPU.
-    let apic = crate::LAPIC.get().expect("LAPIC initialised").id() as u8;
+    let apic = crate::apic_id();
     for i in 0..table.len() {
         table.set_masked(i, true)?;
     }
@@ -138,7 +118,8 @@ fn run(func: &Function<'_, pci::Ecam>) -> Result<(), Error> {
     table.set_masked(0, false)?;
     msix.enable(func);
 
-    let mut disk = Nvme::new(map(regs.address, regs.size), &crate::FRAMES, &Uptime)?;
+    // SAFETY: the controller's register BAR; this driver owns it.
+    let mut disk = Nvme::new(unsafe { map(regs.address, regs.size) }, &crate::FRAMES, &Uptime)?;
     let delivered = wait(|| DELIVERED.load(Ordering::Relaxed) > 0);
     let n = DELIVERED.load(Ordering::Relaxed);
     if delivered {
@@ -174,7 +155,8 @@ fn run(func: &Function<'_, pci::Ecam>) -> Result<(), Error> {
     table.set_masked(1, false)?;
     let idle = || core::hint::spin_loop();
     let irq = Interrupts { vector: 1, signal: &SIGNAL, idle: &idle };
-    let mut disk = Nvme::with_interrupts(map(regs.address, regs.size), &crate::FRAMES, &Uptime, irq)?;
+    // SAFETY: as above; the first driver instance has been dropped.
+    let mut disk = Nvme::with_interrupts(unsafe { map(regs.address, regs.size) }, &crate::FRAMES, &Uptime, irq)?;
     let before = SIGNAL.count();
     // Eight commands' worth, kept in flight several at a time.
     let mut buf = alloc::vec![0xa5u8; 8 * nvme::DATA_LEN];

@@ -8,13 +8,14 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use crate::backend::{Cpu, Pages, Stage2};
+use demos::guest::GuestRun;
 use osmium::boot::elf::Elf;
 use osmium::hal::println;
 use osmium::mm::{FrameAllocator, PAGE_SIZE};
-use osmium::sync::{IrqSpinLock, Once};
+use osmium::sync::Once;
 use osmium::virt::devices::{
     IOAPIC_WINDOW, IpiKind, IpiTarget, LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualIoApic, VirtualLapic,
     VirtualPit, decode_icr,
@@ -58,24 +59,28 @@ pub struct KernelVm {
     apics: Arc<[Once<Arc<VirtualLapic>>; MAX_CPUS]>,
     pit: Arc<VirtualPit>,
     com1: Arc<Uart16550Model>,
-    done: Arc<AtomicBool>,
-    running: AtomicUsize,
+    run: Arc<GuestRun>,
 }
 
 pub static KERNEL_VM: AtomicPtr<KernelVm> = AtomicPtr::new(core::ptr::null_mut());
 
-/// The guest image QEMU's loader left in the window, if any.
-pub fn image() -> Option<(Elf<'static>, u32)> {
-    // SAFETY: the caller reserved the window (RAM the loader filled or left zero).
-    let window = unsafe { core::slice::from_raw_parts(IMAGE_BASE as *const u8, IMAGE_WINDOW as usize) };
-    let elf = Elf::new(window).ok()?;
-    let entry = pvh_entry(&window[..0x10_0000])?;
-    Some((elf, entry))
+/// The guest image QEMU's loader left in the window, if any, and its PVH
+/// entry point.
+///
+/// # Safety
+/// The window must be RAM kept from the allocator (the loader filled it or
+/// left it zero) that nothing writes while the image is in use.
+pub unsafe fn image() -> Option<(Elf<'static>, u32)> {
+    // SAFETY: the caller's contract.
+    let elf = unsafe { demos::guest::loaded_elf(IMAGE_BASE, IMAGE_WINDOW) }?;
+    // SAFETY: as above; the note is in the image's first MiB.
+    let head = unsafe { core::slice::from_raw_parts(IMAGE_BASE as *const u8, 0x10_0000) };
+    Some((elf, pvh_entry(head)?))
 }
 
 /// QEMU's power-off ports (ACPI PM1a control at 0x604, isa-debug-exit at
 /// 0xf4): any write ends the guest.
-struct PowerOff(Arc<AtomicBool>);
+struct PowerOff(Arc<GuestRun>);
 
 /// Set when the guest powered itself off (as opposed to a vCPU failing).
 static POWERED_OFF: AtomicBool = AtomicBool::new(false);
@@ -86,7 +91,7 @@ impl BusDevice for PowerOff {
     }
     fn write(&self, _offset: u64, _data: &[u8]) {
         POWERED_OFF.store(true, Ordering::Release);
-        self.0.store(true, Ordering::Release);
+        self.0.end();
     }
 }
 
@@ -96,48 +101,40 @@ const TYPED: &[u8] = b"hello from the host\n";
 
 /// The guest's console: whole lines, prefixed so they stand apart from the host's.
 fn guest_console() -> impl Fn(u8) + Send + Sync + 'static {
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    move |b| {
-        let mut l = line.lock();
-        match b {
-            b'\n' => {
-                let s = core::str::from_utf8(&l).unwrap_or("?");
-                // x86_64-pc's serial demo routes COM1 and waits for a line.
-                if s.contains("COM1 IRQ 4 ->") {
-                    TYPE_NOW.store(true, Ordering::Release);
-                }
-                println!("| {s}");
-                l.clear();
-            }
-            b'\r' => {}
-            _ => l.push(b),
+    demos::guest::console_with("| ", |s| {
+        // x86_64-pc's serial demo routes COM1 and waits for a line.
+        if s.contains("COM1 IRQ 4 ->") {
+            TYPE_NOW.store(true, Ordering::Release);
         }
-    }
+    })
 }
 
 /// Starts this host CPU's 1 ms local APIC tick (calibrated by `boot`).
 pub fn start_host_tick() {
     let count = HOST_TICK_COUNT.load(Ordering::Relaxed);
-    if count != 0 {
-        LAPIC.get().expect("LAPIC initialised").start_timer(HOST_TICK_VECTOR, count, true);
+    if count != 0
+        && let Some(lapic) = LAPIC.get()
+    {
+        lapic.start_timer(HOST_TICK_VECTOR, count, true);
     }
 }
 
 /// Runs vCPU `me` on this host CPU each time the guest starts it, until
 /// the guest is done.
 pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
+    let (Some(line), Some(apic), Some(bus)) =
+        (vm.lines.get(me), vm.apics.get(me).and_then(|a| a.get()), vm.buses.get(me))
+    else {
+        // No vCPU of this guest for this host CPU.
+        return None;
+    };
     start_host_tick();
-    let mut last = None;
-    while !vm.done.load(Ordering::Acquire) {
-        let Some((entry, info)) = vm.cpus.take_start(me) else {
-            core::hint::spin_loop();
-            continue;
-        };
+    let last = vm.run.vcpu_loop(&vm.cpus, me, |entry, info| {
         let pages = Pages::alloc();
         // SAFETY: fresh blocks of the required sizes, owned by the vCPU.
         let mut v = unsafe { Cpu::new(pages, vm.stage2, entry as u32, 0) }
             .with_memory(vm.mem.clone())
-            .with_irq_line(vm.lines[me].clone());
+            .with_irq_line(line.clone());
         v.set_apic_id(me as u8); // CPUID agrees with the vCPU's APIC
         if me == 0 {
             v.set_reg(3, info); // PVH: ebx = hvm_start_info
@@ -145,7 +142,6 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
             v.set_application_processor();
         }
-        let apic = vm.apics[me].get().expect("get returned None").clone();
         let a = apic.clone();
         v.connect_intr(move || a.acknowledge());
         v.attach(&vm.cpus, me);
@@ -155,8 +151,8 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
                 vm.pit.poll();
             }
         };
-        let exit = run_vcpu(&mut v, &vm.buses[me], &vm.pio, |v, exit| {
-            if vm.done.load(Ordering::Acquire) {
+        let exit = run_vcpu(&mut v, bus, &vm.pio, |v, exit| {
+            if vm.run.done() {
                 return ControlFlow::Break(VmExit::Shutdown);
             }
             match exit {
@@ -169,7 +165,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
                     if v.interrupt_pending() {
                         break ControlFlow::Continue(());
                     }
-                    if vm.done.load(Ordering::Acquire) {
+                    if vm.run.done() {
                         break ControlFlow::Break(VmExit::Shutdown);
                     }
                     core::hint::spin_loop();
@@ -182,29 +178,27 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
                 other => ControlFlow::Break(other),
             }
         });
-        if !vm.done.load(Ordering::Acquire) {
+        if !vm.run.done() {
             println!("[hyp]   vCPU {me}: {exit:?} at {}", v.describe());
         }
         drop(v);
         // SAFETY: the vCPU that owned these blocks is gone.
         unsafe { pages.free() };
-        if !vm.done.swap(true, Ordering::AcqRel) {
-            for i in 0..vm.lines.len() {
-                vm.cpus.kick(i);
-            }
-            if exit != VmExit::Shutdown {
-                println!("[hyp]   vCPU {me} stopped the guest: {exit:?}");
-            }
-            last = Some(exit);
-        }
+        demos::guest::Ran::Exited { exit, pc: None }
+    });
+    if let Some(lapic) = LAPIC.get() {
+        lapic.stop_timer();
     }
-    LAPIC.get().expect("LAPIC initialised").stop_timer();
-    vm.running.fetch_sub(1, Ordering::AcqRel);
     last
 }
 
 /// Loads `elf` into fresh guest RAM and runs it, entered at `entry`, with
 /// one vCPU per host CPU until it powers off.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     let ncpus = ncpus.min(MAX_CPUS);
     // The host tick: calibrate this CPU's local APIC timer against the PIT.
@@ -251,7 +245,7 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     let stage2 = npt.root();
     core::mem::forget(npt); // in use until power-off
 
-    let done = Arc::new(AtomicBool::new(false));
+    let run = Arc::new(GuestRun::new(ncpus));
     let cpus = GuestCpus::with_kick(ncpus, |host| {
         LAPIC.get().expect("LAPIC initialised").send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
     });
@@ -304,17 +298,14 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
     let pit = Arc::new(VirtualPit::new(clock(), |_| {}));
     pio.insert(0x40, 4, pit.clone()).expect("insert failed");
     pio.insert(0x61, 1, pit.port_b()).expect("insert failed");
-    pio.insert(0x604, 2, Arc::new(PowerOff(done.clone()))).expect("insert failed");
-    pio.insert(0xf4, 1, Arc::new(PowerOff(done.clone()))).expect("insert failed");
+    pio.insert(0x604, 2, Arc::new(PowerOff(run.clone()))).expect("insert failed");
+    pio.insert(0xf4, 1, Arc::new(PowerOff(run.clone()))).expect("insert failed");
 
     cpus.request_start(0, entry as u64, blob.start_info).expect("request_start failed");
-    let vm =
-        KernelVm { cpus, mem, stage2, pio, buses, lines, apics, pit, com1, done, running: AtomicUsize::new(ncpus) };
+    let vm = KernelVm { cpus, mem, stage2, pio, buses, lines, apics, pit, com1, run };
     KERNEL_VM.store(&raw const vm as *mut KernelVm, Ordering::Release);
     let exit = vcpu_loop(&vm, 0);
-    while vm.running.load(Ordering::Acquire) > 0 {
-        core::hint::spin_loop();
-    }
+    vm.run.wait_all();
     KERNEL_VM.store(core::ptr::null_mut(), Ordering::Release);
     if crate::HOST_NMIS.load(Ordering::Relaxed) > 0 {
         println!("[hyp]   host NMIs taken: {}", crate::HOST_NMIS.load(Ordering::Relaxed));

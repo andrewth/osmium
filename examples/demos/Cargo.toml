@@ -1,10 +1,34 @@
 [package]
 name = "demos"
-description = "Architecture-independent scheduler demos shared by the example kernels"
+description = "Demos and kernel plumbing shared by the example kernels and hypervisors"
 version = "0.1.0"
 edition = "2024"
 publish = false
 license = "GPL-2.0-only"
 
+[features]
+default = ["user"]
+## Running user programs: `demos::user`, and building `examples/user` for it.
+user = []
+
 [dependencies]
 osmium = { path = "../../crates/osmium", features = ["full"] }
+
+# The workspace's lint policy (examples are not workspace members, so they
+# do not inherit `[workspace.lints]`): keep the two in step.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+# Nothing reachable from user space, the network, a disk image, a device or a guest may panic.
+# Where a panic is a genuine internal invariant, allow it at that item with a comment saying why.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"

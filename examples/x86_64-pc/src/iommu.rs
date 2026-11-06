@@ -31,7 +31,8 @@ pub fn demo(ecam: Option<EcamWindow>, units: Units) {
         println!("[iommu] no ECAM window; skipping");
         return;
     };
-    let cfg = pci::Ecam::new(crate::msi::map(ecam.base, 1 << 20), 0);
+    // SAFETY: the ECAM window from the MCFG; only this demo uses it meanwhile.
+    let cfg = pci::Ecam::new(unsafe { crate::msi::map(ecam.base, 1 << 20) }, 0);
     let mut found = None;
     pci::for_each_function(&cfg, 0, |f| {
         if found.is_none() && f.class() == demos::iommu::TESTDEV_CLASS {
@@ -47,12 +48,14 @@ pub fn demo(ecam: Option<EcamWindow>, units: Units) {
         return;
     };
     func.enable_memory_and_dma();
-    let regs = || crate::msi::map(bar.address, bar.size);
+    // SAFETY: the test device's BAR 0; each demo below is its only user while it runs.
+    let regs = || unsafe { crate::msi::map(bar.address, bar.size) };
     let id = DeviceId::new(0, func.address());
 
     if let Some(unit) = units.vtd {
         // Scalable mode if the unit has it (`x-scalable-mode=on`), else legacy.
-        let map = || crate::msi::map(unit.base, 0x1000);
+        // SAFETY: the unit's registers from the DMAR, for one driver instance at a time.
+        let map = || unsafe { crate::msi::map(unit.base, 0x1000) };
         // SAFETY: QEMU's VT-d reports ECAP.C clear, but its memory is always coherent.
         let scalable =
             unsafe { Vtd::new_scalable_assuming_coherent(map(), &crate::FRAMES, &crate::msi::Uptime, unit.segment) };
@@ -84,7 +87,9 @@ pub fn demo(ecam: Option<EcamWindow>, units: Units) {
     }
     if let Some(unit) = units.amd {
         // The device table covers bus 0 only: the test device sits there.
-        match AmdVi::new(crate::msi::map(unit.base, 0x4000), &crate::FRAMES, &crate::msi::Uptime, unit.segment, 0) {
+        // SAFETY: the unit's registers from the IVRS, for this driver alone.
+        let regs_amd = unsafe { crate::msi::map(unit.base, 0x4000) };
+        match AmdVi::new(regs_amd, &crate::FRAMES, &crate::msi::Uptime, unit.segment, 0) {
             Ok(amd) => {
                 println!(
                     "[iommu] AMD-Vi unit at {:#x}: {} bit I/O addresses",

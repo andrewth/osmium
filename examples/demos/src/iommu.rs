@@ -24,19 +24,25 @@ const REG_PA_LO: usize = 0x1c;
 const REG_PA_HI: usize = 0x20;
 const PATTERN: u32 = 0x1234_5678;
 
+/// What [`dma`] returns when the device's registers are not all in `regs`.
+const NO_REGISTERS: u32 = 0xdead_ffff;
+
 /// Has the device write its pattern to `iova` and read `pa` back; returns the
 /// device's result code (0 on success, an `0xdead....` error otherwise).
 fn dma(regs: &IoMem, iova: u64, pa: u64, len: u32) -> u32 {
-    let w = |off, v: u32| regs.write(off, v).expect("testdev register");
-    w(REG_IOVA_LO, iova as u32);
-    w(REG_IOVA_HI, (iova >> 32) as u32);
-    w(REG_PA_LO, pa as u32);
-    w(REG_PA_HI, (pa >> 32) as u32);
-    w(REG_LEN, len);
-    w(REG_DOORBELL, 1);
-    // The DMA runs inside this read.
-    let _: u32 = regs.read(REG_TRIGGER).expect("testdev register");
-    regs.read(REG_RESULT).expect("testdev register")
+    let run = || {
+        let w = |off, v: u32| regs.write(off, v).ok();
+        w(REG_IOVA_LO, iova as u32)?;
+        w(REG_IOVA_HI, (iova >> 32) as u32)?;
+        w(REG_PA_LO, pa as u32)?;
+        w(REG_PA_HI, (pa >> 32) as u32)?;
+        w(REG_LEN, len)?;
+        w(REG_DOORBELL, 1)?;
+        // The DMA runs inside this read.
+        let _: u32 = regs.read(REG_TRIGGER).ok()?;
+        regs.read(REG_RESULT).ok()
+    };
+    run().unwrap_or(NO_REGISTERS)
 }
 
 /// Takes every logged fault off `iommu` (a blocked DMA the device retries in
@@ -54,8 +60,11 @@ fn drain<I: Iommu>(iommu: &I, id: DeviceId) -> usize {
 /// unmapped address and a detached device are both blocked.
 pub fn testdev<I: Iommu, A: DmaAllocator + TableAlloc>(iommu: &I, id: DeviceId, regs: IoMem, frames: &A, tag: &str) {
     const IOVA: u64 = 0x2000_0000;
-    let mut domain = IoDomain::new(iommu, DomainId(2), frames).expect("IOMMU domain");
-    let page = frames.alloc_coherent(4096).expect("a DMA page");
+    let mut domain = match IoDomain::new(iommu, DomainId(2), frames) {
+        Ok(d) => d,
+        Err(e) => return println!("{tag}: no I/O domain: {e:?}"),
+    };
+    let Some(page) = frames.alloc_coherent(4096) else { return println!("{tag}: no memory for a DMA page") };
     let pa = page.device_addr();
     if let Err(e) = domain.map(IOVA, pa, 4096, MapFlags::RW).and_then(|()| domain.attach(id)) {
         println!("[iommu] {tag}: mapping and attaching the test device failed: {e:?}");
@@ -86,7 +95,10 @@ pub fn testdev<I: Iommu, A: DmaAllocator + TableAlloc>(iommu: &I, id: DeviceId, 
     // Detached: nothing gets through, not even the mapped page. (QEMU's
     // AMD-Vi blocks such a device without logging an event.)
     page.store::<u32>(0, 0);
-    domain.detach(id).expect("detach");
+    if let Err(e) = domain.detach(id) {
+        return println!("{tag}: detaching the device failed: {e:?}");
+    }
+
     let result = dma(&regs, IOVA, pa.as_u64(), 64);
     let seen = page.load::<u32>(0);
     match drain(iommu, id) {

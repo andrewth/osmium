@@ -3,5 +3,16 @@ target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
 # The kernel runs where it is linked, with no loader to apply relocations.
-rustflags = ["-C", "relocation-model=static"]
+# x86_64-unknown-none is soft-float, so the RustCrypto crates under
+# osmium-tls need their portable backends; the repository's root
+# .cargo/config.toml says the same for the workspace, and this file repeats
+# it so the example builds wherever the tree is (repeated --cfg flags are
+# harmless).
+rustflags = [
+    "-C", "relocation-model=static",
+    "--cfg", 'poly1305_backend="soft"',
+    "--cfg", 'sha2_backend="soft"',
+    "--cfg", 'curve25519_dalek_backend="serial"',
+    "--cfg", 'chacha20_backend="soft"',
+]
 runner = "qemu-system-x86_64 -machine q35 -cpu max -nographic -m 128M -smp 4 -kernel"

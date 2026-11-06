@@ -4,7 +4,8 @@
 //!
 //! The same steps as the RISC-V example, on different hardware: PL011 UART,
 //! GICv2 or GICv3 interrupt controller (probed from the device tree), generic timer, AArch64 stage-1 paging and
-//! PSCI for power-off.
+//! PSCI for power-off. What every example kernel does the same way lives in
+//! the `demos` crate.
 #![no_std]
 #![no_main]
 
@@ -14,34 +15,33 @@ mod iommu;
 mod its;
 
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use core::ptr::NonNull;
+use demos::guest::image;
+use demos::kernel::{FRAMES, Frames, GuardedStacks, KernelTable, now_ns};
 use osmium::arch::aarch64::{self, psci};
-use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
-use osmium::arch::{MAX_CPUS, cpu, irq, mmu};
+use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
+use osmium::arch::{cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::irq::{InterruptController, IrqTable, MAX_CLAIMS_PER_CALL};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
 use osmium::hal::timer::TickRate;
-use osmium::mm::frame::order_for;
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::PageSize;
 use osmium::mm::paging::formats::Aarch64;
-use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
+use osmium::mm::{MapFlags, MemoryMap, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
+use osmium::proc::ExitStatus;
 use osmium::sysdrv::gicv2::GicV2;
 use osmium::sysdrv::gicv3::{FIRST_LPI, GicV3, SysRegs};
 use osmium::sysdrv::pl011::Pl011;
 
 use osmium::arch::trap::TrapCpu;
-use osmium::proc::{AddressSpace, ExitStatus, Process, UserMemory};
+use osmium::sched::FifoScheduler;
 use osmium::sched::timer::TimerQueue;
-use osmium::sched::{FifoScheduler, StackAllocator, Task, TaskBuilder};
 use osmium::sync::{IrqSpinLock, Once};
 
 core::arch::global_asm!(
@@ -75,8 +75,13 @@ secondary_start:
     bl secondary_main
     b 3b
 
+    // The boot stack, above a guard page that kmain unmaps once the MMU is
+    // on, so an overflow faults instead of overwriting .data below.
     .section .bss.stack, "aw", @nobits
     .balign 4096
+    .globl boot_stack_guard
+boot_stack_guard:
+    .space 4096
     .space 65536
 boot_stack_top:
 "#
@@ -130,6 +135,7 @@ unsafe extern "C" {
     static user_bad: u8;
     static user_bad_end: u8;
     fn secondary_start();
+    static boot_stack_guard: u8;
     static _kernel_start: u8;
     static _etext: u8;
     static _erodata: u8;
@@ -146,44 +152,19 @@ const RAM_BASE_DTB: usize = 0x4000_0000;
 const EARLY_UART: usize = 0x0900_0000;
 /// Timer interrupt period.
 const TICK_NS: u64 = 10_000_000;
-
-type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
-
-// SAFETY: the kernel runs identity-mapped, before and after enabling the MMU.
-static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
+/// Bytes of a secondary CPU's boot stack.
+const SECONDARY_STACK: usize = 64 * 1024;
 
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 
 /// The kernel page table, shared by all CPUs.
-static PT: IrqSpinLock<Option<PageTable<Aarch64, &'static Frames>>> = IrqSpinLock::new(None);
+static PT: KernelTable<Aarch64> = IrqSpinLock::new(None);
 
-/// Task stacks with an unmapped guard page below them.
-struct GuardedStacks;
-
-// SAFETY: blocks come from the frame allocator (exclusive, page aligned) and
-// the usable part stays mapped read/write.
-unsafe impl StackAllocator for GuardedStacks {
-    fn alloc(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
-        let order = order_for(size + PAGE_SIZE);
-        let guard = FRAMES.lock().alloc(order)?;
-        let (_, flush) = PT.lock().as_mut()?.unmap_4k(VirtAddr::new(guard.0)).ok()?;
-        flush.flush();
-        Some((NonNull::new((guard.0 + PAGE_SIZE as u64) as *mut u8)?, (PAGE_SIZE << order) - PAGE_SIZE))
-    }
-
-    unsafe fn free(&self, base: NonNull<u8>, len: usize) {
-        let guard = base.as_ptr() as u64 - PAGE_SIZE as u64;
-        {
-            let mut pt = PT.lock();
-            let flags = MapFlags::RW | MapFlags::GLOBAL;
-            let pt = pt.as_mut().expect("as_mut returned None");
-            pt.map(VirtAddr::new(guard), PhysAddr::new(guard), PageSize::Size4K, flags).expect("map failed").flush();
-        }
-        // SAFETY: the block came from `alloc` with the same order.
-        unsafe { FRAMES.lock().dealloc(PhysAddr::new(guard), order_for(len + PAGE_SIZE)) };
-    }
-}
+/// Task stacks and secondary CPUs' stacks, each above an unmapped guard
+/// page. TLB maintenance on this table is broadcast to the inner shareable
+/// domain, so no other CPU needs telling.
+static STACKS: GuardedStacks<Aarch64> = GuardedStacks::new(&PT, |_| {});
 
 /// Tells the exception vectors where the incoming task's stack ends.
 fn on_switch(next: &osmium::sched::Task) {
@@ -194,20 +175,14 @@ fn on_switch(next: &osmium::sched::Task) {
         unsafe { aarch64::write_ttbr0_el1(root) };
         osmium::arch::mmu::flush_all();
     }
-    TrapCpu::current().set_stack_limit(next.kernel_stack_range().map_or(0, |r| r.start));
-}
-
-/// Gives this CPU an emergency stack for exceptions from an overflowed stack.
-fn set_exception_stack() {
-    let stack = alloc::vec![0u8; 16 * 1024].leak();
-    let lo = stack.as_ptr() as usize;
-    TrapCpu::current().set_exception_stack(lo..lo + stack.len());
+    TrapCpu::current().set_stack_limit(demos::kernel::stack_limit(next));
 }
 
 static UART: Once<SerialConsole<Pl011>> = Once::new();
 static GIC: Once<Gic> = Once::new();
 
 /// The interrupt controller the device tree describes.
+#[allow(clippy::large_enum_variant, reason = "one static value: boxing buys nothing")]
 enum Gic {
     V2(GicV2),
     V3(GicV3<SysRegs>),
@@ -217,7 +192,11 @@ impl Gic {
     fn init_cpu(&self) {
         match self {
             Gic::V2(g) => g.init_cpu(),
-            Gic::V3(g) => assert!(g.init_cpu(), "GICv3 CPU interface failed to come up"),
+            Gic::V3(g) => {
+                if !g.init_cpu() {
+                    println!("[gic]   GICv3 CPU interface {} failed to come up", cpu::current_id());
+                }
+            }
         }
     }
 
@@ -288,12 +267,10 @@ fn handle_irqs(gic: &Gic) {
 }
 static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
 static TIMERS: TimerQueue = TimerQueue::new();
-static RATE: Once<TickRate> = Once::new();
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static PSCI: Once<psci::Conduit> = Once::new();
 static TTBR0: AtomicU64 = AtomicU64::new(0);
 static VTIMER_IRQ: AtomicU32 = AtomicU32::new(0);
-static ONLINE: AtomicUsize = AtomicUsize::new(1);
 static IPIS: AtomicU64 = AtomicU64::new(0);
 /// SGI used to wake other CPUs.
 const IPI_SGI: u32 = 1;
@@ -301,28 +278,21 @@ const IPI_SGI: u32 = 1;
 /// Handed to a secondary CPU through `x0`.
 #[repr(C)]
 struct SecondaryBoot {
+    /// Read first, by `secondary_start`.
     stack_top: u64,
     cpu: usize,
-}
-
-/// Waits up to a second for `n` CPUs to be online.
-fn wait_online(n: usize) -> bool {
-    let deadline = now_ns() + 1_000_000_000;
-    while ONLINE.load(Ordering::Acquire) < n {
-        if now_ns() > deadline {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-    true
-}
-
-fn now_ns() -> u64 {
-    RATE.get().expect("RATE initialised").ticks_to_ns(cpu::ticks())
+    /// The lowest address of the stack, above its guard page.
+    stack_limit: u64,
 }
 
 fn shutdown() -> ! {
     psci::system_off(*PSCI.get().unwrap_or(&psci::Conduit::Hvc))
+}
+
+/// Says why the kernel cannot boot, and powers off.
+fn fatal(why: &str) -> ! {
+    println!("[boot]  {why}; shutting down");
+    shutdown()
 }
 
 /// When the CPU has SVE (QEMU `-cpu max`, not the default Cortex-A72), checks
@@ -377,6 +347,21 @@ fn sve_selftest(model: &str) {
     );
 }
 
+/// A register window: base and length.
+type Window = (u64, u64);
+
+/// The interrupt controller's two register windows from the device tree:
+/// the distributor, then the CPU interface (GICv2) or the redistributors
+/// (GICv3); and whether it is a GICv3.
+fn gic_windows(fdt: &Fdt<'_>) -> Option<(Window, Window, bool)> {
+    let v3_node = fdt.find_compatible(&["arm,gic-v3"]);
+    let node = v3_node.or_else(|| fdt.find_compatible(&["arm,cortex-a15-gic", "arm,gic-400"]))?;
+    let mut regs = node.reg();
+    let (d, d_len) = regs.next()?;
+    let (c, c_len) = regs.next()?;
+    Some(((d, d_len?), (c, c_len?), v3_node.is_some()))
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn kmain(x0: usize) -> ! {
     // SAFETY: a single CPU runs this kernel; id 0 is unique.
@@ -389,7 +374,7 @@ extern "C" fn kmain(x0: usize) -> ! {
     unsafe { osmium::arch::fp::enable() };
 
     // SAFETY: QEMU virt's PL011 lives here and nothing else drives it.
-    let mut uart = Pl011::new(unsafe { IoMem::new(EARLY_UART as *mut u8, 0x1000) }).expect("new failed");
+    let Ok(mut uart) = Pl011::new(unsafe { IoMem::new(EARLY_UART as *mut u8, 0x1000) }) else { shutdown() };
     uart.init(None);
     set_console(UART.call_once(|| SerialConsole::new(uart)));
     println!("\nosmium aarch64-virt example (EL{})", aarch64::current_el());
@@ -398,14 +383,13 @@ extern "C" fn kmain(x0: usize) -> ! {
     // QEMU passes the device tree in x0 only for Linux images.
     let dtb = if x0 != 0 { x0 } else { RAM_BASE_DTB };
     // SAFETY: QEMU places a valid device tree there; we reserve it below.
-    let fdt = unsafe { Fdt::from_ptr(dtb as *const u8) }.expect("no device tree");
+    let Ok(fdt) = (unsafe { Fdt::from_ptr(dtb as *const u8) }) else { fatal("no device tree") };
     let model = fdt.root().property("model").and_then(|p| p.as_str()).unwrap_or("?");
     println!("[fdt]   {model}, {} bytes at {dtb:#x}", fdt.total_size());
-    let uart_node = fdt.find_compatible(&["arm,pl011"]).expect("no PL011");
-    println!(
-        "[uart]  pl011 at {:#x} (confirmed by the device tree)",
-        uart_node.reg().next().expect("next returned None").0
-    );
+    let Some((uart_base, _)) = fdt.find_compatible(&["arm,pl011"]).and_then(|n| n.reg().next()) else {
+        fatal("no PL011 in the device tree")
+    };
+    println!("[uart]  pl011 at {uart_base:#x} (confirmed by the device tree)");
     let conduit = fdt
         .find_node("/psci")
         .and_then(|n| n.property("method"))
@@ -413,22 +397,18 @@ extern "C" fn kmain(x0: usize) -> ! {
         .and_then(psci::Conduit::from_method)
         .unwrap_or(psci::Conduit::Hvc);
     PSCI.call_once(|| conduit);
-    RATE.call_once(|| TickRate::new(aarch64::counter_frequency()));
+    demos::kernel::set_rate(TickRate::new(aarch64::counter_frequency()));
 
     // --- Interrupt controller and timer line ------------------------------
-    let v3_node = fdt.find_compatible(&["arm,gic-v3"]);
-    let gic_node = v3_node.or_else(|| fdt.find_compatible(&["arm,cortex-a15-gic", "arm,gic-400"])).expect("no GIC");
-    let is_v3 = v3_node.is_some();
-    let mut regs = gic_node.reg();
-    let (gicd, gicd_len) =
-        regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
-    // GICv2: the CPU interface; GICv3: the redistributor region.
-    let (gicc, gicc_len) =
-        regs.next().map(|(a, s)| (a, s.expect("GIC register has a size"))).expect("GIC register present");
+    let Some(((gicd, gicd_len), (gicc, gicc_len), is_v3)) = gic_windows(&fdt) else {
+        fatal("no GIC (with sized register windows) in the device tree")
+    };
     // The virtual timer is the third `interrupts` triple: (PPI, number, flags).
     // (No heap yet, so no collecting into a Vec.)
-    let timer = fdt.find_compatible(&["arm,armv8-timer"]).expect("no timer");
-    let vtimer_irq = 16 + timer.interrupts().nth(2 * 3 + 1).expect("timer has no virtual timer interrupt");
+    let Some(vtimer) = fdt.find_compatible(&["arm,armv8-timer"]).and_then(|t| t.interrupts().nth(2 * 3 + 1)) else {
+        fatal("no virtual timer interrupt in the device tree")
+    };
+    let vtimer_irq = 16 + vtimer;
     println!(
         "[gic]   GICv{} distributor {gicd:#x}, {} {gicc:#x}; virtual timer is INTID {vtimer_irq}; PSCI via {conduit:?}",
         if is_v3 { 3 } else { 2 },
@@ -437,27 +417,22 @@ extern "C" fn kmain(x0: usize) -> ! {
 
     // --- Physical memory ---------------------------------------------------
     let mut map = MemoryMap::<32>::new();
-    fdt.fill_memory_map(&mut map, Some(PhysAddr::new(dtb as u64))).expect("fill_memory_map failed");
+    if fdt.fill_memory_map(&mut map, Some(PhysAddr::new(dtb as u64))).is_err() {
+        fatal("the device tree's memory map does not fit");
+    }
     // SAFETY: linker-provided symbols.
     let (kstart, etext, erodata, kend) =
         unsafe { (sym(&_kernel_start), sym(&_etext), sym(&_erodata), sym(&_kernel_end)) };
-    map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).expect("reserve failed");
+    if map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).is_err() {
+        fatal("cannot reserve the kernel image");
+    }
     map.page_align_usable();
     for r in map.regions() {
         println!("[mem]   {:#011x}..{:#011x} {:?}", r.start.0, r.end.0, r.kind);
     }
-    {
-        let mut buddy = FRAMES.lock();
-        for r in map.usable() {
-            // SAFETY: the memory map says the range is free RAM, identity-mapped.
-            unsafe { buddy.add_region(r.start, r.end) };
-        }
-        println!(
-            "[frame] buddy allocator: {} free frames ({} MiB)",
-            buddy.free_frames(),
-            (buddy.free_frames() * PAGE_SIZE) >> 20
-        );
-    }
+    // SAFETY: the memory map says these ranges are free RAM, identity-mapped.
+    unsafe { demos::kernel::add_ram(map.usable().map(|r| r.start..r.end)) };
+    demos::kernel::report_frames();
 
     // --- Heap ------------------------------------------------------------
     HEAP.init(&FRAMES);
@@ -469,12 +444,11 @@ extern "C" fn kmain(x0: usize) -> ! {
     // --- Paging (stage 1, 4 KiB granule, W^X) ------------------------------
     // The kernel's own memory node is mapped piecewise below (W^X); any
     // other node, all of which the frame allocator was given, as RW.
-    let ram = fdt
-        .memory()
-        .find(|&(base, len)| (base..base + len).contains(&kstart))
-        .expect("no memory node holds the kernel");
+    let Some(ram) = fdt.memory().find(|&(base, len)| (base..base + len).contains(&kstart)) else {
+        fatal("no memory node holds the kernel")
+    };
     let ram_end = ram.0 + ram.1;
-    let mut pt: PageTable<Aarch64, &'static Frames> = PageTable::new(&FRAMES).expect("new failed");
+    let Ok(mut pt) = PageTable::<Aarch64, &'static Frames>::new(&FRAMES) else { fatal("no memory for a page table") };
     let k = |f| f | MapFlags::GLOBAL;
     let va = |a: u64| VirtAddr::new(a);
     let pa = |a: u64| PhysAddr::new(a);
@@ -483,33 +457,43 @@ extern "C" fn kmain(x0: usize) -> ! {
     // needs break-before-make and would briefly unmap 2 MiB under other
     // CPUs.
     let map_4k = |pt: &mut PageTable<Aarch64, &'static Frames>, start: u64, len: u64| {
-        for p in (start..start + len).step_by(PAGE_SIZE) {
-            pt.map(va(p), pa(p), PageSize::Size4K, k(MapFlags::RW)).expect("map failed").ignore();
-        }
+        (start..start + len).step_by(PAGE_SIZE).all(|p| pt.map(va(p), pa(p), PageSize::Size4K, k(MapFlags::RW)).is_ok())
     };
-    map_4k(&mut pt, ram.0, kstart - ram.0);
-    pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).expect("map_range failed");
-    pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).expect("map_range failed");
-    map_4k(&mut pt, erodata, ram_end - erodata);
-    for (base, len) in fdt.memory().filter(|&m| m != ram) {
-        let (start, end) = (base.next_multiple_of(PAGE_SIZE as u64), (base + len) & !(PAGE_SIZE as u64 - 1));
-        if start < end {
-            map_4k(&mut pt, start, end - start);
-        }
+    let mapped = map_4k(&mut pt, ram.0, kstart - ram.0)
+        && pt.map_range(va(kstart), pa(kstart), etext - kstart, k(MapFlags::RX)).is_ok()
+        && pt.map_range(va(etext), pa(etext), erodata - etext, k(MapFlags::READ)).is_ok()
+        && map_4k(&mut pt, erodata, ram_end - erodata)
+        && fdt.memory().filter(|&m| m != ram).all(|(base, len)| {
+            let (start, end) = (base.next_multiple_of(PAGE_SIZE as u64), (base + len) & !(PAGE_SIZE as u64 - 1));
+            start >= end || map_4k(&mut pt, start, end - start)
+        });
+    if !mapped {
+        fatal("cannot map the kernel and RAM");
     }
     for (base, len) in [(EARLY_UART as u64, PAGE_SIZE as u64), (gicd, gicd_len), (gicc, gicc_len)] {
-        pt.map_range(va(base), pa(base), len.next_multiple_of(PAGE_SIZE as u64), k(MapFlags::RW | MapFlags::DEVICE))
-            .expect("map_range failed");
+        demos::kernel::map_device(&mut pt, base, len);
     }
     enable_mmu(pt.root());
     TTBR0.store(pt.root().0, Ordering::Release);
-    let t = pt.translate(va(kmain as *const () as u64)).expect("translate failed");
-    println!("[mmu]   MMU on, TTBR0 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
+    // The page below the boot stack becomes its guard (see `_start`).
+    // SAFETY: a linker symbol.
+    let guard = unsafe { sym(&boot_stack_guard) };
+    if demos::kernel::unmap_guard(&mut pt, guard) {
+        let bottom = guard as usize + PAGE_SIZE;
+        demos::kernel::set_boot_stack_limit(bottom);
+        TrapCpu::current().set_stack_limit(bottom);
+    }
+    if let Some(t) = pt.translate(va(kmain as *const () as u64)) {
+        println!("[mmu]   MMU on, TTBR0 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
+    }
     *PT.lock() = Some(pt);
-    set_exception_stack();
-    osmium::sched::set_stack_allocator(&GuardedStacks);
+    demos::fault::set_exception_stack();
+    osmium::sched::set_stack_allocator(&STACKS);
     osmium::sched::set_switch_hook(on_switch);
-    println!("[guard] task stacks get unmapped guard pages; overflowing exceptions move to a per-CPU exception stack");
+    println!(
+        "[guard] boot, CPU and task stacks get unmapped guard pages; overflowing exceptions move to a per-CPU \
+         exception stack"
+    );
 
     // --- Interrupts, scheduler ---------------------------------------------
     // SAFETY: the device tree says the GIC lives here, mapped as device memory above.
@@ -522,11 +506,12 @@ extern "C" fn kmain(x0: usize) -> ! {
         Gic::V3(g) => g.init_distributor(),
     }
     VTIMER_IRQ.store(vtimer_irq, Ordering::Relaxed);
-    IRQS.register(vtimer_irq, &on_timer).expect("register failed");
-    IRQS.register(IPI_SGI, &|_| {
+    let counted_ipi = &|_| {
         IPIS.fetch_add(1, Ordering::Relaxed);
-    })
-    .expect("register failed");
+    };
+    if IRQS.register(vtimer_irq, &on_timer).is_err() || IRQS.register(IPI_SGI, counted_ipi).is_err() {
+        fatal("cannot register the timer and IPI handlers");
+    }
 
     osmium::sched::inject_scheduler(&SCHED);
     osmium::sched::init_cpu();
@@ -534,23 +519,33 @@ extern "C" fn kmain(x0: usize) -> ! {
     println!("[sched] FIFO scheduler, {} ms tick, {} lines on the GIC", TICK_NS / 1_000_000, gic.num_irqs());
 
     // --- Secondary CPUs -----------------------------------------------------
-    osmium::sched::set_remote_wake_hook(|cpu| GIC.get().expect("GIC initialised").send_sgi(cpu, IPI_SGI));
+    osmium::sched::set_remote_wake_hook(|cpu| {
+        if let Some(gic) = GIC.get() {
+            gic.send_sgi(cpu, IPI_SGI);
+        }
+    });
     let boot_mpidr = aarch64::read_mpidr_el1() & 0xff_00ff_ffff;
-    let cpus = fdt.find_node("/cpus").expect("no /cpus");
-    let mpidrs = cpus
-        .children()
+    let mpidrs = fdt
+        .find_node("/cpus")
+        .into_iter()
+        .flat_map(|cpus| cpus.children())
         .filter(|c| c.property("device_type").and_then(|p| p.as_str()) == Some("cpu"))
         .filter_map(|c| c.reg().next().map(|(m, _)| m));
     let mut ncpus = 1;
-    for mpidr in mpidrs.filter(|&m| m != boot_mpidr).take(MAX_CPUS - 1) {
-        let stack = alloc::vec![0u8; 64 * 1024].leak();
+    for (cpu, mpidr) in demos::kernel::secondaries(mpidrs, boot_mpidr) {
+        // Above a guard page, which takes effect once the CPU turns its MMU on.
+        let Some(stack) = STACKS.leak(SECONDARY_STACK) else {
+            println!("[smp]   no memory for CPU {mpidr:#x}'s stack; continuing with {ncpus} CPUs");
+            break;
+        };
         let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
-            stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
-            cpu: ncpus,
+            stack_top: stack.end,
+            cpu,
+            stack_limit: stack.start,
         }));
         if let Gic::V3(g) = gic {
             // SGIs are addressed by affinity, so the boot CPU maps the new CPU first.
-            g.register_cpu(ncpus, mpidr);
+            g.register_cpu(cpu, mpidr);
         }
         // SAFETY: `secondary_start` sets up its stack from `boot`.
         let rc = unsafe { psci::cpu_on(conduit, mpidr, secondary_start as *const () as u64, boot as *const _ as u64) };
@@ -560,7 +555,7 @@ extern "C" fn kmain(x0: usize) -> ! {
             println!("[smp]   PSCI CPU_ON {mpidr:#x} failed ({rc}); continuing with {ncpus} CPUs");
             break;
         }
-        if !wait_online(ncpus + 1) {
+        if !demos::kernel::wait_online(cpu + 1) {
             println!("[smp]   CPU {mpidr:#x} did not check in within 1 s; continuing with {ncpus} CPUs");
             break;
         }
@@ -573,10 +568,10 @@ extern "C" fn kmain(x0: usize) -> ! {
         demos::smp(ncpus);
         demos::balance(ncpus, &|| SCHED.steals());
     }
-    fault_demo();
-    overflow_demo();
+    demos::fault::fault_demo();
+    demos::fault::overflow_demo();
     demos::user::boot_vfs();
-    user_demo(ncpus);
+    user_demo();
     iommu::demo(&fdt);
     its::demo(&fdt);
 
@@ -584,7 +579,7 @@ extern "C" fn kmain(x0: usize) -> ! {
         "[done]  {} timer ticks, {} IPIs, {} free frames; shutting down",
         TICKS.load(Ordering::Relaxed),
         IPIS.load(Ordering::Relaxed),
-        FRAMES.lock().free_frames()
+        demos::kernel::free_frames()
     );
     shutdown()
 }
@@ -592,7 +587,7 @@ extern "C" fn kmain(x0: usize) -> ! {
 /// Per-CPU interrupt setup: GIC CPU interface, banked timer and IPI lines,
 /// the generic timer, and the CPU's interrupt mask.
 fn start_local_interrupts() {
-    let gic = GIC.get().expect("GIC initialised");
+    let Some(gic) = GIC.get() else { return };
     let vtimer = VTIMER_IRQ.load(Ordering::Relaxed);
     gic.init_cpu();
     gic.set_priority(vtimer, 0x80);
@@ -614,11 +609,14 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     // SAFETY: as on the boot CPU.
     unsafe { osmium::arch::fp::enable() };
     enable_mmu(PhysAddr::new(TTBR0.load(Ordering::Acquire)));
-    set_exception_stack();
+    // The MMU is on, so the guard page below this stack is in force.
+    demos::kernel::set_boot_stack_limit(boot.stack_limit as usize);
+    TrapCpu::current().set_stack_limit(boot.stack_limit as usize);
+    demos::fault::set_exception_stack();
     osmium::sched::init_cpu();
     start_local_interrupts();
     println!("[smp]   MPIDR {:#x} online as CPU {}", aarch64::read_mpidr_el1() & 0xff_ffff, boot.cpu);
-    ONLINE.fetch_add(1, Ordering::Release);
+    demos::kernel::check_in();
     // Hand the CPU to the scheduler for good.
     osmium::sched::exit()
 }
@@ -646,9 +644,9 @@ fn enable_mmu(root: PhysAddr) {
 }
 
 fn arm_timer() {
-    let ticks = RATE.get().expect("RATE initialised").ns_to_ticks(TICK_NS);
+    let Some(rate) = demos::kernel::rate() else { return };
     // SAFETY: reprograms only the virtual timer's countdown.
-    unsafe { aarch64::write_cntv_tval_el0(ticks) };
+    unsafe { aarch64::write_cntv_tval_el0(rate.ns_to_ticks(TICK_NS)) };
 }
 
 fn on_timer(_irq: u32) {
@@ -660,247 +658,50 @@ fn on_timer(_irq: u32) {
     osmium::sched::tick();
 }
 
-/// The last synchronous exception that `on_trap` recovered from.
-static RECOVERED: [IrqSpinLock<Option<Trap>>; MAX_CPUS] = [const { IrqSpinLock::new(None) }; MAX_CPUS];
-/// Whether this CPU expects a trap and may recover from it. Per CPU, so a real
-/// fault on another CPU is never taken for the demo's.
-static RECOVER: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-
-/// Runs `f`, which must take one breakpoint or page fault, with recovery armed
-/// on this CPU only (interrupts off, so the task cannot migrate meanwhile).
-/// Returns the trap that was recovered from.
-fn recover_trap(f: impl FnOnce()) -> Trap {
-    irq::without(|| {
-        let cpu = cpu::current_id();
-        RECOVER[cpu].store(true, Ordering::SeqCst);
-        f();
-        RECOVER[cpu].store(false, Ordering::SeqCst);
-        RECOVERED[cpu].lock().take().expect("recovery recorded by the trap handler")
-    })
+/// Drops to EL0 at `pc` with stack pointer `sp`, taking exceptions from EL0
+/// on this task's kernel stack.
+///
+/// # Safety
+/// See [`demos::user::Enter`].
+unsafe fn enter_user(pc: u64, sp: u64) -> ! {
+    let Some(stack) = osmium::sched::current().kernel_stack_range() else {
+        println!("[user]  {} has no kernel stack of its own", osmium::sched::current().name());
+        osmium::proc::exit(ExitStatus::Code(127))
+    };
+    // SAFETY: the caller's contract; vectors are installed and `stack` is
+    // this task's own kernel stack.
+    unsafe { aarch64::enter_user(pc, sp, stack.end as u64) }
 }
 
-fn fault_demo() {
-    // SAFETY: the handler steps over the breakpoint.
-    let t = recover_trap(|| unsafe { core::arch::asm!("brk #0") });
-    println!("[trap]  recovered from {:?}", t);
-    // Nothing is mapped at 0x1000: a data abort.
-    // SAFETY: the read faults and the handler skips it; the value is never used.
-    let t = recover_trap(|| {
-        let _ = unsafe { core::ptr::read_volatile(0x1000 as *const u64) };
-    });
-    println!("[trap]  recovered from {:?}", t);
-}
-
-/// A task that recurses until it runs off the bottom of its stack.
-fn overflow_demo() {
-    #[inline(never)]
-    fn recurse(depth: u64) -> u64 {
-        let frame = core::hint::black_box([depth; 32]);
-        if core::hint::black_box(true) { recurse(depth + 1) + frame[7] } else { 0 }
-    }
-    let t = TaskBuilder::new("deep").stack_size(16 * 1024).spawn(|| {
-        recurse(0);
-    });
-    t.join();
-    println!("[guard] the other tasks keep running: {} free frames", FRAMES.lock().free_frames());
-}
-
-/// Where every user program is mapped, each in its own address space:
-/// 512 GiB (root entry 1); the kernel lives under root entry 0, shared.
-const USER_BASE: u64 = 0x80_0000_0000;
-
-/// A process's memory: a table sharing the kernel's root entry 0, with
-/// table and user pages from `FRAMES`.
-type Space = AddressSpace<Aarch64, &'static Frames>;
-
-fn new_space() -> Space {
-    // SAFETY: the kernel table lives for the whole run.
-    unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..1) }
-        .expect("out of memory for a page table")
-}
-
-/// Makes code just written to `range` of the running process visible to
-/// instruction fetch on every CPU. The code was written through the kernel's
-/// identity map; cleaning by the user address reaches the same lines.
-fn sync_icache(range: core::ops::Range<u64>) {
-    for line in (range.start & !63..range.end).step_by(64) {
-        // SAFETY: cache maintenance on a mapped EL0 page (PAN is off).
-        unsafe { core::arch::asm!("dc cvau, {}", in(reg) line) };
-    }
-    // SAFETY: barriers and instruction-cache invalidation only.
-    unsafe { core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb") };
-}
-
-/// Copies a user program into fresh pages, maps it EL0-accessible (code
-/// read/execute, stack read/write) at slot `n`, and spawns a task on `cpu`
-/// that drops to EL0 there.
-fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> (Arc<Task>, Weak<Process>) {
-    let (start, end) = (code.0 as *const u8, code.1 as *const u8);
-    // SAFETY: the linker symbols delimit the program's bytes.
-    let mut code = unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }.to_vec();
-    assert!(code.len() <= PAGE_SIZE);
-    // Tell this copy which process it is (the '?' in its message).
-    if let Some(q) = code.iter().position(|&b| b == b'?') {
-        code[q] = b'0' + n as u8;
-    }
-    let (code_va, stack_va, len) = (USER_BASE, USER_BASE + 0x8000, code.len() as u64);
-    let space = new_space();
-    space.load_flat(code_va, &code, MapFlags::RX).expect("load_flat failed");
-    space.map_anon(stack_va, PAGE_SIZE as u64, MapFlags::RW).expect("map_anon failed");
-    let process = Process::new(name, space, USER_BASE + 0x10000);
-    let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
-        // The switch hook has installed this process's table.
-        sync_icache(code_va..code_va + len);
-        let kernel_top =
-            osmium::sched::current().kernel_stack_range().expect("kernel_stack_range returned None").end as u64;
-        // SAFETY: vectors are installed, `kernel_top` is this task's own
-        // kernel stack, and both pages are mapped EL0-accessible.
-        unsafe { aarch64::enter_user(code_va, stack_va + PAGE_SIZE as u64, kernel_top) }
-    });
-    (task, Arc::downgrade(&process))
-}
-
-/// The Rust user program, built by `build.rs` from `examples/user/hello.rs`.
-static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
-
-/// Loads an ELF executable into a new address space and spawns a task on
-/// `cpu` that runs it in user mode.
-fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> (Arc<Task>, Weak<Process>) {
-    let elf = osmium::boot::elf::Elf::new(image).expect("bad user ELF");
-    let space = new_space();
-    let brk = space.load_elf(&elf).expect("loading the user ELF failed");
-    let code: Vec<_> = elf.segments().filter(|s| s.flags.execute).map(|s| s.vaddr..s.vaddr + s.mem_size).collect();
-    let stack_top: u64 = 0xff_0000_0000;
-    space.map_anon(stack_top - PAGE_SIZE as u64, PAGE_SIZE as u64, MapFlags::RW).expect("map_anon failed");
-    let entry = elf.entry();
-    let process = Process::new(name, space, brk);
-    process.set_mmap_area(0xa0_0000_0000..0xa1_0000_0000);
-    let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
-        // The switch hook has installed this process's table.
-        code.into_iter().for_each(sync_icache);
-        let kernel_top =
-            osmium::sched::current().kernel_stack_range().expect("kernel_stack_range returned None").end as u64;
-        // SAFETY: vectors are installed, the switch hook installs this
-        // process's table, and its pages are mapped EL0-accessible.
-        unsafe { aarch64::enter_user(entry, stack_top, kernel_top) }
-    });
-    (task, Arc::downgrade(&process))
-}
-
-/// The Rust program that forks and execs, from `examples/user/init.rs`.
-static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
-
-/// What `fork` and `execve` need: spaces like `new_space`'s, a stack below
-/// 0xff_0000_0000 and an `mmap` area above it, as for `spawn_elf`.
-/// osmium-proc makes loaded and copied code visible to instruction fetch.
+/// What `fork` and `execve` need: spaces sharing the kernel's root entry 0,
+/// laid out as `demos::user` says. osmium-proc makes loaded and copied code
+/// visible to instruction fetch.
 fn platform() -> osmium::proc::Platform {
-    osmium::proc::Platform {
-        new_memory: || {
-            // SAFETY: the kernel table lives for the whole run.
-            let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..1) };
-            osmium::sync::fallible::try_box(space.map_err(|_| osmium::fs::Errno::ENOMEM)?)
-                .map(|space| space as alloc::boxed::Box<dyn osmium::proc::UserMemory>)
-                .map_err(|_| osmium::fs::Errno::ENOMEM)
-        },
-        activate: |root| {
+    demos::user::platform(
+        || demos::user::new_space(&PT),
+        |root| {
             // SAFETY: the table shares the kernel's root entry 0.
             unsafe { aarch64::write_ttbr0_el1(root.0) };
             osmium::arch::mmu::flush_all();
         },
-        resume: |frame| {
-            let kernel_top =
-                osmium::sched::current().kernel_stack_range().expect("kernel_stack_range returned None").end as u64;
+        |frame| {
+            let Some(stack) = osmium::sched::current().kernel_stack_range() else {
+                osmium::proc::exit(ExitStatus::Code(127))
+            };
             // SAFETY: the child's task is running with its table active (the
             // switch hook); the frame, its parent's from an svc, is on this
             // task's stack.
-            unsafe { aarch64::resume_user(&frame, kernel_top) }
+            unsafe { aarch64::resume_user(&frame, stack.end as u64) }
         },
-        stack_top: 0xff_0000_0000,
-        stack_size: 64 * 1024,
-        mmap_area: 0xa0_0000_0000..0xa1_0000_0000,
-        load_base: 0xb0_0000_0000,
-    }
+    )
 }
 
-/// Runs `/bin/init`, which forks, execs and waits, on `cpu`; its children
-/// go wherever the scheduler puts them.
-fn fork_exec_demo(cpu: usize) {
-    demos::user::install("init", INIT_ELF);
-    let process =
-        Process::new_boxed("init", (platform().new_memory)().expect("out of memory for the init address space"), 0);
-    let init = Arc::downgrade(&process);
-    let task = process.spawn(TaskBuilder::new("init").cpu(cpu), || {
-        let entry = osmium::proc::current()
-            .expect("current returned None")
-            .exec("/bin/init", &[b"init"], &[])
-            .expect("exec /bin/init");
-        let kernel_top =
-            osmium::sched::current().kernel_stack_range().expect("kernel_stack_range returned None").end as u64;
-        // SAFETY: exec activated the new table; vectors are installed and
-        // `kernel_top` is this task's own kernel stack.
-        unsafe { aarch64::enter_user(entry.pc, entry.sp, kernel_top) }
-    });
-    drop(process);
-    task.join();
-    // The task holds the process: let it go too.
-    drop(task);
-    let freed = demos::user::freed(&[init]);
-    println!("[user]  init and its children reaped; {freed} of 1 init address space torn down");
-}
-
-fn user_demo(ncpus: usize) {
+/// The user demos: the hand-written EL0 programs, then the Rust ones.
+fn user_demo() {
     osmium::proc::set_platform(platform());
-    // SAFETY: linker symbols delimiting the user programs.
-    let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
-    let cpu = 1 % ncpus;
-    let spawned = [
-        spawn_user("user-1", 1, hello, cpu),
-        spawn_user("user-2", 2, hello, cpu),
-        spawn_user("user-bad", 3, bad, cpu),
-        spawn_elf("user-elf", HELLO_ELF, cpu),
-    ];
-    println!("[user]  running 3 EL0 programs on CPU {cpu}");
-    println!("[user]  each program has its own page table; all run at {USER_BASE:#x}");
-    let mut processes = Vec::new();
-    for (task, process) in spawned {
-        task.join();
-        processes.push(process);
-    }
-    // Exited tasks (and their address spaces) are freed once their CPU has
-    // switched away from them.
-    let freed = demos::user::freed(&processes);
-    println!("[user]  {freed} of 4 address spaces torn down with their tasks");
-    fork_exec_demo(cpu);
-}
-
-/// Handles `svc #0` from EL0. ELR already points past the `svc`.
-fn syscall(frame: &mut TrapFrame) {
-    if let Some(status) = osmium::proc::syscall::handle(frame) {
-        let task = osmium::sched::current();
-        if let ExitStatus::Code(code) = status {
-            println!("[user]  {} exited with status {code} (kernel sees CPU {})", task.name(), cpu::current_id());
-        }
-        drop(task);
-        osmium::proc::exit(status);
-    }
-}
-
-/// A fault in user mode raises a signal: the program's handler runs, or the
-/// default action ends it (and only it, not the kernel).
-fn user_fault(frame: &mut TrapFrame, cause: Trap) {
-    let (sig, addr) = match cause {
-        Trap::PageFault { addr, .. } => (11, addr),
-        Trap::Misaligned { addr } => (7, addr),
-        Trap::IllegalInstruction => (4, frame.pc()),
-        Trap::Breakpoint => (5, frame.pc()),
-        _ => (11, frame.pc()),
-    };
-    if let Some(status) = osmium::proc::signal::user_fault(frame, sig, addr) {
-        let task = osmium::sched::current();
-        println!("[user]  {} killed: {cause:?} at pc {:#x}", task.name(), frame.pc());
-        drop(task);
-        osmium::proc::exit(status);
-    }
+    // SAFETY: linker symbols delimiting the user programs in .rodata.
+    let (hello, bad) = unsafe { (image(&user_hello, &user_hello_end), image(&user_bad, &user_bad_end)) };
+    demos::user::demo(&platform(), hello, bad, "EL0", enter_user);
 }
 
 /// Runs the trap handler, then, before returning to user mode from an
@@ -908,57 +709,31 @@ fn user_fault(frame: &mut TrapFrame, cause: Trap) {
 /// is ending).
 fn on_trap(frame: &mut TrapFrame) {
     handle_trap(frame);
-    if frame.from_user() && matches!(frame.cause(), Trap::Interrupt(_)) {
-        if let Some(status) = osmium::proc::signal::deliver(frame) {
-            osmium::proc::exit(status);
-        }
-    }
+    demos::user::before_return(frame);
 }
 
 fn handle_trap(frame: &mut TrapFrame) {
-    if frame.from_user() {
-        match frame.cause() {
-            Trap::Syscall => return syscall(frame),
-            Trap::Interrupt(_) => {}
-            // A write to a page `fork` shares gets its own copy; retry.
-            Trap::PageFault { addr, access }
-                if osmium::proc::handle_page_fault(addr as u64, access == Access::Write) =>
-            {
-                return;
-            }
-            cause => return user_fault(frame, cause),
-        }
+    if frame.from_user() && demos::user::handle(frame) {
+        return;
     }
-    if TrapCpu::current().overflowed(frame) {
-        // This frame lives on the exception stack; the task's own stack is
-        // exhausted, so it cannot continue. End only that task.
-        let task = osmium::sched::current();
-        println!(
-            "[guard] task {:?} overflowed its stack ({:?} at sp {:#x}); killed",
-            task.name(),
-            frame.cause(),
-            frame.sp()
-        );
-        // A nested exception must stay on the exception stack.
-        // SAFETY: the breakpoint arm below steps over it.
-        let t = recover_trap(|| unsafe { core::arch::asm!("brk #0") });
-        println!("[guard] nested {t:?} on the exception stack handled");
-        drop(task);
-        osmium::sched::exit();
-    }
+    demos::fault::on_overflow(frame);
     match frame.cause() {
         Trap::Interrupt(Interrupt::External) => {
-            handle_irqs(GIC.get().expect("GIC initialised"));
+            if let Some(gic) = GIC.get() {
+                handle_irqs(gic);
+            }
             // Leaving an interrupt is a preemption point.
             osmium::sched::preempt_if_needed();
         }
-        cause @ (Trap::Breakpoint | Trap::PageFault { .. }) if RECOVER[cpu::current_id()].load(Ordering::SeqCst) => {
-            *RECOVERED[cpu::current_id()].lock() = Some(cause);
-            // A64 instructions are always 4 bytes.
-            frame.set_pc(frame.pc() + 4);
-        }
-        cause => panic!("unhandled trap {cause:?} at pc {:#x}, ESR {:#x}", frame.pc(), frame.esr),
+        Trap::Breakpoint | Trap::PageFault { .. } if demos::fault::recovered(frame) => {}
+        cause => unhandled(frame, cause),
     }
+}
+
+/// A kernel exception with no handler: a bug in this kernel, so stop it.
+#[allow(clippy::panic)] // a kernel exception nothing handles leaves no safe way on
+fn unhandled(frame: &TrapFrame, cause: Trap) -> ! {
+    panic!("unhandled trap {cause:?} at pc {:#x}, ESR {:#x}", frame.pc(), frame.esr)
 }
 
 #[panic_handler]

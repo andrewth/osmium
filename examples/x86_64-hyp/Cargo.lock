@@ -180,6 +180,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "demos"
+version = "0.1.0"
+dependencies = [
+ "osmium",
+]
+
+[[package]]
 name = "der"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1004,6 +1011,7 @@ dependencies = [
 name = "x86_64-hyp"
 version = "0.1.0"
 dependencies = [
+ "demos",
  "osmium",
 ]
 

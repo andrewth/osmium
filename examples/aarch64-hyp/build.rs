@@ -1,7 +1,7 @@
-use std::env;
+//! Links with the linker script shared by the examples for this architecture.
 
 fn main() {
-    let dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
-    println!("cargo::rustc-link-arg=-T{dir}/link.x");
-    println!("cargo::rerun-if-changed=link.x");
+    let dir = env!("CARGO_MANIFEST_DIR");
+    println!("cargo::rustc-link-arg=-T{dir}/../link/aarch64.x");
+    println!("cargo::rerun-if-changed=../link/aarch64.x");
 }

@@ -21,6 +21,7 @@ use alloc::sync::Arc;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use demos::guest::image;
 use osmium::arch::aarch64;
 use osmium::boot::fdt::Fdt;
 use osmium::hal::irq::InterruptController;
@@ -159,7 +160,7 @@ pub fn demo(its: Option<(u64, u64)>, gicr: u64) {
 /// Polls this CPU's interface for up to a second for `intid`, completing
 /// whatever else turns up.
 fn take(intid: u32) -> bool {
-    let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
+    let Some(gic) = PHYS_GIC.get() else { return false };
     let deadline = Uptime.now_ns() + 1_000_000_000;
     while Uptime.now_ns() < deadline {
         if let Some(irq) = gic.claim() {
@@ -185,7 +186,10 @@ fn run(base: u64, len: u64, gicr: u64) -> Result<(), Error> {
     }
     let tables = match LPI_TABLES.get() {
         Some(t) => t,
-        None => LPI_TABLES.call_once(|| LpiTables::new(&FRAMES, ID_BITS).expect("LPI tables")),
+        None => {
+            let tables = LpiTables::new(&FRAMES, ID_BITS)?;
+            LPI_TABLES.call_once(|| tables)
+        }
     };
     // The host runs with interrupts masked, so this stays on CPU 0.
     let cpu = osmium::arch::cpu::current_id();
@@ -255,10 +259,7 @@ fn run_guest(
     // and the guest until it is freed below.
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const vlpi_guest;
-        core::slice::from_raw_parts(start, (&raw const vlpi_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&vlpi_guest, &vlpi_guest_end) };
     mem.write(GUEST_RAM, image).map_err(|_| Error::Other("guest image"))?;
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).map_err(|_| Error::Other("stage-2 root"))?;
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).map_err(|_| Error::Other("stage 2"))?;
@@ -292,10 +293,7 @@ fn run_guest(
             // The guest's `wfi`s: just let it look again.
             VmExit::Halt => ControlFlow::Continue(()),
             VmExit::ExternalInterrupt => {
-                let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
-                if let Some(irq) = gic.claim() {
-                    gic.complete(irq);
-                }
+                let _ = crate::ack_irq();
                 ControlFlow::Continue(())
             }
             other => ControlFlow::Break(other),

@@ -3,8 +3,8 @@
 
 use osmium::display::PciDisplay;
 use osmium::display::bochs::BochsVbe;
-use osmium::drivers::virtio::Transport;
 use osmium::display::virtio_gpu::VirtioGpu;
+use osmium::drivers::virtio::Transport;
 use osmium::drivers::virtio::pci::PciTransport;
 use osmium::hal::display::{Display, Rect, Rgb};
 use osmium::hal::dma::DmaAllocator;
@@ -75,9 +75,9 @@ pub fn pci<C: ConfigAccess + ?Sized, D: DmaAllocator + ?Sized>(
     let mut n = 0;
     pci::for_each_function(cfg, first_bus, |f| {
         if let Some(kind) = PciDisplay::identify(&f)
-            && n < found.len()
+            && let Some(slot) = found.get_mut(n)
         {
-            found[n] = Some((f.address(), kind));
+            *slot = Some((f.address(), kind));
             n += 1;
         }
     });

@@ -7,13 +7,12 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
+use demos::guest::{GuestRun, Ran};
 use osmium::boot::elf::Elf;
-use osmium::hal::irq::InterruptController;
 use osmium::hal::println;
 use osmium::mm::{FrameAllocator, PAGE_SIZE, PageTable, PhysAddr};
-use osmium::sync::IrqSpinLock;
 use osmium::virt::aarch64::fdt::{ArmGic, ArmMachine};
 use osmium::virt::aarch64::{self as vm, Aarch64Vcpu};
 use osmium::virt::devices::{GIC_WINDOW, PL011_WINDOW, Pl011, VirtualGicV2};
@@ -21,7 +20,7 @@ use osmium::virt::smp::GuestCpus;
 use osmium::virt::stage2::{Stage2Table, map_guest_memory, vttbr};
 use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
 
-use crate::{FRAMES, KICK_SGI, PHYS_GIC, VTIMER_INTID};
+use crate::{FRAMES, VTIMER_INTID};
 
 /// Where QEMU's loader puts the guest kernel, and the window kept free for it.
 pub const IMAGE_BASE: u64 = 0x5800_0000;
@@ -44,47 +43,29 @@ pub struct KernelVm {
     buses: Vec<Bus>,
     lines: Vec<Arc<AtomicBool>>,
     gic: Arc<VirtualGicV2>,
-    done: AtomicBool,
-    running: AtomicUsize,
+    run: GuestRun,
 }
 
 pub static KERNEL_VM: AtomicPtr<KernelVm> = AtomicPtr::new(core::ptr::null_mut());
 
 /// The guest image QEMU's loader left in the window, if any.
-pub fn image() -> Option<Elf<'static>> {
-    // SAFETY: the caller reserved the window (it is RAM the loader filled or left zero).
-    let window = unsafe { core::slice::from_raw_parts(IMAGE_BASE as *const u8, IMAGE_WINDOW as usize) };
-    Elf::new(window).ok()
-}
-
-/// The guest's console: whole lines, prefixed so they stand apart from the host's.
-fn guest_console() -> impl Fn(u8) + Send + Sync + 'static {
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    move |b| {
-        let mut l = line.lock();
-        match b {
-            b'\n' => {
-                println!("| {}", core::str::from_utf8(&l).unwrap_or("?"));
-                l.clear();
-            }
-            b'\r' => {}
-            _ => l.push(b),
-        }
-    }
+///
+/// # Safety
+/// The window must be RAM kept from the allocator (the loader filled it or
+/// left it zero) that nothing writes while the image is in use.
+pub unsafe fn image() -> Option<Elf<'static>> {
+    // SAFETY: the caller's contract.
+    unsafe { demos::guest::loaded_elf(IMAGE_BASE, IMAGE_WINDOW) }
 }
 
 /// Runs vCPU `me` on this host CPU each time the guest starts it, until the
 /// guest is done. Returns the exit that ended the guest, if it was this
-/// vCPU's.
+/// vCPU's. A host CPU beyond the guest's vCPUs returns at once.
 pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
+    let (Some(line), Some(bus)) = (vm.lines.get(me), vm.buses.get(me)) else { return None };
     let pio = Bus::new();
-    let mut last = None;
-    while !vm.done.load(Ordering::Acquire) {
-        let Some((entry, context)) = vm.cpus.take_start(me) else {
-            core::hint::spin_loop();
-            continue;
-        };
-        let mut vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr).with_irq_line(vm.lines[me].clone());
+    vm.run.vcpu_loop(&vm.cpus, me, |entry, context| {
+        let mut vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr).with_irq_line(line.clone());
         // The virtual timer feeds the vGIC; while its line is up, the
         // physical PPI stays masked on this CPU so it does not keep exiting
         // the guest.
@@ -93,13 +74,12 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
         vcpu.connect_timer(move |level| {
             gic.set_private_level(me, VTIMER_INTID, level);
             if masked.swap(level, Ordering::Relaxed) != level {
-                let g = PHYS_GIC.get().expect("PHYS_GIC initialised");
-                if level { g.disable(VTIMER_INTID) } else { g.enable(VTIMER_INTID) }
+                crate::mask_vtimer(level);
             }
         });
         vm.cpus.attach_arm(me, &mut vcpu);
         let mut stopped = false;
-        let exit = run_vcpu(&mut vcpu, &vm.buses[me], &pio, |v, exit| match exit {
+        let exit = run_vcpu(&mut vcpu, bus, &pio, |v, exit| match exit {
             VmExit::Hypercall { .. } => match vm::psci::handle_smp(v, exit, Some((&vm.cpus, me))) {
                 Some(vm::psci::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
                 Some(vm::psci::Outcome::Stop) => {
@@ -112,7 +92,7 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
                 // The guest idles in wfi: run it again once it has an
                 // interrupt, or stop when another vCPU ended the guest.
                 while !v.interrupt_pending(vm::counter()) {
-                    if vm.done.load(Ordering::Acquire) {
+                    if vm.run.done() {
                         return ControlFlow::Break(VmExit::Halt);
                     }
                     core::hint::spin_loop();
@@ -122,11 +102,8 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             VmExit::ExternalInterrupt => {
                 // The timer's PPI or a kick: acknowledge it; the next entry
                 // delivers what the guest now has pending.
-                let g = PHYS_GIC.get().expect("PHYS_GIC initialised");
-                if let Some(irq) = g.claim() {
-                    g.complete(irq);
-                }
-                if vm.done.load(Ordering::Acquire) {
+                let _ = crate::ack_irq();
+                if vm.run.done() {
                     return ControlFlow::Break(VmExit::Halt);
                 }
                 ControlFlow::Continue(())
@@ -134,26 +111,20 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
             other => ControlFlow::Break(other),
         });
         // Leave the physical timer PPI as the next guest expects it.
-        PHYS_GIC.get().expect("PHYS_GIC initialised").enable(VTIMER_INTID);
-        if stopped {
-            continue; // CPU_OFF: wait for CPU_ON
-        }
-        if !vm.done.swap(true, Ordering::AcqRel) {
-            for i in 0..vm.lines.len() {
-                vm.cpus.kick(i);
-            }
-            if exit != VmExit::Shutdown {
-                println!("[hyp]   vCPU {me} stopped the guest: {exit:?} at pc {:#x}", vcpu.state.pc);
-            }
-            last = Some(exit);
-        }
-    }
-    vm.running.fetch_sub(1, Ordering::AcqRel);
-    last
+        crate::mask_vtimer(false);
+
+        // CPU_OFF: wait for CPU_ON.
+        if stopped { Ran::Stopped } else { Ran::Exited { exit, pc: Some(vcpu.state.pc) } }
+    })
 }
 
 /// Loads `elf` into fresh guest RAM and runs it with one vCPU per host CPU
 /// until it shuts down.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 pub fn boot(elf: &Elf<'_>, ncpus: usize) {
     let ncpus = ncpus.min(MAX_CPUS);
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
@@ -195,8 +166,7 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
 
     // A vCPU's interrupt arriving while it runs guest code on another host
     // CPU kicks that CPU with a physical SGI.
-    let cpus =
-        GuestCpus::with_kick(ncpus, |host| PHYS_GIC.get().expect("PHYS_GIC initialised").send_sgi(1 << host, KICK_SGI));
+    let cpus = GuestCpus::with_kick(ncpus, crate::kick);
     let lines: Vec<Arc<AtomicBool>> = (0..ncpus).map(|_| Arc::new(AtomicBool::new(false))).collect();
     let (l, c) = (lines.clone(), cpus.clone());
     let gic = Arc::new(VirtualGicV2::with_cpus(ncpus, 64, move |cpu, level| {
@@ -206,7 +176,8 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
         }
     }));
     let g = gic.clone();
-    let uart = Arc::new(Pl011::new(guest_console()).with_irq(move |level| g.set_level(32 + UART_SPI, level)));
+    let uart =
+        Arc::new(Pl011::new(demos::guest::console("| ")).with_irq(move |level| g.set_level(32 + UART_SPI, level)));
     let buses = (0..ncpus)
         .map(|cpu| {
             let bus = Bus::new();
@@ -219,13 +190,10 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
     // The boot CPU starts with x0 = the device tree.
     cpus.request_start(0, elf.entry(), GUEST_RAM).expect("request_start failed");
 
-    let vm =
-        KernelVm { cpus, vttbr, buses, lines, gic, done: AtomicBool::new(false), running: AtomicUsize::new(ncpus) };
+    let vm = KernelVm { cpus, vttbr, buses, lines, gic, run: GuestRun::new(ncpus) };
     KERNEL_VM.store(&raw const vm as *mut KernelVm, Ordering::Release);
     let exit = vcpu_loop(&vm, 0);
-    while vm.running.load(Ordering::Acquire) > 0 {
-        core::hint::spin_loop();
-    }
+    vm.run.wait_all();
     KERNEL_VM.store(core::ptr::null_mut(), Ordering::Release);
     match exit {
         Some(e) => println!("[hyp]   guest exit {e:?} from vCPU 0"),

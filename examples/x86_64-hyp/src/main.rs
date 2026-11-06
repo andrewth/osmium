@@ -24,21 +24,23 @@ use core::ops::ControlFlow;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
+use demos::guest::image;
+pub(crate) use demos::kernel::{FRAMES, Frames};
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::arch::x86_64 as x86;
 use osmium::arch::{cpu, irq};
 use osmium::boot::acpi::{Acpi, Madt};
 use osmium::boot::pvh::StartInfo;
+use osmium::hal::console::{SerialConsole, set_console};
+use osmium::hal::mmio::IoMem;
+use osmium::hal::println;
+use osmium::mm::heap::LockedHeap;
+use osmium::mm::{FrameAllocator, MemoryMap};
+use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind};
+use osmium::sync::{IrqSpinLock, Once};
 use osmium::sysdrv::lapic::{self, LocalApic};
 use osmium::sysdrv::pit::{Pio as PitPio, Pit};
 use osmium::sysdrv::uart16550::{Pio, Uart16550};
-use osmium::hal::console::{SerialConsole, set_console};
-use osmium::hal::mmio::IoMem;
-use osmium::hal::{print, println};
-use osmium::mm::heap::LockedHeap;
-use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MemoryMap, OffsetMapper};
-use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind};
-use osmium::sync::{IrqSpinLock, Once};
 use osmium::virt::devices::{
     IOAPIC_WINDOW, IpiKind, IpiTarget, LAPIC_WINDOW, Uart16550 as Uart16550Model, VirtualIoApic, VirtualLapic,
     VirtualPic, VirtualPit, decode_icr,
@@ -491,11 +493,6 @@ fn sym(s: &u8) -> u64 {
 
 const COM1: u16 = 0x3f8;
 
-type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
-
-// SAFETY: the kernel runs identity-mapped by the boot page tables.
-static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
-
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 
@@ -512,6 +509,11 @@ fn shutdown() -> ! {
 }
 
 #[unsafe(no_mangle)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "boot: what QEMU's machine provides is set up once here, so a failure means a broken machine or a bug in this example; the panic handler reports which"
+)]
 extern "C" fn kmain(start_info: usize) -> ! {
     trap::set_handler(on_trap);
     // SAFETY: we run on the boot stack from here on.
@@ -595,7 +597,8 @@ extern "C" fn kmain(start_info: usize) -> ! {
     irq::enable();
 
     // A whole guest kernel if QEMU's loader provided one, else the demos.
-    if let Some((elf, entry)) = image_window.then(kernel::image).flatten() {
+    // SAFETY: the window is kept from the allocator (above) and nothing else writes it.
+    if let Some((elf, entry)) = image_window.then(|| unsafe { kernel::image() }).flatten() {
         if ncpus > 1 {
             start_host_cpu(1);
         }
@@ -636,12 +639,16 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static LAPIC: Once<LocalApic> = Once::new();
 /// Host CPU index to local APIC ID.
 static HOST_APIC_IDS: [AtomicU8; 2] = [const { AtomicU8::new(0) }; 2];
-static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// The vector one host CPU sends another to kick its vCPU out of guest code.
 const KICK_VECTOR: u8 = 0xf0;
 const SPURIOUS_VECTOR: u8 = 0xff;
 
 /// Starts host CPU `cpu` through the shared trampoline and waits for it.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn start_host_cpu(cpu: usize) {
     // SAFETY: low memory is reserved and identity-mapped writable; this is
     // the only AP start in flight.
@@ -658,7 +665,7 @@ fn start_host_cpu(cpu: usize) {
     let id = HOST_APIC_IDS[cpu].load(Ordering::Relaxed);
     // SAFETY: the trampoline is installed and no other AP is in it.
     unsafe { LAPIC.get().expect("LAPIC initialised").start_ap(id, &boot, |ns| pit.wait_ns(ns)) };
-    while ONLINE.load(Ordering::Acquire) <= cpu {
+    while demos::kernel::online() <= cpu {
         core::hint::spin_loop();
     }
     println!("[smp]   host CPU {cpu} (APIC id {id}) online with {:?} on", backend::backend());
@@ -666,6 +673,10 @@ fn start_host_cpu(cpu: usize) {
 
 /// Rust entry of the second host CPU: SVM on, then run vCPUs it is given.
 #[unsafe(no_mangle)]
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 extern "C" fn ap_main(cpu: usize) -> ! {
     // SAFETY: the boot CPU hands out distinct indices.
     unsafe { cpu::set_current_id(cpu) };
@@ -674,7 +685,7 @@ extern "C" fn ap_main(cpu: usize) -> ! {
     LAPIC.get().expect("LAPIC initialised").enable(SPURIOUS_VECTOR);
     backend::enable().expect("virtualization on the second CPU");
     irq::enable();
-    ONLINE.fetch_add(1, Ordering::Release);
+    demos::kernel::check_in();
     loop {
         // SAFETY: smp_demo publishes the VM only while it lives, and waits
         // for this CPU to let go before freeing it.
@@ -743,11 +754,19 @@ fn clock() -> impl Fn() -> u64 + Copy + Send + Sync + 'static {
 const GUEST_RAM_ORDER: u32 = 9; // 2 MiB at guest-physical 0
 
 /// One block of `order` frames as (host pointer, physical address).
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn block(order: u32) -> (NonNull<u8>, u64) {
     let pa = FRAMES.lock().alloc(order).expect("out of frames");
     (NonNull::new(pa.0 as *mut u8).expect("new failed"), pa.0)
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn guest_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -757,28 +776,15 @@ fn guest_demo() {
     unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
     let mem = Arc::new(mem);
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const x86_guest;
-        core::slice::from_raw_parts(start, (&raw const x86_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&x86_guest, &x86_guest_end) };
     backend::load(&mem, GUEST_ENTRY, image);
 
     // Nested page table: guest-physical 0..2 MiB onto the block. NPT walks
     // are user accesses, so the leaves need USER.
     let mut npt = Stage2::new();
     npt.map_ram(0, ram.0, len);
-
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let out = line.clone();
     let pio = Bus::new();
-    let console = move |b| {
-        let mut l = out.lock();
-        l.push(b);
-        if b == b'\n' {
-            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-            l.clear();
-        }
-    };
+    let console = demos::guest::console("");
     let intr = Arc::new(AtomicBool::new(false));
     let i = intr.clone();
     let pic = Arc::new(VirtualPic::new(move |level| i.store(level, Ordering::Release)));
@@ -851,6 +857,11 @@ fn guest_demo() {
 
 /// Runs two vCPUs of an SSE-using guest interleaved on this CPU: each
 /// needs its own x87/SSE state switched in around VMRUN.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn fp_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -911,6 +922,10 @@ fn fp_demo() {
 /// CPU 1 from there on: VMX binds a VMCS to the CPU that runs it, so the
 /// vCPU is released after each run. Its registers, x87/SSE state and
 /// pending event state have to arrive intact.
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn migrate_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -969,6 +984,10 @@ fn migrate_demo() {
 
 /// Runs a 64-bit guest with paging on: long mode set up in the VMCB, page
 /// tables built by the host in guest RAM.
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn long_mode_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -977,10 +996,7 @@ fn long_mode_demo() {
     // and the guest until it is freed below.
     unsafe { mem.add_region(GuestPhysAddr(0), ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const lm_guest;
-        core::slice::from_raw_parts(start, (&raw const lm_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&lm_guest, &lm_guest_end) };
     backend::load(&mem, GUEST_ENTRY, image);
     // Guest page tables: PML4 0x1000 -> PDPT 0x2000. PDPT[0] -> PD 0x3000
     // mapping 0..2 MiB (RAM); PDPT[3] -> PD 0x4000 mapping the 2 MiB page
@@ -997,18 +1013,8 @@ fn long_mode_demo() {
 
     let mut npt = Stage2::new();
     npt.map_ram(0, ram.0, len);
-
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let out = line.clone();
     let mmio = Bus::new();
-    let uart = Uart16550Model::new(move |b| {
-        let mut l = out.lock();
-        l.push(b);
-        if b == b'\n' {
-            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-            l.clear();
-        }
-    });
+    let uart = Uart16550Model::new(demos::guest::console(""));
     mmio.insert(GUEST_MMIO_UART, 8, Arc::new(uart)).expect("insert failed");
     let intr = Arc::new(AtomicBool::new(false));
     let i = intr.clone();
@@ -1079,12 +1085,6 @@ fn long_mode_demo() {
     }
 }
 
-/// The bytes between two linker symbols.
-fn image(start: &u8, end: &u8) -> &'static [u8] {
-    // SAFETY: symbol pairs bounding images in .rodata.
-    unsafe { core::slice::from_raw_parts(start, (end as *const u8).offset_from(start) as usize) }
-}
-
 /// A two-vCPU guest shared by both host CPUs.
 struct SmpVm {
     cpus: Arc<GuestCpus>,
@@ -1111,19 +1111,25 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             core::hint::spin_loop();
             continue;
         };
+        // A host CPU beyond the guest's vCPUs has nothing to run.
+        let (Some(line), Some(apic), Some(bus)) =
+            (vm.lines.get(me), vm.apics.get(me).and_then(|a| a.get()), vm.buses.get(me))
+        else {
+            return;
+        };
         let pages = Pages::alloc();
         // SAFETY: fresh blocks of the required sizes, owned by the vCPU.
         let mut v = unsafe { Cpu::new(pages, vm.stage2, entry as u32, vm.ram_len as u32) }
             .with_memory(vm.mem.clone())
-            .with_irq_line(vm.lines[me].clone());
+            .with_irq_line(line.clone());
         v.set_apic_id(me as u8);
         if me > 0 {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
         }
-        let a = vm.apics[me].get().expect("get returned None").clone();
+        let a = apic.clone();
         v.connect_intr(move || a.acknowledge());
         v.attach(&vm.cpus, me);
-        let exit = run_vcpu(&mut v, &vm.buses[me], &vm.pio, |v, exit| match exit {
+        let exit = run_vcpu(&mut v, bus, &vm.pio, |v, exit| match exit {
             VmExit::Hypercall { nr: 1 | 2, .. } => ControlFlow::Break(exit),
             VmExit::Halt => loop {
                 if v.interrupt_pending() {
@@ -1163,6 +1169,11 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
 /// through emulated local APICs: vCPU 0 on this host CPU, vCPU 1 on host
 /// CPU 1. The fixed IPI from vCPU 1 reaches vCPU 0 while it runs guest code
 /// because the host kicks host CPU 0 with a physical IPI.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn smp_demo() {
     const N: usize = 2;
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
@@ -1177,16 +1188,7 @@ fn smp_demo() {
     backend::load(&mem, 0x8000, ap);
     let mut npt = Stage2::new();
     npt.map_ram(0, ram.0, len);
-
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let com1 = Arc::new(Uart16550Model::new(move |b| {
-        let mut l = line.lock();
-        l.push(b);
-        if b == b'\n' {
-            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-            l.clear();
-        }
-    }));
+    let com1 = Arc::new(Uart16550Model::new(demos::guest::console("")));
     let pio = Bus::new();
     pio.insert(0x3f8, 8, com1).expect("insert failed");
 
@@ -1262,7 +1264,12 @@ fn on_trap(frame: &mut TrapFrame) {
     match frame.vector() {
         // A kick: taking it is all it is for (the guest has already exited).
         // A kick, or the host tick that makes a busy guest exit.
-        KICK_VECTOR | kernel::HOST_TICK_VECTOR => return LAPIC.get().expect("LAPIC initialised").eoi(),
+        KICK_VECTOR | kernel::HOST_TICK_VECTOR => {
+            if let Some(lapic) = LAPIC.get() {
+                lapic.eoi();
+            }
+            return;
+        }
         SPURIOUS_VECTOR => return,
         // An NMI that arrived while a guest ran is the host's: count it.
         2 => {
@@ -1271,6 +1278,12 @@ fn on_trap(frame: &mut TrapFrame) {
         }
         _ => {}
     }
+    unhandled(frame)
+}
+
+/// A trap the host never enables: a bug in this hypervisor, so stop it.
+#[allow(clippy::panic, reason = "a trap nothing handles leaves no safe way on")]
+fn unhandled(frame: &TrapFrame) -> ! {
     panic!("unexpected trap {:?} at rip {:#x}, error {:#x}", frame.cause(), frame.pc(), frame.error_code)
 }
 

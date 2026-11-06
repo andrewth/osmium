@@ -29,15 +29,15 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
+use demos::guest::image;
+use demos::guest::{GuestRun, Ran};
+pub(crate) use demos::kernel::{FRAMES, Frames};
 use osmium::arch::cpu;
 use osmium::arch::riscv64::{self as rv, sbi as host_sbi};
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::boot::elf::Elf;
 use osmium::boot::fdt::Fdt;
-use osmium::storage::ramdisk::RamDisk;
-use osmium::sysdrv::uart16550::{Mmio, Uart16550};
 use osmium::drivers::virtio::mmio::MmioTransport;
-use osmium::netdev::virtio_net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport as _};
 use osmium::hal::block::BlockDevice as _;
 use osmium::hal::console::{SerialConsole, set_console};
@@ -45,9 +45,12 @@ use osmium::hal::mmio::IoMem;
 use osmium::hal::net::NetDevice as _;
 use osmium::hal::println;
 use osmium::mm::heap::LockedHeap;
-use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MemoryMap, OffsetMapper, PageTable};
+use osmium::mm::{FrameAllocator, MemoryMap, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind};
+use osmium::netdev::virtio_net::VirtioNet;
+use osmium::storage::ramdisk::RamDisk;
 use osmium::sync::{IrqSpinLock, Once};
+use osmium::sysdrv::uart16550::{Mmio, Uart16550};
 use osmium::virt::devices::{Uart16550 as Uart16550Model, VirtualAplic, VirtualImsic, VirtualPlic};
 use osmium::virt::riscv::fdt::GuestMachine;
 use osmium::virt::riscv::{self, HartId, RiscvVcpu, sbi};
@@ -189,7 +192,6 @@ struct SecondaryBoot {
 const MAX_HARTS: usize = 4;
 /// Host hart ID of each logical CPU.
 static HARTS: [AtomicUsize; MAX_HARTS] = [const { AtomicUsize::new(0) }; MAX_HARTS];
-static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
 /// Where QEMU's loader puts the guest kernel, and the window kept free for it.
 const IMAGE_BASE: u64 = 0x9800_0000;
@@ -217,11 +219,6 @@ static HOST_NIC: Once<IrqSpinLock<HostNic>> = Once::new();
 /// The guest's device tree, at the top of its RAM.
 const GUEST_DTB_SIZE: u64 = 0x1_0000;
 
-type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
-
-// SAFETY: the kernel runs with the MMU off, so physical = virtual.
-static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
-
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 
@@ -234,6 +231,11 @@ fn sym(s: &u8) -> u64 {
 }
 
 #[unsafe(no_mangle)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "boot: what QEMU's machine provides is set up once here, so a failure means a broken machine or a bug in this example; the panic handler reports which"
+)]
 extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: the boot hart is logical CPU 0; secondaries get 1, 2, ...
     unsafe { cpu::set_current_id(0) };
@@ -319,7 +321,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         unsafe { host_sbi::hart_start(h, secondary_start as *const () as usize, boot as *const _ as usize) }
             .expect("hart_start failed");
         ncpus += 1;
-        while ONLINE.load(Ordering::Acquire) < ncpus {
+        while demos::kernel::online() < ncpus {
             core::hint::spin_loop();
         }
     }
@@ -351,22 +353,6 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     host_sbi::shutdown()
 }
 
-/// The guest's console: whole lines, prefixed so they stand apart from the host's.
-fn guest_console() -> impl Fn(u8) + Send + Sync + Clone + 'static {
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    move |b| {
-        let mut l = line.lock();
-        match b {
-            b'\n' => {
-                println!("| {}", core::str::from_utf8(&l).unwrap_or("?"));
-                l.clear();
-            }
-            b'\r' => {}
-            _ => l.push(b),
-        }
-    }
-}
-
 /// A guest shared by every host hart, each running one of its vCPUs.
 struct Vm {
     cpus: Arc<GuestCpus>,
@@ -377,9 +363,8 @@ struct Vm {
     net: Option<Arc<VirtioMmio<VirtioNetDevice>>>,
     /// Per vCPU: its external-interrupt line (PLIC context 2n + 1).
     lines: Vec<Arc<AtomicBool>>,
-    done: AtomicBool,
-    /// vCPUs not yet back in their host loop for good.
-    running: AtomicUsize,
+    /// Whether the guest is done, and which vCPU loops still run.
+    run: GuestRun,
 }
 
 static VM: AtomicPtr<Vm> = AtomicPtr::new(core::ptr::null_mut());
@@ -395,7 +380,7 @@ extern "C" fn secondary_main(_hartid: usize, boot: &SecondaryBoot) -> ! {
     riscv::init_cpu();
     // SAFETY: as on the boot hart: kicks exit the guest; the host never takes them.
     unsafe { rv::write_sie(rv::read_sie() | 1 << 1) };
-    ONLINE.fetch_add(1, Ordering::Release);
+    demos::kernel::check_in();
     loop {
         // SAFETY: boot_guest publishes the VM only while it lives, and waits
         // for every vCPU loop to finish before freeing it.
@@ -417,7 +402,7 @@ fn poll_net(vm: &Vm) {
         let mut nic = nic.lock();
         let mut buf = [0u8; 1514];
         while let Ok(n) = nic.receive(&mut buf) {
-            frames.push(buf[..n].to_vec());
+            frames.push(buf.get(..n).unwrap_or(&buf).to_vec());
         }
     }
     // Outside the NIC's lock: the card's transmit path takes it.
@@ -428,17 +413,14 @@ fn poll_net(vm: &Vm) {
 
 /// Runs vCPU `me` on this host hart each time the guest starts it, until
 /// the guest is done. Returns the exit that ended the guest, if it was this
-/// vCPU's.
+/// vCPU's. A hart beyond the guest's vCPUs returns at once.
 fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
-    let sbi_out = guest_console();
-    let mut last = None;
-    while !vm.done.load(Ordering::Acquire) {
-        let Some((entry, opaque)) = vm.cpus.take_start(me) else {
-            core::hint::spin_loop();
-            continue;
-        };
+    let line = vm.lines.get(me)?;
+
+    let sbi_out = demos::guest::console("| ");
+    vm.run.vcpu_loop(&vm.cpus, me, |entry, opaque| {
         let mut vcpu = RiscvVcpu::new(GuestPhysAddr(entry), HartId(me as u64), opaque, vm.hgatp)
-            .with_external_irq(vm.lines[me].clone())
+            .with_external_irq(line.clone())
             .with_memory(vm.mem.clone());
         vm.cpus.attach(me, &mut vcpu);
         let mut stopped = false;
@@ -472,7 +454,7 @@ fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
                 // interrupt (its timer, an IPI or a device), or stop when
                 // another vCPU has shut the guest down.
                 while !v.interrupt_pending(riscv::time()) {
-                    if vm.done.load(Ordering::Acquire) {
+                    if vm.run.done() {
                         return ControlFlow::Break(VmExit::Halt);
                     }
                     if me == 0 {
@@ -493,33 +475,24 @@ fn vcpu_loop(vm: &Vm, me: usize) -> Option<VmExit> {
                     next_poll = riscv::time() + NET_POLL_TICKS;
                     host_sbi::set_timer(next_poll);
                 }
-                if vm.done.load(Ordering::Acquire) {
+                if vm.run.done() {
                     return ControlFlow::Break(VmExit::Halt);
                 }
                 ControlFlow::Continue(())
             }
             other => ControlFlow::Break(other),
         });
-        if stopped {
-            continue; // hart_stop: wait for the guest to start it again
-        }
-        if !vm.done.swap(true, Ordering::AcqRel) {
-            // This vCPU ended the guest: get the others out of guest code.
-            for i in 0..vm.lines.len() {
-                vm.cpus.kick(i);
-            }
-            last = Some(exit);
-            if exit != VmExit::Shutdown {
-                println!("[hyp]   vCPU {me} stopped the guest: {exit:?} at pc {:#x}", vcpu.state.pc);
-            }
-        }
-    }
-    vm.running.fetch_sub(1, Ordering::AcqRel);
-    last
+        // hart_stop: wait for the guest to start it again.
+        if stopped { Ran::Stopped } else { Ran::Exited { exit, pc: Some(vcpu.state.pc) } }
+    })
 }
 
 /// Runs a guest that uses an emulated APLIC (MSI delivery) and IMSIC: see the
 /// module documentation.
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn aia_demo(smstateen: bool) {
     const APLIC: u64 = 0x0d00_0000;
     const IMSIC: u64 = 0x2800_0000;
@@ -532,10 +505,7 @@ fn aia_demo(smstateen: bool) {
     // and the guest until it is freed below.
     unsafe { mem.add_region(GuestPhysAddr(GUEST_RAM), ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const aia_guest;
-        core::slice::from_raw_parts(start, (&raw const aia_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&aia_guest, &aia_guest_end) };
     mem.write(GuestPhysAddr(GUEST_RAM), image).expect("write failed");
     let mem = Arc::new(mem);
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
@@ -551,14 +521,16 @@ fn aia_demo(smstateen: bool) {
     );
     let mut vcpu = vcpu.with_imsic(imsic.clone(), 0);
     let a = aplic.clone();
-    let uart = Arc::new(Uart16550Model::new(guest_console()).with_irq(move |level| a.set_input(UART_SOURCE, level)));
+    let uart = Arc::new(
+        Uart16550Model::new(demos::guest::console("| ")).with_irq(move |level| a.set_input(UART_SOURCE, level)),
+    );
     let mmio = Bus::new();
     mmio.insert(APLIC, VirtualAplic::mmio_size(0), aplic).expect("insert failed");
     mmio.insert(IMSIC, VirtualImsic::mmio_size(1), imsic.mmio()).expect("insert failed");
     mmio.insert(GUEST_UART, 8, uart.clone()).expect("insert failed");
 
     let (mut halts, mut typed) = (0, false);
-    let sbi_out = guest_console();
+    let sbi_out = demos::guest::console("| ");
     let exit = run_vcpu(&mut vcpu, &mmio, &Bus::new(), |v, exit| match exit {
         VmExit::Hypercall { .. } => match sbi::handle(v, &mem, exit, &mut |b| b.iter().for_each(|&c| sbi_out(c))) {
             Some(sbi::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
@@ -598,6 +570,11 @@ fn aia_demo(smstateen: bool) {
 
 /// Loads `elf` into fresh guest RAM and runs it with one vCPU per host
 /// hart until it shuts down.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn boot_guest(elf: &Elf<'_>, harts: usize) {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -652,7 +629,8 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     }));
     let plic_for_blk = plic.clone();
     let p = plic.clone();
-    let uart = Arc::new(Uart16550Model::new(guest_console()).with_irq(move |level| p.set_level(UART_IRQ, level)));
+    let uart =
+        Arc::new(Uart16550Model::new(demos::guest::console("| ")).with_irq(move |level| p.set_level(UART_IRQ, level)));
     let mmio = Bus::new();
     mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2 * harts), plic).expect("insert failed");
     mmio.insert(GUEST_UART, 8, uart).expect("insert failed");
@@ -688,25 +666,16 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     // An IPI or fence for a vCPU running guest code on another hart kicks
     // that hart with a host IPI.
     let cpus = GuestCpus::with_kick(harts, |cpu| {
-        let _ = host_sbi::send_ipi(1, HARTS[cpu].load(Ordering::Relaxed));
+        if let Some(h) = HARTS.get(cpu) {
+            let _ = host_sbi::send_ipi(1, h.load(Ordering::Relaxed));
+        }
     });
     cpus.request_start(0, elf.entry(), dtb_at).expect("request_start failed");
 
-    let vm = Vm {
-        cpus,
-        mem,
-        hgatp: hgatp_sv39x4(gstage.root(), 1),
-        mmio,
-        net,
-        lines,
-        done: AtomicBool::new(false),
-        running: AtomicUsize::new(harts),
-    };
+    let vm = Vm { cpus, mem, hgatp: hgatp_sv39x4(gstage.root(), 1), mmio, net, lines, run: GuestRun::new(harts) };
     VM.store(&raw const vm as *mut Vm, Ordering::Release);
     let exit = vcpu_loop(&vm, 0);
-    while vm.running.load(Ordering::Acquire) > 0 {
-        core::hint::spin_loop();
-    }
+    vm.run.wait_all();
     VM.store(core::ptr::null_mut(), Ordering::Release);
     match exit {
         Some(e) => println!("[hyp]   guest exit {e:?} from vCPU 0"),
@@ -723,6 +692,10 @@ fn boot_guest(elf: &Elf<'_>, harts: usize) {
     }
 }
 
+#[allow(
+    clippy::panic,
+    reason = "a trap this example never enables is a bug in it; stopping with a report is all there is to do"
+)]
 fn on_trap(frame: &mut TrapFrame) {
     panic!("unexpected trap {:?} at pc {:#x}", frame.cause(), frame.pc())
 }

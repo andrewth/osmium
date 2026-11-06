@@ -14,14 +14,14 @@
 use alloc::vec::Vec;
 
 use osmium::boot::acpi::EcamWindow;
-use osmium::usb::ehci::{self, Ehci};
-use osmium::sysdrv::ioapic::{IoApic, LineMode};
-use osmium::usb::uhci::{self, Uhci, UhciRegs};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci::{self, BarKind, Function, command};
 use osmium::hal::println;
 use osmium::mm::PAGE_SIZE;
 use osmium::sync::{IrqSpinLock, Once};
+use osmium::sysdrv::ioapic::{IoApic, LineMode};
+use osmium::usb::ehci::{self, Ehci};
+use osmium::usb::uhci::{self, Uhci, UhciRegs};
 
 use crate::Frames;
 use crate::msi::{Uptime, map};
@@ -53,7 +53,7 @@ pub fn on_interrupt() {
             uhci.lock().handle_interrupt();
         }
     }
-    crate::LAPIC.get().expect("LAPIC initialised").eoi();
+    crate::eoi();
 }
 
 /// Routes the PCI interrupt inputs to [`VECTOR`] on this CPU. False if the
@@ -62,7 +62,7 @@ fn route_pci_lines() -> bool {
     let Some(&(io_addr, gsi_base, ..)) = crate::IOAPIC_INFO.get() else { return false };
     // SAFETY: the MADT says the I/O APIC lives here; mapped uncached at boot.
     let ioapic = IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
-    let dest = crate::LAPIC.get().expect("LAPIC initialised").id() as u8;
+    let dest = crate::apic_id();
     // PCI lines are active low and level triggered.
     let mode = LineMode { active_low: true, level: true };
     for gsi in PCI_GSIS {
@@ -78,7 +78,8 @@ pub fn demo(ecam: Option<EcamWindow>) {
         println!("[usb]   no ECAM window; skipping EHCI and UHCI");
         return;
     };
-    let cfg = pci::Ecam::new(map(ecam.base, 1 << 20), 0);
+    // SAFETY: the ECAM window from the MCFG; only this demo uses it meanwhile.
+    let cfg = pci::Ecam::new(unsafe { map(ecam.base, 1 << 20) }, 0);
     let irq = route_pci_lines();
     if !irq {
         println!("[usb]   no I/O APIC in the MADT; polling");
@@ -110,7 +111,8 @@ fn run_ehci(func: &Function<'_, pci::Ecam>, irq: bool) {
         return;
     };
     func.enable_memory_and_dma();
-    let io = map(bar.address, bar.size);
+    // SAFETY: the controller's register BAR; this driver owns it.
+    let io = unsafe { map(bar.address, bar.size) };
     ehci::release_from_firmware(func, &io, &Uptime);
     match Ehci::new(io, &crate::FRAMES, &Uptime) {
         Ok(hc) => {

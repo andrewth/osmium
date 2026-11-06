@@ -8,37 +8,22 @@
 
 use alloc::vec::Vec;
 
+use demos::kernel::{FRAMES, Uptime};
 use osmium::boot::fdt::Fdt;
 use osmium::hal::iommu::{DeviceId, Iommu};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci;
 use osmium::hal::println;
-use osmium::hal::timer::Clock;
-use osmium::mm::{MapFlags, PAGE_SIZE, PhysAddr, VirtAddr};
 use osmium::sysdrv::iommu::smmuv3::{Smmuv3, StreamTableLayout};
 
-struct Uptime;
-
-impl Clock for Uptime {
-    fn now_ns(&self) -> u64 {
-        crate::now_ns()
-    }
-}
-
-/// Identity-maps `[addr, addr + size)` as device memory (the pages not
-/// mapped yet) and returns a window onto it.
-fn map(addr: u64, size: u64) -> IoMem {
-    let mut guard = crate::PT.lock();
-    let pt = guard.as_mut().expect("kernel page table installed");
-    let end = (addr + size).next_multiple_of(PAGE_SIZE as u64);
-    for page in (addr & !(PAGE_SIZE as u64 - 1)..end).step_by(PAGE_SIZE) {
-        if pt.translate(VirtAddr::new(page)).is_none() {
-            let flags = MapFlags::RW | MapFlags::DEVICE | MapFlags::GLOBAL;
-            pt.map_range(VirtAddr::new(page), PhysAddr::new(page), PAGE_SIZE as u64, flags).expect("map_range failed");
-        }
-    }
-    // SAFETY: just mapped as device memory; the demo owns the device.
-    unsafe { IoMem::new(addr as *mut u8, size as usize) }
+/// Identity-maps `[addr, addr + size)` in the kernel's table as device
+/// memory and returns a window onto it.
+///
+/// # Safety
+/// The window must be a device's registers that this demo owns.
+unsafe fn map(addr: u64, size: u64) -> IoMem {
+    // SAFETY: the caller's contract.
+    unsafe { demos::kernel::map_io(&crate::PT, addr, size) }
 }
 
 /// Runs the demo if the device tree has an SMMU and the bus a test device.
@@ -62,7 +47,8 @@ pub fn demo(fdt: &Fdt<'_>) {
         return;
     };
 
-    let cfg = pci::Ecam::new(map(ecam, ecam_len.min(1 << 20)), 0);
+    // SAFETY: the bridge's ECAM window from the device tree; only this demo uses it.
+    let cfg = pci::Ecam::new(unsafe { map(ecam, ecam_len.min(1 << 20)) }, 0);
     let mut found = None;
     pci::for_each_function(&cfg, 0, |f| {
         if found.is_none() && f.class() == demos::iommu::TESTDEV_CLASS {
@@ -86,10 +72,14 @@ pub fn demo(fdt: &Fdt<'_>) {
     let id = DeviceId::new(0, func.address());
 
     // Both register pages of the SMMU, and every stream ID of bus 0.
-    match Smmuv3::new(map(smmu.0, 0x20000), &crate::FRAMES, &Uptime, 0, 0xff) {
+    // SAFETY: the SMMU's register pages from the device tree, for this driver alone.
+    let regs = unsafe { map(smmu.0, 0x20000) };
+    match Smmuv3::new(regs, &FRAMES, &Uptime, 0, 0xff) {
         Ok(unit) => {
             println!("[iommu] SMMUv3 at {:#x}: {} bit I/O addresses", smmu.0, unit.iova_limit().trailing_zeros());
-            demos::iommu::testdev(&unit, id, map(bar.address, bar.size), &crate::FRAMES, "smmuv3");
+            // SAFETY: the test device's BAR 0, assigned above; only the demo uses it.
+            let regs = unsafe { map(bar.address, bar.size) };
+            demos::iommu::testdev(&unit, id, regs, &FRAMES, "smmuv3");
         }
         Err(e) => println!("[iommu] SMMUv3 at {:#x}: init failed: {e:?}", smmu.0),
     }
@@ -98,11 +88,15 @@ pub fn demo(fdt: &Fdt<'_>) {
     // two-level stream table, which allocates the level-2 table the test
     // device's stream ID falls in when it attaches.
     let layout = StreamTableLayout::TwoLevel;
-    match Smmuv3::with_layout(map(smmu.0, 0x20000), &crate::FRAMES, &Uptime, 0, 0x1ff, layout) {
+    // SAFETY: as above; the first driver instance has been dropped.
+    let regs = unsafe { map(smmu.0, 0x20000) };
+    match Smmuv3::with_layout(regs, &FRAMES, &Uptime, 0, 0x1ff, layout) {
         Ok(unit) => match unit.stage1() {
             Ok(stage1) => {
                 println!("[iommu] SMMUv3 stage 1, two-level stream table: {}", unit.two_level());
-                demos::iommu::testdev(&stage1, id, map(bar.address, bar.size), &crate::FRAMES, "smmuv3 stage 1");
+                // SAFETY: as above; the first demo is done with it.
+                let regs = unsafe { map(bar.address, bar.size) };
+                demos::iommu::testdev(&stage1, id, regs, &FRAMES, "smmuv3 stage 1");
             }
             Err(e) => println!("[iommu] SMMUv3 has no stage 1: {e:?}"),
         },
