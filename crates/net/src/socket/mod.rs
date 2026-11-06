@@ -252,6 +252,13 @@ fn flow_hash(src: SocketAddr, dst: SocketAddr) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SocketHandle(usize);
 
+impl SocketHandle {
+    /// The slot the handle names.
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// The sockets an [`Interface`](crate::Interface) serves.
 #[derive(Default)]
 pub struct SocketSet {
@@ -344,6 +351,21 @@ impl SocketSet {
         self.try_remove(handle).expect("socket already removed")
     }
 
+    /// Iterates over the sockets, starting at the slot `start` and wrapping
+    /// around, so that a caller that stops early can let the next pass start
+    /// where it stopped.
+    pub(crate) fn iter_mut_from(&mut self, start: usize) -> impl Iterator<Item = (SocketHandle, &mut Socket)> {
+        let start = start.checked_rem(self.slots.len()).unwrap_or(0);
+        let (head, tail) = self.slots.split_at_mut(start);
+        let tail = tail.iter_mut().enumerate().map(move |(i, s)| (i + start, s));
+        tail.chain(head.iter_mut().enumerate()).filter_map(|(i, s)| Some((SocketHandle(i), s.as_mut()?)))
+    }
+
+    /// The number of slots, used or not: one more than the highest handle.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Every socket, in handle order.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (SocketHandle, &mut Socket)> {
         self.slots.iter_mut().enumerate().filter_map(|(i, s)| Some((SocketHandle(i), s.as_mut()?)))
@@ -417,6 +439,25 @@ impl SocketSet {
         let reuse = self.try_get::<TcpSocket>(handle).ok_or(Error::InvalidState)?.reuse();
         self.check_bind(BindProtocol::Tcp, addr, reuse, Some(handle))?;
         self.try_get_mut::<TcpSocket>(handle).ok_or(Error::InvalidState)?.listen_on(addr)
+    }
+
+    /// Connects the TCP socket `handle` to `remote` from `local_port` (0 for
+    /// an ephemeral port), like [`TcpSocket::connect`], but first fails with
+    /// [`Error::AddressInUse`] if another socket of the set already holds
+    /// that port and `remote`: two connections with the same addresses and
+    /// ports could not be told apart.
+    pub fn connect_tcp(&mut self, handle: SocketHandle, remote: SocketAddr, local_port: u16) -> Result<(), Error> {
+        self.try_get::<TcpSocket>(handle).ok_or(Error::InvalidState)?;
+        if local_port != 0 && self.tcp_tuple_held(local_port, remote, Some(handle)) {
+            return Err(Error::AddressInUse);
+        }
+        self.try_get_mut::<TcpSocket>(handle).ok_or(Error::InvalidState)?.connect(remote, local_port)
+    }
+
+    /// Returns true if a TCP socket other than `except` holds the
+    /// connection `local_port` -> `remote`.
+    fn tcp_tuple_held(&self, local_port: u16, remote: SocketAddr, except: Option<SocketHandle>) -> bool {
+        self.iter().any(|(h, s)| Some(h) != except && matches!(s, Socket::Tcp(t) if t.holds_tuple(local_port, remote)))
     }
 
     /// The UDP sockets a datagram `src` -> `dst` goes to. A unicast one
@@ -499,8 +540,26 @@ impl SocketSet {
     }
 
     /// Gives each TCP connection that is waiting to send its SYN from an
-    /// unchosen port a random one that is free.
+    /// unchosen port a random one that is free, and fails those waiting to
+    /// send it from a chosen port that another socket already uses for the
+    /// same peer.
     pub(crate) fn assign_ephemeral_ports(&mut self, rng: &mut Rng) {
+        let explicit: Vec<(SocketHandle, u16, SocketAddr)> = self
+            .iter()
+            .filter_map(|(h, s)| match s {
+                Socket::Tcp(t) => t.pending_explicit_connect().map(|(port, remote)| (h, port, remote)),
+                _ => None,
+            })
+            .collect();
+        // From the last: of two new connections with the same addresses,
+        // the one made first goes ahead.
+        for (h, port, remote) in explicit.into_iter().rev() {
+            if self.tcp_tuple_held(port, remote, Some(h))
+                && let Some(t) = self.try_get_mut::<TcpSocket>(h)
+            {
+                t.refuse_connect(Error::AddressInUse);
+            }
+        }
         if !self.iter().any(|(_, s)| matches!(s, Socket::Tcp(t) if t.needs_port())) {
             return;
         }

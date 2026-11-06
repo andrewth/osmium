@@ -1,5 +1,12 @@
 //! Path MTU discovery: learning from ICMP "fragmentation needed" and ICMPv6
 //! "packet too big", and telling the connections it affects.
+//!
+//! A report is believed only if the packet it quotes is one we could have
+//! sent just now: a TCP segment whose sequence number is in flight, an echo
+//! request with a socket's identifier, or a UDP datagram whose whole header
+//! (ports, length and checksum, which depends on the payload) matches one of
+//! the [`SENT_UDP`] most recently sent to that destination. Knowing a bound
+//! UDP port is not enough to make the interface shrink its packets.
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -7,7 +14,7 @@ use super::Interface;
 use crate::Instant;
 use crate::ipv6::{IPV6_HEADER_LEN, PROTO_ICMPV6};
 use crate::pmtu::plateau_below;
-use crate::socket::{Socket, SocketSet};
+use crate::socket::{Packet, Socket, SocketSet};
 use crate::wire::{PROTO_ICMP, PROTO_TCP, PROTO_UDP, be16, be32, ip};
 
 /// The ICMP and ICMPv6 echo request types, whose quoted identifier names the
@@ -15,7 +22,31 @@ use crate::wire::{PROTO_ICMP, PROTO_TCP, PROTO_UDP, be16, be32, ip};
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
 
+/// UDP datagrams remembered for checking the ICMP errors that quote them.
+pub(super) const SENT_UDP: usize = 32;
+
+/// A UDP datagram sent recently: its destination and its 8-byte header.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct SentUdp {
+    dst: IpAddr,
+    header: [u8; 8],
+}
+
 impl Interface {
+    /// Remembers the header of `p` if it is a UDP datagram.
+    pub(super) fn note_sent(&mut self, p: &Packet) {
+        let Some(&[a, b, c, d, e, f, g, h]) = p.payload.get(..8) else { return };
+        if p.protocol != PROTO_UDP {
+            return;
+        }
+        let sent = SentUdp { dst: p.dst, header: [a, b, c, d, e, f, g, h] };
+        self.sent_udp.retain(|s| *s != sent);
+        if self.sent_udp.len() >= SENT_UDP {
+            self.sent_udp.pop_front();
+        }
+        self.sent_udp.push_back(sent);
+    }
+
     /// The largest IP packet sent to `dst` now: the link's MTU, or less if a
     /// router has reported a smaller path MTU (see [`pmtu`](crate::pmtu)).
     pub fn path_mtu(&self, dst: IpAddr, now: Instant) -> usize {
@@ -109,8 +140,8 @@ impl Interface {
     /// Returns true if the packet an ICMP error quotes (`transport` is what
     /// follows its IP header, at least eight bytes) is one a socket of ours
     /// could have sent just now: for TCP its sequence number is in flight on
-    /// that connection, for UDP the source port is bound, and for an echo
-    /// request the identifier is a socket's.
+    /// that connection, for UDP its header is that of a datagram recently
+    /// sent to `dst`, and for an echo request the identifier is a socket's.
     fn quoted_flow(&self, sockets: &SocketSet, proto: u8, src: IpAddr, dst: IpAddr, transport: &[u8]) -> bool {
         match proto {
             PROTO_TCP => {
@@ -121,7 +152,9 @@ impl Interface {
             }
             PROTO_UDP => {
                 let local = SocketAddr::new(src, be16(transport, 0));
+                let header = transport.get(..8);
                 sockets.iter().any(|(_, s)| matches!(s, Socket::Udp(u) if u.accepts(local)))
+                    && self.sent_udp.iter().any(|s| s.dst == dst && Some(&s.header[..]) == header)
             }
             PROTO_ICMP | PROTO_ICMPV6 => {
                 let echo = if proto == PROTO_ICMP { ICMP_ECHO_REQUEST } else { ICMPV6_ECHO_REQUEST };
