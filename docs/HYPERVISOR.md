@@ -3,33 +3,41 @@
 `osmium-virt` gives you the parts of a type-1 hypervisor and leaves the
 policy to you: how many VMs, where their memory comes from, which devices
 they see, what happens when they halt. The three `*-hyp` examples
-(`examples/riscv-virt/src/hyp.rs`, `examples/aarch64-hyp`,
-`examples/x86_64-hyp`) put the pieces together; this page explains them.
-`examples/aarch64-vhe` is a smaller one for an AArch64 VHE host.
-`examples/riscv-hyp`, and `examples/aarch64-hyp` and `examples/x86_64-hyp`
-when QEMU's loader provides an image, go further and boot a whole kernel
-from ELF with one vCPU per host CPU: Osmium's own `riscv-virt` (with a
+(`examples/riscv-hyp`, `examples/aarch64-hyp`, `examples/x86_64-hyp`) put
+the pieces together; this page explains them. `examples/aarch64-vhe` is a
+smaller one for an AArch64 VHE host, and `examples/riscv-virt` runs small
+H-extension guests of its own (`src/hyp.rs`). The `*-hyp` examples run small
+demo guests and, when QEMU's loader provides an image, boot a whole kernel
+from ELF with one vCPU per host CPU: osmium's own `riscv-virt` (with a
 virtio-blk disk and a virtio-net card bridged to the host's network card)
 and `aarch64-virt` under a generated device tree, and `x86_64-pc` through
-PVH with generated ACPI tables.
+PVH with generated ACPI tables. Their shared plumbing (guest consoles,
+images, the per-CPU run loop of a multi-vCPU guest) is in
+`examples/demos/src/guest.rs`.
 
 ## The pieces
 
 | Piece | What it does |
 |---|---|
-| `GuestMemory` | Guest-physical RAM as regions of host memory; bounds-checked `read`/`write`/`read_obj`/`write_obj` |
-| Stage-2 tables (`stage2`) | Guest-physical to host-physical translation: `GStageTable` (RISC-V Sv39x4), `Stage2Table` (Arm), `EptTable`, or plain `X86_64` tables for AMD NPT; `map_guest_memory` maps a `GuestMemory` |
+| `GuestMemory` | Guest-physical RAM as regions of host memory (`add_region`); bounds-checked `read`/`write`/`read_obj`/`write_obj`, and `load_elf` for a kernel image |
+| Stage-2 tables (`stage2`) | Guest-physical to host-physical translation: `GStageTable` (RISC-V Sv39x4) or `GStage48Table` (Sv48x4), `Stage2Table` (Arm), `EptTable` (Intel), or plain `X86_64` tables for AMD NPT; `map_guest_memory` maps a `GuestMemory`; `hgatp_sv39x4`, `vttbr` and `eptp` encode the root |
 | `Bus` | MMIO and port-I/O address spaces of `BusDevice`s |
-| `Vcpu` + `VmExit` | A backend runs guest code until the next exit, normalized into `MmioRead`, `MmioWrite`, `PioIn`, `PioOut`, `Hypercall`, `Halt`, `ExternalInterrupt`, `Shutdown` or `Unhandled` |
+| `Vcpu` + `VmExit` | A backend runs guest code until the next exit, normalized into `MmioRead`, `MmioWrite`, `PioIn`, `PioOut`, `Hypercall`, `Halt`, `ExternalInterrupt`, `Shutdown` or `Unhandled` (methods below) |
 | `run_vcpu` | The loop: services MMIO and port I/O from the buses and hands every other exit to your closure |
-| Devices (`devices`, `virtio`) | 16550 UART, PLIC, APLIC and IMSIC, GICv2, GICv3 (no ITS), 8259 PIC pair, 8254 PIT, local APIC; virtio-mmio console, block and net |
+| Devices (`devices`, `virtio`) | 16550 UART (`Uart16550`), PL011 UART (`Pl011`), PLIC, APLIC and IMSIC, GICv2, GICv3 (no LPIs or ITS in the model; GICv4 virtual LPIs go through the host's ITS, below), 8259 PIC pair, 8254 PIT, local APIC (`VirtualLapic`), I/O APIC (`VirtualIoApic`); virtio-mmio (`VirtioMmio`) console, block and net |
 
 ## The run loop
 
 ```rust
 let exit = run_vcpu(&mut vcpu, &mmio_bus, &pio_bus, |vcpu, exit| match exit {
-    VmExit::Hypercall { .. } => /* SBI, PSCI or your own ABI */,
-    VmExit::Halt => /* wait for vcpu.interrupt_pending(..), or yield the host CPU */,
+    VmExit::Hypercall { nr, args } => {
+        vcpu.complete_hypercall(my_abi(nr, args)); // or riscv::sbi / aarch64::psci
+        ControlFlow::Continue(())
+    }
+    VmExit::Halt => {
+        while !vcpu.interrupt_pending(now()) { /* wait, or yield the host CPU */ }
+        ControlFlow::Continue(())
+    }
     VmExit::ExternalInterrupt => ControlFlow::Continue(()), // the host already handled it
     other => ControlFlow::Break(other),
 });
@@ -40,22 +48,40 @@ claims returns all ones; a write to one is dropped, as on real hardware.
 
 ## Backends
 
-| | RISC-V (`riscv::RiscvVcpu`) | AArch64 (`aarch64::Aarch64Vcpu`) | x86 (`x86::svm::SvmVcpu`) |
-|---|---|---|---|
-| Host runs in | HS-mode | EL2, non-VHE or VHE | long mode with SVM on |
-| Feature | `riscv64-hs` (osmium-arch and osmium-virt) | `aarch64-el2` (non-VHE) or `aarch64-vhe` (VHE) | none (bare-metal x86_64) |
-| Guest entry/exit | `sret` / the trap entry's guest-exit hook | `eret` / lower-EL vectors 8-11 | `VMRUN` / `#VMEXIT` |
-| Second stage | G-stage, `hgatp_sv39x4` | stage 2, `vttbr`; `init_cpu` sets `VTCR_EL2` | NPT, `X86_64` tables with `USER` leaves |
-| MMIO exits from | guest-page faults, decoded from `htinst` or the instruction (`hlvx`) | data aborts with a valid syndrome | nested page faults, decoded by `x86::decode` |
-| Hypercalls | `ecall` (SBI: `riscv::sbi`) | `hvc` (PSCI: `aarch64::psci`) | `vmmcall` |
-| Interrupt input | `external_irq()` line, becomes `hvip.VSEIP` | `irq_line()`, becomes `HCR_EL2.VI` | `irq_line()` plus `connect_intr` (injected through `EVENTINJ`) |
-| Interrupt controller to emulate | `VirtualPlic`, or `VirtualAplic` + `VirtualImsic` | `VirtualGicV2`, or `VirtualGicV3` | `VirtualPic`, or `VirtualLapic` per vCPU plus `VirtualIoApic` |
-| Guest timer | Sstc `vstimecmp`, switched per vCPU | virtual timer; `connect_timer` feeds it to the GIC | `VirtualPit` on the PIC's IRQ 0, or the `VirtualLapic` timer; either driven by `poll` at its `next_deadline` |
+| | RISC-V (`riscv::RiscvVcpu`) | AArch64 (`aarch64::Aarch64Vcpu`) | AMD (`x86::svm::SvmVcpu`) | Intel (`x86::vmx::VmxVcpu`) |
+|---|---|---|---|---|
+| Host runs in | HS-mode | EL2, non-VHE or VHE | long mode with SVM on (`svm::enable`) | long mode in VMX root operation (`vmx::enable`) |
+| Feature | `riscv64-hs` (osmium-arch and osmium-virt) | `aarch64-el2` (non-VHE) or `aarch64-vhe` (VHE) | none (bare-metal x86_64) | none (bare-metal x86_64) |
+| Guest entry/exit | `sret` / the trap entry's guest-exit hook | `eret` / lower-EL vectors 8-11 | `VMRUN` / `#VMEXIT` | `VMLAUNCH` or `VMRESUME` / VM exit |
+| Second stage | G-stage, `hgatp_sv39x4` | stage 2, `vttbr`; `init_cpu` sets `VTCR_EL2` | NPT, `X86_64` tables with `USER` leaves | EPT, `EptTable` and `eptp`; VPID |
+| MMIO exits from | guest-page faults, decoded from `htinst` or the instruction (`hlvx`) | data aborts with a valid syndrome | nested page faults, decoded by `x86::decode` | EPT violations, decoded by `x86::decode` |
+| Hypercalls | `ecall` (SBI: `riscv::sbi`) | `hvc` (PSCI: `aarch64::psci`) | `vmmcall` | `vmcall` |
+| Interrupt input | `external_irq()` (the same line as `irq_line()`), becomes `hvip.VSEIP` | `irq_line()`, becomes `HCR_EL2.VI` | `irq_line()` plus `connect_intr` or `connect_lapic` (injected through `EVENTINJ`) | `irq_line()` plus `connect_intr` or `connect_lapic` (injected through the VM-entry interruption field) |
+| Interrupt controller to emulate | `VirtualPlic`, or `VirtualAplic` + `VirtualImsic` | `VirtualGicV2`, or `VirtualGicV3` | `VirtualPic`, or `VirtualLapic` per vCPU plus `VirtualIoApic` | as SVM |
+| Guest timer | Sstc `vstimecmp`, switched per vCPU | virtual timer; `connect_timer` feeds it to the GIC | `VirtualPit` on the PIC's IRQ 0, or the `VirtualLapic` timer; either driven by `poll` at its `next_deadline` | as SVM |
 
 Each backend saves the host's callee-saved registers, runs the guest, and
 returns to the caller of `Vcpu::run` with interrupts restored. A host
 interrupt that arrives while the guest runs exits with
 `ExternalInterrupt`; the host takes it as soon as `run` returns.
+
+The `Vcpu` trait is what a backend-generic host loop needs:
+
+| Method | What it does |
+|---|---|
+| `run(&mut self) -> VmExit` | Runs guest code until the next exit |
+| `complete_read(&mut self, value: u64)` | Finishes an `MmioRead` or `PioIn` (`run_vcpu` calls it) |
+| `complete_hypercall(&mut self, ret: u64)` | Finishes a `Hypercall` with its return value |
+| `interrupt_pending(&self, now: u64) -> bool` | Whether a halted vCPU has an interrupt it can take; `now` is the clock the guest's timer compares against (the counter on AArch64, `time` on RISC-V; ignored on x86) |
+| `flush_stage2(&mut self)` | Flushes the guest's cached stage-2 translations before the next entry; call it after unmapping a page or reducing its permissions |
+| `irq_line(&self) -> Arc<AtomicBool>` | The vCPU's interrupt line, for a controller model to drive: INTR on x86, `HCR_EL2.VI` on AArch64, `hvip.VSEIP` on RISC-V |
+| `connect_cpu(&mut self, link: CpuLink)` | Links the vCPU to its `GuestCpus` slot; `GuestCpus::attach` calls it |
+
+Entry state, guest memory (`with_memory`) and interrupt-controller
+attachments stay with each backend's constructor and builder methods.
+Given its guest memory with `with_memory`, every backend reports a
+second-stage fault on an address inside guest RAM (a permission fault, or
+a fault in the guest's own page-table walk) as `Unhandled`, not as MMIO.
 
 ### AArch64 VHE hosts
 
@@ -89,8 +115,8 @@ with `E2H`) are set on each entry, leaving the host's EL0 bits alone.
 
 ## Interrupts: wiring a device to a guest
 
-Devices have an output line (`Uart16550::with_irq`, `VirtioMmio::new`'s
-`irq` callback). Connect it to an emulated interrupt controller's input,
+Devices have an output line (`Uart16550::with_irq`, `Pl011::with_irq`,
+`VirtioMmio::new`'s `irq` callback). Connect it to an emulated interrupt controller's input,
 and connect the controller's output to the vCPU:
 
 ```rust
@@ -112,10 +138,11 @@ unchanged inside a guest.
 `smp::GuestCpus` holds a guest's per-CPU start/stop state. Run each vCPU on
 its own host CPU (a pinned task with `TaskBuilder::cpu`, or a dedicated
 CPU loop), take start requests with `take_start`, and connect the vCPU
-(`attach` on RISC-V, `attach_arm` on AArch64). Then:
+with `GuestCpus::attach(cpu, &mut vcpu)` (any backend). Then:
 
 - RISC-V: `riscv::sbi::handle_smp` implements SBI HSM, IPI (injected as
-  `VSSIP`) and RFENCE. Created with `GuestCpus::with_kick`, an IPI or fence
+  `VSSIP`) and RFENCE (`riscv::harts::GuestHarts` is `GuestCpus` under its
+  RISC-V name). Created with `GuestCpus::with_kick`, an IPI or fence
   aimed at a vCPU that is running guest code on another host CPU interrupts
   that CPU so the vCPU exits and notices at once.
 - AArch64: `aarch64::psci::handle_smp` implements `CPU_ON`, `CPU_OFF` and
@@ -130,11 +157,12 @@ CPU loop), take start requests with `take_start`, and connect the vCPU
 
 - x86: guests start their APs the PC way, with INIT and STARTUP through
   `VirtualLapic` (decode the hook's ICR with `decode_icr`); start the AP's
-  vCPU with `SvmVcpu::set_real_mode` and `set_application_processor`, and
-  give each vCPU its APIC ID with `set_apic_id` so CPUID agrees. Kick as on
-  the other architectures: `GuestCpus::with_kick` sends the host CPU a
-  physical IPI, which exits the guest (the host runs with interrupts on, so
-  `VMRUN` honours them), and `attach_svm` records where it runs.
+  vCPU with `set_real_mode` and `set_application_processor` (on `SvmVcpu`
+  or `VmxVcpu`), and give each vCPU its APIC ID with `set_apic_id` so CPUID
+  agrees. Kick as on the other architectures: `GuestCpus::with_kick` sends
+  the host CPU a physical IPI, which exits the guest with
+  `ExternalInterrupt`, and `GuestCpus::attach` records where each vCPU
+  runs.
 
 ## Advanced interrupt controllers
 
@@ -148,11 +176,26 @@ pending interrupts into `ICH_LR<n>_EL2` and reads the acknowledged and
 completed state back (`fill_list_registers` / `sync_list_registers`); guest
 `ICC_SGI1R_EL1` writes trap and call `send_sgi`; the guest's `MPIDR_EL1` is
 `vcpu_mpidr(cpu)` so it finds its redistributor by affinity. Not modeled:
-LPIs and the ITS, GICv4, message-based SPIs, and the GICv2-compatibility
-mode. If more interrupts are pending than list registers, the rest wait for
+LPIs and the ITS (see GICv4 below), message-based SPIs, and the
+GICv2-compatibility mode. If more interrupts are pending than list registers, the rest wait for
 the next exit; the vCPU asks for a maintenance interrupt
 (`ICH_HCR_EL2.UIE`), which only helps if the host enables that PPI.
 `ArmGic::V3` in the device-tree writer describes it to a guest.
+
+**GICv4 virtual LPIs** (`osmium_sysdrv::gicv3::v4`). On a GICv4 host a
+guest's LPIs need no model: the host's ITS delivers them. The hypervisor
+gives each vCPU a vPE (`Vpe`, its virtual pending table, mapped with
+`Its::map_vpe`, `VMAPP`) and the VM a virtual LPI property table
+(`VlpiTables`), maps device events to virtual LPIs with
+`Its::map_virtual_event` (`VMAPTI`), and makes the vPE resident on its
+redistributor around guest runs (`GicV3::make_vpe_resident` and
+`make_vpe_nonresident`; `Its::move_vpe` follows a vCPU to another CPU).
+While it is resident the guest acknowledges the virtual LPI through its CPU
+interface with no list register and no exit; while it is not, the ITS
+raises the event's doorbell, a physical LPI the hypervisor chose.
+`examples/aarch64-hyp/src/vlpi.rs` runs this under QEMU
+`-machine virt,virtualization=on,gic-version=4`. GICv4.1 (vSGIs) is not
+implemented.
 
 **APLIC and IMSIC** (`devices::VirtualAplic`, `VirtualImsic`). One APLIC
 domain, in MSI or direct delivery mode, forwarding messages through a
@@ -173,19 +216,21 @@ sources in a second domain. `riscv::fdt::Aia` adds the `riscv,aplic` and
 memory, PLIC or APLIC and IMSIC, UARTs, virtio-mmio slots) in the layout Linux expects from
 QEMU `virt`; pass its address in `a1`. `aarch64::fdt::ArmMachine` does the
 same for an AArch64 guest (PSCI over `hvc`, GICv2 or GICv3, timer, PL011s,
-virtio-mmio); pass it in `x0`. On x86, `x86::pc::PcBoot` writes what a PVH
-kernel boots from: the `hvm_start_info` (pass it in `ebx`), its memory map
-and ACPI tables with a MADT; `x86::pc::pvh_entry` finds the kernel's
+virtio-mmio); pass it in `x0`. On x86, `x86::pc::PcBoot::build` writes what
+a PVH kernel boots from: the `hvm_start_info` (the blob's `start_info`
+address goes in `ebx`), its memory map and ACPI tables with a MADT listing
+the local APICs and the I/O APIC; `x86::pc::pvh_entry` finds the kernel's
 32-bit entry. `osmium_boot::fdt::FdtWriter` builds any other tree.
 
 ## Booting a whole kernel
 
-The three `*-hyp` examples boot Osmium's own kernels as guests, and the
+The three `*-hyp` examples boot osmium's own kernels as guests, and the
 recipe is the same on each:
 
-1. Allocate guest RAM, add it to a `GuestMemory`, and copy in each ELF
-   segment (`osmium_boot::elf`) at its address, zeroing the rest of its
-   memory size.
+1. Allocate guest RAM, add it to a `GuestMemory` (`add_region`), and load
+   the kernel with `GuestMemory::load_elf`, which copies each segment
+   (`osmium_boot::elf`) to its address and zeroes the rest of its memory
+   size.
 2. Write the machine description into guest RAM where the kernel expects
    it, and map the RAM in the second-stage table.
 3. Put the devices on the buses at the addresses the description gives,
@@ -200,10 +245,24 @@ recipe is the same on each:
 
 ## Current limits
 
-- x86 MMIO emulation decodes moves, `MOVZX` and `TEST`; without decode
-  assists it walks 4-level (long-mode) guest page tables, or none; 32-bit
-  paging is not walked. MSRs other than the syscall ones, EFER, PAT,
-  `TSC_AUX` and `APIC_BASE` read as zero.
+- Nothing has run on physical hardware; every backend has only run under
+  QEMU.
+- x86 MMIO emulation decodes moves (including the `moffs` forms), `MOVZX`
+  and `TEST`. The instruction comes from SVM's decode assists when the CPU
+  has them, and otherwise is fetched through the guest's page tables in
+  whatever mode it runs (no paging, 32-bit with PSE, PAE or 4-level long
+  mode), so MMIO works from 32-bit and PAE guests on both backends.
+- x86 MSRs: every access exits. EFER, STAR, LSTAR, CSTAR, SFMASK, FS and GS
+  base, `KernelGsBase`, `SYSENTER_CS`/`ESP`/`EIP`, PAT, `TSC_AUX` and
+  `APIC_BASE` (the xAPIC at its default address) are emulated; a value the
+  hardware would reject raises `#GP`. Other MSRs read as zero and ignore
+  writes.
+- x86 CPUID hides MONITOR/MWAIT, x2APIC, XSAVE and AVX
+  (`x86::patch_cpuid`), and the backend's own SVM or VMX. On both SVM and
+  VMX the guest's SVM or VMX instructions, `XSETBV`, `MONITOR` and `MWAIT`
+  raise `#UD`, so a halted guest always exits through `HLT`. With `connect_lapic` the guest's `CR8`
+  is its local APIC's task priority (SVM through `V_TPR`, VMX by exiting on
+  `MOV CR8`); without an APIC `CR8` gates nothing.
 - `x86::vmx::VmxVcpu` is the Intel backend: EPT (`stage2::eptp`), VPID and
   unrestricted guest mode, so guests start as under SVM (protected mode, real
   mode or long mode). It differs from SVM in four ways: no decode assists (MMIO
@@ -223,11 +282,25 @@ recipe is the same on each:
   KVM (`examples/x86_64-hyp` with `-accel kvm -cpu host`).
 - FP/SIMD state is switched per vCPU on the assumption that the host
   kernel itself never uses those registers (soft-float targets): always on
-  RISC-V and AArch64 (where SVE is not switched and traps; a VHE host's own
-  `q` registers are kept if its FP was on, but not the upper bits of SVE
-  `z` registers), and on x86 for
+  RISC-V and AArch64, and on x86 for
   vCPUs built `with_fp_switching` (x87 and SSE through FXSAVE/FXRSTOR, not
   AVX). Without it an x86 guest uses the host CPU's registers as they are,
   which is enough for one vCPU per host CPU; the whole-kernel x86 guest runs
   that way because, under QEMU's multi-threaded TCG, switching around VMRUN
   made it take spurious page faults that single-threaded TCG never showed.
+- AArch64 guests do not see SVE, SME, MTE or pointer authentication: their
+  state is not switched and their instructions trap, and `HCR_EL2.TID3`
+  traps the ID registers so `Aarch64Vcpu::emulate_sysreg` returns the
+  host's values with those features hidden (`aarch64::guest_id_register`).
+  A VHE host's own `q` registers are kept if its FP was on, but not the
+  upper bits of SVE `z` registers.
+- virtio devices: the transport registers sit behind a short IRQ-off lock,
+  but a device's work (a disk read, a frame handed to a NIC backend) runs
+  under a second lock that does not mask interrupts, so a backend may block
+  or wait for its own interrupt. A notify that finds the device busy on
+  another CPU leaves a request for the busy context instead of waiting.
+  `VirtioMmio::with_device` does wait for a busy device, so do not call it
+  from an interrupt handler.
+- `VirtioBlock` serves requests synchronously on notify, at most 4 MiB of
+  data each: it advertises `size_max` 64 KiB and `seg_max` 64, and a larger
+  request fails with `VIRTIO_BLK_S_IOERR`.
