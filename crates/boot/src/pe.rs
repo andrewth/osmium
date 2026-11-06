@@ -3,6 +3,10 @@
 //! style kernel.
 //!
 //! Every offset read from the file is bounds checked: images are untrusted.
+//! [`parse`] also checks that the sections lie inside the image, in ascending
+//! order, without overlapping each other or the headers, so that a loader can
+//! give each one its own permissions: [`sections`] says which are writable and
+//! which executable, for a loader that maps the image write-xor-execute.
 //!
 //! ```ignore
 //! let info = pe::parse(file, pe::MACHINE_X86_64)?;
@@ -57,6 +61,74 @@ pub const SUBSYSTEM_EFI_RUNTIME_DRIVER: u16 = 12;
 
 /// Largest SectionAlignment accepted (arm64 Linux uses 64 KiB).
 pub const MAX_SECTION_ALIGNMENT: u32 = 2 * 1024 * 1024;
+
+/// `IMAGE_SCN_CNT_CODE`: the section holds code.
+pub const SCN_CNT_CODE: u32 = 0x0000_0020;
+/// `IMAGE_SCN_MEM_EXECUTE`: the section can be executed.
+pub const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+/// `IMAGE_SCN_MEM_READ`: the section can be read.
+pub const SCN_MEM_READ: u32 = 0x4000_0000;
+/// `IMAGE_SCN_MEM_WRITE`: the section can be written.
+pub const SCN_MEM_WRITE: u32 = 0x8000_0000;
+
+/// The access a section asks for, from its `Characteristics`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionFlags {
+    /// `IMAGE_SCN_MEM_READ`.
+    pub read: bool,
+    /// `IMAGE_SCN_MEM_WRITE`.
+    pub write: bool,
+    /// `IMAGE_SCN_MEM_EXECUTE`, or `IMAGE_SCN_CNT_CODE` (code is executable even where a linker left out
+    /// the memory flag).
+    pub execute: bool,
+}
+
+/// A section as it lies in the loaded image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section {
+    /// The name, NUL-padded (`.text`, `.data`, ...).
+    pub name: [u8; 8],
+    /// Where it starts, relative to the image base.
+    pub rva: u32,
+    /// Bytes it occupies in memory: `VirtualSize`, or `SizeOfRawData` when that is zero. Bytes past the
+    /// file data are zero.
+    pub size: u32,
+    /// The raw `Characteristics` field.
+    pub characteristics: u32,
+    /// The access it asks for. A section that is both writable and executable cannot be mapped
+    /// write-xor-execute; a loader that enforces that refuses the image.
+    pub flags: SectionFlags,
+}
+
+impl Section {
+    /// The RVAs the section covers. When the image's `SectionAlignment` is below the page size, two
+    /// sections can share a page, and a loader has to give that page both sections' access.
+    pub fn range(&self) -> core::ops::Range<u32> {
+        self.rva..self.rva.saturating_add(self.size)
+    }
+}
+
+fn section_at(file: &[u8], info: &PeInfo, i: usize) -> Result<Section, PeError> {
+    let s = i.checked_mul(40).and_then(|o| info.section_table.checked_add(o)).ok_or(PeError::Malformed)?;
+    let name = *file.get(s..).and_then(|b| b.first_chunk::<8>()).ok_or(PeError::Malformed)?;
+    let virtual_size = u32_at(file, s + 8)?;
+    let rva = u32_at(file, s + 12)?;
+    let raw_size = u32_at(file, s + 16)?;
+    let characteristics = u32_at(file, s + 36)?;
+    let flags = SectionFlags {
+        read: characteristics & SCN_MEM_READ != 0,
+        write: characteristics & SCN_MEM_WRITE != 0,
+        execute: characteristics & (SCN_MEM_EXECUTE | SCN_CNT_CODE) != 0,
+    };
+    let size = if virtual_size == 0 { raw_size } else { virtual_size };
+    Ok(Section { name, rva, size, characteristics, flags })
+}
+
+/// The sections of `file`, which [`parse`] gave `info` for, in RVA order.
+pub fn sections<'f>(file: &'f [u8], info: &PeInfo) -> impl Iterator<Item = Result<Section, PeError>> + 'f {
+    let info = *info;
+    (0..info.num_sections).map(move |i| section_at(file, &info, i))
+}
 
 /// The header fields a loader needs.
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +207,18 @@ pub fn parse(file: &[u8], machine: u16) -> Result<PeInfo, PeError> {
     let table_end = info.section_table.checked_add(num_sections * 40).ok_or(PeError::Malformed)?;
     if table_end > file.len() {
         return Err(PeError::Malformed);
+    }
+    // Sections lie inside the image after the headers, in ascending order and apart (as the PE
+    // specification requires), so each byte of the image belongs to at most one of them and per-section
+    // permissions mean something.
+    let mut floor = info.size_of_headers;
+    for s in sections(file, &info) {
+        let s = s?;
+        let end = s.rva.checked_add(s.size).ok_or(PeError::Malformed)?;
+        if s.rva < floor || end > info.size_of_image {
+            return Err(PeError::Malformed);
+        }
+        floor = end;
     }
     Ok(info)
 }
@@ -327,12 +411,16 @@ mod tests {
         f[o + 152..o + 156].copy_from_slice(&0x2000u32.to_le_bytes()); // reloc rva
         f[o + 156..o + 160].copy_from_slice(&12u32.to_le_bytes()); // reloc size
         let s = o + 240; // 0x148
-        for (i, (va, raw)) in [(0x1000u32, 0x200u32), (0x2000, 0x300)].iter().enumerate() {
+        let sections =
+            [(b".text\0\0\0", 0x1000u32, 0x200u32, 0x6000_0020u32), (b".reloc\0\0", 0x2000, 0x300, 0x4200_0040)];
+        for (i, (name, va, raw, characteristics)) in sections.iter().enumerate() {
             let h = s + i * 40;
+            f[h..h + 8].copy_from_slice(*name);
             f[h + 8..h + 12].copy_from_slice(&0x100u32.to_le_bytes());
             f[h + 12..h + 16].copy_from_slice(&va.to_le_bytes());
             f[h + 16..h + 20].copy_from_slice(&0x100u32.to_le_bytes());
             f[h + 20..h + 24].copy_from_slice(&raw.to_le_bytes());
+            f[h + 36..h + 40].copy_from_slice(&characteristics.to_le_bytes());
         }
         // .text: pointer to image_base+0x1234 at offset 8.
         f[0x208..0x210].copy_from_slice(&(image_base + 0x1234).to_le_bytes());
@@ -421,6 +509,50 @@ mod tests {
         assert_eq!(u64::from_le_bytes(own[0x1008..0x1010].try_into().unwrap()), 0x1111);
         // A site beyond the image is ignored, not a panic.
         rebase(&mut moved, &[Fixup { rva: 0x2ffc, reserved: 0, value: 0 }], delta);
+    }
+
+    #[test]
+    fn sections_say_what_access_they_need() {
+        let mut f = sample(0x1_4000_0000);
+        let info = parse(&f, 0x8664).unwrap();
+        let secs: std::vec::Vec<_> = sections(&f, &info).map(Result::unwrap).collect();
+        assert_eq!(secs.len(), 2);
+        assert_eq!((&secs[0].name, secs[0].range()), (b".text\0\0\0", 0x1000..0x1100));
+        assert_eq!(secs[0].flags, SectionFlags { read: true, write: false, execute: true });
+        assert_eq!(secs[1].flags, SectionFlags { read: true, write: false, execute: false });
+        // A writable code section is reported as such, for a W^X loader to refuse.
+        f[0x148 + 36..0x148 + 40].copy_from_slice(&(SCN_MEM_READ | SCN_MEM_WRITE | SCN_MEM_EXECUTE).to_le_bytes());
+        let info = parse(&f, 0x8664).unwrap();
+        let text = sections(&f, &info).next().unwrap().unwrap();
+        assert!(text.flags.write && text.flags.execute);
+        // CNT_CODE alone counts as executable.
+        f[0x148 + 36..0x148 + 40].copy_from_slice(&SCN_CNT_CODE.to_le_bytes());
+        let info = parse(&f, 0x8664).unwrap();
+        assert!(sections(&f, &info).next().unwrap().unwrap().flags.execute);
+    }
+
+    #[test]
+    fn overlapping_or_misplaced_sections_are_refused() {
+        let f = sample(0x1_4000_0000);
+        // The second section moved into the first.
+        let mut bad = f.clone();
+        bad[0x170 + 12..0x170 + 16].copy_from_slice(&0x1080u32.to_le_bytes());
+        assert_eq!(parse(&bad, 0x8664).unwrap_err(), PeError::Malformed);
+        // Out of order (apart, but descending).
+        let mut bad = f.clone();
+        bad[0x148 + 12..0x148 + 16].copy_from_slice(&0x2800u32.to_le_bytes());
+        assert_eq!(parse(&bad, 0x8664).unwrap_err(), PeError::Malformed);
+        // Over the headers.
+        let mut bad = f.clone();
+        bad[0x148 + 12..0x148 + 16].copy_from_slice(&0x100u32.to_le_bytes());
+        assert_eq!(parse(&bad, 0x8664).unwrap_err(), PeError::Malformed);
+        // Past the end of the image, or wrapping.
+        let mut bad = f.clone();
+        bad[0x170 + 8..0x170 + 12].copy_from_slice(&0x1001u32.to_le_bytes());
+        assert_eq!(parse(&bad, 0x8664).unwrap_err(), PeError::Malformed);
+        let mut bad = f;
+        bad[0x170 + 8..0x170 + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse(&bad, 0x8664).unwrap_err(), PeError::Malformed);
     }
 
     #[test]

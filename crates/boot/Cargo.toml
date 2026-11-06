@@ -1,6 +1,6 @@
 [package]
 name = "osmium-boot"
-description = "Osmium: device tree, Multiboot2, PVH, ACPI parsing, UEFI GOP and loader boot services, FDT writer, boot memory maps"
+description = "Osmium: device tree parsing and writing, Multiboot2, PVH, ELF64 and PE32+ loading, static ACPI tables, UEFI GOP and loader boot services, boot memory maps"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
