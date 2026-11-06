@@ -24,7 +24,7 @@ use crate::write::{RefMode, Tx};
 use crate::xxhash::xxh64;
 
 /// Offsets in a root item.
-mod root {
+pub(crate) mod root {
     pub const GENERATION: usize = 160;
     pub const DIRID: usize = 168;
     pub const BYTENR: usize = 176;

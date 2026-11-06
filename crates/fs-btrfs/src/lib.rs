@@ -39,13 +39,14 @@
 //! [`BtrfsFs::punch_hole`] preallocate and deallocate ranges; new data and
 //! metadata chunks are added when the block groups
 //! fill up. Unlinked files that are still open are kept as orphans and
-//! deleted when their last node goes, or at the next mount.
+//! deleted when their last node goes, or at the next writable mount, in
+//! every subvolume but read-only ones (whose orphans stay as they are).
 //!
 //! Several devices: writing works with the single, `DUP`, `RAID0`, `RAID1*`
 //! and `RAID10` profiles when every device is present and their superblocks
 //! agree, onto the block groups that exist; a new chunk is only allocated in
-//! a single or `DUP` profile, and on the first device, so a full `RAID`
-//! block group means `ENOSPC`. `RAID5` and `RAID6` are read-only, as is a
+//! a single or `DUP` profile, on the device with the most room, so a full
+//! `RAID` block group means `ENOSPC`. `RAID5` and `RAID6` are read-only, as is a
 //! degraded volume.
 //!
 //! A volume with an fsync log (what Linux leaves after a crash that follows
@@ -84,8 +85,13 @@
 //! [`BtrfsFs::replace_device`] change the set of devices under a mounted
 //! volume, which the chunk allocator then spreads new chunks over. Balance and
 //! device removal leave alone system chunks and anything shared through
-//! snapshots (`EOPNOTSUPP` in the report or result), and a volume mounted
-//! with more than one device is still read-only.
+//! snapshots (`EOPNOTSUPP` in the report or result), including blocks
+//! Linux's balance flagged `RELOC`; a read-only subvolume that shares nothing
+//! is moved like any other. Writes treat a `RELOC` block as shared, as Linux
+//! does, so they work across what Linux relocated. A volume with more than
+//! one device is mounted with [`BtrfsFs::mount_multi`] and given all of
+//! them; it is then writable as above, and read-only (degraded) if any is
+//! missing.
 //!
 //! Readers see the last commit: each call takes the current state, and the
 //! space a commit frees is not reused until no reader can still be reading it.
@@ -558,7 +564,8 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             if (dev.num_blocks() as u128) * (block_size as u128) < end as u128 {
                 return Err(Errno::EINVAL);
             }
-            let mut d = Dev { devid: 0, block_size, dev_item: SpinLock::new([0; DEV_ITEM_SIZE]), dev: SpinLock::new(dev) };
+            let mut d =
+                Dev { devid: 0, block_size, dev_item: SpinLock::new([0; DEV_ITEM_SIZE]), dev: SpinLock::new(dev) };
             let mut b = try_zeroed(disk::SUPER_SIZE)?;
             d.read(disk::SUPER_OFFSET, &mut b).map_err(|_| Errno::EINVAL)?;
             let sb = Super::parse(&b)?;
@@ -720,7 +727,7 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
             }
         }
         let shared = try_arc(shared)?;
-        shared.delete_orphans(top);
+        shared.delete_all_orphans();
         shared.drop_dead_roots();
         let root = shared.node(top, disk::tree::FIRST_FREE)?;
         if root.kind != FileKind::Directory {
@@ -822,9 +829,9 @@ impl<D: BlockDevice + Send + 'static> BtrfsFs<D> {
     /// Adds `dev` to the volume and returns its device id. New chunks are
     /// then placed on whichever device has the most room. The device's
     /// previous contents are lost; it must have the block size of the first
-    /// and hold at least 16 MiB. A volume with more than one device mounts
-    /// read-only here, so the devices are used within this mount; `EROFS` if
-    /// the volume is read-only.
+    /// and hold at least 16 MiB. To mount the volume again, give
+    /// [`BtrfsFs::mount_multi`] every device; without this one it mounts
+    /// read-only (degraded). `EROFS` if the volume is read-only.
     pub fn add_device(&self, dev: D) -> Result<u64, Errno> {
         self.shared.add_device(dev)
     }
@@ -1212,7 +1219,9 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
         let size = self.nodesize as u64;
         let mut held = Vec::new();
         for &b in &blocks {
-            let free = w.group_mut(b).is_some_and(|g| g.free.iter().any(|&(s, l)| s <= b && b + size <= s + l));
+            let free = w
+                .group_mut(b)
+                .is_some_and(|g| g.free.iter().any(|&(s, l)| s <= b && b.saturating_add(size) <= s.saturating_add(l)));
             if free {
                 if let Some(g) = w.group_mut(b) {
                     space::carve(&mut g.free, b, size)?;
@@ -1236,6 +1245,40 @@ impl<D: BlockDevice + Send + 'static> Shared<D> {
             }
         }
         Ok(())
+    }
+
+    /// Deletes the orphans a previous mount left, in every subvolume that
+    /// can be written (Linux deletes a subvolume's when it first opens it).
+    fn delete_all_orphans(&self) {
+        if self.writer.is_none() {
+            return;
+        }
+        let st = self.state();
+        let mut trees = Vec::new();
+        let mut c = Cursor::new(self, &st.chunks, st.root_tree);
+        let mut at = c.seek(Key::new(disk::tree::FS, item::ROOT_ITEM, 0));
+        while let Ok(Some((k, d))) = at {
+            if k.objectid > disk::tree::LAST_FREE {
+                break;
+            }
+            let subvol = k.objectid == disk::tree::FS || k.objectid >= disk::tree::FIRST_FREE;
+            // Live (`refs`), and not read-only.
+            let live = disk::le32(d, 216).is_ok_and(|r| r != 0) && disk::le64(d, 208).is_ok_and(|f| f & 1 == 0);
+            if k.ty == item::ROOT_ITEM
+                && subvol
+                && live
+                && trees.last() != Some(&k.objectid)
+                && try_push(&mut trees, k.objectid).is_err()
+            {
+                break;
+            }
+            at = c.next();
+        }
+        drop(st);
+        for tree in trees {
+            // Best effort, one subvolume at a time: what is left goes at the next mount.
+            self.delete_orphans(tree);
+        }
     }
 
     /// Deletes the orphans a previous mount left in subvolume `tree`.

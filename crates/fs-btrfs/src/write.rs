@@ -36,6 +36,20 @@ pub struct RootPtr {
     /// Blocks written at or before this generation may be shared with a
     /// snapshot.
     pub last_snapshot: u64,
+    /// A read-only subvolume (`BTRFS_ROOT_SUBVOL_RDONLY`): its contents
+    /// do not change, but a relocation may still move its blocks.
+    pub read_only: bool,
+}
+
+/// Whether block `n` of the tree whose root is `r` may be shared with
+/// another tree, as Linux's `btrfs_block_can_be_shared` decides: only a
+/// subvolume's blocks other than its root can be, and only those written
+/// before its last snapshot or by a relocation. Linux's balance leaves blocks
+/// of a snapshotted subvolume flagged `RELOC`, written after the snapshot but
+/// shared all the same, often owned by another tree and `FULL_BACKREF`.
+pub(crate) fn may_be_shared(r: &RootPtr, n: &TNode) -> bool {
+    let shareable = r.id == tree::FS || r.id >= tree::FIRST_FREE;
+    shareable && n.addr != r.addr && (n.generation <= r.last_snapshot || n.reloc)
 }
 
 /// A pending change to a tree block's reference.
@@ -210,6 +224,9 @@ pub struct Tx<'a, D: BlockDevice + Send + 'static> {
     /// Write the superblock even if no block changed (the replay of a log
     /// that left the trees as they were).
     pub(crate) force: bool,
+    /// A relocation: blocks of read-only subvolumes may be copied (their
+    /// contents stay as they are).
+    pub(crate) relocating: bool,
 }
 
 /// What the children of a block refer to it by.
@@ -261,6 +278,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             pend: Vec::new(),
             flag_ops: Vec::new(),
             force: false,
+            relocating: false,
         }
     }
 
@@ -320,25 +338,23 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
         if let Some(r) = self.roots.iter().find(|r| r.id == id) {
             return Ok(*r);
         }
-        let (addr, level, last_snapshot) = match id {
-            tree::ROOT => (self.base.root_tree.0, self.base.root_tree.1, 0),
-            tree::CHUNK => (self.base.chunk_root.0, self.base.chunk_root.1, 0),
+        let (addr, level, last_snapshot, read_only) = match id {
+            tree::ROOT => (self.base.root_tree.0, self.base.root_tree.1, 0, false),
+            tree::CHUNK => (self.base.chunk_root.0, self.base.chunk_root.1, 0, false),
             _ => {
                 let key = Key::new(id, item::ROOT_ITEM, 0);
                 let (k, data) = self.next_item(tree::ROOT, key)?.ok_or(Errno::ENOENT)?;
                 if k.objectid != id || k.ty != item::ROOT_ITEM {
                     return Err(Errno::ENOENT);
                 }
-                if id == tree::FS || id >= tree::FIRST_FREE {
-                    // A read-only subvolume (`btrfs property set ro`).
-                    if le64(&data, 208)? & 1 != 0 {
-                        return Err(Errno::EROFS);
-                    }
-                }
-                (le64(&data, 176)?, crate::disk::byte(&data, 238)?, le64(&data, 200)?)
+                // A read-only subvolume (`btrfs property set ro`, or a
+                // read-only snapshot).
+                let subvol = id == tree::FS || id >= tree::FIRST_FREE;
+                let read_only = subvol && le64(&data, crate::snap::root::FLAGS)? & crate::snap::root::RDONLY != 0;
+                (le64(&data, 176)?, crate::disk::byte(&data, 238)?, le64(&data, 200)?, read_only)
             }
         };
-        let r = RootPtr { id, addr, level, orig: addr, last_snapshot };
+        let r = RootPtr { id, addr, level, orig: addr, last_snapshot, read_only };
         try_push(&mut self.roots, r)?;
         Ok(r)
     }
@@ -420,7 +436,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
     /// A new, empty block of tree `owner` at `level`.
     pub(crate) fn new_block(&mut self, owner: u64, level: u8, body: Body) -> Result<u64, Errno> {
         let addr = self.alloc_meta(owner)?;
-        let n = TNode { addr, owner, level, generation: self.transid, body };
+        let n = TNode { addr, owner, level, generation: self.transid, reloc: false, body };
         if let Err(e) = self.add_dirty(n) {
             self.unalloc(addr);
             return Err(e);
@@ -564,7 +580,12 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
     /// first (it keeps them for the other users, and is flagged
     /// `FULL_BACKREF`); a flagged block last used by one tree has those
     /// references turned into the copy's.
+    ///
+    /// `EROFS` for a read-only subvolume, unless this is a relocation.
     fn cow(&mut self, id: u64, addr: u64, level: u8) -> Result<u64, Errno> {
+        if self.root(id)?.read_only && !self.relocating {
+            return Err(Errno::EROFS);
+        }
         if self.dirty_at(addr).is_some() {
             return Ok(addr);
         }
@@ -577,9 +598,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
             return Err(Errno::EIO);
         }
         let r = self.root(id)?;
-        let shareable = id == tree::FS || id >= tree::FIRST_FREE;
-        let may_share = shareable && addr != r.addr && n.generation <= r.last_snapshot;
-        let (refs, full) = if may_share { self.block_refs(addr, level)? } else { (1, false) };
+        let (refs, full) = if may_be_shared(&r, &n) { self.block_refs(addr, level)? } else { (1, false) };
         if refs == 0 {
             return Err(Errno::EIO);
         }
@@ -596,6 +615,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
         n.addr = new;
         n.owner = id;
         n.generation = self.transid;
+        n.reloc = false;
         if let Err(e) = self.add_dirty(n) {
             self.unalloc(new);
             return Err(e);
@@ -642,6 +662,7 @@ impl<'a, D: BlockDevice + Send + 'static> Tx<'a, D> {
         n.addr = new;
         n.owner = id;
         n.generation = self.transid;
+        n.reloc = false;
         if let Err(e) = self.add_dirty(n) {
             self.unalloc(new);
             return Err(e);

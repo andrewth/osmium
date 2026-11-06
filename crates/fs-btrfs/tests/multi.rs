@@ -595,6 +595,8 @@ fn write_multi() {
         ("single", "raid1", 2),
         ("raid1c3", "raid1c3", 3),
         ("raid0", "raid0", 3),
+        ("raid10", "raid10", 4),
+        ("raid1c4", "raid1c4", 4),
     ] {
         let dir = scratch(&format!("write-{d}-{m}-{n}"));
         let Some(imgs) = populated(&dir, d, m, n) else { return };
@@ -637,8 +639,10 @@ fn write_multi() {
         verify_after(&mount(&paths(&imgs), ro()).unwrap());
         // Metadata is mirrored on each device, so btrfs check can go by one of
         // them (it reports the others missing); data is checked where it is
-        // whole there.
-        if m != "raid0" {
+        // whole there. RAID10 metadata is not whole on any one device: the
+        // degraded mounts below, and `linux_checks_multi_device` in
+        // `linux.rs` (all devices in one `btrfs check`), cover it.
+        if m != "raid0" && m != "raid10" {
             for img in &imgs {
                 check(img, d.starts_with("raid1"));
             }
@@ -654,9 +658,32 @@ fn write_multi() {
             assert!(out.status.success() && text.contains(&format!("dev_item.devid\t\t{}", i + 1)), "{text}");
             assert!(!text.contains("FAILED") && !text.contains("bad"), "{text}");
         }
-        // A device lost from a mirrored volume after the writes.
-        if d.starts_with("raid1") || d == "raid10" {
-            verify_after(&mount(&paths(&imgs)[1..], ro()).unwrap());
+        // Every copy was written: with any set of devices gone that the
+        // profiles cover (one for RAID1 and RAID10, two for RAID1C3, three
+        // for RAID1C4), what is left reads back the same, checksums and all.
+        let copies = |p: &str| match p {
+            "raid1" | "raid10" => 2,
+            "raid1c3" => 3,
+            "raid1c4" => 4,
+            _ => 1,
+        };
+        let lost = copies(d).min(copies(m)) - 1;
+        for mask in 1u32..(1 << n) {
+            if lost == 0 || mask.count_ones() as usize > lost {
+                continue;
+            }
+            let have: Vec<&Path> = (0..n).filter(|i| mask >> i & 1 == 0).map(|i| &*imgs[i]).collect();
+            let fs = mount(&have, MountOptions::default()).unwrap();
+            assert!(fs.is_read_only());
+            verify_after(&fs);
+            // Every copy on the devices there is good: scrub finds fault only
+            // with those that are gone.
+            let rep = fs.scrub(false).unwrap();
+            let gone = |devid: u64| mask >> (devid - 1) & 1 != 0;
+            assert!(
+                rep.uncorrectable == 0 && rep.errors.iter().all(|e| gone(e.devid)),
+                "-d {d} -m {m}, devices missing {mask:0n$b}: {rep:?}"
+            );
         }
     }
 }
