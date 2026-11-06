@@ -1,6 +1,6 @@
 [package]
 name = "osmium-arch"
-description = "Osmium: CPU primitives (IRQ flags, CPU id, MMU control) for x86_64, AArch64 and RISC-V"
+description = "Osmium: CPU primitives (IRQ flags, traps, CPU id, MMU and system registers, FP state) for x86_64, AArch64 and RISC-V"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

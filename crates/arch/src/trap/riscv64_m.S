@@ -90,6 +90,10 @@ osmium_trap_entry:
 5:
     mv a0, sp
     call osmium_trap_dispatch
+    // Interrupts stay masked (MIE clear) from here to mret even if the
+    // handler unmasked them: a trap taken after mepc/mstatus are loaded
+    // would overwrite them.
+    csrci mstatus, 0x8
     ld t0, 256(sp)
     csrw mepc, t0
     ld t0, 264(sp)

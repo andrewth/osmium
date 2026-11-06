@@ -412,8 +412,18 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
     /// `protect` and `split` refuse addresses under them
     /// ([`MapError::InvalidAddress`] / [`UnmapError::InvalidAddress`]).
     ///
+    /// Call it on a fresh table. An index that already holds this table's own
+    /// mappings loses them: their subtables are freed (and, in a table that
+    /// owns its leaves, the leaves' frame references released), as `drop`
+    /// would. An index that was already shared is simply re-pointed.
+    ///
     /// # Safety
     /// `kernel` (its subtables, at least) must outlive this table.
+    ///
+    /// If any index in `indices` holds this table's own mappings, no CPU may
+    /// be using this table to translate addresses under it, and none may
+    /// still cache those translations: flush the TLB for them first if the
+    /// table has been active.
     ///
     /// Does nothing if the format has a multi-page root (G-stage tables);
     /// indices past the root table are ignored.
@@ -428,10 +438,16 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
         let top = F::LEVELS - 1;
         for i in indices.start..indices.end.min(ENTRIES) {
             let va = VirtAddr::new((i as u64) << (12 + 9 * top));
+            let was_shared = self.is_shared(va);
             let pte = kernel.entry(kernel.root, va, top).load(Ordering::Acquire);
-            self.entry(self.root, va, top).store(pte, Ordering::Release);
+            let old = self.entry(self.root, va, top).swap(pte, Ordering::AcqRel);
             if let Some(w) = self.shared.get_mut(i / 64) {
                 *w |= 1 << (i % 64);
+            }
+            // A subtable of our own would otherwise leak. (A root-level leaf owns nothing: owned leaves
+            // are 4 KiB.)
+            if top > 0 && !was_shared && F::is_valid(old) && !F::is_leaf(old, top) {
+                self.free_subtree(F::addr(old, top), top - 1);
             }
         }
     }
@@ -797,14 +813,15 @@ impl<F: PageTableFormat, A: TableAlloc> PageTable<F, A> {
                         self.free_subtree(F::addr(pte, level), level - 1);
                     }
                 } else if self.owned && level == 0 {
-                    // SAFETY: the table is being dropped, so this leaf's reference is given up
+                    // SAFETY: the table (or this unlinked subtree) is being discarded, so this leaf's reference is given up
                     // here, and nothing maps the frame through it any more.
                     unsafe { self.alloc.release_frame(F::addr(pte, level)) };
                 }
             }
         }
-        // SAFETY: called once per table, during drop, when nothing else
-        // references the tree.
+        // SAFETY: called once per table, when nothing else references the
+        // tree: during drop, or by `share_root_entries` for a subtree it has
+        // just unlinked (whose caller guarantees no CPU still uses it).
         unsafe {
             if level == F::LEVELS - 1 {
                 self.alloc.free_root(table, F::ROOT_PAGES);

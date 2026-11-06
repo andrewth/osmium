@@ -1015,8 +1015,12 @@ osmium_trap_stub_255:
     jmp osmium_trap_common
 .globl osmium_trap_common
 osmium_trap_common:
-    // Slots for cr2 (filled in Rust) and padding keep the frame 16-byte aligned.
-    sub rsp, 16
+    // Slots for cr2 (filled in Rust for #PF) and padding keep the frame
+    // 16-byte aligned. Zero them rather than `sub rsp, 16`: the frame is
+    // `Clone` + `Debug` and copied around, so it must not carry stale
+    // kernel stack bytes.
+    push 0
+    push 0
     push rax
     push rbx
     push rcx

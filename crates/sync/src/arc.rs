@@ -154,7 +154,7 @@ impl<A: Adapter<Link>> Drop for ArcList<A> {
 
 /// An ordered set of `Arc<A::Value>`, linked through the [`TreeLink`] that
 /// `A` locates, keyed as `A` says. A key must not change while its element
-/// is in the tree.
+/// is in the tree, except as [`KeyAdapter::key`] allows.
 pub struct ArcTree<A: KeyAdapter<TreeLink>> {
     tree: RbTree<A>,
 }

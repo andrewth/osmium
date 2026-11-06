@@ -100,16 +100,34 @@ impl<T> PerCpuCell<T> {
     }
 
     /// Runs `f` with exclusive access to this CPU's value.
+    ///
+    /// If `f` unwinds (hosted builds; kernels abort on panic), the slot is
+    /// released and the interrupt state restored on the way out, so the
+    /// next `with` on this CPU works.
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        let state = irq::save_and_disable();
+        /// Clears `busy` (if set) and restores the interrupt state, on return or unwind.
+        struct Exit<'slot> {
+            busy: Option<&'slot Cell<bool>>,
+            irq: Option<irq::IrqState>,
+        }
+        impl Drop for Exit<'_> {
+            fn drop(&mut self) {
+                if let Some(busy) = self.busy {
+                    busy.set(false);
+                }
+                if let Some(state) = self.irq.take() {
+                    irq::restore(state);
+                }
+            }
+        }
+        let mut exit = Exit { busy: None, irq: Some(irq::save_and_disable()) };
         let slot = pick(&self.slots, cpu::current_id());
+        // On this panic `exit` restores the interrupt state but leaves `busy` to the outer `with`.
         assert!(!slot.busy.replace(true), "PerCpuCell::with re-entered");
+        exit.busy = Some(&slot.busy);
         // SAFETY: interrupts are masked and `busy` was clear, so no other
         // reference to this slot exists.
-        let r = f(unsafe { &mut *slot.value.get() });
-        slot.busy.set(false);
-        irq::restore(state);
-        r
+        f(unsafe { &mut *slot.value.get() })
     }
 
     /// Returns a raw pointer to this CPU's value.
@@ -155,5 +173,27 @@ mod tests {
             CELL.with(|v| *v)
         });
         assert_eq!(t.join().unwrap(), 2);
+    }
+
+    #[test]
+    fn cell_with_recovers_from_unwinding() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        static CELL: PerCpuCell<u64> = PerCpuCell::new([0; MAX_CPUS]);
+        let t = std::thread::spawn(|| {
+            // SAFETY: host simulation; this thread is the only "CPU 5".
+            unsafe { cpu::set_current_id(5) };
+            irq::enable();
+            let r = catch_unwind(AssertUnwindSafe(|| CELL.with(|_| panic!("handler failed"))));
+            assert!(r.is_err());
+            assert!(irq::are_enabled(), "interrupt state restored on unwind");
+            // The slot is free again rather than reported as re-entered.
+            CELL.with(|v| *v += 1);
+            // A re-entry panic also leaves interrupts as they were and the outer `with` intact.
+            let r = catch_unwind(AssertUnwindSafe(|| CELL.with(|_| CELL.with(|_| ()))));
+            assert!(r.is_err());
+            assert!(irq::are_enabled());
+            CELL.with(|v| *v)
+        });
+        assert_eq!(t.join().unwrap(), 1);
     }
 }

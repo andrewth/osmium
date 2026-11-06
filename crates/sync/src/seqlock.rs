@@ -247,4 +247,34 @@ mod tests {
         lock.write([3, 4]);
         assert_eq!(lock.read(), [3, 4]);
     }
+
+    #[test]
+    fn default_guardian_masks_interrupts_for_the_write_only() {
+        use osmium_arch::irq;
+        // A fresh thread: the simulated IRQ flag and preemption count are per thread.
+        std::thread::spawn(|| {
+            // SAFETY: host simulation; no other test uses "CPU 47", so its preemption count is ours.
+            unsafe { osmium_arch::cpu::set_current_id(47) };
+            let lock: SeqLock<u64> = SeqLock::new(1);
+            irq::enable();
+            let count = crate::preempt::count();
+            lock.update(|v| {
+                assert!(!irq::are_enabled(), "writer runs with interrupts masked");
+                assert!(crate::preempt::count() > count, "and preemption disabled");
+                *v += 1;
+            });
+            assert!(irq::are_enabled(), "restored after the write");
+            assert_eq!(crate::preempt::count(), count);
+            // Reads take no guardian.
+            assert_eq!(lock.read(), 2);
+            // An unwinding update restores both too.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lock.update(|_| panic!("in update"))));
+            assert!(r.is_err());
+            assert!(irq::are_enabled());
+            assert_eq!(crate::preempt::count(), count);
+            assert_eq!(lock.read(), 2);
+        })
+        .join()
+        .unwrap();
+    }
 }

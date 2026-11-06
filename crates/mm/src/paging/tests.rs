@@ -266,6 +266,51 @@ fn shared_kernel_entries() {
     assert!(kernel_tables > 0);
 }
 
+#[test]
+fn sharing_over_own_entry_frees_its_subtables() {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let before = frames.lock().free_frames();
+    let mut kernel: PageTable<X86_64, _> = PageTable::new(&frames).unwrap();
+    kernel.map(va(0x20_0000), pa(0x20_0000), PageSize::Size4K, MapFlags::RW).unwrap().ignore();
+    let with_kernel = frames.lock().free_frames();
+    {
+        let mut proc: PageTable<X86_64, _> = PageTable::new(&frames).unwrap();
+        let fresh = frames.lock().free_frames();
+        // An own mapping under root entry 0 builds three subtables there.
+        proc.map(va(0x40_0000), pa(0x1000), PageSize::Size4K, MapFlags::RW).unwrap().ignore();
+        assert_eq!(frames.lock().free_frames(), fresh - 3);
+        // SAFETY: `kernel` outlives `proc`; `proc` was never active.
+        unsafe { proc.share_root_entries(&kernel, 0..1) };
+        assert_eq!(frames.lock().free_frames(), fresh, "the replaced subtables were freed, not leaked");
+        assert!(proc.translate(va(0x40_0000)).is_none(), "own mapping gone");
+        assert_eq!(proc.translate(va(0x20_0000)).unwrap().pa, pa(0x20_0000), "kernel mapping visible");
+        // Sharing again re-points the entry and frees nothing of the kernel's.
+        // SAFETY: as above.
+        unsafe { proc.share_root_entries(&kernel, 0..1) };
+        assert_eq!(frames.lock().free_frames(), fresh);
+    }
+    assert_eq!(frames.lock().free_frames(), with_kernel, "the process freed only its root");
+    assert!(kernel.translate(va(0x20_0000)).is_some());
+    drop(kernel);
+    assert_eq!(frames.lock().free_frames(), before);
+}
+
+#[test]
+fn sharing_over_owned_leaves_releases_them() {
+    let ram = SimRam::new(0x8000_0000, 2 << 20);
+    let frames = frames(&ram);
+    let kernel: PageTable<Sv39, _> = PageTable::new(&frames).unwrap();
+    let mut pt: PageTable<Sv39, _> = PageTable::new_owned(&frames).unwrap();
+    let fresh = frames.lock().free_frames();
+    let frame = OwnedFrame::claim(&frames, frames.alloc_table().unwrap()).unwrap();
+    pt.map_owned(va(0x40_0000), frame, MapFlags::RW).unwrap().ignore();
+    assert_eq!(frames.lock().free_frames(), fresh - 3, "the leaf frame and two subtables");
+    // SAFETY: `kernel` outlives `pt`; `pt` was never active.
+    unsafe { pt.share_root_entries(&kernel, 0..1) };
+    assert_eq!(frames.lock().free_frames(), fresh, "subtables and the owned leaf frame released");
+}
+
 /// Maps, translates, protects and unmaps through an IOMMU format, whose
 /// leaves carry only read and write permission.
 fn exercise_io<F: PageTableFormat>(huge: bool, high_va: u64) {
