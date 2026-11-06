@@ -530,6 +530,24 @@ impl Vcpu for RiscvVcpu {
     fn complete_hypercall(&mut self, ret: u64) {
         self.complete_sbi(0, ret);
     }
+
+    fn interrupt_pending(&self, now: u64) -> bool {
+        RiscvVcpu::interrupt_pending(self, now)
+    }
+
+    fn flush_stage2(&mut self) {
+        RiscvVcpu::flush_stage2(self);
+    }
+
+    fn irq_line(&self) -> Arc<AtomicBool> {
+        self.external_irq()
+    }
+
+    fn connect_cpu(&mut self, link: crate::smp::CpuLink) {
+        self.connect_ipi(link.ipi().clone());
+        self.running = Some(link.running().clone());
+        self.fence = Some(link.fence().clone());
+    }
 }
 
 #[cfg(test)]

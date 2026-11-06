@@ -1217,7 +1217,7 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             Some(g) => vcpu.with_vgic_v3(g.clone(), me),
             None => vcpu,
         };
-        vm.cpus.attach_arm(me, &mut vcpu);
+        vm.cpus.attach(me, &mut vcpu);
         let mut stopped = false;
         let exit = run_vcpu(&mut vcpu, &vm.buses[me], &pio, |v, exit| match exit {
             VmExit::Hypercall { .. } => match vm::psci::handle_smp(v, exit, Some((&vm.cpus, me))) {

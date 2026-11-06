@@ -13,14 +13,18 @@
 //! - [`devices`]: emulated devices (including the GICv3, APLIC and IMSIC interrupt controllers).
 //! - [`riscv`]: a RISC-V H-extension vCPU and a minimal SBI for guests.
 //! - [`smp`]: start/stop state, IPIs and kicks for multi-vCPU guests.
-//! - [`aarch64`]: an AArch64 EL2 (non-VHE) vCPU and PSCI for guests.
+//! - [`aarch64`]: an AArch64 vCPU for a host at EL2, non-VHE
+//!   (`aarch64-el2`) or VHE (`aarch64-vhe`), and PSCI for guests.
 //! - [`x86`]: AMD SVM and Intel VMX vCPUs with nested paging.
 //! - [`virtio`]: virtio device models behind the virtio-mmio transport.
 //!
 //! Hardware backends implement [`Vcpu`]: RISC-V H ([`riscv::RiscvVcpu`]),
-//! AArch64 EL2 ([`aarch64::Aarch64Vcpu`]) and AMD SVM ([`x86::svm::SvmVcpu`])
-//! and Intel VMX ([`x86::vmx::VmxVcpu`]). `docs/HYPERVISOR.md` shows how the pieces
-//! fit together.
+//! AArch64 EL2 ([`aarch64::Aarch64Vcpu`]), AMD SVM ([`x86::svm::SvmVcpu`])
+//! and Intel VMX ([`x86::vmx::VmxVcpu`]). The trait is enough for a
+//! backend-generic host loop: [`run_vcpu`], [`Vcpu::interrupt_pending`] for
+//! halts, [`Vcpu::flush_stage2`], [`Vcpu::irq_line`] for the interrupt
+//! controller, and [`smp::GuestCpus::attach`] for SMP guests.
+//! `docs/HYPERVISOR.md` shows how the pieces fit together.
 #![no_std]
 
 extern crate alloc;
@@ -31,8 +35,8 @@ pub mod aarch64;
 pub mod bus;
 pub mod devices;
 pub mod memory;
-pub mod smp;
 pub mod riscv;
+pub mod smp;
 pub mod stage2;
 pub mod vcpu;
 pub mod virtio;

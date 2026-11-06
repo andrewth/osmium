@@ -44,7 +44,7 @@ use osmium::virt::devices::{
     VirtualPic, VirtualPit, decode_icr,
 };
 use osmium::virt::smp::GuestCpus;
-use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, VmExit, run_vcpu};
+use osmium::virt::{Bus, GuestMemory, GuestPhysAddr, Vcpu, VmExit, run_vcpu};
 
 mod backend;
 
@@ -820,7 +820,7 @@ fn guest_demo() {
             // would arm a timer for the deadline and run something else.
             loop {
                 pit.poll();
-                if v.interrupt_pending() {
+                if v.interrupt_pending(0) {
                     break ControlFlow::Continue(());
                 }
                 let Some(deadline) = pit.next_deadline() else { break ControlFlow::Break(VmExit::Halt) };
@@ -1043,8 +1043,7 @@ fn long_mode_demo() {
         .with_memory(mem.clone())
         .with_irq_line(intr);
     vcpu.set_long_mode(0x1000);
-    let a = apic.clone();
-    vcpu.connect_intr(move || a.acknowledge());
+    vcpu.connect_lapic(apic.clone());
     let now = clock();
     let mut typed = false;
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
@@ -1056,7 +1055,7 @@ fn long_mode_demo() {
                 com1.push_input(b'z');
             }
             apic.poll();
-            if v.interrupt_pending() {
+            if v.interrupt_pending(0) {
                 break ControlFlow::Continue(());
             }
             let Some(deadline) = apic.next_deadline() else { break ControlFlow::Break(VmExit::Halt) };
@@ -1120,13 +1119,12 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
         if me > 0 {
             v.set_real_mode((entry >> 12) as u8); // started by STARTUP
         }
-        let a = vm.apics[me].get().expect("get returned None").clone();
-        v.connect_intr(move || a.acknowledge());
-        v.attach(&vm.cpus, me);
+        v.connect_lapic(vm.apics[me].get().expect("get returned None").clone());
+        vm.cpus.attach(me, &mut v);
         let exit = run_vcpu(&mut v, &vm.buses[me], &vm.pio, |v, exit| match exit {
             VmExit::Hypercall { nr: 1 | 2, .. } => ControlFlow::Break(exit),
             VmExit::Halt => loop {
-                if v.interrupt_pending() {
+                if v.interrupt_pending(0) {
                     break ControlFlow::Continue(());
                 }
                 if vm.done.load(Ordering::Acquire) {
