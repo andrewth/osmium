@@ -214,7 +214,8 @@ static CPU_TABLES: [core::sync::atomic::AtomicPtr<x86::CpuTables>; MAX_CPUS] =
 /// will put the trap frame when that task traps out of ring 3.
 fn on_switch(next: &osmium::sched::Task) {
     // Each process runs on its own page table; kernel tasks on the kernel's.
-    let root = osmium::proc::root_for(next).map_or(CR3.load(Ordering::Relaxed), |r| r.0);
+    let kernel = osmium::mm::PhysAddr::new(CR3.load(Ordering::Relaxed));
+    let root = osmium::proc::switch_root(next, kernel).0;
     if x86::read_cr3() & !0xfff != root {
         // SAFETY: both kinds of table map the kernel (shared root entry 0).
         unsafe { x86::write_cr3(root) };

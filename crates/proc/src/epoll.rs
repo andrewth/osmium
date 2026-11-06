@@ -19,7 +19,7 @@ use osmium_sync::intrusive::{Adapter, KeyAdapter, Shared, TreeLink};
 
 use crate::bytes;
 use crate::fd::{Access, OpenFile};
-use crate::poll::{check_sigmask, notify, user_add, wait};
+use crate::poll::{notify, user_add, user_sigmask, wait};
 use crate::process::Process;
 
 type SysResult = Result<u64, Errno>;
@@ -340,7 +340,17 @@ pub(crate) fn wait_events(p: &Process, epfd: i32, events: u64, max: u64, timeout
     Ok(ready.len() as u64)
 }
 
-pub(crate) fn pwait(p: &Process, epfd: i32, events: u64, max: u64, timeout_ms: u64, mask: u64, size: u64) -> SysResult {
-    check_sigmask(p, mask, size)?;
-    wait_events(p, epfd, events, max, timeout_ms)
+#[allow(clippy::too_many_arguments)] // the system call's own six, and the thread.
+pub(crate) fn pwait(
+    p: &Process,
+    th: &crate::thread::Thread,
+    epfd: i32,
+    events: u64,
+    max: u64,
+    timeout_ms: u64,
+    mask: u64,
+    size: u64,
+) -> SysResult {
+    let mask = user_sigmask(p, mask, size)?;
+    th.sig.with_mask(th, mask, || wait_events(p, epfd, events, max, timeout_ms))
 }

@@ -69,8 +69,6 @@ pub struct Thread {
     /// Changes once, when a non-leader thread's `execve` makes it the leader.
     tid: AtomicU32,
     leader: AtomicBool,
-    /// The task running it, plus one; 0 until it is known.
-    task: AtomicU64,
     pub(crate) mask: AtomicU64,
     pub(crate) pending: AtomicU64,
     /// Queued signals, the alternate stack and `sigsuspend`'s saved mask.
@@ -88,6 +86,10 @@ pub struct Thread {
     stale_count: AtomicU32,
     /// Restart block and priority-inheritance state.
     pub(crate) ext: crate::thread_ext::ThreadExt,
+    /// The address of the wait queue the thread sleeps in while it is in an
+    /// interruptible wait ([`crate::signal::wait_on`]), or 0: how a signal
+    /// wakes this thread alone.
+    pub(crate) sleep: IrqSpinLock<usize>,
     /// Links the thread into its group's list.
     group_link: Shared<Link>,
     /// Links a non-leader thread into [`TIDS`], keyed by `key`.
@@ -137,7 +139,6 @@ impl Thread {
         Self {
             tid: AtomicU32::new(tid),
             leader: AtomicBool::new(leader),
-            task: AtomicU64::new(0),
             mask: AtomicU64::new(0),
             pending: AtomicU64::new(0),
             sig: crate::sigqueue::ThreadSig::new(),
@@ -150,6 +151,7 @@ impl Thread {
             stale_page: AtomicU64::new(0),
             stale_count: AtomicU32::new(0),
             ext: crate::thread_ext::ThreadExt::new(),
+            sleep: IrqSpinLock::new(0),
             group_link: Shared::new(Link::new()),
             tid_link: Shared::new(TreeLink::new()),
             key: tid,
@@ -286,6 +288,11 @@ impl Process {
 /// Non-leader threads by thread id; leaders are found by process id.
 static TIDS: IrqSpinLock<Registry<ByTid>> = IrqSpinLock::new(Registry::new());
 
+/// Whether a non-leader thread has id `id`.
+pub(crate) fn tid_in_use(id: u32) -> bool {
+    TIDS.lock().find(&id).is_some()
+}
+
 /// The live thread with id `tid` and its process.
 pub(crate) fn find(tid: u32) -> Option<(Arc<Process>, Arc<Thread>)> {
     let p = Process::find(Pid(tid)).or_else(|| TIDS.lock().find(&tid)?.owner.get()?.upgrade())?;
@@ -294,22 +301,16 @@ pub(crate) fn find(tid: u32) -> Option<(Arc<Process>, Arc<Thread>)> {
 }
 
 /// The running thread of `p`, which must be the current task's process.
-/// A new process's first task claims the leader thread the first time it
-/// asks.
+/// Every task a process runs carries its thread (see
+/// [`crate::process::UserTask`]), so this is a lookup, not a search. A task
+/// that is not one of `p`'s (a kernel task acting for it) is taken for the
+/// leader.
 pub(crate) fn current_thread(p: &Process) -> Arc<Thread> {
     let task = osmium_sched::current();
-    let id = task.id().0 + 1;
-    let threads = p.group.threads.lock();
-    if let Some(t) = threads.clone_first_where(|t| t.task.load(Ordering::SeqCst) == id) {
-        t.ext.bind(&task);
-        return t;
+    match task.data::<crate::process::UserTask>() {
+        Some(u) if core::ptr::eq(Arc::as_ptr(&u.process), p) => u.thread.clone(),
+        _ => p.leader(),
     }
-    let leader = ThreadGroup::leader_in(&threads);
-    // The first thread's task is spawned before it can run and cannot be
-    // named until then, so it is recognised by being the first to ask.
-    let _ = leader.task.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst);
-    leader.ext.bind(&task);
-    leader
 }
 
 /// Retries a write fault at `addr` that was not copy-on-write, if the page
@@ -337,10 +338,7 @@ const STALE_RETRIES: u32 = 3;
 /// process's threads. For a kernel's switch hook on architectures where it
 /// is not part of the trap frame (x86_64: load it into `FS.base`).
 pub fn tls_for(task: &osmium_sched::Task) -> Option<u64> {
-    let p = task.data::<Arc<Process>>()?;
-    let id = task.id().0 + 1;
-    let threads = p.group.threads.lock();
-    threads.iter().find(|t| t.task.load(Ordering::SeqCst) == id).map(|t| t.tls())
+    task.data::<crate::process::UserTask>().map(|u| u.thread.tls())
 }
 
 mod flag {
@@ -410,7 +408,15 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
     }
     let me = Process::find(p.pid()).ok_or(ESRCH)?;
     let tid = crate::process::alloc_id();
-    // Written before the thread is registered, so a fault here leaves
+    let th = try_arc(Thread::new(tid, false)).map_err(|_| Errno::ENOMEM)?;
+    let _ = th.owner.set(Arc::downgrade(&me));
+    // SAFETY: `Thread`'s `Drop` takes it out again; the key never changes.
+    // The id counter wrapped onto a live thread or process: refuse rather
+    // than alias it (dropping `th` leaves `TIDS` as it was).
+    if !unsafe { TIDS.lock().insert(&th) } || Process::find(Pid(tid)).is_some() {
+        return Err(Errno::EAGAIN);
+    }
+    // Written before the thread joins its group, so a fault here leaves
     // nothing behind to clean up.
     let bytes = tid.to_ne_bytes();
     if flags & PARENT_SETTID != 0 {
@@ -419,7 +425,6 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
     if flags & CHILD_SETTID != 0 {
         p.memory().write(ctid, &bytes)?;
     }
-    let th = try_arc(Thread::new(tid, false)).map_err(|_| Errno::ENOMEM)?;
     th.mask.store(caller.signal_mask(), Ordering::SeqCst);
     if flags & SETTLS != 0 {
         th.tls.store(tls, Ordering::SeqCst);
@@ -442,9 +447,6 @@ fn new_thread(p: &Process, caller: &Thread, flags: u64, [stack, ptid, ctid, tls]
         }
         threads.push_back(th.clone());
     }
-    let _ = th.owner.set(Arc::downgrade(&me));
-    // SAFETY: `Thread`'s `Drop` takes it out again; the key never changes.
-    unsafe { TIDS.lock().insert(&th) };
     Ok(Outcome::Thread { tid, stack, tls: if flags & SETTLS != 0 { tls } else { 0 } })
 }
 
@@ -484,22 +486,13 @@ pub(crate) fn start(
         me.pin(cpu);
         builder = builder.cpu(cpu);
     }
-    let t = th.clone();
-    let spawned = p.try_spawn_with_fp(builder, fp, move || {
-        // The spawner records the task's id as soon as it has it.
-        while t.task.load(Ordering::SeqCst) == 0 {
-            osmium_sched::yield_now();
-        }
-        drop(t);
-        resume(regs)
-    });
-    let Ok(task) = spawned else {
+    let Ok(task) = p.try_spawn_with_fp(builder, fp, th.clone(), move || resume(regs)) else {
         // `clone` registered the thread, but it will never run: take it
         // back, so the group does not count or wait for it.
         p.group.unregister(&th);
         return Err(Errno::ENOMEM);
     };
-    th.task.store(task.id().0 + 1, Ordering::SeqCst);
+    th.ext.bind(&task);
     UserRegs::set_ret(frame, tid as u64);
     Ok(())
 }
@@ -547,7 +540,7 @@ pub(crate) fn exit_thread(p: &Process, th: &Arc<Thread>, status: ExitStatus) {
         drop(files);
         p.set_exited(status);
     } else if group_wide.is_some() {
-        crate::signal::wake_blocked();
+        crate::signal::wake_threads(p);
     }
 }
 
@@ -565,9 +558,11 @@ pub(crate) fn exec_begin(p: &Process, th: &Thread) -> Result<(), Errno> {
     if !doom_others(p, th) {
         return Err(Errno::EINTR);
     }
-    crate::signal::wake_blocked();
+    crate::signal::wake_threads(p);
     p.child_exited.wake_all();
-    p.group.ended.wait_until(|| {
+    // Interruptible, so that an `exit_group` or a competing `execve` that
+    // dooms this thread meanwhile is noticed.
+    crate::signal::wait_on(&p.group.ended, || {
         if th.doomed.load(Ordering::SeqCst) || p.group.exiting.get().is_some() {
             Some(Err(Errno::EINTR))
         } else if p.group.live() == 1 {

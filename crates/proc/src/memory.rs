@@ -675,6 +675,12 @@ impl<F: PageTableFormat + Send + Sync + 'static, A: TableAlloc + Clone + Send + 
             return Err(Errno::EINVAL);
         }
         let end = va.checked_add(len).ok_or(Errno::ENOMEM)?;
+        // Outside the user half a page would land at a table index the
+        // hardware never uses, or among the kernel's shared entries (which
+        // translate, and so would be skipped as "already mapped").
+        if len != 0 && !self.is_user_range(va, end) {
+            return Err(Errno::ENOMEM);
+        }
         let mut inner = self.inner.lock();
         for page in (va..end).step_by(PAGE_SIZE) {
             if inner.pt.translate(VirtAddr::new(page)).is_some() {

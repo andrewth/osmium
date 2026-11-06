@@ -188,7 +188,8 @@ unsafe impl StackAllocator for GuardedStacks {
 /// Tells the exception vectors where the incoming task's stack ends.
 fn on_switch(next: &osmium::sched::Task) {
     // Each process runs on its own TTBR0 table; kernel tasks on the kernel's.
-    let root = osmium::proc::root_for(next).map_or(TTBR0.load(Ordering::Relaxed), |r| r.0);
+    let kernel = osmium::mm::PhysAddr::new(TTBR0.load(Ordering::Relaxed));
+    let root = osmium::proc::switch_root(next, kernel).0;
     if aarch64::read_ttbr0_el1() & 0x0000_ffff_ffff_f000 != root {
         // SAFETY: both kinds of table map the kernel (shared root entry 0).
         unsafe { aarch64::write_ttbr0_el1(root) };
