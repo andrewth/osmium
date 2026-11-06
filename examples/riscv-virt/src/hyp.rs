@@ -19,7 +19,6 @@ use osmium::hal::{print, println};
 use osmium::mm::{FrameAllocator, MapFlags, PageTable, PhysAddr, VirtAddr};
 use osmium::sched::TaskBuilder;
 use osmium::storage::ramdisk::RamDisk;
-use osmium::sync::IrqSpinLock;
 use osmium::virt::devices::{Uart16550, VirtualPlic};
 use osmium::virt::riscv::fdt::GuestMachine;
 use osmium::virt::riscv::harts::GuestHarts;
