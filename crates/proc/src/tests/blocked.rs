@@ -118,3 +118,43 @@ fn a_signal_interrupts_a_blocked_read_but_data_wins() {
     assert_eq!(call(&p, Sys::Write, &[w, DATA + 0x300, 3]), 3);
     assert_eq!(call(&p, Sys::Read, &[r, DATA + 0x100, 8]), 3);
 }
+
+#[test]
+fn ppoll_installs_its_mask_for_the_wait_only() {
+    become_cpu();
+    let (p, _) = process("ppoll-mask");
+    let (r, _w) = pipe_fds(&p);
+    let usr1 = 1u64 << (SIGUSR1 - 1);
+    let usr2 = 1u64 << (SIGUSR2 - 1);
+    // The caller blocks SIGUSR1; ppoll's mask blocks SIGUSR2 instead.
+    p.leader().mask.store(usr1, Ordering::SeqCst);
+    let pollfd: Vec<u8> = (r as i32).to_ne_bytes().into_iter().chain(1u16.to_ne_bytes()).chain([0; 2]).collect();
+    put(&p, DATA + 0x100, &pollfd);
+    put(&p, DATA + 0x200, &usr2.to_ne_bytes());
+    // A zero timeout: nothing is ready, and the caller's mask is back at once.
+    put(&p, DATA + 0x300, &[0; 16]);
+    assert_eq!(call(&p, Sys::Ppoll, &[DATA + 0x100, 1, DATA + 0x300, DATA + 0x200, 8]), 0);
+    assert_eq!(p.leader().signal_mask(), usr1);
+
+    // SIGUSR1 is pending: the caller's mask blocks it, ppoll's lets it in, so
+    // a wait with no timeout ends with EINTR at once, and the mask stays
+    // ppoll's (for the handler) until the signal is delivered.
+    signal::send(&p, SIGUSR1, p.pid()).unwrap();
+    let (task, result) = block_or_finish(&p, move |p| call(p, Sys::Ppoll, &[DATA + 0x100, 1, 0, DATA + 0x200, 8]));
+    task.join();
+    assert_eq!(result.load(Ordering::SeqCst), EINTR);
+    assert_eq!(p.leader().signal_mask(), usr2, "the handler would run with ppoll's mask");
+    assert_eq!(p.leader().sig.take_saved_mask(), Some(usr1), "and the caller's comes back after it");
+}
+
+/// [`block_in`] for a call that may not block at all.
+fn block_or_finish(
+    p: &Arc<Process>,
+    body: impl FnOnce(&Process) -> i64 + Send + 'static,
+) -> (Arc<osmium_sched::Task>, Arc<AtomicI64>) {
+    let result = Arc::new(AtomicI64::new(PENDING));
+    let (q, r) = (p.clone(), result.clone());
+    let builder = TaskBuilder::new("maybe-blocked").stack_size(256 * 1024).cpu(osmium_arch::cpu::current_id());
+    let task = p.spawn(builder, move || r.store(body(&q), Ordering::SeqCst));
+    (task, result)
+}

@@ -446,11 +446,11 @@ pub fn dispatch_as(p: &Process, th: &Thread, nr: u64, a: [u64; 6]) -> Outcome {
         Sys::Pipe2 => crate::pipe::pipe2(p, a[0], a[1]),
         #[cfg(target_arch = "x86_64")]
         Sys::Pipe => crate::pipe::pipe2(p, a[0], 0),
-        Sys::Ppoll => crate::poll::ppoll(p, a[0], a[1], a[2], a[3], a[4]),
-        Sys::Pselect6 => crate::poll::pselect6(p, a[0], a[1], a[2], a[3], a[4], a[5]),
+        Sys::Ppoll => crate::poll::ppoll(p, th, a[0], a[1], a[2], a[3], a[4]),
+        Sys::Pselect6 => crate::poll::pselect6(p, th, a[0], a[1], a[2], a[3], a[4], a[5]),
         Sys::EpollCreate1 => crate::epoll::create1(p, a[0]),
         Sys::EpollCtl => crate::epoll::ctl(p, fd, a[1], a[2] as i32, a[3]),
-        Sys::EpollPwait => crate::epoll::pwait(p, fd, a[1], a[2], a[3], a[4], a[5]),
+        Sys::EpollPwait => crate::epoll::pwait(p, th, fd, a[1], a[2], a[3], a[4], a[5]),
         #[cfg(target_arch = "x86_64")]
         Sys::Poll => crate::poll::poll(p, a[0], a[1], a[2]),
         #[cfg(target_arch = "x86_64")]

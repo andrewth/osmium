@@ -189,6 +189,34 @@ impl ThreadSig {
         }
     }
 
+    /// Runs `wait` with the thread's signal mask set to `mask` (if given),
+    /// for `ppoll`, `pselect6` and `epoll_pwait`. The old mask is kept as
+    /// `sigsuspend` keeps it: if the wait is interrupted (`EINTR`), the
+    /// handler of the signal that did it runs with `mask` and the old one
+    /// comes back when it returns; otherwise it comes back at once.
+    pub(crate) fn with_mask<R>(
+        &self,
+        th: &Thread,
+        mask: Option<u64>,
+        wait: impl FnOnce() -> Result<R, Errno>,
+    ) -> Result<R, Errno> {
+        let Some(mask) = mask else { return wait() };
+        {
+            let mut saved = self.saved_mask.lock();
+            if saved.is_none() {
+                *saved = Some(th.mask.load(Ordering::SeqCst));
+            }
+        }
+        th.mask.store(mask & !UNBLOCKABLE, Ordering::SeqCst);
+        let r = wait();
+        if !matches!(r, Err(Errno::EINTR))
+            && let Some(old) = self.take_saved_mask()
+        {
+            th.mask.store(old, Ordering::SeqCst);
+        }
+        r
+    }
+
     pub(crate) fn take_saved_mask(&self) -> Option<u64> {
         self.saved_mask.lock().take()
     }
