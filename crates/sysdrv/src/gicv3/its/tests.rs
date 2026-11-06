@@ -162,6 +162,62 @@ fn refuses_bad_windows_and_non_physical_its() {
     assert_eq!(none.its(&dma, &clock, ItsConfig::default()).err(), Some(ItsError::Unsupported));
 }
 
+/// A `HostDma` that refuses allocations after the first `left`.
+struct Limited {
+    inner: HostDma,
+    left: core::cell::Cell<usize>,
+}
+
+impl DmaAllocator for Limited {
+    fn alloc_coherent(&self, len: usize) -> Option<osmium_hal::dma::DmaBuffer> {
+        let left = self.left.get().checked_sub(1)?;
+        self.left.set(left);
+        self.inner.alloc_coherent(len)
+    }
+
+    unsafe fn free_coherent(&self, buf: osmium_hal::dma::DmaBuffer) {
+        // SAFETY: forwarded contract.
+        unsafe { self.inner.free_coherent(buf) }
+    }
+}
+
+#[test]
+fn failed_setup_invalidates_what_it_programmed() {
+    let clock = StdClock::default();
+    let fake = FakeIts::new(TYPER, Quirks::default());
+    // The queue and the device table, then nothing for the collection table.
+    let dma = Limited { inner: HostDma::default(), left: core::cell::Cell::new(2) };
+    let r = Its::new(fake.regs.io(), PhysAddr::new(ITS_PHYS), &dma, &clock, ItsConfig { device_bits: 8, vpes: 1 });
+    assert_eq!(r.err(), Some(ItsError::NoMemory));
+    assert_eq!(dma.inner.live(), 0, "everything freed");
+    assert_eq!(fake.regs.r64(GITS_BASER) & BASER_VALID, 0, "the device table's register no longer points at it");
+    assert_eq!(fake.regs.r64(GITS_CBASER) & BASER_VALID, 0, "nor the queue's");
+    assert_eq!(fake.regs.r32(GITS_CTLR) & CTLR_ENABLED, 0);
+}
+
+#[test]
+fn the_command_queue_wraps() {
+    let (dma, clock) = (HostDma::default(), StdClock::default());
+    let lpis = LpiTables::new(&dma, 14).unwrap();
+    let fake = FakeIts::new(TYPER, Quirks::default());
+    let its = fake.its(&dma, &clock, ItsConfig { device_bits: 8, vpes: 1 }).unwrap();
+    its.map_collection(0, 0).unwrap();
+    its.add_device(1, 1).unwrap();
+    its.map_event(1, 0, 0, &lpis, 0x5f).unwrap();
+    fake.take();
+    // Two commands (INT, SYNC) per trigger: several trips round the
+    // 128-slot ring, each command seen once and in order.
+    let rounds = 3 * QUEUE_LEN / CMD_LEN / 2 + 1;
+    for _ in 0..rounds {
+        its.trigger(1, 0).unwrap();
+    }
+    let cmds = fake.take();
+    assert_eq!(cmds.len(), 2 * rounds);
+    assert!(cmds.chunks(2).all(|c| c == [cmd::int(1, 0), cmd::sync(0)]));
+    assert_eq!(fake.regs.r64(GITS_CWRITER), fake.regs.r64(GITS_CREADR));
+    assert!(fake.regs.r64(GITS_CWRITER) < QUEUE_LEN as u64);
+}
+
 #[test]
 fn map_and_unmap_events() {
     let (dma, clock) = (HostDma::default(), StdClock::default());

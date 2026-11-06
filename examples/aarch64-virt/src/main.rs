@@ -245,6 +245,12 @@ impl InterruptController for Gic {
             Gic::V3(g) => g.enable(irq),
         }
     }
+    fn set_target(&self, irq: u32, cpu: usize) -> bool {
+        match self {
+            Gic::V2(g) => g.set_target(irq, cpu),
+            Gic::V3(g) => g.set_target(irq, cpu),
+        }
+    }
     fn disable(&self, irq: u32) {
         match self {
             Gic::V2(g) => g.disable(irq),

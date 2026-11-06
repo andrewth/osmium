@@ -253,7 +253,11 @@ pub fn boot(elf: &Elf<'_>, entry: u32, ncpus: usize) {
 
     let done = Arc::new(AtomicBool::new(false));
     let cpus = GuestCpus::with_kick(ncpus, |host| {
-        LAPIC.get().expect("LAPIC initialised").send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
+        LAPIC
+            .get()
+            .expect("LAPIC initialised")
+            .send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR)
+            .expect("kick IPI accepted by the local APIC");
     });
     // Interrupt routing: COM1 -> I/O APIC -> the destination's local APIC.
     let apics: Arc<[Once<Arc<VirtualLapic>>; MAX_CPUS]> = Arc::new([const { Once::new() }; MAX_CPUS]);

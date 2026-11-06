@@ -81,9 +81,13 @@ impl<'d, D: DmaAllocator + ?Sized> VirtQueue<'d, D> {
         self.write(at, if on { bits | 1 << (head % 8) } else { bits & !(1 << (head % 8)) });
     }
 
-    /// Allocates queue `index` with `size` entries (1–32768).
+    /// Allocates queue `index` with `size` entries, a power of two from 1 to
+    /// 32768 (§2.7: ring slots are free-running 16-bit indices taken modulo
+    /// the size, which only stays consistent across the wrap for powers of
+    /// two). Other sizes are refused with [`VirtioError::BadQueue`]; round a
+    /// device's maximum down with `1 << max.ilog2()`.
     pub fn new(dma: &'d D, index: u16, size: u16) -> Result<Self, VirtioError> {
-        if size == 0 || size > 32768 {
+        if !size.is_power_of_two() || size > 32768 {
             return Err(VirtioError::BadQueue);
         }
         let len = Self::bitmap_offset(size) + (size as usize).div_ceil(8);
@@ -399,6 +403,12 @@ pub mod tests {
         drop(q);
         assert_eq!(dma.live.get(), 0);
         assert_eq!(VirtQueue::new(&dma, 0, 0).err(), Some(VirtioError::BadQueue));
+        for size in [3, 6, 100, 32767, 65535] {
+            assert_eq!(VirtQueue::new(&dma, 0, size).err(), Some(VirtioError::BadQueue), "{size}");
+        }
+        assert!(VirtQueue::new(&dma, 0, 1).is_ok());
+        assert!(VirtQueue::new(&dma, 0, 32768).is_ok());
+        assert_eq!(dma.live.get(), 0);
     }
 
     #[test]

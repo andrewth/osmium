@@ -657,7 +657,8 @@ fn start_host_cpu(cpu: usize) {
     let pit = Pit::new(unsafe { PitPio::new() });
     let id = HOST_APIC_IDS[cpu].load(Ordering::Relaxed);
     // SAFETY: the trampoline is installed and no other AP is in it.
-    unsafe { LAPIC.get().expect("LAPIC initialised").start_ap(id, &boot, |ns| pit.wait_ns(ns)) };
+    unsafe { LAPIC.get().expect("LAPIC initialised").start_ap(id, &boot, |ns| pit.wait_ns(ns)) }
+        .expect("the host CPU accepts the startup IPIs");
     while ONLINE.load(Ordering::Acquire) <= cpu {
         core::hint::spin_loop();
     }
@@ -1197,7 +1198,11 @@ fn smp_demo() {
     let k = kicks.clone();
     let cpus = GuestCpus::with_kick(N, move |host| {
         k.fetch_add(1, Ordering::Relaxed);
-        LAPIC.get().expect("LAPIC initialised").send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR);
+        LAPIC
+            .get()
+            .expect("LAPIC initialised")
+            .send_ipi(HOST_APIC_IDS[host].load(Ordering::Relaxed), KICK_VECTOR)
+            .expect("kick IPI accepted by the local APIC");
     });
     // One local APIC per vCPU. An ICR write the sender cannot deliver
     // itself lands in the hook: STARTUP becomes a start request, a fixed

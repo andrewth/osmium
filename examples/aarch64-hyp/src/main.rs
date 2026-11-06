@@ -652,6 +652,13 @@ impl InterruptController for PhysGic {
         }
     }
 
+    fn set_target(&self, irq: u32, cpu: usize) -> bool {
+        match self {
+            PhysGic::V2(g) => g.set_target(irq, cpu),
+            PhysGic::V3(g) => g.set_target(irq, cpu),
+        }
+    }
+
     fn disable(&self, irq: u32) {
         match self {
             PhysGic::V2(g) => g.disable(irq),

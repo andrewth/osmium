@@ -18,7 +18,7 @@ pub struct MmioTransport {
 
 impl MmioTransport {
     /// Checks the magic number and version of the registers in `io` (at
-    /// least 0x200 bytes). A window with device ID 0 is a valid but empty
+    /// least 0x100 bytes, the registers before the device configuration space). A window with device ID 0 is a valid but empty
     /// slot; [`Transport::device_type`] reports it as `Other(0)`.
     pub fn new(io: IoMem) -> Result<Self, VirtioError> {
         if io.len() < CONFIG || io.read::<u32>(MAGIC_VALUE) != Ok(MAGIC) {
@@ -121,7 +121,47 @@ impl Transport for MmioTransport {
     }
 
     fn config_read8(&self, offset: usize) -> u8 {
-        self.io.read(CONFIG + offset).unwrap_or(0)
+        self.cfg_read(offset)
+    }
+
+    fn config_read16(&self, offset: usize) -> u16 {
+        self.cfg_read(offset)
+    }
+
+    fn config_read32(&self, offset: usize) -> u32 {
+        self.cfg_read(offset)
+    }
+
+    fn config_write8(&self, offset: usize, value: u8) {
+        self.cfg_write(offset, value);
+    }
+
+    fn config_write16(&self, offset: usize, value: u16) {
+        self.cfg_write(offset, value);
+    }
+
+    fn config_write32(&self, offset: usize, value: u32) {
+        self.cfg_write(offset, value);
+    }
+
+    /// `ConfigGeneration`; legacy devices have none.
+    fn config_generation(&self) -> u32 {
+        if self.legacy { 0 } else { self.r(CONFIG_GENERATION) }
+    }
+}
+
+impl MmioTransport {
+    /// One access of `T`'s width to the configuration at `offset`; 0 if it
+    /// is outside the window or misaligned.
+    fn cfg_read<T: osmium_hal::mmio::RegValue>(&self, offset: usize) -> T {
+        offset.checked_add(CONFIG).and_then(|o| self.io.read(o).ok()).unwrap_or_default()
+    }
+
+    /// As [`cfg_read`](Self::cfg_read), for writes, which are dropped.
+    fn cfg_write<T: osmium_hal::mmio::RegValue>(&self, offset: usize, value: T) {
+        if let Some(o) = offset.checked_add(CONFIG) {
+            let _ = self.io.write(o, value);
+        }
     }
 }
 
@@ -152,6 +192,26 @@ mod tests {
         assert!(!t.is_legacy());
         assert_eq!(t.config_read8(1), 0x54);
         assert_eq!(t.config_read16(0), 0x5452);
+        assert_eq!(t.config_read16(2), 0x0012);
+        assert_eq!(t.config_read32(0), 0x0012_5452);
+        assert_eq!(t.config_read16(1), 0, "misaligned: no access");
+        assert_eq!(t.config_read32(0x100), 0, "outside the window");
+    }
+
+    #[test]
+    fn config_writes_and_generation() {
+        let mut regs = [0u32; 0x80];
+        let t = window(&mut regs, 2);
+        t.config_write8(4, 0xaa);
+        t.config_write16(6, 0xbbcc);
+        t.config_write32(8, 0x1122_3344);
+        t.config_write32(0x100, 1);
+        drop(t);
+        assert_eq!(regs[CONFIG / 4 + 1], 0xbbcc_00aa);
+        assert_eq!(regs[CONFIG / 4 + 2], 0x1122_3344);
+        regs[CONFIG_GENERATION / 4] = 7;
+        assert_eq!(window(&mut regs, 2).config_generation(), 7);
+        assert_eq!(window(&mut regs, 1).config_generation(), 0, "legacy has no generation");
     }
 
     #[test]

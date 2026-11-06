@@ -15,9 +15,12 @@
 //! table, no permissions) for every other requester ID the table covers, and
 //! detaching a device blocks it again.
 //!
-//! Interrupts from attached devices are forwarded unchanged (`IntCtl` = 1 in
-//! the device table entry; blocked devices have theirs aborted); interrupt
-//! remapping is not used. Only 4 KiB pages are used, the guest-translation,
+//! Fixed and arbitrated interrupts from attached devices are forwarded
+//! unchanged (`IV` set with `IntCtl` = 1 in the device table entry); blocked
+//! entries set `IV` with `IntCtl` = 0, so their interrupts are target-aborted.
+//! An entry without `IV` would pass every interrupt through unmapped. NMI,
+//! INIT and ExtInt messages (the `*Pass` bits) are aborted for every device.
+//! Interrupt remapping (an interrupt table) is not used. Only 4 KiB pages are used, the guest-translation,
 //! PPR and GA logs are left off, and the unit's own coherency control is not
 //! touched.
 
@@ -81,10 +84,16 @@ const DTE_MODE_4: u64 = 4 << 9;
 const DTE_MODE_MASK: u64 = 7 << 9;
 /// Valid with translation but no page table or permissions: blocks the device.
 const DTE_BLOCKED: u64 = DTE_V | DTE_TV;
+/// IV (bit 0 of the third quadword): the interrupt fields are valid. Without
+/// it the unit passes every interrupt through unmapped.
+const DTE_IV: u64 = 1 << 0;
+/// Third quadword of a blocked entry: IV with IntCtl = 0 (target abort).
+const DTE_INT_BLOCKED: u64 = DTE_IV;
 const DTE_IR: u64 = 1 << 61;
 const DTE_IW: u64 = 1 << 62;
-/// IntCtl (bits 61:60 of the third quadword): forward interrupts as they are.
-const DTE_INTCTL_FORWARD: u64 = 1 << 60;
+/// IV with IntCtl (bits 61:60 of the third quadword) = 1: forward
+/// interrupts as they are.
+const DTE_INT_FORWARD: u64 = DTE_IV | 1 << 60;
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 /// Invalidate-pages address operand meaning "everything" (S set, all ones).
@@ -240,9 +249,9 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
             for id in first..(first + BATCH).min(count) {
                 let off = id * DTE_BYTES;
                 if devtab.load::<u64>(off) & DTE_V == 0 {
-                    for q in 1..4 {
-                        devtab.store::<u64>(off + q * 8, 0);
-                    }
+                    devtab.store::<u64>(off + 8, 0);
+                    devtab.store::<u64>(off + 16, DTE_INT_BLOCKED);
+                    devtab.store::<u64>(off + 24, 0);
                     devtab.store::<u64>(off, DTE_BLOCKED);
                 }
             }
@@ -266,9 +275,9 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> AmdVi<'d, D> {
         let devtab = &Self::buffers(st).devtab;
         devtab.store::<u64>(off, DTE_BLOCKED);
         barrier::dma_wmb();
-        for q in 1..4 {
-            devtab.store::<u64>(off + q * 8, 0);
-        }
+        devtab.store::<u64>(off + 8, 0);
+        devtab.store::<u64>(off + 16, DTE_INT_BLOCKED);
+        devtab.store::<u64>(off + 24, 0);
         barrier::dma_wmb();
     }
 
@@ -324,7 +333,7 @@ impl<D: DmaAllocator + Sync + ?Sized> Iommu for AmdVi<'_, D> {
         }
         let devtab = &Self::buffers(&st).devtab;
         devtab.store::<u64>(off + 8, domain.0 as u64);
-        devtab.store::<u64>(off + 16, DTE_INTCTL_FORWARD);
+        devtab.store::<u64>(off + 16, DTE_INT_FORWARD);
         devtab.store::<u64>(off + 24, 0);
         barrier::dma_wmb();
         devtab.store::<u64>(off, root.as_u64() | DTE_V | DTE_TV | DTE_MODE_4 | DTE_IR | DTE_IW);
@@ -555,6 +564,27 @@ mod tests {
             }
         }
 
+        /// Delivers a fixed interrupt from `sid` as the unit would.
+        fn interrupt(&self, sid: u16) -> Result<(), &'static str> {
+            if !self.translating() {
+                return Ok(());
+            }
+            let tab = self.regs.r64(DEV_TAB_BAR) & ADDR_MASK;
+            let dte = tab + sid as u64 * 32;
+            if mem64(dte) & DTE_V == 0 {
+                return Ok(());
+            }
+            let q2 = mem64(dte + 16);
+            if q2 & DTE_IV == 0 {
+                return Ok(()); // interrupt fields invalid: passed unmapped
+            }
+            match q2 >> 60 & 3 {
+                0 => Err("interrupt aborted"),
+                1 => Ok(()),
+                _ => Err("remapping not set up"),
+            }
+        }
+
         fn domain_of(&self, sid: u16) -> u64 {
             mem64((self.regs.r64(DEV_TAB_BAR) & ADDR_MASK) + sid as u64 * 32 + 8) & 0xffff
         }
@@ -620,6 +650,8 @@ mod tests {
         assert_eq!(f.translate(sid, 0x30_0000, false), Err("not present"));
         assert_eq!(f.translate(dev(Address::new(0, 3, 2)).bdf(), 0x20_0000, false), Err("device blocked"));
         assert_eq!(f.translate(dev(FAR).bdf(), 0x20_0000, false), Err("device blocked"), "other buses too");
+        assert_eq!(f.interrupt(sid), Ok(()), "attached devices' interrupts are forwarded");
+        assert_eq!(f.interrupt(dev(FAR).bdf()), Err("interrupt aborted"), "blocked devices' are not");
 
         d.map(0x50_0000, buf.device_addr() + 0x1000, 0x1000, MapFlags::RW).unwrap();
         assert_eq!(f.translate(sid, 0x50_0008, true), Ok(base + 0x1008));
@@ -632,6 +664,7 @@ mod tests {
         assert_eq!(d.attach(dev(NIC)), Err(IommuError::Busy));
         d.detach(dev(NIC)).unwrap();
         assert_eq!(f.translate(sid, 0x20_0000, false), Err("device blocked"));
+        assert_eq!(f.interrupt(sid), Err("interrupt aborted"), "detach blocks interrupts too");
         assert_eq!(d.detach(dev(NIC)), Err(IommuError::NotAttached));
         drop(d);
         // SAFETY: nothing maps it any more.
@@ -751,6 +784,7 @@ mod tests {
                 assert!(!log.contains(&"all".into()) && devtabs >= 8 * 256, "{devtabs}");
             }
             assert_eq!(f.translate(dev(FAR).bdf(), 0x1000, false), Err("device blocked"));
+            assert_eq!(f.interrupt(dev(FAR).bdf()), Err("interrupt aborted"));
         }
     }
 

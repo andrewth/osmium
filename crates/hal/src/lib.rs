@@ -19,11 +19,14 @@
 //!   by drivers and device models.
 //! - [`irq::IrqTable`]: maps interrupt numbers to handlers.
 //! - [`console`]: a swappable global console behind `print!`/`println!`.
-//! - [`dma`]: DMA buffer descriptors.
+//! - [`dma`]: DMA buffer descriptors, the allocator trait and [`dma::OwnedDma`].
 //! - [`iommu`]: the IOMMU model: domains, IOVA allocation and DMA through
 //!   an IOMMU.
 //! - [`display`]: linear framebuffers, pixel formats and the
 //!   [`display::Display`] trait.
+//! - [`fbcon`]: a text console drawn on a framebuffer.
+//! - [`ioext`]: panic-free register access for drivers (out-of-window
+//!   reads return all ones, writes are dropped).
 //! - `block_cache` (feature `alloc`): `CachedDevice`, a write-back or
 //!   write-through cache for any block device.
 #![no_std]

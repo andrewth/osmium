@@ -279,7 +279,9 @@ fn shootdown_others(va: usize, pages: usize) {
     SHOOT_PENDING.store(others, Ordering::Release);
     let apic = LAPIC.get().expect("LAPIC initialised");
     for cpu in (0..MAX_CPUS).filter(|c| others & (1 << c) != 0) {
-        apic.send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, SHOOTDOWN_VECTOR);
+        // The wait below would never end without the IPI.
+        apic.send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, SHOOTDOWN_VECTOR)
+            .expect("shootdown IPI accepted by the local APIC");
     }
     while SHOOT_PENDING.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
@@ -598,7 +600,8 @@ extern "C" fn kmain(start_info: usize) -> ! {
 
     // --- Application processors (INIT, STARTUP, STARTUP) ---------------------
     osmium::sched::set_remote_wake_hook(|cpu| {
-        LAPIC.get().expect("LAPIC initialised").send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, IPI_VECTOR)
+        // A lost wake-up is picked up at that CPU's next tick.
+        let _ = LAPIC.get().expect("LAPIC initialised").send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, IPI_VECTOR);
     });
     osmium::arch::mmu::set_remote_flush(shootdown_others);
     // SAFETY: the trampoline page is free low memory (reserved from the
@@ -617,7 +620,15 @@ extern "C" fn kmain(start_info: usize) -> ! {
         };
         // SAFETY: the trampoline is installed and the previous AP has
         // checked in (below); the boot tables identity-map it and the kernel.
-        unsafe { apic.start_ap(apic_id.load(Ordering::Relaxed) as u8, &boot, |ns| pit.wait_ns(ns)) };
+        let started = unsafe { apic.start_ap(apic_id.load(Ordering::Relaxed) as u8, &boot, |ns| pit.wait_ns(ns)) };
+        if started.is_err() {
+            println!(
+                "[smp]   APIC id {} did not accept the startup IPIs; continuing with {cpu} CPUs",
+                apic_id.load(Ordering::Relaxed)
+            );
+            ncpus = cpu;
+            break;
+        }
         // One AP at a time: they share the trampoline's slots. One that
         // never checks in ends the bring-up (it may still be in the
         // trampoline), so CPU indices stay dense.

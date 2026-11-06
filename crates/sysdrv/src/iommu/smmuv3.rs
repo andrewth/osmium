@@ -438,29 +438,37 @@ impl<'d, D: DmaAllocator + Sync + ?Sized> Smmuv3<'d, D> {
     }
 
     /// Posts `CMD_SYNC` and waits until the unit has consumed every command.
+    ///
+    /// A command the unit rejects (`GERROR.CMDQ_ERR`) is skipped as Linux
+    /// does: its slot is rewritten with a `CMD_SYNC`, which cannot fault, and
+    /// the error acknowledged, so the unit resumes there and runs the rest of
+    /// the queue. `CMDQ_PROD` only ever moves forward (moving it back is
+    /// unpredictable). The result is then [`IommuError::Hardware`].
     fn sync(&self, st: &mut State<'d, D>) -> Result<(), IommuError> {
         self.post(st, CMD_SYNC | SYNC_CS_SEV, 0)?;
         let (mask, want) = (wrap_mask(self.cmdq_log2), st.prod);
-        let done = self.wait(|| {
-            (self.regs.r32(GERROR) ^ self.regs.r32(GERRORN)) & GERROR_CMDQ_ERR != 0
-                || self.regs.r32(CMDQ_CONS) & mask == want
-        });
-        let active = self.regs.r32(GERROR) ^ self.regs.r32(GERRORN);
-        if active & GERROR_CMDQ_ERR != 0 {
-            // The unit stopped at the faulting command (CONS). Replace it with
-            // a CMD_SYNC, which cannot fault, and empty the queue, both
-            // before acknowledging: the unit resumes at CONS on the
-            // acknowledgement and must find nothing to run.
+        let errored = || (self.regs.r32(GERROR) ^ self.regs.r32(GERRORN)) & GERROR_CMDQ_ERR != 0;
+        let mut done = self.wait(|| errored() || self.regs.r32(CMDQ_CONS) & mask == want);
+        let mut faulted = false;
+        // Each pass skips one command; the queue holds at most 2^log2.
+        for _ in 0..=1u32 << self.cmdq_log2 {
+            if !errored() {
+                break;
+            }
+            faulted = true;
+            // The unit stopped at the faulting command (CONS) and resumes
+            // there once the error is acknowledged.
             let cons = self.regs.r32(CMDQ_CONS) & mask;
             let at = (cons & ((1u32 << self.cmdq_log2) - 1)) as usize * CMD_BYTES;
             let cmds = &Self::buffers(st).commands;
-            cmds.store::<u64>(at, CMD_SYNC);
+            cmds.store::<u64>(at, CMD_SYNC | SYNC_CS_SEV);
             cmds.store::<u64>(at + 8, 0);
-            st.prod = cons;
-            barrier::mb();
-            self.regs.w32(CMDQ_PROD, st.prod);
+            // The new command must be visible before the acknowledgement.
             barrier::mb();
             self.regs.w32(GERRORN, self.regs.r32(GERROR));
+            done = self.wait(|| errored() || self.regs.r32(CMDQ_CONS) & mask == want);
+        }
+        if faulted {
             return Err(IommuError::Hardware);
         }
         done
@@ -1240,9 +1248,15 @@ mod tests {
             f.hw.lock().unwrap().error_next = true;
             assert_eq!(d.attach(dev(NIC)), Err(IommuError::Hardware));
             std::thread::sleep(core::time::Duration::from_millis(10));
-            // Only the rollback's own cfgi, tlbi and sync ran; the rejected
-            // attach's commands were dropped, not re-executed.
-            assert_eq!(f.log().len(), before + 3, "{:?}", f.log());
+            // The rejected command became a CMD_SYNC and the rest of the
+            // queue ran (CMDQ_PROD never moved back), then the rollback's
+            // own cfgi, tlbi and sync.
+            let log = f.log();
+            let new = &log[before..];
+            assert_eq!(new.first().map(|s| s.as_str()), Some("sync"), "{new:?}");
+            assert_eq!(new[..3], ["sync", "tlbi_s12 1", "sync"], "commands after the rejected one ran: {new:?}");
+            assert_eq!(&new[new.len() - 3..], ["cfgi_ste 25 leaf 1", "tlbi_s12 1", "sync"], "{new:?}");
+            assert_eq!(f.regs.r32(CMDQ_PROD), f.regs.r32(CMDQ_CONS));
             // The error was acknowledged and the queue still works.
             d.attach(dev(NIC)).unwrap();
         }
