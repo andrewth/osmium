@@ -152,10 +152,7 @@ features.
   port that needs a warm reset is not recovered. UHCI, OHCI and EHCI have no
   isochronous endpoints, and EHCI supports no hubs. CDC-NCM has only been
   tested against a simulated device.
-- Signal frames do not hold FP/SIMD state, so a signal handler must leave
-  those registers as it found them.
-- A change in a file's readiness wakes every task waiting in `poll`,
-  `select` or `epoll`; there are no per-file wait queues.
+- Signal frames hold the FP/SIMD registers but not SVE state beyond them.
 - A process's threads share one CPU unless the kernel registers a remote TLB
   flush (`osmium::arch::mmu::set_remote_flush`; AArch64 needs none). Load
   balancing between CPUs (`with_stealing`) is opt-in.
