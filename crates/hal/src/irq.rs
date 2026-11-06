@@ -8,8 +8,23 @@ use osmium_sync::{IrqDisabled, RwSpinLock};
 /// used from interrupt context; implementations use per-register volatile
 /// accesses, which the hardware serializes.
 pub trait InterruptController: Sync {
-    /// Unmasks `irq`, routing it to the current CPU where that applies.
+    /// Unmasks `irq`.
+    ///
+    /// On controllers that steer shared lines to a CPU (GICv2, GICv3), a
+    /// line that has no target yet (from [`set_target`](Self::set_target)
+    /// or an earlier `enable`) is first routed to the calling CPU, so that
+    /// it reaches some CPU; a line that has one keeps it. On controllers
+    /// whose enables are per CPU (the PLIC's contexts), this enables it for
+    /// the calling CPU only.
     fn enable(&self, irq: u32);
+
+    /// Routes shared line `irq` to logical CPU `cpu`, without changing
+    /// whether it is masked. Returns false if the controller cannot steer
+    /// `irq` to `cpu`: a per-CPU line, a CPU the controller does not know,
+    /// or a controller without routing (the default).
+    fn set_target(&self, _irq: u32, _cpu: usize) -> bool {
+        false
+    }
 
     /// Masks `irq`.
     fn disable(&self, irq: u32);

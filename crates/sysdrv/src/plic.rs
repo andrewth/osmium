@@ -76,6 +76,10 @@ impl InterruptController for Plic {
     /// Enables `irq` for the current CPU's context. A source with priority 0
     /// never fires, so this also raises its priority to 1 if it is 0. Does
     /// nothing for a source the PLIC lacks, or if the window is too small.
+    ///
+    /// The PLIC has no routing apart from these per-context enables, so
+    /// [`InterruptController::set_target`] is not supported: call `enable`
+    /// on each hart that should take the source.
     fn enable(&self, irq: u32) {
         if !self.valid(irq) {
             return;

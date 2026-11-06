@@ -21,7 +21,7 @@ pub mod its;
 pub mod lpi;
 pub mod v4;
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use osmium_arch::MAX_CPUS;
 use osmium_hal::dma::DmaAllocator;
@@ -266,6 +266,8 @@ pub struct GicV3<C: CpuInterface> {
     /// Each CPU's affinity, valid once its `redist` is set.
     affinity: PerCpu<AtomicU64>,
     eoi_split: AtomicBool,
+    /// One bit per line: a target has been chosen for it.
+    routed: [AtomicU32; MAX_IRQS.div_ceil(32) as usize],
 }
 
 impl<C: CpuInterface> GicV3<C> {
@@ -279,6 +281,7 @@ impl<C: CpuInterface> GicV3<C> {
             redist: PerCpu::new([const { AtomicUsize::new(NO_REDIST) }; MAX_CPUS]),
             affinity: PerCpu::new([const { AtomicU64::new(0) }; MAX_CPUS]),
             eoi_split: AtomicBool::new(false),
+            routed: [const { AtomicU32::new(0) }; MAX_IRQS.div_ceil(32) as usize],
         }
     }
 
@@ -537,11 +540,24 @@ impl<C: CpuInterface> GicV3<C> {
     }
 
     /// Routes SPI `irq` to the CPU with affinity `mpidr`. Ignores private
-    /// interrupts and lines the distributor lacks.
+    /// interrupts and lines the distributor lacks. A later
+    /// [`InterruptController::enable`] keeps this target.
     pub fn route(&self, irq: u32, mpidr: u64) {
         if irq >= FIRST_SPI && self.valid(irq) {
             let _ = self.gicd.write(GICD_IROUTER + irq as usize * 8, affinity(mpidr));
+            self.mark_routed(irq);
         }
+    }
+
+    /// Marks `irq` routed; returns whether it already was.
+    fn mark_routed(&self, irq: u32) -> bool {
+        let bit = 1 << (irq % 32);
+        self.routed.get(irq as usize / 32).is_some_and(|w| w.fetch_or(bit, Ordering::Relaxed) & bit != 0)
+    }
+
+    /// Whether a target has been chosen for SPI `irq`.
+    fn is_routed(&self, irq: u32) -> bool {
+        self.routed.get(irq as usize / 32).is_some_and(|w| w.load(Ordering::Relaxed) & 1 << (irq % 32) != 0)
     }
 
     /// Makes `irq` pending in software (for SGIs and PPIs, on this CPU).
@@ -587,16 +603,32 @@ impl<C: CpuInterface> GicV3<C> {
 }
 
 impl<C: CpuInterface> InterruptController for GicV3<C> {
-    /// Enables `irq`; shared peripheral interrupts are also routed to the
-    /// current CPU. Does nothing if the controller lacks `irq`.
+    /// Enables `irq`. A shared peripheral interrupt without a target yet
+    /// (from [`GicV3::route`], [`InterruptController::set_target`] or an
+    /// earlier `enable`) is routed to the current CPU first; one with a
+    /// target keeps it. Does nothing if the controller lacks `irq`.
     fn enable(&self, irq: u32) {
         if !self.valid(irq) {
             return;
         }
-        if irq >= FIRST_SPI {
+        if irq >= FIRST_SPI && !self.is_routed(irq) {
             self.route(irq, self.cpu_if.mpidr());
         }
         self.set_bit(GICD_ISENABLER, irq);
+    }
+
+    /// Routes SPI `irq` to logical CPU `cpu`, which must have been
+    /// registered ([`GicV3::init_cpu`] or [`GicV3::register_cpu`]). Fails
+    /// for private lines, lines the distributor lacks and unknown CPUs.
+    fn set_target(&self, irq: u32, cpu: usize) -> bool {
+        if irq < FIRST_SPI || !self.valid(irq) || cpu >= MAX_CPUS {
+            return false;
+        }
+        if self.redist.for_cpu(cpu).load(Ordering::Acquire) == NO_REDIST {
+            return false;
+        }
+        self.route(irq, self.affinity.for_cpu(cpu).load(Ordering::Relaxed));
+        true
     }
 
     /// Does nothing if the controller lacks `irq`.
@@ -775,6 +807,28 @@ mod tests {
         assert_eq!(cpu.grp1.load(Ordering::Relaxed), 1);
         assert_eq!(f.r[(GICR_STRIDE + GICR_WAKER) / 4] & GICR_WAKER_PROCESSOR_SLEEP, 0, "CPU 1 woken");
         assert_ne!(f.r[GICR_WAKER / 4] & GICR_WAKER_PROCESSOR_SLEEP, 0, "CPU 0 left asleep");
+    }
+
+    #[test]
+    fn enable_keeps_an_explicit_target() {
+        let (mut f, cpu) = (Fake::new(), FakeCpu::new(1));
+        let gic = f.gic(&cpu);
+        gic.init_distributor();
+        assert!(gic.init_cpu());
+        // Logical CPU 3 is the one with affinity 0.
+        assert!(gic.register_cpu(3, 0));
+        assert!(gic.set_target(40, 3));
+        gic.enable(40);
+        gic.route(41, 0);
+        gic.enable(41);
+        gic.enable(42);
+        assert!(!gic.set_target(40, 4), "CPU 4 is not registered");
+        assert!(!gic.set_target(20, 3), "private lines have no target");
+        assert!(!gic.set_target(96, 3), "no such line");
+        drop(gic);
+        assert_eq!(f.d[GICD_IROUTER / 4 + 40 * 2], 0, "set_target's choice survives enable");
+        assert_eq!(f.d[GICD_IROUTER / 4 + 41 * 2], 0, "so does route's");
+        assert_eq!(f.d[GICD_IROUTER / 4 + 42 * 2], 1, "an unrouted line goes to the enabling CPU");
     }
 
     #[test]
