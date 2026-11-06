@@ -3,8 +3,10 @@
 //! This is the lowest Osmium layer. It wraps the handful of instructions that
 //! every other component needs: interrupt-flag control, CPU identity, waiting
 //! for interrupts, a monotonic counter, TLB maintenance and DMA memory
-//! barriers. Architecture specific registers live in the `x86_64`, `aarch64`
-//! and `riscv64` modules (each compiled only for its own architecture).
+//! barriers, plus trap entry ([`trap`]), per-task FP/SIMD state ([`fp`]) and
+//! hardware random numbers ([`rng`]). Architecture specific registers live in
+//! the `x86_64`, `aarch64` and `riscv64` modules (each compiled only for its
+//! own architecture).
 //!
 //! On freestanding targets (`target_os = "none"` or `"uefi"`) the functions
 //! execute the real instructions. On hosted targets they fall back to a

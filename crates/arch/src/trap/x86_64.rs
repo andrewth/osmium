@@ -1,8 +1,12 @@
+#[cfg(bare)]
 use core::cell::UnsafeCell;
 
 use super::{Access, Interrupt, Trap};
 use crate::x86_64::read_cr2;
 
+// Hosted test builds compile this module only to unit-test the frame decoding; the stubs (which call into
+// the bare-metal dispatcher) are left out.
+#[cfg(bare)]
 core::arch::global_asm!(include_str!("x86_64.S"));
 
 /// Vector used for `int 0x80` system calls.
@@ -28,7 +32,8 @@ pub struct TrapFrame {
     pub rcx: u64,
     pub rbx: u64,
     pub rax: u64,
-    /// CR2 at entry, captured for page faults.
+    /// CR2 at entry, captured for page faults (vector 14); 0 for every other
+    /// vector.
     pub cr2: u64,
     _pad: u64,
     /// Interrupt vector (0–255).
@@ -43,6 +48,19 @@ pub struct TrapFrame {
 }
 
 const _: () = assert!(size_of::<TrapFrame>() == 24 * 8);
+// The layout `osmium_trap_common` builds, lowest address first: its fifteen pushes (r15 last), the two zeroed
+// slots for cr2 and padding, then what the stub (vector, error code) and the CPU pushed.
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(TrapFrame, r15) == 0);
+    assert!(offset_of!(TrapFrame, rax) == 14 * 8);
+    assert!(offset_of!(TrapFrame, cr2) == 15 * 8);
+    assert!(offset_of!(TrapFrame, _pad) == 16 * 8);
+    assert!(offset_of!(TrapFrame, vector) == 17 * 8);
+    assert!(offset_of!(TrapFrame, error_code) == 18 * 8);
+    assert!(offset_of!(TrapFrame, rip) == 19 * 8);
+    assert!(offset_of!(TrapFrame, ss) == 23 * 8);
+};
 
 /// Whether `addr` is canonical for 4-level paging (bits 63:47 all equal).
 pub(super) fn is_canonical(addr: u64) -> bool {
@@ -78,6 +96,15 @@ impl TrapFrame {
     }
 
     /// System-call number (`rax`) and arguments (`rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`), Linux order.
+    ///
+    /// The shape differs per architecture; portable decoders must
+    /// special-case it:
+    ///
+    /// | Arch    | Returns       | Linux call number      |
+    /// |---------|---------------|------------------------|
+    /// | x86_64  | `[u64; 7]`: `rax`, then six arguments | element 0 (`rax`) |
+    /// | RISC-V  | `[u64; 8]`: `a0..=a7` | element 7 (`a7`) |
+    /// | AArch64 | `[u64; 8]`: `x0..=x7` | not included: read `frame.x[8]` |
     pub fn syscall_args(&self) -> [u64; 7] {
         [self.rax, self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9]
     }
@@ -138,6 +165,7 @@ impl TrapFrame {
 /// # Panics
 ///
 /// If `ist` is not in `1..=7`.
+#[cfg(bare)]
 pub unsafe fn set_ist(vector: u8, ist: u8) {
     assert!((1..=7).contains(&ist), "IST indices are 1-7");
     let gate = IDT.0.get().cast::<u64>().wrapping_add(2 * vector as usize);
@@ -153,21 +181,27 @@ pub unsafe fn set_ist(vector: u8, ist: u8) {
 /// # Safety
 /// [`install`] must have run, and the handler must treat the vector as
 /// untrusted input from user mode.
+#[cfg(bare)]
 pub unsafe fn allow_from_user(vector: u8) {
     let gate = IDT.0.get().cast::<u64>().wrapping_add(2 * vector as usize);
     // SAFETY: as in `set_ist`.
     unsafe { gate.write_volatile(gate.read_volatile() | 3 << 45) };
 }
 
+#[cfg(bare)]
 #[repr(C, align(16))]
 struct Idt(UnsafeCell<[u64; 512]>);
 
 // SAFETY: written once under `BUILT`, then only read by the CPU.
+#[cfg(bare)]
 unsafe impl Sync for Idt {}
 
+#[cfg(bare)]
 static IDT: Idt = Idt(UnsafeCell::new([0; 512]));
+#[cfg(bare)]
 static BUILT: crate::trap::OnceFlag = crate::trap::OnceFlag::new();
 
+#[cfg(bare)]
 #[repr(C, packed)]
 struct IdtPointer {
     limit: u16,
@@ -179,8 +213,12 @@ struct IdtPointer {
 /// segment. Call on every CPU.
 ///
 /// # Safety
-/// Replaces the current IDT. Traps are handled on the current stack (no IST
-/// or privilege change), which must be valid whenever one can occur.
+/// Replaces the current IDT. Traps from ring 0 are handled on the current
+/// stack, which must be valid whenever one can occur, unless the vector has
+/// been given an IST stack with [`set_ist`]. Traps from ring 3 switch to the
+/// TSS's `rsp[0]` (see `osmium_arch::x86_64::CpuTables`), which must then be
+/// loaded.
+#[cfg(bare)]
 pub unsafe fn install() {
     unsafe extern "C" {
         static osmium_trap_stub_table: [u64; 256];
@@ -202,4 +240,66 @@ pub unsafe fn install() {
     let ptr = IdtPointer { limit: (512 * 8 - 1) as u16, base: IDT.0.get() as u64 };
     // SAFETY: the IDT is fully built and lives forever.
     unsafe { core::arch::asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags)) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(vector: u64, error_code: u64) -> TrapFrame {
+        TrapFrame { vector, error_code, rip: 0x40_1000, cs: 0x08, ..TrapFrame::default() }
+    }
+
+    #[test]
+    fn canonical_addresses() {
+        assert!(is_canonical(0x0000_7fff_ffff_ffff));
+        assert!(is_canonical(0xffff_8000_0000_0000));
+        assert!(!is_canonical(0x0000_8000_0000_0000));
+        assert!(!is_canonical(0xffff_7fff_ffff_ffff));
+    }
+
+    #[test]
+    fn page_fault_access_from_error_code() {
+        let mut f = frame(14, 0);
+        f.cr2 = 0xdead_b000;
+        assert_eq!(f.cause(), Trap::PageFault { addr: 0xdead_b000, access: Access::Read });
+        f.error_code = 1 << 1;
+        assert_eq!(f.cause(), Trap::PageFault { addr: 0xdead_b000, access: Access::Write });
+        // Instruction fetch wins over the write bit.
+        f.error_code = 1 << 4 | 1 << 1;
+        assert_eq!(f.cause(), Trap::PageFault { addr: 0xdead_b000, access: Access::Execute });
+    }
+
+    #[test]
+    fn other_vectors_decode() {
+        assert_eq!(frame(3, 0).cause(), Trap::Breakpoint);
+        assert_eq!(frame(6, 0).cause(), Trap::IllegalInstruction);
+        assert_eq!(frame(17, 0).cause(), Trap::Misaligned { addr: 0x40_1000 });
+        assert_eq!(frame(SYSCALL_VECTOR as u64, 0).cause(), Trap::Syscall);
+        assert_eq!(frame(32, 0).cause(), Trap::Interrupt(Interrupt::External));
+        assert_eq!(frame(13, 0x18).cause(), Trap::Other { raw: 13 | 0x18 << 32 });
+    }
+
+    #[test]
+    fn breakpoint_entry_points_at_int3() {
+        let mut f = frame(3, 0);
+        f.on_entry();
+        assert_eq!(f.pc(), 0x40_0fff);
+        let mut f = frame(3, 0);
+        f.rip = 0;
+        f.on_entry();
+        assert_eq!(f.rip, u64::MAX, "wraps instead of panicking");
+    }
+
+    #[test]
+    fn syscall_args_and_privilege() {
+        let mut f = frame(SYSCALL_VECTOR as u64, 0);
+        (f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9) = (60, 1, 2, 3, 4, 5, 6);
+        assert_eq!(f.syscall_args(), [60, 1, 2, 3, 4, 5, 6]);
+        f.set_return(7);
+        assert_eq!(f.rax, 7);
+        assert!(!f.from_user());
+        f.cs = 0x23;
+        assert!(f.from_user());
+    }
 }

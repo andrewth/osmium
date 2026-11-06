@@ -79,6 +79,13 @@ impl TrapCpu {
 
     /// Sets the stack (top address) used for traps from U-mode. Update it
     /// on every switch to a task that runs user code.
+    ///
+    /// RISC-V only. On AArch64 this stores the value but no entry stub reads
+    /// it: exceptions from EL0 arrive on `SP_EL1`, which is whatever
+    /// `aarch64::enter_user` / `aarch64::resume_user` loaded from their
+    /// `kernel_sp` argument (and is unwound back to that top by every
+    /// return to EL0). AArch64 kernels pass the task's kernel stack there
+    /// instead. (On x86_64 the equivalent is the TSS's `rsp[0]`.)
     pub fn set_kernel_stack(&self, top: usize) {
         self.kernel_sp.store(top as u64, Ordering::Relaxed);
     }

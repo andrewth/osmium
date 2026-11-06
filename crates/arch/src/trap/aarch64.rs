@@ -94,7 +94,10 @@ impl TrapFrame {
         VectorKind(self.kind)
     }
 
-    /// System-call argument registers `x0`..=`x7`.
+    /// System-call argument registers `x0`..=`x7`. The Linux call number is
+    /// in `x8`, which is not included: read `self.x[8]`. (RISC-V returns
+    /// `a0..=a7` with the number in `a7`; x86_64 returns seven values with
+    /// the number first. See `syscall_args` on each frame.)
     pub fn syscall_args(&self) -> [u64; 8] {
         let [a0, a1, a2, a3, a4, a5, a6, a7, ..] = self.x;
         [a0, a1, a2, a3, a4, a5, a6, a7]
