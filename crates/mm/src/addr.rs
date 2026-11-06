@@ -68,32 +68,61 @@ macro_rules! address {
             pub const fn page_offset(self) -> usize {
                 (self.0 as usize) & (PAGE_SIZE - 1)
             }
+
+            /// Adds `rhs`, or returns `None` if the result does not fit in 64 bits.
+            pub const fn checked_add(self, rhs: u64) -> Option<Self> {
+                match self.0.checked_add(rhs) {
+                    Some(x) => Some(Self(x)),
+                    None => None,
+                }
+            }
+
+            /// Subtracts `rhs`, or returns `None` if the result would be below zero.
+            pub const fn checked_sub(self, rhs: u64) -> Option<Self> {
+                match self.0.checked_sub(rhs) {
+                    Some(x) => Some(Self(x)),
+                    None => None,
+                }
+            }
+
+            /// The distance from `base` up to `self`, or `None` if `self` is below `base`.
+            pub const fn checked_offset_from(self, base: Self) -> Option<u64> {
+                self.0.checked_sub(base.0)
+            }
         }
 
+        // The operators panic on overflow in every build profile, not only where `overflow-checks` is on:
+        // a silently wrapped address is a wild pointer. Use the `checked_*` methods for values that come from
+        // untrusted sources.
+
+        /// Panics if the sum does not fit in 64 bits.
         impl Add<u64> for $name {
             type Output = Self;
             fn add(self, rhs: u64) -> Self {
-                Self(self.0 + rhs)
+                self.checked_add(rhs).expect(concat!(stringify!($name), " + u64 overflowed"))
             }
         }
 
+        /// Panics if the sum does not fit in 64 bits.
         impl AddAssign<u64> for $name {
             fn add_assign(&mut self, rhs: u64) {
-                self.0 += rhs;
+                *self = *self + rhs;
             }
         }
 
+        /// Panics if the result would be below zero.
         impl Sub<u64> for $name {
             type Output = Self;
             fn sub(self, rhs: u64) -> Self {
-                Self(self.0 - rhs)
+                self.checked_sub(rhs).expect(concat!(stringify!($name), " - u64 underflowed"))
             }
         }
 
+        /// The distance between two addresses. Panics if `rhs` is above `self`.
         impl Sub for $name {
             type Output = u64;
             fn sub(self, rhs: Self) -> u64 {
-                self.0 - rhs.0
+                self.checked_offset_from(rhs).expect(concat!(stringify!($name), " - ", stringify!($name), " underflowed"))
             }
         }
 
@@ -163,5 +192,45 @@ mod tests {
         assert!(VirtAddr::new(0xffff_8000_0000_0000).is_canonical(48));
         assert!(!VirtAddr::new(0x0000_8000_0000_0000).is_canonical(48));
         assert!(VirtAddr::new(0xffff_ffc0_0000_0000).is_canonical(39));
+    }
+
+    #[test]
+    fn checked_arithmetic() {
+        let a = PhysAddr::new(0x1000);
+        assert_eq!(a.checked_add(0x10), Some(PhysAddr::new(0x1010)));
+        assert_eq!(PhysAddr::new(u64::MAX).checked_add(1), None);
+        assert_eq!(a.checked_sub(0x1000), Some(PhysAddr::ZERO));
+        assert_eq!(a.checked_sub(0x1001), None);
+        assert_eq!(a.checked_offset_from(PhysAddr::new(0x800)), Some(0x800));
+        assert_eq!(a.checked_offset_from(PhysAddr::new(0x1001)), None);
+        assert_eq!(a + 0x10 - 0x10, a);
+        assert_eq!((a + 0x20) - a, 0x20);
+    }
+
+    // The messages are this module's own, so these fail if the operators wrap (release) or rely on the
+    // compiler's overflow checks (debug).
+    #[test]
+    #[should_panic(expected = "VirtAddr + u64 overflowed")]
+    fn add_overflow_panics_in_every_profile() {
+        let _ = VirtAddr::new(u64::MAX) + 1;
+    }
+
+    #[test]
+    #[should_panic(expected = "PhysAddr + u64 overflowed")]
+    fn add_assign_overflow_panics_in_every_profile() {
+        let mut a = PhysAddr::new(u64::MAX - 1);
+        a += 2;
+    }
+
+    #[test]
+    #[should_panic(expected = "PhysAddr - u64 underflowed")]
+    fn sub_underflow_panics_in_every_profile() {
+        let _ = PhysAddr::new(1) - 2;
+    }
+
+    #[test]
+    #[should_panic(expected = "VirtAddr - VirtAddr underflowed")]
+    fn distance_underflow_panics_in_every_profile() {
+        let _ = VirtAddr::new(1) - VirtAddr::new(2);
     }
 }
