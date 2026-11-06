@@ -753,10 +753,23 @@ fn signals_and_threads() {
     while STARTED.load(Ordering::SeqCst) < 3 {
         sys::call(sys::SCHED_YIELD, [0; 5]);
     }
-    GATE.store(1, Ordering::SeqCst);
-    // REQUEUE: wake 1, move up to 2 more to GATE2.
-    let moved = sys::call(sys::FUTEX, [GATE.as_ptr() as u64, 128 | 3, 1, 2, GATE2.as_ptr() as u64]);
-    sys::call(sys::FUTEX, [GATE2.as_ptr() as u64, 128 | 1, 10, 0, 0]);
+    // The gate stays shut, so a waiter that has not reached FUTEX_WAIT yet
+    // still goes to sleep when it does. REQUEUE with no wake-ups moves the
+    // sleepers to GATE2 as they arrive, until all three have been moved:
+    // only a sleeping waiter can be moved, so then all three are asleep.
+    let mut moved = 0;
+    for _ in 0..100_000 {
+        if moved >= 3 {
+            break;
+        }
+        let r = sys::call(sys::FUTEX, [GATE.as_ptr() as u64, 128 | 3, 0, 3 - moved as u64, GATE2.as_ptr() as u64]);
+        moved += r.max(0);
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+    }
+    // Then REQUEUE proper: wake one of them, move the other two back to GATE,
+    // and wake those there.
+    let woke_and_moved = sys::call(sys::FUTEX, [GATE2.as_ptr() as u64, 128 | 3, 1, 2, GATE.as_ptr() as u64]);
+    let woken = sys::call(sys::FUTEX, [GATE.as_ptr() as u64, 128 | 1, 10, 0, 0]);
     for (i, &tid) in tids.iter().enumerate() {
         // SAFETY: as above; the kernel clears the word when the thread ends.
         let ctid = unsafe { (&raw mut WAITER_CTIDS) as *mut u32 }.wrapping_add(i);
@@ -764,7 +777,14 @@ fn signals_and_threads() {
             sys::call(sys::FUTEX, [ctid as u64, 128, tid as u64, 0, 0]);
         }
     }
-    let ok = tids.iter().all(|&t| t > 0) && (0..=3).contains(&moved) && FINISHED.load(Ordering::SeqCst) == 3;
+    let ok = tids.iter().all(|&t| t > 0)
+        && moved == 3
+        && woke_and_moved == 3
+        && woken == 2
+        && FINISHED.load(Ordering::SeqCst) == 3;
+    if !ok {
+        say!("threads: requeue: moved {moved} sleepers, then woke one and moved {woke_and_moved} in all, woke {woken}");
+    }
     say!(
         "threads: 3 threads slept on a futex, were requeued and woken, and joined: {}",
         if ok { "ok" } else { "FAILED" }
