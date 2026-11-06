@@ -656,7 +656,11 @@ fn write_multi() {
                 .unwrap();
             let text = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success() && text.contains(&format!("dev_item.devid\t\t{}", i + 1)), "{text}");
-            assert!(!text.contains("FAILED") && !text.contains("bad"), "{text}");
+            // Random UUIDs are hex and may contain "bad", so look at the other lines only.
+            let damaged = |l: &&str| {
+                !l.contains("uuid") && (l.contains("FAILED") || l.contains("bad") || l.contains("DON'T MATCH"))
+            };
+            assert!(!text.lines().any(|l| damaged(&l)), "{text}");
         }
         // Every copy was written: with any set of devices gone that the
         // profiles cover (one for RAID1 and RAID10, two for RAID1C3, three
