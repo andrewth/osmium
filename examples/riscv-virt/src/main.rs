@@ -13,28 +13,19 @@ extern crate alloc;
 mod hyp;
 
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use core::ptr::NonNull;
+use demos::guest::image;
+pub(crate) use demos::kernel::{FRAMES, Frames};
+use demos::kernel::{GuardedStacks, KernelTable, Uptime, now_ns};
 use osmium::arch::riscv64::{self, SatpMode, sbi};
-use osmium::arch::trap::{self, Access, Interrupt, Trap, TrapFrame};
+use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::fdt::{Fdt, Node};
-use osmium::storage::ahci::{self, Ahci};
-use osmium::usb::ehci::Ehci;
-use osmium::sysdrv::iommu::riscv::RiscvIommu;
-use osmium::storage::nvme::{self, Nvme};
-use osmium::usb::ohci::Ohci;
-use osmium::sysdrv::plic::Plic;
-use osmium::sysdrv::uart16550::{Mmio, Uart16550};
-use osmium::storage::virtio_blk::VirtioBlk;
 use osmium::drivers::virtio::console::VirtioConsole;
 use osmium::drivers::virtio::mmio::MmioTransport;
-use osmium::netdev::virtio_net::VirtioNet;
 use osmium::drivers::virtio::{DeviceType, Transport};
-use osmium::usb::xhci::Xhci;
 use osmium::hal::block::BlockDevice;
 use osmium::hal::console::{Console, SerialConsole, set_console};
 use osmium::hal::dma::DmaAllocator;
@@ -43,19 +34,26 @@ use osmium::hal::irq::{InterruptController, IrqTable, RegisterError};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci;
 use osmium::hal::println;
-use osmium::hal::timer::{Clock, TickRate};
+use osmium::hal::timer::TickRate;
 use osmium::hal::usb::UsbHost;
-use osmium::mm::frame::order_for;
 use osmium::mm::heap::LockedHeap;
-use osmium::mm::paging::PageSize;
 use osmium::mm::paging::formats::Sv39;
-use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
+use osmium::mm::{MapFlags, MemoryMap, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
+use osmium::netdev::virtio_net::VirtioNet;
 use osmium::sched::timer::TimerQueue;
+use osmium::storage::ahci::{self, Ahci};
+use osmium::storage::nvme::{self, Nvme};
+use osmium::storage::virtio_blk::VirtioBlk;
+use osmium::sysdrv::iommu::riscv::RiscvIommu;
+use osmium::sysdrv::plic::Plic;
+use osmium::sysdrv::uart16550::{Mmio, Uart16550};
+use osmium::usb::ehci::Ehci;
+use osmium::usb::ohci::Ohci;
+use osmium::usb::xhci::Xhci;
 
 use osmium::arch::trap::TrapCpu;
-use osmium::proc::{AddressSpace, ExitStatus, Process, UserMemory};
-use osmium::sched::{FifoScheduler, StackAllocator, Task, TaskBuilder};
+use osmium::sched::FifoScheduler;
 use osmium::sync::Once;
 
 core::arch::global_asm!(
@@ -88,11 +86,16 @@ secondary_start:
     call secondary_main
 
     # The boot hart runs all of kmain on this stack (device probing and driver
-    # setup inline into big frames). It sits first in .bss, so running off the
-    # bottom silently overwrites the statics in .data below it (SCHED, FRAMES,
-    # lock words...). 64 KiB was outgrown; keep generous headroom.
+    # setup inline into big frames). 64 KiB was outgrown; keep generous
+    # headroom. It sits first in .bss, above .data: the page below it is a
+    # guard page that kmain unmaps once paging is on, so an overflow faults
+    # instead of overwriting the statics there.
     .section .bss.stack
     .align 12
+    .globl boot_stack_guard
+boot_stack_guard:
+    .space 4096
+boot_stack_bottom:
     .space 262144
 boot_stack_top:
 "#
@@ -143,6 +146,7 @@ unsafe extern "C" {
     static user_bad: u8;
     static user_bad_end: u8;
     fn secondary_start();
+    static boot_stack_guard: u8;
     static _kernel_start: u8;
     static _etext: u8;
     static _erodata: u8;
@@ -166,8 +170,6 @@ impl Console for SbiConsole {
         }
     }
 }
-
-type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
 
 /// The xHCI controller. Its lock masks interrupts on the locking CPU: the
 /// controller's interrupt handler takes the same lock, so on one CPU the
@@ -203,58 +205,27 @@ fn usb_irq(_irq: u32) {
     }
 }
 
-// SAFETY: the kernel runs identity-mapped (before and after enabling
-// paging), so physical address = virtual address for all RAM.
-pub(crate) static FRAMES: Frames =
-    unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
-
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 
 /// The kernel page table, shared by all harts.
-static PT: osmium::sync::IrqSpinLock<Option<PageTable<Sv39, &'static Frames>>> = osmium::sync::IrqSpinLock::new(None);
+static PT: KernelTable<Sv39> = osmium::sync::IrqSpinLock::new(None);
+
+/// Task stacks and secondary harts' stacks, each above an unmapped guard page.
+static STACKS: GuardedStacks<Sv39> = GuardedStacks::new(&PT, |va| remote_sfence_vma(va, PAGE_SIZE));
 
 /// Invalidates `[start, start + size)` on every other online hart (SBI RFENCE
 /// `remote_sfence_vma`, which returns once the harts have done it).
 fn remote_sfence_vma(start: usize, size: usize) {
     const EID_RFENCE: usize = 0x5246_4e43;
     let me = cpu::current_id();
-    for c in (0..ONLINE.load(Ordering::Acquire)).filter(|&c| c != me) {
-        let hart = HARTS[c].load(Ordering::Relaxed);
+    for hart in HARTS.iter().take(demos::kernel::online()).enumerate().filter(|&(c, _)| c != me) {
+        let hart = hart.1.load(Ordering::Relaxed);
         // SAFETY: an SBI remote fence only flushes TLB entries on the named hart.
         unsafe {
             core::arch::asm!("ecall", inlateout("a0") 1usize => _, inlateout("a1") hart => _,
                 in("a2") start, in("a3") size, in("a6") 1usize, in("a7") EID_RFENCE, options(nostack))
         }
-    }
-}
-
-/// Task stacks with an unmapped guard page below them.
-struct GuardedStacks;
-
-// SAFETY: blocks come from the frame allocator (exclusive, page aligned) and
-// the usable part stays mapped read/write.
-unsafe impl StackAllocator for GuardedStacks {
-    fn alloc(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
-        let order = order_for(size + PAGE_SIZE);
-        let guard = FRAMES.lock().alloc(order)?;
-        let (_, flush) = PT.lock().as_mut()?.unmap_4k(VirtAddr::new(guard.0)).ok()?;
-        flush.flush();
-        // The old mapping was global and may be cached on any hart.
-        remote_sfence_vma(guard.0 as usize, PAGE_SIZE);
-        Some((NonNull::new((guard.0 + PAGE_SIZE as u64) as *mut u8)?, (PAGE_SIZE << order) - PAGE_SIZE))
-    }
-
-    unsafe fn free(&self, base: NonNull<u8>, len: usize) {
-        let guard = base.as_ptr() as u64 - PAGE_SIZE as u64;
-        {
-            let mut pt = PT.lock();
-            let pt = pt.as_mut().expect("as_mut returned None");
-            let flags = MapFlags::RW | MapFlags::GLOBAL;
-            pt.map(VirtAddr::new(guard), PhysAddr::new(guard), PageSize::Size4K, flags).expect("map failed").flush();
-        }
-        // SAFETY: the block came from `alloc` with the same order.
-        unsafe { FRAMES.lock().dealloc(PhysAddr::new(guard), order_for(len + PAGE_SIZE)) };
     }
 }
 
@@ -275,7 +246,7 @@ fn on_switch(next: &osmium::sched::Task) {
         unsafe { core::arch::asm!("fence.i") };
     }
     let cpu = TrapCpu::current();
-    cpu.set_stack_limit(next.kernel_stack_range().map_or(0, |r| r.start));
+    cpu.set_stack_limit(demos::kernel::stack_limit(next));
     // Where traps from U-mode land while `next` runs user code.
     cpu.set_kernel_stack(next.kernel_stack_range().map_or(0, |r| r.end));
 }
@@ -302,33 +273,37 @@ fn isa_has_ext(fdt: &osmium::boot::fdt::Fdt<'_>, ext: &str) -> bool {
         .is_some_and(|isa| isa.split('_').skip(1).any(|e| e == ext))
 }
 
-/// Gives this hart an emergency stack for traps from an overflowed stack.
-fn set_exception_stack() {
-    let stack = alloc::vec![0u8; 16 * 1024].leak();
-    let lo = stack.as_ptr() as usize;
-    TrapCpu::current().set_exception_stack(lo..lo + stack.len());
-}
-
 static UART: Once<SerialConsole<Uart16550<Mmio>>> = Once::new();
 static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
 static TIMERS: TimerQueue = TimerQueue::new();
-static RATE: Once<TickRate> = Once::new();
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Hart id of each logical CPU.
 static HARTS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
-static ONLINE: AtomicUsize = AtomicUsize::new(1);
 static SATP_ROOT: AtomicU64 = AtomicU64::new(0);
 
 /// Handed to a secondary hart through `a1`.
 #[repr(C)]
 struct SecondaryBoot {
+    /// Read first, by `secondary_start`.
     stack_top: u64,
     cpu: usize,
+    /// The lowest address of the stack, above its guard page.
+    stack_limit: u64,
 }
+
+/// Bytes of a secondary hart's boot stack.
+const SECONDARY_STACK: usize = 64 * 1024;
 
 /// Timer interrupt period.
 const TICK_NS: u64 = 10_000_000;
+
+/// Asks the SBI for this hart's next timer interrupt, a tick from now.
+fn arm_timer() {
+    if let Some(rate) = demos::kernel::rate() {
+        sbi::set_timer(cpu::ticks() + rate.ns_to_ticks(TICK_NS));
+    }
+}
 
 /// A PCIe host bridge from the device tree: the ECAM window and the 32-bit
 /// memory window BARs are assigned from (both as base and length).
@@ -390,20 +365,16 @@ fn pci_intx_irq(fdt: &Fdt<'_>, addr: pci::Address, pin: u8) -> Option<u32> {
     let mask: Vec<u32> = node.property("interrupt-map-mask")?.as_u32_cells().collect();
     let unit = [(addr.bus as u32) << 16 | (addr.device as u32) << 11 | (addr.function as u32) << 8, 0, 0, pin as u32];
     let cell = |n: &Node<'_>, name, default| n.property(name).and_then(|p| p.as_u32()).unwrap_or(default) as usize;
-    let mut i = 0;
-    while i + 5 <= map.len() {
-        let phandle = map[i + 4];
+    let mut rest = map.as_slice();
+    while let Some((&[a0, a1, a2, a_pin, phandle], after)) = rest.split_first_chunk::<5>() {
         let parent = fdt.all_nodes().find(|n| n.property("phandle").and_then(|p| p.as_u32()) == Some(phandle))?;
         let (acells, icells) = (cell(&parent, "#address-cells", 0), cell(&parent, "#interrupt-cells", 1));
-        if i + 5 + acells + icells > map.len() {
-            return None;
+        let parent_unit = after.get(..acells + icells)?;
+        let masked = |k: usize, v: u32| v & mask.get(k).copied().unwrap_or(!0);
+        if [a0, a1, a2, a_pin].iter().zip(unit).enumerate().all(|(k, (&m, u))| masked(k, m) == masked(k, u)) {
+            return parent_unit.get(acells).copied();
         }
-        if (0..4)
-            .all(|k| map[i + k] & mask.get(k).copied().unwrap_or(!0) == unit[k] & mask.get(k).copied().unwrap_or(!0))
-        {
-            return map.get(i + 5 + acells).copied();
-        }
-        i += 5 + acells + icells;
+        rest = after.get(acells + icells..)?;
     }
     None
 }
@@ -428,7 +399,9 @@ fn usb_interrupts(fdt: &Fdt<'_>, addr: pci::Address, pin: u8, plic_base: u64, pl
     };
     // SAFETY: the device tree puts the PLIC here; it was mapped as device memory.
     let io = unsafe { IoMem::new(plic_base as *mut u8, plic_len as usize) };
-    let plic = PLIC.call_once(|| Plic::new(io, |cpu| Plic::supervisor_context(HARTS[cpu].load(Ordering::Relaxed))));
+    let plic = PLIC.call_once(|| {
+        Plic::new(io, |cpu| Plic::supervisor_context(HARTS.get(cpu).map_or(0, |h| h.load(Ordering::Relaxed))))
+    });
     match IRQS.register(irq, &usb_irq) {
         Ok(()) | Err(RegisterError::Busy) => {}
         Err(RegisterError::OutOfRange) => return None,
@@ -445,31 +418,6 @@ fn virtio_slots<'src>(fdt: &Fdt<'src>) -> impl Iterator<Item = (u64, u64)> + 'sr
     fdt.all_nodes()
         .filter(|n| n.compatible().any(|c| c == "virtio,mmio"))
         .filter_map(|n| n.reg().next().map(|(a, s)| (a, s.unwrap_or(0x200))))
-}
-
-/// Waits up to a second for `n` CPUs to be online.
-fn wait_online(n: usize) -> bool {
-    let deadline = now_ns() + 1_000_000_000;
-    while ONLINE.load(Ordering::Acquire) < n {
-        if now_ns() > deadline {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-    true
-}
-
-fn now_ns() -> u64 {
-    RATE.get().expect("RATE initialised").ticks_to_ns(cpu::ticks())
-}
-
-/// [`now_ns`] for drivers that take a [`Clock`].
-struct Uptime;
-
-impl Clock for Uptime {
-    fn now_ns(&self) -> u64 {
-        now_ns()
-    }
 }
 
 /// Runs `before` ahead of every transfer on the disk it wraps.
@@ -533,6 +481,11 @@ fn nvme_demo<D: DmaAllocator>(addr: pci::Address, io: IoMem, dma: &D, before: &d
 }
 
 #[unsafe(no_mangle)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "boot: what QEMU's machine provides is set up once here, so a failure means a broken machine or a bug in this example; the panic handler reports which"
+)]
 extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: the boot hart is logical CPU 0; secondaries get 1, 2, ...
     unsafe { cpu::set_current_id(0) };
@@ -550,7 +503,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     let model = fdt.root().property("model").and_then(|p| p.as_str()).unwrap_or("?");
     println!("[fdt]   {model}, {} bytes, bootargs {:?}", fdt.total_size(), fdt.bootargs().unwrap_or(""));
     let timebase = fdt.find_node("/cpus").and_then(|c| c.property("timebase-frequency")).and_then(|p| p.as_u32());
-    RATE.call_once(|| TickRate::new(timebase.unwrap_or(10_000_000) as u64));
+    demos::kernel::set_rate(TickRate::new(timebase.unwrap_or(10_000_000) as u64));
 
     // --- Console on the real UART -----------------------------------------
     let uart_node = fdt.find_compatible(&["ns16550a"]).expect("no UART");
@@ -575,18 +528,9 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     for r in map.regions() {
         println!("[mem]   {:#011x}..{:#011x} {:?}", r.start.0, r.end.0, r.kind);
     }
-    {
-        let mut buddy = FRAMES.lock();
-        for r in map.usable() {
-            // SAFETY: the memory map says the range is free RAM, identity-mapped.
-            unsafe { buddy.add_region(r.start, r.end) };
-        }
-        println!(
-            "[frame] buddy allocator: {} free frames ({} MiB)",
-            buddy.free_frames(),
-            (buddy.free_frames() * PAGE_SIZE) >> 20
-        );
-    }
+    // SAFETY: the memory map says these ranges are free RAM, identity-mapped.
+    unsafe { demos::kernel::add_ram(map.usable().map(|r| r.start..r.end)) };
+    demos::kernel::report_frames();
 
     // --- Heap ------------------------------------------------------------
     HEAP.init(&FRAMES);
@@ -622,24 +566,8 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             pt.map_range(va(start), pa(start), end - start, k(MapFlags::RW)).expect("map_range failed");
         }
     }
-    // Device windows from the device tree: rounded out to whole pages, and
-    // tolerant of windows that share a page (virtio-mmio slots do) or that
-    // were mapped already.
-    let mut map_device = |base: u64, len: u64| {
-        let page = PAGE_SIZE as u64;
-        let (start, end) = (base & !(page - 1), (base + len).next_multiple_of(page));
-        let flags = k(MapFlags::RW | MapFlags::DEVICE);
-        if pt.translate(va(start)).is_none() && pt.translate(va(end - page)).is_none() {
-            if pt.map_range(va(start), pa(start), end - start, flags).is_ok() {
-                return;
-            }
-        }
-        for p in (start..end).step_by(PAGE_SIZE) {
-            if pt.translate(va(p)).is_none() {
-                pt.map(va(p), pa(p), PageSize::Size4K, flags).expect("mapping a device page").ignore();
-            }
-        }
-    };
+    // Device windows from the device tree.
+    let mut map_device = |base, len| demos::kernel::map_device(&mut pt, base, len);
     map_device(uart_base, PAGE_SIZE as u64);
     for (base, len) in virtio_slots(&fdt) {
         map_device(base, len);
@@ -658,6 +586,14 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // SAFETY: the table identity-maps the running code, its stack, the heap and the UART.
     unsafe { riscv64::write_satp(SatpMode::Sv39, 0, pt.root().0) };
     SATP_ROOT.store(pt.root().0, Ordering::Release);
+    // The page below the boot stack becomes its guard (see `_start`).
+    // SAFETY: a linker symbol.
+    let guard = unsafe { sym(&boot_stack_guard) };
+    if demos::kernel::unmap_guard(&mut pt, guard) {
+        let bottom = guard as usize + PAGE_SIZE;
+        demos::kernel::set_boot_stack_limit(bottom);
+        TrapCpu::current().set_stack_limit(bottom);
+    }
     let t = pt.translate(va(kmain as *const () as u64)).expect("translate failed");
     println!("[mmu]   Sv39 on, root {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
     let t = pt.translate(va(ram_end - 1)).expect("translate failed");
@@ -667,12 +603,14 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         // harts that have it, so S-mode may read `seed`.
         unsafe { osmium::arch::rng::assume_seed_csr() };
     }
-    rand_demo();
+    demos::kernel::rand_demo();
     *PT.lock() = Some(pt);
-    set_exception_stack();
-    osmium::sched::set_stack_allocator(&GuardedStacks);
+    demos::fault::set_exception_stack();
+    osmium::sched::set_stack_allocator(&STACKS);
     osmium::sched::set_switch_hook(on_switch);
-    println!("[guard] task stacks get unmapped guard pages; overflowing traps move to a per-hart exception stack");
+    println!(
+        "[guard] boot, hart and task stacks get unmapped guard pages; overflowing traps move to a per-hart exception stack"
+    );
     // Processes may use FP: each one's registers are switched with its task.
     if isa_has(&fdt, 'd') {
         // SAFETY: the kernel is soft-float, and the harts have D.
@@ -683,7 +621,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     // --- Scheduler and timer interrupts -----------------------------------
     osmium::sched::inject_scheduler(&SCHED);
     osmium::sched::init_cpu();
-    sbi::set_timer(cpu::ticks() + RATE.get().expect("RATE initialised").ns_to_ticks(TICK_NS));
+    arm_timer();
     // SAFETY: enabling timer and software interrupts; the trap vector is installed.
     unsafe { riscv64::write_sie(riscv64::SIE_STIE | riscv64::SIE_SSIE) };
     irq::enable();
@@ -691,7 +629,9 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
 
     // --- Secondary harts ----------------------------------------------------
     osmium::sched::set_remote_wake_hook(|cpu| {
-        let _ = sbi::send_ipi(1, HARTS[cpu].load(Ordering::Relaxed));
+        if let Some(h) = HARTS.get(cpu) {
+            let _ = sbi::send_ipi(1, h.load(Ordering::Relaxed));
+        }
     });
     // User threads run on any hart: address-space changes shoot the others down.
     osmium::arch::mmu::set_remote_flush(|start, pages| remote_sfence_vma(start, pages * PAGE_SIZE));
@@ -702,13 +642,20 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         .filter(|c| c.property("status").and_then(|p| p.as_str()).is_none_or(|s| s == "okay"))
         .filter_map(|c| c.reg().next().map(|(h, _)| h as usize));
     let mut ncpus = 1;
-    for h in harts.filter(|&h| h != hartid).take(MAX_CPUS - 1) {
-        let stack = alloc::vec![0u8; 64 * 1024].leak();
+    for (cpu, h) in demos::kernel::secondaries(harts, hartid) {
+        // Above a guard page, which takes effect once the hart turns paging on.
+        let Some(stack) = STACKS.leak(SECONDARY_STACK) else {
+            println!("[smp]   no memory for hart {h}'s stack; continuing with {ncpus} CPUs");
+            break;
+        };
         let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
-            stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
-            cpu: ncpus,
+            stack_top: stack.end,
+            cpu,
+            stack_limit: stack.start,
         }));
-        HARTS[ncpus].store(h, Ordering::Relaxed);
+        if let Some(slot) = HARTS.get(cpu) {
+            slot.store(h, Ordering::Relaxed);
+        }
         // SAFETY: `secondary_start` sets up gp and the stack from `boot`.
         let started = unsafe { sbi::hart_start(h, secondary_start as *const () as usize, boot as *const _ as usize) };
         // One hart at a time: a hart that fails to start or never checks in
@@ -717,7 +664,7 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
             println!("[smp]   hart {h} did not start ({e:?}); continuing with {ncpus} CPUs");
             break;
         }
-        if !wait_online(ncpus + 1) {
+        if !demos::kernel::wait_online(cpu + 1) {
             println!("[smp]   hart {h} did not check in within 1 s; continuing with {ncpus} CPUs");
             break;
         }
@@ -1026,8 +973,8 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
         demos::smp(ncpus);
         demos::balance(ncpus, &|| SCHED.steals());
     }
-    fault_demo();
-    overflow_demo();
+    demos::fault::fault_demo();
+    demos::fault::overflow_demo();
     demos::user::boot_vfs();
     user_demo();
     if hyp::available(&fdt) {
@@ -1042,41 +989,9 @@ extern "C" fn kmain(hartid: usize, dtb: usize) -> ! {
     println!(
         "[done]  {} timer ticks, {} free frames; shutting down",
         TICKS.load(Ordering::Relaxed),
-        FRAMES.lock().free_frames()
+        demos::kernel::free_frames()
     );
     sbi::shutdown()
-}
-
-/// The last synchronous trap that `on_trap` recovered from.
-static RECOVERED: [osmium::sync::IrqSpinLock<Option<Trap>>; MAX_CPUS] =
-    [const { osmium::sync::IrqSpinLock::new(None) }; MAX_CPUS];
-/// Whether this CPU expects a trap and may recover from it. Per CPU, so a real
-/// fault on another CPU is never taken for the demo's.
-static RECOVER: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-
-/// Runs `f`, which must take one breakpoint or page fault, with recovery armed
-/// on this CPU only (interrupts off, so the task cannot migrate meanwhile).
-/// Returns the trap that was recovered from.
-fn recover_trap(f: impl FnOnce()) -> Trap {
-    irq::without(|| {
-        let cpu = cpu::current_id();
-        RECOVER[cpu].store(true, Ordering::SeqCst);
-        f();
-        RECOVER[cpu].store(false, Ordering::SeqCst);
-        RECOVERED[cpu].lock().take().expect("recovery recorded by the trap handler")
-    })
-}
-
-fn fault_demo() {
-    // SAFETY: the handler steps over the breakpoint.
-    let t = recover_trap(|| unsafe { core::arch::asm!("ebreak") });
-    println!("[trap]  recovered from {:?}", t);
-    // Nothing is mapped at 0x1000: a load page fault.
-    // SAFETY: the read faults and the handler skips it; the value is never used.
-    let t = recover_trap(|| {
-        let _ = unsafe { core::ptr::read_volatile(0x1000 as *const u64) };
-    });
-    println!("[trap]  recovered from {:?}", t);
 }
 
 /// Entry point of secondary harts, on their own stack with the MMU off.
@@ -1088,121 +1003,46 @@ extern "C" fn secondary_main(hartid: usize, boot: &SecondaryBoot) -> ! {
     unsafe { trap::install() };
     // SAFETY: the boot hart's table identity-maps everything we touch.
     unsafe { riscv64::write_satp(SatpMode::Sv39, 0, SATP_ROOT.load(Ordering::Acquire)) };
-    set_exception_stack();
+    // Paging is on, so the guard page below this stack is in force.
+    demos::kernel::set_boot_stack_limit(boot.stack_limit as usize);
+    TrapCpu::current().set_stack_limit(boot.stack_limit as usize);
+    demos::fault::set_exception_stack();
     if osmium::arch::fp::enabled() {
         // SAFETY: as on the boot hart.
         unsafe { osmium::arch::fp::enable() };
     }
     osmium::sched::init_cpu();
-    sbi::set_timer(cpu::ticks() + RATE.get().expect("RATE initialised").ns_to_ticks(TICK_NS));
+    arm_timer();
     // SAFETY: as on the boot hart.
     unsafe { riscv64::write_sie(riscv64::SIE_STIE | riscv64::SIE_SSIE) };
     irq::enable();
     println!("[smp]   hart {hartid} online as CPU {}", boot.cpu);
-    ONLINE.fetch_add(1, Ordering::Release);
+    demos::kernel::check_in();
     // This flow of execution has nothing more to do: hand the CPU to the
     // scheduler for good.
     osmium::sched::exit()
 }
 
-/// A task that recurses until it runs off the bottom of its stack.
-fn overflow_demo() {
-    #[inline(never)]
-    fn recurse(depth: u64) -> u64 {
-        let frame = core::hint::black_box([depth; 32]);
-        if core::hint::black_box(true) { recurse(depth + 1) + frame[7] } else { 0 }
-    }
-    let t = TaskBuilder::new("deep").stack_size(16 * 1024).spawn(|| {
-        recurse(0);
-    });
-    t.join();
-    println!("[guard] the other tasks keep running: {} free frames", FRAMES.lock().free_frames());
+/// Drops to U-mode at `pc` with stack pointer `sp`.
+///
+/// # Safety
+/// See [`demos::user::Enter`].
+unsafe fn enter_user(pc: u64, sp: u64) -> ! {
+    // The code may have been written through the identity map, possibly by
+    // another hart: make it visible to this hart's instruction fetch.
+    // SAFETY: fence.i only synchronizes this hart's instruction stream.
+    unsafe { core::arch::asm!("fence.i") };
+    // SAFETY: the caller's contract; traps are installed, and the switch
+    // hook keeps TrapCpu's kernel stack on this task.
+    unsafe { riscv64::enter_user(pc as usize, sp as usize) }
 }
 
-/// Where every user program is mapped, each in its own address space: 64 GiB
-/// (root entry 64), clear of RAM and the PCIe windows, which the kernel
-/// shares from root entries 0..64.
-const USER_BASE: u64 = 0x10_0000_0000;
-
-/// A process's memory: an Sv39 table sharing the kernel's root entries
-/// 0..64, with table and user pages from `FRAMES`.
-type Space = AddressSpace<Sv39, &'static Frames>;
-
-fn new_space() -> Space {
-    // SAFETY: the kernel table lives for the whole run.
-    unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..64) }
-        .expect("out of memory for a page table")
-}
-
-/// Copies a user program into fresh pages, maps it user-accessible (code
-/// read/execute, stack read/write) at slot `n`, and spawns a task that drops
-/// to U-mode there.
-fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> (Arc<Task>, Weak<Process>) {
-    let (start, end) = (code.0 as *const u8, code.1 as *const u8);
-    // SAFETY: the linker symbols delimit the program's bytes.
-    let mut code = unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }.to_vec();
-    assert!(code.len() <= PAGE_SIZE);
-    // Tell this copy which process it is (the '?' in its message).
-    if let Some(q) = code.iter().position(|&b| b == b'?') {
-        code[q] = b'0' + n as u8;
-    }
-    let (code_va, stack_va) = (USER_BASE, USER_BASE + 0x8000);
-    let space = new_space();
-    space.load_flat(code_va, &code, MapFlags::RX).expect("load_flat failed");
-    space.map_anon(stack_va, PAGE_SIZE as u64, MapFlags::RW).expect("map_anon failed");
-    let process = Process::new(name, space, USER_BASE + 0x10000);
-    let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
-        // The code was written through the identity map, possibly by another
-        // hart: make it visible to this hart's instruction fetch.
-        // SAFETY: fence.i only synchronizes this hart's instruction stream.
-        unsafe { core::arch::asm!("fence.i") };
-        // SAFETY: traps are installed, the switch hook keeps TrapCpu's kernel
-        // stack on this task, and both pages are mapped user-accessible.
-        unsafe { riscv64::enter_user(code_va as usize, (stack_va as usize) + PAGE_SIZE) }
-    });
-    (task, Arc::downgrade(&process))
-}
-
-/// The Rust user program, built by `build.rs` from `examples/user/hello.rs`.
-static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
-
-/// Loads an ELF executable into a new address space and spawns a task on
-/// `cpu` that runs it in user mode.
-fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> (Arc<Task>, Weak<Process>) {
-    let elf = osmium::boot::elf::Elf::new(image).expect("bad user ELF");
-    let space = new_space();
-    let brk = space.load_elf(&elf).expect("loading the user ELF failed");
-    let stack_top: u64 = 0x11_0000_0000;
-    space.map_anon(stack_top - PAGE_SIZE as u64, PAGE_SIZE as u64, MapFlags::RW).expect("map_anon failed");
-    let entry = elf.entry();
-    let process = Process::new(name, space, brk);
-    process.set_mmap_area(0x12_0000_0000..0x13_0000_0000);
-    let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
-        // SAFETY: the code was written through the identity map; make it
-        // visible to this hart's instruction fetch.
-        unsafe { core::arch::asm!("fence.i") };
-        // SAFETY: traps are installed, the switch hook installs this
-        // process's table and kernel stack, and its pages are mapped.
-        unsafe { riscv64::enter_user(entry as usize, stack_top as usize) }
-    });
-    (task, Arc::downgrade(&process))
-}
-
-/// The Rust program that forks and execs, from `examples/user/init.rs`.
-static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
-
-/// What `fork` and `execve` need: Sv39 spaces like `new_space`'s, a stack
-/// below 0x11_0000_0000 and an `mmap` area above it, as for `spawn_elf`.
+/// What `fork` and `execve` need: Sv39 spaces sharing the kernel's root
+/// entries, laid out as `demos::user` says.
 fn platform() -> osmium::proc::Platform {
-    osmium::proc::Platform {
-        new_memory: || {
-            // SAFETY: the kernel table lives for the whole run.
-            let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..64) };
-            osmium::sync::fallible::try_box(space.map_err(|_| osmium::fs::Errno::ENOMEM)?)
-                .map(|space| space as alloc::boxed::Box<dyn osmium::proc::UserMemory>)
-                .map_err(|_| osmium::fs::Errno::ENOMEM)
-        },
-        activate: |root| {
+    demos::user::platform(
+        || demos::user::new_space(&PT),
+        |root| {
             // SAFETY: the table shares the kernel's root entries; fence.i
             // only synchronizes this hart's instruction stream.
             unsafe {
@@ -1212,99 +1052,25 @@ fn platform() -> osmium::proc::Platform {
         },
         // SAFETY: the child's task is running with its table active (the
         // switch hook), and the frame is its parent's from an ecall.
-        resume: |frame| unsafe { riscv64::resume_user(&frame) },
-        stack_top: 0x11_0000_0000,
-        stack_size: 64 * 1024,
-        mmap_area: 0x12_0000_0000..0x13_0000_0000,
-        load_base: 0x14_0000_0000,
-    }
+        |frame| unsafe { riscv64::resume_user(&frame) },
+    )
 }
 
-/// Runs `/bin/init`, which forks, execs and waits, on `cpu`; its children
-/// go wherever the scheduler puts them.
-fn fork_exec_demo(cpu: usize) {
-    demos::user::install("init", INIT_ELF);
-    let process =
-        Process::new_boxed("init", (platform().new_memory)().expect("out of memory for the init address space"), 0);
-    let init = Arc::downgrade(&process);
-    let task = process.spawn(TaskBuilder::new("init").cpu(cpu), || {
-        let entry = osmium::proc::current()
-            .expect("current returned None")
-            .exec("/bin/init", &[b"init"], &[])
-            .expect("exec /bin/init");
-        // SAFETY: exec activated the new table; traps are installed and the
-        // switch hook keeps TrapCpu's kernel stack on this task.
-        unsafe { riscv64::enter_user(entry.pc as usize, entry.sp as usize) }
-    });
-    drop(process);
-    task.join();
-    // The task holds the process: let it go too.
-    drop(task);
-    let freed = demos::user::freed(&[init]);
-    println!("[user]  init and its children reaped; {freed} of 1 init address space torn down");
-}
-
-/// Position-independent programs, from `examples/user/pie.rs` (twice) and
-/// `ld.rs`.
-static PIE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pie.elf"));
-static DYN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn.elf"));
-static LD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ld.elf"));
-
-/// Runs `/bin/pie`, a static PIE that the kernel relocates, and `/bin/dyn`,
-/// the same program linked against the interpreter `/bin/ld`, which
-/// relocates it.
-fn pie_demo() {
-    demos::user::install("pie", PIE_ELF);
-    demos::user::install("dyn", DYN_ELF);
-    demos::user::install("ld", LD_ELF);
-    for name in ["pie", "dyn"] {
-        let process =
-            Process::new_boxed(name, (platform().new_memory)().expect("out of memory for an address space"), 0);
-        let path = alloc::format!("/bin/{name}");
-        let task = process.spawn(TaskBuilder::new(name), move || {
-            let entry = osmium::proc::current()
-                .expect("current returned None")
-                .exec(&path, &[path.as_bytes()], &[])
-                .expect("exec of a position-independent program failed");
-            // SAFETY: exec activated the new table; traps are installed and
-            // the switch hook keeps TrapCpu's kernel stack on this task.
-            unsafe { riscv64::enter_user(entry.pc as usize, entry.sp as usize) }
-        });
-        drop(process);
-        task.join();
-        drop(task);
-    }
-    println!("[user]  position-independent programs exited");
-}
-
+/// The user demos: the hand-written U-mode programs, the Rust ones, the
+/// position-independent ones, and the socket calls over virtio-net.
 fn user_demo() {
     osmium::proc::set_platform(platform());
-    // SAFETY: linker symbols delimiting the user programs.
-    let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
-    // Run them on another hart (when there is one): user code owns `tp`, so
-    // traps from U-mode must restore the kernel's CPU id, and a wrong id
-    // would only go unnoticed on CPU 0.
-    let cpu = 1 % ONLINE.load(Ordering::Acquire);
-    let spawned = [
-        spawn_user("user-1", 1, hello, cpu),
-        spawn_user("user-2", 2, hello, cpu),
-        spawn_user("user-bad", 3, bad, cpu),
-        spawn_elf("user-elf", HELLO_ELF, cpu),
-    ];
-    println!("[user]  running 3 U-mode programs on CPU {cpu}");
-    println!("[user]  each program has its own page table; all run at {USER_BASE:#x}");
-    let mut processes = Vec::new();
-    for (task, process) in spawned {
-        task.join();
-        processes.push(process);
+    let platform = platform();
+    // SAFETY: linker symbols delimiting the user programs in .rodata.
+    let (hello, bad) = unsafe { (image(&user_hello, &user_hello_end), image(&user_bad, &user_bad_end)) };
+    demos::user::demo(&platform, hello, bad, "U-mode", enter_user);
+    demos::user::pie_demo(&platform, enter_user);
+    // Taken out first: the lock must not be held while the demo runs.
+    let dev = NETDEV.lock().take();
+    match dev {
+        Some(dev) => demos::user::socket_demo(&platform, dev, &TIMERS, enter_user),
+        None => println!("[sock]  no network device"),
     }
-    // Exited tasks (and their address spaces) are freed once their CPU has
-    // switched away from them.
-    let freed = demos::user::freed(&processes);
-    println!("[user]  {freed} of 4 address spaces torn down with their tasks");
-    fork_exec_demo(cpu);
-    pie_demo();
-    socket_demo();
 }
 
 /// The virtio-net device, kept for the socket demo once the others are done
@@ -1312,127 +1078,19 @@ fn user_demo() {
 static NETDEV: osmium::sync::IrqSpinLock<Option<alloc::boxed::Box<dyn osmium::hal::net::NetDevice + Send>>> =
     osmium::sync::IrqSpinLock::new(None);
 
-/// The Rust program that uses sockets, from `examples/user/net.rs`.
-static NET_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net.elf"));
-
-/// Gives the virtio-net device to osmium-proc's socket calls (after a DHCP
-/// lease), polls it from a task, and runs `/bin/net`, which does a TCP echo
-/// round trip and reads a file by TFTP over UDP.
-fn socket_demo() {
-    use osmium::net::{DhcpClient, Instant, Interface, SocketSet};
-    use osmium::proc::net::{NetStack, set_stack};
-
-    let Some(mut dev) = NETDEV.lock().take() else { return };
-    let mut iface = Interface::new(&*dev, now_ns());
-    let mut sockets = SocketSet::new();
-    sockets.add(DhcpClient::new());
-    let start = now_ns();
-    while iface.config().is_none() && now_ns() - start < 5_000_000_000 {
-        iface.poll(Instant::from_nanos(now_ns()), &mut *dev, &mut sockets);
-    }
-    let Some(config) = iface.config() else {
-        println!("[sock]  no DHCP lease");
-        return;
-    };
-    println!("[sock]  {} on the socket stack", config.address);
-    let stack = Arc::new(NetStack::new(iface, dev, sockets, now_ns));
-    set_stack(stack.clone());
-    static STOP: AtomicBool = AtomicBool::new(false);
-    let poller = TaskBuilder::new("net-poll").spawn(move || {
-        while !STOP.load(Ordering::Acquire) {
-            stack.poll();
-            TIMERS.sleep_until(now_ns() + 1_000_000);
-        }
-    });
-    demos::user::install("net", NET_ELF);
-    let process = Process::new_boxed("net", (platform().new_memory)().unwrap(), 0);
-    let task = process.spawn(TaskBuilder::new("net"), || {
-        let entry = osmium::proc::current().unwrap().exec("/bin/net", &[b"net"], &[]).expect("exec /bin/net");
-        // SAFETY: exec activated the new table; traps are installed and the
-        // switch hook keeps TrapCpu's kernel stack on this task.
-        unsafe { riscv64::enter_user(entry.pc as usize, entry.sp as usize) }
-    });
-    drop(process);
-    task.join();
-    drop(task);
-    STOP.store(true, Ordering::Release);
-    poller.join();
-    println!("[sock]  net exited; its sockets are closed");
-}
-
-/// Handles `ecall` from U-mode.
-fn syscall(frame: &mut TrapFrame) {
-    if let Some(status) = osmium::proc::syscall::handle(frame) {
-        let task = osmium::sched::current();
-        if let ExitStatus::Code(code) = status {
-            println!("[user]  {} exited with status {code} (kernel sees CPU {})", task.name(), cpu::current_id());
-        }
-        drop(task);
-        osmium::proc::exit(status);
-    }
-}
-
-/// A fault in user mode raises a signal: the program's handler runs, or the
-/// default action ends it (and only it, not the kernel).
-fn user_fault(frame: &mut TrapFrame, cause: Trap) {
-    let (sig, addr) = match cause {
-        Trap::PageFault { addr, .. } => (11, addr),
-        Trap::Misaligned { addr } => (7, addr),
-        Trap::IllegalInstruction => (4, frame.pc()),
-        Trap::Breakpoint => (5, frame.pc()),
-        _ => (11, frame.pc()),
-    };
-    if let Some(status) = osmium::proc::signal::user_fault(frame, sig, addr) {
-        let task = osmium::sched::current();
-        println!("[user]  {} killed: {cause:?} at pc {:#x}", task.name(), frame.pc());
-        drop(task);
-        osmium::proc::exit(status);
-    }
-}
-
 /// Runs the trap handler, then, before returning to user mode from an
 /// interrupt, delivers pending signals (and stops threads of a process that
 /// is ending).
 fn on_trap(frame: &mut TrapFrame) {
     handle_trap(frame);
-    if frame.from_user() && matches!(frame.cause(), Trap::Interrupt(_)) {
-        if let Some(status) = osmium::proc::signal::deliver(frame) {
-            osmium::proc::exit(status);
-        }
-    }
+    demos::user::before_return(frame);
 }
 
 fn handle_trap(frame: &mut TrapFrame) {
-    if frame.from_user() {
-        match frame.cause() {
-            Trap::Syscall => return syscall(frame),
-            Trap::Interrupt(_) => {}
-            // A write to a page `fork` shares gets its own copy, and the first touch of a
-            // demand-paged `mmap` page its frame; retry.
-            Trap::PageFault { addr, access } if osmium::proc::handle_page_fault(addr as u64, access == Access::Write) => {
-                return;
-            }
-            cause => return user_fault(frame, cause),
-        }
+    if frame.from_user() && demos::user::handle(frame) {
+        return;
     }
-    if TrapCpu::current().overflowed(frame) {
-        // This frame lives on the exception stack; the task's own stack is
-        // exhausted, so it cannot continue. End only that task.
-        let task = osmium::sched::current();
-        println!(
-            "[guard] task {:?} overflowed its stack ({:?} at sp {:#x}); killed",
-            task.name(),
-            frame.cause(),
-            frame.sp()
-        );
-        // A trap taken while on the exception stack must nest there, not be
-        // mistaken for another overflow.
-        // SAFETY: the breakpoint arm below steps over it.
-        let t = recover_trap(|| unsafe { core::arch::asm!("ebreak") });
-        println!("[guard] nested {t:?} on the exception stack handled");
-        drop(task);
-        osmium::sched::exit();
-    }
+    demos::fault::on_overflow(frame);
     match frame.cause() {
         Trap::Interrupt(Interrupt::Software) => {
             // An IPI: new work was queued here. Clear it; the idle loop or
@@ -1441,13 +1099,7 @@ fn handle_trap(frame: &mut TrapFrame) {
             unsafe { riscv64::write_sip(riscv64::read_sip() & !riscv64::SIE_SSIE) };
             osmium::sched::preempt_if_needed();
         }
-        cause @ (Trap::Breakpoint | Trap::PageFault { .. }) if RECOVER[cpu::current_id()].load(Ordering::SeqCst) => {
-            *RECOVERED[cpu::current_id()].lock() = Some(cause);
-            // Step over the instruction: 2 bytes if compressed, else 4.
-            // SAFETY: the faulting instruction is mapped executable code.
-            let insn = unsafe { (frame.pc() as *const u16).read() };
-            frame.set_pc(frame.pc() + if insn & 3 == 3 { 4 } else { 2 });
-        }
+        Trap::Breakpoint | Trap::PageFault { .. } if demos::fault::recovered(frame) => {}
         Trap::Interrupt(Interrupt::External) => {
             if let Some(plic) = PLIC.get() {
                 IRQS.handle_pending(plic);
@@ -1458,8 +1110,14 @@ fn handle_trap(frame: &mut TrapFrame) {
             // Leaving an interrupt is a preemption point.
             osmium::sched::preempt_if_needed();
         }
-        cause => panic!("unhandled trap {cause:?} at pc {:#x}", frame.pc()),
+        cause => unhandled(frame, cause),
     }
+}
+
+/// A kernel trap with no handler: a bug in this kernel, so stop it.
+#[allow(clippy::panic)] // a kernel trap nothing handles leaves no safe way on
+fn unhandled(frame: &TrapFrame, cause: Trap) -> ! {
+    panic!("unhandled trap {cause:?} at pc {:#x}", frame.pc())
 }
 
 /// Called on every supervisor timer interrupt.
@@ -1467,8 +1125,7 @@ fn on_timer() {
     if cpu::current_id() == 0 {
         TICKS.fetch_add(1, Ordering::Relaxed);
     }
-    let rate = RATE.get().expect("RATE initialised");
-    sbi::set_timer(cpu::ticks() + rate.ns_to_ticks(TICK_NS));
+    arm_timer();
     TIMERS.process(now_ns());
     osmium::sched::tick();
 }
@@ -1488,28 +1145,4 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     }
     let _ = writeln!(Sbi, "\n[panic] {info}");
     sbi::shutdown()
-}
-
-/// Seeds a generator from the CPU's random number instructions, draws from
-/// it, and runs the TLS self-test on it.
-fn rand_demo() {
-    static RNG: osmium::rand::SharedRng = osmium::rand::SharedRng::new();
-    if !osmium::rand::CpuEntropy::available() {
-        println!("[rand]  no CPU random number instructions");
-        return;
-    }
-    match RNG.seed(&osmium::rand::CpuEntropy) {
-        Ok(()) => match (RNG.next_u64(), RNG.next_u64()) {
-            (Ok(a), Ok(b)) if a != b => {
-                println!("[rand]  seeded from the CPU; draws differ");
-                // Any time will do: the self-test's certificate is valid around it.
-                match osmium::tls::self_test(&RNG, 1_800_000_000) {
-                    Ok(()) => println!("[tls]   self-test passed: TLS 1.3 handshake and echo"),
-                    Err(e) => println!("[tls]   self-test failed: {e}"),
-                }
-            }
-            r => println!("[rand]  seeded, but draws look wrong: {r:?}"),
-        },
-        Err(e) => println!("[rand]  {e}"),
-    }
 }

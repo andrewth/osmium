@@ -181,6 +181,16 @@ pub trait File: Send + Sync {
         POLLIN | POLLOUT
     }
 
+    /// The queue this file notifies after each change to what
+    /// [`poll`](File::poll) reports, so a waiter can sleep until this file
+    /// changes rather than until anything does. `None` (the default) for a
+    /// file that never changes on its own, or does not say when it does:
+    /// waiters then fall back to whatever global wake-up their layer has
+    /// (in `osmium-proc`, a timer tick).
+    fn poll_queue(&self) -> Option<&crate::PollQueue> {
+        None
+    }
+
     /// Device-specific control (`ioctl`); returns the call's result.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<usize, Errno> {
         let _ = (cmd, arg);

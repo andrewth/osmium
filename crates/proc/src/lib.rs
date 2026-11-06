@@ -88,6 +88,7 @@ mod process;
 mod reloc;
 mod restart;
 mod scm;
+mod sigfp;
 pub mod signal;
 mod sigqueue;
 pub mod socket;

@@ -1,12 +1,12 @@
-/* Loaded by QEMU's PVH loader at its physical link address. */
-ENTRY(pvh_start)
+/* Shared by the AArch64 examples (aarch64-virt, aarch64-hyp, aarch64-vhe).
+   QEMU virt: RAM starts at 0x40000000 and, for ELF kernels, the device tree
+   is placed at its base, so the kernel is linked above it. */
+ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x200000;
+    . = 0x40200000;
     _kernel_start = .;
-
-    .note : { KEEP(*(.note.Xen)) }
 
     .text : {
         *(.text.entry)
@@ -19,12 +19,12 @@ SECTIONS
 
     . = ALIGN(4K);
     _erodata = .;
-    .data : { *(.data .data.*) *(.got .got.*) }
+    .data : { *(.data .data.*) }
 
     . = ALIGN(4K);
     .bss (NOLOAD) : {
         _bss_start = .;
-        *(.bss.boot)
+        *(.bss.stack)
         *(.bss .bss.*)
         *(COMMON)
         . = ALIGN(8);

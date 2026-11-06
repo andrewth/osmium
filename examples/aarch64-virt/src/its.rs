@@ -20,15 +20,16 @@ use osmium::hal::irq::IrqHandler;
 use osmium::hal::mmio::IoMem;
 use osmium::hal::pci::{self, Function, MsiError};
 use osmium::hal::println;
-use osmium::hal::timer::Clock;
-use osmium::mm::{MapFlags, PAGE_SIZE, PhysAddr, VirtAddr};
+
+use osmium::mm::PhysAddr;
 use osmium::storage::nvme::{self, Interrupts, IrqSignal, Nvme, NvmeError};
 use osmium::sync::Once;
 use osmium::sysdrv::gicv3::its::{Its, ItsConfig, ItsError};
 use osmium::sysdrv::gicv3::lpi::{LpiError, LpiTables};
 use osmium::sysdrv::gicv3::{FIRST_LPI, GicV3, SysRegs};
 
-use crate::{FRAMES, Frames, Gic};
+use crate::Gic;
+use demos::kernel::{FRAMES, Frames, Uptime};
 
 /// The LPI tables every redistributor reads; they must outlive the GIC.
 static LPI_TABLES: Once<LpiTables<'static, Frames>> = Once::new();
@@ -37,14 +38,6 @@ static LPI_TABLES: Once<LpiTables<'static, Frames>> = Once::new();
 static ADMIN: AtomicU32 = AtomicU32::new(0);
 /// Raised by entry 1's LPI, for the NVMe driver to wait on.
 static IO: IrqSignal = IrqSignal::new();
-
-struct Uptime;
-
-impl Clock for Uptime {
-    fn now_ns(&self) -> u64 {
-        crate::now_ns()
-    }
-}
 
 #[derive(Debug)]
 #[allow(dead_code)] // fields are only printed
@@ -80,34 +73,20 @@ impl From<NvmeError> for Error {
     }
 }
 
-/// Identity-maps `[addr, addr + size)` as device memory (the pages not
-/// mapped yet) and returns a window onto it.
-fn map(addr: u64, size: u64) -> IoMem {
-    let mut guard = crate::PT.lock();
-    let pt = guard.as_mut().expect("kernel page table installed");
-    let end = (addr + size).next_multiple_of(PAGE_SIZE as u64);
-    for page in (addr & !(PAGE_SIZE as u64 - 1)..end).step_by(PAGE_SIZE) {
-        if pt.translate(VirtAddr::new(page)).is_none() {
-            let flags = MapFlags::RW | MapFlags::DEVICE | MapFlags::GLOBAL;
-            pt.map_range(VirtAddr::new(page), PhysAddr::new(page), PAGE_SIZE as u64, flags).expect("map_range failed");
-        }
-    }
-    // SAFETY: just mapped as device memory; the demo owns the device.
-    unsafe { IoMem::new(addr as *mut u8, size as usize) }
+/// Identity-maps `[addr, addr + size)` in the kernel's table as device
+/// memory and returns a window onto it.
+///
+/// # Safety
+/// The window must be a device's registers that this demo owns.
+unsafe fn map(addr: u64, size: u64) -> IoMem {
+    // SAFETY: the caller's contract.
+    unsafe { demos::kernel::map_io(&crate::PT, addr, size) }
 }
 
 /// Spins for up to 100 ms until `done` holds.
 fn wait(done: impl Fn() -> bool) -> bool {
-    let deadline = crate::now_ns() + 100_000_000;
-    while !done() {
-        if crate::now_ns() > deadline {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-    true
+    demos::kernel::wait_for(100_000_000, done)
 }
-
 /// The PCIe host bridge: its ECAM window and its 32-bit memory window.
 pub struct HostBridge {
     pub ecam: (u64, u64),
@@ -158,7 +137,8 @@ pub fn demo(fdt: &Fdt<'_>) {
         println!("[its]   no PCIe host bridge; skipping");
         return;
     };
-    let cfg = pci::Ecam::new(map(bridge.ecam.0, bridge.ecam.1.min(1 << 20)), 0);
+    // SAFETY: the bridge's ECAM window from the device tree; only this demo uses it.
+    let cfg = pci::Ecam::new(unsafe { map(bridge.ecam.0, bridge.ecam.1.min(1 << 20)) }, 0);
     let mut found = None;
     pci::for_each_function(&cfg, 0, |f| {
         if found.is_none() && f.class() == pci::Class::NVME {
@@ -176,7 +156,8 @@ pub fn demo(fdt: &Fdt<'_>) {
         return;
     };
     println!("[its]   ITS at {its_phys:#x}; nvme {:02x}:{:02x}.{} is device {dev:#x}", a.bus, a.device, a.function);
-    let its = map(its_phys, its_len);
+    // SAFETY: the ITS's registers from the device tree, for this driver alone.
+    let its = unsafe { map(its_phys, its_len) };
     if let Err(e) = run(gic, its, PhysAddr::new(its_phys), PhysAddr::new(gicr_phys), &func, dev, &bridge) {
         println!("[its]   {e:?}");
     }
@@ -196,7 +177,10 @@ fn run(
     let id_bits = gic.lpi_id_bits().ok_or(LpiError::Unsupported)?.min(14);
     let tables = match LPI_TABLES.get() {
         Some(t) => t,
-        None => LPI_TABLES.call_once(|| LpiTables::new(&FRAMES, id_bits).expect("LPI tables")),
+        None => {
+            let tables = LpiTables::new(&FRAMES, id_bits)?;
+            LPI_TABLES.call_once(|| tables)
+        }
     };
     let its = Its::new(its_regs, its_phys, &FRAMES, &Uptime, ItsConfig { device_bits: 16, vpes: 0 })?;
     let (cpu, icid) = osmium::arch::irq::without(|| -> Result<_, Error> {
@@ -219,7 +203,8 @@ fn run(
     let bar = |i| func.bar(i).filter(|b| b.address != 0).ok_or(Error::NoBar);
     let (regs, table_bar) = (bar(nvme::BAR)?, bar(msix.table_bir())?);
     func.enable_memory_and_dma();
-    let table = msix.table(&map(table_bar.address, table_bar.size))?;
+    // SAFETY: the BAR holding the MSI-X table, assigned above; only this demo uses it.
+    let table = msix.table(&unsafe { map(table_bar.address, table_bar.size) })?;
     for i in 0..table.len() {
         table.set_masked(i, true)?;
     }
@@ -235,7 +220,8 @@ fn run(
     table.set_masked(0, false)?;
     msix.enable(func);
 
-    let disk = Nvme::new(map(regs.address, regs.size), &FRAMES, &Uptime)?;
+    // SAFETY: the controller's register BAR, assigned above; this driver owns it.
+    let disk = Nvme::new(unsafe { map(regs.address, regs.size) }, &FRAMES, &Uptime)?;
     let ok = wait(|| ADMIN.load(Ordering::Relaxed) > 0);
     let n = ADMIN.load(Ordering::Relaxed);
     if ok {
@@ -266,7 +252,8 @@ fn run(
     table.set_masked(1, false)?;
     let idle = || core::hint::spin_loop();
     let irq = Interrupts { vector: 1, signal: &IO, idle: &idle };
-    let mut disk = Nvme::with_interrupts(map(regs.address, regs.size), &FRAMES, &Uptime, irq)?;
+    // SAFETY: as above; the first driver instance has been dropped.
+    let mut disk = Nvme::with_interrupts(unsafe { map(regs.address, regs.size) }, &FRAMES, &Uptime, irq)?;
     let before = IO.count();
     let mut buf = alloc::vec![0xa5u8; 4 * nvme::DATA_LEN];
     let read = disk.read_blocks(0, &mut buf).is_ok() && buf.iter().all(|&b| b == 0);

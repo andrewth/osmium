@@ -490,6 +490,14 @@ extern "C" fn on_signal(sig: i32, _info: *const u8, _ctx: *const u8) {
     GOT_SIGNAL.store(sig as u32, Ordering::SeqCst);
 }
 
+static GOT_FP_SIGNAL: AtomicU32 = AtomicU32::new(0);
+
+/// Changes the FP registers, which the interrupted code must not see.
+extern "C" fn on_fp_signal(_sig: i32, _info: *const u8, _ctx: *const u8) {
+    sys::fp_set(0x5555_aaaa_5555_aaaa, false);
+    GOT_FP_SIGNAL.fetch_add(1, Ordering::SeqCst);
+}
+
 extern "C" fn on_chld(_sig: i32, _info: *const u8, _ctx: *const u8) {
     GOT_CHLD.fetch_add(1, Ordering::SeqCst);
 }
@@ -753,10 +761,23 @@ fn signals_and_threads() {
     while STARTED.load(Ordering::SeqCst) < 3 {
         sys::call(sys::SCHED_YIELD, [0; 5]);
     }
-    GATE.store(1, Ordering::SeqCst);
-    // REQUEUE: wake 1, move up to 2 more to GATE2.
-    let moved = sys::call(sys::FUTEX, [GATE.as_ptr() as u64, 128 | 3, 1, 2, GATE2.as_ptr() as u64]);
-    sys::call(sys::FUTEX, [GATE2.as_ptr() as u64, 128 | 1, 10, 0, 0]);
+    // The gate stays shut, so a waiter that has not reached FUTEX_WAIT yet
+    // still goes to sleep when it does. REQUEUE with no wake-ups moves the
+    // sleepers to GATE2 as they arrive, until all three have been moved:
+    // only a sleeping waiter can be moved, so then all three are asleep.
+    let mut moved = 0;
+    for _ in 0..100_000 {
+        if moved >= 3 {
+            break;
+        }
+        let r = sys::call(sys::FUTEX, [GATE.as_ptr() as u64, 128 | 3, 0, 3 - moved as u64, GATE2.as_ptr() as u64]);
+        moved += r.max(0);
+        sys::call(sys::SCHED_YIELD, [0; 5]);
+    }
+    // Then REQUEUE proper: wake one of them, move the other two back to GATE,
+    // and wake those there.
+    let woke_and_moved = sys::call(sys::FUTEX, [GATE2.as_ptr() as u64, 128 | 3, 1, 2, GATE.as_ptr() as u64]);
+    let woken = sys::call(sys::FUTEX, [GATE.as_ptr() as u64, 128 | 1, 10, 0, 0]);
     for (i, &tid) in tids.iter().enumerate() {
         // SAFETY: as above; the kernel clears the word when the thread ends.
         let ctid = unsafe { (&raw mut WAITER_CTIDS) as *mut u32 }.wrapping_add(i);
@@ -764,7 +785,14 @@ fn signals_and_threads() {
             sys::call(sys::FUTEX, [ctid as u64, 128, tid as u64, 0, 0]);
         }
     }
-    let ok = tids.iter().all(|&t| t > 0) && (0..=3).contains(&moved) && FINISHED.load(Ordering::SeqCst) == 3;
+    let ok = tids.iter().all(|&t| t > 0)
+        && moved == 3
+        && woke_and_moved == 3
+        && woken == 2
+        && FINISHED.load(Ordering::SeqCst) == 3;
+    if !ok {
+        say!("threads: requeue: moved {moved} sleepers, then woke one and moved {woke_and_moved} in all, woke {woken}");
+    }
     say!(
         "threads: 3 threads slept on a futex, were requeued and woken, and joined: {}",
         if ok { "ok" } else { "FAILED" }
@@ -1214,6 +1242,14 @@ unsafe extern "C" fn main(sp: *const u64) -> ! {
         let (_, code) = wait(-1);
         let ok = kept && code == 0 && sys::fp_get() == ours;
         say!("fp: FP registers inherited by fork and kept across switches: {}", if ok { "ok" } else { "FAILED" });
+
+        // A handler that changes them leaves the program's as they were: the
+        // signal frame saves them and `rt_sigreturn` restores them.
+        catch(10, on_fp_signal);
+        let me = sys::call(sys::GETPID, [0; 5]) as u64;
+        let r = sys::call(sys::KILL, [me, 10, 0, 0, 0]);
+        let ok = r == 0 && GOT_FP_SIGNAL.load(Ordering::SeqCst) == 1 && sys::fp_get() == ours;
+        say!("fp: FP registers restored after a signal handler changed them: {}", if ok { "ok" } else { "FAILED" });
     } else {
         say!("fp: the kernel does not offer FP (AT_HWCAP)");
     }

@@ -1,4 +1,5 @@
-/* Loaded by OpenSBI at the start of S-mode payload space on QEMU virt. */
+/* Shared by the RISC-V S-mode examples (riscv-virt, riscv-hyp): loaded by
+   OpenSBI at the start of S-mode payload space on QEMU virt. */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 

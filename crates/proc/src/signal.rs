@@ -23,12 +23,13 @@
 //! the registers, the mask and the alternate stack from the `ucontext`, as a
 //! handler may have changed them.
 //!
-//! The FP/SIMD registers are not part of the frame: x86_64's `fpstate` is
-//! null, AArch64's `sigcontext` has no `fpsimd_context` record (only the
-//! terminating one) and RISC-V's FP state is zero. They are not saved across
-//! a handler either, so a handler must leave them as it found them (code
-//! built with FP or vector instructions, including a C library's `memcpy`,
-//! may not).
+//! The FP/SIMD registers are saved in the frame as Linux saves them, and
+//! `rt_sigreturn` restores them (after checking them, so a forged frame
+//! cannot make the kernel fault): x86_64's `fpstate` points at an FXSAVE or
+//! XSAVE area above the frame, AArch64's `sigcontext` has a
+//! `fpsimd_context` record, and RISC-V's holds the D extension's state; see
+//! the `sigfp` module. A kernel that leaves FP off (soft-float user
+//! programs) saves none. SVE state beyond the FP registers is not saved.
 //!
 //! `sigaltstack` and `SA_ONSTACK`, `rt_sigsuspend`, queued real-time signals, and
 //! stopping and continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT`, reported by
@@ -254,14 +255,12 @@ fn poke(p: &Process, th: Option<&Thread>) {
         Some(th) => wake_thread(th),
         None => wake_threads(p),
     }
-    // Futex waits are not yet registered per thread (see `wait_on`).
-    crate::futex::interrupt();
     p.child_exited.wake_all();
 }
 
 /// Makes every thread of `p` that is blocked in an interruptible wait
-/// (`poll`, `select`, `epoll`, pipe and socket I/O, `accept`, `connect`, a
-/// stop, `sigsuspend`, `execve`'s wait for the other threads) look again,
+/// (`futex`, `poll`, `select`, `epoll`, pipe and socket I/O, `accept`,
+/// `connect`, a stop, `sigsuspend`, `execve`'s wait for the other threads) look again,
 /// so that one that is interrupted or whose process is ending gives up.
 /// Other processes' sleepers are left alone.
 pub(crate) fn wake_threads(p: &Process) {
@@ -271,16 +270,12 @@ pub(crate) fn wake_threads(p: &Process) {
 /// [`wake_threads`] for one thread.
 fn wake_thread(th: &Thread) {
     let sleep = th.sleep.lock();
-    if *sleep == 0 {
-        return;
-    }
-    if let Some(task) = th.ext.task() {
-        // SAFETY: `wait_on` stores the address of a queue it borrows for as
-        // long as the address is set, and clears it under this lock before
-        // the borrow ends, so the queue is alive while the lock is held.
-        let queue = unsafe { &*core::ptr::with_exposed_provenance::<osmium_sched::WaitQueue>(*sleep) };
-        queue.wake_task(&task);
-    }
+    let Some((addr, task)) = &*sleep else { return };
+    // SAFETY: `wait_on_for` stores the address of a queue it borrows for as
+    // long as the address is set, and clears it under this lock before the
+    // borrow ends, so the queue is alive while the lock is held.
+    let queue = unsafe { &*core::ptr::with_exposed_provenance::<osmium_sched::WaitQueue>(*addr) };
+    queue.wake_task(task);
 }
 
 /// Waits in `queue` until `cond` returns `Some`, as
@@ -292,13 +287,28 @@ fn wake_thread(th: &Thread) {
 /// Lock order: a thread's `sleep` lock is taken before the queue's, so
 /// `cond`, which runs under the queue's lock, must not take a thread
 /// group's lock.
-pub(crate) fn wait_on<R>(queue: &osmium_sched::WaitQueue, cond: impl FnMut() -> Option<R>) -> R {
+pub(crate) fn wait_on<R>(queue: &osmium_sched::WaitQueue, mut cond: impl FnMut() -> Option<R>) -> R {
+    if let Some(r) = cond() {
+        return r;
+    }
     let task = osmium_sched::current();
-    let Some(user) = task.data::<crate::process::UserTask>() else { return queue.wait_until(cond) };
-    let th = &user.thread;
-    *th.sleep.lock() = core::ptr::from_ref(queue).expose_provenance();
+    match task.data::<crate::process::UserTask>() {
+        Some(user) => wait_on_for(&user.thread, queue, cond),
+        None => queue.wait_until(cond),
+    }
+}
+
+/// [`wait_on`] on behalf of thread `th`: a signal for `th` (or its process
+/// ending) wakes the calling task. The same lock order applies.
+pub(crate) fn wait_on_for<R>(th: &Thread, queue: &osmium_sched::WaitQueue, mut cond: impl FnMut() -> Option<R>) -> R {
+    if let Some(r) = cond() {
+        return r;
+    }
+    let me = osmium_sched::current();
+    // The task is dropped (released) after the lock, not under it.
+    let _was = th.sleep.lock().replace((core::ptr::from_ref(queue).expose_provenance(), me));
     let r = queue.wait_until(cond);
-    *th.sleep.lock() = 0;
+    let _me = th.sleep.lock().take();
     r
 }
 
@@ -554,16 +564,35 @@ fn push_frame<R: UserRegs>(
     let saved_mask = th.sig.take_saved_mask().unwrap_or_else(|| th.mask.load(Ordering::SeqCst));
     put(head, uc + f.sigmask, &saved_mask.to_ne_bytes())?;
     regs.save_mcontext(head.get_mut(uc + f.mcontext..).ok_or(Errno::EFAULT)?, fault.unwrap_or(0), saved_mask);
+    let fp = crate::sigfp::for_frame(f.fp);
+    crate::sigfp::save(f.fp, head, uc + f.mcontext, fp.as_ref())?;
+    // x86_64's FP state goes in an area of its own, above the frame.
+    let fp_area = if f.fp == crate::sigfp::FpLayout::X86_64 { crate::sigfp::x86_area_len(fp.as_ref()) } else { 0 };
     // Below the stack (or at the top of the alternate one), aligned as a
-    // handler entered by a call expects.
-    let place = |below: u64| below.checked_sub(f.size).and_then(|b| (b & !15).checked_sub(f.misalign));
-    let base = match th.sig.alt_top(act.flags, user_sp) {
+    // handler entered by a call expects, below the FP area if there is one.
+    let place = |below: u64| {
+        let below =
+            if fp_area == 0 { below } else { below.checked_sub(fp_area)? & !(crate::sigfp::X86_AREA_ALIGN - 1) };
+        let frame = below.checked_sub(f.size).and_then(|b| (b & !15).checked_sub(f.misalign))?;
+        Some((frame, below))
+    };
+    let (base, fp_va) = match th.sig.alt_top(act.flags, user_sp) {
         // `SA_ONSTACK` with an alternate stack that is not in use: its top, with no red zone to keep.
-        Some((top, low)) => place(top).filter(|&sp| sp >= low),
+        Some((top, low)) => place(top).filter(|&(sp, _)| sp >= low),
         None => user_sp.checked_sub(R::RED_ZONE).and_then(place),
     }
-    .filter(|&sp| sp != 0)
+    .filter(|&(sp, _)| sp != 0)
     .ok_or(Errno::EFAULT)?;
+    if let Some(img) = fp.as_ref().filter(|_| fp_area != 0) {
+        let mut area = [0u8; crate::sigfp::IMAGE_MAX + 4];
+        let area = area.get_mut(..fp_area as usize).ok_or(Errno::EFAULT)?;
+        crate::sigfp::x86_area(img, area)?;
+        p.memory().write(fp_va, area)?;
+        put(head, uc + f.mcontext + crate::sigfp::X86_FPSTATE, &fp_va.to_ne_bytes())?;
+        if img.is_xsave() {
+            put(head, uc, &(f.uc_flags | crate::sigfp::UC_FP_XSTATE).to_ne_bytes())?;
+        }
+    }
     if let Some(slot) = f.ret_slot {
         put(head, slot, &ra.to_ne_bytes())?;
     }
@@ -582,12 +611,13 @@ fn push_frame<R: UserRegs>(
     if act.flags & sa::RESETHAND != 0 {
         p.signals.set_action(sig, SigAction::default());
     }
+    crate::sigfp::enter_handler(f.fp, fp.is_some());
     regs.enter_handler(act.handler, base, ra, [sig as u64, base + f.info as u64, base + uc as u64]);
     Ok(())
 }
 
-/// `rt_sigreturn`: restores the registers, mask and alternate stack saved in
-/// the signal frame's `ucontext` (as the handler may have changed them),
+/// `rt_sigreturn`: restores the registers (FP/SIMD too), mask and alternate
+/// stack saved in the signal frame's `ucontext` (as the handler may have changed them),
 /// finding the frame at the stack pointer, where the handler's return left
 /// it. Only unprivileged registers can be restored, so a forged frame is no
 /// more than the program could do anyway.
@@ -602,6 +632,12 @@ pub(crate) fn sigreturn<R: UserRegs>(p: &Process, th: &Thread, regs: &mut R) -> 
         return Some(status);
     }
     let uc = f.uc;
+    if crate::sigfp::restore(p, f.fp, head, uc + f.mcontext).is_err() {
+        // A malformed or forged FP state: the program cannot continue.
+        let status = ExitStatus::Signal(SIGSEGV);
+        kill_group(p, status);
+        return Some(status);
+    }
     let word = |off: usize| crate::bytes::u64_at(head, off).unwrap_or(0);
     th.mask.store(word(uc + f.sigmask) & !UNBLOCKABLE, Ordering::SeqCst);
     regs.restore_mcontext(head.get(uc + f.mcontext..).unwrap_or_default());

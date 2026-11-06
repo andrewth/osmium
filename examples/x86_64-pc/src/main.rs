@@ -17,12 +17,13 @@ mod msi;
 mod usb;
 
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use core::ptr::NonNull;
-use osmium::arch::trap::{self, Access, Trap, TrapFrame};
+use demos::guest::image;
+pub(crate) use demos::kernel::{FRAMES, Frames, now_ns};
+use demos::kernel::{GuardedStacks, KernelTable};
+use osmium::arch::trap::{self, Trap, TrapFrame};
 use osmium::arch::x86_64 as x86;
 use osmium::arch::{MAX_CPUS, cpu, irq};
 use osmium::boot::acpi::{Acpi, Dmar, EcamWindow, HpetTable, Ivrs, Madt, Mcfg};
@@ -32,20 +33,17 @@ use osmium::hal::display::{Display, FramebufferInfo};
 use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
 use osmium::hal::timer::{Clock, TickRate};
-use osmium::mm::frame::order_for;
 use osmium::mm::heap::LockedHeap;
-use osmium::mm::paging::PageSize;
 use osmium::mm::paging::formats::X86_64;
-use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
+use osmium::mm::{MapFlags, MemoryMap, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
 use osmium::sysdrv::hpet::{self, Hpet};
 use osmium::sysdrv::lapic::{self, LocalApic};
 use osmium::sysdrv::pit::{self, Pit};
 use osmium::sysdrv::uart16550::{Pio, Uart16550};
 
-use osmium::proc::{AddressSpace, ExitStatus, Process, UserMemory};
+use osmium::sched::FifoScheduler;
 use osmium::sched::timer::TimerQueue;
-use osmium::sched::{FifoScheduler, StackAllocator, Task, TaskBuilder};
 use osmium::sync::{IrqSpinLock, Once};
 
 osmium::boot::pvh_start!(kmain, ap: ap_main);
@@ -109,6 +107,15 @@ fn sym(s: &u8) -> u64 {
     s as *const u8 as u64
 }
 
+/// The guard page below the boot stack: `osmium_boot::pvh_start!` puts the
+/// boot tables first in `.bss.boot` (`boot_pml4`, the PDPT and four PDs,
+/// one page each) and the 64 KiB boot stack right after them, so the page
+/// below the stack is the last page directory's. Only the CPU's page walker
+/// reads that page once the kernel's own table is active (physically, for
+/// application processors still on the boot tables), so its virtual mapping
+/// can go.
+const BOOT_STACK_GUARD_OFFSET: u64 = 5 * PAGE_SIZE as u64;
+
 const COM1: u16 = 0x3f8;
 /// RAM the PVH boot tables identity-map (`pvh_start!`): the first 4 GiB.
 const BOOT_MAPPED: u64 = 1 << 32;
@@ -136,28 +143,35 @@ const SPURIOUS_VECTOR: u8 = 0xff;
 const PIC_VECTORS: core::ops::Range<u8> = 0xe0..0xf0;
 /// Timer interrupt period.
 const TICK_NS: u64 = 10_000_000;
-
-type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
-
-// SAFETY: the kernel runs identity-mapped, before and after switching tables.
-static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
+/// Bytes of an [`ApStack`], its guard page included.
+const AP_STACK: u64 = size_of::<ApStack>() as u64;
 
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 
 /// The kernel page table, shared by all CPUs.
-static PT: IrqSpinLock<Option<PageTable<X86_64, &'static Frames>>> = IrqSpinLock::new(None);
+static PT: KernelTable<X86_64> = IrqSpinLock::new(None);
+
+/// Task stacks with an unmapped guard page below them, so an overflow
+/// faults instead of silently overwriting whatever lies beneath. The old
+/// mapping was global and may be cached on any CPU.
+static STACKS: GuardedStacks<X86_64> = GuardedStacks::new(&PT, |va| shootdown_others(va, 1));
 
 /// Gives this CPU its own GDT and TSS, with fresh stacks for double faults
 /// and for `ANY_STACK_VECTORS`.
 fn load_cpu_tables() {
     let tables = alloc::boxed::Box::leak(alloc::boxed::Box::new(x86::CpuTables::new()));
-    for slot in 0..=ANY_STACK_VECTORS.len() {
+    // A copy: the TSS is packed, so its fields cannot be borrowed.
+    let mut ist = tables.tss.ist;
+    for top in ist.iter_mut().take(ANY_STACK_VECTORS.len() + 1) {
         let stack = alloc::vec![0u8; 16 * 1024].leak();
-        tables.tss.ist[slot] = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
+        *top = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
     }
+    tables.tss.ist = ist;
     let ptr = &raw mut *tables;
-    CPU_TABLES[cpu::current_id()].store(ptr, Ordering::Relaxed);
+    if let Some(slot) = CPU_TABLES.get(cpu::current_id()) {
+        slot.store(ptr, Ordering::Relaxed);
+    }
     // SAFETY: the kernel is soft-float. Processes may use x87 and SSE: each
     // one's registers are switched with its task.
     unsafe { osmium::arch::fp::enable() };
@@ -200,11 +214,18 @@ fn avx_selftest() {
 }
 
 /// Application processors' first stacks (`AP_STACKS[cpu - 1]`; the boot CPU
-/// has its own), where each stays as its CPU's bootstrap task.
-#[repr(align(16))]
+/// has its own), where each stays as its CPU's bootstrap task. In the
+/// kernel image, not the heap: an AP first runs on the boot tables, which
+/// map only the first 4 GiB. Each sits above a guard page that is unmapped
+/// in the kernel's table, which the AP switches to first thing.
+#[repr(C, align(4096))]
 #[allow(dead_code)] // only its address is used
-struct ApStack([u8; 64 * 1024]);
-static mut AP_STACKS: [ApStack; MAX_CPUS - 1] = [const { ApStack([0; 64 * 1024]) }; MAX_CPUS - 1];
+struct ApStack {
+    guard: [u8; PAGE_SIZE],
+    stack: [u8; 64 * 1024],
+}
+static mut AP_STACKS: [ApStack; MAX_CPUS - 1] =
+    [const { ApStack { guard: [0; PAGE_SIZE], stack: [0; 64 * 1024] } }; MAX_CPUS - 1];
 
 /// Each CPU's GDT and TSS, so the switch hook can update `rsp[0]`.
 static CPU_TABLES: [core::sync::atomic::AtomicPtr<x86::CpuTables>; MAX_CPUS] =
@@ -223,7 +244,7 @@ fn on_switch(next: &osmium::sched::Task) {
     // FS.base is the thread pointer of the incoming thread (0 for kernel tasks).
     // SAFETY: a user-supplied base is checked to be canonical by `arch_prctl`.
     unsafe { x86::wrmsr(x86::msr::IA32_FS_BASE, osmium::proc::thread::tls_for(next).unwrap_or(0)) };
-    let tables = CPU_TABLES[cpu::current_id()].load(Ordering::Relaxed);
+    let tables = CPU_TABLES.get(cpu::current_id()).map_or(core::ptr::null_mut(), |t| t.load(Ordering::Relaxed));
     if let (Some(top), false) = (next.kernel_stack_top(), tables.is_null()) {
         // SAFETY: this CPU's own tables; interrupts are off during a switch.
         unsafe { (*tables).tss.rsp[0] = top as u64 };
@@ -254,20 +275,18 @@ fn shootdown_service() {
     }
 }
 
-/// Invalidates `va` on every online CPU and returns once all have done so.
-fn shootdown(va: usize) {
-    osmium::arch::mmu::flush_page(va);
-    shootdown_others(va, 1);
-}
-
 /// Invalidates `pages` pages from `va` on every online CPU but this one, and
 /// returns once they have all done so (the hook behind
 /// `osmium::arch::mmu::flush_remote`, for user threads on several CPUs).
 /// Waiting CPUs keep servicing requests, so two initiators cannot deadlock
 /// even when interrupts are off.
+#[allow(
+    clippy::expect_used,
+    reason = "a lost shootdown IPI would leave a stale TLB entry or hang the wait; neither can be recovered from"
+)]
 fn shootdown_others(va: usize, pages: usize) {
     let me = cpu::current_id();
-    let others = ((1usize << ONLINE.load(Ordering::Acquire)) - 1) & !(1 << me);
+    let others = ((1usize << demos::kernel::online()) - 1) & !(1 << me);
     if others == 0 {
         return;
     }
@@ -278,49 +297,17 @@ fn shootdown_others(va: usize, pages: usize) {
     SHOOT_ADDR.store(va, Ordering::Release);
     SHOOT_PAGES.store(pages, Ordering::Release);
     SHOOT_PENDING.store(others, Ordering::Release);
-    let apic = LAPIC.get().expect("LAPIC initialised");
-    for cpu in (0..MAX_CPUS).filter(|c| others & (1 << c) != 0) {
-        // The wait below would never end without the IPI.
-        apic.send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, SHOOTDOWN_VECTOR)
-            .expect("shootdown IPI accepted by the local APIC");
+    if let Some(apic) = LAPIC.get() {
+        for (_, id) in APIC_IDS.iter().enumerate().filter(|&(c, _)| others & (1 << c) != 0) {
+            // The wait below would never end without the IPI.
+            apic.send_ipi(id.load(Ordering::Relaxed) as u8, SHOOTDOWN_VECTOR)
+                .expect("shootdown IPI accepted by the local APIC");
+        }
     }
     while SHOOT_PENDING.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }
     SHOOT_BUSY.store(false, Ordering::Release);
-}
-
-/// Task stacks with an unmapped guard page below them, so an overflow
-/// faults instead of silently overwriting whatever lies beneath.
-struct GuardedStacks;
-
-// SAFETY: blocks come from the frame allocator (exclusive, page aligned) and
-// the usable part stays mapped read/write.
-unsafe impl StackAllocator for GuardedStacks {
-    fn alloc(&self, size: usize) -> Option<(NonNull<u8>, usize)> {
-        let order = order_for(size + PAGE_SIZE);
-        let guard = FRAMES.lock().alloc(order)?;
-        {
-            let mut pt = PT.lock();
-            let (_, flush) = pt.as_mut()?.unmap_4k(VirtAddr::new(guard.0)).ok()?;
-            flush.flush();
-        }
-        // The old mapping was global and may be cached on any CPU.
-        shootdown(guard.0 as usize);
-        Some((NonNull::new((guard.0 + PAGE_SIZE as u64) as *mut u8)?, (PAGE_SIZE << order) - PAGE_SIZE))
-    }
-
-    unsafe fn free(&self, base: NonNull<u8>, len: usize) {
-        let guard = base.as_ptr() as u64 - PAGE_SIZE as u64;
-        {
-            let mut pt = PT.lock();
-            let flags = MapFlags::RW | MapFlags::GLOBAL;
-            let pt = pt.as_mut().expect("as_mut returned None");
-            pt.map(VirtAddr::new(guard), PhysAddr::new(guard), PageSize::Size4K, flags).expect("map failed").flush();
-        }
-        // SAFETY: the block came from `alloc` with the same order.
-        unsafe { FRAMES.lock().dealloc(PhysAddr::new(guard), order_for(len + PAGE_SIZE)) };
-    }
 }
 
 /// Received bytes, from the COM1 interrupt handler to the reader task.
@@ -340,18 +327,12 @@ static UART: Once<SerialConsole<Uart16550<Pio>>> = Once::new();
 static LAPIC: Once<LocalApic> = Once::new();
 static SCHED: FifoScheduler = FifoScheduler::new(2).with_stealing();
 static TIMERS: TimerQueue = TimerQueue::new();
-static TSC_RATE: Once<TickRate> = Once::new();
 static TICKS: AtomicU64 = AtomicU64::new(0);
 /// APIC id of each logical CPU.
 static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
-static ONLINE: AtomicUsize = AtomicUsize::new(1);
 static CR3: AtomicU64 = AtomicU64::new(0);
 /// APIC timer initial count for one tick.
 static APIC_TICK_COUNT: AtomicU32 = AtomicU32::new(0);
-
-fn now_ns() -> u64 {
-    TSC_RATE.get().expect("TSC_RATE initialised").ticks_to_ns(cpu::ticks())
-}
 
 /// Powers QEMU off: ACPI PM1a control (q35/i440fx), then isa-debug-exit.
 fn shutdown() -> ! {
@@ -367,6 +348,11 @@ fn shutdown() -> ! {
 }
 
 #[unsafe(no_mangle)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "boot: what QEMU's machine provides is set up once here, so a failure means a broken machine or a bug in this example; the panic handler reports which"
+)]
 extern "C" fn kmain(start_info: usize) -> ! {
     trap::set_handler(on_trap);
     // SAFETY: we run on the boot stack from here on.
@@ -454,21 +440,13 @@ extern "C" fn kmain(start_info: usize) -> ! {
     for r in map.regions() {
         println!("[mem]   {:#011x}..{:#011x} {:?}", r.start.0, r.end.0, r.kind);
     }
-    {
-        let mut buddy = FRAMES.lock();
-        // Only RAM below 4 GiB for now: the allocator writes into free
-        // frames, and the boot tables map just the first 4 GiB. The rest is
-        // added once the kernel's own table maps it.
-        for r in map.usable().filter(|r| r.start.0 < BOOT_MAPPED) {
-            // SAFETY: the memory map says the range is free RAM, identity-mapped.
-            unsafe { buddy.add_region(r.start, r.end.min(PhysAddr::new(BOOT_MAPPED))) };
-        }
-        println!(
-            "[frame] buddy allocator: {} free frames ({} MiB)",
-            buddy.free_frames(),
-            (buddy.free_frames() * PAGE_SIZE) >> 20
-        );
-    }
+    // Only RAM below 4 GiB for now: the allocator writes into free frames,
+    // and the boot tables map just the first 4 GiB. The rest is added once
+    // the kernel's own table maps it.
+    let below = PhysAddr::new(BOOT_MAPPED);
+    // SAFETY: the memory map says the ranges are free RAM, identity-mapped.
+    unsafe { demos::kernel::add_ram(map.usable().filter(|r| r.start < below).map(|r| r.start..r.end.min(below))) };
+    demos::kernel::report_frames();
 
     // --- Heap ------------------------------------------------------------
     HEAP.init(&FRAMES);
@@ -519,16 +497,21 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: the new table maps the running code, its stack, the heap and the APIC.
     unsafe { x86::write_cr3(pt.root().0) };
     CR3.store(pt.root().0, Ordering::Release);
-    {
-        let mut buddy = FRAMES.lock();
-        for r in map.usable().filter(|r| r.end.0 > BOOT_MAPPED) {
-            // SAFETY: free RAM, identity-mapped by the table just loaded.
-            unsafe { buddy.add_region(r.start.max(PhysAddr::new(BOOT_MAPPED)), r.end) };
-        }
+    // SAFETY: free RAM, identity-mapped by the table just loaded.
+    unsafe { demos::kernel::add_ram(map.usable().filter(|r| r.end > below).map(|r| r.start.max(below)..r.end)) };
+    // Guard pages below the boot stack and the APs' stacks (see
+    // `BOOT_STACK_GUARD_OFFSET` and `ApStack`).
+    // SAFETY: a linker symbol; only the address is taken.
+    let boot_guard = unsafe { sym(&boot_pml4) } + BOOT_STACK_GUARD_OFFSET;
+    let ap_stacks = (&raw const AP_STACKS) as u64;
+    let guards = core::iter::once(boot_guard).chain((0..MAX_CPUS as u64 - 1).map(|i| ap_stacks + i * AP_STACK));
+    let guarded =
+        guards.filter(|&g| g.is_multiple_of(PAGE_SIZE as u64) && demos::kernel::unmap_guard(&mut pt, g)).count();
+    demos::kernel::set_boot_stack_limit(boot_guard as usize + PAGE_SIZE);
+    if let Some(t) = pt.translate(va(kmain as *const () as u64)) {
+        println!("[mmu]   CR3 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
     }
-    let t = pt.translate(va(kmain as *const () as u64)).expect("translate failed");
-    println!("[mmu]   CR3 {:#x}; kmain mapped {:?} via {:?} page", pt.root().0, t.flags, t.size);
-    rand_demo();
+    demos::kernel::rand_demo();
     *PT.lock() = Some(pt);
     load_cpu_tables();
     // SAFETY: this CPU's TSS now has a double-fault stack; APs load theirs
@@ -538,11 +521,14 @@ extern "C" fn kmain(start_info: usize) -> ! {
         // SAFETY: as above; load_cpu_tables fills these IST slots too.
         unsafe { trap::set_ist(vector, DOUBLE_FAULT_IST + 1 + i as u8) };
     }
-    osmium::sched::set_stack_allocator(&GuardedStacks);
+    osmium::sched::set_stack_allocator(&STACKS);
     osmium::sched::set_switch_hook(on_switch);
     // SAFETY: the syscall handler treats every argument as untrusted.
     unsafe { trap::allow_from_user(trap::SYSCALL_VECTOR) };
-    println!("[guard] task stacks get unmapped guard pages; double faults run on IST{DOUBLE_FAULT_IST}");
+    println!(
+        "[guard] task stacks and {guarded} boot stacks get unmapped guard pages; double faults run on \
+         IST{DOUBLE_FAULT_IST}"
+    );
     avx_selftest();
 
     // --- Displays: the VESA framebuffer, then PCI adapters (virtio-vga) -----
@@ -552,7 +538,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // SAFETY: the PIT and port 0x61 belong to this kernel.
     let pit = Pit::new(unsafe { pit::Pio::new() });
     let tsc_hz = pit.calibrate(10_000_000, cpu::ticks);
-    TSC_RATE.call_once(|| TickRate::new(tsc_hz));
+    demos::kernel::set_rate(TickRate::new(tsc_hz));
     // Move the legacy 8259 PICs off the exception vectors (their power-on
     // bases alias IRQ 0-7 onto vectors 8-15, IRQ 0 onto #DF), then mask
     // them; the local APIC delivers everything. Only spurious IRQ 7 or 15
@@ -602,20 +588,20 @@ extern "C" fn kmain(start_info: usize) -> ! {
     // --- Application processors (INIT, STARTUP, STARTUP) ---------------------
     osmium::sched::set_remote_wake_hook(|cpu| {
         // A lost wake-up is picked up at that CPU's next tick.
-        let _ = LAPIC.get().expect("LAPIC initialised").send_ipi(APIC_IDS[cpu].load(Ordering::Relaxed) as u8, IPI_VECTOR);
+        if let (Some(apic), Some(id)) = (LAPIC.get(), APIC_IDS.get(cpu)) {
+            let _ = apic.send_ipi(id.load(Ordering::Relaxed) as u8, IPI_VECTOR);
+        }
     });
     osmium::arch::mmu::set_remote_flush(shootdown_others);
     // SAFETY: the trampoline page is free low memory (reserved from the
     // allocator), mapped writable above; no AP is starting yet.
     unsafe { x86::smp::install() };
     for (cpu, apic_id) in APIC_IDS.iter().enumerate().take(ncpus).skip(1) {
-        // In the kernel image, not the heap: the AP first runs on the boot
-        // tables, which map only the first 4 GiB.
         // SAFETY: only the address is taken; this AP is its sole user.
         let stack = unsafe { &raw mut AP_STACKS[cpu - 1] };
         let boot = x86::smp::ApBoot {
             cr3: &raw const boot_pml4 as u64,
-            stack_top: (stack as u64 + size_of::<ApStack>() as u64) & !15,
+            stack_top: (stack as u64 + AP_STACK) & !15,
             entry: ap_start64 as *const () as u64,
             cpu,
         };
@@ -633,11 +619,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
         // One AP at a time: they share the trampoline's slots. One that
         // never checks in ends the bring-up (it may still be in the
         // trampoline), so CPU indices stay dense.
-        let deadline = now_ns() + 1_000_000_000;
-        while ONLINE.load(Ordering::Acquire) <= cpu && now_ns() < deadline {
-            core::hint::spin_loop();
-        }
-        if ONLINE.load(Ordering::Acquire) <= cpu {
+        if !demos::kernel::wait_online(cpu + 1) {
             println!(
                 "[smp]   APIC id {} did not check in within 1 s; continuing with {cpu} CPUs",
                 apic_id.load(Ordering::Relaxed)
@@ -653,8 +635,8 @@ extern "C" fn kmain(start_info: usize) -> ! {
         demos::smp(ncpus);
         demos::balance(ncpus, &|| SCHED.steals());
     }
-    fault_demo();
-    overflow_demo();
+    demos::fault::fault_demo();
+    demos::fault::overflow_demo();
     demos::user::boot_vfs();
     user_demo();
     serial_demo();
@@ -666,7 +648,7 @@ extern "C" fn kmain(start_info: usize) -> ! {
     println!(
         "[done]  {} timer ticks, {} free frames; shutting down",
         TICKS.load(Ordering::Relaxed),
-        FRAMES.lock().free_frames()
+        demos::kernel::free_frames()
     );
     shutdown()
 }
@@ -710,22 +692,10 @@ fn vesa(width: u16, height: u16) -> Option<(PhysAddr, FramebufferInfo, usize)> {
 /// DISPI registers the BIOS programmed, then on every PCI display adapter.
 fn display_demo(vesa: Option<(PhysAddr, FramebufferInfo, usize)>, ecam: Option<EcamWindow>) {
     use osmium::display::bochs::BochsVbe;
-    let mut guard = PT.lock();
-    let pt = guard.as_mut().expect("as_mut returned None");
-    // Identity-maps device memory (the pages not mapped yet); returns a
-    // window onto it.
-    let mut map = |addr: u64, size: u64| {
-        let end = (addr + size).next_multiple_of(PAGE_SIZE as u64);
-        for page in (addr & !(PAGE_SIZE as u64 - 1)..end).step_by(PAGE_SIZE) {
-            if pt.translate(VirtAddr::new(page)).is_none() {
-                let flags = MapFlags::RW | MapFlags::DEVICE | MapFlags::GLOBAL;
-                pt.map_range(VirtAddr::new(page), PhysAddr::new(page), PAGE_SIZE as u64, flags)
-                    .expect("map_range failed");
-            }
-        }
-        // SAFETY: just mapped as device memory; the demo owns the device.
-        unsafe { IoMem::new(addr as *mut u8, size as usize) }
-    };
+    // Identity-maps device memory and returns a window onto it.
+    // SAFETY: the windows are video memory and BARs of the display devices
+    // this demo owns.
+    let mut map = |addr: u64, size: u64| unsafe { demos::kernel::map_io(&PT, addr, size) };
     if let Some((addr, fb, vram)) = vesa {
         let vram = map(addr.0, vram.max(fb.size()) as u64);
         // SAFETY: the VGA device's DISPI and VGA ports; this kernel owns them.
@@ -746,14 +716,17 @@ fn display_demo(vesa: Option<(PhysAddr, FramebufferInfo, usize)>, ecam: Option<E
 
 /// The CPUID brand string (no heap needed: called before the heap exists).
 fn cpu_brand(buf: &mut [u8; 48]) -> &str {
-    for (i, leaf) in (0x8000_0002..=0x8000_0004).enumerate() {
-        let r = x86::cpuid(leaf, 0);
-        for (j, w) in [r.eax, r.ebx, r.ecx, r.edx].into_iter().enumerate() {
-            buf[i * 16 + j * 4..][..4].copy_from_slice(&w.to_le_bytes());
-        }
+    let words = (0x8000_0002..=0x8000_0004).map(|leaf| x86::cpuid(leaf, 0)).flat_map(|r| [r.eax, r.ebx, r.ecx, r.edx]);
+    for (chunk, w) in buf.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        *chunk = w.to_le_bytes();
     }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(48);
-    core::str::from_utf8(&buf[..end]).unwrap_or("?").trim()
+    let brand = buf.split(|&b| b == 0).next().unwrap_or(&[]);
+    core::str::from_utf8(brand).unwrap_or("?").trim()
+}
+
+/// This CPU's local APIC id (0 before the local APIC is set up).
+pub(crate) fn apic_id() -> u8 {
+    LAPIC.get().map_or(0, |apic| apic.id() as u8)
 }
 
 /// Rust entry of application processors, on their own stack.
@@ -768,13 +741,14 @@ extern "C" fn ap_main(cpu: usize) -> ! {
     // handled rather than a triple fault.
     unsafe { trap::install() };
     load_cpu_tables();
-    let apic = LAPIC.get().expect("LAPIC initialised");
+    // The boot CPU set the local APIC up before starting this one.
+    let Some(apic) = LAPIC.get() else { cpu::halt_forever() };
     apic.enable(SPURIOUS_VECTOR);
     osmium::sched::init_cpu();
     apic.start_timer(TIMER_VECTOR, APIC_TICK_COUNT.load(Ordering::Relaxed), true);
     irq::enable();
     println!("[smp]   APIC id {} online as CPU {cpu}", apic.id());
-    ONLINE.fetch_add(1, Ordering::Release);
+    demos::kernel::check_in();
     // Hand the CPU to the scheduler for good.
     osmium::sched::exit()
 }
@@ -785,53 +759,6 @@ fn on_timer() {
     }
     TIMERS.process(now_ns());
     osmium::sched::tick();
-}
-
-/// The last exception that `on_trap` recovered from.
-static RECOVERED: [IrqSpinLock<Option<Trap>>; MAX_CPUS] = [const { IrqSpinLock::new(None) }; MAX_CPUS];
-/// Whether this CPU expects a trap and may recover from it. Per CPU, so a real
-/// fault on another CPU is never taken for the demo's.
-static RECOVER: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-
-/// Runs `f`, which must take one breakpoint or page fault, with recovery armed
-/// on this CPU only (interrupts off, so the task cannot migrate meanwhile).
-/// Returns the trap that was recovered from.
-fn recover_trap(f: impl FnOnce()) -> Trap {
-    irq::without(|| {
-        let cpu = cpu::current_id();
-        RECOVER[cpu].store(true, Ordering::SeqCst);
-        f();
-        RECOVER[cpu].store(false, Ordering::SeqCst);
-        RECOVERED[cpu].lock().take().expect("recovery recorded by the trap handler")
-    })
-}
-
-fn fault_demo() {
-    // SAFETY: the handler steps over the breakpoint.
-    let t = recover_trap(|| unsafe { core::arch::asm!("int3") });
-    println!("[trap]  recovered from {:?}", t);
-    // The first 1 MiB is unmapped: a page fault.
-    let t = recover_trap(|| {
-        let v: u64;
-        // SAFETY: the read faults and the handler skips it; the value is never used.
-        unsafe { core::arch::asm!("mov {}, qword ptr [0x1000]", out(reg) v) };
-        let _ = v;
-    });
-    println!("[trap]  recovered from {:?}", t);
-}
-
-/// A task that recurses until it runs off the bottom of its stack.
-fn overflow_demo() {
-    #[inline(never)]
-    fn recurse(depth: u64) -> u64 {
-        let frame = core::hint::black_box([depth; 32]);
-        if core::hint::black_box(true) { recurse(depth + 1) + frame[7] } else { 0 }
-    }
-    let t = TaskBuilder::new("deep").stack_size(16 * 1024).spawn(|| {
-        recurse(0);
-    });
-    t.join();
-    println!("[guard] the other tasks keep running: {}", alloc::format!("{} free frames", FRAMES.lock().free_frames()));
 }
 
 /// Starts the HPET found in the ACPI tables and checks its counter against the PIT.
@@ -883,9 +810,11 @@ fn hpet_demo() {
         println!("[hpet]  no comparator can drive an I/O APIC input; skipping");
         return;
     };
-    h.route(index, gsi, false).expect("route was in the capability mask");
+    if let Err(e) = h.route(index, gsi, false) {
+        return println!("[hpet]  routing comparator {index} to input {gsi}: {e:?}");
+    }
     let mode = osmium::sysdrv::ioapic::LineMode { active_low: false, level: false };
-    ioapic.route(gsi as u32, HPET_VECTOR, LAPIC.get().expect("LAPIC initialised").id() as u8, mode);
+    ioapic.route(gsi as u32, HPET_VECTOR, apic_id(), mode);
     println!("[hpet]  comparator {index} -> I/O APIC input {gsi} -> vector {HPET_VECTOR}");
 
     let wait = |what: &str, want: u32| {
@@ -898,7 +827,7 @@ fn hpet_demo() {
             false
         }
     };
-    let timer = h.timer(index).expect("index was valid");
+    let Some(timer) = h.timer(index) else { return println!("[hpet]  no comparator {index}") };
     osmium::hal::timer::OneShotTimer::set_deadline(&timer, h.now_ns() + 2_000_000);
     if wait("one-shot", 1) {
         println!("[hpet]  one-shot comparator interrupt taken");
@@ -924,10 +853,12 @@ fn serial_demo() {
     };
     // SAFETY: the MADT says the I/O APIC lives here; mapped uncached above.
     let ioapic = osmium::sysdrv::ioapic::IoApic::new(unsafe { IoMem::new(io_addr as *mut u8, PAGE_SIZE) }, gsi_base);
-    let (producer, mut rx) = RX.split().expect("split returned None");
+    let (Some((producer, mut rx)), Some(uart)) = (RX.split(), UART.get()) else {
+        return println!("[uart]  the receive ring or the console is not set up; skipping");
+    };
     *RX_PRODUCER.lock() = Some(producer);
-    ioapic.route(gsi, COM1_VECTOR, LAPIC.get().expect("LAPIC initialised").id() as u8, mode);
-    UART.get().expect("UART initialised").port().enable_rx_interrupt();
+    ioapic.route(gsi, COM1_VECTOR, apic_id(), mode);
+    uart.port().enable_rx_interrupt();
     println!("[uart]  COM1 IRQ {COM1_IRQ} -> GSI {gsi} -> vector {COM1_VECTOR} on {} I/O APIC lines", ioapic.lines());
 
     let deadline = now_ns() + 300_000_000;
@@ -956,88 +887,15 @@ fn serial_demo() {
     }
 }
 
-/// Where every user program is mapped, each in its own address space:
-/// root entry 1 (512 GiB), outside the kernel's root entry 0.
-const USER_BASE: u64 = 0x80_0000_0000;
-
-/// A process's memory: a table sharing the kernel's root entry 0, with
-/// table and user pages from `FRAMES`.
-type Space = AddressSpace<X86_64, &'static Frames>;
-
-fn new_space() -> Space {
-    // SAFETY: the kernel table lives for the whole run.
-    unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..1) }
-        .expect("out of memory for a page table")
-}
-
-/// Copies a user program into fresh pages, maps it user-accessible (code
-/// read/execute, stack read/write) at slot `n`, and spawns a task that drops
-/// to ring 3 there.
-fn spawn_user(name: &'static str, n: u64, code: (&u8, &u8), cpu: usize) -> (Arc<Task>, Weak<Process>) {
-    let (start, end) = (code.0 as *const u8, code.1 as *const u8);
-    // SAFETY: the linker symbols delimit the program's bytes.
-    let mut code = unsafe { core::slice::from_raw_parts(start, end as usize - start as usize) }.to_vec();
-    assert!(code.len() <= PAGE_SIZE);
-    // Tell this copy which process it is (the '?' in its message).
-    if let Some(q) = code.iter().position(|&b| b == b'?') {
-        code[q] = b'0' + n as u8;
-    }
-    let (code_va, stack_va) = (USER_BASE, USER_BASE + 0x8000);
-    let space = new_space();
-    space.load_flat(code_va, &code, MapFlags::RX).expect("load_flat failed");
-    space.map_anon(stack_va, PAGE_SIZE as u64, MapFlags::RW).expect("map_anon failed");
-    let process = Process::new(name, space, USER_BASE + 0x10000);
-    let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
-        // SAFETY: CpuTables are loaded, the switch hook keeps rsp[0] on this
-        // task's kernel stack, and both pages are mapped user-accessible.
-        unsafe { x86::enter_user(code_va, stack_va + PAGE_SIZE as u64) }
-    });
-    (task, Arc::downgrade(&process))
-}
-
-/// The Rust user program, built by `build.rs`.
-static HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
-
-/// Loads an ELF executable into a new address space and spawns a task on
-/// `cpu` that runs it in ring 3.
-fn spawn_elf(name: &'static str, image: &[u8], cpu: usize) -> (Arc<Task>, Weak<Process>) {
-    use osmium::boot::elf::{Elf, Machine};
-    let elf = Elf::new(image).expect("bad user ELF");
-    assert_eq!(elf.machine(), Machine::X86_64);
-    let space = new_space();
-    let brk = space.load_elf(&elf).expect("loading the user ELF failed");
-    // A one-page stack just below 1 TiB, clear of the image.
-    let stack_top = 0xff_0000_0000u64;
-    space.map_anon(stack_top - PAGE_SIZE as u64, PAGE_SIZE as u64, MapFlags::RW).expect("map_anon failed");
-    let entry = elf.entry();
-    let process = Process::new(name, space, brk);
-    process.set_mmap_area(0xa0_0000_0000..0xa1_0000_0000);
-    let task = process.spawn(TaskBuilder::new(name).cpu(cpu), move || {
-        // SAFETY: as for the hand-written programs: CpuTables are loaded, the
-        // switch hook installs this process's table, and its pages are mapped.
-        unsafe { x86::enter_user(entry, stack_top) }
-    });
-    (task, Arc::downgrade(&process))
-}
-
-/// The Rust program that forks and execs, from `examples/user/init.rs`.
-static INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
-
-/// What `fork` and `execve` need: spaces like `new_space`'s, and a stack
-/// and `mmap` area where `spawn_elf` puts them.
+/// What `fork` and `execve` need: spaces sharing the kernel's root entry 0,
+/// laid out as `demos::user` says.
 fn platform() -> osmium::proc::Platform {
-    osmium::proc::Platform {
-        new_memory: || {
-            // SAFETY: the kernel table lives for the whole run.
-            let space = unsafe { Space::new(&FRAMES, PT.lock().as_ref().expect("as_ref returned None"), 0..1) };
-            osmium::sync::fallible::try_box(space.map_err(|_| osmium::fs::Errno::ENOMEM)?)
-                .map(|space| space as alloc::boxed::Box<dyn osmium::proc::UserMemory>)
-                .map_err(|_| osmium::fs::Errno::ENOMEM)
-        },
+    demos::user::platform(
+        || demos::user::new_space(&PT),
         // SAFETY: the table shares the kernel's root entry 0. Instruction
         // fetch is coherent with stores on x86, so nothing else is needed.
-        activate: |root| unsafe { x86::write_cr3(root.0) },
-        resume: |frame| {
+        |root| unsafe { x86::write_cr3(root.0) },
+        |frame| {
             // A new thread can start on another CPU before its creator has
             // recorded its task id, so the switch hook that loaded FS.base
             // did not know the thread pointer yet. Load it now.
@@ -1048,121 +906,42 @@ fn platform() -> osmium::proc::Platform {
             // switch hook), and the frame is its parent's from a system call.
             unsafe { x86::resume_user(&frame) }
         },
-        stack_top: 0xff_0000_0000,
-        stack_size: 64 * 1024,
-        mmap_area: 0xa0_0000_0000..0xa1_0000_0000,
-        load_base: 0xb0_0000_0000,
-    }
+    )
 }
 
-/// Runs `/bin/init`, which forks, execs and waits, on `cpu`; its children
-/// go wherever the scheduler puts them.
-fn fork_exec_demo(cpu: usize) {
-    demos::user::install("init", INIT_ELF);
-    let process =
-        Process::new_boxed("init", (platform().new_memory)().expect("out of memory for the init address space"), 0);
-    let init = Arc::downgrade(&process);
-    let task = process.spawn(TaskBuilder::new("init").cpu(cpu), || {
-        let entry = osmium::proc::current()
-            .expect("current returned None")
-            .exec("/bin/init", &[b"init"], &[])
-            .expect("exec /bin/init");
-        // SAFETY: exec activated the new table; CpuTables are loaded and the
-        // switch hook keeps rsp[0] on this task's kernel stack.
-        unsafe { x86::enter_user(entry.pc, entry.sp) }
-    });
-    drop(process);
-    task.join();
-    // The task holds the process: let it go too.
-    drop(task);
-    let freed = demos::user::freed(&[init]);
-    println!("[user]  init and its children reaped; {freed} of 1 init address space torn down");
-}
-
+/// The user demos: the hand-written ring-3 programs (`user_hello` enters
+/// the kernel with `syscall`, `user_bad` with `int 0x80`), then the Rust
+/// ones. On CPU 1: the syscall stub finds its kernel stack through that
+/// CPU's GS base, which CPU 0 alone would not test.
 fn user_demo() {
     osmium::proc::set_platform(platform());
-    // SAFETY: linker symbols delimiting the user programs.
-    let (hello, bad) = unsafe { ((&user_hello, &user_hello_end), (&user_bad, &user_bad_end)) };
-    // On another CPU: the syscall stub finds its kernel stack through that
-    // CPU's GS base, which CPU 0 alone would not test.
-    let cpu = 1 % ONLINE.load(Ordering::Acquire);
-    println!("[user]  running 3 ring-3 programs on CPU {cpu}");
-    let spawned = [
-        spawn_user("user-1", 1, hello, cpu),
-        spawn_user("user-2", 2, hello, cpu),
-        spawn_user("user-bad", 3, bad, cpu),
-        spawn_elf("user-elf", HELLO_ELF, cpu),
-    ];
-    println!("[user]  each program has its own page table; all run at {USER_BASE:#x}");
-    let mut processes = Vec::new();
-    for (task, process) in spawned {
-        task.join();
-        processes.push(process);
-    }
-    // Exited tasks (and their address spaces) are freed once their CPU has
-    // switched away from them.
-    let freed = demos::user::freed(&processes);
-    println!("[user]  {freed} of 4 address spaces torn down with their tasks");
-    fork_exec_demo(cpu);
+    // SAFETY: linker symbols delimiting the user programs in .rodata.
+    let (hello, bad) = unsafe { (image(&user_hello, &user_hello_end), image(&user_bad, &user_bad_end)) };
+    // `CpuTables` are loaded and the switch hook keeps `rsp[0]` on the
+    // running task's kernel stack, as `x86::enter_user` requires.
+    demos::user::demo(&platform(), hello, bad, "ring-3", x86::enter_user);
 }
-
-/// Handles `syscall` and `int 0x80` from ring 3.
-fn syscall(frame: &mut TrapFrame) {
-    if let Some(status) = osmium::proc::syscall::handle(frame) {
-        let task = osmium::sched::current();
-        if let ExitStatus::Code(code) = status {
-            println!("[user]  {} exited with status {code} (kernel sees CPU {})", task.name(), cpu::current_id());
-        }
-        drop(task);
-        osmium::proc::exit(status);
-    }
-}
-
-/// A fault in user mode raises a signal: the program's handler runs, or the
-/// default action ends it (and only it, not the kernel).
-fn user_fault(frame: &mut TrapFrame, cause: Trap) {
-    let (sig, addr) = match cause {
-        Trap::PageFault { addr, .. } => (11, addr),
-        Trap::Misaligned { addr } => (7, addr),
-        Trap::IllegalInstruction => (4, frame.pc()),
-        Trap::Breakpoint => (5, frame.pc()),
-        _ => (11, frame.pc()),
-    };
-    if let Some(status) = osmium::proc::signal::user_fault(frame, sig, addr) {
-        let task = osmium::sched::current();
-        println!("[user]  {} killed: {cause:?} at rip {:#x}", task.name(), frame.pc());
-        drop(task);
-        osmium::proc::exit(status);
-    }
-}
-
 /// Runs the trap handler, then, before returning to user mode from an
 /// interrupt, delivers pending signals (and stops threads of a process that
 /// is ending).
 fn on_trap(frame: &mut TrapFrame) {
     handle_trap(frame);
-    if frame.from_user() && matches!(frame.cause(), Trap::Interrupt(_)) {
-        if let Some(status) = osmium::proc::signal::deliver(frame) {
-            osmium::proc::exit(status);
-        }
+    demos::user::before_return(frame);
+}
+
+/// Acknowledges the interrupt being handled at this CPU's local APIC.
+pub(crate) fn eoi() {
+    if let Some(apic) = LAPIC.get() {
+        apic.eoi();
     }
 }
 
 fn handle_trap(frame: &mut TrapFrame) {
-    // A write to a page `fork` shares gets its own copy, and the first touch of a
-    // demand-paged `mmap` page its frame; retry.
-    if let Trap::PageFault { addr, access } = frame.cause()
-        && frame.from_user()
-        && osmium::proc::handle_page_fault(addr as u64, access == Access::Write)
-    {
+    // System calls, and exceptions (vectors below 32) from ring 3.
+    if frame.from_user() && demos::user::handle(frame) {
         return;
     }
-    if frame.from_user() && frame.vector() < 32 && frame.cause() != Trap::Syscall {
-        let cause = frame.cause();
-        return user_fault(frame, cause);
-    }
     match (frame.vector(), frame.cause()) {
-        (_, Trap::Syscall) if frame.from_user() => syscall(frame),
         (DOUBLE_FAULT, _) => {
             // Reached through IST1: the task's own stack is unusable. A
             // double fault cannot be resumed, so end only the faulting task.
@@ -1178,31 +957,31 @@ fn handle_trap(frame: &mut TrapFrame) {
         (TIMER_VECTOR, _) => {
             // Acknowledge before a possible task switch, or no further
             // timer interrupts would be delivered.
-            LAPIC.get().expect("LAPIC initialised").eoi();
+            eoi();
             on_timer();
             osmium::sched::preempt_if_needed();
         }
         (IPI_VECTOR, _) => {
-            LAPIC.get().expect("LAPIC initialised").eoi();
+            eoi();
             osmium::sched::preempt_if_needed();
         }
         (SHOOTDOWN_VECTOR, _) => {
             shootdown_service();
-            LAPIC.get().expect("LAPIC initialised").eoi();
+            eoi();
         }
         (HPET_VECTOR, _) => {
             HPET_FIRED.fetch_add(1, Ordering::SeqCst);
-            LAPIC.get().expect("LAPIC initialised").eoi();
+            eoi();
         }
         (COM1_VECTOR, _) => {
             // Drain the UART's FIFO into the ring, then wake the reader.
-            if let Some(p) = RX_PRODUCER.lock().as_mut() {
-                let mut port = UART.get().expect("UART initialised").port();
+            if let (Some(p), Some(uart)) = (RX_PRODUCER.lock().as_mut(), UART.get()) {
+                let mut port = uart.port();
                 while let Some(b) = osmium::hal::serial::SerialPort::read_byte(&mut *port) {
                     let _ = p.push(b);
                 }
             }
-            LAPIC.get().expect("LAPIC initialised").eoi();
+            eoi();
             RX_READY.wake_all();
             osmium::sched::preempt_if_needed();
         }
@@ -1211,18 +990,15 @@ fn handle_trap(frame: &mut TrapFrame) {
         (SPURIOUS_VECTOR, _) => {}
         // A spurious IRQ from a masked PIC: no EOI (none was latched).
         (v, _) if PIC_VECTORS.contains(&v) => {}
-        (_, cause @ (Trap::Breakpoint | Trap::PageFault { .. }))
-            if RECOVER[cpu::current_id()].load(Ordering::SeqCst) =>
-        {
-            *RECOVERED[cpu::current_id()].lock() = Some(cause);
-            // `int3` is 1 byte; the faulting `mov rax, [0x1000]` is 8.
-            let len = if cause == Trap::Breakpoint { 1 } else { 8 };
-            frame.set_pc(frame.pc() + len);
-        }
-        (v, cause) => {
-            panic!("unhandled trap {cause:?} (vector {v}) at rip {:#x}, error {:#x}", frame.pc(), frame.error_code)
-        }
+        (_, Trap::Breakpoint | Trap::PageFault { .. }) if demos::fault::recovered(frame) => {}
+        (v, cause) => unhandled(frame, v, cause),
     }
+}
+
+/// A kernel trap with no handler: a bug in this kernel, so stop it.
+#[allow(clippy::panic)] // a kernel trap nothing handles leaves no safe way on
+fn unhandled(frame: &TrapFrame, vector: u8, cause: Trap) -> ! {
+    panic!("unhandled trap {cause:?} (vector {vector}) at rip {:#x}, error {:#x}", frame.pc(), frame.error_code)
 }
 
 #[panic_handler]
@@ -1236,28 +1012,4 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let mut com1 = Uart16550::new(unsafe { Pio::new(COM1) });
     let _ = writeln!(osmium::hal::serial::SerialWriter(&mut com1), "\n[panic] {info}");
     shutdown()
-}
-
-/// Seeds a generator from the CPU's random number instructions, draws from
-/// it, and runs the TLS self-test on it.
-fn rand_demo() {
-    static RNG: osmium::rand::SharedRng = osmium::rand::SharedRng::new();
-    if !osmium::rand::CpuEntropy::available() {
-        println!("[rand]  no CPU random number instructions");
-        return;
-    }
-    match RNG.seed(&osmium::rand::CpuEntropy) {
-        Ok(()) => match (RNG.next_u64(), RNG.next_u64()) {
-            (Ok(a), Ok(b)) if a != b => {
-                println!("[rand]  seeded from the CPU; draws differ");
-                // Any time will do: the self-test's certificate is valid around it.
-                match osmium::tls::self_test(&RNG, 1_800_000_000) {
-                    Ok(()) => println!("[tls]   self-test passed: TLS 1.3 handshake and echo"),
-                    Err(e) => println!("[tls]   self-test failed: {e}"),
-                }
-            }
-            r => println!("[rand]  seeded, but draws look wrong: {r:?}"),
-        },
-        Err(e) => println!("[rand]  {e}"),
-    }
 }

@@ -1,22 +1,26 @@
 //! Waiting for readiness: `poll`, `ppoll`, `select` and `pselect6`, and the
 //! wait queue that `epoll` shares with them.
 //!
-//! A file reports its readiness through [`osmium_fs::File::poll`]. A call that has to
-//! wait sleeps on one global queue, which every source of readiness wakes
-//! after it changes: the [`NetStack`](crate::net::NetStack) whenever it runs,
-//! and the in-memory socket pairs whenever they move data. (`File` has no
-//! way to name a queue of its own, so a change to one file wakes every
-//! poller.) A signal or the end of a process wakes only the threads it
-//! concerns, wherever they sleep (`signal::wait_on`).
+//! A file reports its readiness through [`osmium_fs::File::poll`], and says
+//! when that may have changed through its [`osmium_fs::File::poll_queue`]. A
+//! call that has to wait registers with the queue of each file it watches
+//! and sleeps until one of them is notified, so a change to one file wakes
+//! only the calls watching it: a pipe and each Unix socket have a queue of
+//! their own, and the network stack's sockets share the
+//! [`NetStack`](crate::net::NetStack)'s, which it notifies whenever it runs.
+//! A file without a queue (a device, say) is watched through a global one,
+//! which only [`tick`] (and the network stack, as it runs) notifies. A signal
+//! or the end of a process wakes only the threads it concerns, wherever they
+//! sleep (`signal::wait_on`).
 //!
 //! # Timeouts
 //!
 //! A timeout needs a clock: the kernel's [`set_clock`], or failing that the
 //! network stack's. Without either, a call with a positive timeout waits for
 //! readiness alone (a zero timeout still returns at once). A sleeping call
-//! notices its deadline only when something wakes the queue, so the kernel
-//! should call [`tick`] from its timer (polling the network stack does it
-//! too).
+//! notices its deadline only when [`tick`] runs (or one of its files changes),
+//! so the kernel should call [`tick`] from its timer (polling the network
+//! stack does it too).
 //!
 //! `ppoll`, `pselect6` and `epoll_pwait` install their signal mask for the
 //! wait, atomically with it, as Linux does: a signal the new mask lets in
@@ -26,12 +30,15 @@
 //! is not written back.
 
 use alloc::sync::Arc;
+use alloc::task::Wake;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::Waker;
 
-use osmium_fs::{Errno, POLLERR, POLLHUP, POLLIN, POLLOUT};
+use osmium_fs::{Errno, File, POLLERR, POLLHUP, POLLIN, POLLOUT, PollQueue, PollRegistration};
 use osmium_sched::WaitQueue;
 use osmium_sync::Once;
-use osmium_sync::fallible::try_zeroed;
+use osmium_sync::fallible::{try_arc, try_zeroed};
 
 use crate::fd::{MAX_FDS, OpenFile};
 use crate::net::stack;
@@ -47,7 +54,9 @@ const FD_SETSIZE: u64 = 1024;
 /// `sizeof(struct pollfd)`.
 const POLLFD_LEN: usize = 8;
 
-static READY: WaitQueue = WaitQueue::new();
+/// The queue of the files that have none of their own, and of timed waits:
+/// [`tick`] notifies it.
+static GLOBAL: PollQueue = PollQueue::new();
 static CLOCK: Once<fn() -> u64> = Once::new();
 
 /// Sets the monotonic clock (nanoseconds) that timeouts of `poll`, `select`
@@ -57,16 +66,35 @@ pub fn set_clock(now_ns: fn() -> u64) {
     assert!(CLOCK.set(now_ns).is_ok(), "poll clock already set");
 }
 
-/// Wakes every task waiting in `poll`, `select` or `epoll_wait`, so each
-/// rechecks its files and its deadline. Call it from a timer.
+/// Wakes the tasks waiting in `poll`, `select`, `epoll_wait` or a blocking
+/// read or write that have a deadline, or watch a file with no
+/// [`poll_queue`](osmium_fs::File::poll_queue) of its own, so each rechecks
+/// its files and its deadline. Call it from a timer.
 pub fn tick() {
-    notify();
+    GLOBAL.notify();
 }
 
-/// Wakes the waiters after something became ready (or stopped being so).
-/// Never call it with a lock held that [`osmium_fs::File::poll`] takes.
-pub(crate) fn notify() {
-    READY.wake_all();
+/// The queue that tells waiters `f` may have changed: its own, or the global one.
+pub(crate) fn queue_of(f: &dyn File) -> &PollQueue {
+    f.poll_queue().unwrap_or(&GLOBAL)
+}
+
+/// What a waiting call sleeps in; the files' queues wake it through a
+/// [`Waker`], which sets `woken` first.
+struct Sleeper {
+    woken: AtomicBool,
+    queue: WaitQueue,
+}
+
+impl Wake for Sleeper {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+        self.queue.wake_all();
+    }
 }
 
 fn now() -> Option<u64> {
@@ -76,12 +104,21 @@ fn now() -> Option<u64> {
     }
 }
 
-/// Runs `scan` until it returns `Some`, sleeping between attempts, and
-/// returns that; returns `None` once `timeout_ns` (`None` for no limit) has
-/// passed. `EINTR` if the calling thread is interrupted by a signal or its
-/// process is ending, with nothing ready (see
-/// [`crate::signal::current_interrupted`]).
-pub(crate) fn wait<R>(timeout_ns: Option<u64>, mut scan: impl FnMut() -> Option<R>) -> Result<Option<R>, Errno> {
+/// Runs `scan` until it returns `Some`, sleeping between attempts until one
+/// of `queues` is notified (or, with a timeout, [`tick`] runs), and returns
+/// that; returns `None` once `timeout_ns` (`None` for no limit) has passed.
+/// `EINTR` if the calling thread is interrupted by a signal or its process
+/// is ending, with nothing ready (see [`crate::signal::current_interrupted`]).
+/// `ENOMEM` if there is no memory to register with the queues.
+///
+/// `scan` runs with no lock of the wait's held: a file may notify its queue
+/// with its own lock held, and `scan` may take any lock that is not held
+/// around a [`PollQueue::notify`].
+pub(crate) fn wait<'q, R>(
+    queues: impl IntoIterator<Item = &'q PollQueue>,
+    timeout_ns: Option<u64>,
+    mut scan: impl FnMut() -> Option<R>,
+) -> Result<Option<R>, Errno> {
     if let Some(r) = scan() {
         return Ok(Some(r));
     }
@@ -89,12 +126,36 @@ pub(crate) fn wait<R>(timeout_ns: Option<u64>, mut scan: impl FnMut() -> Option<
         return Ok(None);
     }
     let deadline = timeout_ns.and_then(|t| now().map(|n| n.saturating_add(t)));
-    crate::signal::wait_on(&READY, || match scan() {
-        Some(r) => Some(Ok(Some(r))),
-        None if crate::signal::current_interrupted() => Some(Err(Errno::EINTR)),
-        None if deadline.is_some_and(|d| now().is_some_and(|n| n >= d)) => Some(Ok(None)),
-        None => None,
-    })
+    let sleeper = try_arc(Sleeper { woken: AtomicBool::new(false), queue: WaitQueue::new() }).map_err(crate::oom)?;
+    let waker = Waker::from(sleeper.clone());
+    let mut regs: Vec<PollRegistration<'q>> = Vec::new();
+    let timed = deadline.is_some().then_some(&GLOBAL);
+    for q in queues.into_iter().chain(timed) {
+        // Files often share a queue (a pipe's two ends, the network's sockets).
+        if !regs.iter().any(|r| r.is_in(q)) {
+            regs.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+            regs.push(q.register(&waker)?);
+        }
+    }
+    let expired = || deadline.is_some_and(|d| now().is_some_and(|n| n >= d));
+    let r = loop {
+        // Cleared before the scan: a change after it sets the flag again.
+        sleeper.woken.store(false, Ordering::SeqCst);
+        if let Some(r) = scan() {
+            break Ok(Some(r));
+        }
+        if crate::signal::current_interrupted() {
+            break Err(Errno::EINTR);
+        }
+        if expired() {
+            break Ok(None);
+        }
+        crate::signal::wait_on(&sleeper.queue, || {
+            (sleeper.woken.load(Ordering::SeqCst) || crate::signal::current_interrupted() || expired()).then_some(())
+        });
+    };
+    drop(regs);
+    r
 }
 
 /// `user + n`, or `EFAULT` if it wraps.
@@ -180,8 +241,9 @@ fn do_poll(p: &Process, fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult 
         }
         any.then_some(())
     };
+    let queues = watches.iter().filter_map(|w| w.file.as_ref()).map(|f| queue_of(&**f.file()));
     // On a timeout the last scan found nothing, so every revent is 0.
-    wait(timeout, scan)?;
+    wait(queues, timeout, scan)?;
     let ready = revents.iter().filter(|&&r| r != 0).count();
     for (c, &r) in raw.as_chunks_mut::<POLLFD_LEN>().0.iter_mut().zip(&revents) {
         crate::bytes::put(c, 6, &(r as u16).to_ne_bytes())?;
@@ -262,8 +324,9 @@ fn do_select(p: &Process, nfds: u64, sets: [u64; 3], timeout: Option<u64>) -> Sy
         }
         (count > 0).then_some(())
     };
+    let queues = watched.iter().map(|(_, f)| queue_of(&**f.file()));
     // On a timeout the last scan found nothing, so the sets are all clear.
-    wait(timeout, scan)?;
+    wait(queues, timeout, scan)?;
     for (va, bits) in s.user.iter().zip(out.iter()) {
         if *va != 0 {
             p.memory().write(*va, bits)?;

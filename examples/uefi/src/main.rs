@@ -322,8 +322,14 @@ mod serial {
     }
 }
 
+/// Reports the panic on the serial port, then halts. The port is written
+/// directly, not through the firmware's console: that works whether or not
+/// boot services are still up, and the panic may have come from inside a
+/// console write.
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    let mut serial = serial::port();
+    let _ = writeln!(SerialWriter(&mut serial), "\n[panic] {info}");
     loop {
         core::hint::spin_loop();
     }

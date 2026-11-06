@@ -1,8 +1,45 @@
 #!/usr/bin/env bash
-# Full verification: host tests, lints, docs, every bare-metal target, and
-# the RISC-V example kernel booted under QEMU.
+# The full gate: host tests, clippy and rustdoc on the workspace, the library
+# built for every bare-metal target and type-checked for the two musl
+# targets that save FP registers in the context switch, the self-test of
+# scripts/iscsi-target.py, every example linted (clippy -D warnings) and
+# built, and then the examples booted under QEMU: riscv-virt, aarch64-virt
+# (GICv2 and GICv3) and x86_64-pc with their devices, the IOMMU boots, the
+# heap-free riscv-firmware, the hypervisors (riscv-hyp, aarch64-hyp on
+# GICv2, GICv3 and GICv4, aarch64-vhe, x86_64-hyp on SVM and, under nested
+# KVM, VMX) with the example kernels as their guests, and examples/uefi on
+# OVMF and AAVMF. Each boot's serial log must hold the lines its demos print.
+#
+# A step whose Rust target, QEMU, QEMU device, firmware or optional tool
+# (dosfstools, bzip2, KVM with nested VMX) is missing is skipped with a
+# message, and listed again at the end; it does not fail the gate. UEFI
+# boots use the system's OVMF and AAVMF, or the images in fw/ when those are
+# not installed (OSMIUM_FW=bundled uses fw/ regardless).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Every temporary file and directory lives in $work, removed on every exit,
+# as is the screen.py helper, which may still be waiting for a QEMU that
+# never came up (a failed build, a crashed or hung kernel).
+work=$(mktemp -d)
+screen_pid=0
+cleanup() {
+    [ "$screen_pid" = 0 ] || kill "$screen_pid" 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+tmp() { mktemp -p "$work" "$@"; }
+
+# Steps skipped for want of something, for the summary at the end.
+skipped=()
+skip() {
+    echo "== $1; skipping $2"
+    skipped+=("$2 ($1)")
+}
+
+# Whether the toolchain has the standard library for target $1.
+sysroot=$(rustc --print sysroot)
+have_target() { [ -d "$sysroot/lib/rustlib/$1" ]; }
 
 echo "== host tests"
 cargo test -q --workspace --all-features
@@ -14,6 +51,7 @@ echo "== rustdoc"
 RUSTDOCFLAGS="-D warnings" cargo doc -q --workspace --all-features --no-deps
 
 for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64imac-unknown-none-elf; do
+    have_target "$target" || { skip "no $target target" "the $target build"; continue; }
     echo "== build $target"
     # osmium-drivers only has the std-backed `testing` feature, so it is built as a dependency instead.
     cargo build -q --workspace --exclude osmium-drivers --all-features --target "$target"
@@ -21,19 +59,65 @@ done
 
 # Variants that save FP registers in the context switch.
 for target in aarch64-unknown-linux-musl riscv64gc-unknown-linux-musl; do
+    have_target "$target" || { skip "no $target target" "the $target check"; continue; }
     echo "== check $target"
     cargo check -q --workspace --all-features --target "$target"
 done
 
-# Cleans up on every exit: the screen.py helper may still be waiting for a
-# QEMU that never came up (a failed build, a crashed or hung kernel).
-screen_pid=0
-qmp_dir=
-cleanup() {
-    [ "$screen_pid" = 0 ] || kill "$screen_pid" 2>/dev/null || true
-    [ -z "$qmp_dir" ] || rm -rf "$qmp_dir"
+# The iSCSI target the boots below run under QEMU's guestfwd, against its
+# own initiator (both directions of every login and transfer path).
+if command -v python3 >/dev/null; then
+    echo "== scripts/iscsi-target.py --self-test"
+    python3 -I scripts/iscsi-target.py --self-test --log "$work/iscsi-self-test.log" 2>&1 \
+        || { cat "$work/iscsi-self-test.log"; echo "iscsi-target.py: self-test failed"; exit 1; }
+else
+    skip "no python3" "the iscsi-target.py self-test and the QEMU boots"
+fi
+
+# The examples: linted and built whether or not QEMU can boot them. Each one
+# is its own workspace, built from its directory so that its
+# .cargo/config.toml (target, runner, flags) applies.
+built=" "
+for ex in riscv-virt riscv-firmware riscv-hyp aarch64-virt aarch64-hyp aarch64-vhe x86_64-pc x86_64-hyp; do
+    target=$(sed -n 's/^target = "\(.*\)"/\1/p' "examples/$ex/.cargo/config.toml")
+    have_target "$target" || { skip "no $target target" "examples/$ex"; continue; }
+    echo "== clippy and build examples/$ex"
+    (cd "examples/$ex" && cargo clippy -q --release -- -D warnings && cargo build -q --release)
+    built+="$ex "
+done
+for target in x86_64-unknown-uefi aarch64-unknown-uefi; do
+    have_target "$target" || { skip "no $target target" "examples/uefi for $target"; continue; }
+    echo "== clippy and build examples/uefi for $target"
+    (cd examples/uefi && cargo clippy -q --release --target "$target" -- -D warnings \
+        && cargo build -q --release --target "$target")
+    built+="uefi-${target%%-*} "
+done
+# The shared crate, with and without its user programs (the hypervisors
+# leave them out), on each architecture's kernel target.
+for target in riscv64imac-unknown-none-elf aarch64-unknown-none-softfloat x86_64-unknown-none; do
+    have_target "$target" || continue
+    echo "== clippy examples/demos for $target"
+    (cd examples/demos && cargo clippy -q --release --target "$target" -- -D warnings \
+        && cargo clippy -q --release --no-default-features --target "$target" -- -D warnings)
+done
+# Whether example $1 was built above.
+is_built() { [[ "$built" == *" $1 "* ]]; }
+# `can_boot NAME QEMU` says whether example NAME was built and QEMU is
+# installed, recording a skip when not.
+can_boot() {
+    if ! command -v python3 >/dev/null; then
+        skip "no python3" "booting examples/$1"
+        return 1
+    fi
+    if ! is_built "$1"; then
+        skip "examples/$1 not built" "its QEMU boots"
+        return 1
+    fi
+    if ! command -v "$2" >/dev/null; then
+        skip "no $2" "booting examples/$1"
+        return 1
+    fi
 }
-trap cleanup EXIT
 
 # `expect NAME LOG PATTERN...` fails the gate unless every grep pattern
 # matches somewhere in LOG.
@@ -67,15 +151,13 @@ run_qemu() {
 boot() {
     local name=$1 qemu=$2 target=$3
     shift 3
-    if ! command -v "$qemu" >/dev/null; then
-        echo "== $qemu not found; skipping $name"
+    if ! can_boot "$name" "$qemu"; then
         EXPECT=()
         return
     fi
     echo "== boot examples/$name under QEMU"
     local log
-    log=$(mktemp)
-    (cd "examples/$name" && cargo build -q --release)
+    log=$(tmp)
     run_qemu "$name" "$log" 60 "$qemu" "$@" -nographic -m 128M \
         -kernel "examples/$name/target/$target/release/$name"
     expect "$name" "$log" '\[mutex\] .* = 4000' '\[preempt\]' '\[timer\]' '4 CPUs online' \
@@ -86,17 +168,18 @@ boot() {
 }
 
 # Checks a display while QEMU runs: scripts/screen.py screendumps over QMP
-# until it sees the demos' colour bars. `screen QEMU WIDTH HEIGHT [DEVICE]`
-# sets $qmp to a fresh socket for QEMU's -qmp and starts the checker in the
-# background as $screen_pid (0 when QEMU is missing); `screen_wait NAME`
+# until it sees the demos' colour bars. `screen BUILT QEMU WIDTH HEIGHT
+# [DEVICE]` sets $qmp to a fresh socket for QEMU's -qmp and, if example (or
+# UEFI build) BUILT was built and QEMU is there to run it, starts the
+# checker in the background as $screen_pid (else 0); `screen_wait NAME`
 # collects its verdict.
 screen() {
     # A socket in a fresh private directory, not a guessable /tmp name.
-    qmp_dir=$(mktemp -d)
+    qmp_dir=$(tmp -d)
     qmp=$qmp_dir/qmp.sock
     screen_pid=0
-    command -v "$1" >/dev/null || return 0
-    python3 -I scripts/screen.py "$qmp" "$2" "$3" 600 ${4:-} &
+    is_built "$1" && command -v "$2" >/dev/null && command -v python3 >/dev/null || return 0
+    python3 -I scripts/screen.py "$qmp" "$3" "$4" 600 ${5:-} &
     screen_pid=$!
 }
 screen_wait() {
@@ -106,7 +189,6 @@ screen_wait() {
         wait "$pid" || { echo "$1: screen check failed"; exit 1; }
     fi
     rm -rf "$qmp_dir"
-    qmp_dir=
 }
 
 # Multi-threaded TCG runs the four CPUs in parallel on host threads.
@@ -127,18 +209,18 @@ screen_wait() {
 # serves through a second guestfwd. Colour bars go up on virtio-gpu over
 # PCI and MMIO and on bochs-display (Bochs DISPI registers, no BIOS); the
 # PCI GPU's screen is checked.
-stick=$(mktemp)
-stick_ehci=$(mktemp)
-stick_ohci=$(mktemp)
-vdisk=$(mktemp)
-sata=$(mktemp)
-nvdisk=$(mktemp)
-uasdisk=$(mktemp)
-iscsi=$(mktemp)
-vcon=$(mktemp)
+stick=$(tmp)
+stick_ehci=$(tmp)
+stick_ohci=$(tmp)
+vdisk=$(tmp)
+sata=$(tmp)
+nvdisk=$(tmp)
+uasdisk=$(tmp)
+iscsi=$(tmp)
+vcon=$(tmp)
 truncate -s 8M "$vdisk" "$sata" "$nvdisk" "$iscsi" "$uasdisk"
 truncate -s 40000K "$stick" "$stick_ehci" "$stick_ohci"
-tftp=$(mktemp -d)
+tftp=$(tmp -d)
 echo "hello over UDP" >"$tftp/osmium.txt"
 fat_expect=()
 if PATH=$PATH:/usr/sbin command -v mkfs.fat >/dev/null && PATH=$PATH:/usr/sbin command -v fsck.fat >/dev/null; then
@@ -147,7 +229,7 @@ if PATH=$PATH:/usr/sbin command -v mkfs.fat >/dev/null && PATH=$PATH:/usr/sbin c
     PATH=$PATH:/usr/sbin mkfs.fat -F 32 -s 1 "$stick_ohci" >/dev/null
     fat_expect=('\[fat\]   wrote and read back "/osmium/Hello from osmium.txt"')
 fi
-screen qemu-system-riscv64 640 400 gpu
+screen riscv-virt qemu-system-riscv64 640 400 gpu
 EXPECT=(
     # QEMU's default rv64 CPU has no Zkr; `-cpu max` does, and then the line reads "seeded from the CPU".
     '\[rand\]  no CPU random number instructions'
@@ -264,10 +346,10 @@ boot riscv-virt qemu-system-riscv64 riscv64imac-unknown-none-elf \
     -device virtio-gpu-device -device virtio-gpu-pci,id=gpu -device bochs-display -qmp "unix:$qmp,server=on,wait=off" \
     -chardev file,id=vc0,path="$vcon" -device virtio-serial-device -device virtconsole,chardev=vc0
 screen_wait riscv-virt
-if command -v qemu-system-riscv64 >/dev/null; then
+if is_built riscv-virt && command -v qemu-system-riscv64 >/dev/null; then
     grep -aq "hello from osmium over virtio-console" "$vcon" || { echo "riscv-virt: virtio-console output did not reach the host"; exit 1; }
 fi
-if [ "${#fat_expect[@]}" -gt 0 ] && command -v qemu-system-riscv64 >/dev/null; then
+if [ "${#fat_expect[@]}" -gt 0 ] && is_built riscv-virt && command -v qemu-system-riscv64 >/dev/null; then
     echo "== fsck.fat the USB stick the kernel wrote"
     report=$(PATH=$PATH:/usr/sbin fsck.fat -n -l "$stick") || { echo "$report"; echo "riscv-virt: fsck.fat rejected the USB stick"; exit 1; }
     grep -q "/OSMIUM/Hello from osmium.txt" <<<"$report" || { echo "$report"; echo "riscv-virt: file missing on the USB stick"; exit 1; }
@@ -283,8 +365,9 @@ rm -rf "$tftp"
 # The test device DMAs through a mapping, to an unmapped address and after
 # being detached; the NVMe driver then runs on addresses from an IommuDma
 # allocator, with the faults it would cause logged.
-if command -v qemu-system-riscv64 >/dev/null && qemu-system-riscv64 -device help 2>&1 | grep -q 'iommu-testdev'; then
-    iommu_disk=$(mktemp)
+if is_built riscv-virt && command -v qemu-system-riscv64 >/dev/null \
+    && qemu-system-riscv64 -device help 2>&1 | grep -q 'iommu-testdev'; then
+    iommu_disk=$(tmp)
     truncate -s 8M "$iommu_disk"
     EXPECT=(
         '\[iommu\] [0-9a-f:.]* RISC-V IOMMU: Sv39 domains'
@@ -302,7 +385,7 @@ if command -v qemu-system-riscv64 >/dev/null && qemu-system-riscv64 -device help
         -drive if=none,id=nv0,format=raw,file="$iommu_disk" -device nvme,serial=osmium0,drive=nv0
     rm -f "$iommu_disk"
 else
-    echo "== QEMU lacks riscv-iommu-pci or iommu-testdev; skipping the RISC-V IOMMU boot"
+    skip "no QEMU with riscv-iommu-pci and iommu-testdev" "the RISC-V IOMMU boot"
 fi
 a64_expect=(
     '\[fp\]    no SVE: tasks keep q0-q31 only'
@@ -358,7 +441,8 @@ boot aarch64-virt qemu-system-aarch64 aarch64-unknown-none-softfloat \
 # iommu-testdev: stage-2 translation of the test device's DMA, a blocked
 # unmapped address and a blocked detached device; then the same through
 # stage 1 behind a two-level stream table.
-if command -v qemu-system-aarch64 >/dev/null && qemu-system-aarch64 -device help 2>&1 | grep -q 'iommu-testdev'; then
+if is_built aarch64-virt && command -v qemu-system-aarch64 >/dev/null \
+    && qemu-system-aarch64 -device help 2>&1 | grep -q 'iommu-testdev'; then
     EXPECT=(
         '\[iommu\] SMMUv3 at 0x[0-9a-f]*: 44 bit I/O addresses'
         'smmuv3: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'
@@ -373,7 +457,7 @@ if command -v qemu-system-aarch64 >/dev/null && qemu-system-aarch64 -device help
         -machine virt,gic-version=2,iommu=smmuv3 -cpu cortex-a72 -smp 4 -accel tcg,thread=multi \
         -device iommu-testdev
 else
-    echo "== QEMU lacks iommu-testdev; skipping the SMMUv3 boot"
+    skip "no QEMU with iommu-testdev" "the SMMUv3 boot"
 fi
 # The VESA BIOS sets the mode through a real-mode thunk, then virtio-vga's
 # virtio-gpu side takes over the screen, which is checked. An NVMe controller
@@ -383,13 +467,13 @@ fi
 # a high-speed stick on an ICH9 EHCI controller. The full-speed usb-net on
 # that EHCI is handed to one of its three companion UHCI controllers, which
 # resolves ARP through it.
-stick_uhci=$(mktemp)
-stick_ehci=$(mktemp)
+stick_uhci=$(tmp)
+stick_ehci=$(tmp)
 truncate -s 40000K "$stick_uhci" "$stick_ehci"
 for s in "$stick_uhci" "$stick_ehci"; do
     [ "${#fat_expect[@]}" -eq 0 ] || PATH=$PATH:/usr/sbin mkfs.fat -F 32 -s 1 "$s" >/dev/null
 done
-screen qemu-system-x86_64 640 400
+screen x86_64-pc qemu-system-x86_64 640 400
 EXPECT=(
     '\[rand\]  seeded from the CPU; draws differ'
     '\[tls\]   self-test passed: TLS 1.3 handshake and echo'
@@ -465,7 +549,7 @@ boot x86_64-pc qemu-system-x86_64 x86_64-unknown-none \
     -drive if=none,id=stick-ehci,format=raw,file="$stick_ehci" -device usb-storage,bus=ehci.0,drive=stick-ehci \
     -netdev user,id=n1 -device usb-net,netdev=n1,bus=ehci.0
 screen_wait x86_64-pc
-if [ "${#fat_expect[@]}" -gt 0 ] && command -v qemu-system-x86_64 >/dev/null; then
+if [ "${#fat_expect[@]}" -gt 0 ] && is_built x86_64-pc && command -v qemu-system-x86_64 >/dev/null; then
     for s in "$stick_uhci" "$stick_ehci"; do
         report=$(PATH=$PATH:/usr/sbin fsck.fat -n -l "$s") || { echo "$report"; echo "x86_64-pc: fsck.fat rejected a stick behind UHCI or EHCI"; exit 1; }
         grep -q "/OSMIUM/Hello from osmium.txt" <<<"$report" || { echo "$report"; echo "x86_64-pc: file missing on a stick behind UHCI or EHCI"; exit 1; }
@@ -477,7 +561,8 @@ rm -f "$stick_uhci" "$stick_ehci"
 # IVRS table says where the unit is): a DMA through a mapping reaches memory,
 # one to an unmapped address and one after detaching are blocked. QEMU's AMD
 # model translates DMA only with dma-remap=on.
-if command -v qemu-system-x86_64 >/dev/null && qemu-system-x86_64 -device help 2>&1 | grep -q 'iommu-testdev'; then
+if is_built x86_64-pc && command -v qemu-system-x86_64 >/dev/null \
+    && qemu-system-x86_64 -device help 2>&1 | grep -q 'iommu-testdev'; then
     EXPECT=(
         '\[iommu\] VT-d unit at 0xfed90000: 48 bit I/O addresses'
         'vt-d: device wrote 0x12345678 through IOVA 0x[0-9a-f]* into physical page PA(0x[0-9a-f]*) (16/16 words)'
@@ -510,15 +595,14 @@ if command -v qemu-system-x86_64 >/dev/null && qemu-system-x86_64 -device help 2
         -machine q35 -cpu max -smp 4 -accel tcg,thread=multi -display none -no-reboot \
         -device amd-iommu,dma-remap=on -device iommu-testdev
 else
-    echo "== QEMU lacks iommu-testdev; skipping the x86 IOMMU boots"
+    skip "no QEMU with iommu-testdev" "the x86 IOMMU boots"
 fi
 
 # Heap-free M-mode firmware (no OpenSBI): checked for its own lines, since it
 # runs none of the scheduler demos.
-if command -v qemu-system-riscv64 >/dev/null; then
+if can_boot riscv-firmware qemu-system-riscv64; then
     echo "== boot examples/riscv-firmware under QEMU"
-    fwlog=$(mktemp)
-    (cd examples/riscv-firmware && cargo build -q --release)
+    fwlog=$(tmp)
     run_qemu "riscv-firmware" "$fwlog" 60 qemu-system-riscv64 -machine virt -bios none -smp 1 -m 128M -nographic \
         -kernel examples/riscv-firmware/target/riscv64imac-unknown-none-elf/release/riscv-firmware
     expect "riscv-firmware" "$fwlog" 'awaited 5 timer interrupts' 'console task:' 'all tasks finished'
@@ -532,58 +616,60 @@ fi
 # QEMU user network (DHCP, ping, the TCP echo and an iSCSI LUN all from
 # inside the guest).
 # Guest lines carry a "| " prefix.
-if command -v qemu-system-riscv64 >/dev/null; then
-    echo "== boot examples/riscv-virt as a guest of examples/riscv-hyp under QEMU"
-    nestlog=$(mktemp)
-    nestiscsi=$(mktemp)
-    truncate -s 8M "$nestiscsi"
-    (cd examples/riscv-hyp && cargo build -q --release)
-    run_qemu "riscv-hyp" "$nestlog" 120 qemu-system-riscv64 -machine virt -bios default -smp 2 -accel tcg,thread=multi -m 512M -nographic \
-        -kernel examples/riscv-hyp/target/riscv64imac-unknown-none-elf/release/riscv-hyp \
-        -device loader,file=examples/riscv-virt/target/riscv64imac-unknown-none-elf/release/riscv-virt,addr=0x98000000,force-raw=on \
-        -netdev user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat,guestfwd=tcp:10.0.2.100:3260-cmd:"python3 scripts/iscsi-target.py $nestiscsi" \
-        -device virtio-net-device,netdev=n0
-    expect "riscv-hyp" "$nestlog" 'guest kernel: [0-9]* KiB loaded, entry 0x80200000' '| osmium riscv-virt example (hart 0)' \
-        '| \[mmu\]   Sv39 on' '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
-        '| \[smp\]   2 CPUs online' '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' \
-        '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
-        '| \[net\]   DHCP: 10.0.2.15/24 via 10.0.2.2' '| \[net\]   ping 10.0.2.2: seq 1 in' \
-        '| \[net\]   TCP echo from 10.0.2.100:7: "hello over TCP"' \
-        '| \[net\]   IPv6 fragmentation: 4000 bytes sent in [0-9]* fragments and reassembled' \
-        '| \[net\]   IPv6 privacy: stable opaque address 2001:db8:1:2:' \
-        '| \[net\]   DHCPv6: leased 2001:db8:1:2::1234, DNS 2001:db8::53' \
-        '| \[iscsi\] REPORT LUNS: \[0\] over 1 connection' \
-        '| \[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512' \
-        '| \[iscsi\] wrote and read back block 8192' \
-        '| \[blk\]   virtio-blk (1.x) at 0x10001000: 8192 sectors; wrote and read back sector 4096' \
-        "the host RAM disk holds the guest's write to sector 4096" \
-        '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' \
-        '| \[hyp\]   no H extension in riscv,isa: skipping the guests' '| \[done\]' 'guest exit Shutdown' \
-        'fp: the kernel does not offer FP'
-    rm -f "$nestlog" "$nestiscsi"
+if can_boot riscv-hyp qemu-system-riscv64; then
+    if is_built riscv-virt; then
+        echo "== boot examples/riscv-virt as a guest of examples/riscv-hyp under QEMU"
+        nestlog=$(tmp)
+        nestiscsi=$(tmp)
+        truncate -s 8M "$nestiscsi"
+        run_qemu "riscv-hyp" "$nestlog" 120 qemu-system-riscv64 -machine virt -bios default -smp 2 -accel tcg,thread=multi -m 512M -nographic \
+            -kernel examples/riscv-hyp/target/riscv64imac-unknown-none-elf/release/riscv-hyp \
+            -device loader,file=examples/riscv-virt/target/riscv64imac-unknown-none-elf/release/riscv-virt,addr=0x98000000,force-raw=on \
+            -netdev user,id=n0,guestfwd=tcp:10.0.2.100:7-cmd:cat,guestfwd=tcp:10.0.2.100:3260-cmd:"python3 scripts/iscsi-target.py $nestiscsi" \
+            -device virtio-net-device,netdev=n0
+        expect "riscv-hyp" "$nestlog" 'guest kernel: [0-9]* KiB loaded, entry 0x80200000' '| osmium riscv-virt example (hart 0)' \
+            '| \[mmu\]   Sv39 on' '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
+            '| \[smp\]   2 CPUs online' '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' \
+            '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
+            '| \[net\]   DHCP: 10.0.2.15/24 via 10.0.2.2' '| \[net\]   ping 10.0.2.2: seq 1 in' \
+            '| \[net\]   TCP echo from 10.0.2.100:7: "hello over TCP"' \
+            '| \[net\]   IPv6 fragmentation: 4000 bytes sent in [0-9]* fragments and reassembled' \
+            '| \[net\]   IPv6 privacy: stable opaque address 2001:db8:1:2:' \
+            '| \[net\]   DHCPv6: leased 2001:db8:1:2::1234, DNS 2001:db8::53' \
+            '| \[iscsi\] REPORT LUNS: \[0\] over 1 connection' \
+            '| \[iscsi\] 10.0.2.100:3260: "OSMIUM" "iscsi-target.py", 16384 blocks of 512' \
+            '| \[iscsi\] wrote and read back block 8192' \
+            '| \[blk\]   virtio-blk (1.x) at 0x10001000: 8192 sectors; wrote and read back sector 4096' \
+            "the host RAM disk holds the guest's write to sector 4096" \
+            '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' \
+            '| \[hyp\]   no H extension in riscv,isa: skipping the guests' '| \[done\]' 'guest exit Shutdown' \
+            'fp: the kernel does not offer FP'
+        rm -f "$nestlog" "$nestiscsi"
+    else
+        skip "examples/riscv-virt not built" "its boot as a guest of examples/riscv-hyp"
+    fi
     # On a hart with Ssaia the hypervisor first runs a guest with an emulated
     # APLIC (MSI delivery) and IMSIC: it enables the interrupt file through
     # siselect/sireg and claims three interrupts with stopei, all completed
     # by the hypervisor (virtual-instruction traps). Needs a QEMU with Ssaia.
     if timeout 2 qemu-system-riscv64 -machine virt -cpu rv64,ssaia=true -nographic -S -monitor none -serial none >/dev/null 2>&1 || [ $? -eq 124 ]; then
         echo "== boot examples/riscv-hyp with an APLIC and IMSIC guest under QEMU"
-        aialog=$(mktemp)
+        aialog=$(tmp)
         run_qemu "riscv-hyp (AIA)" "$aialog" 60 qemu-system-riscv64 -machine virt -bios default -cpu rv64,ssaia=true -smp 2 -m 512M -nographic \
             -kernel examples/riscv-hyp/target/riscv64imac-unknown-none-elf/release/riscv-hyp
         expect "riscv-hyp (AIA)" "$aialog" '| \[guest\] AIA UART interrupt, received: ping' \
             'AIA guest exit Shutdown: eie0 0x2a0, APLIC domaincfg 0x[0-9a-f]*80000104; stopei claimed 0x50005 (APLIC setipnum), 0x70007 (IMSIC page write), 0x90009 (UART via APLIC), then 0x0'
         rm -f "$aialog"
     else
-        echo "== QEMU lacks the Ssaia CPU option; skipping the riscv-hyp APLIC/IMSIC boot"
+        skip "no QEMU with the Ssaia CPU option" "the riscv-hyp APLIC/IMSIC boot"
     fi
 fi
 
 # EL2 hypervisor (QEMU starts it at EL2 with virtualization=on): checked for
 # its own lines, since it runs none of the scheduler demos.
-if command -v qemu-system-aarch64 >/dev/null; then
+if can_boot aarch64-hyp qemu-system-aarch64; then
     echo "== boot examples/aarch64-hyp under QEMU"
-    hyplog=$(mktemp)
-    (cd examples/aarch64-hyp && cargo build -q --release)
+    hyplog=$(tmp)
     run_qemu "aarch64-hyp" "$hyplog" 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=2 -cpu max -smp 2 -m 128M -nographic \
         -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp
     expect "aarch64-hyp" "$hyplog" 'example (EL2)' 'EL2 MMU on' '\[rand\]  seeded from the CPU; draws differ' \
@@ -601,7 +687,7 @@ if command -v qemu-system-aarch64 >/dev/null; then
     # through list registers; ICC_SGI1R_EL1 writes trap), on one vCPU and on
     # two, next to the GICv2 guests above.
     echo "== boot examples/aarch64-hyp on a GICv3 host under QEMU"
-    hyplog=$(mktemp)
+    hyplog=$(tmp)
     run_qemu "aarch64-hyp (GICv3)" "$hyplog" 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=3 -cpu max -smp 2 -m 128M -nographic \
         -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp
     expect "aarch64-hyp (GICv3)" "$hyplog" 'physical GICv3 (distributor/redistributors) at' '2 CPUs online at EL2' \
@@ -617,10 +703,10 @@ if command -v qemu-system-aarch64 >/dev/null; then
     # pending table and rings a physical doorbell LPI; once resident, the
     # guest takes it, then another raised while it runs, through its CPU
     # interface without exits. Older QEMUs lack GICv4 emulation under TCG.
-    probe_dir=$(mktemp -d)
+    probe_dir=$(tmp -d)
     if qemu-system-aarch64 -machine virt,virtualization=on,gic-version=4,dumpdtb="$probe_dir/v4.dtb" -cpu max -nographic >/dev/null 2>&1; then
         echo "== boot examples/aarch64-hyp on a GICv4 host under QEMU"
-        hyplog=$(mktemp)
+        hyplog=$(tmp)
         run_qemu "aarch64-hyp (GICv4)" "$hyplog" 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=4 -cpu max -smp 2 -m 128M -nographic \
             -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp
         expect "aarch64-hyp (GICv4)" "$hyplog" 'physical GICv3 (distributor/redistributors) at' \
@@ -631,24 +717,28 @@ if command -v qemu-system-aarch64 >/dev/null; then
             '\[done\]'
         rm -f "$hyplog"
     else
-        echo "== QEMU cannot emulate a GICv4 under TCG; skipping the aarch64-hyp GICv4 boot"
+        skip "no QEMU that emulates a GICv4 under TCG" "the aarch64-hyp GICv4 boot"
     fi
     rm -rf "$probe_dir"
     # The same hypervisor booting the aarch64-virt kernel built above as a
     # two-vCPU EL1 guest (QEMU's loader places the ELF raw in host RAM).
-    echo "== boot examples/aarch64-virt as a guest of examples/aarch64-hyp under QEMU"
-    nestlog=$(mktemp)
-    run_qemu "aarch64-hyp (guest kernel)" "$nestlog" 120 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=2 -cpu max -smp 2 \
-        -accel tcg,thread=multi -m 512M -nographic \
-        -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp \
-        -device loader,file=examples/aarch64-virt/target/aarch64-unknown-none-softfloat/release/aarch64-virt,addr=0x58000000,force-raw=on
-    expect "aarch64-hyp (guest kernel)" "$nestlog" 'guest kernel: [0-9]* KiB loaded, entry 0x40200000, 2 vCPUs' '| osmium aarch64-virt example (EL1)' \
-        '| \[uart\]  pl011 at 0x9000000' 'virtual timer is INTID 27; PSCI via Hvc' '| \[smp\]   2 CPUs online' \
-        '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
-        '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
-        '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' '| \[done\]' \
-        'fp: FP registers inherited by fork and kept across switches: ok' 'guest exit Shutdown'
-    rm -f "$nestlog"
+    if is_built aarch64-virt; then
+        echo "== boot examples/aarch64-virt as a guest of examples/aarch64-hyp under QEMU"
+        nestlog=$(tmp)
+        run_qemu "aarch64-hyp (guest kernel)" "$nestlog" 120 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=2 -cpu max -smp 2 \
+            -accel tcg,thread=multi -m 512M -nographic \
+            -kernel examples/aarch64-hyp/target/aarch64-unknown-none-softfloat/release/aarch64-hyp \
+            -device loader,file=examples/aarch64-virt/target/aarch64-unknown-none-softfloat/release/aarch64-virt,addr=0x58000000,force-raw=on
+        expect "aarch64-hyp (guest kernel)" "$nestlog" 'guest kernel: [0-9]* KiB loaded, entry 0x40200000, 2 vCPUs' '| osmium aarch64-virt example (EL1)' \
+            '| \[uart\]  pl011 at 0x9000000' 'virtual timer is INTID 27; PSCI via Hvc' '| \[smp\]   2 CPUs online' \
+            '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
+            '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
+            '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' '| \[done\]' \
+            'fp: FP registers inherited by fork and kept across switches: ok' 'guest exit Shutdown'
+        rm -f "$nestlog"
+    else
+        skip "examples/aarch64-virt not built" "its boot as a guest of examples/aarch64-hyp"
+    fi
 fi
 
 # VHE hypervisor: sets HCR_EL2.E2H and TGE at boot and runs as an EL1
@@ -656,11 +746,10 @@ fi
 # through the VHE world switch (TGE clear, _EL12 registers) and a user
 # program whose svc must still reach the host's own trap handler. Needs a CPU
 # with VHE: cortex-a72 has none.
-if command -v qemu-system-aarch64 >/dev/null; then
-    (cd examples/aarch64-vhe && cargo build -q --release)
+if can_boot aarch64-vhe qemu-system-aarch64; then
     for vhe_cpu in max neoverse-n1; do
         echo "== boot examples/aarch64-vhe under QEMU (-cpu $vhe_cpu)"
-        vhelog=$(mktemp)
+        vhelog=$(tmp)
         run_qemu "aarch64-vhe ($vhe_cpu)" "$vhelog" 60 qemu-system-aarch64 -machine virt,virtualization=on,gic-version=3 -cpu "$vhe_cpu" -m 128M -nographic \
             -kernel examples/aarch64-vhe/target/aarch64-unknown-none-softfloat/release/aarch64-vhe
         expect "aarch64-vhe ($vhe_cpu)" "$vhelog" 'aarch64-vhe example (EL2)' 'E2H and TGE set' 'EL2&0 MMU on' \
@@ -674,10 +763,9 @@ if command -v qemu-system-aarch64 >/dev/null; then
 fi
 
 # AMD SVM hypervisor (QEMU's TCG implements SVM with nested paging).
-if command -v qemu-system-x86_64 >/dev/null; then
+if can_boot x86_64-hyp qemu-system-x86_64; then
     echo "== boot examples/x86_64-hyp under QEMU"
-    svmlog=$(mktemp)
-    (cd examples/x86_64-hyp && cargo build -q --release)
+    svmlog=$(tmp)
     run_qemu "x86_64-hyp" "$svmlog" 60 qemu-system-x86_64 -machine q35 -cpu max -smp 2 -m 128M -nographic -no-reboot -display none \
         -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp
     expect "x86_64-hyp" "$svmlog" 'SVM on, nested paging' '\[guest\] hello from SVM over port I/O' \
@@ -695,28 +783,32 @@ if command -v qemu-system-x86_64 >/dev/null; then
     rm -f "$svmlog"
     # The same hypervisor booting the x86_64-pc kernel built above as a
     # two-vCPU PVH guest (QEMU's loader places the ELF raw in host RAM).
-    echo "== boot examples/x86_64-pc as a guest of examples/x86_64-hyp under QEMU"
-    nestlog=$(mktemp)
-    run_qemu "x86_64-hyp (guest kernel)" "$nestlog" 120 qemu-system-x86_64 -machine q35 -cpu max -smp 2 -accel tcg,thread=multi -m 512M -nographic \
-        -no-reboot -display none -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp \
-        -device loader,file=examples/x86_64-pc/target/x86_64-unknown-none/release/x86_64-pc,addr=0x18000000,force-raw=on
-    expect "x86_64-hyp (guest kernel)" "$nestlog" 'guest kernel: [0-9]* KiB loaded, PVH entry 0x[0-9a-f]*, 2 vCPUs' '| osmium x86_64-pc example' \
-        '| \[acpi\]  MADT lists 2 enabled CPUs' '| \[smp\]   2 CPUs online' \
-        '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
-        '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
-        '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' \
-        '| \[uart\]  interrupt-driven input: "hello from the host"' '| \[done\]' 'guest powered off' \
-        'fp: FP registers inherited by fork and kept across switches: ok'
-    rm -f "$nestlog"
+    if is_built x86_64-pc; then
+        echo "== boot examples/x86_64-pc as a guest of examples/x86_64-hyp under QEMU"
+        nestlog=$(tmp)
+        run_qemu "x86_64-hyp (guest kernel)" "$nestlog" 120 qemu-system-x86_64 -machine q35 -cpu max -smp 2 -accel tcg,thread=multi -m 512M -nographic \
+            -no-reboot -display none -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp \
+            -device loader,file=examples/x86_64-pc/target/x86_64-unknown-none/release/x86_64-pc,addr=0x18000000,force-raw=on
+        expect "x86_64-hyp (guest kernel)" "$nestlog" 'guest kernel: [0-9]* KiB loaded, PVH entry 0x[0-9a-f]*, 2 vCPUs' '| osmium x86_64-pc example' \
+            '| \[acpi\]  MADT lists 2 enabled CPUs' '| \[smp\]   2 CPUs online' \
+            '| \[mutex\] 4 tasks x 1000 increments across yields = 4000' '| \[preempt\]' \
+            '| \[smp\]   migrating task visited CPUs \[0, 1, 0\]' '| \[balance\] 4 unpinned tasks spawned on CPU 0 ran on CPUs 0b11' \
+            '| \[user\]  user-elf exited with status 0' '| \[user\]  init and its children reaped' \
+            '| \[uart\]  interrupt-driven input: "hello from the host"' '| \[done\]' 'guest powered off' \
+            'fp: FP registers inherited by fork and kept across switches: ok'
+        rm -f "$nestlog"
+    else
+        skip "examples/x86_64-pc not built" "its boot as a guest of examples/x86_64-hyp"
+    fi
 fi
 
 # Intel VMX hypervisor: needs KVM with nested virtualization (TCG has no VMX).
-if command -v qemu-system-x86_64 >/dev/null && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
+if is_built x86_64-hyp && is_built x86_64-pc && command -v qemu-system-x86_64 >/dev/null && [ -r /dev/kvm ] && [ -w /dev/kvm ] \
     && grep -qx '[Y1]' /sys/module/kvm_intel/parameters/nested 2>/dev/null; then
     # The SVM hypervisor on an Intel CPU picks VMX: the same demos, then the
     # x86_64-pc kernel as a two-vCPU guest. Nested exits are slow, so allow time.
     echo "== boot examples/x86_64-hyp on VMX under QEMU/KVM"
-    hyplog=$(mktemp)
+    hyplog=$(tmp)
     run_qemu "x86_64-hyp on VMX" "$hyplog" 150 qemu-system-x86_64 -machine q35 -accel kvm -cpu host -smp 2 -m 128M -nographic -no-reboot -display none \
         -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp
     expect "x86_64-hyp on VMX" "$hyplog" 'VMX on: EPT, VPID and unrestricted guest' '\[guest\] hello from SVM over port I/O' \
@@ -728,7 +820,7 @@ if command -v qemu-system-x86_64 >/dev/null && [ -r /dev/kvm ] && [ -w /dev/kvm 
         '\[smp-guest\] cpu 0: IPI 0x41 from cpu 1 through the local APICs' '\[done\]'
     rm -f "$hyplog"
     echo "== boot examples/x86_64-pc as a guest of examples/x86_64-hyp on VMX under QEMU/KVM"
-    hyplog=$(mktemp)
+    hyplog=$(tmp)
     run_qemu "x86_64-hyp on VMX (guest kernel)" "$hyplog" 300 qemu-system-x86_64 -machine q35 -accel kvm -cpu host -smp 2 -m 512M -nographic \
         -no-reboot -display none -kernel examples/x86_64-hyp/target/x86_64-unknown-none/release/x86_64-hyp \
         -device loader,file=examples/x86_64-pc/target/x86_64-unknown-none/release/x86_64-pc,addr=0x18000000,force-raw=on
@@ -738,7 +830,8 @@ if command -v qemu-system-x86_64 >/dev/null && [ -r /dev/kvm ] && [ -w /dev/kvm 
         '| \[uart\]  interrupt-driven input: "hello from the host"' '| \[done\]' 'guest powered off'
     rm -f "$hyplog"
 else
-    echo "== skipping x86_64-hyp on VMX: needs /dev/kvm and nested VMX"
+    skip "no /dev/kvm with nested VMX" "x86_64-hyp on VMX"
+
 fi
 
 # UEFI application on OVMF (x86_64) and AAVMF (AArch64): GOP sets a mode and
@@ -746,19 +839,21 @@ fi
 # none; the screens are checked. Then the loader services: the RSDP from the
 # configuration tables, a file read from the ESP, page allocation, the memory
 # map and ExitBootServices, after which it reports on the serial port.
+# There is no RISC-V boot: examples/uefi has no RISC-V build, as Rust has no
+# RISC-V UEFI target (fw/ holds RISC-V firmware for trying one by hand).
 uefi() {
     local arch=$1 qemu=$2 boot_efi=$3 width=$4 height=$5
     shift 5
-    command -v "$qemu" >/dev/null || { echo "== $qemu not found; skipping UEFI $arch"; return; }
+    is_built "uefi-$arch" || { skip "examples/uefi not built for $arch" "its UEFI boot"; return; }
+    command -v "$qemu" >/dev/null || { skip "no $qemu" "UEFI $arch"; return; }
     echo "== boot examples/uefi ($arch) under QEMU"
-    (cd examples/uefi && cargo build -q --release --target "$arch-unknown-uefi")
     local esp log
-    esp=$(mktemp -d)
-    log=$(mktemp)
+    esp=$(tmp -d)
+    log=$(tmp)
     mkdir -p "$esp/EFI/BOOT" "$esp/osmium"
     cp "examples/uefi/target/$arch-unknown-uefi/release/uefi.efi" "$esp/EFI/BOOT/$boot_efi"
     printf 'hello from the ESP\n' > "$esp/osmium/hello.txt"
-    screen "$qemu" "$width" "$height"
+    screen "uefi-$arch" "$qemu" "$width" "$height"
     run_qemu "uefi ($arch)" "$log" 120 "$qemu" "$@" -m 256M -nographic -display none -no-reboot \
         -drive if=none,id=esp,format=raw,file="fat:rw:$esp" -device virtio-blk-pci,drive=esp \
         -qmp "unix:$qmp,server=on,wait=off"
@@ -772,24 +867,49 @@ uefi() {
         '\[done\]  shutting down'
     rm -rf "$esp" "$log"
 }
+# `bundled NAME [SIZE]` decompresses fw/NAME.fd.bz2 into $work, padded to
+# SIZE if given, and prints its path; it fails without bzip2.
+bundled() {
+    command -v bzip2 >/dev/null || return 1
+    local out
+    out=$(tmp --suffix=.fd)
+    bzip2 -dc "fw/$1.fd.bz2" >"$out"
+    [ -z "${2:-}" ] || truncate -s "$2" "$out"
+    echo "$out"
+}
+# The system's firmware, unless OSMIUM_FW=bundled asks for fw/'s.
+system_fw() { [ "${OSMIUM_FW:-}" != bundled ] && [ -f "$1" ]; }
+
 ovmf=
 for f in /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd; do
-    [ -f "$f" ] && { ovmf=$f; break; }
+    system_fw "$f" && { ovmf=$f; break; }
 done
 if [ -n "$ovmf" ]; then
     uefi x86_64 qemu-system-x86_64 BOOTX64.EFI 800 600 -machine q35 -bios "$ovmf"
+elif code=$(bundled X64_CODE) && vars=$(bundled X64_VARS); then
+    echo "== UEFI x86_64 on the bundled OVMF (fw/X64_CODE.fd.bz2)"
+    uefi x86_64 qemu-system-x86_64 BOOTX64.EFI 800 600 -machine q35 \
+        -drive if=pflash,format=raw,readonly=on,file="$code" -drive if=pflash,format=raw,file="$vars"
 else
-    echo "== no OVMF; skipping UEFI x86_64"
+    skip "no OVMF, and no bzip2 for fw/" "UEFI x86_64"
 fi
 aavmf=/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd
-if [ -f "$aavmf" ] && [ -f /usr/share/AAVMF/AAVMF_VARS.fd ]; then
-    vars=$(mktemp)
+if system_fw "$aavmf" && [ -f /usr/share/AAVMF/AAVMF_VARS.fd ]; then
+    vars=$(tmp)
     cp /usr/share/AAVMF/AAVMF_VARS.fd "$vars"
     uefi aarch64 qemu-system-aarch64 BOOTAA64.EFI 1280 800 -machine virt -cpu cortex-a72 \
         -drive if=pflash,format=raw,readonly=on,file="$aavmf" -drive if=pflash,format=raw,file="$vars" -device virtio-gpu-pci
-    rm -f "$vars"
+# QEMU's virt machine wants both flash banks 64 MiB long.
+elif code=$(bundled ARM64_CODE 64M) && vars=$(bundled ARM64_VARS 64M); then
+    echo "== UEFI aarch64 on the bundled AAVMF (fw/ARM64_CODE.fd.bz2)"
+    uefi aarch64 qemu-system-aarch64 BOOTAA64.EFI 1280 800 -machine virt -cpu cortex-a72 \
+        -drive if=pflash,format=raw,readonly=on,file="$code" -drive if=pflash,format=raw,file="$vars" -device virtio-gpu-pci
 else
-    echo "== no AAVMF; skipping UEFI aarch64"
+    skip "no AAVMF, and no bzip2 for fw/" "UEFI aarch64"
 fi
 
+if [ "${#skipped[@]}" -gt 0 ]; then
+    echo "== skipped:"
+    printf '   %s\n' "${skipped[@]}" | sort -u
+fi
 echo "all checks passed"

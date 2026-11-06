@@ -54,7 +54,7 @@ pub mod timer;
 
 pub use core_sched::{
     EnqueueReason, Scheduler, current, current_fp_state, exit, init_cpu, inject_scheduler, preempt_if_needed,
-    reset_current_fp, set_remote_wake_hook, set_switch_hook, spawn, tick, yield_now,
+    reset_current_fp, set_current_fp_state, set_remote_wake_hook, set_switch_hook, spawn, tick, yield_now,
 };
 pub use policy::{EdfScheduler, FifoScheduler, PriorityScheduler};
 pub use sync::{Mutex, MutexGuard, Semaphore, WaitQueue};

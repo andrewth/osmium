@@ -21,6 +21,13 @@
 //! - RISC-V: `f0`..`f31` and `fcsr` (the D extension).
 //!
 //! On hosted targets a per-thread variable stands in for the registers.
+//!
+//! [`FpState::as_bytes`] and [`FpState::set_bytes`] give the saved registers
+//! in the architecture's own layout, for a kernel that copies them to and
+//! from user memory (signal frames). `set_bytes` refuses values that would
+//! make the restore fault (x86_64's reserved `MXCSR` bits, a malformed XSAVE
+//! header), so a state built from untrusted bytes is as safe to load as one
+//! that was saved.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -29,6 +36,18 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static XSAVE_ON: AtomicBool = AtomicBool::new(false);
 /// The scheduler's loader for the first FP/SIMD instruction after a lazy switch.
 static LAZY_LOAD: AtomicUsize = AtomicUsize::new(0);
+/// x86_64: bytes of the area `xsave` writes for the enabled features (set by [`enable`]).
+#[cfg(all(bare, target_arch = "x86_64"))]
+static XSAVE_SIZE: AtomicUsize = AtomicUsize::new(0);
+/// x86_64: the `MXCSR` bits the CPU accepts (`MXCSR_MASK`, set by [`enable`]).
+#[cfg(all(bare, target_arch = "x86_64"))]
+static MXCSR_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(DEFAULT_MXCSR_MASK);
+
+/// The `MXCSR_MASK` to assume when `fxsave` reports 0 (Intel SDM 10.5.1.2).
+#[cfg_attr(not(any(test, all(bare, target_arch = "x86_64"))), allow(dead_code))]
+const DEFAULT_MXCSR_MASK: u32 = 0xffbf;
+/// x86_64 `XCR0` while XSAVE is on: x87, SSE and AVX.
+const XCR0: u64 = 7;
 
 /// `ESR_EL1` for the trap of a simulated FP/SIMD instruction on hosted builds: class 0x07, then a marker.
 #[cfg(not(bare))]
@@ -39,6 +58,35 @@ const HOST_FP_TRAP: u64 = 0x07 << 26 | 0x46_50;
 /// false off x86_64 and on hosted builds.
 pub fn avx_enabled() -> bool {
     XSAVE_ON.load(Ordering::Relaxed)
+}
+
+/// The XSAVE feature set ([`FpState::as_bytes`] is an XSAVE area holding
+/// these components): `XCR0`, x87|SSE|AVX, when [`avx_enabled`]; 0 when the
+/// state is an FXSAVE area or not x86_64.
+pub fn xsave_features() -> u64 {
+    if avx_enabled() { XCR0 } else { 0 }
+}
+
+/// [`FpState::set_bytes`] refused the bytes: loading them could fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidFpState;
+
+/// Whether an x86_64 FXSAVE (`xcr0` 0) or standard-format XSAVE image can be
+/// loaded without a fault: `MXCSR` has no bit outside `mxcsr_mask`, and an
+/// XSAVE header names only features in `xcr0`, is not compacted and has its
+/// reserved bytes clear.
+#[cfg_attr(not(any(test, all(bare, target_arch = "x86_64"))), allow(dead_code))]
+fn x86_image_ok(b: &[u8], mxcsr_mask: u32, xcr0: u64) -> bool {
+    let word = |off: usize| b.get(off..off + 8).and_then(|w| w.try_into().ok()).map(u64::from_le_bytes);
+    let Some(mxcsr) = b.get(24..28).and_then(|w| w.try_into().ok()).map(u32::from_le_bytes) else { return false };
+    if b.len() < 512 || mxcsr & !mxcsr_mask != 0 {
+        return false;
+    }
+    if xcr0 == 0 {
+        return true;
+    }
+    let (Some(xstate_bv), Some(xcomp_bv)) = (word(512), word(520)) else { return false };
+    xstate_bv & !xcr0 == 0 && xcomp_bv == 0 && b.get(528..576).is_some_and(|r| r.iter().all(|&x| x == 0))
 }
 
 /// Bytes of an x86_64 [`FpState`]: the XSAVE area for x87|SSE|AVX is 832
@@ -160,29 +208,25 @@ fn is_lazy_trap(_frame: &crate::trap::TrapFrame) -> bool {
 #[derive(Clone)]
 pub struct FpState([u8; XSAVE_AREA]);
 
-/// One task's FP/SIMD registers, saved while the task is switched out.
+/// One task's FP/SIMD registers, saved while the task is switched out:
+/// `q0`..`q31`, then `FPCR` and `FPSR` as 64-bit words.
 #[cfg(all(bare, target_arch = "aarch64"))]
 #[repr(C, align(16))]
 #[derive(Clone)]
-pub struct FpState {
-    q: [u128; 32],
-    fpcr: u64,
-    fpsr: u64,
-}
+pub struct FpState([u8; 528]);
 
-/// One task's FP/SIMD registers, saved while the task is switched out.
+/// One task's FP/SIMD registers, saved while the task is switched out:
+/// `f0`..`f31`, then `fcsr` as a 64-bit word.
 #[cfg(all(bare, target_arch = "riscv64"))]
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone)]
-pub struct FpState {
-    f: [u64; 32],
-    fcsr: u64,
-}
+pub struct FpState([u8; 264]);
 
-/// One task's FP/SIMD registers, saved while the task is switched out.
+/// One task's FP/SIMD registers, saved while the task is switched out: the
+/// simulated register, native-endian.
 #[cfg(not(bare))]
 #[derive(Clone)]
-pub struct FpState(u64);
+pub struct FpState([u8; 8]);
 
 impl Default for FpState {
     fn default() -> Self {
@@ -211,16 +255,65 @@ impl FpState {
         }
         #[cfg(all(bare, target_arch = "aarch64"))]
         {
-            Self { q: [0; 32], fpcr: 0, fpsr: 0 }
+            Self([0; 528])
         }
         #[cfg(all(bare, target_arch = "riscv64"))]
         {
-            Self { f: [0; 32], fcsr: 0 }
+            Self([0; 264])
         }
         #[cfg(not(bare))]
         {
-            Self(0)
+            Self([0; 8])
         }
+    }
+
+    /// The saved registers in the architecture's layout: on x86_64 the
+    /// FXSAVE area (512 bytes), or with [`avx_enabled`] the XSAVE area for
+    /// [`xsave_features`] (standard format, the size CPUID reports); on
+    /// AArch64 `q0`..`q31` then `FPCR` and `FPSR` as 64-bit words (528
+    /// bytes); on RISC-V `f0`..`f31` then `fcsr` as a 64-bit word (264
+    /// bytes); on hosted builds the 8-byte simulated register.
+    pub fn as_bytes(&self) -> &[u8] {
+        #[cfg(all(bare, target_arch = "x86_64"))]
+        {
+            let len = if XSAVE_ON.load(Ordering::Relaxed) { XSAVE_SIZE.load(Ordering::Relaxed) } else { 512 };
+            self.0.get(..len).unwrap_or(&self.0)
+        }
+        #[cfg(not(all(bare, target_arch = "x86_64")))]
+        {
+            &self.0
+        }
+    }
+
+    /// Replaces the saved registers with `bytes`, in the layout of
+    /// [`as_bytes`](Self::as_bytes) and of the same length, if loading them
+    /// cannot fault; otherwise changes nothing. On x86_64 `MXCSR` must have
+    /// no bit the CPU reserves, and an XSAVE area's header must be in
+    /// standard form, name only [`xsave_features`] and have its reserved
+    /// bytes clear. On AArch64 the upper halves of `FPCR` and `FPSR`
+    /// (reserved) and on RISC-V the bits of `fcsr` above `frm` and `fflags`
+    /// are cleared.
+    pub fn set_bytes(&mut self, bytes: &[u8]) -> Result<(), InvalidFpState> {
+        let len = self.as_bytes().len();
+        if bytes.len() != len {
+            return Err(InvalidFpState);
+        }
+        #[cfg(all(bare, target_arch = "x86_64"))]
+        if !x86_image_ok(bytes, MXCSR_MASK.load(Ordering::Relaxed), xsave_features()) {
+            return Err(InvalidFpState);
+        }
+        if let Some(dst) = self.0.get_mut(..len) {
+            dst.copy_from_slice(bytes);
+        }
+        #[cfg(all(bare, target_arch = "aarch64"))]
+        for range in [516..520, 524..528] {
+            self.0.get_mut(range).into_iter().flatten().for_each(|b| *b = 0);
+        }
+        #[cfg(all(bare, target_arch = "riscv64"))]
+        for b in self.0.get_mut(257..264).into_iter().flatten() {
+            *b = 0;
+        }
+        Ok(())
     }
 
     /// The registers live on this CPU now: what a forked child inherits.
@@ -294,7 +387,7 @@ impl FpState {
         }
         #[cfg(not(bare))]
         {
-            self.0 = host::live();
+            self.0 = host::live().to_ne_bytes();
         }
     }
 
@@ -306,10 +399,11 @@ impl FpState {
     /// registers must have saved them or no longer need them.
     pub unsafe fn restore(&self) {
         #[cfg(all(bare, target_arch = "x86_64"))]
-        // SAFETY: FP is on (the caller's contract). `self` came from `new`
-        // or `fxsave64`/`xsave64` (its field is private), so MXCSR has no
-        // reserved bits set, the XSAVE header is in standard (non-compacted)
-        // form with no reserved bits, and the restore cannot fault.
+        // SAFETY: FP is on (the caller's contract). `self` came from `new`,
+        // `fxsave64`/`xsave64` or `set_bytes` (its field is private), which
+        // checked it, so MXCSR has no reserved bits set, the XSAVE header is
+        // in standard (non-compacted) form with no reserved bits and only
+        // enabled features, and the restore cannot fault.
         unsafe {
             if XSAVE_ON.load(Ordering::Relaxed) {
                 core::arch::asm!("xrstor64 [{}]", in(reg) self.0.as_ptr(), in("eax") !0u32, in("edx") !0u32, options(nostack, readonly))
@@ -359,14 +453,9 @@ impl FpState {
             )
         }
         #[cfg(not(bare))]
-        host::set_live(self.0);
+        host::set_live(u64::from_ne_bytes(self.0));
     }
 }
-
-#[cfg(all(bare, target_arch = "aarch64"))]
-const _: () = assert!(core::mem::offset_of!(FpState, fpcr) == 512 && core::mem::offset_of!(FpState, fpsr) == 520);
-#[cfg(all(bare, target_arch = "riscv64"))]
-const _: () = assert!(core::mem::offset_of!(FpState, fcsr) == 256);
 
 /// Turns FP/SIMD on for the kernel and user mode on this CPU, undoing any
 /// earlier `trap_fp`, and returns true; false if this CPU or build has no FP
@@ -395,6 +484,7 @@ pub unsafe fn enable() -> bool {
                 options(nomem, nostack, preserves_flags),
             )
         };
+        record_mxcsr_mask();
         enable_xsave();
         true
     };
@@ -629,7 +719,9 @@ fn enable_xsave() {
         )
     };
     // With XCR0 = 7, EBX is the size of the area `xsave` writes.
-    if cpuid(0xd, 0).ebx as usize <= XSAVE_AREA {
+    let size = cpuid(0xd, 0).ebx as usize;
+    if (576..=XSAVE_AREA).contains(&size) {
+        XSAVE_SIZE.store(size, Ordering::Relaxed);
         XSAVE_ON.store(true, Ordering::Relaxed);
     } else {
         // SAFETY: as above, XCR0 = 3 (x87|SSE) is valid; AVX goes back off.
@@ -637,6 +729,18 @@ fn enable_xsave() {
             core::arch::asm!("xor ecx, ecx", "xsetbv", in("eax") 3u32, in("edx") 0u32, out("ecx") _, options(nomem, nostack))
         };
     }
+}
+
+/// Reads `MXCSR_MASK` from an `fxsave` image, for [`FpState::set_bytes`].
+#[cfg(all(bare, target_arch = "x86_64"))]
+fn record_mxcsr_mask() {
+    #[repr(C, align(16))]
+    struct Area([u8; 512]);
+    let mut area = Area([0; 512]);
+    // SAFETY: SSE is on (CR4.OSFXSR, just set); writes only `area`, 16-byte aligned and 512 bytes.
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) area.0.as_mut_ptr(), options(nostack)) };
+    let mask = area.0.get(28..32).and_then(|w| w.try_into().ok()).map_or(0, u32::from_le_bytes);
+    MXCSR_MASK.store(if mask == 0 { DEFAULT_MXCSR_MASK } else { mask }, Ordering::Relaxed);
 }
 
 /// The simulated FP registers of hosted builds: one value per thread.
@@ -694,5 +798,46 @@ mod tests {
         // SAFETY: as above.
         unsafe { saved.restore() };
         assert_eq!(host::live(), 7);
+    }
+
+    #[test]
+    fn bytes_round_trip_and_keep_their_length() {
+        let mut s = FpState::new();
+        assert_eq!(s.as_bytes(), [0; 8]);
+        assert_eq!(s.set_bytes(&5u64.to_ne_bytes()), Ok(()));
+        // SAFETY: hosted; the registers are simulated.
+        unsafe { s.restore() };
+        assert_eq!(host::live(), 5);
+        assert_eq!(s.set_bytes(&[0; 9]), Err(InvalidFpState), "another length");
+        assert_eq!(s.as_bytes(), 5u64.to_ne_bytes(), "unchanged");
+    }
+
+    #[test]
+    fn x86_images_that_would_fault_are_refused() {
+        let mut fx = [0u8; 512];
+        fx[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        assert!(x86_image_ok(&fx, DEFAULT_MXCSR_MASK, 0));
+        assert!(!x86_image_ok(&fx[..511], DEFAULT_MXCSR_MASK, 0), "short");
+        fx[24..28].copy_from_slice(&0x1_1f80u32.to_le_bytes());
+        assert!(!x86_image_ok(&fx, DEFAULT_MXCSR_MASK, 0), "reserved MXCSR bit");
+        fx[24..28].copy_from_slice(&0x1fc0u32.to_le_bytes());
+        assert!(!x86_image_ok(&fx, DEFAULT_MXCSR_MASK, 0), "DAZ where the CPU lacks it");
+        assert!(x86_image_ok(&fx, 0xffff, 0), "DAZ where it has it");
+
+        let mut xs = [0u8; 832];
+        xs[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        xs[512..520].copy_from_slice(&7u64.to_le_bytes());
+        assert!(x86_image_ok(&xs, DEFAULT_MXCSR_MASK, XCR0));
+        assert!(!x86_image_ok(&xs[..560], DEFAULT_MXCSR_MASK, XCR0), "no whole header");
+        for (off, v, why) in [
+            (512, 0xffu64, "a feature XCR0 lacks"),
+            (520, 1 << 63, "compacted form"),
+            (528, 1, "reserved header bytes"),
+            (568, 1 << 56, "the last reserved byte"),
+        ] {
+            let mut bad = xs;
+            bad[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            assert!(!x86_image_ok(&bad, DEFAULT_MXCSR_MASK, XCR0), "{why}");
+        }
     }
 }

@@ -19,21 +19,22 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
+use demos::guest::image;
+use demos::kernel::{FRAMES, Frames};
 use osmium::arch::aarch64::{self, psci};
 use osmium::arch::trap::{self, Trap, TrapFrame};
 use osmium::arch::{cpu, irq, mmu};
 use osmium::boot::fdt::Fdt;
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::mmio::IoMem;
-use osmium::hal::{print, println};
+use osmium::hal::println;
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::formats::Aarch64;
-use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
+use osmium::mm::{FrameAllocator, MapFlags, MemoryMap, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
-use osmium::sync::{IrqSpinLock, Once};
+use osmium::sync::Once;
 use osmium::sysdrv::pl011::Pl011;
 use osmium::virt::aarch64::{self as vm, Aarch64Vcpu};
 use osmium::virt::devices::Uart16550;
@@ -62,8 +63,13 @@ _start:
 3:  wfe
     b 3b
 
+    // The boot stack, above a guard page that kmain unmaps before turning
+    // the MMU on, so an overflow faults instead of overwriting .data below.
     .section .bss.stack, "aw", @nobits
     .balign 4096
+    .globl boot_stack_guard
+boot_stack_guard:
+    .space 4096
     .space 65536
 boot_stack_top:
 "#
@@ -121,6 +127,7 @@ user_image_end:
 );
 
 unsafe extern "C" {
+    static boot_stack_guard: u8;
     static _kernel_start: u8;
     static _etext: u8;
     static _erodata: u8;
@@ -135,24 +142,9 @@ fn sym(s: &u8) -> u64 {
     s as *const u8 as u64
 }
 
-/// The bytes between two linker symbols.
-///
-/// # Safety
-/// `start..end` must bound initialised, immutable data.
-unsafe fn image(start: &'static u8, end: &'static u8) -> &'static [u8] {
-    // SAFETY: the caller's contract.
-    unsafe { core::slice::from_raw_parts(start, (end as *const u8).offset_from(start) as usize) }
-}
-
 /// QEMU virt's PL011, and where it puts the device tree for ELF kernels.
 const EARLY_UART: usize = 0x0900_0000;
 const RAM_BASE_DTB: usize = 0x4000_0000;
-
-type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
-
-// SAFETY: the kernel runs identity-mapped (before and after enabling the
-// MMU), so physical address = virtual address for all RAM.
-static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
 
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
@@ -176,6 +168,10 @@ fn shutdown() -> ! {
 }
 
 #[unsafe(no_mangle)]
+#[allow(
+    clippy::expect_used,
+    reason = "boot: what QEMU's machine provides is set up once here, so a failure means a broken machine or a bug in this example; the panic handler reports which"
+)]
 extern "C" fn kmain(x0: usize) -> ! {
     // VHE first: from here on the EL1 register names reach EL2, which is what
     // osmium-arch's EL1 build (with `aarch64-vhe`) expects.
@@ -225,13 +221,8 @@ extern "C" fn kmain(x0: usize) -> ! {
     map.reserve(PhysAddr::new(kstart), PhysAddr::new(kend), RegionKind::Kernel).expect("reserve failed");
     map.page_align_usable();
     let (ram_start, ram_end) = map.regions().iter().fold((u64::MAX, 0), |(s, e), r| (s.min(r.start.0), e.max(r.end.0)));
-    {
-        let mut buddy = FRAMES.lock();
-        for r in map.usable() {
-            // SAFETY: the memory map says the range is free RAM, identity-mapped.
-            unsafe { buddy.add_region(r.start, r.end) };
-        }
-    }
+    // SAFETY: the memory map says these ranges are free RAM, identity-mapped.
+    unsafe { demos::kernel::add_ram(map.usable().map(|r| r.start..r.end)) };
     HEAP.init(&FRAMES);
 
     // --- EL2&0 stage-1 MMU ---------------------------------------------------
@@ -255,7 +246,18 @@ extern "C" fn kmain(x0: usize) -> ! {
     unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), user.0 as *mut u8, code.len()) };
     pt.map_range(VirtAddr::new(USER_VA), user, PAGE_SIZE as u64, MapFlags::RX | MapFlags::USER)
         .expect("map_range failed");
+    // The page below the boot stack becomes its guard (see `_start`). Before
+    // the MMU is on: splitting the block it sits in while the table is live
+    // would need break-before-make under the running stack.
+    // SAFETY: a linker symbol.
+    let guard = unsafe { sym(&boot_stack_guard) };
+    let guarded = demos::kernel::unmap_guard(&mut pt, guard);
     enable_mmu(pt.root());
+    if guarded {
+        let bottom = guard as usize + PAGE_SIZE;
+        demos::kernel::set_boot_stack_limit(bottom);
+        osmium::arch::trap::TrapCpu::current().set_stack_limit(bottom);
+    }
     println!(
         "[mmu]   EL2&0 MMU on (TCR in the EL1 layout), TTBR0 {:#x}; RAM {ram_start:#x}..{ram_end:#x}",
         pt.root().0
@@ -296,6 +298,10 @@ const GUEST_RAM: GuestPhysAddr = GuestPhysAddr(0x4000_0000);
 const GUEST_RAM_ORDER: u32 = 9; // 2 MiB
 const GUEST_UART: u64 = 0x1000_0000;
 
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn guest_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -307,18 +313,8 @@ fn guest_demo() {
     mem.write(GUEST_RAM, unsafe { image(&guest_image, &guest_image_end) }).expect("write failed");
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
-
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let out = line.clone();
     let mmio = Bus::new();
-    let uart = Uart16550::new(move |b| {
-        let mut l = out.lock();
-        l.push(b);
-        if b == b'\n' {
-            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-            l.clear();
-        }
-    });
+    let uart = Uart16550::new(demos::guest::console(""));
     mmio.insert(GUEST_UART, 8, Arc::new(uart)).expect("insert failed");
     let pio = Bus::new();
 
@@ -332,7 +328,9 @@ fn guest_demo() {
         unsafe { core::arch::asm!(".arch_extension fp", "fmov d0, {}", in(reg) HOST_D0, options(nomem, nostack)) };
     }
 
-    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1));
+    // Stage-2 faults on guest RAM are then reported, not emulated as MMIO.
+    let mem = Arc::new(mem);
+    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1)).with_memory(mem.clone());
     let (mut hypercalls, mut halts) = (0, 0);
     let mut tge_on_exits = true;
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| {
@@ -385,6 +383,10 @@ fn user_demo() -> ! {
     unsafe { aarch64::enter_user(USER_VA, USER_VA + PAGE_SIZE as u64, top) }
 }
 
+#[allow(
+    clippy::panic,
+    reason = "a trap this example never enables is a bug in it; stopping with a report is all there is to do"
+)]
 fn on_trap(frame: &mut TrapFrame) {
     if frame.from_user() && frame.cause() == Trap::Syscall {
         println!(

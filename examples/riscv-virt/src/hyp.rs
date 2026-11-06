@@ -11,12 +11,13 @@ use core::ops::ControlFlow;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use osmium::storage::ramdisk::RamDisk;
+use demos::guest::image;
 use osmium::hal::block::BlockDevice as _;
 use osmium::hal::dma::{DmaAllocator, DmaBuffer};
 use osmium::hal::{print, println};
 use osmium::mm::{FrameAllocator, MapFlags, PageTable, PhysAddr, VirtAddr};
 use osmium::sched::TaskBuilder;
+use osmium::storage::ramdisk::RamDisk;
 use osmium::sync::IrqSpinLock;
 use osmium::virt::devices::{Uart16550, VirtualPlic};
 use osmium::virt::riscv::fdt::GuestMachine;
@@ -97,6 +98,10 @@ pub fn available(fdt: &osmium::boot::fdt::Fdt<'_>) -> bool {
     letters.contains('h')
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 pub fn demo() {
     riscv::init_cpu();
 
@@ -108,31 +113,20 @@ pub fn demo() {
     // and the guest until it is freed below.
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const guest_image;
-        core::slice::from_raw_parts(start, (&raw const guest_image_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&guest_image, &guest_image_end) };
     mem.write(GUEST_RAM, image).expect("write failed");
 
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
     map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     let hgatp = hgatp_sv39x4(gstage.root(), 1);
-
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let out = line.clone();
     let mmio = Bus::new();
-    let uart = Uart16550::new(move |b| {
-        let mut l = out.lock();
-        l.push(b);
-        if b == b'\n' {
-            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-            l.clear();
-        }
-    });
+    let uart = Uart16550::new(demos::guest::console(""));
     mmio.insert(GUEST_UART, 8, Arc::new(uart)).expect("insert failed");
     let pio = Bus::new();
 
-    let mut vcpu = RiscvVcpu::new(GUEST_RAM, HartId(0), 0, hgatp);
+    // Guest-page faults on guest RAM are then reported, not emulated as MMIO.
+    let mem = Arc::new(mem);
+    let mut vcpu = RiscvVcpu::new(GUEST_RAM, HartId(0), 0, hgatp).with_memory(mem.clone());
     let (mut hypercalls, mut halts, mut interrupts) = (0, 0, 0);
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { .. } => {
@@ -188,6 +182,10 @@ const GUEST2_RAM: GuestPhysAddr = GuestPhysAddr(0x1_0000_0000);
 /// injected through the PLIC as `hvip.VSEIP`, then brings up a virtio-net
 /// card with osmium's driver and resolves the gateway over ARP, answered by
 /// a responder in the hypervisor.
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 pub fn demo_irq() {
     let free_before = FRAMES.lock().free_frames();
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
@@ -239,22 +237,8 @@ pub fn demo_irq() {
             eip.store(level, Ordering::Release);
         }
     }));
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let out = line.clone();
     let p = plic.clone();
-    let uart = Arc::new(
-        Uart16550::new(move |b| {
-            let mut l = out.lock();
-            if b != b'\r' {
-                l.push(b);
-            }
-            if b == b'\n' {
-                print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-                l.clear();
-            }
-        })
-        .with_irq(move |level| p.set_level(UART_IRQ, level)),
-    );
+    let uart = Arc::new(Uart16550::new(demos::guest::console("")).with_irq(move |level| p.set_level(UART_IRQ, level)));
     let mmio = Bus::new();
     mmio.insert(PLIC_BASE, VirtualPlic::mmio_size(2), plic.clone()).expect("insert failed");
     mmio.insert(GUEST_UART, 8, uart.clone()).expect("insert failed");
@@ -329,21 +313,26 @@ pub fn demo_irq() {
 
 /// The driver guest. Runs in VS-mode from the shared host image, so it uses
 /// no statics: only its stack, the device tree and MMIO.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "the guest's own code: a failure stops only the guest, which the host reports"
+)]
 extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     use core::fmt::Write;
     use osmium::boot::fdt::Fdt;
-    use osmium::sysdrv::plic::Plic;
-    use osmium::sysdrv::uart16550::{Mmio, Uart16550 as UartDriver};
     use osmium::drivers::virtio::DeviceType;
     use osmium::drivers::virtio::Transport;
-    use osmium::storage::virtio_blk::VirtioBlk;
     use osmium::drivers::virtio::mmio::MmioTransport;
-    use osmium::netdev::virtio_net::VirtioNet;
     use osmium::hal::block::BlockDevice;
     use osmium::hal::irq::InterruptController;
     use osmium::hal::mmio::IoMem;
     use osmium::hal::net::{MacAddress, NetDevice};
     use osmium::hal::serial::{SerialPort, SerialWriter};
+    use osmium::netdev::virtio_net::VirtioNet;
+    use osmium::storage::virtio_blk::VirtioBlk;
+    use osmium::sysdrv::plic::Plic;
+    use osmium::sysdrv::uart16550::{Mmio, Uart16550 as UartDriver};
 
     // SAFETY: the hypervisor put a device tree at `dtb`.
     let Ok(fdt) = (unsafe { Fdt::from_ptr(dtb as *const u8) }) else { sbi_shutdown() };
@@ -501,7 +490,9 @@ impl DmaAllocator for BumpDma {
 /// The hypervisor's side of the guest's link: answers ARP requests for the
 /// gateway address.
 fn arp_responder(f: &[u8], reply: &mut dyn FnMut(&[u8])) {
-    if f.len() < 42 || f[12..14] != [0x08, 0x06] || f[20..22] != [0, 1] || f[38..42] != GATEWAY_IP {
+    // An ARP request (EtherType 0x0806, opcode 1) for the gateway's address.
+    let Some(f) = f.first_chunk::<42>() else { return };
+    if f[12..14] != [0x08, 0x06] || f[20..22] != [0, 1] || f[38..42] != GATEWAY_IP {
         return;
     }
     let mut r = [0u8; 42];
@@ -619,6 +610,11 @@ unsafe extern "C" {
 
 /// Runs the two-hart guest, each vCPU in a host task pinned to its own
 /// host CPU (1 and 2 when there are enough).
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 pub fn demo_smp(ncpus: usize) {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = 4096u64 << GUEST_RAM_ORDER;
@@ -627,10 +623,7 @@ pub fn demo_smp(ncpus: usize) {
     // and the guest until it is freed below.
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const smp_guest;
-        core::slice::from_raw_parts(start, (&raw const smp_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&smp_guest, &smp_guest_end) };
     mem.write(GUEST_RAM, image).expect("write failed");
     let mem = Arc::new(mem);
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
@@ -643,7 +636,9 @@ pub fn demo_smp(ncpus: usize) {
     let k = kicks.clone();
     let harts = GuestHarts::with_kick(2, move |cpu| {
         k.fetch_add(1, Ordering::Relaxed);
-        let _ = osmium::arch::riscv64::sbi::send_ipi(1, crate::HARTS[cpu].load(Ordering::Relaxed));
+        if let Some(h) = crate::HARTS.get(cpu) {
+            let _ = osmium::arch::riscv64::sbi::send_ipi(1, h.load(Ordering::Relaxed));
+        }
     });
     harts.request_start(0, GUEST_RAM.0, 0).expect("request_start failed");
     let buses = Arc::new((Bus::new(), Bus::new()));
@@ -765,6 +760,11 @@ const REPORT: u64 = 0x0a00_0001;
 
 /// Interleaves two vCPUs on this hart and checks each computed with its own
 /// floating-point registers.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 pub fn demo_fp() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = 4096u64 << GUEST_RAM_ORDER;
@@ -773,10 +773,7 @@ pub fn demo_fp() {
     // and the guests until it is freed below.
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const fp_guest;
-        core::slice::from_raw_parts(start, (&raw const fp_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&fp_guest, &fp_guest_end) };
     mem.write(GUEST_RAM, image).expect("write failed");
     let mut gstage: GStageTable<_> = PageTable::new(&FRAMES).expect("G-stage root");
     map_guest_memory(&mut gstage, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
@@ -794,7 +791,8 @@ pub fn demo_fp() {
         v.complete_hypercall(0);
         (exit, a0)
     };
-    let mut vcpus = [RiscvVcpu::new(GUEST_RAM, HartId(1), 0, hgatp), RiscvVcpu::new(GUEST_RAM, HartId(2), 0, hgatp)];
+    let mem = Arc::new(mem);
+    let mut vcpus = [1, 2].map(|h| RiscvVcpu::new(GUEST_RAM, HartId(h), 0, hgatp).with_memory(mem.clone()));
     let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
     let ok = |(e, _): &(VmExit, u64), nr| matches!(e, VmExit::Hypercall { nr: n, .. } if *n == nr);
     let (ra, rb) = (steps[2].1, steps[3].1);

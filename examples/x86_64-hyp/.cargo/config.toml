@@ -3,6 +3,14 @@ target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
 # The kernel runs where it is linked, with no loader to apply relocations.
-rustflags = ["-C", "relocation-model=static"]
+# The RustCrypto backends as in ../x86_64-pc/.cargo/config.toml (the
+# hypervisor builds osmium with `full`, osmium-tls included).
+rustflags = [
+    "-C", "relocation-model=static",
+    "--cfg", 'poly1305_backend="soft"',
+    "--cfg", 'sha2_backend="soft"',
+    "--cfg", 'curve25519_dalek_backend="serial"',
+    "--cfg", 'chacha20_backend="soft"',
+]
 # TCG implements AMD SVM with nested paging; `max` exposes it.
 runner = "qemu-system-x86_64 -machine q35 -cpu max -nographic -m 128M -no-reboot -kernel"

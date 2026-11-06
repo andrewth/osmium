@@ -28,8 +28,10 @@ mod vlpi;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
+use demos::guest::image;
+pub(crate) use demos::kernel::{FRAMES, Frames};
 use osmium::arch::aarch64::{self, psci};
 use osmium::arch::trap::{self, TrapFrame};
 use osmium::arch::{cpu, irq, mmu};
@@ -37,12 +39,13 @@ use osmium::boot::fdt::Fdt;
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::irq::InterruptController;
 use osmium::hal::mmio::IoMem;
-use osmium::hal::{print, println};
+use osmium::hal::println;
+use osmium::hal::timer::TickRate;
 use osmium::mm::heap::LockedHeap;
 use osmium::mm::paging::formats::Aarch64El2;
-use osmium::mm::{BuddyAllocator, FrameAllocator, LockedFrames, MapFlags, MemoryMap, OffsetMapper, PageTable};
+use osmium::mm::{FrameAllocator, MapFlags, MemoryMap, PageTable};
 use osmium::mm::{PAGE_SIZE, PhysAddr, RegionKind, VirtAddr};
-use osmium::sync::{IrqSpinLock, Once};
+use osmium::sync::Once;
 use osmium::sysdrv::gicv2::GicV2;
 use osmium::sysdrv::gicv3::{CpuInterface, GicV3, SysRegs};
 use osmium::sysdrv::pl011::Pl011;
@@ -82,8 +85,13 @@ secondary_start:
     bl secondary_main
     b 3b
 
+    // The boot stack, above a guard page that kmain unmaps before turning
+    // the MMU on, so an overflow faults instead of overwriting .data below.
     .section .bss.stack, "aw", @nobits
     .balign 4096
+    .globl boot_stack_guard
+boot_stack_guard:
+    .space 4096
     .space 65536
 boot_stack_top:
 "#
@@ -488,6 +496,7 @@ fp_guest_end:
 
 unsafe extern "C" {
     fn secondary_start();
+    static boot_stack_guard: u8;
     static _kernel_start: u8;
     static _etext: u8;
     static _erodata: u8;
@@ -514,19 +523,12 @@ fn sym(s: &u8) -> u64 {
 const EARLY_UART: usize = 0x0900_0000;
 const RAM_BASE_DTB: usize = 0x4000_0000;
 
-type Frames = LockedFrames<BuddyAllocator<OffsetMapper>, OffsetMapper>;
-
-// SAFETY: the kernel runs identity-mapped (before and after enabling the
-// MMU), so physical address = virtual address for all RAM.
-static FRAMES: Frames = unsafe { LockedFrames::new(BuddyAllocator::new(OffsetMapper::new(0)), OffsetMapper::new(0)) };
-
 #[global_allocator]
 static HEAP: LockedHeap<&'static Frames> = LockedHeap::new();
 
 static UART: Once<SerialConsole<Pl011>> = Once::new();
 static PSCI: Once<psci::Conduit> = Once::new();
 static TTBR0: AtomicU64 = AtomicU64::new(0);
-static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// The multi-vCPU demo guest being run; leaked, so never freed.
 static SMP_VM: AtomicPtr<SmpVm> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -545,12 +547,13 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     unsafe { trap::install() };
     enable_mmu(PhysAddr::new(TTBR0.load(Ordering::Acquire)));
     // This CPU's GIC interface, for kicks from the other CPU.
-    let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
-    gic.init_cpu();
-    gic.enable(KICK_SGI);
-    // A guest's timer expiring while it runs here exits it, as on CPU 0.
-    gic.enable(VTIMER_INTID);
-    ONLINE.fetch_add(1, Ordering::Release);
+    if let Some(gic) = PHYS_GIC.get() {
+        gic.init_cpu();
+        gic.enable(KICK_SGI);
+        // A guest's timer expiring while it runs here exits it, as on CPU 0.
+        gic.enable(VTIMER_INTID);
+    }
+    demos::kernel::check_in();
     // Wait for a guest, then run its vCPU with our index while it lives.
     loop {
         // SAFETY: smp_guest_demo publishes leaked guests, which are never freed.
@@ -569,8 +572,6 @@ extern "C" fn secondary_main(boot: &SecondaryBoot) -> ! {
     }
 }
 
-/// The host's interrupt controller, whichever version QEMU provides.
-#[allow(clippy::large_enum_variant)] // one static value: boxing buys nothing
 /// The GICv3 CPU interface of a CPU running at EL2: the `ICC_*_EL1` registers
 /// are the physical ones there, but `ICC_SRE_EL2` must also let the guest at
 /// EL1 use the system registers.
@@ -619,6 +620,8 @@ impl CpuInterface for El2Regs {
     }
 }
 
+/// The host's interrupt controller, whichever version QEMU provides.
+#[allow(clippy::large_enum_variant, reason = "one static value: boxing buys nothing")]
 enum PhysGic {
     V2(GicV2),
     V3(GicV3<El2Regs>),
@@ -686,11 +689,39 @@ static PHYS_GIC: Once<PhysGic> = Once::new();
 /// guest code.
 const KICK_SGI: u32 = 0;
 
+/// Kicks host CPU `host` out of guest code (`GuestCpus`' kick hook).
+fn kick(host: usize) {
+    if let Some(g) = PHYS_GIC.get() {
+        g.send_sgi(1 << host, KICK_SGI);
+    }
+}
+
+/// Masks (`true`) or unmasks the physical virtual-timer PPI on this CPU,
+/// while a guest has the virtual one pending.
+fn mask_vtimer(masked: bool) {
+    if let Some(g) = PHYS_GIC.get() {
+        if masked { g.disable(VTIMER_INTID) } else { g.enable(VTIMER_INTID) }
+    }
+}
+
+/// Claims and completes the pending physical interrupt on this CPU (the
+/// timer PPI or a kick that made the guest exit) and says which it was.
+fn ack_irq() -> Option<u32> {
+    let g = PHYS_GIC.get()?;
+    let irq = g.claim()?;
+    g.complete(irq);
+    Some(irq)
+}
+
 fn shutdown() -> ! {
     psci::system_off(*PSCI.get().unwrap_or(&psci::Conduit::Smc))
 }
 
 #[unsafe(no_mangle)]
+#[allow(
+    clippy::expect_used,
+    reason = "boot: what QEMU's machine provides is set up once here, so a failure means a broken machine or a bug in this example; the panic handler reports which"
+)]
 extern "C" fn kmain(x0: usize) -> ! {
     // SAFETY: a single CPU runs this kernel; id 0 is unique.
     unsafe { cpu::set_current_id(0) };
@@ -734,15 +765,11 @@ extern "C" fn kmain(x0: usize) -> ! {
     }
     map.page_align_usable();
     let (ram_start, ram_end) = map.regions().iter().fold((u64::MAX, 0), |(s, e), r| (s.min(r.start.0), e.max(r.end.0)));
-    {
-        let mut buddy = FRAMES.lock();
-        for r in map.usable() {
-            // SAFETY: the memory map says the range is free RAM, identity-mapped.
-            unsafe { buddy.add_region(r.start, r.end) };
-        }
-        println!("[frame] {} free frames ({} MiB)", buddy.free_frames(), (buddy.free_frames() * PAGE_SIZE) >> 20);
-    }
+    // SAFETY: the memory map says these ranges are free RAM, identity-mapped.
+    unsafe { demos::kernel::add_ram(map.usable().map(|r| r.start..r.end)) };
+    demos::kernel::report_frames();
     HEAP.init(&FRAMES);
+    demos::kernel::set_rate(TickRate::new(aarch64::counter_frequency()));
 
     // --- EL2 stage-1 MMU -----------------------------------------------------
     let mut pt: PageTable<Aarch64El2, &'static Frames> = PageTable::new(&FRAMES).expect("new failed");
@@ -769,10 +796,21 @@ extern "C" fn kmain(x0: usize) -> ! {
     if let Some((base, len)) = its_window {
         id(&mut pt, base, base + len, rw | MapFlags::DEVICE);
     }
+    // The page below the boot stack becomes its guard (see `_start`). Before
+    // the MMU is on: splitting the block it sits in while the table is live
+    // would need break-before-make under the running stack.
+    // SAFETY: a linker symbol.
+    let guard = unsafe { sym(&boot_stack_guard) };
+    let guarded = demos::kernel::unmap_guard(&mut pt, guard);
     enable_mmu(pt.root());
     TTBR0.store(pt.root().0, Ordering::Release);
+    if guarded {
+        let bottom = guard as usize + PAGE_SIZE;
+        demos::kernel::set_boot_stack_limit(bottom);
+        osmium::arch::trap::TrapCpu::current().set_stack_limit(bottom);
+    }
     println!("[mmu]   EL2 MMU on, TTBR0_EL2 {:#x}; RAM {ram_start:#x}..{ram_end:#x}", pt.root().0);
-    rand_demo();
+    demos::kernel::rand_demo();
     core::mem::forget(pt);
 
     // The physical GIC only needs the virtual timer's PPI enabled: its
@@ -799,29 +837,37 @@ extern "C" fn kmain(x0: usize) -> ! {
     let boot_mpidr = aarch64::read_mpidr_el1() & 0xff_00ff_ffff;
     let mpidrs = fdt
         .find_node("/cpus")
-        .expect("no /cpus")
-        .children()
+        .into_iter()
+        .flat_map(|cpus| cpus.children())
         .filter(|c| c.property("device_type").and_then(|p| p.as_str()) == Some("cpu"))
         .filter_map(|c| c.reg().next().map(|(m, _)| m));
+    // No more CPUs than the per-CPU arrays hold (`secondaries` stops there),
+    // and one at a time: one that fails to start or never checks in ends the
+    // bring-up, so CPU indices stay dense and every started CPU is counted.
     let mut ncpus = 1;
-    for mpidr in mpidrs.filter(|&m| m != boot_mpidr) {
+    for (cpu, mpidr) in demos::kernel::secondaries(mpidrs, boot_mpidr) {
         let stack = alloc::vec![0u8; 64 * 1024].leak();
         let boot = alloc::boxed::Box::leak(alloc::boxed::Box::new(SecondaryBoot {
             stack_top: (stack.as_ptr() as u64 + stack.len() as u64) & !15,
-            cpu: ncpus,
+            cpu,
         }));
         // SAFETY: `secondary_start` sets up its stack from `boot`.
         let rc = unsafe { psci::cpu_on(conduit, mpidr, secondary_start as *const () as u64, boot as *const _ as u64) };
-        assert_eq!(rc, 0, "PSCI CPU_ON {mpidr:#x} failed");
+        if rc != 0 {
+            println!("[smp]   PSCI CPU_ON {mpidr:#x} failed ({rc}); continuing with {ncpus} CPUs");
+            break;
+        }
+        if !demos::kernel::wait_online(cpu + 1) {
+            println!("[smp]   CPU {mpidr:#x} did not check in within 1 s; continuing with {ncpus} CPUs");
+            break;
+        }
         ncpus += 1;
-    }
-    while ONLINE.load(Ordering::Acquire) < ncpus {
-        core::hint::spin_loop();
     }
     println!("[smp]   {ncpus} CPUs online at EL2");
 
     // A whole guest kernel if QEMU's loader provided one, else the demos.
-    match image_window.then(kernel::image).flatten() {
+    // SAFETY: the window is kept from the allocator (above) and nothing else writes it.
+    match image_window.then(|| unsafe { kernel::image() }).flatten() {
         Some(elf) => kernel::boot(&elf, ncpus),
         None => {
             guest_demo();
@@ -879,6 +925,10 @@ const GUEST_UART_INTID: u32 = 33;
 const GUEST_RAM_ORDER: u32 = 9; // 2 MiB
 const GUEST_UART: u64 = 0x1000_0000;
 
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn guest_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -887,30 +937,19 @@ fn guest_demo() {
     // and the guest until it is freed below.
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const guest_image;
-        core::slice::from_raw_parts(start, (&raw const guest_image_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&guest_image, &guest_image_end) };
     mem.write(GUEST_RAM, image).expect("write failed");
 
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
-
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let out = line.clone();
     let mmio = Bus::new();
-    let uart = Uart16550::new(move |b| {
-        let mut l = out.lock();
-        l.push(b);
-        if b == b'\n' {
-            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-            l.clear();
-        }
-    });
+    let uart = Uart16550::new(demos::guest::console(""));
     mmio.insert(GUEST_UART, 8, Arc::new(uart)).expect("insert failed");
     let pio = Bus::new();
 
-    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1));
+    // Stage-2 faults on guest RAM are then reported, not emulated as MMIO.
+    let mem = Arc::new(mem);
+    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1)).with_memory(mem.clone());
     let (mut hypercalls, mut halts, mut interrupts) = (0, 0, 0);
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { .. } => {
@@ -944,6 +983,10 @@ fn guest_demo() {
 
 /// Runs a guest that programs an emulated GICv2: its virtual timer and a
 /// 16550 receive interrupt arrive as virtual IRQs (`HCR_EL2.VI`).
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn gic_guest_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -952,15 +995,13 @@ fn gic_guest_demo() {
     // and the guest until it is freed below.
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const gic_guest;
-        core::slice::from_raw_parts(start, (&raw const gic_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&gic_guest, &gic_guest_end) };
     mem.write(GUEST_RAM, image).expect("write failed");
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
 
-    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 2));
+    let mem = Arc::new(mem);
+    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 2)).with_memory(mem.clone());
     let irq = vcpu.irq_line();
     let vgic = Arc::new(VirtualGicV2::new(64, move |level| irq.store(level, Ordering::Release)));
     let g = vgic.clone();
@@ -971,25 +1012,12 @@ fn gic_guest_demo() {
         // exiting the guest again; restore it once the guest has dealt
         // with the timer.
         if masked.swap(level, Ordering::Relaxed) != level {
-            let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
-            if level { gic.disable(VTIMER_INTID) } else { gic.enable(VTIMER_INTID) }
+            crate::mask_vtimer(level);
         }
     });
-
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let out = line.clone();
     let g = vgic.clone();
-    let uart = Arc::new(
-        Uart16550::new(move |b| {
-            let mut l = out.lock();
-            l.push(b);
-            if b == b'\n' {
-                print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-                l.clear();
-            }
-        })
-        .with_irq(move |level| g.set_level(GUEST_UART_INTID, level)),
-    );
+    let uart =
+        Arc::new(Uart16550::new(demos::guest::console("")).with_irq(move |level| g.set_level(GUEST_UART_INTID, level)));
     let mmio = Bus::new();
     mmio.insert(GUEST_GICD, GIC_WINDOW, vgic.distributor()).expect("insert failed");
     mmio.insert(GUEST_GICC, GIC_WINDOW, vgic.cpu_interface()).expect("insert failed");
@@ -1042,6 +1070,10 @@ fn gic_guest_demo() {
 /// Runs a guest that programs an emulated GICv3 through its system
 /// registers and redistributor: an SGI it sends itself, its virtual timer
 /// and a 16550 receive interrupt, arriving through the list registers.
+#[allow(
+    clippy::expect_used,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn gicv3_guest_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -1050,15 +1082,13 @@ fn gicv3_guest_demo() {
     // and the guest until it is freed below.
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const gicv3_guest;
-        core::slice::from_raw_parts(start, (&raw const gicv3_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&gicv3_guest, &gicv3_guest_end) };
     mem.write(GUEST_RAM, image).expect("write failed");
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
 
-    let vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 6));
+    let mem = Arc::new(mem);
+    let vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 6)).with_memory(mem.clone());
     let irq = vcpu.irq_line();
     let vgic = Arc::new(VirtualGicV3::new(1, 64, move |_, level| irq.store(level, Ordering::Release)));
     let mut vcpu = vcpu.with_vgic_v3(vgic.clone(), 0);
@@ -1069,25 +1099,12 @@ fn gicv3_guest_demo() {
         // As with the GICv2 guest: keep the physical timer interrupt from
         // exiting the guest again while the virtual one is up.
         if masked.swap(level, Ordering::Relaxed) != level {
-            let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
-            if level { gic.disable(VTIMER_INTID) } else { gic.enable(VTIMER_INTID) }
+            crate::mask_vtimer(level);
         }
     });
-
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let out = line.clone();
     let g = vgic.clone();
-    let uart = Arc::new(
-        Uart16550::new(move |b| {
-            let mut l = out.lock();
-            l.push(b);
-            if b == b'\n' {
-                print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-                l.clear();
-            }
-        })
-        .with_irq(move |level| g.set_level(GUEST_UART_INTID, level)),
-    );
+    let uart =
+        Arc::new(Uart16550::new(demos::guest::console("")).with_irq(move |level| g.set_level(GUEST_UART_INTID, level)));
     let mmio = Bus::new();
     mmio.insert(GUEST_GICD, GICD_V3_WINDOW, vgic.distributor()).expect("insert failed");
     mmio.insert(GUEST_GICR, VirtualGicV3::redistributor_window(1), vgic.redistributors()).expect("insert failed");
@@ -1122,10 +1139,7 @@ fn gicv3_guest_demo() {
         VmExit::ExternalInterrupt => {
             interrupts += 1;
             // The physical timer PPI (or a maintenance interrupt): acknowledge it.
-            let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
-            if let Some(irq) = gic.claim() {
-                gic.complete(irq);
-            }
+            let _ = crate::ack_irq();
             ControlFlow::Continue(())
         }
         other => ControlFlow::Break(other),
@@ -1135,7 +1149,7 @@ fn gicv3_guest_demo() {
         vcpu.state.x[24], vcpu.state.x[20], vcpu.state.x[21], vcpu.state.x[22]
     );
     // Leave the physical timer PPI as the next guest expects it.
-    PHYS_GIC.get().expect("PHYS_GIC initialised").enable(VTIMER_INTID);
+    mask_vtimer(false);
 
     drop(mmio);
     drop(s2);
@@ -1149,6 +1163,11 @@ const REPORT: u64 = 0xc600_0001;
 
 /// Interleaves two vCPUs on this CPU and checks each computed with its own
 /// FP/SIMD registers.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn fp_demo() {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -1157,10 +1176,7 @@ fn fp_demo() {
     // and the guests until it is freed below.
     unsafe { mem.add_region(GUEST_RAM, ram.0 as *mut u8, len) };
     // SAFETY: linker symbols bounding the guest image in .rodata.
-    let image = unsafe {
-        let start = &raw const fp_guest;
-        core::slice::from_raw_parts(start, (&raw const fp_guest_end).offset_from(start) as usize)
-    };
+    let image = unsafe { image(&fp_guest, &fp_guest_end) };
     mem.write(GUEST_RAM, image).expect("write failed");
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
@@ -1175,7 +1191,8 @@ fn fp_demo() {
         let x1 = v.state.x[1];
         (exit, x1)
     };
-    let mut vcpus = [Aarch64Vcpu::new(GUEST_RAM, 1, vttbr), Aarch64Vcpu::new(GUEST_RAM, 2, vttbr)];
+    let mem = Arc::new(mem);
+    let mut vcpus = [1, 2].map(|context| Aarch64Vcpu::new(GUEST_RAM, context, vttbr).with_memory(mem.clone()));
     let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
     let is = |s: &(VmExit, u64), n| matches!(s.0, VmExit::Hypercall { nr, .. } if nr == n);
     let fine = is(&steps[0], YIELD) && is(&steps[1], YIELD) && is(&steps[2], REPORT) && is(&steps[3], REPORT);
@@ -1194,9 +1211,8 @@ fn fp_demo() {
 /// A guest shared by the host CPUs that run its vCPUs.
 struct SmpVm {
     cpus: Arc<GuestCpus>,
-    /// Keeps the guest's RAM alive.
-    #[allow(dead_code)]
-    mem: GuestMemory,
+    /// The guest's RAM, for the vCPUs to tell its stage-2 faults from MMIO.
+    mem: Arc<GuestMemory>,
     vttbr: u64,
     /// Per vCPU: its MMIO bus (its own vGIC views plus the shared UART)
     /// and its IRQ line.
@@ -1213,28 +1229,40 @@ struct SmpVm {
 
 /// Runs vCPU `me` of `vm` whenever it is started, until the guest is done.
 fn vcpu_loop(vm: &SmpVm, me: usize) {
+    // Host CPUs beyond the guest's vCPUs have nothing to run.
+    let (Some(line), Some(bus)) = (vm.lines.get(me), vm.buses.get(me)) else { return };
     let pio = Bus::new();
     while !vm.done.load(Ordering::Acquire) {
         let Some((entry, context)) = vm.cpus.take_start(me) else {
             core::hint::spin_loop();
             continue;
         };
-        let vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr).with_irq_line(vm.lines[me].clone());
+        let vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr)
+            .with_irq_line(line.clone())
+            .with_memory(vm.mem.clone());
         let mut vcpu = match &vm.gic3 {
             Some(g) => vcpu.with_vgic_v3(g.clone(), me),
             None => vcpu,
         };
         vm.cpus.attach(me, &mut vcpu);
         let mut stopped = false;
-        let exit = run_vcpu(&mut vcpu, &vm.buses[me], &pio, |v, exit| match exit {
-            VmExit::Hypercall { .. } => match vm::psci::handle_smp(v, exit, Some((&vm.cpus, me))) {
-                Some(vm::psci::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
-                Some(vm::psci::Outcome::Stop) => {
-                    stopped = true;
-                    ControlFlow::Break(VmExit::Halt)
+        let exit = run_vcpu(&mut vcpu, bus, &pio, |v, exit| match exit {
+            VmExit::Hypercall { .. } => {
+                if me != 0 {
+                    // Recorded before the call is handled: vCPU 1's last call
+                    // is CPU_OFF, and once that has marked it off, vCPU 0
+                    // (polling AFFINITY_INFO) may shut down and read this.
+                    vm.results[2].store(v.state.x[22], Ordering::Release);
                 }
-                _ => ControlFlow::Continue(()),
-            },
+                match vm::psci::handle_smp(v, exit, Some((&vm.cpus, me))) {
+                    Some(vm::psci::Outcome::Shutdown) => ControlFlow::Break(VmExit::Shutdown),
+                    Some(vm::psci::Outcome::Stop) => {
+                        stopped = true;
+                        ControlFlow::Break(VmExit::Halt)
+                    }
+                    _ => ControlFlow::Continue(()),
+                }
+            }
             VmExit::Halt => {
                 let deadline = vm::counter() + aarch64::counter_frequency();
                 while !v.interrupt_pending(vm::counter()) {
@@ -1248,12 +1276,8 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             VmExit::ExternalInterrupt => {
                 // A kick (or another physical interrupt): acknowledge it; the
                 // next entry delivers whatever the vGIC now has pending.
-                let gic = PHYS_GIC.get().expect("PHYS_GIC initialised");
-                if let Some(irq) = gic.claim() {
-                    if irq == KICK_SGI && me == 0 {
-                        vm.kicks.fetch_add(1, Ordering::Relaxed);
-                    }
-                    gic.complete(irq);
+                if crate::ack_irq() == Some(KICK_SGI) && me == 0 {
+                    vm.kicks.fetch_add(1, Ordering::Relaxed);
                 }
                 if vm.done.load(Ordering::Acquire) {
                     return ControlFlow::Break(VmExit::Halt);
@@ -1265,8 +1289,6 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
         if me == 0 {
             vm.results[0].store(vcpu.state.x[20], Ordering::Release);
             vm.results[1].store(vcpu.state.x[21], Ordering::Release);
-        } else {
-            vm.results[2].store(vcpu.state.x[22], Ordering::Release);
         }
         if !stopped {
             if exit != VmExit::Shutdown {
@@ -1281,6 +1303,11 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
 
 /// Runs a two-vCPU guest: vCPU 0 on this CPU, vCPU 1 on host CPU 1, under
 /// an emulated GICv2, or GICv3 if `v3`.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 fn smp_guest_demo(v3: bool) {
     let ram = FRAMES.lock().alloc(GUEST_RAM_ORDER).expect("no memory for the guest");
     let len = (PAGE_SIZE as u64) << GUEST_RAM_ORDER;
@@ -1305,8 +1332,7 @@ fn smp_guest_demo(v3: bool) {
     // A vCPU's interrupt arriving while it runs guest code on another host
     // CPU kicks that CPU with a physical SGI, so the guest exits and the
     // next entry delivers it.
-    let cpus =
-        GuestCpus::with_kick(2, |host| PHYS_GIC.get().expect("PHYS_GIC initialised").send_sgi(1 << host, KICK_SGI));
+    let cpus = GuestCpus::with_kick(2, crate::kick);
     let lines: Vec<Arc<AtomicBool>> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
     let (l, c) = (lines.clone(), cpus.clone());
     let output = move |cpu: usize, level: bool| {
@@ -1320,15 +1346,7 @@ fn smp_guest_demo(v3: bool) {
     } else {
         (Some(Arc::new(VirtualGicV2::with_cpus(2, 64, output))), None)
     };
-    let line = Arc::new(IrqSpinLock::new(Vec::new()));
-    let uart: Arc<Uart16550> = Arc::new(Uart16550::new(move |b| {
-        let mut l = line.lock();
-        l.push(b);
-        if b == b'\n' {
-            print!("{}", core::str::from_utf8(&l).unwrap_or("?\n"));
-            l.clear();
-        }
-    }));
+    let uart: Arc<Uart16550> = Arc::new(Uart16550::new(demos::guest::console("")));
     let buses = (0..2)
         .map(|cpu| {
             let bus = Bus::new();
@@ -1347,7 +1365,7 @@ fn smp_guest_demo(v3: bool) {
     cpus.request_start(0, GUEST_RAM.0, 0).expect("request_start failed");
     let vm: &'static SmpVm = alloc::boxed::Box::leak(alloc::boxed::Box::new(SmpVm {
         cpus,
-        mem,
+        mem: Arc::new(mem),
         vttbr,
         buses,
         lines,
@@ -1369,6 +1387,10 @@ fn smp_guest_demo(v3: bool) {
     println!("[hyp]   vCPU 0 kicked out of guest code by a host SGI {} time(s)", vm.kicks.load(Ordering::Relaxed));
 }
 
+#[allow(
+    clippy::panic,
+    reason = "a trap this example never enables is a bug in it; stopping with a report is all there is to do"
+)]
 fn on_trap(frame: &mut TrapFrame) {
     panic!("unexpected trap {:?} at pc {:#x}, ESR {:#x}", frame.cause(), frame.pc(), frame.esr)
 }
@@ -1384,28 +1406,4 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
         let _ = writeln!(osmium::hal::serial::SerialWriter(&mut uart), "\n[panic] {info}");
     }
     shutdown()
-}
-
-/// Seeds a generator from the CPU's random number instructions, draws from
-/// it, and runs the TLS self-test on it.
-fn rand_demo() {
-    static RNG: osmium::rand::SharedRng = osmium::rand::SharedRng::new();
-    if !osmium::rand::CpuEntropy::available() {
-        println!("[rand]  no CPU random number instructions");
-        return;
-    }
-    match RNG.seed(&osmium::rand::CpuEntropy) {
-        Ok(()) => match (RNG.next_u64(), RNG.next_u64()) {
-            (Ok(a), Ok(b)) if a != b => {
-                println!("[rand]  seeded from the CPU; draws differ");
-                // Any time will do: the self-test's certificate is valid around it.
-                match osmium::tls::self_test(&RNG, 1_800_000_000) {
-                    Ok(()) => println!("[tls]   self-test passed: TLS 1.3 handshake and echo"),
-                    Err(e) => println!("[tls]   self-test failed: {e}"),
-                }
-            }
-            r => println!("[rand]  seeded, but draws look wrong: {r:?}"),
-        },
-        Err(e) => println!("[rand]  {e}"),
-    }
 }

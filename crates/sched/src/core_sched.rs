@@ -433,6 +433,13 @@ pub fn current_fp_state() -> FpState {
 /// Clears the calling task's FP/SIMD registers, as a new program starts with
 /// them.
 pub fn reset_current_fp() {
+    set_current_fp_state(&FpState::new());
+}
+
+/// Replaces the calling task's FP/SIMD registers with `state` (a signal
+/// handler's return, say), as if it had been saved from them. Does nothing
+/// unless FP is enabled, and for a task that uses [`SveState`](osmium_arch::fp::SveState) instead.
+pub fn set_current_fp_state(state: &FpState) {
     if !fp::enabled() {
         return;
     }
@@ -440,18 +447,20 @@ pub fn reset_current_fp() {
         let st = CPUS.as_ptr();
         // SAFETY: IRQs are off, so the task stays on this CPU.
         let cur = unsafe { &*current_ptr() };
-        let fresh = FpState::new();
+        if cur.sve.is_some() {
+            return;
+        }
         // SAFETY: as above; the task is running here, so no other CPU touches its `fp`.
         unsafe {
             if let Some(fp) = &cur.fp {
-                *fp.get() = fresh.clone();
+                *fp.get() = state.clone();
             }
             if fp::LAZY {
-                // Whatever the registers hold is discarded; the next FP/SIMD instruction loads `fresh`.
+                // Whatever the registers hold is discarded; the next FP/SIMD instruction loads `state`.
                 (*st).fp_loaded = false;
                 fp::arm_lazy();
             } else {
-                fresh.restore();
+                state.restore();
                 (*st).fp_loaded = cur.fp.is_some();
             }
         }

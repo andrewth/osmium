@@ -15,9 +15,6 @@ use core::task::Poll;
 
 use osmium::arch::trap::{self, Interrupt, Trap, TrapFrame};
 use osmium::arch::{cpu, irq};
-use osmium::sysdrv::clint::Clint;
-use osmium::sysdrv::plic::Plic;
-use osmium::sysdrv::uart16550::{Mmio, Uart16550};
 use osmium::exec::{AtomicWaker, Executor, Signal};
 use osmium::hal::console::{SerialConsole, set_console};
 use osmium::hal::irq::InterruptController;
@@ -25,6 +22,9 @@ use osmium::hal::mmio::IoMem;
 use osmium::hal::println;
 use osmium::hal::serial::SerialPort;
 use osmium::sync::{IrqSpinLock, Once, Producer, SpscRing};
+use osmium::sysdrv::clint::Clint;
+use osmium::sysdrv::plic::Plic;
+use osmium::sysdrv::uart16550::{Mmio, Uart16550};
 
 core::arch::global_asm!(
     r#"
@@ -80,6 +80,10 @@ static RX_WAKER: AtomicWaker = AtomicWaker::new();
 static TICKER_DONE: AtomicBool = AtomicBool::new(false);
 
 #[unsafe(no_mangle)]
+#[allow(
+    clippy::expect_used,
+    reason = "boot: the CLINT, PLIC and UART QEMU's virt machine provides are set up once here; a failure is a bug in this firmware, reported by the panic handler"
+)]
 extern "C" fn fw_main(hart: usize) -> ! {
     // SAFETY: only hart 0 gets here.
     unsafe { cpu::set_current_id(0) };
@@ -96,6 +100,7 @@ extern "C" fn fw_main(hart: usize) -> ! {
 
     // SAFETY: QEMU virt's CLINT and PLIC; this firmware owns them.
     let clint = CLINT.call_once(|| Clint::new(unsafe { IoMem::new(CLINT_BASE as *mut u8, 0x1_0000) }));
+    // SAFETY: as above.
     let plic =
         PLIC.call_once(|| Plic::new(unsafe { IoMem::new(PLIC_BASE as *mut u8, 0x40_0000) }, Plic::machine_context));
     plic.set_priority(UART_IRQ, 1);
@@ -150,15 +155,17 @@ async fn console(mut rx: osmium::sync::Consumer<'static, u8, 64>) {
         .await;
         match next {
             Some(b'\n' | b'\r') if len > 0 => break,
-            Some(b) if (b.is_ascii_graphic() || b == b' ') && len < line.len() => {
-                line[len] = b;
-                len += 1;
+            Some(b) if b.is_ascii_graphic() || b == b' ' => {
+                if let Some(slot) = line.get_mut(len) {
+                    *slot = b;
+                    len += 1;
+                }
             }
             Some(_) => {}
             None => break,
         }
     }
-    match core::str::from_utf8(&line[..len]) {
+    match core::str::from_utf8(line.get(..len).unwrap_or(&line)) {
         Ok("") => println!("[fw]    console task: no input before the ticker finished"),
         Ok(s) => println!("[fw]    console task: interrupt-driven input {s:?}"),
         Err(_) => println!("[fw]    console task: input was not UTF-8"),
@@ -167,16 +174,20 @@ async fn console(mut rx: osmium::sync::Consumer<'static, u8, 64>) {
 
 fn on_trap(frame: &mut TrapFrame) {
     match frame.cause() {
+        // Both are enabled only once fw_main has set up what they use.
         Trap::Interrupt(Interrupt::Timer) => {
-            let clint = CLINT.get().expect("CLINT initialised");
-            clint.set_deadline(0, clint.mtime() + TICK);
+            if let Some(clint) = CLINT.get() {
+                clint.set_deadline(0, clint.mtime() + TICK);
+            }
             TICKS.signal(TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1);
         }
         Trap::Interrupt(Interrupt::External) => {
-            let plic = PLIC.get().expect("PLIC initialised");
+            let Some(plic) = PLIC.get() else { return };
             while let Some(irq) = plic.claim() {
-                if irq == UART_IRQ {
-                    let mut port = UART.get().expect("UART initialised").port();
+                if irq == UART_IRQ
+                    && let Some(uart) = UART.get()
+                {
+                    let mut port = uart.port();
                     let mut producer = RX_PRODUCER.lock();
                     while let Some(b) = port.read_byte() {
                         if let Some(p) = producer.as_mut() {
@@ -188,8 +199,14 @@ fn on_trap(frame: &mut TrapFrame) {
                 plic.complete(irq);
             }
         }
-        cause => panic!("unhandled trap {cause:?} at pc {:#x}", frame.pc()),
+        cause => unhandled(frame, cause),
     }
+}
+
+/// A trap this firmware never enables: a bug in it, so stop it.
+#[allow(clippy::panic, reason = "a trap nothing handles leaves no safe way on")]
+fn unhandled(frame: &TrapFrame, cause: Trap) -> ! {
+    panic!("unhandled trap {cause:?} at pc {:#x}", frame.pc())
 }
 
 #[panic_handler]

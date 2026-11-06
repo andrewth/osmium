@@ -32,6 +32,7 @@ pub enum Backend {
 static BACKEND: Once<Backend> = Once::new();
 
 /// The extension in use; [`enable`] must have run on some CPU.
+#[allow(clippy::expect_used, reason = "enable() runs on the boot CPU before anything asks")]
 pub fn backend() -> Backend {
     *BACKEND.get().expect("backend::enable ran")
 }
@@ -67,6 +68,7 @@ pub enum Stage2 {
 
 impl Stage2 {
     /// An empty table.
+    #[allow(clippy::expect_used, reason = "demo setup: a root table is one frame, and running out is a bug here")]
     pub fn new() -> Self {
         match backend() {
             Backend::Svm => Self::Npt(PageTable::new(&FRAMES).expect("NPT root")),
@@ -76,6 +78,10 @@ impl Stage2 {
 
     /// Guest RAM at `ga..ga + len` onto the host block at `pa`, read/write/execute
     /// (NPT walks are user accesses, so the leaves get USER).
+    #[allow(
+        clippy::expect_used,
+        reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+    )]
     pub fn map_ram(&mut self, ga: u64, pa: u64, len: u64) {
         let flags = MapFlags::RW | MapFlags::EXEC | MapFlags::USER;
         let (va, pa) = (VirtAddr::new(ga), PhysAddr::new(pa));
@@ -291,6 +297,11 @@ impl Vcpu for Cpu {
 
 /// Copies a guest image to guest-physical `gpa`. The images call the
 /// hypervisor with AMD's `vmmcall`; on Intel the same three bytes become `vmcall`.
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "demo setup on fresh memory and fixed guest addresses: a failure is a bug in this example, reported by the panic handler"
+)]
 pub fn load(mem: &GuestMemory, gpa: u64, image: &[u8]) {
     let mut bytes = alloc::vec::Vec::from(image);
     if backend() == Backend::Vmx {

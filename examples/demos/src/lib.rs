@@ -1,11 +1,20 @@
-//! Scheduler demos shared by the example kernels. Each prints one line that
-//! `scripts/check.sh` looks for.
+//! What the example kernels and hypervisors share: the scheduler, network,
+//! storage and USB demos (each prints lines that `scripts/check.sh` looks
+//! for), and the plumbing that is the same on every platform: [`kernel`]
+//! (frames, guarded stacks, clock, CPU bring-up), [`fault`], `user` (user
+//! programs and the user half of a trap handler; the default `user`
+//! feature, which also builds `examples/user`) and [`guest`] (for the
+//! hypervisors).
 #![no_std]
 
 extern crate alloc;
 
 pub mod display;
+pub mod fault;
+pub mod guest;
 pub mod iommu;
+pub mod kernel;
+#[cfg(feature = "user")]
 pub mod user;
 
 use alloc::vec::Vec;
@@ -178,8 +187,14 @@ pub fn arp_tagged(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u6
     while now_ns() < deadline {
         let Ok(n) = dev.receive(&mut frame) else { continue };
         let Some(f) = frame.get(..n) else { continue };
-        if n >= 42 && f[12..14] == [0x08, 0x06] && f[20..22] == [0, 2] && f[28..32] == GATEWAY {
-            let gw = osmium::hal::net::MacAddress(f[22..28].try_into().expect("fixed-width slice"));
+        let field = |r: core::ops::Range<usize>| f.get(r).unwrap_or(&[]);
+        // An ARP reply (EtherType 0x0806, opcode 2) from the gateway.
+        if field(12..14) == [0x08, 0x06]
+            && field(20..22) == [0, 2]
+            && field(28..32) == GATEWAY
+            && let Ok(mac) = <[u8; 6]>::try_from(field(22..28))
+        {
+            let gw = osmium::hal::net::MacAddress(mac);
             println!("{tag}ARP: {}.{}.{}.{} is at {gw}", GATEWAY[0], GATEWAY[1], GATEWAY[2], GATEWAY[3]);
             return;
         }
@@ -238,7 +253,10 @@ pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
         }
         if let Some(r) = lookup.and_then(|q| dns.result(q)) {
             match r {
-                Ok(addrs) => println!("[net]   DNS: localhost is {}", addrs[0]),
+                Ok(addrs) => match addrs.first() {
+                    Some(a) => println!("[net]   DNS: localhost is {a}"),
+                    None => println!("[net]   DNS: localhost has no address"),
+                },
                 Err(e) => println!("[net]   DNS: localhost: {e}"),
             }
             lookup = None;
@@ -251,7 +269,7 @@ pub fn net(dev: &mut impl osmium::hal::net::NetDevice, now_ns: fn() -> u64) {
         let s = sockets.get_mut::<TcpSocket>(tcp);
         let mut buf = [0u8; 64];
         if let Ok(n) = s.recv(&mut buf) {
-            echoed.extend_from_slice(&buf[..n]);
+            echoed.extend_from_slice(buf.get(..n).unwrap_or(&buf));
             if echoed.len() == MESSAGE.len() && !tcp_done {
                 println!("[net]   TCP echo from {ECHO}: \"{}\"", core::str::from_utf8(&echoed).unwrap_or("?"));
                 s.close();
@@ -585,12 +603,12 @@ where
     H: osmium::hal::usb::UsbHost + Send + 'static,
     G: osmium::sync::Guardian + 'static,
 {
+    use osmium::hal::block::BlockDevice;
+    use osmium::hal::usb::{Descriptor, Descriptors, UsbHost, enumerate, read_configuration, set_configuration};
     use osmium::netdev::usb::ecm::{EcmFunction, UsbEthernet};
     use osmium::usb::class::hid::device::{fetch_report_descriptor, hid_interfaces};
     use osmium::usb::class::hid::{HidKeyboard, HidMouse};
     use osmium::usb::class::storage::UsbStorage;
-    use osmium::hal::block::BlockDevice;
-    use osmium::hal::usb::{Descriptor, Descriptors, UsbHost, enumerate, read_configuration, set_configuration};
 
     let mut host = shared;
     let mut found = Vec::new();
@@ -616,14 +634,17 @@ where
         let d = dev.device;
         // Read again: an EHCI port knows its speed only once reset enabled it.
         let speed = host.port_status(port).speed.or(status.speed);
-        println!(
-            "[usb]   port {port}: {:04x}:{:04x} {:?}-speed, {} interface(s)",
-            d.vendor_id,
-            d.product_id,
-            speed.expect("an attached port reports a speed"),
-            dev.config.num_interfaces
-        );
-        for desc in Descriptors::new(&config[..dev.config_len]).flatten() {
+        match speed {
+            Some(speed) => println!(
+                "[usb]   port {port}: {:04x}:{:04x} {speed:?}-speed, {} interface(s)",
+                d.vendor_id, d.product_id, dev.config.num_interfaces
+            ),
+            None => println!(
+                "[usb]   port {port}: {:04x}:{:04x} of unknown speed, {} interface(s)",
+                d.vendor_id, d.product_id, dev.config.num_interfaces
+            ),
+        }
+        for desc in Descriptors::new(config.get(..dev.config_len).unwrap_or(&config)).flatten() {
             if let Descriptor::Interface(i) = desc
                 && i.alternate == 0
             {
@@ -848,12 +869,14 @@ pub fn usb_uas<H, G>(
             }
             match done {
                 (Some(Ok(36)), Some(Ok(n))) if n >= 7 && sense[0] == 3 && sense[2..4] == tag.to_be_bytes() => {
-                    let text = |b: &[u8]| core::str::from_utf8(b).unwrap_or("?").trim_end().len();
+                    fn text(b: &[u8]) -> &str {
+                        core::str::from_utf8(b).map_or("?", str::trim_end)
+                    }
                     let (vendor, product) = (&data[8..16], &data[16..32]);
                     println!(
                         "[usb]     uas: stream {tag}: INQUIRY \"{}\" \"{}\", SCSI status {}",
-                        core::str::from_utf8(&vendor[..text(vendor)]).unwrap_or("?"),
-                        core::str::from_utf8(&product[..text(product)]).unwrap_or("?"),
+                        text(vendor),
+                        text(product),
                         sense[6]
                     );
                 }
@@ -892,7 +915,7 @@ pub fn fat<D: osmium::hal::block::BlockDevice + Send + 'static>(disk: D) {
         let mut back = [0u8; 64];
         let n = f.read(0, &mut back)?;
         f.sync()?;
-        Ok((path, n == text.len() && back[..n] == text[..]))
+        Ok((path, back.get(..n) == Some(text)))
     })();
     match result {
         Ok((path, true)) => println!("[fat]   wrote and read back \"{path}\""),
