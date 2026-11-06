@@ -910,7 +910,9 @@ fn guest_demo() {
     mmio.insert(GUEST_UART, 8, Arc::new(uart)).expect("insert failed");
     let pio = Bus::new();
 
-    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1));
+    // Stage-2 faults on guest RAM are then reported, not emulated as MMIO.
+    let mem = Arc::new(mem);
+    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1)).with_memory(mem.clone());
     let (mut hypercalls, mut halts, mut interrupts) = (0, 0, 0);
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { .. } => {
@@ -960,7 +962,8 @@ fn gic_guest_demo() {
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
 
-    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 2));
+    let mem = Arc::new(mem);
+    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 2)).with_memory(mem.clone());
     let irq = vcpu.irq_line();
     let vgic = Arc::new(VirtualGicV2::new(64, move |level| irq.store(level, Ordering::Release)));
     let g = vgic.clone();
@@ -1058,7 +1061,8 @@ fn gicv3_guest_demo() {
     let mut s2: Stage2Table<_> = PageTable::new(&FRAMES).expect("stage-2 root");
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
 
-    let vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 6));
+    let mem = Arc::new(mem);
+    let vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 6)).with_memory(mem.clone());
     let irq = vcpu.irq_line();
     let vgic = Arc::new(VirtualGicV3::new(1, 64, move |_, level| irq.store(level, Ordering::Release)));
     let mut vcpu = vcpu.with_vgic_v3(vgic.clone(), 0);
@@ -1175,7 +1179,8 @@ fn fp_demo() {
         let x1 = v.state.x[1];
         (exit, x1)
     };
-    let mut vcpus = [Aarch64Vcpu::new(GUEST_RAM, 1, vttbr), Aarch64Vcpu::new(GUEST_RAM, 2, vttbr)];
+    let mem = Arc::new(mem);
+    let mut vcpus = [1, 2].map(|context| Aarch64Vcpu::new(GUEST_RAM, context, vttbr).with_memory(mem.clone()));
     let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
     let is = |s: &(VmExit, u64), n| matches!(s.0, VmExit::Hypercall { nr, .. } if nr == n);
     let fine = is(&steps[0], YIELD) && is(&steps[1], YIELD) && is(&steps[2], REPORT) && is(&steps[3], REPORT);
@@ -1194,9 +1199,8 @@ fn fp_demo() {
 /// A guest shared by the host CPUs that run its vCPUs.
 struct SmpVm {
     cpus: Arc<GuestCpus>,
-    /// Keeps the guest's RAM alive.
-    #[allow(dead_code)]
-    mem: GuestMemory,
+    /// The guest's RAM, for the vCPUs to tell its stage-2 faults from MMIO.
+    mem: Arc<GuestMemory>,
     vttbr: u64,
     /// Per vCPU: its MMIO bus (its own vGIC views plus the shared UART)
     /// and its IRQ line.
@@ -1219,7 +1223,9 @@ fn vcpu_loop(vm: &SmpVm, me: usize) {
             core::hint::spin_loop();
             continue;
         };
-        let vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr).with_irq_line(vm.lines[me].clone());
+        let vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr)
+            .with_irq_line(vm.lines[me].clone())
+            .with_memory(vm.mem.clone());
         let mut vcpu = match &vm.gic3 {
             Some(g) => vcpu.with_vgic_v3(g.clone(), me),
             None => vcpu,
@@ -1347,7 +1353,7 @@ fn smp_guest_demo(v3: bool) {
     cpus.request_start(0, GUEST_RAM.0, 0).expect("request_start failed");
     let vm: &'static SmpVm = alloc::boxed::Box::leak(alloc::boxed::Box::new(SmpVm {
         cpus,
-        mem,
+        mem: Arc::new(mem),
         vttbr,
         buses,
         lines,

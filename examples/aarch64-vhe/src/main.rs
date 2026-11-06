@@ -332,7 +332,9 @@ fn guest_demo() {
         unsafe { core::arch::asm!(".arch_extension fp", "fmov d0, {}", in(reg) HOST_D0, options(nomem, nostack)) };
     }
 
-    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1));
+    // Stage-2 faults on guest RAM are then reported, not emulated as MMIO.
+    let mem = Arc::new(mem);
+    let mut vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 1)).with_memory(mem.clone());
     let (mut hypercalls, mut halts) = (0, 0);
     let mut tge_on_exits = true;
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| {

@@ -11,12 +11,12 @@ use core::ops::ControlFlow;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use osmium::storage::ramdisk::RamDisk;
 use osmium::hal::block::BlockDevice as _;
 use osmium::hal::dma::{DmaAllocator, DmaBuffer};
 use osmium::hal::{print, println};
 use osmium::mm::{FrameAllocator, MapFlags, PageTable, PhysAddr, VirtAddr};
 use osmium::sched::TaskBuilder;
+use osmium::storage::ramdisk::RamDisk;
 use osmium::sync::IrqSpinLock;
 use osmium::virt::devices::{Uart16550, VirtualPlic};
 use osmium::virt::riscv::fdt::GuestMachine;
@@ -132,7 +132,9 @@ pub fn demo() {
     mmio.insert(GUEST_UART, 8, Arc::new(uart)).expect("insert failed");
     let pio = Bus::new();
 
-    let mut vcpu = RiscvVcpu::new(GUEST_RAM, HartId(0), 0, hgatp);
+    // Guest-page faults on guest RAM are then reported, not emulated as MMIO.
+    let mem = Arc::new(mem);
+    let mut vcpu = RiscvVcpu::new(GUEST_RAM, HartId(0), 0, hgatp).with_memory(mem.clone());
     let (mut hypercalls, mut halts, mut interrupts) = (0, 0, 0);
     let exit = run_vcpu(&mut vcpu, &mmio, &pio, |v, exit| match exit {
         VmExit::Hypercall { .. } => {
@@ -332,18 +334,18 @@ pub fn demo_irq() {
 extern "C" fn guest_main(_hartid: usize, dtb: usize) -> ! {
     use core::fmt::Write;
     use osmium::boot::fdt::Fdt;
-    use osmium::sysdrv::plic::Plic;
-    use osmium::sysdrv::uart16550::{Mmio, Uart16550 as UartDriver};
     use osmium::drivers::virtio::DeviceType;
     use osmium::drivers::virtio::Transport;
-    use osmium::storage::virtio_blk::VirtioBlk;
     use osmium::drivers::virtio::mmio::MmioTransport;
-    use osmium::netdev::virtio_net::VirtioNet;
     use osmium::hal::block::BlockDevice;
     use osmium::hal::irq::InterruptController;
     use osmium::hal::mmio::IoMem;
     use osmium::hal::net::{MacAddress, NetDevice};
     use osmium::hal::serial::{SerialPort, SerialWriter};
+    use osmium::netdev::virtio_net::VirtioNet;
+    use osmium::storage::virtio_blk::VirtioBlk;
+    use osmium::sysdrv::plic::Plic;
+    use osmium::sysdrv::uart16550::{Mmio, Uart16550 as UartDriver};
 
     // SAFETY: the hypervisor put a device tree at `dtb`.
     let Ok(fdt) = (unsafe { Fdt::from_ptr(dtb as *const u8) }) else { sbi_shutdown() };
@@ -794,7 +796,8 @@ pub fn demo_fp() {
         v.complete_hypercall(0);
         (exit, a0)
     };
-    let mut vcpus = [RiscvVcpu::new(GUEST_RAM, HartId(1), 0, hgatp), RiscvVcpu::new(GUEST_RAM, HartId(2), 0, hgatp)];
+    let mem = Arc::new(mem);
+    let mut vcpus = [1, 2].map(|h| RiscvVcpu::new(GUEST_RAM, HartId(h), 0, hgatp).with_memory(mem.clone()));
     let steps: Vec<_> = [0, 1, 0, 1].into_iter().map(|i| step(&mut vcpus[i])).collect();
     let ok = |(e, _): &(VmExit, u64), nr| matches!(e, VmExit::Hypercall { nr: n, .. } if *n == nr);
     let (ra, rb) = (steps[2].1, steps[3].1);
