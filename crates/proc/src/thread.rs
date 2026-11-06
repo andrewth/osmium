@@ -87,9 +87,9 @@ pub struct Thread {
     /// Restart block and priority-inheritance state.
     pub(crate) ext: crate::thread_ext::ThreadExt,
     /// The address of the wait queue the thread sleeps in while it is in an
-    /// interruptible wait ([`crate::signal::wait_on`]), or 0: how a signal
-    /// wakes this thread alone.
-    pub(crate) sleep: IrqSpinLock<usize>,
+    /// interruptible wait ([`crate::signal::wait_on`]), and the task that
+    /// sleeps there for it: how a signal wakes this thread alone.
+    pub(crate) sleep: IrqSpinLock<Option<(usize, Arc<osmium_sched::Task>)>>,
     /// Links the thread into its group's list.
     group_link: Shared<Link>,
     /// Links a non-leader thread into [`TIDS`], keyed by `key`.
@@ -151,7 +151,7 @@ impl Thread {
             stale_page: AtomicU64::new(0),
             stale_count: AtomicU32::new(0),
             ext: crate::thread_ext::ThreadExt::new(),
-            sleep: IrqSpinLock::new(0),
+            sleep: IrqSpinLock::new(None),
             group_link: Shared::new(Link::new()),
             tid_link: Shared::new(TreeLink::new()),
             key: tid,

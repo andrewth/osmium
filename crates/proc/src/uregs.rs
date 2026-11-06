@@ -11,6 +11,7 @@
 #![cfg_attr(not(test), allow(dead_code, unused_macros))]
 
 use crate::bytes::{put, u64_at};
+use crate::sigfp::FpLayout;
 
 /// Where an architecture's `struct rt_sigframe` puts things, as Linux lays
 /// it out. Offsets are in bytes from the start of the frame, or of the
@@ -42,14 +43,16 @@ pub(crate) struct SigFrame {
     pub sigreturn_back: u64,
     /// `uc_flags`.
     pub uc_flags: u64,
+    /// Where the FP/SIMD state goes (see `crate::sigfp`).
+    pub fp: FpLayout,
 }
 
-/// Most bytes of a frame built at once (RISC-V's whole frame).
-pub(crate) const HEAD_MAX: usize = 1088;
+/// Most bytes of a frame built at once (AArch64's frame up to its FP record).
+pub(crate) const HEAD_MAX: usize = 1136;
 
 /// x86_64: `pretcode`, then `ucontext` (flags, link, `stack_t`, 256 bytes of
-/// `sigcontext`, an 8-byte `sigset_t`), then `siginfo`. No FP state follows
-/// (`fpstate` is null).
+/// `sigcontext`, an 8-byte `sigset_t`), then `siginfo`. The FP state is in
+/// an area of its own above the frame, which `fpstate` points at.
 pub(crate) const X86_64_FRAME: SigFrame = SigFrame {
     size: 440,
     head: 440,
@@ -62,16 +65,17 @@ pub(crate) const X86_64_FRAME: SigFrame = SigFrame {
     sigreturn_back: 8,
     // UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS.
     uc_flags: 0x6,
+    fp: FpLayout::X86_64,
 };
 
 /// AArch64: `siginfo`, then `ucontext` (flags, link, `stack_t`, a 128-byte
 /// `sigset_t` area, then at 176 the `sigcontext`: `fault_address`,
-/// `regs[31]`, `sp`, `pc`, `pstate` and 4096 bytes of records, here only the
-/// terminating null record), then the frame record `{ fp, lr }` that `x29`
-/// points at.
+/// `regs[31]`, `sp`, `pc`, `pstate` and 4096 bytes of records: the
+/// `fpsimd_context` while FP is on, then the terminating null record), then
+/// the frame record `{ fp, lr }` that `x29` points at.
 pub(crate) const AARCH64_FRAME: SigFrame = SigFrame {
     size: 128 + 4560 + 16,
-    head: 128 + 176 + 288 + 16,
+    head: 128 + 176 + 288 + 528 + 16,
     info: 0,
     uc: 128,
     sigmask: 40,
@@ -80,6 +84,7 @@ pub(crate) const AARCH64_FRAME: SigFrame = SigFrame {
     ret_slot: None,
     sigreturn_back: 0,
     uc_flags: 0,
+    fp: FpLayout::Aarch64,
 };
 
 /// Offset of AArch64's frame record, after the `rt_sigframe`.
@@ -87,7 +92,7 @@ pub(crate) const AARCH64_RECORD: usize = 128 + 4560;
 
 /// RISC-V: `siginfo`, then `ucontext` (flags, link, `stack_t`, a 128-byte
 /// `sigset_t` area, then at 176 the `sigcontext`: `pc`, `x1`..`x31`, and
-/// 528 bytes of FP state, here zero).
+/// 528 bytes of FP state: `f0`..`f31` and `fcsr`, zero while FP is off).
 pub(crate) const RISCV64_FRAME: SigFrame = SigFrame {
     size: 1088,
     head: 1088,
@@ -99,6 +104,7 @@ pub(crate) const RISCV64_FRAME: SigFrame = SigFrame {
     ret_slot: None,
     sigreturn_back: 0,
     uc_flags: 0,
+    fp: FpLayout::Riscv64,
 };
 
 /// The user registers of a trap frame, without anything privileged: what a
@@ -279,7 +285,7 @@ macro_rules! aarch64_user_regs {
 
 /// The x86_64 registers: `sigcontext` is `r8`..`r15`, `rdi`, `rsi`, `rbp`,
 /// `rbx`, `rdx`, `rax`, `rcx`, `rsp`, `rip`, `eflags`, the selectors, `err`,
-/// `trapno`, `oldmask`, `cr2`, `fpstate` (null here) and reserved words.
+/// `trapno`, `oldmask`, `cr2`, `fpstate` (set by `push_frame`) and reserved words.
 macro_rules! x86_64_user_regs {
     ($frame:ty) => {
         impl $crate::uregs::UserRegs for $frame {

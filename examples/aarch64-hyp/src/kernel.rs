@@ -37,6 +37,8 @@ const MAX_CPUS: usize = 8;
 /// A guest shared by every host CPU, each running one of its vCPUs.
 pub struct KernelVm {
     cpus: Arc<GuestCpus>,
+    /// The guest's RAM, for the vCPUs to tell its stage-2 faults from MMIO.
+    mem: Arc<GuestMemory>,
     vttbr: u64,
     /// Per vCPU: its MMIO bus (its own GIC views plus the shared PL011),
     /// its IRQ line.
@@ -65,7 +67,9 @@ pub fn vcpu_loop(vm: &KernelVm, me: usize) -> Option<VmExit> {
     let (Some(line), Some(bus)) = (vm.lines.get(me), vm.buses.get(me)) else { return None };
     let pio = Bus::new();
     vm.run.vcpu_loop(&vm.cpus, me, |entry, context| {
-        let mut vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr).with_irq_line(line.clone());
+        let mut vcpu = Aarch64Vcpu::new(GuestPhysAddr(entry), context, vm.vttbr)
+            .with_irq_line(line.clone())
+            .with_memory(vm.mem.clone());
         // The virtual timer feeds the vGIC; while its line is up, the
         // physical PPI stays masked on this CPU so it does not keep exiting
         // the guest.
@@ -162,7 +166,8 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
     map_guest_memory(&mut s2, &mem, |p| PhysAddr::new(p as u64)).expect("map_guest_memory failed");
     let vttbr = vttbr(s2.root(), 4);
     core::mem::forget(s2); // in use until power-off
-    core::mem::forget(mem);
+    // In use until power-off.
+    let mem = Arc::new(mem);
 
     // A vCPU's interrupt arriving while it runs guest code on another host
     // CPU kicks that CPU with a physical SGI.
@@ -190,7 +195,7 @@ pub fn boot(elf: &Elf<'_>, ncpus: usize) {
     // The boot CPU starts with x0 = the device tree.
     cpus.request_start(0, elf.entry(), GUEST_RAM).expect("request_start failed");
 
-    let vm = KernelVm { cpus, vttbr, buses, lines, gic, run: GuestRun::new(ncpus) };
+    let vm = KernelVm { cpus, mem, vttbr, buses, lines, gic, run: GuestRun::new(ncpus) };
     KERNEL_VM.store(&raw const vm as *mut KernelVm, Ordering::Release);
     let exit = vcpu_loop(&vm, 0);
     vm.run.wait_all();

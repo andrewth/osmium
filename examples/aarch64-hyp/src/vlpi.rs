@@ -266,7 +266,8 @@ fn run_guest(
 
     // The guest uses the virtual CPU interface (ICH_HCR_EL2.En), so it gets a
     // virtual GICv3, though nothing is ever injected through the model.
-    let vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 9));
+    let mem = Arc::new(mem);
+    let vcpu = Aarch64Vcpu::new(GUEST_RAM, 0, vttbr(s2.root(), 9)).with_memory(mem.clone());
     let irq = vcpu.irq_line();
     let vgic = Arc::new(VirtualGicV3::new(1, 64, move |_, level: bool| irq.store(level, Ordering::Release)));
     let mut vcpu = vcpu.with_vgic_v3(vgic, 0);

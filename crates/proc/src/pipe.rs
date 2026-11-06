@@ -5,12 +5,12 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, POLLOUT, Stat};
+use osmium_fs::{Errno, File, FileKind, POLLERR, POLLHUP, POLLIN, POLLOUT, PollQueue, Stat};
 use osmium_sync::IrqSpinLock;
 use osmium_sync::fallible::try_arc;
 
 use crate::fd::{Access, OpenFile};
-use crate::poll::{notify, wait};
+use crate::poll::wait;
 use crate::process::Process;
 
 type SysResult = Result<u64, Errno>;
@@ -32,7 +32,24 @@ struct State {
     no_writer: bool,
 }
 
-type Shared = Arc<IrqSpinLock<State>>;
+/// A pipe's state, and the queue both ends notify when it changes.
+struct Pipe {
+    st: IrqSpinLock<State>,
+    queue: PollQueue,
+}
+
+impl Pipe {
+    fn lock(&self) -> osmium_sync::SpinLockGuard<'_, State, osmium_sync::IrqDisabled> {
+        self.st.lock()
+    }
+
+    /// Wakes the waiters on either end. Call it without the state locked.
+    fn notify(&self) {
+        self.queue.notify();
+    }
+}
+
+type Shared = Arc<Pipe>;
 
 /// The read end of a pipe.
 pub struct PipeReader {
@@ -49,7 +66,7 @@ pub struct PipeWriter {
 /// A new pipe: its read end and its write end. `ENOMEM` if there is no
 /// memory for it.
 pub fn try_pipe(nonblock: bool) -> Result<(PipeReader, PipeWriter), Errno> {
-    let pipe = try_arc(IrqSpinLock::new(State::default())).map_err(crate::oom)?;
+    let pipe = try_arc(Pipe { st: IrqSpinLock::new(State::default()), queue: PollQueue::new() }).map_err(crate::oom)?;
     Ok((
         PipeReader { pipe: pipe.clone(), nonblock: AtomicBool::new(nonblock) },
         PipeWriter { pipe, nonblock: AtomicBool::new(nonblock) },
@@ -101,7 +118,7 @@ impl File for PipeReader {
                         *b = x;
                     }
                     drop(s);
-                    notify();
+                    self.pipe.notify();
                     return Ok(n);
                 }
                 if s.no_writer {
@@ -111,7 +128,7 @@ impl File for PipeReader {
             if self.is_nonblocking() {
                 return Err(Errno::EAGAIN);
             }
-            wait(None, || Self::ready(&self.pipe.lock()).then_some(()))?;
+            wait([&self.pipe.queue], None, || Self::ready(&self.pipe.lock()).then_some(()))?;
         }
     }
 
@@ -124,6 +141,10 @@ impl File for PipeReader {
         (if s.data.is_empty() { 0 } else { POLLIN }) | if s.no_writer { POLLHUP } else { 0 }
     }
 
+    fn poll_queue(&self) -> Option<&PollQueue> {
+        Some(&self.pipe.queue)
+    }
+
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
@@ -132,7 +153,7 @@ impl File for PipeReader {
 impl Drop for PipeReader {
     fn drop(&mut self) {
         self.pipe.lock().no_reader = true;
-        notify();
+        self.pipe.notify();
     }
 }
 
@@ -164,7 +185,7 @@ impl File for PipeWriter {
                     s.data.extend(buf.get(done..done + n).unwrap_or_default());
                     done += n;
                     drop(s);
-                    notify();
+                    self.pipe.notify();
                     if done == buf.len() {
                         return Ok(done);
                     }
@@ -175,7 +196,7 @@ impl File for PipeWriter {
                 return if done > 0 { Ok(done) } else { Err(Errno::EAGAIN) };
             }
             let want = if buf.len() <= PIPE_BUF { need } else { 1 };
-            let waited = wait(None, || {
+            let waited = wait([&self.pipe.queue], None, || {
                 let s = self.pipe.lock();
                 (s.no_reader || CAPACITY - s.data.len() >= want).then_some(())
             });
@@ -200,6 +221,10 @@ impl File for PipeWriter {
         }
     }
 
+    fn poll_queue(&self) -> Option<&PollQueue> {
+        Some(&self.pipe.queue)
+    }
+
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
@@ -208,7 +233,7 @@ impl File for PipeWriter {
 impl Drop for PipeWriter {
     fn drop(&mut self) {
         self.pipe.lock().no_writer = true;
-        notify();
+        self.pipe.notify();
     }
 }
 

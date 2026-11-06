@@ -717,6 +717,10 @@ impl File for SocketFile {
         self.readiness()
     }
 
+    fn poll_queue(&self) -> Option<&osmium_fs::PollQueue> {
+        Some(self.net.readiness())
+    }
+
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }

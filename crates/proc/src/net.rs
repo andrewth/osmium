@@ -10,7 +10,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use osmium_fs::Errno;
+use osmium_fs::{Errno, PollQueue};
 use osmium_hal::net::NetDevice;
 use osmium_net::{Instant, Interface, Socket, SocketHandle, SocketSet, TcpSocket};
 use osmium_sched::WaitQueue;
@@ -21,6 +21,8 @@ use osmium_sync::{IrqSpinLock, Once};
 pub struct NetStack {
     inner: IrqSpinLock<Inner>,
     events: WaitQueue,
+    /// The `poll` queue of every socket of the stack, notified as it runs.
+    readiness: PollQueue,
     now_ns: fn() -> u64,
 }
 
@@ -35,7 +37,12 @@ impl NetStack {
     /// `sockets` may already hold sockets of the kernel's own, such as a
     /// DHCP client.
     pub fn new(iface: Interface, dev: Box<dyn NetDevice + Send>, sockets: SocketSet, now_ns: fn() -> u64) -> Self {
-        Self { inner: IrqSpinLock::new(Inner { iface, dev, sockets }), events: WaitQueue::new(), now_ns }
+        Self {
+            inner: IrqSpinLock::new(Inner { iface, dev, sockets }),
+            events: WaitQueue::new(),
+            readiness: PollQueue::new(),
+            now_ns,
+        }
     }
 
     fn now(&self) -> Instant {
@@ -81,7 +88,9 @@ impl NetStack {
             (r, active)
         };
         self.events.wake_all();
-        crate::poll::notify();
+        self.readiness.notify();
+        // Running the stack doubles as a clock tick for timed waits.
+        crate::poll::tick();
         (r, active)
     }
 
@@ -127,6 +136,11 @@ impl NetStack {
                 None
             }
         })
+    }
+
+    /// The queue its sockets' `poll` readiness is announced on.
+    pub(crate) fn readiness(&self) -> &PollQueue {
+        &self.readiness
     }
 
     /// The stack's clock, in nanoseconds.
